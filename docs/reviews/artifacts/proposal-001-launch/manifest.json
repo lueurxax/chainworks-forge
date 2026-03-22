@@ -1,0 +1,32 @@
+[
+  {
+    "attachments" : [
+      {
+        "arguments" : [
+          "1"
+        ],
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "00F45C92-67A3-4A53-9829-F6818D0D6113.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "Launch Screen_0_631816D7-E436-4811-B327-9211D346B2B1.png",
+        "timestamp" : 1774167201.879
+      },
+      {
+        "arguments" : [
+          "2"
+        ],
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "D0068B54-F071-45EF-904C-07A0DB58AC73.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "Launch Screen_0_F7511BA6-2821-4297-B532-8F4560A8C1BF.png",
+        "timestamp" : 1774167206.318
+      }
+    ],
+    "testIdentifier" : "Chainworks_ForgeUITestsLaunchTests/testLaunch",
+    "testIdentifierURL" : "test://com.apple.xcode/Chainworks%20Forge/Chainworks%20ForgeUITests/Chainworks_ForgeUITestsLaunchTests/testLaunch"
+  }
+]

@@ -6,6 +6,9 @@
 - **Workflow**: a YAML-defined execution graph that describes stages, agents, approvals, and transitions.
 - **Stage**: one logical step in a workflow, such as proposal generation, review, implementation, or pre-push validation.
 - **Run**: one execution instance of a workflow for one idea.
+- **RunPlanSnapshot**: an immutable compiled snapshot of workflow, agent bindings, backend profiles, and artifact paths used by a run.
+- **WorkflowVersion**: the exact workflow definition revision compiled into a run.
+- **AgentCatalogVersion**: the exact agent catalog revision resolved by the workflow at run start.
 - **Agent**: a specialized worker bound to a role, provider, permissions, and output contract.
 - **Approval gate**: a workflow-defined pause where the engineer must review and explicitly continue.
 
@@ -46,8 +49,11 @@ Measurement plan: compare a fixed set of ideas executed manually vs through Chai
 
 - The engineer must be able to describe an idea in text in the app, optionally attach or reference a file, select a workflow definition, and start a run so that one idea maps to one workflow execution.
 - The system must parse `workflow.yaml` and execute its stages so that stage transitions are driven by the workflow definition rather than hardcoded flows.
+- The system must compile each started run into an immutable `RunPlanSnapshot` so that resume and reporting use the same workflow, agent bindings, backend profiles, and artifact paths that were active at run start.
+- The system must resolve workflow stage agent references through the agent catalog and backend profiles so that workflow topology and agent policy remain separate concerns.
 - The system must enforce exactly one active run per idea in MVP so that workflow ownership and UI state stay unambiguous.
 - The system must persist ideas, runs, stages, active agents, and approvals in SwiftData so that app state survives restart and can be inspected later.
+- The system must persist only metadata, indexes, statuses, and artifact references in SwiftData so that large logs, diffs, markdown, and structured payloads remain in the artifact store on disk.
 - The system must show a list of in-progress ideas so that the engineer can see all currently active work in one place.
 - The system must show, for each idea, the workflow chain and current stage so that progress is observable without opening raw artifacts.
 - The system must show a list of active agents and let the engineer open each agent so that raw logs, markdown summaries, and structured outputs can be inspected during execution.
@@ -56,6 +62,7 @@ Measurement plan: compare a fixed set of ideas executed manually vs through Chai
 - The system must support multiple providers from the first version so that agents can run against different model backends in one workflow, with Codex and Claude Code required in v1.
 - The system must treat workflow actions such as push or distribution as workflow-defined capabilities so that examples like Connect remain optional and not product-defining.
 - The system must automatically resume interrupted runs on app launch so that the engineer does not need to restore workflow progress manually.
+- The system must never silently auto-resume stages with external side effects; those stages must return to `waiting_approval` or `blocked`.
 
 ### 3.2 Non-functional requirements
 
@@ -65,6 +72,7 @@ Measurement plan: compare a fixed set of ideas executed manually vs through Chai
 - Provider integration must support adding more backends without rewriting the workflow model.
 - Agent output retrieval for an active run should open in `[TBD]` seconds or less on a typical local machine.
 - Completed-run reporting must retain at least summary, elapsed time, and cost for each finished idea.
+- Resumed runs must continue from the frozen run snapshot, not from the latest YAML files on disk.
 
 ## 4. HLD
 
@@ -81,6 +89,49 @@ At a high level:
 ### 4.1 Teams
 
 - One engineer owns product definition, workflow modeling, app implementation, and operational use in the MVP phase.
+
+### 4.2 Execution model
+
+Execution in MVP follows this chain:
+
+- idea -> run -> compiled `RunPlanSnapshot` -> stage executions -> agent executions -> artifacts -> approvals -> final report
+- `RunPlanSnapshot` freezes `WorkflowVersion`, `AgentCatalogVersion`, backend-profile bindings, permissions, artifact paths, and runtime settings at run start
+- workflow stages resolve agent references through the agent catalog rather than embedding provider/model policy inline
+- resume always uses the stored snapshot, never the latest YAML files on disk
+
+### 4.3 State machines
+
+The implementation must track separate status machines for:
+
+- **Run**: `pending`, `ready`, `running`, `waiting_approval`, `blocked`, `completed`, `failed`, `cancelled`
+- **Stage**: `pending`, `ready`, `running`, `waiting_approval`, `blocked`, `completed`, `failed`, `skipped`
+- **Agent execution**: `pending`, `ready`, `running`, `completed`, `failed`, `cancelled`, `skipped`
+- **Approval**: `pending`, `requested`, `granted`, `rejected`, `expired`
+- **Side effect**: `pending`, `armed`, `running`, `completed`, `failed`, `blocked`
+
+### 4.4 Artifact model
+
+Artifacts are first-class runtime objects, not just log by-products.
+
+- canonical examples include `proposal.md`, `review.json`, `audit.md`, `patch.diff`, `run-report.json`
+- every artifact must record provenance: run, stage, agent, provider, model, effort, and creation time
+- artifacts are immutable once written for a stage attempt; new attempts create new artifacts rather than rewriting history
+- SwiftData stores artifact metadata, paths, checksums, and aggregates; artifact content lives on disk
+
+### 4.5 Resume / retry policy
+
+- safe local stages may auto-resume on launch from the frozen run snapshot
+- workflow-defined approval stages resume into `waiting_approval`, not into silent execution
+- stages with external side effects such as push, publish, and distribution never auto-resume silently
+- retries are bounded by workflow/stage policy and must create new stage-attempt records and new artifacts
+
+### 4.6 Out of scope for MVP
+
+- Gemini and other provider integrations beyond Codex and Claude Code
+- parallel write-capable agents in the same worktree
+- distributed workers or cloud execution
+- cloud sync and multi-user orchestration
+- silent auto-resume of external side-effect stages
 
 ## 5. Open questions
 

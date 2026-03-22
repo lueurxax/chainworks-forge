@@ -4,6 +4,20 @@ Chainworks Forge is the macOS SwiftUI app project for **Chainworks**: a local co
 
 The product thesis is simple: the system should move an idea through proposal, review, implementation, audit, and release using explicit workflows, specialized agents, durable artifacts, and hard approval gates. The primary object is not a chat session. It is a **Run**.
 
+## Architecture Sketch
+
+```text
+SwiftUI client
+  -> Run coordinator
+  -> RunPlanSnapshot compiler
+  -> Provider adapters (Codex / Claude Code)
+  -> SwiftData metadata index
+  -> Artifact store on disk
+  -> Approval gates
+  -> Deterministic side-effect services
+  -> Final run report
+```
+
 ## What This Repository Contains
 
 This repository currently combines four layers:
@@ -12,6 +26,7 @@ This repository currently combines four layers:
 - MVP and product-definition documents
 - architecture research for the runtime and orchestration model
 - canonical YAML examples for agent catalogs and workflows
+- implementation proposals and review evidence packs
 
 ## Product Model
 
@@ -34,6 +49,29 @@ For the current MVP slice, the system is intended to support:
   - after the first proposal
   - before implementation
   - before push / distribution
+
+## Implemented Today
+
+- product vision, MVP scope, and architecture research documents
+- canonical YAML examples for agent catalog and workflow definitions
+- a SwiftUI macOS app scaffold with SwiftData already wired in
+- repository structure aligned around docs and examples
+
+## Planned Next
+
+- immutable `RunPlanSnapshot` compilation at run start
+- explicit state machines for run, stage, agent, approval, and side effects
+- SwiftData metadata models plus disk-backed artifact store
+- workflow executor, provider adapters, and approval handling in the app
+- agent/run inspection UI with raw logs, markdown, and structured outputs
+
+## Not In MVP
+
+- Gemini and other post-MVP providers
+- parallel write-capable agents in one worktree
+- distributed workers
+- cloud sync
+- shared multi-user orchestration
 
 ## Canonical Documents
 
@@ -76,6 +114,7 @@ The current runtime direction assumes:
 - YAML-defined workflows and agent catalogs
 - a Goose-based execution substrate via `goosed` and REST/SSE
 - deterministic side-effect boundaries for git/release/publish operations
+- workflow topology resolved through agent catalog references and backend profiles
 
 ## Development
 
