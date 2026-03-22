@@ -7,7 +7,7 @@ agent:
 
   backend:
     runtime: goose
-    provider: claude-acp
+    provider: claude_code
     model: default
     effort: high
 

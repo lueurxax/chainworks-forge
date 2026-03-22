@@ -1,0 +1,929 @@
+schema_version: 1
+app:
+  name: Chainworks
+  runtime: goose
+  transport: rest_sse
+  description: Multi-agent catalog for a single-engineer workflow constructor/executor.
+  idea_input_mode: text_with_optional_file
+  single_active_run_per_idea: true
+  run_resume_policy: automatic_on_launch
+  required_providers:
+  - codex
+  - claude_code
+paths:
+  repo_root: ${CHAINWORKS_REPO_ROOT:-.}
+  meta_root: ${CHAINWORKS_META_ROOT:-.chainworks}
+  worktrees_root: ${CHAINWORKS_WORKTREES_ROOT:-.chainworks/worktrees}
+  implementation_worktree: ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}
+artifacts:
+  idea_brief: ${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md
+  proposal_current: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/proposal.md
+  proposal_revision_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/revision-summary.md
+  proposal_review_po: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/product-owner.json
+  proposal_review_ux: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ux.json
+  proposal_review_ui: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json
+  proposal_review_architect: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/architect.json
+  proposal_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json
+  approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
+  implementation_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md
+  implementation_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml
+  implementation_progress: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/progress.md
+  implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
+  changed_files_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/changed-files.json
+  tests_result: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/tests.json
+  audit_report: ${CHAINWORKS_META_ROOT:-.chainworks}/audit/proposal-vs-implementation.json
+  security_report: ${CHAINWORKS_META_ROOT:-.chainworks}/security/report.json
+  prepush_review_report: ${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json
+  implementation_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/review/implementation-summary.json
+  docs_report: ${CHAINWORKS_META_ROOT:-.chainworks}/docs/report.json
+  docs_delta: ${CHAINWORKS_META_ROOT:-.chainworks}/docs/changed-files.json
+  run_state: ${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json
+  orchestrator_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/orchestrator.md
+  approval_request: ${CHAINWORKS_META_ROOT:-.chainworks}/approvals/current-request.json
+  release_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/manifest.json
+  git_push_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/git-push.json
+  release_bundle_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/bundle.json
+  connect_upload_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/connect-upload.json
+  final_feature_report: ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/final-feature-report.json
+skills:
+  proposal_review_triad:
+    type: external_skill
+    path: /Users/user/.codex/skills/proposal-review-triad
+    notes: Shared skill for PO / UX / UI / Architect proposal review lenses.
+  proposal_implementation_audit:
+    type: external_skill
+    path: /Users/user/.codex/skills/proposal-implementation-audit
+  docs_quality_guardian:
+    type: builtin_agent
+    name: docs-quality-guardian
+  orchestrator_core:
+    type: inline_skill
+    description: Lead orchestration, fan-out/fan-in, gatekeeping, loop control, artifact routing.
+  proposal_writer_core:
+    type: inline_skill
+    description: Draft and refine product/technical proposals from idea + review feedback.
+  code_writer_core:
+    type: inline_skill
+    description: Implement approved proposal incrementally in a dedicated worktree.
+  security_checker_core:
+    type: inline_skill
+    description: Threat-model and review the implementation for security, privacy, secrets, auth, and unsafe defaults.
+  prepush_review_core:
+    type: inline_skill
+    description: Final code review barrier before commit/push; looks for correctness, readability, regressions, and missing tests.
+  github_commit_push:
+    type: inline_skill
+    description: Use deterministic git/github tools to commit and push only after human release approval.
+  connect_publisher:
+    type: inline_skill
+    description: Build release archive, compute checksum, and upload to Connect through deterministic tools.
+contracts:
+  proposal_review_v1:
+    format: json
+    required_fields:
+    - agent_id
+    - role
+    - score
+    - verdict
+    - blocking_issues
+    - non_blocking_issues
+    - suggestions
+    - assumptions
+  proposal_review_summary_v1:
+    format: json
+    required_fields:
+    - aggregate_score
+    - min_individual_score
+    - blocker_count
+    - recurring_themes
+    - decision
+  implementation_self_assessment_v1:
+    format: json
+    required_fields:
+    - seemingly_complete
+    - remaining_tasks
+    - known_risks
+    - tests_run
+    - docs_impacted
+  audit_report_v1:
+    format: json
+    required_fields:
+    - status
+    - matches_proposal
+    - missing_items
+    - extra_items
+    - defects
+    - required_fixes
+  security_report_v1:
+    format: json
+    required_fields:
+    - status
+    - critical
+    - high
+    - medium
+    - low
+    - findings
+    - required_fixes
+  prepush_review_v1:
+    format: json
+    required_fields:
+    - status
+    - major_concerns
+    - cleanup_items
+    - test_coverage_notes
+    - release_note
+  implementation_review_summary_v1:
+    format: json
+    required_fields:
+    - status
+    - open_blockers
+    - must_fix
+    - recommended_next_step
+  docs_report_v1:
+    format: json
+    required_fields:
+    - status
+    - changed_docs
+    - missing_docs
+    - followups
+  git_push_receipt_v1:
+    format: json
+    required_fields:
+    - status
+    - branch
+    - commit_sha
+    - remote
+  connect_upload_receipt_v1:
+    format: json
+    required_fields:
+    - status
+    - artifact_id
+    - checksum
+    - destination
+  final_feature_report_v1:
+    format: json
+    required_fields:
+    - final_status
+    - summary
+    - started_at
+    - completed_at
+    - duration_seconds
+    - total_cost
+    - cost_currency
+backend_profiles:
+  claude_orchestrator_high:
+    provider: claude_code
+    model: default
+    effort: high
+    temperature: 0.1
+    max_turns: 20
+    structured_output: required
+  claude_writer_high:
+    provider: claude_code
+    model: default
+    effort: high
+    temperature: 0.2
+    max_turns: 18
+    structured_output: preferred
+  claude_product_high:
+    provider: claude_code
+    model: default
+    effort: high
+    temperature: 0.1
+    max_turns: 14
+    structured_output: required
+  claude_design_medium:
+    provider: claude_code
+    model: default
+    effort: medium
+    temperature: 0.2
+    max_turns: 12
+    structured_output: required
+  codex_architect_high:
+    provider: codex
+    model: default
+    effort: high
+    temperature: 0.1
+    max_turns: 16
+    structured_output: required
+  codex_builder_high:
+    provider: codex
+    model: default
+    effort: high
+    temperature: 0.1
+    max_turns: 24
+    structured_output: required
+  codex_audit_high:
+    provider: codex
+    model: default
+    effort: high
+    temperature: 0.0
+    max_turns: 18
+    structured_output: required
+  claude_security_high:
+    provider: claude_code
+    model: default
+    effort: high
+    temperature: 0.0
+    max_turns: 16
+    structured_output: required
+  claude_prepush_medium:
+    provider: claude_code
+    model: default
+    effort: medium
+    temperature: 0.1
+    max_turns: 12
+    structured_output: required
+  codex_ops_low:
+    provider: codex
+    model: default
+    effort: low
+    temperature: 0.0
+    max_turns: 8
+    structured_output: required
+  claude_docs_medium:
+    provider: claude_code
+    model: default
+    effort: medium
+    temperature: 0.2
+    max_turns: 12
+    structured_output: required
+permission_profiles:
+  ORCH:
+    filesystem:
+      read:
+      - ${CHAINWORKS_REPO_ROOT:-.}/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/state/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/approvals/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/**
+      deny:
+      - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      - git status
+      - git diff --stat
+      - git diff --name-only
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow:
+      - github.read
+      - connect.read
+  RO_REVIEW:
+    filesystem:
+      read:
+      - ${CHAINWORKS_REPO_ROOT:-.}/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/**
+      deny:
+      - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      - git status
+      - git diff --stat
+      - git diff --name-only
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow: []
+  RO_VERIFY:
+    filesystem:
+      read:
+      - ${CHAINWORKS_REPO_ROOT:-.}/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/audit/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/security/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/review/**
+      deny:
+      - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      - git status
+      - git diff --stat
+      - git diff --name-only
+      - go test ./...
+      - cargo test
+      - cargo clippy
+      - swift build
+      - swift test
+      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
+      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+      - npm test
+      - pnpm test
+      - yarn test
+      - make test
+      - just test
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow:
+      - scanner.readonly
+      - dependency_scan.readonly
+      - secrets_scan.readonly
+  PROPOSAL_WRITE:
+    filesystem:
+      read:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/docs/**/*.md
+      - ${CHAINWORKS_REPO_ROOT:-.}/README*
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/**
+      deny:
+      - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
+    git:
+      status: true
+      diff: false
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow: []
+  CODE_WRITE:
+    filesystem:
+      read:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/**
+      write:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/src/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/app/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/lib/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/internal/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/cmd/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/crates/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/packages/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks Forge/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks ForgeTests/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks ForgeUITests/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks Forge.xcodeproj/project.pbxproj
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/tests/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Cargo.toml
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Cargo.lock
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/go.mod
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/go.sum
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Package.swift
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/**
+      deny:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/docs/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/README*
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/CHANGELOG*
+    git:
+      status: true
+      diff: true
+      checkout: true
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      - git status
+      - git diff --stat
+      - git diff --name-only
+      - go test ./...
+      - cargo test
+      - cargo clippy
+      - swift build
+      - swift test
+      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
+      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+      - npm test
+      - pnpm test
+      - yarn test
+      - make test
+      - make build
+      - just test
+      - just build
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow: []
+  DOC_WRITE:
+    filesystem:
+      read:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/docs/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/README*
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/CHANGELOG*
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/docs/**
+      deny:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      - git diff --stat
+      - git diff --name-only
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow: []
+  RELEASE_GIT:
+    filesystem:
+      read:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/release/**
+      deny:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: true
+      push: true
+    shell:
+      allow:
+      - git status
+      - git diff --stat
+      - git diff --name-only
+      deny:
+      - rm -rf *
+    network:
+      allow:
+      - github
+    mcp:
+      allow:
+      - git.commit
+      - git.push
+      - github.read
+  RELEASE_PUBLISH:
+    filesystem:
+      read:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/release/**
+      deny:
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**
+    git:
+      status: false
+      diff: false
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow: []
+      deny:
+      - '*'
+    network:
+      allow:
+      - connect
+    mcp:
+      allow:
+      - build.archive
+      - connect.upload
+agents:
+- id: lead_orchestrator
+  title: Lead / Orchestrator
+  mode: orchestration
+  backend_profile: claude_orchestrator_high
+  permission_profile: ORCH
+  skill_ref: orchestrator_core
+  inputs:
+  - idea_brief
+  - proposal_current
+  - proposal_review_summary
+  - approved_proposal
+  - implementation_review_summary
+  - run_state
+  outputs:
+  - proposal_review_summary
+  - approved_proposal
+  - implementation_plan
+  - implementation_backlog
+  - implementation_review_summary
+  - run_state
+  - orchestrator_summary
+  - approval_request
+  - final_feature_report
+  requires_human_approval: false
+  notes: Owns fan-out/fan-in, loop control, and approval gates.
+  prompt: |-
+    You are the lead orchestrator for the full proposal -> implementation -> release lifecycle.
+    Move the workflow forward one safe state at a time.
+    Delegate all authoring, review, implementation, audit, docs, and release work to specialized agents.
+    Aggregate only structured outputs, track loop counters, enforce gates, and stop on contradictions.
+    Never edit product code, never commit, never push, and never publish artifacts yourself.
+    Escalate only for the three workflow approval checkpoints, or when loop budgets are exhausted.
+- id: proposal_reviewer_product_owner
+  title: Proposal Reviewer / Product Owner
+  mode: proposal_review.product_owner
+  backend_profile: claude_product_high
+  permission_profile: RO_REVIEW
+  skill_ref: proposal_review_triad
+  skill_role: product_owner
+  inputs:
+  - idea_brief
+  - proposal_current
+  outputs:
+  - proposal_review_po
+  output_contract: proposal_review_v1
+  requires_human_approval: false
+  prompt: |-
+    Review the proposal as a product owner.
+    Focus on user problem clarity, business value, scope discipline, acceptance criteria, rollout risk, metrics, and dependency realism.
+    Be strict about missing assumptions, hidden scope, and ambiguous success criteria.
+    Output only the structured review contract with a numeric score from 0 to 10.
+    Mark blocking issues only when they would materially reduce the chance of shipping the right thing.
+- id: proposal_reviewer_ux
+  title: Proposal Reviewer / UX
+  mode: proposal_review.ux
+  backend_profile: claude_design_medium
+  permission_profile: RO_REVIEW
+  skill_ref: proposal_review_triad
+  skill_role: ux_designer
+  inputs:
+  - idea_brief
+  - proposal_current
+  outputs:
+  - proposal_review_ux
+  output_contract: proposal_review_v1
+  requires_human_approval: false
+  prompt: |-
+    Review the proposal as a UX designer.
+    Focus on task flow, user friction, discoverability, error states, accessibility implications, onboarding, and edge cases across the journey.
+    Be concrete: call out where the proposal skips transitions, recovery paths, or mental model mismatches.
+    Output only the structured review contract with a numeric score from 0 to 10.
+    Prefer actionable suggestions over abstract taste.
+- id: proposal_reviewer_ui
+  title: Proposal Reviewer / UI
+  mode: proposal_review.ui
+  backend_profile: claude_design_medium
+  permission_profile: RO_REVIEW
+  skill_ref: proposal_review_triad
+  skill_role: ui_designer
+  inputs:
+  - idea_brief
+  - proposal_current
+  outputs:
+  - proposal_review_ui
+  output_contract: proposal_review_v1
+  requires_human_approval: false
+  prompt: |-
+    Review the proposal as a UI designer.
+    Focus on component consistency, screen states, empty/loading/error states, visual hierarchy, density, and cross-screen coherence.
+    Flag places where the proposal is too vague to build a consistent interface.
+    Output only the structured review contract with a numeric score from 0 to 10.
+    Keep suggestions specific enough that the proposal writer can apply them directly.
+- id: proposal_reviewer_architect
+  title: Proposal Reviewer / Architect
+  mode: proposal_review.architect
+  backend_profile: codex_architect_high
+  permission_profile: RO_REVIEW
+  skill_ref: proposal_review_triad
+  skill_role: architect
+  inputs:
+  - idea_brief
+  - proposal_current
+  outputs:
+  - proposal_review_architect
+  output_contract: proposal_review_v1
+  requires_human_approval: false
+  prompt: |-
+    Review the proposal as a software architect.
+    Focus on architecture fit, component boundaries, data flow, operational risk, migration cost, testability, failure modes, and implementation sequencing.
+    Flag over-engineering, missing interfaces, unsafe coupling, and vague runtime assumptions.
+    Output only the structured review contract with a numeric score from 0 to 10.
+    Prefer practical implementation concerns over theoretical purity.
+- id: code_writer
+  title: Code Writer
+  mode: implementation
+  backend_profile: codex_builder_high
+  permission_profile: CODE_WRITE
+  skill_ref: code_writer_core
+  worktree_policy:
+    strategy: dedicated
+    path: ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}
+    base_branch: ${CHAINWORKS_BASE_BRANCH:-main}
+    write_enabled: true
+  required_tools:
+  - git status
+  - git diff --stat
+  - go test ./...
+  - cargo test
+  - swift build
+  - swift test
+  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
+  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+  inputs:
+  - approved_proposal
+  - implementation_plan
+  - implementation_backlog
+  - audit_report
+  - security_report
+  - prepush_review_report
+  outputs:
+  - implementation_progress
+  - implementation_self_assessment
+  - changed_files_manifest
+  - tests_result
+  output_contract: implementation_self_assessment_v1
+  requires_human_approval: false
+  prompt: |-
+    Implement the approved proposal incrementally in the dedicated implementation worktree.
+    Prefer small, reversible changes that keep the project buildable.
+    Keep a running progress artifact, write or update tests with the code, and record a self-assessment after each pass.
+    Do not commit, do not push, and do not edit repository docs unless the docs agent is invoked.
+    When in doubt, choose the simplest implementation that satisfies the approved proposal and current review findings.
+- id: proposal_writer
+  title: Proposal Writer
+  mode: proposal_authoring
+  backend_profile: claude_writer_high
+  permission_profile: PROPOSAL_WRITE
+  skill_ref: proposal_writer_core
+  worktree_policy:
+    strategy: meta_only
+    path: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals
+    write_enabled: true
+  inputs:
+  - idea_brief
+  - proposal_current
+  - proposal_review_po
+  - proposal_review_ux
+  - proposal_review_ui
+  - proposal_review_architect
+  - proposal_review_summary
+  outputs:
+  - proposal_current
+  - proposal_revision_summary
+  requires_human_approval: false
+  prompt: |-
+    Draft and refine the proposal from the current idea and all reviewer feedback.
+    Produce one clear proposal document that is easy to review and easy to implement.
+    Cover problem, goals, non-goals, UX/UI notes, architecture, rollout, metrics, risks, and open questions.
+    Resolve reviewer feedback explicitly; do not silently ignore disagreements.
+    Optimize for a proposal that can reach an aggregate score above 9 without hiding trade-offs.
+- id: proposal_implementation_auditor
+  title: Proposal vs Implementation Auditor
+  mode: audit
+  backend_profile: codex_audit_high
+  permission_profile: RO_VERIFY
+  skill_ref: proposal_implementation_audit
+  required_tools:
+  - git diff --stat
+  - git diff --name-only
+  - go test ./...
+  - cargo test
+  - swift test
+  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
+  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+  inputs:
+  - approved_proposal
+  - implementation_progress
+  - changed_files_manifest
+  - tests_result
+  - docs_report
+  outputs:
+  - audit_report
+  output_contract: audit_report_v1
+  requires_human_approval: false
+  prompt: |-
+    Compare the approved proposal against the implementation in the implementation worktree.
+    Identify missing work, extra work, mismatches in behavior, broken acceptance criteria, and signs that the proposal was interpreted incorrectly.
+    Be exact and evidence-based.
+    Output only the audit contract and set status to Implemented only when the implementation truly matches the approved proposal.
+- id: security_checker
+  title: Security Checker
+  mode: security
+  backend_profile: claude_security_high
+  permission_profile: RO_VERIFY
+  skill_ref: security_checker_core
+  required_tools:
+  - scanner.readonly
+  - dependency_scan.readonly
+  - secrets_scan.readonly
+  - git diff --name-only
+  inputs:
+  - approved_proposal
+  - implementation_progress
+  - changed_files_manifest
+  - tests_result
+  outputs:
+  - security_report
+  output_contract: security_report_v1
+  requires_human_approval: false
+  prompt: |-
+    Review the current implementation for security and privacy risks.
+    Focus on auth/authz, secrets handling, unsafe defaults, injection, serialization, filesystem access, network boundaries, data leakage, and dependency risk.
+    Use readonly scanners when available, but do not rely on scanners alone.
+    Output only the structured security report and mark status as pass only when no blocking issue remains.
+- id: commit_and_push_to_github
+  title: Commit and Push to GitHub
+  mode: release_git
+  backend_profile: codex_ops_low
+  permission_profile: RELEASE_GIT
+  skill_ref: github_commit_push
+  worktree_policy:
+    strategy: dedicated
+    path: ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}
+    write_enabled: false
+  required_tools:
+  - git.commit
+  - git.push
+  - github.read
+  inputs:
+  - approved_proposal
+  - implementation_review_summary
+  - docs_report
+  - prepush_review_report
+  outputs:
+  - release_manifest
+  - git_push_receipt
+  output_contract: git_push_receipt_v1
+  requires_human_approval: true
+  prompt: |-
+    Commit and push the already approved implementation.
+    This agent is for release mechanics only, not for code changes.
+    Use deterministic git/github tools, record the resulting commit SHA and branch, and write a release manifest.
+    Never modify source files, never bypass approval, and never run before the final release approval gate is green.
+- id: prepush_code_reviewer
+  title: Pre-push Code Reviewer
+  mode: prepush_review
+  backend_profile: claude_prepush_medium
+  permission_profile: RO_VERIFY
+  skill_ref: prepush_review_core
+  required_tools:
+  - git diff --stat
+  - git diff --name-only
+  - go test ./...
+  - cargo test
+  - swift test
+  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
+  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+  inputs:
+  - approved_proposal
+  - implementation_progress
+  - changed_files_manifest
+  - tests_result
+  - audit_report
+  - security_report
+  outputs:
+  - prepush_review_report
+  output_contract: prepush_review_v1
+  requires_human_approval: false
+  prompt: |-
+    Perform the last human-like code review before commit and push.
+    Focus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.
+    Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
+    Output only the structured pre-push review contract.
+- id: build_archive_and_push_connect
+  title: Build Archive and Push to Connect
+  mode: release_publish
+  backend_profile: codex_ops_low
+  permission_profile: RELEASE_PUBLISH
+  skill_ref: connect_publisher
+  worktree_policy:
+    strategy: dedicated
+    path: ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}
+    write_enabled: false
+  required_tools:
+  - build.archive
+  - connect.upload
+  inputs:
+  - git_push_receipt
+  - release_manifest
+  outputs:
+  - release_bundle_manifest
+  - connect_upload_receipt
+  output_contract: connect_upload_receipt_v1
+  requires_human_approval: true
+  prompt: |-
+    Build the release archive from the approved implementation, compute checksums, and upload the artifact to Connect.
+    Use deterministic build and upload tools only.
+    Record the artifact id, checksum, destination, and any release metadata required for traceability.
+    Never edit source code and never run before final release approval and commit/push have succeeded.
+- id: docs_guardian
+  title: Docs Guardian
+  mode: docs
+  backend_profile: claude_docs_medium
+  permission_profile: DOC_WRITE
+  skill_ref: docs_quality_guardian
+  worktree_policy:
+    strategy: shared_implementation_worktree
+    path: ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}
+    write_enabled: true
+  inputs:
+  - approved_proposal
+  - implementation_progress
+  - changed_files_manifest
+  - audit_report
+  outputs:
+  - docs_report
+  - docs_delta
+  output_contract: docs_report_v1
+  requires_human_approval: false
+  prompt: |-
+    Keep documentation consistent with the approved proposal and the implemented behavior.
+    Update only the docs that are genuinely impacted: README, docs pages, changelog, runbooks, or usage notes.
+    Prefer small exact edits over broad rewrites.
+    When docs are already aligned, output that no doc change is needed and explain why.
