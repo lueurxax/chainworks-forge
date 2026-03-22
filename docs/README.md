@@ -18,21 +18,23 @@ Reading order:
 6. [reference/architecture-decisions.md](reference/architecture-decisions.md)
 7. [reference/runtime-contract.md](reference/runtime-contract.md)
 8. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md)
-9. [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
-10. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
+9. [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md)
+10. [proposals/003-forge-steward-sdlc-health-and-adaptation.md](proposals/003-forge-steward-sdlc-health-and-adaptation.md)
+11. [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
+12. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
 
 Status:
 
 - Owner: single-engineer working repo
 - Last updated: 2026-03-22
-- State: active, foundation layer implemented
+- State: active, foundation + core runtime engine implemented, UI still inspection-first
 
 ## Reference (implemented)
 
-- [reference/domain-model.md](reference/domain-model.md) — SwiftData persistence layer: 6 models, status enums, RunRepository, provenance, drift detection
-- [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md) — YAML parsing, validation (10 categories), compact workflow, provenance hashing, verification scaffold UI
-- [reference/architecture-decisions.md](reference/architecture-decisions.md) — Key architecture decisions (ARCH-001 through ARCH-PA-003)
-- [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
+- [reference/domain-model.md](reference/domain-model.md) — SwiftData persistence layer, run/stage/agent state, approvals, artifacts, Steward records, provenance, drift detection
+- [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md) — YAML parsing, validation, compact workflow normalization, provenance hashing, verification scaffold UI
+- [reference/architecture-decisions.md](reference/architecture-decisions.md) — Key architecture decisions across foundation and runtime slices
+- [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model, execution and resume contracts
 - [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — Worktree isolation risk analysis
 - [reference/README.md](reference/README.md) — Reference section overview
 
@@ -42,13 +44,16 @@ Status:
 
 ## Proposals
 
-- [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md) — **Draft**
+- [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md) — workflow execution engine slice
+- [proposals/003-forge-steward-sdlc-health-and-adaptation.md](proposals/003-forge-steward-sdlc-health-and-adaptation.md) — Steward analysis and adaptation slice
 
 ## Reviews
 
 - [reviews/001-proposal-002-gate.md](reviews/001-proposal-002-gate.md) — Go/no-go gate for Proposal 002
 - [reviews/002-workflow-execution-engine-review.md](reviews/002-workflow-execution-engine-review.md)
 - [reviews/002-workflow-execution-engine-evidence-pack.md](reviews/002-workflow-execution-engine-evidence-pack.md)
+- [reviews/003-forge-steward-sdlc-health-and-adaptation-review.md](reviews/003-forge-steward-sdlc-health-and-adaptation-review.md)
+- [reviews/003-forge-steward-sdlc-health-and-adaptation-evidence-pack.md](reviews/003-forge-steward-sdlc-health-and-adaptation-evidence-pack.md)
 
 ## Research
 

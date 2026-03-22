@@ -7,26 +7,26 @@ The product thesis is simple: the system should move an idea through proposal, r
 ## Architecture Sketch
 
 ```text
-SwiftUI client
-  -> Run coordinator
-  -> RunPlanSnapshot compiler
-  -> Provider adapters (Codex / Claude Code)
-  -> SwiftData metadata index
-  -> Artifact store on disk
-  -> Approval gates
-  -> Deterministic side-effect services
-  -> Final run report
+SwiftUI macOS app
+  -> Ideas / Agent Catalog / Workflow Inspector
+  -> YAML parser + validator + compact normalizer
+  -> RunPlan compiler + transition evaluator
+  -> Execution service + workflow orchestrator + resume manager
+  -> SwiftData models + RunRepository
+  -> Artifact manager + disk-backed storage
+  -> Steward deterministic analysis services
+  -> Approval + artifact-backed run history
 ```
 
 ## What This Repository Contains
 
-This repository currently combines four layers:
+This repository currently combines:
 
-- a native SwiftUI desktop client scaffold
-- MVP and product-definition documents
-- architecture research for the runtime and orchestration model
-- canonical YAML examples for agent catalogs and workflows
-- implementation proposals and review evidence packs
+- a native SwiftUI macOS client with implemented foundation and core runtime slices
+- MVP, proposal, review, and reference documents
+- architecture research for orchestration and workspace isolation
+- canonical YAML examples for agent catalogs, workflows, and steward config
+- unit/UI tests plus CI configuration
 
 ## Product Model
 
@@ -52,18 +52,33 @@ For the current MVP slice, the system is intended to support:
 
 ## Implemented Today
 
-- product vision, MVP scope, and architecture research documents
-- canonical YAML examples for agent catalog and workflow definitions
-- a SwiftUI macOS app scaffold with SwiftData already wired in
-- repository structure aligned around docs and examples
+- SwiftUI desktop shell with `Ideas`, `Agent Catalog`, and `Workflow Inspector` tabs
+- SwiftData domain models for ideas, runs, stages, agents, approvals, artifacts, and Steward records
+- YAML DSL parsing, validation, compact workflow normalization, and provenance hashing
+- run compilation/runtime core:
+  - `RunPlanCompiler`
+  - `TransitionEvaluator`
+  - `ExecutionService`
+  - `WorkflowOrchestrator`
+  - `ResumeManager`
+- artifact handling:
+  - `ArtifactStorage`
+  - `ArtifactManager`
+  - output-contract-aware artifact formatting
+- deterministic Steward services:
+  - metrics collection
+  - cohort classification
+  - anomaly detection
+  - run dossier building
+- unit tests, UI tests, and CI workflow
 
 ## Planned Next
 
-- immutable `RunPlanSnapshot` compilation at run start
-- explicit state machines for run, stage, agent, approval, and side effects
-- SwiftData metadata models plus disk-backed artifact store
-- workflow executor, provider adapters, and approval handling in the app
-- agent/run inspection UI with raw logs, markdown, and structured outputs
+- real provider-backed execution adapters beyond the simulated executor
+- end-to-end `Start Run` / run progress / stage detail / artifact inspection UI
+- approval inbox and approval decision surfaces in the app
+- richer run and artifact browsing for implemented Proposal 002 flows
+- Steward report and recommendation UI for Proposal 003 flows
 
 ## Not In MVP
 
@@ -78,6 +93,9 @@ For the current MVP slice, the system is intended to support:
 - [Product vision](docs/research/chainworks_core_idea.md)
 - [MVP scope](docs/ps/chainworks-forge-mvp.md)
 - [Architecture research](docs/research/goose_swiftui_agent_architecture_research.md)
+- [Foundation/runtime reference](docs/reference/README.md)
+- [Proposal 002: Workflow execution engine](docs/proposals/002-workflow-execution-engine.md)
+- [Proposal 003: Forge Steward](docs/proposals/003-forge-steward-sdlc-health-and-adaptation.md)
 
 ## Canonical YAML Examples
 
@@ -92,27 +110,37 @@ For the current MVP slice, the system is intended to support:
 Chainworks Forge/
   Chainworks Forge.xcodeproj/   Xcode project
   Chainworks Forge/             SwiftUI application sources
+    DSL/                        YAML parsing, validation, normalization
+    Engine/                     Compiler, orchestration, execution, Steward services
+    Models/                     SwiftData persistence models
+    Views/                      Current desktop UI surfaces
   Chainworks ForgeTests/        Unit tests
   Chainworks ForgeUITests/      UI tests
-  docs/                         Product docs, PS, and research
-  examples/                     Agent and workflow YAML examples
+  docs/                         Product docs, proposals, reviews, reference
+  examples/                     Agent, workflow, and steward YAML examples
+  .github/                      CI workflow
 ```
 
 ## Current Status
 
-The SwiftUI app is still close to the default app template. The product model, workflow DSL, and orchestration direction are currently ahead of the UI implementation. At this stage, the repository is primarily validating:
+The repository is no longer just a template scaffold. The domain model, YAML DSL, and a large part of the run/execution core are now implemented. The main gap is still UI depth: the desktop app is inspection-first and does not yet expose the full Proposal 002 or Proposal 003 lifecycle as end-to-end runtime flows.
+
+At this stage, the repository is primarily validating:
 
 - the product shape
 - the workflow model
 - the agent catalog structure
+- immutable run compilation and orchestration contracts
 - the approval and artifact model
+- deterministic Steward analysis boundaries
 - the local macOS control-plane direction
 
 The current runtime direction assumes:
 
 - local-first control plane in SwiftUI
 - YAML-defined workflows and agent catalogs
-- a Goose-based execution substrate via `goosed` and REST/SSE
+- SwiftData metadata plus disk-backed artifacts
+- provider adapters and workspace-isolation boundaries
 - deterministic side-effect boundaries for git/release/publish operations
 - workflow topology resolved through agent catalog references and backend profiles
 
