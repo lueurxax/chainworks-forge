@@ -530,10 +530,10 @@ struct YAMLParserTests {
         #expect(FileManager.default.fileExists(atPath: url.path), "File must exist at \(url.path)")
         do {
             let catalog = try YAMLParser.loadAgentCatalog(from: url)
-            #expect(catalog.agents.count == 13)
-            #expect(catalog.backendProfiles.count == 11)
+            #expect(catalog.agents.count == 16)  // 13 original + 3 Steward agents (Proposal 003)
+            #expect(catalog.backendProfiles.count == 14)  // 11 original + 3 Steward profiles
             #expect(catalog.permissionProfiles.count == 8)
-            #expect(catalog.contracts.count == 11)
+            #expect(catalog.contracts.count == 14)  // 11 original + 3 Steward contracts
         } catch {
             Issue.record("Parse failed: \(error)")
         }
@@ -620,7 +620,7 @@ struct YAMLParserTests {
 
     @Test func testParseArtifactContracts() throws {
         let catalog = try YAMLParser.loadAgentCatalog(from: fixtureURL("agents.yaml"))
-        #expect(catalog.contracts.count == 11)
+        #expect(catalog.contracts.count == 14)  // 11 original + 3 Steward contracts (Proposal 003)
     }
 
     // MARK: - REQ-011: Transitions

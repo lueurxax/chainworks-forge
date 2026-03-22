@@ -2,10 +2,12 @@ import SwiftUI
 import SwiftData
 
 struct ContentView: View {
+    @Environment(ExecutionService.self) private var executionService
     @State private var selectedTab: Tab = .ideas
 
     enum Tab: String, CaseIterable {
         case ideas = "Ideas"
+        case approvals = "Approvals"
         case agentCatalog = "Agent Catalog"
         case workflowInspector = "Workflow Inspector"
     }
@@ -33,6 +35,14 @@ struct ContentView: View {
                 .tag(Tab.ideas)
                 .accessibilityIdentifier("tab-ideas")
 
+            ApprovalInboxView()
+                .tabItem {
+                    Label("Approvals", systemImage: "checkmark.seal")
+                }
+                .tag(Tab.approvals)
+                .badge(executionService.pendingApprovalCount)
+                .accessibilityIdentifier("tab-approvals")
+
             AgentCatalogView(
                 catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
             )
@@ -49,6 +59,8 @@ struct ContentView: View {
             .tag(Tab.workflowInspector)
             .accessibilityIdentifier("tab-workflow-inspector")
         }
+        // Approval badge on Ideas tab when approvals are pending
+        .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
     }
 }
 
@@ -58,4 +70,11 @@ struct ContentView: View {
             for: [Idea.self],
             inMemory: true
         )
+        .environment(ExecutionService(
+            modelContext: try! ModelContainer(
+                for: Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self]),
+                configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
+            ).mainContext,
+            executor: SimulatedAgentExecutor()
+        ))
 }

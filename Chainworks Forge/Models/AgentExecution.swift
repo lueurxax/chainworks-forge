@@ -15,6 +15,13 @@ import SwiftData
     var logSnippet: String?
     var gooseSessionID: String?
 
+    // Proposal 004: Live provider fields (Section 11.1)
+    var providerSessionID: String?
+    var providerRequestID: String?
+    var transcriptArtifactPath: String?
+    var resolvedBackendProfileID: String?
+    var consumedInputArtifactNamesJSON: Data?
+
     // Steward data model additions (Proposal 003 — optional, lightweight migration)
     var agentConfigHash: String?
     var skillSnapshotHash: String?

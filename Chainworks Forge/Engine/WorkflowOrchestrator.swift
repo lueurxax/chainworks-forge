@@ -135,8 +135,9 @@ final class WorkflowOrchestrator {
                 await resumeAfterApproval(stageID: stageID)
             }
         } else if !granted {
-            // Rejection: mark as failed
-            run.status = .failed
+            // Rejection: cancel the run (proposal contract — rejection cancels, not fails)
+            run.status = .cancelled
+            isCancelled = true
             isRunning = false
             onComplete?(false)
         }

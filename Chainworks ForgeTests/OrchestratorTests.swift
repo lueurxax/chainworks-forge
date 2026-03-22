@@ -594,4 +594,136 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertNotNil(run.totalCostCents)
         XCTAssertTrue(run.totalCostCents! > 0, "Cost should be aggregated from executed agents")
     }
+
+    // MARK: - Approval Rejection (REQ-005: rejection cancels, not fails)
+
+    /// Proposal contract: approval rejection must cancel the run, not mark it as failed.
+    func testApprovalRejectedCancels() async {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Approval Gate", type: .start,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
+                    approvalRequired: true, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["a1": makeAgent(id: "a1")],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let executor = SimulatedAgentExecutor()
+        let orchestrator = WorkflowOrchestrator(
+            run: run, plan: plan, workspace: workspace,
+            executor: executor, modelContext: context
+        )
+
+        var completionCalled = false
+        var completionSuccess = false
+        orchestrator.onComplete = { success in
+            completionCalled = true
+            completionSuccess = success
+        }
+
+        await orchestrator.start()
+        XCTAssertEqual(run.status, .waitingApproval)
+        XCTAssertTrue(orchestrator.isPaused)
+
+        // Reject the approval
+        orchestrator.resolveApproval(stageID: "start", granted: false, comment: "Rejected in test")
+
+        // Proposal contract: rejection cancels (not fails)
+        XCTAssertEqual(run.status, .cancelled, "Rejected approval must cancel the run, not fail it")
+        XCTAssertTrue(orchestrator.isCancelled, "Orchestrator must be marked cancelled")
+        XCTAssertFalse(orchestrator.isRunning, "Orchestrator must stop running")
+        XCTAssertTrue(completionCalled, "onComplete must fire on rejection")
+        XCTAssertFalse(completionSuccess, "onComplete should report failure")
+
+        // Verify the approval record was updated
+        let rejectedApproval = run.approvals.first { $0.stageID == "start" }
+        XCTAssertNotNil(rejectedApproval)
+        XCTAssertEqual(rejectedApproval?.decision, .rejected)
+        XCTAssertNotNil(rejectedApproval?.decidedAt)
+        XCTAssertEqual(rejectedApproval?.comment, "Rejected in test")
+    }
+
+    // MARK: - Run After Approval (REQ-005: run_after_approval block)
+
+    /// Verifies that the run_after_approval block executes after approval is granted.
+    func testRunAfterApproval() async {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Gate with post-approval", type: .start,
+                    ownerAgentID: "a1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a1", task: "pre_approval_work", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a2", task: "post_approval_work", inputs: nil, outputs: nil)])
+                    ]),
+                    transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
+                    approvalRequired: true, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "a1": makeAgent(id: "a1"),
+                "a2": makeAgent(id: "a2")
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let executor = SimulatedAgentExecutor()
+        let orchestrator = WorkflowOrchestrator(
+            run: run, plan: plan, workspace: workspace,
+            executor: executor, modelContext: context
+        )
+
+        await orchestrator.start()
+
+        // Should have executed the pre-approval work
+        XCTAssertEqual(run.status, .waitingApproval)
+        XCTAssertEqual(executor.executedTasks.count, 1, "Should execute pre-approval block")
+        XCTAssertEqual(executor.executedTasks[0].task, "pre_approval_work")
+
+        // Grant approval — triggers run_after_approval + transitions
+        orchestrator.resolveApproval(stageID: "start", granted: true, comment: "Approved")
+
+        // Wait for the post-approval work + transition to complete
+        try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+
+        // Verify the post-approval block executed
+        XCTAssertEqual(executor.executedTasks.count, 2, "Should execute both pre- and post-approval blocks")
+        XCTAssertEqual(executor.executedTasks[1].agentID, "a2", "Post-approval should use agent a2")
+        XCTAssertEqual(executor.executedTasks[1].task, "post_approval_work")
+        XCTAssertEqual(run.status, .completed, "Run should complete after post-approval work + transition")
+    }
 }

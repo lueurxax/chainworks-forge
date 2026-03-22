@@ -119,10 +119,12 @@ final class ExecutionService {
                 case .needsDecision(let run, let reason):
                     // Mark as blocked, needs user intervention
                     run.status = .blocked
+                    run.driftDetectedAt = Date()
                     run.driftDetails = reason
 
                 case .cannotResume(let run, let reason):
                     run.status = .failed
+                    run.driftDetectedAt = Date()
                     run.driftDetails = reason
                 }
             }

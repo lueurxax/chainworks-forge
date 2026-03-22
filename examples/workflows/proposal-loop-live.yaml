@@ -1,0 +1,151 @@
+# Proposal 004: Live Proposal Loop Workflow
+# Dedicated workflow for the first live provider-backed execution slice.
+# States: idea_received -> proposal_drafted -> proposal_reviewed -> proposal_refined -> proposal_approval -> workflow_complete
+# Loop rule: state_3 -> state_4 -> state_3 until review passes or budget exhausted.
+
+schema_version: 1
+workflow:
+  id: proposal_loop_live
+  name: Proposal Loop (Live)
+  uses_agent_catalog: ../agents/agents.yaml
+  description: >
+    Live provider-backed proposal loop. Takes an idea through drafting,
+    multi-reviewer fan-out, refinement, and human approval.
+    This is the first vertical slice from architecture to felt product value.
+  idea_input:
+    mode: text_with_optional_file
+  execution:
+    single_active_run_per_idea: true
+    resume_policy: automatic_on_launch
+  required_providers:
+  - claude_code
+
+variables:
+  proposal_score_target: 9.1
+  min_individual_proposal_score: 8.5
+  max_proposal_revision_cycles: 3
+
+failure_policy:
+  on_error: pause_and_require_human
+  on_loop_budget_exhausted: pause_and_require_human
+  preserve_artifacts: true
+
+scoring:
+  proposal:
+    aggregate_formula: round((po.score + ux.score + ui.score + architect.score) / 4, 2)
+    pass_when:
+    - aggregate_score > vars.proposal_score_target
+    - min_individual_score >= vars.min_individual_proposal_score
+    - blocker_count == 0
+
+initial_state: state_1_idea_received
+
+states:
+  state_1_idea_received:
+    label: Idea received
+    type: start
+    owner: lead_orchestrator
+    run:
+      sequence:
+      - agent: lead_orchestrator
+        task: normalize_idea_and_prepare_proposal_brief
+        inputs:
+        - input.idea
+        outputs:
+        - idea_brief
+    transitions:
+    - to: state_2_proposal_drafted
+      when: exists('idea_brief')
+
+  state_2_proposal_drafted:
+    label: Proposal drafted
+    owner: proposal_writer
+    run:
+      sequence:
+      - agent: proposal_writer
+        task: draft_initial_proposal
+        inputs:
+        - idea_brief
+        outputs:
+        - proposal_current
+    transitions:
+    - to: state_3_proposal_reviewed
+      when: exists('proposal_current')
+
+  state_3_proposal_reviewed:
+    label: Proposal reviewed
+    owner: lead_orchestrator
+    run:
+      parallel:
+      - agent: proposal_reviewer_product_owner
+        task: review_proposal_from_product_perspective
+        inputs:
+        - proposal_current
+        outputs:
+        - proposal_review_po
+      - agent: proposal_reviewer_ux
+        task: review_proposal_from_ux_perspective
+        inputs:
+        - proposal_current
+        outputs:
+        - proposal_review_ux
+      - agent: proposal_reviewer_ui
+        task: review_proposal_from_ui_perspective
+        inputs:
+        - proposal_current
+        outputs:
+        - proposal_review_ui
+      - agent: proposal_reviewer_architect
+        task: review_proposal_from_architecture_perspective
+        inputs:
+        - proposal_current
+        outputs:
+        - proposal_review_arch
+      then:
+      - agent: lead_orchestrator
+        task: aggregate_proposal_reviews
+        inputs:
+        - proposal_review_po
+        - proposal_review_ux
+        - proposal_review_ui
+        - proposal_review_arch
+        outputs:
+        - proposal_review_summary
+    loop:
+      counter: proposal_revision_count
+      max: vars.max_proposal_revision_cycles
+    transitions:
+    - to: state_5_proposal_approval
+      when: "proposal_review_summary.aggregate_score > vars.proposal_score_target"
+    - to: state_4_proposal_refined
+      when: "'true'"
+
+  state_4_proposal_refined:
+    label: Proposal refined
+    owner: proposal_writer
+    run:
+      sequence:
+      - agent: proposal_writer
+        task: refine_proposal_based_on_review
+        inputs:
+        - proposal_current
+        - proposal_review_summary
+        outputs:
+        - proposal_current
+        - proposal_revision_summary
+    transitions:
+    - to: state_3_proposal_reviewed
+      when: exists('proposal_current')
+
+  state_5_proposal_approval:
+    label: "Human approval: proposal quality"
+    owner: lead_orchestrator
+    approval: required
+    transitions:
+    - to: state_6_workflow_complete
+      when: "approval.granted == true"
+
+  state_6_workflow_complete:
+    label: Workflow complete
+    type: end
+    owner: lead_orchestrator
