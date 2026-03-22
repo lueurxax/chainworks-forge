@@ -6,6 +6,16 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		CE8914952F6FFF06006EC77C /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = CE8913712F6FC400006EC77C /* Yams */; };
+		CE8914962F6FFF06006EC77C /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = CE8913722F6FC400006EC77C /* Yams */; };
+		CE8915702F700957006EC77C /* proposal-po-reviewer.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */; };
+		CE8915712F700957006EC77C /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = CE89156E2F700957006EC77C /* README.md */; };
+		CE8915722F700957006EC77C /* proposal-to-release.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156B2F700957006EC77C /* proposal-to-release.yaml */; };
+		CE8915732F700957006EC77C /* agents.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915682F700957006EC77C /* agents.yaml */; };
+		CE8915742F700957006EC77C /* workflow.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156C2F700957006EC77C /* workflow.yaml */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		CE8913492F6FC30A006EC77C /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -27,6 +37,11 @@
 		CE8913392F6FC308006EC77C /* Chainworks Forge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Chainworks Forge.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE8913482F6FC30A006EC77C /* Chainworks ForgeTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Chainworks ForgeTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE8913522F6FC30A006EC77C /* Chainworks ForgeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Chainworks ForgeUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		CE8915682F700957006EC77C /* agents.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = agents.yaml; sourceTree = "<group>"; };
+		CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-po-reviewer.yaml"; sourceTree = "<group>"; };
+		CE89156B2F700957006EC77C /* proposal-to-release.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-to-release.yaml"; sourceTree = "<group>"; };
+		CE89156C2F700957006EC77C /* workflow.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = workflow.yaml; sourceTree = "<group>"; };
+		CE89156E2F700957006EC77C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,6 +67,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CE8914952F6FFF06006EC77C /* Yams in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -59,6 +75,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CE8914962F6FFF06006EC77C /* Yams in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -75,6 +92,7 @@
 		CE8913302F6FC308006EC77C = {
 			isa = PBXGroup;
 			children = (
+				CE89156F2F700957006EC77C /* examples */,
 				CE89133B2F6FC308006EC77C /* Chainworks Forge */,
 				CE89134B2F6FC30A006EC77C /* Chainworks ForgeTests */,
 				CE8913552F6FC30A006EC77C /* Chainworks ForgeUITests */,
@@ -90,6 +108,34 @@
 				CE8913522F6FC30A006EC77C /* Chainworks ForgeUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		CE89156A2F700957006EC77C /* agents */ = {
+			isa = PBXGroup;
+			children = (
+				CE8915682F700957006EC77C /* agents.yaml */,
+				CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */,
+			);
+			path = agents;
+			sourceTree = "<group>";
+		};
+		CE89156D2F700957006EC77C /* workflows */ = {
+			isa = PBXGroup;
+			children = (
+				CE89156B2F700957006EC77C /* proposal-to-release.yaml */,
+				CE89156C2F700957006EC77C /* workflow.yaml */,
+			);
+			path = workflows;
+			sourceTree = "<group>";
+		};
+		CE89156F2F700957006EC77C /* examples */ = {
+			isa = PBXGroup;
+			children = (
+				CE89156A2F700957006EC77C /* agents */,
+				CE89156D2F700957006EC77C /* workflows */,
+				CE89156E2F700957006EC77C /* README.md */,
+			);
+			path = examples;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -112,6 +158,7 @@
 			);
 			name = "Chainworks Forge";
 			packageProductDependencies = (
+				CE8913712F6FC400006EC77C /* Yams */,
 			);
 			productName = "Chainworks Forge";
 			productReference = CE8913392F6FC308006EC77C /* Chainworks Forge.app */;
@@ -135,6 +182,7 @@
 			);
 			name = "Chainworks ForgeTests";
 			packageProductDependencies = (
+				CE8913722F6FC400006EC77C /* Yams */,
 			);
 			productName = "Chainworks ForgeTests";
 			productReference = CE8913482F6FC30A006EC77C /* Chainworks ForgeTests.xctest */;
@@ -195,6 +243,9 @@
 			);
 			mainGroup = CE8913302F6FC308006EC77C;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				CE8913702F6FC400006EC77C /* XCRemoteSwiftPackageReference "Yams" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = CE89133A2F6FC308006EC77C /* Products */;
 			projectDirPath = "";
@@ -212,6 +263,11 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CE8915702F700957006EC77C /* proposal-po-reviewer.yaml in Resources */,
+				CE8915712F700957006EC77C /* README.md in Resources */,
+				CE8915722F700957006EC77C /* proposal-to-release.yaml in Resources */,
+				CE8915732F700957006EC77C /* agents.yaml in Resources */,
+				CE8915742F700957006EC77C /* workflow.yaml in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -398,10 +454,9 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R859U8DTY9;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -430,10 +485,9 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R859U8DTY9;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -573,6 +627,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		CE8913702F6FC400006EC77C /* XCRemoteSwiftPackageReference "Yams" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/jpsim/Yams.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 5.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		CE8913712F6FC400006EC77C /* Yams */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CE8913702F6FC400006EC77C /* XCRemoteSwiftPackageReference "Yams" */;
+			productName = Yams;
+		};
+		CE8913722F6FC400006EC77C /* Yams */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CE8913702F6FC400006EC77C /* XCRemoteSwiftPackageReference "Yams" */;
+			productName = Yams;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = CE8913312F6FC308006EC77C /* Project object */;
 }

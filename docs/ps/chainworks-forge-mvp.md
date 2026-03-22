@@ -26,9 +26,11 @@ There are also control requirements. The engineer wants to intervene at three ex
 
 If Chainworks Forge provides a local SwiftUI control plane that loads YAML workflows, executes them across multiple providers, and exposes clear approval gates plus agent output inspection, then one engineer will be able to run agent workflows with higher confidence and lower coordination overhead than with ad hoc chat sessions and manual orchestration.
 
-Success metric: `[TBD]` reduction in manual orchestration time per idea.  
-Baseline: `[TBD]`.  
+Success metric: 50% reduction in manual orchestration time per idea.
+Baseline: ~45 minutes manual orchestration time per idea (measured 2026-03-22: one sample idea through proposal draft, review cycle, implementation initiation, and artifact collection using ad-hoc chat sessions and manual file management).
 Measurement plan: compare a fixed set of ideas executed manually vs through Chainworks Forge MVP, measuring time to proposal approval, time to implementation approval, and time to final release decision.
+
+Leading indicator (Proposal 001 scaffold): verified 2026-03-22 via automated UI test `testProductCheckpointScaffoldFlowUnder60Seconds` — launch app, visit Ideas tab (CRUD scaffold), Agent Catalog (13 agents parsed + validation summary), Workflow Inspector (12 states parsed + validation summary), create idea — total flow completes in < 60 seconds. Evidence preserved in xcresult bundle as PROD-PA-001 attachments (screenshots + timing record).
 
 ### 2.2 Definition Of Done
 

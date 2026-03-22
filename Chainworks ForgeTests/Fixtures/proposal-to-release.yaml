@@ -1,0 +1,95 @@
+version: 1
+
+agent_aliases:
+  proposal-po-reviewer: proposal_reviewer_product_owner
+  proposal-ux-reviewer: proposal_reviewer_ux
+  proposal-ui-reviewer: proposal_reviewer_ui
+  proposal-architect-reviewer: proposal_reviewer_architect
+  proposal-implementation-audit: proposal_implementation_auditor
+  security-checker: security_checker
+  prepush-code-review: prepush_code_reviewer
+  github-commit-push: commit_and_push_to_github
+  connect-publisher: build_archive_and_push_connect
+
+workflow:
+  id: proposal-to-release
+  title: Proposal -> Code -> Audit -> Release
+  execution:
+    single_active_run_per_idea: true
+    resume_policy: automatic_on_launch
+  required_providers:
+    - codex
+    - claude_code
+
+  stages:
+    - id: draft_initial_proposal
+      type: single
+      agent: proposal-writer
+
+    - id: approve_initial_proposal
+      type: approval
+      approval: required
+      needs:
+        - draft_initial_proposal
+
+    - id: initial_review
+      type: fanout
+      agents:
+        - proposal-po-reviewer
+        - proposal-ux-reviewer
+        - proposal-ui-reviewer
+        - proposal-architect-reviewer
+      needs:
+        - approve_initial_proposal
+      gate:
+        require:
+          - all_reports_present
+
+    - id: rewrite_proposal
+      type: single
+      agent: proposal-writer
+      needs:
+        - initial_review
+
+    - id: approve_implementation_start
+      type: approval
+      approval: required
+      needs:
+        - rewrite_proposal
+
+    - id: start_implementation
+      type: single
+      agent: code-writer
+      needs:
+        - approve_implementation_start
+
+    - id: verification
+      type: fanout
+      agents:
+        - proposal-implementation-audit
+        - security-checker
+        - prepush-code-review
+        - docs-guardian
+      needs:
+        - start_implementation
+      gate:
+        require:
+          - no_blocking_findings
+
+    - id: approve_release
+      type: approval
+      approval: required
+      needs:
+        - verification
+
+    - id: commit_and_push
+      type: single
+      agent: github-commit-push
+      needs:
+        - approve_release
+
+    - id: build_and_publish
+      type: single
+      agent: connect-publisher
+      needs:
+        - commit_and_push

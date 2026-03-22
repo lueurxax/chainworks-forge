@@ -1,59 +1,61 @@
-//
-//  ContentView.swift
-//  Chainworks Forge
-//
-//  Created by user on 22/03/2026.
-//
-
 import SwiftUI
 import SwiftData
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @State private var selectedTab: Tab = .ideas
+
+    enum Tab: String, CaseIterable {
+        case ideas = "Ideas"
+        case agentCatalog = "Agent Catalog"
+        case workflowInspector = "Workflow Inspector"
+    }
+
+    private func exampleFileURL(bundleName: String, bundledExtension: String = "yaml", repoRelativePath: String) -> URL? {
+        if let bundled = Bundle.main.url(forResource: bundleName, withExtension: bundledExtension) {
+            return bundled
+        }
+
+        let candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(repoRelativePath),
+            URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Documents/Chainworks Forge")
+                .appendingPathComponent(repoRelativePath)
+        ]
+
+        return candidates.first { FileManager.default.isReadableFile(atPath: $0.path) }
+    }
 
     var body: some View {
-        NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-            .toolbar {
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
-        } detail: {
-            Text("Select an item")
-        }
-    }
+        TabView(selection: $selectedTab) {
+            IdeaListView()
+                .tabItem { Label("Ideas", systemImage: "lightbulb") }
+                .tag(Tab.ideas)
+                .accessibilityIdentifier("tab-ideas")
 
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
+            AgentCatalogView(
+                catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
+            )
+            .tabItem { Label("Agent Catalog", systemImage: "person.3") }
+            .tag(Tab.agentCatalog)
+            .accessibilityIdentifier("tab-agent-catalog")
 
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
-            }
+            WorkflowInspectorView(
+                workflowURL: exampleFileURL(bundleName: "workflow", repoRelativePath: "examples/workflows/workflow.yaml"),
+                compactWorkflowURL: exampleFileURL(bundleName: "proposal-to-release", repoRelativePath: "examples/workflows/proposal-to-release.yaml"),
+                catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
+            )
+            .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
+            .tag(Tab.workflowInspector)
+            .accessibilityIdentifier("tab-workflow-inspector")
         }
     }
 }
 
 #Preview {
     ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+        .modelContainer(
+            for: [Idea.self],
+            inMemory: true
+        )
 }

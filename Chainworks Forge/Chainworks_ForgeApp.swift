@@ -1,10 +1,3 @@
-//
-//  Chainworks_ForgeApp.swift
-//  Chainworks Forge
-//
-//  Created by user on 22/03/2026.
-//
-
 import SwiftUI
 import SwiftData
 
@@ -12,7 +5,17 @@ import SwiftData
 struct Chainworks_ForgeApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            Idea.self,
+            Run.self,
+            StageExecution.self,
+            AgentExecution.self,
+            Approval.self,
+            Artifact.self,
+            StewardAnalysis.self,
+            StewardAnalysisRunLink.self,
+            StewardRecommendation.self,
+            StewardExperiment.self,
+            StewardDecision.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
