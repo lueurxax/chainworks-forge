@@ -1,0 +1,56 @@
+version: 1
+
+workflow:
+  id: proposal-to-release
+  title: Proposal -> Code -> Audit -> Release
+
+  stages:
+    - id: initial_review
+      type: fanout
+      agents:
+        - proposal-po-reviewer
+        - proposal-ux-reviewer
+        - proposal-ui-reviewer
+        - proposal-architect-reviewer
+      gate:
+        require:
+          - all_reports_present
+
+    - id: rewrite_proposal
+      type: single
+      agent: proposal-writer
+      needs:
+        - initial_review
+
+    - id: implement
+      type: single
+      agent: code-writer
+      needs:
+        - rewrite_proposal
+
+    - id: verification
+      type: fanout
+      agents:
+        - proposal-implementation-audit
+        - security-checker
+        - prepush-code-review
+        - docs-guardian
+      needs:
+        - implement
+      gate:
+        require:
+          - no_blocking_findings
+
+    - id: commit_and_push
+      type: single
+      agent: github-commit-push
+      needs:
+        - verification
+      approval: required
+
+    - id: build_and_publish
+      type: single
+      agent: connect-publisher
+      needs:
+        - commit_and_push
+      approval: required

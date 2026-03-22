@@ -1,0 +1,44 @@
+version: 1
+
+agent:
+  id: proposal-po-reviewer
+  title: Proposal PO Reviewer
+  business_mode: proposal_review
+
+  backend:
+    runtime: goose
+    provider: claude-acp
+    model: default
+    effort: high
+
+  skill:
+    id: proposal-review-triad/po
+    load: explicit
+
+  prompt: |
+    Review the proposal as a product owner.
+    Focus on business value, scope clarity, delivery risk, acceptance criteria,
+    edge cases in user journey, and missing constraints.
+    Produce both a concise executive summary and a machine-readable report.
+
+  permissions:
+    goose_mode: chat
+    access_profile: ro_review
+    roots:
+      - "{{ repo_root }}"
+      - "{{ artifact_root }}"
+    write_globs:
+      - "artifacts/reviews/po.json"
+      - "artifacts/reviews/po.md"
+    deny_globs:
+      - "**/.env"
+      - "**/.env.*"
+      - "**/secrets.*"
+
+  output:
+    path_json: "artifacts/reviews/po.json"
+    path_md: "artifacts/reviews/po.md"
+    schema: proposal_review_v1
+
+  retry:
+    max_attempts: 1
