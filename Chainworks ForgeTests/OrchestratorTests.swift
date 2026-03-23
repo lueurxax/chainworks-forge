@@ -68,6 +68,35 @@ final class OrchestratorTests: XCTestCase {
         )
     }
 
+    private final class MockGooseTransport: GooseTransport, @unchecked Sendable {
+        var streamEvents: [GooseStreamEvent] = []
+
+        init() {
+            super.init(baseURL: URL(string: "http://localhost:0")!)
+        }
+
+        override func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            GooseSessionResponse(sessionId: "live-session-001", status: "active")
+        }
+
+        override func submitPrompt(
+            sessionID: String,
+            prompt: GoosePromptRequest
+        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            let events = streamEvents
+            return AsyncThrowingStream { continuation in
+                Task {
+                    for event in events {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                }
+            }
+        }
+
+        override func closeSession(sessionID: String) async throws {}
+    }
+
     // MARK: - Simple Linear Workflow
 
     func testSimpleLinearWorkflow() async {
@@ -239,6 +268,77 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertEqual(executor.executedTasks.count, 3)
         let executedAgentIDs = Set(executor.executedTasks.map(\.agentID))
         XCTAssertEqual(executedAgentIDs, Set(["a1", "a2", "a3"]))
+    }
+
+    func testLiveExecutorPublishesTimelineEvents() async {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let plan = RunPlan(
+            workflowID: "proposal_loop_live", workflowTitle: "Proposal Loop (Live)",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "proposal_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "proposal_writer", task: "draft_initial_proposal", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "proposal_writer", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "proposal_writer": makeAgent(id: "proposal_writer", outputs: ["proposal_current"])
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let transport = MockGooseTransport()
+        transport.streamEvents = [
+            .sessionStarted(raw: #"{"session_id":"live-session-001"}"#),
+            .toolCallStarted(toolName: "read_artifact", raw: "{}"),
+            .textChunk(text: "Drafting proposal..."),
+            .finalOutput(content: "{\"proposal\":\"ready\"}"),
+            .sessionClosed(raw: "{}")
+        ]
+        let executor = GooseAgentExecutor(transport: transport)
+        let orchestrator = WorkflowOrchestrator(
+            run: run, plan: plan, workspace: workspace,
+            executor: executor, modelContext: context
+        )
+
+        await orchestrator.start()
+
+        // Allow fire-and-forget live event routing tasks to complete.
+        // configureLiveEventBridge() schedules MainActor tasks via Task { @MainActor in ... },
+        // which may not have run yet when start() returns.
+        // Poll with timeout until the timeline is populated.
+        for _ in 0..<30 {
+            if !orchestrator.liveTimeline.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        }
+
+        XCTAssertFalse(orchestrator.liveTimeline.isEmpty, "Live timeline should have entries after execution")
+        if !orchestrator.liveTimeline.isEmpty {
+            XCTAssertTrue(orchestrator.liveTimeline.contains { $0.event.type == .sessionStarted })
+            XCTAssertTrue(orchestrator.liveTimeline.contains { $0.event.type == .toolCallStarted })
+            XCTAssertTrue(orchestrator.liveTimeline.contains { $0.event.type == .finalOutput })
+        }
+
+        let agentExecution = try? XCTUnwrap(run.stageExecutions.first?.agentExecutions.first)
+        XCTAssertEqual(agentExecution?.providerSessionID, "live-session-001")
+        XCTAssertTrue(agentExecution?.logSnippet?.contains("Final output") == true)
     }
 
     // MARK: - Approval Gate

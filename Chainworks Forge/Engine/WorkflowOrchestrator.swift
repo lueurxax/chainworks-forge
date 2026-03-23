@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import Observation
+import CryptoKit
 
 // MARK: - ApprovalRequest
 
@@ -11,6 +12,28 @@ struct ApprovalRequest: Identifiable, Sendable {
     let stageID: String
     let stageLabel: String
     let requestedAt: Date
+}
+
+struct LiveExecutionTimelineEntry: Identifiable, Sendable {
+    let id: UUID
+    let agentID: String
+    let agentTitle: String
+    let stageID: String
+    let event: ExecutionEvent
+
+    init(
+        id: UUID = UUID(),
+        agentID: String,
+        agentTitle: String,
+        stageID: String,
+        event: ExecutionEvent
+    ) {
+        self.id = id
+        self.agentID = agentID
+        self.agentTitle = agentTitle
+        self.stageID = stageID
+        self.event = event
+    }
 }
 
 // MARK: - WorkflowOrchestrator (@MainActor @Observable, per-run state machine driver)
@@ -42,6 +65,7 @@ final class WorkflowOrchestrator {
     private(set) var isRunning: Bool = false
     private(set) var isPaused: Bool = false
     private(set) var isCancelled: Bool = false
+    private(set) var liveTimeline: [LiveExecutionTimelineEntry] = []
 
     /// Callback for approval requests (ARCH-028: published to a collection, not singleton)
     var onApprovalRequest: ((ApprovalRequest) -> Void)?
@@ -57,6 +81,8 @@ final class WorkflowOrchestrator {
     private var artifactFields: [String: [String: AnyCodableValue]] = [:]
     /// Runtime variables (clone of plan.variables, mutable for loop counters)
     private var runtimeVariables: [String: AnyCodableValue]
+    /// Tracks currently active agent executions for live event routing.
+    private var liveAgentExecutionsByAgentID: [String: [AgentExecution]] = [:]
 
     // MARK: - Init
 
@@ -77,6 +103,7 @@ final class WorkflowOrchestrator {
         self.catalog = catalog
         self.currentStateID = plan.initialStateID
         self.runtimeVariables = plan.variables
+        configureLiveEventBridge()
     }
 
     // MARK: - Start Execution
@@ -386,8 +413,13 @@ final class WorkflowOrchestrator {
             provider: agent.provider,
             effort: agent.effort
         )
+        // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
+        agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
+        agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
+
         agentExec.stageExecution = stageExec
         modelContext.insert(agentExec)
+        registerLiveExecution(agentExec, for: agent.id)
 
         // Gather input artifacts
         let inputData = gatherInputs(for: task)
@@ -411,13 +443,17 @@ final class WorkflowOrchestrator {
             agentExec.status = .failed
             agentExec.completedAt = Date()
             agentExec.logSnippet = "Error: \(error.localizedDescription)"
+            unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
 
         // Marshal results back to MainActor
         agentExec.completedAt = Date()
         agentExec.costCents = result.costCents
-        agentExec.logSnippet = result.logSnippet
+        agentExec.logSnippet = mergedLogSnippet(
+            existing: agentExec.logSnippet,
+            result: result.logSnippet
+        )
 
         if result.succeeded {
             agentExec.status = .completed
@@ -467,13 +503,16 @@ final class WorkflowOrchestrator {
             } catch {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Artifact persistence error: \(error.localizedDescription)"
+                unregisterLiveExecution(agentExec, for: agent.id)
                 return false
             }
 
+            unregisterLiveExecution(agentExec, for: agent.id)
             return true
         } else {
             agentExec.status = .failed
             agentExec.logSnippet = result.errorMessage
+            unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
     }
@@ -498,8 +537,13 @@ final class WorkflowOrchestrator {
                 provider: agent.provider,
                 effort: agent.effort
             )
+            // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
+            agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
+            agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
+
             agentExec.stageExecution = stageExec
             modelContext.insert(agentExec)
+            registerLiveExecution(agentExec, for: agent.id)
 
             taskAgentPairs.append((task, agent, agentExec))
         }
@@ -554,13 +598,17 @@ final class WorkflowOrchestrator {
             guard let result = optResult, result.succeeded else {
                 agentExec.status = .failed
                 agentExec.logSnippet = optResult?.errorMessage ?? "Execution failed"
+                unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
             }
 
             agentExec.status = .completed
             agentExec.costCents = result.costCents
-            agentExec.logSnippet = result.logSnippet
+            agentExec.logSnippet = mergedLogSnippet(
+                existing: agentExec.logSnippet,
+                result: result.logSnippet
+            )
 
             do {
                 let artifacts = try artifactManager.persistOutputs(
@@ -584,8 +632,12 @@ final class WorkflowOrchestrator {
             } catch {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Artifact persistence error: \(error.localizedDescription)"
+                unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
+                continue
             }
+
+            unregisterLiveExecution(agentExec, for: agent.id)
         }
 
         return allSucceeded
@@ -655,5 +707,123 @@ final class WorkflowOrchestrator {
         default:
             break
         }
+    }
+
+    // MARK: - Steward Metadata Helpers (Proposal 003 — REQ-002)
+
+    /// Compute a deterministic config hash for a resolved agent.
+    private static func computeAgentConfigHash(agent: ResolvedAgent) -> String {
+        let canonical = [
+            agent.id, agent.provider, agent.model, agent.effort,
+            String(agent.maxTurns), String(agent.temperature),
+            agent.permissionProfile, agent.skillRef,
+            agent.outputContract ?? ""
+        ].joined(separator: "|")
+        return DefinitionHasher.hashString(canonical)
+    }
+
+    // MARK: - Live Event Routing
+
+    private func configureLiveEventBridge() {
+        guard let gooseExecutor = executor as? GooseAgentExecutor else { return }
+
+        gooseExecutor.onExecutionEvent = { [weak self] agentID, event in
+            Task { @MainActor [weak self] in
+                self?.recordLiveExecutionEvent(agentID: agentID, event: event)
+            }
+        }
+    }
+
+    private func registerLiveExecution(_ agentExecution: AgentExecution, for agentID: String) {
+        liveAgentExecutionsByAgentID[agentID, default: []].append(agentExecution)
+    }
+
+    private func unregisterLiveExecution(_ agentExecution: AgentExecution, for agentID: String) {
+        guard var executions = liveAgentExecutionsByAgentID[agentID] else { return }
+        executions.removeAll { $0.id == agentExecution.id }
+        if executions.isEmpty {
+            liveAgentExecutionsByAgentID.removeValue(forKey: agentID)
+        } else {
+            liveAgentExecutionsByAgentID[agentID] = executions
+        }
+    }
+
+    private func recordLiveExecutionEvent(agentID: String, event: ExecutionEvent) {
+        let agentExecution = resolvedAgentExecution(for: agentID)
+
+        if let sessionID = event.sessionID {
+            agentExecution?.providerSessionID = sessionID
+            agentExecution?.gooseSessionID = sessionID
+        }
+
+        let existingSnippet = agentExecution?.logSnippet
+        let eventSnippet = logSnippet(for: event, existing: existingSnippet)
+        agentExecution?.logSnippet = eventSnippet
+
+        let entry = LiveExecutionTimelineEntry(
+            agentID: agentID,
+            agentTitle: agentExecution?.agentTitle ?? plan.agentBindings[agentID]?.title ?? agentID,
+            stageID: agentExecution?.stageExecution?.stageID ?? currentStateID,
+            event: event
+        )
+
+        if event.type == .textChunk,
+           let lastIndex = liveTimeline.lastIndex(where: { $0.agentID == agentID && $0.event.type == .textChunk }) {
+            liveTimeline[lastIndex] = entry
+        } else {
+            liveTimeline.append(entry)
+            if liveTimeline.count > 40 {
+                liveTimeline.removeFirst(liveTimeline.count - 40)
+            }
+        }
+    }
+
+    private func logSnippet(for event: ExecutionEvent, existing: String?) -> String {
+        switch event.type {
+        case .sessionStarted:
+            return event.detail
+        case .promptSubmitted:
+            return existing ?? "Prompt submitted"
+        case .toolCallStarted, .toolCallFinished:
+            return event.detail
+        case .textChunk:
+            let trimmed = event.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return existing ?? "Streaming output..." }
+            return String(trimmed.prefix(220))
+        case .finalOutput:
+            return "Final output received"
+        case .error:
+            return "Provider error: \(event.detail)"
+        case .sessionClosed:
+            return existing ?? "Session closed"
+        case .unknown:
+            return event.detail
+        }
+    }
+
+    private func resolvedAgentExecution(for agentID: String) -> AgentExecution? {
+        if let activeExecution = liveAgentExecutionsByAgentID[agentID]?.last {
+            return activeExecution
+        }
+
+        return run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .filter { $0.agentID == agentID }
+            .sorted { $0.startedAt < $1.startedAt }
+            .last
+    }
+
+    private func mergedLogSnippet(existing: String?, result: String?) -> String? {
+        let existing = existing?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = result?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let existing, !existing.isEmpty,
+           existing != "Session started",
+           existing != "Prompt submitted" {
+            return existing
+        }
+
+        guard let result, !result.isEmpty else { return existing }
+        return result
     }
 }

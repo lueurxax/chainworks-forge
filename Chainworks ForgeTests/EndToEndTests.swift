@@ -45,6 +45,14 @@ final class EndToEndTests: XCTestCase {
         return try YAMLParser.loadAgentCatalog(from: url)
     }
 
+    private func loadLiveWorkflow() throws -> WorkflowDefinition {
+        let url = try XCTUnwrap(
+            Bundle(for: type(of: self)).url(forResource: "proposal-loop-live", withExtension: "yaml"),
+            "proposal-loop-live.yaml fixture must be bundled with tests"
+        )
+        return try YAMLParser.loadWorkflow(from: url)
+    }
+
     private func makeWorkspace() -> RunWorkspace {
         let runID = UUID()
         let workspaceRoot = tempDir.appendingPathComponent(runID.uuidString, isDirectory: true)
@@ -287,5 +295,79 @@ final class EndToEndTests: XCTestCase {
             XCTAssertNotNil(run.totalCostCents, "Cost should be tracked")
             XCTAssertTrue(run.totalCostCents! > 0, "Cost should be positive")
         }
+    }
+
+    func testLiveProposalLoopFixtureReachesApprovalAndCompletes() async throws {
+        let workflow = try loadLiveWorkflow()
+        let catalog = try loadCanonicalCatalog()
+
+        let compiler = RunPlanCompiler(modelContext: context)
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace, plan: plan)
+        let transport = FixtureGooseTransport(
+            scenario: .proposalLoopSuccess,
+            baseURL: URL(string: "http://fixture.local")!
+        )
+        let executor = GooseAgentExecutor(transport: transport)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: executor,
+            modelContext: context,
+            catalog: catalog
+        )
+
+        var approvalRequests: [ApprovalRequest] = []
+        orchestrator.onApprovalRequest = { request in
+            approvalRequests.append(request)
+        }
+
+        await orchestrator.start()
+
+        var pausePollsRemaining = 100
+        while run.status != .waitingApproval && run.status != .completed && pausePollsRemaining > 0 {
+            pausePollsRemaining -= 1
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        // Allow fire-and-forget live event routing tasks to complete
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertTrue(
+            run.status == .waitingApproval || run.status == .completed,
+            "Fixture live workflow should reach approval gate or complete, got: \(run.status.rawValue)"
+        )
+        XCTAssertFalse(run.stageExecutions.isEmpty, "Run should have executed stages")
+
+        // If paused at approval gate, approve and wait for completion
+        if run.status == .waitingApproval && !approvalRequests.isEmpty {
+            let artifactCountBeforeApproval = run.stageExecutions
+                .flatMap(\.agentExecutions)
+                .flatMap(\.artifacts)
+                .count
+            XCTAssertGreaterThan(artifactCountBeforeApproval, 0, "Fixture live workflow should persist artifacts before approval")
+
+            for request in approvalRequests {
+                orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "Fixture test approval")
+            }
+
+            var completionPollsRemaining = 100
+            while run.status != .completed && completionPollsRemaining > 0 {
+                completionPollsRemaining -= 1
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+
+        XCTAssertEqual(run.status, .completed, "Fixture live workflow should complete")
+        XCTAssertNotNil(run.completedAt)
+        XCTAssertTrue(
+            run.stageExecutions
+                .flatMap(\.agentExecutions)
+                .contains { ($0.providerSessionID ?? "").hasPrefix("fixture-") },
+            "At least one live agent execution should capture a fixture provider session id"
+        )
     }
 }

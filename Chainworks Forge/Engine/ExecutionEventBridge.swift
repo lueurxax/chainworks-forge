@@ -28,27 +28,19 @@ final class ExecutionEventBridge: @unchecked Sendable {
     // MARK: - Public Accessors
 
     var accumulatedText: String {
-        _lock.lock()
-        defer { _lock.unlock() }
-        return _accumulatedText
+        withLock { _accumulatedText }
     }
 
     var toolCalls: [ToolCallRecord] {
-        _lock.lock()
-        defer { _lock.unlock() }
-        return _toolCalls
+        withLock { _toolCalls }
     }
 
     var eventLog: [ExecutionEvent] {
-        _lock.lock()
-        defer { _lock.unlock() }
-        return _eventLog
+        withLock { _eventLog }
     }
 
     var hasFinalOutput: Bool {
-        _lock.lock()
-        defer { _lock.unlock() }
-        return _hasFinalOutput
+        withLock { _hasFinalOutput }
     }
 
     // MARK: - Event Processing
@@ -68,29 +60,29 @@ final class ExecutionEventBridge: @unchecked Sendable {
             switch event {
             case .finalOutput(let content):
                 finalContent = content
-                _lock.lock()
-                _hasFinalOutput = true
-                _lock.unlock()
-            case .textChunk(let text):
-                _lock.lock()
-                _accumulatedText += text
-                _lock.unlock()
-            case .toolCallStarted(let toolName, _):
-                _lock.lock()
-                _toolCalls.append(ToolCallRecord(
-                    toolName: toolName,
-                    startedAt: Date(),
-                    completedAt: nil,
-                    succeeded: nil
-                ))
-                _lock.unlock()
-            case .toolCallFinished(let toolName, _):
-                _lock.lock()
-                if let idx = _toolCalls.lastIndex(where: { $0.toolName == toolName && $0.completedAt == nil }) {
-                    _toolCalls[idx].completedAt = Date()
-                    _toolCalls[idx].succeeded = true
+                withLock {
+                    _hasFinalOutput = true
                 }
-                _lock.unlock()
+            case .textChunk(let text):
+                withLock {
+                    _accumulatedText += text
+                }
+            case .toolCallStarted(let toolName, _):
+                withLock {
+                    _toolCalls.append(ToolCallRecord(
+                        toolName: toolName,
+                        startedAt: Date(),
+                        completedAt: nil,
+                        succeeded: nil
+                    ))
+                }
+            case .toolCallFinished(let toolName, _):
+                withLock {
+                    if let idx = _toolCalls.lastIndex(where: { $0.toolName == toolName && $0.completedAt == nil }) {
+                        _toolCalls[idx].completedAt = Date()
+                        _toolCalls[idx].succeeded = true
+                    }
+                }
             case .error:
                 break
             default:
@@ -112,14 +104,31 @@ final class ExecutionEventBridge: @unchecked Sendable {
         let timestamp = Date()
 
         switch event {
-        case .sessionStarted:
-            return ExecutionEvent(type: .sessionStarted, timestamp: timestamp, detail: "Session started")
+        case .sessionStarted(let raw):
+            let sessionID = parseMetadataValue(from: raw, keys: ["session_id", "sessionId", "id"])
+            let detail = sessionID.map { "Session started: \($0)" } ?? "Session started"
+            return ExecutionEvent(
+                type: .sessionStarted,
+                timestamp: timestamp,
+                detail: detail,
+                sessionID: sessionID
+            )
         case .promptSubmitted:
             return ExecutionEvent(type: .promptSubmitted, timestamp: timestamp, detail: "Prompt submitted")
         case .toolCallStarted(let toolName, _):
-            return ExecutionEvent(type: .toolCallStarted, timestamp: timestamp, detail: "Tool: \(toolName)")
+            return ExecutionEvent(
+                type: .toolCallStarted,
+                timestamp: timestamp,
+                detail: "Tool: \(toolName)",
+                toolName: toolName
+            )
         case .toolCallFinished(let toolName, _):
-            return ExecutionEvent(type: .toolCallFinished, timestamp: timestamp, detail: "Tool completed: \(toolName)")
+            return ExecutionEvent(
+                type: .toolCallFinished,
+                timestamp: timestamp,
+                detail: "Tool completed: \(toolName)",
+                toolName: toolName
+            )
         case .textChunk(let text):
             return ExecutionEvent(type: .textChunk, timestamp: timestamp, detail: String(text.prefix(200)))
         case .finalOutput:
@@ -133,20 +142,41 @@ final class ExecutionEventBridge: @unchecked Sendable {
         }
     }
 
+    private func parseMetadataValue(from raw: String, keys: [String]) -> String? {
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        for key in keys {
+            if let value = json[key] as? String, !value.isEmpty {
+                return value
+            }
+        }
+
+        return nil
+    }
+
     private func record(_ event: ExecutionEvent) {
-        _lock.lock()
-        _eventLog.append(event)
-        _lock.unlock()
+        withLock {
+            _eventLog.append(event)
+        }
     }
 
     /// Reset state for a new execution.
     func reset() {
+        withLock {
+            _accumulatedText = ""
+            _toolCalls = []
+            _eventLog = []
+            _hasFinalOutput = false
+        }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
         _lock.lock()
-        _accumulatedText = ""
-        _toolCalls = []
-        _eventLog = []
-        _hasFinalOutput = false
-        _lock.unlock()
+        defer { _lock.unlock() }
+        return body()
     }
 }
 
@@ -158,6 +188,22 @@ struct ExecutionEvent: Sendable, Identifiable {
     let type: EventType
     let timestamp: Date
     let detail: String
+    let sessionID: String?
+    let toolName: String?
+
+    init(
+        type: EventType,
+        timestamp: Date,
+        detail: String,
+        sessionID: String? = nil,
+        toolName: String? = nil
+    ) {
+        self.type = type
+        self.timestamp = timestamp
+        self.detail = detail
+        self.sessionID = sessionID
+        self.toolName = toolName
+    }
 
     enum EventType: String, Sendable {
         case sessionStarted = "session_started"

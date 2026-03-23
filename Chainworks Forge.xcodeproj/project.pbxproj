@@ -14,6 +14,7 @@
 		CE8915722F700957006EC77C /* proposal-to-release.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156B2F700957006EC77C /* proposal-to-release.yaml */; };
 		CE8915732F700957006EC77C /* agents.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915682F700957006EC77C /* agents.yaml */; };
 		CE8915742F700957006EC77C /* workflow.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156C2F700957006EC77C /* workflow.yaml */; };
+		CE8915752F700957006EC77C /* proposal-loop-live.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915762F700957006EC77C /* proposal-loop-live.yaml */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -41,6 +42,7 @@
 		CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-po-reviewer.yaml"; sourceTree = "<group>"; };
 		CE89156B2F700957006EC77C /* proposal-to-release.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-to-release.yaml"; sourceTree = "<group>"; };
 		CE89156C2F700957006EC77C /* workflow.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = workflow.yaml; sourceTree = "<group>"; };
+		CE8915762F700957006EC77C /* proposal-loop-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-loop-live.yaml"; sourceTree = "<group>"; };
 		CE89156E2F700957006EC77C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -123,6 +125,7 @@
 			isa = PBXGroup;
 			children = (
 				CE89156B2F700957006EC77C /* proposal-to-release.yaml */,
+				CE8915762F700957006EC77C /* proposal-loop-live.yaml */,
 				CE89156C2F700957006EC77C /* workflow.yaml */,
 			);
 			path = workflows;
@@ -266,6 +269,7 @@
 				CE8915702F700957006EC77C /* proposal-po-reviewer.yaml in Resources */,
 				CE8915712F700957006EC77C /* README.md in Resources */,
 				CE8915722F700957006EC77C /* proposal-to-release.yaml in Resources */,
+				CE8915752F700957006EC77C /* proposal-loop-live.yaml in Resources */,
 				CE8915732F700957006EC77C /* agents.yaml in Resources */,
 				CE8915742F700957006EC77C /* workflow.yaml in Resources */,
 			);

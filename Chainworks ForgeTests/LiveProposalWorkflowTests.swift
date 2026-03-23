@@ -10,57 +10,18 @@ final class LiveProposalWorkflowTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func loadLiveWorkflowAndCatalog() -> (WorkflowDefinition, AgentCatalog)? {
-        let candidates: [String] = [
-            "examples/workflows/proposal-loop-live.yaml",
-        ]
-        let catalogCandidates: [String] = [
-            "examples/agents/agents.yaml",
-        ]
-
-        var workflowURL: URL?
-        var catalogURL: URL?
-
-        for path in candidates {
-            let url = URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Documents/Chainworks Forge/\(path)")
-            if FileManager.default.isReadableFile(atPath: url.path) {
-                workflowURL = url
-                break
-            }
-            // Try from cwd
-            let cwdURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(path)
-            if FileManager.default.isReadableFile(atPath: cwdURL.path) {
-                workflowURL = cwdURL
-                break
-            }
-        }
-
-        for path in catalogCandidates {
-            let url = URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Documents/Chainworks Forge/\(path)")
-            if FileManager.default.isReadableFile(atPath: url.path) {
-                catalogURL = url
-                break
-            }
-            let cwdURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(path)
-            if FileManager.default.isReadableFile(atPath: cwdURL.path) {
-                catalogURL = cwdURL
-                break
-            }
-        }
-
-        guard let wURL = workflowURL, let cURL = catalogURL else {
-            return nil
-        }
-
-        guard let workflow = try? YAMLParser.loadWorkflow(from: wURL),
-              let catalog = try? YAMLParser.loadAgentCatalog(from: cURL) else {
-            return nil
-        }
-
+    private func loadLiveWorkflowAndCatalog() throws -> (WorkflowDefinition, AgentCatalog) {
+        let bundle = Bundle(for: type(of: self))
+        let workflowURL = try XCTUnwrap(
+            bundle.url(forResource: "proposal-loop-live", withExtension: "yaml"),
+            "proposal-loop-live.yaml fixture must be bundled with tests"
+        )
+        let catalogURL = try XCTUnwrap(
+            bundle.url(forResource: "agents", withExtension: "yaml"),
+            "agents.yaml fixture must be bundled with tests"
+        )
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
         return (workflow, catalog)
     }
 
@@ -68,9 +29,7 @@ final class LiveProposalWorkflowTests: XCTestCase {
 
     /// testLiveProposalWorkflowCompiles — Section 12.1
     func testLiveProposalWorkflowCompiles() throws {
-        guard let (workflow, catalog) = loadLiveWorkflowAndCatalog() else {
-            throw XCTSkip("proposal-loop-live.yaml or agents.yaml not found at expected paths")
-        }
+        let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // Workflow ID should match
         XCTAssertEqual(workflow.workflow.id, "proposal_loop_live")
@@ -105,9 +64,7 @@ final class LiveProposalWorkflowTests: XCTestCase {
 
     /// testLiveProposalWorkflowUsesExpectedAgents — Section 12.1
     func testLiveProposalWorkflowUsesExpectedAgents() throws {
-        guard let (workflow, _) = loadLiveWorkflowAndCatalog() else {
-            throw XCTSkip("proposal-loop-live.yaml or agents.yaml not found at expected paths")
-        }
+        let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // Collect all agent IDs referenced in the workflow
         var referencedAgents: Set<String> = []
@@ -142,9 +99,7 @@ final class LiveProposalWorkflowTests: XCTestCase {
 
     /// testReviewFanoutParallelismIsRecordedCorrectly — Section 12.1
     func testReviewFanoutParallelismIsRecordedCorrectly() throws {
-        guard let (workflow, _) = loadLiveWorkflowAndCatalog() else {
-            throw XCTSkip("proposal-loop-live.yaml or agents.yaml not found at expected paths")
-        }
+        let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // state_3_proposal_reviewed should have a parallel block with 4 reviewers
         guard let reviewState = workflow.states["state_3_proposal_reviewed"] else {
@@ -170,9 +125,7 @@ final class LiveProposalWorkflowTests: XCTestCase {
 
     /// testLiveWorkflowHasLoopConfig
     func testLiveWorkflowHasLoopConfig() throws {
-        guard let (workflow, _) = loadLiveWorkflowAndCatalog() else {
-            throw XCTSkip("proposal-loop-live.yaml or agents.yaml not found at expected paths")
-        }
+        let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // state_3 should have a loop config
         guard let reviewState = workflow.states["state_3_proposal_reviewed"] else {
@@ -187,9 +140,7 @@ final class LiveProposalWorkflowTests: XCTestCase {
 
     /// testLiveWorkflowVariables
     func testLiveWorkflowVariables() throws {
-        guard let (workflow, _) = loadLiveWorkflowAndCatalog() else {
-            throw XCTSkip("proposal-loop-live.yaml or agents.yaml not found at expected paths")
-        }
+        let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         let variables = workflow.variables ?? [:]
         XCTAssertNotNil(variables["max_proposal_revision_cycles"])

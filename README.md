@@ -65,6 +65,11 @@ For the current MVP slice, the system is intended to support:
   - `ArtifactStorage`
   - `ArtifactManager`
   - output-contract-aware artifact formatting
+- live execution slice:
+  - per-run live vs simulated executor selection
+  - Goose event bridging into run progress and live timeline state
+  - deterministic fixture-backed `proposal_loop_live` transport for local proof and tests
+  - runtime readiness gating for live mode in the app
 - deterministic Steward services:
   - metrics collection
   - cohort classification
@@ -74,8 +79,9 @@ For the current MVP slice, the system is intended to support:
 
 ## Planned Next
 
-- real provider-backed execution adapters beyond the simulated executor
-- end-to-end `Start Run` / run progress / stage detail / artifact inspection UI
+- harden the live app-level proof path so the fixture-backed proposal loop is fully stable in UI automation
+- extend provider-backed execution beyond the current first live slice
+- deepen `Start Run` / run progress / stage detail / artifact inspection UI
 - approval inbox and approval decision surfaces in the app
 - richer run and artifact browsing for implemented Proposal 002 flows
 - Steward report and recommendation UI for Proposal 003 flows
@@ -123,7 +129,7 @@ Chainworks Forge/
 
 ## Current Status
 
-The repository is no longer just a template scaffold. The domain model, YAML DSL, and a large part of the run/execution core are now implemented. The main gap is still UI depth: the desktop app is inspection-first and does not yet expose the full Proposal 002 or Proposal 003 lifecycle as end-to-end runtime flows.
+The repository is no longer just a template scaffold. The domain model, YAML DSL, run compilation/orchestration core, and the first live execution slice are implemented. The app can now resolve live workflows per run, gate live launch on runtime readiness, and stream provider events into run state. The biggest remaining gap is full UI hardening around that live slice: the desktop app is closer to an operator console, but the end-to-end UX still needs deeper polish and more stable automation coverage.
 
 At this stage, the repository is primarily validating:
 
@@ -132,6 +138,7 @@ At this stage, the repository is primarily validating:
 - the agent catalog structure
 - immutable run compilation and orchestration contracts
 - the approval and artifact model
+- the first live provider execution path through `proposal_loop_live`
 - deterministic Steward analysis boundaries
 - the local macOS control-plane direction
 
@@ -167,4 +174,14 @@ Run tests:
 
 ```bash
 xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+```
+
+Run the live fixture slice locally:
+
+```bash
+CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success \
+CHAINWORKS_LIVE_PROVIDER=claude_code \
+CHAINWORKS_LIVE_MODEL=fixture-model \
+CHAINWORKS_LIVE_EFFORT=high \
+open "Chainworks Forge.xcodeproj"
 ```

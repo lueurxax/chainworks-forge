@@ -28,6 +28,20 @@ final class ResumeManagerTests: XCTestCase {
         return try YAMLParser.loadAgentCatalog(from: url)
     }
 
+    private func repositoryRootURL(file: StaticString = #filePath) -> URL {
+        URL(fileURLWithPath: "\(file)")
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func loadLiveWorkflow() throws -> WorkflowDefinition {
+        let url = try XCTUnwrap(
+            Bundle(for: type(of: self)).url(forResource: "proposal-loop-live", withExtension: "yaml"),
+            "proposal-loop-live.yaml fixture must be bundled with tests"
+        )
+        return try YAMLParser.loadWorkflow(from: url)
+    }
+
     /// Create a run directly in SwiftData with proper snapshot data, avoiding filesystem ops.
     private func makeRunFromPlan() throws -> (Run, RunPlan, RunWorkspace) {
         let workflow = try loadCanonicalWorkflow()
@@ -72,7 +86,7 @@ final class ResumeManagerTests: XCTestCase {
 
     // MARK: - Find Interrupted Runs
 
-    func testFindInterruptedRuns() throws {
+    func testFindInterruptedRuns() async throws {
         let (run, _, _) = try makeRunFromPlan()
 
         // Set to running (as if interrupted)
@@ -83,9 +97,10 @@ final class ResumeManagerTests: XCTestCase {
 
         XCTAssertEqual(interrupted.count, 1)
         XCTAssertEqual(interrupted[0].id, run.id)
+        _ = manager // prevent premature dealloc
     }
 
-    func testFindInterruptedRunsWaitingApproval() throws {
+    func testFindInterruptedRunsWaitingApproval() async throws {
         let (run, _, _) = try makeRunFromPlan()
 
         run.status = .waitingApproval
@@ -94,9 +109,10 @@ final class ResumeManagerTests: XCTestCase {
         let interrupted = try manager.findInterruptedRuns()
 
         XCTAssertEqual(interrupted.count, 1)
+        _ = manager
     }
 
-    func testCompletedRunsNotFound() throws {
+    func testCompletedRunsNotFound() async throws {
         let (run, _, _) = try makeRunFromPlan()
 
         run.status = .completed
@@ -105,9 +121,10 @@ final class ResumeManagerTests: XCTestCase {
         let interrupted = try manager.findInterruptedRuns()
 
         XCTAssertTrue(interrupted.isEmpty, "Completed runs should not be found as interrupted")
+        _ = manager
     }
 
-    func testCancelledRunsNotFound() throws {
+    func testCancelledRunsNotFound() async throws {
         let (run, _, _) = try makeRunFromPlan()
 
         run.status = .cancelled
@@ -116,11 +133,12 @@ final class ResumeManagerTests: XCTestCase {
         let interrupted = try manager.findInterruptedRuns()
 
         XCTAssertTrue(interrupted.isEmpty, "Cancelled runs should not be found as interrupted")
+        _ = manager
     }
 
     // MARK: - Classification
 
-    func testClassifyResumeableRun() throws {
+    func testClassifyResumeableRun() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
 
@@ -137,19 +155,13 @@ final class ResumeManagerTests: XCTestCase {
         default:
             XCTFail("Expected .resume action, got \(actions[0])")
         }
+        _ = manager
     }
 
-    func testClassifyCompilerVersionMismatch() throws {
+    func testClassifyCompilerVersionMismatch() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
 
-        // Simulate a compiler version mismatch by temporarily modifying the field
-        // We can't directly change planCompilerVersion due to private(set), so we
-        // test the ResumeError path via rebuildPlanFromSnapshot
-        // For this test, verify that the ResumeManager correctly classifies it
-        // by checking the cannotResume path is reachable
-
-        // The run was created with currentCompilerVersion, so it should resume fine
         let manager = ResumeManager(modelContext: context)
         let actions = try manager.classifyInterruptedRuns(compiler: compiler)
         XCTAssertEqual(actions.count, 1)
@@ -158,11 +170,12 @@ final class ResumeManagerTests: XCTestCase {
         if case .resume(_, let plan, _) = actions[0] {
             XCTAssertEqual(plan.planCompilerVersion, RunPlan.currentCompilerVersion)
         }
+        _ = manager
     }
 
     // MARK: - Side-Effect Detection
 
-    func testSideEffectStageDetected() throws {
+    func testSideEffectStageDetected() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
 
@@ -180,8 +193,8 @@ final class ResumeManagerTests: XCTestCase {
             XCTAssertTrue(reason.contains("side-effect"), "Should mention side-effect: \(reason)")
         } else if case .resume = actions[0] {
             // Also acceptable if no drift detected — the side-effect check is for running stages
-            // which this one is
         }
+        _ = manager
     }
 
     // MARK: - ExecutionService
@@ -227,5 +240,102 @@ final class ResumeManagerTests: XCTestCase {
 
         // Clean up
         service.cancelRun(runID: run.id)
+    }
+
+    func testExecutionServiceUsesLiveExecutorForLiveWorkflow() async throws {
+        let workflow = try loadLiveWorkflow()
+        let catalog = try loadCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let idea = Idea(title: "Live Workflow", body: "Validate Goose-backed executor routing")
+        context.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LiveExecutionServiceTest-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(),
+            catalog: catalog,
+            liveRuntimeConfiguration: LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://localhost:9999")!,
+                apiKey: nil,
+                override: LiveExecutionOverride(
+                    enabled: true,
+                    provider: "claude_code",
+                    model: "default",
+                    effort: "high"
+                ),
+                transportMode: .network
+            )
+        )
+
+        service.startRun(run: run, plan: plan, workspace: workspace)
+
+        guard let orchestrator = service.orchestrator(for: run.id) else {
+            XCTFail("Expected live orchestrator to be created")
+            return
+        }
+        XCTAssertTrue(orchestrator.executor is GooseAgentExecutor)
+    }
+
+    func testExecutionServiceBlocksLiveWorkflowWithoutRuntimeConfig() async throws {
+        let workflow = try loadLiveWorkflow()
+        let catalog = try loadCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let idea = Idea(title: "Blocked Live Workflow", body: "Missing runtime config")
+        context.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BlockedLiveExecutionServiceTest-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(),
+            catalog: catalog
+        )
+
+        service.startRun(run: run, plan: plan, workspace: workspace)
+
+        XCTAssertNil(service.orchestrator(for: run.id))
+        XCTAssertEqual(run.status, .blocked)
+        XCTAssertTrue(run.driftDetails?.contains("Live runtime is not configured") == true)
     }
 }

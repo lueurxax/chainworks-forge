@@ -48,9 +48,11 @@ struct IdeaListView: View {
                                         }
                                     }
                                 }
+                                .accessibilityIdentifier("idea-row-\(idea.title)")
                             }
                             .onDelete(perform: deleteIdeas)
                         }
+                        .accessibilityIdentifier("idea-list")
                     }
                 }
 
@@ -93,6 +95,18 @@ struct IdeaListView: View {
                 Label("\(executionService.activeOrchestrators.count) running", systemImage: "bolt.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
+            }
+            switch executionService.liveRuntimeReadiness {
+            case .ready(_, let source):
+                Label("Live ready (\(source))", systemImage: "bolt.horizontal.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .accessibilityIdentifier("live-runtime-ready")
+            case .unavailable:
+                Label("Live unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("live-runtime-unavailable")
             }
         }
         .font(.caption)
@@ -157,6 +171,7 @@ struct IdeaListView: View {
             attachmentPath: trimmedPath.isEmpty ? nil : trimmedPath
         )
         modelContext.insert(idea)
+        try? modelContext.save()
         resetForm()
     }
 
@@ -170,6 +185,7 @@ struct IdeaListView: View {
         for index in offsets {
             modelContext.delete(ideas[index])
         }
+        try? modelContext.save()
     }
 
     private func browseAttachment() {
@@ -191,6 +207,7 @@ struct IdeaDetailView: View {
     @Environment(ExecutionService.self) private var executionService
     let idea: Idea
     @State private var showStartRunSheet = false
+    @State private var autoOpenedRun: Run?
 
     /// Whether this idea has an active run (prevents starting another).
     private var hasActiveRun: Bool {
@@ -265,6 +282,7 @@ struct IdeaDetailView: View {
                                 }
                             }
                         }
+                        .accessibilityIdentifier("run-row-\(run.workflowTitle)")
                     }
                 }
             }
@@ -272,7 +290,12 @@ struct IdeaDetailView: View {
         .formStyle(.grouped)
         .navigationTitle(idea.title)
         .sheet(isPresented: $showStartRunSheet) {
-            WorkflowStartRunSheet(idea: idea)
+            WorkflowStartRunSheet(idea: idea) { run in
+                autoOpenedRun = run
+            }
+        }
+        .navigationDestination(item: $autoOpenedRun) { run in
+            WorkflowRunProgressView(run: run)
         }
     }
 
@@ -317,18 +340,94 @@ struct WorkflowStartRunSheet: View {
     @Environment(ExecutionService.self) private var executionService
 
     let idea: Idea
+    var onRunStarted: ((Run) -> Void)? = nil
 
     @State private var compileState: CompileState = .idle
     @State private var compiledPlan: RunPlan?
-    @State private var workflowURL: URL?
+    @State private var workflowURLs: [WorkflowPreset: URL] = [:]
     @State private var catalogURL: URL?
     @State private var isStarting = false
+    @State private var selectedMode: ExecutionMode = .simulated
+    @State private var selectedWorkflow: WorkflowPreset = .canonicalRelease
 
     private enum CompileState: Equatable {
         case idle
         case compiling
         case success(stateCount: Int, agentCount: Int)
         case error(String)
+    }
+
+    private enum ExecutionMode: String, CaseIterable, Identifiable {
+        case simulated
+        case live
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .simulated: return "Simulated"
+            case .live: return "Live"
+            }
+        }
+    }
+
+    private enum WorkflowPreset: String, CaseIterable, Identifiable {
+        case canonicalRelease
+        case proposalLoopLive
+
+        var id: String { rawValue }
+
+        var mode: ExecutionMode {
+            switch self {
+            case .canonicalRelease: return .simulated
+            case .proposalLoopLive: return .live
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .canonicalRelease: return "Canonical Workflow"
+            case .proposalLoopLive: return "Proposal Loop (Live)"
+            }
+        }
+
+        var relativePath: String {
+            switch self {
+            case .canonicalRelease:
+                return "examples/workflows/workflow.yaml"
+            case .proposalLoopLive:
+                return "examples/workflows/proposal-loop-live.yaml"
+            }
+        }
+
+        var bundleResourceName: String? {
+            switch self {
+            case .canonicalRelease:
+                return "workflow"
+            case .proposalLoopLive:
+                return "proposal-loop-live"
+            }
+        }
+    }
+
+    private var availableWorkflows: [WorkflowPreset] {
+        WorkflowPreset.allCases.filter { $0.mode == selectedMode }
+    }
+
+    private var selectedWorkflowURL: URL? {
+        workflowURLs[selectedWorkflow]
+    }
+
+    private var availableModes: [ExecutionMode] {
+        executionService.supportsLiveExecution ? ExecutionMode.allCases : [.simulated]
+    }
+
+    private var liveModeConfigured: Bool {
+        executionService.supportsLiveExecution
+    }
+
+    private var liveModeRequiresConfiguration: Bool {
+        selectedMode == .live && !liveModeConfigured
     }
 
     var body: some View {
@@ -364,11 +463,76 @@ struct WorkflowStartRunSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            GroupBox("Run Mode") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Execution Mode", selection: $selectedMode) {
+                        ForEach(availableModes) { mode in
+                            Text(mode.title)
+                                .accessibilityIdentifier("execution-mode-\(mode.id)")
+                                .tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("execution-mode-picker")
+
+                    Picker("Workflow", selection: $selectedWorkflow) {
+                        ForEach(availableWorkflows) { workflow in
+                            Text(workflow.title)
+                                .accessibilityIdentifier("workflow-preset-\(workflow.id)")
+                                .tag(workflow)
+                        }
+                    }
+                    .accessibilityIdentifier("workflow-preset-picker")
+
+                    if !liveModeConfigured {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label(
+                                "Live runtime is unavailable.",
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            Text("Missing prerequisite: `CHAINWORKS_GOOSE_BASE_URL` or `CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success`.")
+                            Text("Recovery: relaunch the app with live runtime configuration to unlock `Proposal Loop (Live)`.")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("live-runtime-missing-block")
+                    } else if selectedMode == .live {
+                        if let liveRuntimeConfiguration = executionService.liveRuntimeConfiguration {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label(
+                                    "Live runtime: \(liveRuntimeConfiguration.summary)",
+                                    systemImage: "bolt.horizontal.circle"
+                                )
+                                Label("Source: \(liveRuntimeConfiguration.sourceDescription)", systemImage: "server.rack")
+                                Label("Safety: read-only workspace, no git/release side effects", systemImage: "lock.shield")
+                                if let compiledPlan {
+                                    let liveAgents = compiledPlan.agentBindings.values
+                                        .sorted { $0.title < $1.title }
+                                        .map { "\($0.title) (\($0.id))" }
+                                    Label("Resolved live agents: \(liveAgents.count)", systemImage: "person.3.sequence")
+                                    Text(liveAgents.joined(separator: ", "))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                            .accessibilityIdentifier("live-runtime-config-block")
+                        }
+                    } else {
+                        Label("Simulated mode uses the canonical local executor.", systemImage: "checkmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             GroupBox("Compilation Preview") {
                 VStack(alignment: .leading, spacing: 8) {
                     switch compileState {
                     case .idle:
-                        Text("Compile to validate `workflow.yaml` and `agents.yaml` before starting.")
+                        Text("Compile to validate `\(selectedWorkflow.relativePath)` and `agents.yaml` before starting.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
@@ -396,6 +560,11 @@ struct WorkflowStartRunSheet: View {
                                 Text("Workflow hash: \(compiledPlan.workflowSnapshotHash)")
                                     .lineLimit(1)
                                     .truncationMode(.middle)
+                                if selectedMode == .live {
+                                    Text("Executor: Goose-backed live execution")
+                                } else {
+                                    Text("Executor: Simulated")
+                                }
                             }
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
@@ -429,24 +598,41 @@ struct WorkflowStartRunSheet: View {
                     startRun()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(compiledPlan == nil || isStarting || compileState == .compiling)
+                .disabled(compiledPlan == nil || isStarting || compileState == .compiling || liveModeRequiresConfiguration)
                 .accessibilityIdentifier("workflow-start-run-confirm-button")
             }
         }
         .padding(20)
-        .frame(minWidth: 520, minHeight: 400)
+        .frame(minWidth: 520, minHeight: 480)
         .task {
             resolveURLs()
+            selectedMode = availableModes.contains(selectedMode) ? selectedMode : .simulated
+            selectedWorkflow = availableWorkflows.first ?? .canonicalRelease
+            compile()
+        }
+        .onChange(of: selectedMode) { _, newMode in
+            if let firstWorkflow = WorkflowPreset.allCases.first(where: { $0.mode == newMode }) {
+                selectedWorkflow = firstWorkflow
+            }
+            compile()
+        }
+        .onChange(of: selectedWorkflow) { _, _ in
             compile()
         }
     }
 
     private func resolveURLs() {
-        workflowURL = resolveExistingFile(at: [
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("examples/workflows/workflow.yaml"),
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/examples/workflows/workflow.yaml"),
-            Bundle.main.url(forResource: "workflow", withExtension: "yaml")
-        ])
+        workflowURLs = Dictionary(uniqueKeysWithValues: WorkflowPreset.allCases.compactMap { preset in
+            let bundleURL = preset.bundleResourceName.flatMap { Bundle.main.url(forResource: $0, withExtension: "yaml") }
+            guard let url = resolveExistingFile(at: [
+                URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(preset.relativePath),
+                URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/\(preset.relativePath)"),
+                bundleURL
+            ]) else {
+                return nil
+            }
+            return (preset, url)
+        })
 
         catalogURL = resolveExistingFile(at: [
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("examples/agents/agents.yaml"),
@@ -463,7 +649,7 @@ struct WorkflowStartRunSheet: View {
     }
 
     private func compile() {
-        guard let workflowURL, let catalogURL else {
+        guard let workflowURL = selectedWorkflowURL, let catalogURL else {
             compileState = .error("Unable to locate workflow or agent catalog")
             compiledPlan = nil
             return
@@ -486,7 +672,7 @@ struct WorkflowStartRunSheet: View {
     }
 
     private func startRun() {
-        guard let compiledPlan else { return }
+        guard let compiledPlan, let workflowURL = selectedWorkflowURL else { return }
         isStarting = true
 
         do {
@@ -494,11 +680,13 @@ struct WorkflowStartRunSheet: View {
             let (run, workspace) = try compiler.createRun(
                 for: idea,
                 plan: compiledPlan,
-                workflowSourcePath: workflowURL?.path ?? "",
+                workflowSourcePath: workflowURL.path,
                 catalogSourcePath: catalogURL?.path ?? ""
             )
             idea.status = .active
+            try? modelContext.save()
             executionService.startRun(run: run, plan: compiledPlan, workspace: workspace)
+            onRunStarted?(run)
             dismiss()
         } catch {
             compileState = .error("Failed to start run: \(error.localizedDescription)")
@@ -539,8 +727,41 @@ struct WorkflowRunProgressView: View {
             .sorted { $0.createdAt > $1.createdAt }
     }
 
+    private var orchestrator: WorkflowOrchestrator? {
+        executionService.orchestrator(for: run.id)
+    }
+
+    private var liveTimeline: [LiveExecutionTimelineEntry] {
+        orchestrator?.liveTimeline.reversed() ?? []
+    }
+
     private var pendingApprovalRequest: ApprovalRequest? {
         executionService.pendingApprovals.values.first { $0.runID == run.id }
+    }
+
+    private var currentStageExecution: StageExecution? {
+        sortedStages.last
+    }
+
+    private var latestMeaningfulEvent: LiveExecutionTimelineEntry? {
+        liveTimeline.first(where: { $0.event.type != .textChunk }) ?? liveTimeline.first
+    }
+
+    private var nextActionText: String {
+        switch run.status {
+        case .waitingApproval:
+            return "Approve or reject the current proposal."
+        case .blocked:
+            return run.driftDetails ?? "Inspect the blocked stage and decide whether to resume."
+        case .failed:
+            return "Inspect receipts and artifacts, then retry or adjust the workflow."
+        case .completed:
+            return "Review the completed feature report and generated artifacts."
+        case .running, .pending, .ready:
+            return "Watch live progress and inspect artifacts as they arrive."
+        case .cancelled:
+            return "Run was cancelled."
+        }
     }
 
     var body: some View {
@@ -548,9 +769,17 @@ struct WorkflowRunProgressView: View {
             Section("Overview") {
                 LabeledContent("Workflow", value: run.workflowTitle)
                 LabeledContent("Status", value: run.status.rawValue)
+                    .accessibilityIdentifier("run-status-\(run.status.rawValue)")
                 LabeledContent("Current Stage", value: run.currentStageID ?? "None")
                 LabeledContent("Elapsed", value: elapsedText)
                 LabeledContent("Total Cost", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+            }
+
+            Section("Current Phase") {
+                LabeledContent("Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
+                LabeledContent("Latest Event", value: latestMeaningfulEvent?.event.detail ?? "Waiting for the next execution event")
+                LabeledContent("Next Action", value: nextActionText)
             }
 
             if let pendingApprovalRequest {
@@ -625,6 +854,37 @@ struct WorkflowRunProgressView: View {
                 }
             }
 
+            if !liveTimeline.isEmpty {
+                Section("Live Timeline") {
+                    ForEach(liveTimeline) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(entry.agentTitle)
+                                    .font(.headline)
+                                Spacer()
+                                Text(entry.event.type.rawValue)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(entry.event.detail)
+                                .font(.caption)
+                            HStack(spacing: 10) {
+                                Text(entry.stageID)
+                                if let sessionID = entry.event.sessionID {
+                                    Text("Session \(sessionID)")
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Text(entry.event.timestamp, format: .dateTime.hour().minute().second())
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
             Section("Active Agents") {
                 if activeAgents.isEmpty {
                     Text(run.status == .completed ? "No active agents." : "No agents are currently executing.")
@@ -677,6 +937,7 @@ struct WorkflowRunProgressView: View {
             }
         }
         .navigationTitle(run.workflowTitle)
+        .accessibilityIdentifier("run-progress-view")
         .sheet(item: $selectedStage) { stage in
             WorkflowStageDetailView(stageExecution: stage, run: run)
         }
@@ -793,6 +1054,7 @@ struct WorkflowStageDetailView: View {
             }
         }
         .frame(minWidth: 560, minHeight: 420)
+        .accessibilityIdentifier("stage-detail-view")
         .sheet(item: $selectedArtifact) { artifact in
             WorkflowArtifactInspectorView(run: run, artifact: artifact)
         }
@@ -826,14 +1088,36 @@ struct WorkflowArtifactInspectorView: View {
             Divider()
 
             ScrollView {
-                Text(renderedContent)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if artifact.format == .markdown {
+                    // Render markdown with full block-level support (proposal contract REQ-010)
+                    let attributed = (try? AttributedString(markdown: renderedContent,
+                                                            options: .init(interpretedSyntax: .full))) ?? AttributedString(renderedContent)
+                    Text(attributed)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                } else if artifact.format == .diff {
+                    // Diff: monospaced with color per line
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(renderedContent.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(line.hasPrefix("+") ? .green : line.hasPrefix("-") ? .red : line.hasPrefix("@@") ? .blue : .primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                     .textSelection(.enabled)
-                    .font(.system(.body, design: .monospaced))
+                } else {
+                    // JSON / report: monospaced
+                    Text(renderedContent)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .font(.system(.body, design: .monospaced))
+                }
             }
         }
         .padding()
         .frame(minWidth: 640, minHeight: 480)
+        .accessibilityIdentifier("artifact-inspector-view")
         .task(id: artifact.id) {
             renderedContent = loadContent()
         }
