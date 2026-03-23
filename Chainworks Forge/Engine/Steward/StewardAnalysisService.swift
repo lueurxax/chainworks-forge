@@ -3,6 +3,12 @@ import SwiftData
 
 /// Orchestrates the V1 Steward meta-workflow (steps 1-8).
 /// Runs entirely over persisted run data. No in-app Steward UI.
+///
+/// Proposal 003 contract obligations fulfilled:
+/// - REQ-003: Validates `steward_config.yaml` before running.
+/// - REQ-006: Partitions by primary cohort key `(workflowFamily, riskClass)`.
+/// - REQ-009: Executes `system_steward` agent and writes `health-report.json`.
+/// - REQ-010: Executes `steward_auditor` agent and writes audit report.
 @MainActor
 final class StewardAnalysisService {
     let modelContext: ModelContext
@@ -22,8 +28,29 @@ final class StewardAnalysisService {
         self.catalog = catalog
     }
 
+    // MARK: - Errors
+
+    enum AnalysisError: Error, LocalizedError {
+        case configValidationFailed([ValidationIssue])
+
+        var errorDescription: String? {
+            switch self {
+            case .configValidationFailed(let issues):
+                let errors = issues.filter { $0.severity == .error }
+                return "Steward config validation failed with \(errors.count) error(s): \(errors.map(\.message).joined(separator: "; "))"
+            }
+        }
+    }
+
     /// Run a complete V1 Steward analysis (meta-workflow steps 1-8).
     func runAnalysis() async throws -> StewardAnalysis {
+        // REQ-003: Validate steward_config before running.
+        let validationIssues = YAMLValidator.validateStewardConfig(stewardConfig)
+        let errors = validationIssues.filter { $0.severity == .error }
+        if !errors.isEmpty {
+            throw AnalysisError.configValidationFailed(validationIssues)
+        }
+
         let analysisID = UUID()
         let windows = stewardConfig.windows
 
@@ -34,13 +61,24 @@ final class StewardAnalysisService {
         let allRuns = try modelContext.fetch(fetchDescriptor)
         let completedRuns = allRuns.filter { $0.status == .completed }
 
-        // Step 2: Split into observation and baseline windows
+        // REQ-006: Partition by primary cohort key `(workflowFamily, riskClass)`.
+        // Runs with different primary keys are NEVER compared directly.
+        let primaryCohortRuns = selectPrimaryCohort(from: completedRuns)
+
+        // Step 2: Split into observation and baseline windows (over the primary cohort)
         let (observationRuns, baselineRuns) = CohortClassifier.splitWindows(
-            runs: completedRuns,
+            runs: primaryCohortRuns,
             observationSize: windows.observationWindowSize,
             baselineSize: windows.baselineWindowSize,
             maximumAgeDays: windows.maximumWindowAgeDays
         )
+
+        // REQ-006: Log `sample_too_small` event when windows are insufficient.
+        let isInconclusive = observationRuns.count < windows.minimumWindowSize
+            || baselineRuns.count < windows.minimumWindowSize
+        if isInconclusive {
+            print("[Steward] sample_too_small: observation=\(observationRuns.count), baseline=\(baselineRuns.count), minimum=\(windows.minimumWindowSize). Analysis will be marked inconclusive.")
+        }
 
         // Step 3: Classify cohort quality
         let cohortQuality = CohortClassifier.classifyQuality(runs: observationRuns)
@@ -71,7 +109,7 @@ final class StewardAnalysisService {
             for: implicatedRuns.isEmpty ? Array(observationRuns.prefix(5)) : implicatedRuns
         )
 
-        // Step 7: Write deterministic artifacts to disk
+        // Step 7a: Write deterministic artifacts to disk
         let workspacePath = stewardWorkspacePath(for: analysisID)
         try FileManager.default.createDirectory(atPath: workspacePath, withIntermediateDirectories: true)
 
@@ -80,13 +118,16 @@ final class StewardAnalysisService {
         encoder.dateEncodingStrategy = .iso8601
 
         let metricsPath = "\(workspacePath)/metrics-window.json"
-        try encoder.encode(observationMetrics).write(to: URL(fileURLWithPath: metricsPath))
+        let metricsData = try encoder.encode(observationMetrics)
+        try metricsData.write(to: URL(fileURLWithPath: metricsPath))
 
         let baselinePath = "\(workspacePath)/baseline-window.json"
-        try encoder.encode(baselineMetrics).write(to: URL(fileURLWithPath: baselinePath))
+        let baselineData = try encoder.encode(baselineMetrics)
+        try baselineData.write(to: URL(fileURLWithPath: baselinePath))
 
         let dossiersDir = "\(workspacePath)/dossiers"
         try FileManager.default.createDirectory(atPath: dossiersDir, withIntermediateDirectories: true)
+        let dossiersData = try encoder.encode(dossiers)
         for dossier in dossiers {
             let dossierPath = "\(dossiersDir)/\(dossier.runID.uuidString).json"
             try encoder.encode(dossier).write(to: URL(fileURLWithPath: dossierPath))
@@ -107,9 +148,104 @@ final class StewardAnalysisService {
         let stewardConfigHash = (try? DefinitionHasher.hash(stewardConfig).sha256) ?? "unknown"
 
         let reportPath = "\(workspacePath)/health-report.json"
+        let auditReportPath = "\(workspacePath)/audit-report.json"
 
-        let isInconclusive = observationRuns.count < windows.minimumWindowSize
-            || baselineRuns.count < windows.minimumWindowSize
+        // Step 7b — REQ-009: Execute system_steward agent and write health-report.json.
+        var healthReportData: Data?
+        if let resolvedSteward = resolveAgent(id: "system_steward") {
+            let stewardInputs: [String: Data] = [
+                "metrics_window": metricsData,
+                "baseline_window": baselineData,
+                "implicated_run_dossiers": dossiersData,
+            ]
+
+            let task = AgentTask(
+                agent: "system_steward",
+                task: "sdlc_health_analysis",
+                inputs: ["metrics_window", "baseline_window", "implicated_run_dossiers"],
+                outputs: ["sdlc_health_report"]
+            )
+
+            let stewardWorkspace = RunWorkspace(
+                runID: analysisID,
+                workspaceRoot: URL(fileURLWithPath: workspacePath),
+                artifactRoot: URL(fileURLWithPath: workspacePath).appendingPathComponent("artifacts"),
+                worktreeRoot: nil
+            )
+
+            let context = ExecutionContext(
+                workspace: stewardWorkspace,
+                stageID: "steward_analysis",
+                iteration: 1,
+                attemptNumber: 1,
+                inputArtifacts: stewardInputs,
+                variables: [:],
+                ideaBody: ""
+            )
+
+            do {
+                let result = try await executor.execute(task: task, agent: resolvedSteward, context: context)
+                if result.succeeded, let reportData = result.outputs["sdlc_health_report"] {
+                    try reportData.write(to: URL(fileURLWithPath: reportPath))
+                    healthReportData = reportData
+                    print("[Steward] health-report.json written to \(reportPath)")
+                }
+            } catch {
+                print("[Steward] system_steward execution failed: \(error.localizedDescription)")
+            }
+        } else {
+            print("[Steward] system_steward agent not found in catalog — skipping agentic analysis.")
+        }
+
+        // Step 7c — REQ-010: Execute steward_auditor and write audit report.
+        var auditArtifactPath: String?
+        if let resolvedAuditor = resolveAgent(id: "steward_auditor"),
+           let healthReport = healthReportData {
+            let auditorInputs: [String: Data] = [
+                "sdlc_health_report": healthReport,
+                "metrics_window": metricsData,
+                "baseline_window": baselineData,
+                "implicated_run_dossiers": dossiersData,
+            ]
+
+            let task = AgentTask(
+                agent: "steward_auditor",
+                task: "challenge_steward_analysis",
+                inputs: ["sdlc_health_report", "metrics_window", "baseline_window", "implicated_run_dossiers"],
+                outputs: ["stewardship_audit_report"]
+            )
+
+            let auditWorkspace = RunWorkspace(
+                runID: analysisID,
+                workspaceRoot: URL(fileURLWithPath: workspacePath),
+                artifactRoot: URL(fileURLWithPath: workspacePath).appendingPathComponent("artifacts"),
+                worktreeRoot: nil
+            )
+
+            let context = ExecutionContext(
+                workspace: auditWorkspace,
+                stageID: "steward_audit",
+                iteration: 1,
+                attemptNumber: 1,
+                inputArtifacts: auditorInputs,
+                variables: [:],
+                ideaBody: ""
+            )
+
+            do {
+                let result = try await executor.execute(task: task, agent: resolvedAuditor, context: context)
+                if result.succeeded, let auditData = result.outputs["stewardship_audit_report"] {
+                    try auditData.write(to: URL(fileURLWithPath: auditReportPath))
+                    auditArtifactPath = auditReportPath
+                    print("[Steward] audit-report.json written to \(auditReportPath)")
+                }
+            } catch {
+                print("[Steward] steward_auditor execution failed: \(error.localizedDescription)")
+            }
+        } else if healthReportData != nil {
+            print("[Steward] steward_auditor agent not found in catalog — skipping audit.")
+        }
+
         let analysisStatus: AnalysisStatus = isInconclusive ? .inconclusive : .completed
 
         // Step 8: Persist StewardAnalysis
@@ -124,6 +260,7 @@ final class StewardAnalysisService {
             baselineSnapshotPath: baselinePath,
             degradationsDetected: signals.count,
             reportArtifactPath: reportPath,
+            auditArtifactPath: auditArtifactPath,
             status: analysisStatus,
             workflowCatalogSnapshotHash: workflowCatalogHash,
             stewardConfigSnapshotHash: stewardConfigHash
@@ -159,6 +296,61 @@ final class StewardAnalysisService {
 
         try modelContext.save()
         return analysis
+    }
+
+    // MARK: - Primary Cohort Selection (Proposal 003 — REQ-006)
+
+    /// Select the most populous primary cohort from completed runs.
+    /// Primary grouping key: `(workflowFamily, riskClass)`.
+    /// Runs with different primary keys are NEVER compared directly.
+    private func selectPrimaryCohort(from completedRuns: [Run]) -> [Run] {
+        // Group by primary key
+        let groups = Dictionary(grouping: completedRuns) { run -> String in
+            let wf = run.workflowFamily ?? "default"
+            let rc = (run.riskClass ?? .standard).rawValue
+            return "\(wf)|\(rc)"
+        }
+
+        // Select the largest group for analysis
+        guard let largest = groups.max(by: { $0.value.count < $1.value.count }) else {
+            return completedRuns
+        }
+
+        if groups.count > 1 {
+            print("[Steward] Found \(groups.count) primary cohort groups. Analyzing largest: '\(largest.key)' (\(largest.value.count) runs). Other groups excluded per cohorting contract.")
+        }
+
+        return largest.value
+    }
+
+    // MARK: - Agent Resolution (Proposal 003 — REQ-009, REQ-010)
+
+    /// Resolve an agent from the catalog into a `ResolvedAgent` for execution.
+    private func resolveAgent(id agentID: String) -> ResolvedAgent? {
+        guard let catalog else { return nil }
+        guard let agentDef = catalog.agents.first(where: { $0.id == agentID }) else { return nil }
+        guard let backend = catalog.backendProfiles[agentDef.backendProfile] else {
+            print("[Steward] Backend profile '\(agentDef.backendProfile)' not found for agent '\(agentID)'")
+            return nil
+        }
+        return ResolvedAgent(
+            id: agentDef.id,
+            title: agentDef.title,
+            mode: agentDef.mode,
+            provider: backend.provider,
+            model: backend.model,
+            effort: backend.effort,
+            maxTurns: backend.maxTurns,
+            temperature: backend.temperature,
+            permissionProfile: agentDef.permissionProfile,
+            skillRef: agentDef.skillRef,
+            skillRole: agentDef.skillRole,
+            prompt: agentDef.prompt,
+            outputContract: agentDef.outputContract,
+            requiresHumanApproval: agentDef.requiresHumanApproval,
+            inputs: agentDef.inputs,
+            outputs: agentDef.outputs
+        )
     }
 
     // MARK: - Helpers

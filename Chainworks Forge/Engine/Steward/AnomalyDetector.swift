@@ -16,9 +16,12 @@ struct AnomalyDetector: Sendable {
         observationRunIDs: [UUID],
         cohortQuality: CohortQuality
     ) -> [DegradationSignal] {
-        // Refuse to produce findings with insufficient data
+        // Refuse to produce findings with insufficient data (Proposal 003 — REQ-006).
+        // The anomaly detector must refuse to flag a degradation when sample size < minimumWindowSize
+        // and log a `sample_too_small` event instead of silently returning empty results.
         guard observation.runCount >= minimumWindowSize,
               baseline.runCount >= max(minimumWindowSize, 3) else {
+            print("[Steward] sample_too_small: observation=\(observation.runCount), baseline=\(baseline.runCount), minimum=\(minimumWindowSize). Refusing to produce findings.")
             return []
         }
 

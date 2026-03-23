@@ -96,17 +96,10 @@ struct IdeaListView: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             }
-            switch executionService.liveRuntimeReadiness {
-            case .ready(_, let source):
-                Label("Live ready (\(source))", systemImage: "bolt.horizontal.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-                    .accessibilityIdentifier("live-runtime-ready")
-            case .unavailable:
-                Label("Live unavailable", systemImage: "exclamationmark.triangle.fill")
+            if executionService.pendingApprovalCount > 0 {
+                Label("\(executionService.pendingApprovalCount) approvals", systemImage: "checkmark.circle")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                    .accessibilityIdentifier("live-runtime-unavailable")
             }
         }
         .font(.caption)
@@ -419,11 +412,11 @@ struct WorkflowStartRunSheet: View {
     }
 
     private var availableModes: [ExecutionMode] {
-        executionService.supportsLiveExecution ? ExecutionMode.allCases : [.simulated]
+        [.simulated]
     }
 
     private var liveModeConfigured: Bool {
-        executionService.supportsLiveExecution
+        false
     }
 
     private var liveModeRequiresConfiguration: Bool {
@@ -496,29 +489,6 @@ struct WorkflowStartRunSheet: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .accessibilityIdentifier("live-runtime-missing-block")
-                    } else if selectedMode == .live {
-                        if let liveRuntimeConfiguration = executionService.liveRuntimeConfiguration {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Label(
-                                    "Live runtime: \(liveRuntimeConfiguration.summary)",
-                                    systemImage: "bolt.horizontal.circle"
-                                )
-                                Label("Source: \(liveRuntimeConfiguration.sourceDescription)", systemImage: "server.rack")
-                                Label("Safety: read-only workspace, no git/release side effects", systemImage: "lock.shield")
-                                if let compiledPlan {
-                                    let liveAgents = compiledPlan.agentBindings.values
-                                        .sorted { $0.title < $1.title }
-                                        .map { "\($0.title) (\($0.id))" }
-                                    Label("Resolved live agents: \(liveAgents.count)", systemImage: "person.3.sequence")
-                                    Text(liveAgents.joined(separator: ", "))
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.green)
-                            .accessibilityIdentifier("live-runtime-config-block")
-                        }
                     } else {
                         Label("Simulated mode uses the canonical local executor.", systemImage: "checkmark.circle")
                             .font(.caption)

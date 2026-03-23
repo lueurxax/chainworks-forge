@@ -17,4 +17,11 @@ struct DefinitionHasher: Sendable {
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return (data, hex)
     }
+
+    /// Compute SHA-256 of a raw string (for config hashes that don't come from Encodable values).
+    nonisolated static func hashString(_ value: String) -> String {
+        let data = Data(value.utf8)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
 }

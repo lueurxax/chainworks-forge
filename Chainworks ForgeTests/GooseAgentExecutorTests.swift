@@ -8,6 +8,27 @@ import Foundation
 /// Tests session creation, streaming, receipt persistence, output validation, and result building.
 final class GooseAgentExecutorTests: XCTestCase {
 
+    // MARK: - Thread-Safe Event Collector
+
+    /// Thread-safe collector for execution events.
+    /// Avoids unsafe mutation of captured vars in @Sendable closures.
+    final class EventCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _events: [ExecutionEvent] = []
+
+        func append(_ event: ExecutionEvent) {
+            lock.lock()
+            _events.append(event)
+            lock.unlock()
+        }
+
+        var events: [ExecutionEvent] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _events
+        }
+    }
+
     // MARK: - Test Doubles
 
     /// Mock transport that returns pre-configured responses without real HTTP.
@@ -119,6 +140,7 @@ final class GooseAgentExecutorTests: XCTestCase {
     // MARK: - Tests
 
     /// testGooseExecutorCreatesSession — Section 12.1
+    @MainActor
     func testGooseExecutorCreatesSession() async throws {
         let mockTransport = MockGooseTransport()
         mockTransport.createSessionResult = GooseSessionResponse(
@@ -149,6 +171,7 @@ final class GooseAgentExecutorTests: XCTestCase {
     }
 
     /// testGooseExecutorStreamsEvents — Section 12.1
+    @MainActor
     func testGooseExecutorStreamsEvents() async throws {
         let mockTransport = MockGooseTransport()
         mockTransport.streamEvents = [
@@ -161,10 +184,11 @@ final class GooseAgentExecutorTests: XCTestCase {
             .sessionClosed(raw: "{}")
         ]
 
-        var receivedEvents: [ExecutionEvent] = []
+        // Use thread-safe collection to avoid concurrent mutation of captured var
+        let eventCollector = EventCollector()
         let executor = GooseAgentExecutor(transport: mockTransport)
         executor.onExecutionEvent = { _, event in
-            receivedEvents.append(event)
+            eventCollector.append(event)
         }
 
         let agent = makeAgent(outputs: ["test_output.md"])
@@ -175,6 +199,7 @@ final class GooseAgentExecutorTests: XCTestCase {
         _ = try await executor.execute(task: task, agent: agent, context: context)
 
         // Should have received multiple events
+        let receivedEvents = eventCollector.events
         XCTAssertTrue(receivedEvents.count >= 5, "Should receive at least 5 events, got \(receivedEvents.count)")
 
         let eventTypes = receivedEvents.map(\.type)
@@ -185,6 +210,7 @@ final class GooseAgentExecutorTests: XCTestCase {
     }
 
     /// testGooseExecutorPersistsReceiptArtifact — Section 12.1
+    @MainActor
     func testGooseExecutorPersistsReceiptArtifact() async throws {
         let mockTransport = MockGooseTransport()
         mockTransport.streamEvents = [
@@ -206,8 +232,10 @@ final class GooseAgentExecutorTests: XCTestCase {
         XCTAssertNotNil(receiptKey, "Should produce a receipt artifact")
 
         if let key = receiptKey, let data = result.outputs[key] {
-            // Parse the receipt JSON
-            let receipt = try JSONDecoder().decode(ExecutionReceipt.self, from: data)
+            // Parse the receipt JSON (must match encoder's .iso8601 date strategy)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let receipt = try decoder.decode(ExecutionReceipt.self, from: data)
             XCTAssertEqual(receipt.agentID, "proposal_writer")
             XCTAssertTrue(receipt.succeeded)
             XCTAssertEqual(receipt.receiptVersion, "1.0")
@@ -215,6 +243,7 @@ final class GooseAgentExecutorTests: XCTestCase {
     }
 
     /// testGooseExecutorFailsWhenRequiredOutputsMissing — Section 12.1
+    @MainActor
     func testGooseExecutorFailsWhenRequiredOutputsMissing() async throws {
         let mockTransport = MockGooseTransport()
         // Stream completes but no files are written and no final output
@@ -238,6 +267,7 @@ final class GooseAgentExecutorTests: XCTestCase {
     }
 
     /// testGooseExecutorReturnsAgentResult — Section 12.1
+    @MainActor
     func testGooseExecutorReturnsAgentResult() async throws {
         let mockTransport = MockGooseTransport()
         mockTransport.streamEvents = [
@@ -264,6 +294,7 @@ final class GooseAgentExecutorTests: XCTestCase {
     }
 
     /// testGooseExecutorSessionCreationFailure
+    @MainActor
     func testGooseExecutorSessionCreationFailure() async throws {
         let mockTransport = MockGooseTransport()
         mockTransport.createSessionError = GooseTransportError.httpError(

@@ -122,6 +122,13 @@ struct RunRepository {
             planCompilerVersion: plan.planCompilerVersion
         )
         run.idea = idea
+
+        // Proposal 003 — REQ-002: Populate mandatory cohort metadata at run creation.
+        run.workflowFamily = Self.deriveWorkflowFamily(from: plan.workflowID)
+        run.projectKey = Self.deriveProjectKey(from: idea)
+        run.riskClass = .standard
+        run.stack = "unknown"
+
         context.insert(run)
         return run
     }
@@ -130,6 +137,33 @@ struct RunRepository {
     func activeRun(for idea: Idea) -> Run? {
         let activeStatuses: [RunStatus] = [.pending, .ready, .running, .waitingApproval, .blocked]
         return idea.runs.first(where: { activeStatuses.contains($0.status) })
+    }
+
+    // MARK: - Cohort Metadata Derivation (Proposal 003 — REQ-002)
+
+    /// Derive `workflowFamily` from the workflow ID.
+    /// e.g. "proposal_to_release_v1" → "proposal_to_release".
+    private static func deriveWorkflowFamily(from workflowID: String) -> String {
+        let components = workflowID.split(separator: "_")
+        // Strip a trailing version component like "v1", "v2"
+        if components.count > 1,
+           let last = components.last,
+           last.count <= 3,
+           last.hasPrefix("v"),
+           last.dropFirst().allSatisfy(\.isNumber) {
+            return components.dropLast().joined(separator: "_")
+        }
+        return workflowID
+    }
+
+    /// Derive `projectKey` from the idea.
+    /// Falls back to `"untagged"` per the cohorting contract.
+    private static func deriveProjectKey(from idea: Idea) -> String {
+        let title = idea.title
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "_")
+        return title.isEmpty ? "untagged" : title
     }
 }
 
