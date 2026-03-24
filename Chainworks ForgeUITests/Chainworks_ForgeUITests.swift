@@ -19,8 +19,12 @@ final class Chainworks_ForgeUITests: XCTestCase {
         seedWaitingApprovalRun: Bool = false
     ) -> XCUIApplication {
         let app = XCUIApplication()
+        // Prevent macOS scene restoration from opening stale windows that
+        // overlap the test window and cause XCUITest to click hidden elements.
+        app.launchArguments += ["-NSQuitAlwaysKeepsWindows", "NO"]
         app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = "1"
         app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
+        app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
         if let seededIdeaTitle {
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"] = seededIdeaTitle
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_BODY"] = seededIdeaBody
@@ -37,6 +41,21 @@ final class Chainworks_ForgeUITests: XCTestCase {
         return app
     }
 
+    /// Launches the app and verifies scene restoration did not create extra windows.
+    /// If extra windows are detected despite the launch arguments, logs a warning
+    /// and attempts to bring the primary window to front.
+    private func launchClean(_ app: XCUIApplication) {
+        app.launch()
+        // If scene restoration still created extra windows, bring primary to front
+        if app.windows.count > 1 {
+            let primaryWindow = app.windows.firstMatch
+            if primaryWindow.exists {
+                primaryWindow.click()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            }
+        }
+    }
+
     /// Takes an evidence screenshot. Silently skips if app has crashed/terminated.
     private func screenshot(_ app: XCUIApplication, name: String) {
         guard app.state != .notRunning && app.state != .unknown else { return }
@@ -49,6 +68,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
+
     override func tearDownWithError() throws {}
 
     // MARK: - PROD-PA-001: Scaffold Walkthrough < 60 seconds
@@ -56,7 +76,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     func testProductCheckpointScaffoldFlowUnder60Seconds() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
         let app = makeApp()
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
 
@@ -102,7 +122,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     func testProductCheckpointExecutionFlowReachable() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
         let app = makeApp(seededIdeaTitle: "Execution Test", liveFixture: true)
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -133,7 +153,10 @@ final class Chainworks_ForgeUITests: XCTestCase {
             screenshot(app, name: "PA002_04_RunStarted")
 
             if app.state != .notRunning {
-                screen.tab("Approvals").click()
+                // Use selectTab with retry loop — badge-modified accessibility labels
+                // (P005-OPS §10 dock badge) can cause exact-match tab() to miss.
+                let switched = screen.selectTab("Approvals", timeout: 10)
+                XCTAssertTrue(switched, "Approvals tab must be reachable after run start")
                 screenshot(app, name: "PA002_05_Approvals")
             }
         } else {
@@ -148,7 +171,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     func testLiveProposalLoopFixtureFlowReachesApprovalAndCompletion() throws {
         let app = makeApp(seededIdeaTitle: "Live Proposal Proof", liveFixture: true)
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -191,7 +214,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     func testApprovalInboxReachable() throws {
         let app = makeApp(initialTab: "Approvals")
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let approvals = ApprovalInboxScreen(app: app)
@@ -204,11 +227,49 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "REQ011_Approvals")
     }
 
+    func testProviderSettingsTabReachable() throws {
+        let app = makeApp(initialTab: "Settings")
+        launchClean(app)
+
+        let screen = AppScreen(app: app)
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
+                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+
+        XCTAssertTrue(screen.selectTab("Settings"))
+        let providerSettingsRoot = app.otherElements["provider-settings-view"].firstMatch
+        let providerSettingsTitle = app.staticTexts["provider-settings-title"].firstMatch
+        XCTAssertTrue(
+            providerSettingsRoot.waitForExistence(timeout: 10)
+            || providerSettingsTitle.waitForExistence(timeout: 10),
+            "Provider settings surface must render in the Settings tab"
+        )
+        screenshot(app, name: "P006_Settings")
+    }
+
+    func testPilotReadinessTabReachable() throws {
+        let app = makeApp(initialTab: "Pilot Readiness")
+        launchClean(app)
+
+        let screen = AppScreen(app: app)
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
+                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+
+        XCTAssertTrue(screen.selectTab("Pilot Readiness"))
+        let readinessRoot = app.otherElements["pilot-readiness-view"].firstMatch
+        let readinessTitle = app.staticTexts["pilot-readiness-title"].firstMatch
+        XCTAssertTrue(
+            readinessRoot.waitForExistence(timeout: 10)
+            || readinessTitle.waitForExistence(timeout: 10),
+            "Pilot readiness surface must render in the Pilot Readiness tab"
+        )
+        screenshot(app, name: "P006_PilotReadiness")
+    }
+
     // MARK: - REQ-011: Start Run Sheet UI
 
     func testStartRunSheetUI() throws {
         let app = makeApp(seededIdeaTitle: "Sheet Test", liveFixture: true)
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -232,7 +293,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     func testLiveRuntimeUnavailableShowsRecoveryGuidance() throws {
         let app = makeApp(seededIdeaTitle: "Missing Runtime")
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -268,7 +329,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// Verifies the Run Progress view renders its expected sections after starting a run.
     func testRunProgressViewSurface() throws {
         let app = makeApp(seededIdeaTitle: "RunProgressTest", liveFixture: true)
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -324,7 +385,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// Verifies the Approval Gate inline view or Approval Inbox is reachable and shows expected elements.
     func testApprovalGateViewSurface() throws {
         let app = makeApp(initialTab: "Approvals")
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let approvals = ApprovalInboxScreen(app: app)
@@ -351,7 +412,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
             initialTab: "Approvals",
             seedWaitingApprovalRun: true
         )
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let approvals = ApprovalInboxScreen(app: app)
@@ -371,7 +432,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
             liveFixture: true,
             seedWaitingApprovalRun: true
         )
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -424,7 +485,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// Verifies the Stage Detail view is reachable from Run Progress.
     func testStageDetailViewSurface() throws {
         let app = makeApp()
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -474,7 +535,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// Verifies the Artifact Inspector view is reachable from Run Progress artifacts list.
     func testArtifactInspectorViewSurface() throws {
         let app = makeApp()
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
@@ -528,7 +589,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     func testFullProductCheckpointCanonicalExecution() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
         let app = makeApp()
-        app.launch()
+        launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)

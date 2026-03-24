@@ -554,7 +554,8 @@ final class LiveGooseConnectionProofTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: "Live Goose connection proof test"
+            ideaBody: "Live Goose connection proof test",
+            providerBinding: nil
         )
 
         // Execute through the full pipeline

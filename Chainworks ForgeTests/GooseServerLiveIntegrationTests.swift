@@ -31,11 +31,18 @@ final class GooseServerLiveIntegrationTests: XCTestCase {
     private let baseURL = URL(string: "https://127.0.0.1:51200")!
     private let secretKey = "chainworks-dev-secret"
 
+    /// Cached result — avoids creating multiple ephemeral URLSessions per test.
+    private var _shouldRunCached: Bool?
+
     /// Check both env var and live server availability.
     /// Tests skip automatically if goosed is not reachable.
+    /// Result is cached to avoid creating duplicate ephemeral URLSessions.
     private var shouldRun: Bool {
+        if let cached = _shouldRunCached { return cached }
+
         // Allow explicit opt-in via env var
         if ProcessInfo.processInfo.environment["CHAINWORKS_LIVE_INTEGRATION_TEST"] == "1" {
+            _shouldRunCached = true
             return true
         }
         // Also run if goosed is reachable (auto-detect)
@@ -51,8 +58,11 @@ final class GooseServerLiveIntegrationTests: XCTestCase {
                 semaphore.signal()
             }.resume()
             semaphore.wait()
+            session.invalidateAndCancel()
+            _shouldRunCached = reachable
             return reachable
         }
+        _shouldRunCached = false
         return false
     }
 
@@ -91,7 +101,11 @@ final class GooseServerLiveIntegrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: workDir) }
 
         let sessionRequest = GooseSessionRequest(
-            systemPrompt: "You are a test agent.",
+            systemPrompt: """
+            You are a test agent.
+            Do not call xcode_mcp or any IDE/editor MCP tools.
+            Respond directly in plain text.
+            """,
             workingDirectory: workDir.path,
             model: nil,
             provider: nil,

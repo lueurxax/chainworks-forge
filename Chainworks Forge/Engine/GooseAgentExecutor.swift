@@ -65,7 +65,11 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 succeeded: false,
                 errorMessage: "Session creation failed: \(error.localizedDescription)",
                 sessionID: nil,
-                durationSeconds: Date().timeIntervalSince(startedAt)
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                providerReceipt: nil,
+                resolvedModel: context.providerBinding?.model ?? override?.model ?? agent.model,
+                configuredProviderID: context.providerBinding?.configuredProviderID,
+                adapterVersion: context.providerBinding?.adapterVersion
             )
         }
 
@@ -141,7 +145,20 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 succeeded: !salvagedOutputs && !salvaged.isEmpty,
                 errorMessage: salvagedOutputs ? "Stream processing failed: \(error.localizedDescription)" : nil,
                 sessionID: sessionExecution.sessionID,
-                durationSeconds: completedAt.timeIntervalSince(startedAt)
+                durationSeconds: completedAt.timeIntervalSince(startedAt),
+                providerReceipt: UsageReceiptNormalizer.makeReceipt(
+                    providerFamily: context.providerBinding?.providerFamily ?? resolvedProvider,
+                    configuredProviderID: context.providerBinding?.configuredProviderID,
+                    model: context.providerBinding?.model ?? resolvedModel,
+                    effort: context.providerBinding?.effort ?? resolvedEffort,
+                    transport: context.providerBinding?.transport ?? "goose",
+                    costCents: nil,
+                    durationSeconds: completedAt.timeIntervalSince(startedAt),
+                    rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]
+                ),
+                resolvedModel: context.providerBinding?.model ?? resolvedModel,
+                configuredProviderID: context.providerBinding?.configuredProviderID,
+                adapterVersion: context.providerBinding?.adapterVersion
             )
         }
 
@@ -221,7 +238,20 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 succeeded: false,
                 errorMessage: "Required outputs missing: \(missingList)",
                 sessionID: sessionExecution.sessionID,
-                durationSeconds: completedAt.timeIntervalSince(startedAt)
+                durationSeconds: completedAt.timeIntervalSince(startedAt),
+                providerReceipt: UsageReceiptNormalizer.makeReceipt(
+                    providerFamily: context.providerBinding?.providerFamily ?? resolvedProvider,
+                    configuredProviderID: context.providerBinding?.configuredProviderID,
+                    model: context.providerBinding?.model ?? resolvedModel,
+                    effort: context.providerBinding?.effort ?? resolvedEffort,
+                    transport: context.providerBinding?.transport ?? "goose",
+                    costCents: estimateCost(streamResult: streamResult),
+                    durationSeconds: completedAt.timeIntervalSince(startedAt),
+                    rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]
+                ),
+                resolvedModel: context.providerBinding?.model ?? resolvedModel,
+                configuredProviderID: context.providerBinding?.configuredProviderID,
+                adapterVersion: context.providerBinding?.adapterVersion
             )
         }
 
@@ -241,7 +271,20 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             succeeded: true,
             errorMessage: nil,
             sessionID: sessionExecution.sessionID,
-            durationSeconds: completedAt.timeIntervalSince(startedAt)
+            durationSeconds: completedAt.timeIntervalSince(startedAt),
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(
+                providerFamily: context.providerBinding?.providerFamily ?? resolvedProvider,
+                configuredProviderID: context.providerBinding?.configuredProviderID,
+                model: context.providerBinding?.model ?? resolvedModel,
+                effort: context.providerBinding?.effort ?? resolvedEffort,
+                transport: context.providerBinding?.transport ?? "goose",
+                costCents: estimateCost(streamResult: streamResult),
+                durationSeconds: completedAt.timeIntervalSince(startedAt),
+                rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]
+            ),
+            resolvedModel: context.providerBinding?.model ?? resolvedModel,
+            configuredProviderID: context.providerBinding?.configuredProviderID,
+            adapterVersion: context.providerBinding?.adapterVersion
         )
     }
 

@@ -8,7 +8,20 @@ import Foundation
 /// Tests session creation, streaming, receipt persistence, output validation, and result building.
 final class GooseAgentExecutorTests: XCTestCase {
 
-    // MARK: - Thread-Safe Event Collector
+    // MARK: - Temp Directory Tracking
+
+    /// Tracks all temp directories created during this test for reliable cleanup.
+    /// This ensures cleanup happens even when assertions fail (where `defer` may not execute).
+    private var createdTempDirs: [URL] = []
+
+    override func tearDown() async throws {
+        for dir in createdTempDirs {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        createdTempDirs.removeAll()
+    }
+
+    // MARK: - Thread-Safe Event Collector (use SharedEventCollector for new tests)
 
     /// Thread-safe collector for execution events.
     /// Avoids unsafe mutation of captured vars in @Sendable closures.
@@ -121,6 +134,9 @@ final class GooseAgentExecutorTests: XCTestCase {
         // Create directories
         try? FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
 
+        // Track for reliable cleanup in tearDown (even on assertion failure)
+        createdTempDirs.append(tempDir)
+
         let workspace = RunWorkspace(
             runID: runID,
             workspaceRoot: tempDir,
@@ -135,10 +151,12 @@ final class GooseAgentExecutorTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: "Test idea body"
+            ideaBody: "Test idea body",
+            providerBinding: nil
         )
     }
 
+    /// Explicit cleanup for backward compatibility. tearDown also handles this.
     private func cleanupContext(_ context: ExecutionContext) {
         try? FileManager.default.removeItem(at: context.workspace.workspaceRoot)
     }

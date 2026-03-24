@@ -3,6 +3,18 @@ import SwiftData
 
 @main
 struct Chainworks_ForgeApp: App {
+
+    /// Disable macOS window/scene restoration when running under UI tests.
+    /// Without this, `WindowGroup` restores the previous session's window,
+    /// creating two overlapping windows that cause XCUITest element queries
+    /// to find (and click) elements hidden behind the wrong window — leading
+    /// to indefinite hangs.
+    init() {
+        if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+            UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+        }
+    }
+
     var sharedModelContainer: ModelContainer = {
         let environment = ProcessInfo.processInfo.environment
         let schema = Schema([
@@ -73,11 +85,28 @@ struct AppBootstrapMenuBarView: View {
 struct AppBootstrapView: View {
     @Environment(\.modelContext) private var modelContext
     @State private var executionService: ExecutionService?
+    @State private var appConfigurationStore: AppConfigurationStore?
+    @State private var providerSettingsStore: ProviderSettingsStore?
+    @State private var providerRegistry: ProviderRegistry?
+    @State private var showFirstRunWizard = false
 
     var body: some View {
-        if let service = executionService {
+        if let service = executionService,
+           let appConfigurationStore,
+           let providerSettingsStore,
+           let providerRegistry {
             ContentView()
                 .environment(service)
+                .environment(appConfigurationStore)
+                .environment(providerSettingsStore)
+                .environment(providerRegistry)
+                .sheet(isPresented: $showFirstRunWizard) {
+                    FirstRunSetupWizard(isPresented: $showFirstRunWizard)
+                        .environment(service)
+                        .environment(appConfigurationStore)
+                        .environment(providerSettingsStore)
+                        .environment(providerRegistry)
+                }
         } else {
             ProgressView("Starting engine...")
                 .accessibilityIdentifier("bootstrap-loading")
@@ -91,7 +120,15 @@ struct AppBootstrapView: View {
     private func bootstrapService() {
         guard executionService == nil else { return }
 
-        let catalog = Self.loadBundledCatalog()
+        let appConfigurationStore = AppConfigurationStore()
+        let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
+        let providerSettingsStore = ProviderSettingsStore()
+        let providerRegistry = ProviderRegistry(settingsStore: providerSettingsStore)
+        self.appConfigurationStore = appConfigurationStore
+        self.providerSettingsStore = providerSettingsStore
+        self.providerRegistry = providerRegistry
+
+        let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
         let liveRuntimeConfiguration = Self.loadLiveRuntimeConfiguration()
         // The simulated executor remains the safe default, but Proposal 004 live runs
@@ -114,10 +151,22 @@ struct AppBootstrapView: View {
 
         // Proposal 003 — REQ-008: Check if config has changed since last analysis.
         service.checkForConfigChange()
+
+        Task { @MainActor in
+            await providerRegistry.refreshHealth()
+        }
+
+        if shouldPresentFirstRunWizard(
+            configuration: resolvedConfiguration,
+            providerSettings: providerSettingsStore.settings
+        ) {
+            showFirstRunWizard = true
+        }
     }
 
-    private static func loadBundledCatalog() -> AgentCatalog? {
+    private static func loadBundledCatalog(appConfiguration: AppConfiguration) -> AgentCatalog? {
         let candidates: [URL?] = [
+            URL(fileURLWithPath: appConfiguration.agentCatalogSourcePath),
             Bundle.main.url(forResource: "agents", withExtension: "yaml"),
             URL(fileURLWithPath: NSHomeDirectory())
                 .appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml")
@@ -128,6 +177,26 @@ struct AppBootstrapView: View {
             }
         }
         return nil
+    }
+
+    private func shouldPresentFirstRunWizard(
+        configuration: AppConfiguration,
+        providerSettings: ProviderSettings
+    ) -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] != nil || environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+            return false
+        }
+
+        if !FileManager.default.fileExists(atPath: configuration.workflowSourcePath) {
+            return true
+        }
+
+        if !FileManager.default.fileExists(atPath: configuration.agentCatalogSourcePath) {
+            return true
+        }
+
+        return providerSettings.configuredProviders.isEmpty
     }
 
     private static func loadBundledWorkflow(named resourceName: String, repoRelativePath: String) -> WorkflowDefinition? {

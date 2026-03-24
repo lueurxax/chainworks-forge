@@ -180,7 +180,8 @@ final class StewardAnalysisService {
                 attemptNumber: 1,
                 inputArtifacts: stewardInputs,
                 variables: [:],
-                ideaBody: ""
+                ideaBody: "",
+                providerBinding: nil
             )
 
             do {
@@ -229,7 +230,8 @@ final class StewardAnalysisService {
                 attemptNumber: 1,
                 inputArtifacts: auditorInputs,
                 variables: [:],
-                ideaBody: ""
+                ideaBody: "",
+                providerBinding: nil
             )
 
             do {

@@ -147,7 +147,7 @@ final class RunReportBuilder {
             RunReportPayload.AgentEntry(
                 agentID: agent.agentID,
                 provider: agent.provider,
-                model: agent.resolvedBackendProfileID,
+                model: agent.resolvedModel ?? agent.resolvedBackendProfileID,
                 effort: agent.effort,
                 costCents: agent.costCents,
                 duration: agentDuration(agent),
@@ -190,6 +190,39 @@ final class RunReportBuilder {
             )
         }
 
+        // §6.5: Retry/recovery narrative
+        let retriesPerformed = stages.reduce(0) { $0 + max(0, $1.attemptNumber - 1) }
+        let recoveryActionsTaken: [String] = allAgents
+            .compactMap { $0.retryReason }
+
+        // §6.5: Compute retry path and resume path from current run state
+        let retryPath: String? = {
+            if run.status == .failed || run.status == .blocked {
+                if let failedStage = stages.last(where: { $0.status == .failed }) {
+                    if let failedAgent = failedStage.agentExecutions.first(where: { $0.status == .failed }) {
+                        return "Retry agent '\(failedAgent.agentID)' in stage '\(failedStage.label)'"
+                    }
+                    return "Retry stage '\(failedStage.label)'"
+                }
+                if let blockedStage = stages.last(where: { $0.status == .blocked }) {
+                    return "Retry stage '\(blockedStage.label)'"
+                }
+            }
+            return nil
+        }()
+
+        let resumePath: String? = {
+            if run.status == .waitingApproval {
+                if let gateStage = stages.last(where: { $0.status == .waitingApproval }) {
+                    return "Resume from approval gate '\(gateStage.label)'"
+                }
+            }
+            if run.status == .failed || run.status == .blocked {
+                return "Clone run (frozen snapshot or current config)"
+            }
+            return nil
+        }()
+
         return RunReportPayload(
             ideaTitle: run.idea?.title ?? "Unknown",
             workflowTitle: run.workflowTitle,
@@ -216,9 +249,11 @@ final class RunReportBuilder {
             approvalEntries: approvalEntries,
             keyArtifacts: keyArtifactEntries,
             blockedReason: run.driftDetails,
-            retryPath: nil,
-            resumePath: nil,
-            driftDecision: run.driftDecision?.rawValue
+            retryPath: retryPath,
+            resumePath: resumePath,
+            driftDecision: run.driftDecision?.rawValue,
+            retriesPerformed: retriesPerformed,
+            recoveryActionsTaken: recoveryActionsTaken
         )
     }
 
@@ -293,6 +328,13 @@ final class RunReportBuilder {
         if let retry = payload.retryPath { lines.append("- Retry path: \(retry)") }
         if let resume = payload.resumePath { lines.append("- Resume path: \(resume)") }
         if let drift = payload.driftDecision { lines.append("- Drift decision: \(drift)") }
+        lines.append("- Retries performed: \(payload.retriesPerformed)")
+        if !payload.recoveryActionsTaken.isEmpty {
+            lines.append("- Recovery actions taken:")
+            for action in payload.recoveryActionsTaken {
+                lines.append("  - \(action)")
+            }
+        }
         lines.append("")
         lines.append("## 9. Outcome")
         lines.append("- \(payload.runStatus)")
@@ -424,6 +466,10 @@ struct RunReportPayload: Codable, Sendable {
     let retryPath: String?
     let resumePath: String?
     let driftDecision: String?
+
+    // §6.5: Retry/recovery narrative
+    let retriesPerformed: Int
+    let recoveryActionsTaken: [String]
 
     struct StageEntry: Codable, Sendable {
         let label: String

@@ -222,10 +222,10 @@ That is why the MVP in `/Users/user/Documents/Chainworks Forge/docs/ps/chainwork
 - agent inspection,
 - explicit approval gates,
 - durable run state in SwiftData,
-- multi-provider execution limited to Codex and Claude Code,
+- multi-provider execution limited to Codex, Claude Code, and Gemini,
 - readable completion reports.
 
-Additional providers such as Gemini belong to post-MVP provider adapter extensions, not to the first implementation slice.
+Additional providers beyond Codex, Claude Code, and Gemini belong to post-MVP provider adapter extensions, not to the first implementation slice.
 
 In other words, the MVP validates the product thesis that **workflow clarity + role specialization + artifact discipline** produce a better engineering experience than ad hoc chat orchestration.
 

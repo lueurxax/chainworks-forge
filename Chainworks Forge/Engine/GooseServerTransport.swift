@@ -39,8 +39,19 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
     /// Trusts self-signed certificates for localhost (development).
     private let session: URLSession
 
+    /// Per-session system prompts.
+    /// goosed has no separate system-prompt field on /reply, so we persist the
+    /// prompt at session creation time and prepend it to the user message later.
+    private let systemPromptStore = GooseSystemPromptStore()
+
     /// Request timeout in seconds (300s for cold-start tolerance).
     let requestTimeout: TimeInterval
+
+    // MARK: - Lifecycle
+
+    deinit {
+        session.invalidateAndCancel()
+    }
 
     // MARK: - Init
 
@@ -113,6 +124,8 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
             )
         }
 
+        await systemPromptStore.set(request.systemPrompt, for: sessionID)
+
         // Phase 2: POST /agent/update_provider (REQUIRED — without this, /reply returns "Provider not set")
         let resolvedProvider = request.provider ?? provider
         let resolvedModel = request.model ?? model
@@ -156,7 +169,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         prompt: GoosePromptRequest
     ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     let url = self.baseURL.appendingPathComponent("reply")
                     var httpRequest = URLRequest(url: url)
@@ -166,7 +179,12 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
                     self.applyAuth(&httpRequest)
 
                     // Build the ChatRequest in goosed format
-                    let chatRequest = self.buildChatRequest(sessionID: sessionID, prompt: prompt)
+                    let sessionSystemPrompt = await self.systemPromptStore.get(for: sessionID)
+                    let chatRequest = self.buildChatRequest(
+                        sessionID: sessionID,
+                        prompt: prompt,
+                        systemPrompt: sessionSystemPrompt
+                    )
                     httpRequest.httpBody = chatRequest
 
                     let (bytes, response) = try await self.session.bytes(for: httpRequest)
@@ -180,6 +198,9 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
                     var isFirstMessage = true
 
                     for try await byte in bytes {
+                        // Cooperative cancellation: exit cleanly if stream consumer is done
+                        try Task.checkCancellation()
+
                         let char = Character(UnicodeScalar(byte))
 
                         if char == "\n" {
@@ -227,9 +248,18 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
                     // Stream ended without explicit Finish — synthesize session closed
                     continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+
+            // When the stream consumer finishes or is dropped, cancel the
+            // underlying Task so the byte iteration and URLSession data task
+            // are torn down cooperatively — preventing double-free on cleanup.
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }
@@ -243,6 +273,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
 
         let (data, response) = try await session.data(for: httpRequest)
         try validateHTTPResponse(response, data: data)
+        await systemPromptStore.remove(sessionID)
     }
 
     // MARK: - Private: Auth
@@ -273,10 +304,24 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
 
     /// Build a goosed `ChatRequest` JSON body.
     /// IMPORTANT: `metadata.userVisible` and `metadata.agentVisible` are REQUIRED (422 without them).
-    private func buildChatRequest(sessionID: String, prompt: GoosePromptRequest) -> Data {
+    private func buildChatRequest(
+        sessionID: String,
+        prompt: GoosePromptRequest,
+        systemPrompt: String?
+    ) -> Data {
         // Combine prompt content with context attachments into the message text.
         // LOCKED-003: System prompt is embedded in the user message.
-        var fullContent = prompt.content
+        var fullContent = ""
+        if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fullContent += """
+            ## System Instructions
+            \(systemPrompt)
+
+            ---
+
+            """
+        }
+        fullContent += prompt.content
         if let attachments = prompt.context, !attachments.isEmpty {
             fullContent += "\n\n---\n\n"
             for attachment in attachments {
@@ -312,6 +357,22 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         ]
 
         return (try? JSONSerialization.data(withJSONObject: chatRequest)) ?? Data()
+    }
+}
+
+private actor GooseSystemPromptStore {
+    private var promptsBySessionID: [String: String] = [:]
+
+    func set(_ prompt: String, for sessionID: String) {
+        promptsBySessionID[sessionID] = prompt
+    }
+
+    func get(for sessionID: String) -> String? {
+        promptsBySessionID[sessionID]
+    }
+
+    func remove(_ sessionID: String) {
+        promptsBySessionID.removeValue(forKey: sessionID)
     }
 }
 

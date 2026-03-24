@@ -47,6 +47,7 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 - [proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md](proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md) — multi-provider routing, settings, diagnostics
 - [proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) — worktrees, implementation loop, release, dogfooding
+- [proposals/008-mvp-hardening-and-sign-off.md](proposals/008-mvp-hardening-and-sign-off.md) — MVP validation, boundary freeze, recovery UX, launch gate
 
 ## Evidence
 

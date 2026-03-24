@@ -49,6 +49,7 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
 
         // Check for injected failures
         if failingAgentIDs.contains(agent.id) {
+            let binding = context.providerBinding
             return AgentResult(
                 outputs: [:],
                 logSnippet: "Simulated failure for agent '\(agent.id)'",
@@ -56,7 +57,19 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
                 succeeded: false,
                 errorMessage: "Simulated failure for agent '\(agent.id)'",
                 sessionID: nil,
-                durationSeconds: simulatedDelay
+                durationSeconds: simulatedDelay,
+                providerReceipt: UsageReceiptNormalizer.makeReceipt(
+                    providerFamily: binding?.providerFamily ?? agent.provider,
+                    configuredProviderID: binding?.configuredProviderID,
+                    model: binding?.model ?? agent.model,
+                    effort: binding?.effort ?? agent.effort,
+                    transport: binding?.transport ?? "simulated",
+                    costCents: 0,
+                    durationSeconds: simulatedDelay
+                ),
+                resolvedModel: binding?.model ?? agent.model,
+                configuredProviderID: binding?.configuredProviderID,
+                adapterVersion: binding?.adapterVersion
             )
         }
 
@@ -83,6 +96,7 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
             outputs["\(agent.id)_output"] = defaultOutput.data
         }
 
+        let binding = context.providerBinding
         return AgentResult(
             outputs: outputs,
             logSnippet: "Simulated execution of '\(agent.id)' for task '\(task.task)' completed successfully",
@@ -90,7 +104,19 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
             succeeded: true,
             errorMessage: nil,
             sessionID: "sim-\(UUID().uuidString.prefix(8))",
-            durationSeconds: simulatedDelay
+            durationSeconds: simulatedDelay,
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(
+                providerFamily: binding?.providerFamily ?? agent.provider,
+                configuredProviderID: binding?.configuredProviderID,
+                model: binding?.model ?? agent.model,
+                effort: binding?.effort ?? agent.effort,
+                transport: binding?.transport ?? "simulated",
+                costCents: 100,
+                durationSeconds: simulatedDelay
+            ),
+            resolvedModel: binding?.model ?? agent.model,
+            configuredProviderID: binding?.configuredProviderID,
+            adapterVersion: binding?.adapterVersion
         )
     }
 

@@ -85,6 +85,8 @@ final class WorkflowOrchestrator {
     private var runtimeVariables: [String: AnyCodableValue]
     /// Tracks currently active agent executions for live event routing.
     private var liveAgentExecutionsByAgentID: [String: [AgentExecution]] = [:]
+    /// Frozen provider bindings captured at run start.
+    private let providerBindingsByAgentID: [String: ResolvedProviderBinding]
 
     // MARK: - Init
 
@@ -105,6 +107,7 @@ final class WorkflowOrchestrator {
         self.catalog = catalog
         self.currentStateID = plan.initialStateID
         self.runtimeVariables = plan.variables
+        self.providerBindingsByAgentID = Self.decodeProviderBindings(from: run.providerBindingSnapshotJSON)
         configureLiveEventBridge()
     }
 
@@ -428,6 +431,7 @@ final class WorkflowOrchestrator {
         // Gather input artifacts
         let inputData = gatherInputs(for: task)
         agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(inputData.keys).sorted())
+        agentExec.inputBindingsJSON = buildInputBindings(for: task)
         agentExec.resolvedBackendProfileID = agent.backendProfileID
 
         // Build execution context
@@ -438,7 +442,8 @@ final class WorkflowOrchestrator {
             attemptNumber: 1,
             inputArtifacts: inputData,
             variables: runtimeVariables,
-            ideaBody: run.idea?.body ?? ""
+            ideaBody: run.idea?.body ?? "",
+            providerBinding: providerBindingsByAgentID[agent.id]
         )
 
         // Execute off-MainActor, marshal results back
@@ -456,6 +461,10 @@ final class WorkflowOrchestrator {
         // Marshal results back to MainActor
         agentExec.completedAt = Date()
         agentExec.costCents = result.costCents
+        agentExec.resolvedModel = result.resolvedModel
+        agentExec.configuredProviderID = result.configuredProviderID
+        agentExec.adapterVersion = result.adapterVersion
+        agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
         agentExec.logSnippet = mergedLogSnippet(
             existing: agentExec.logSnippet,
             result: result.logSnippet
@@ -560,6 +569,8 @@ final class WorkflowOrchestrator {
         let results = await withTaskGroup(of: (Int, AgentResult?).self) { group in
             for (index, pair) in taskAgentPairs.enumerated() {
                 let gatheredInputs = gatherInputs(for: pair.task)
+                let task = pair.task
+                let agent = pair.agent
                 let execContext = ExecutionContext(
                     workspace: workspace,
                     stageID: state.id,
@@ -567,12 +578,12 @@ final class WorkflowOrchestrator {
                     attemptNumber: 1,
                     inputArtifacts: gatheredInputs,
                     variables: runtimeVariables,
-                    ideaBody: run.idea?.body ?? ""
+                    ideaBody: run.idea?.body ?? "",
+                    providerBinding: providerBindingsByAgentID[agent.id]
                 )
-                let task = pair.task
-                let agent = pair.agent
                 let executor = self.executor
                 pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(gatheredInputs.keys).sorted())
+                pair.agentExec.inputBindingsJSON = buildInputBindings(for: pair.task)
 
                 group.addTask {
                     do {
@@ -615,6 +626,10 @@ final class WorkflowOrchestrator {
             }
 
             agentExec.costCents = result.costCents
+            agentExec.resolvedModel = result.resolvedModel
+            agentExec.configuredProviderID = result.configuredProviderID
+            agentExec.adapterVersion = result.adapterVersion
+            agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
             if let sessionID = result.sessionID {
                 agentExec.providerSessionID = sessionID
                 agentExec.gooseSessionID = sessionID
@@ -753,6 +768,25 @@ final class WorkflowOrchestrator {
             }
         }
         return inputs
+    }
+
+    /// P005-OPS §9.3: Build structured input bindings with producing agent traceability.
+    private func buildInputBindings(for task: AgentTask) -> Data? {
+        guard let inputNames = task.inputs, !inputNames.isEmpty else { return nil }
+        var bindings: [InputBinding] = []
+        for name in inputNames {
+            var producingAgentID: String?
+            if let artifacts = try? artifactManager.artifacts(forRunID: workspace.runID),
+               let artifact = artifacts.last(where: { $0.name == name }) {
+                producingAgentID = artifact.agentID
+            }
+            bindings.append(InputBinding(
+                inputName: name,
+                artifactName: name,
+                producingAgentID: producingAgentID
+            ))
+        }
+        return try? JSONEncoder().encode(bindings)
     }
 
     private func validateStructuredOutputs(
@@ -1121,6 +1155,18 @@ final class WorkflowOrchestrator {
             .filter { $0.agentID == agentID }
             .sorted { $0.startedAt < $1.startedAt }
             .last
+    }
+
+    private func encodeProviderReceipt(_ receipt: ProviderExecutionReceipt?) -> Data? {
+        guard let receipt else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(receipt)
+    }
+
+    private static func decodeProviderBindings(from data: Data?) -> [String: ResolvedProviderBinding] {
+        guard let data else { return [:] }
+        return (try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)) ?? [:]
     }
 
     private func mergedLogSnippet(existing: String?, result: String?) -> String? {

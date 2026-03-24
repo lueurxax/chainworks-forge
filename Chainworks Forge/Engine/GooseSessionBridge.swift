@@ -190,6 +190,10 @@ final class GooseSessionBridge: Sendable {
         parts.append("- Do not perform any git operations.")
         parts.append("- Do not modify files outside the workspace root.")
         parts.append("- Do not rely on implicit working directory — use explicit paths.")
+        if ProcessInfo.processInfo.environment["CHAINWORKS_DISABLE_XCODE_MCP"] == "1" {
+            parts.append("- Do not call xcode_mcp or any IDE/editor MCP tools.")
+            parts.append("- In tests, respond directly and complete the task without MCP tool discovery.")
+        }
 
         return parts.joined(separator: "\n")
     }

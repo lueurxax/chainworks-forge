@@ -121,7 +121,7 @@ final class RunComparisonService {
             bindings.append(RunComparison.AgentBinding(
                 agentID: agent.agentID,
                 provider: agent.provider,
-                model: agent.resolvedBackendProfileID,
+                model: agent.resolvedModel ?? agent.resolvedBackendProfileID,
                 effort: agent.effort
             ))
         }

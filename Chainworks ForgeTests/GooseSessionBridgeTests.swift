@@ -118,7 +118,8 @@ final class GooseSessionBridgeTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: "Test idea"
+            ideaBody: "Test idea",
+            providerBinding: nil
         )
 
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
@@ -131,6 +132,32 @@ final class GooseSessionBridgeTests: XCTestCase {
         // System prompt should contain boundaries
         XCTAssertTrue(packet.systemPrompt.contains("Do not perform any git operations"))
         XCTAssertTrue(packet.systemPrompt.contains("Do not modify files outside the workspace root"))
+    }
+
+    func testPacketCanDisableXcodeMCPViaEnvironment() {
+        setenv("CHAINWORKS_DISABLE_XCODE_MCP", "1", 1)
+        defer { unsetenv("CHAINWORKS_DISABLE_XCODE_MCP") }
+
+        let agent = makeAgent()
+        let task = makeTask()
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_1",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        XCTAssertTrue(packet.systemPrompt.contains("Do not call xcode_mcp"),
+                      "Test env should append explicit xcode_mcp suppression to the system prompt")
     }
 
     func testPacketContainsTaskDirective() {
@@ -146,7 +173,8 @@ final class GooseSessionBridgeTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: ["input_artifact": Data("test input data".utf8)],
             variables: [:],
-            ideaBody: "Build a great feature"
+            ideaBody: "Build a great feature",
+            providerBinding: nil
         )
 
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
@@ -180,7 +208,8 @@ final class GooseSessionBridgeTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: ""
+            ideaBody: "",
+            providerBinding: nil
         )
 
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
@@ -239,7 +268,8 @@ final class GooseSessionBridgeTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: "Test idea"
+            ideaBody: "Test idea",
+            providerBinding: nil
         )
 
         _ = try await bridge.executeInIsolatedSession(

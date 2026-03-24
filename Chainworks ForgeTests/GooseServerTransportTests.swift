@@ -319,6 +319,55 @@ final class GooseServerTransportTests: XCTestCase {
         XCTAssertTrue(text.contains("artifact content here"), "Should contain attachment content")
     }
 
+    /// Verifies that the session system prompt is embedded into the /reply payload for goosed.
+    func testChatRequestEncodingIncludesSessionSystemPrompt() async throws {
+        let transport = makeMockTransport()
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.path ?? ""
+            if url.hasSuffix("/agent/start") {
+                let response = #"{"id":"prompt-session-1","working_dir":"/tmp/test","name":"Prompt Session"}"#
+                return (200, ["Content-Type": "application/json"], Data(response.utf8))
+            }
+            if url.hasSuffix("/reply") {
+                let sseBody = "data: {\"type\":\"Finish\",\"reason\":\"stop\"}\n\n"
+                return (200, ["Content-Type": "text/event-stream"], Data(sseBody.utf8))
+            }
+            return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+        }
+
+        let session = try await transport.createSession(request: GooseSessionRequest(
+            systemPrompt: "Do not call xcode_mcp.",
+            workingDirectory: "/tmp/test-workspace",
+            model: nil,
+            provider: nil,
+            executionPolicy: nil,
+            metadata: nil
+        ))
+
+        let stream = transport.submitPrompt(
+            sessionID: session.sessionId,
+            prompt: GoosePromptRequest(content: "Reply with exactly ok", context: nil)
+        )
+        for try await _ in stream {}
+
+        let requests = MockURLProtocol.recordedRequests()
+        let replyRequest = requests.first { $0.url.contains("/reply") }
+
+        guard let body = replyRequest?.body,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let userMessage = json["user_message"] as? [String: Any],
+              let content = userMessage["content"] as? [[String: Any]],
+              let text = content.first?["text"] as? String else {
+            XCTFail("Should have a valid /reply request with text content")
+            return
+        }
+
+        XCTAssertTrue(text.contains("Do not call xcode_mcp."),
+                      "System prompt must be embedded in the goosed /reply payload")
+        XCTAssertTrue(text.contains("Reply with exactly ok"))
+    }
+
     /// Verifies that X-Secret-Key header is used (not Authorization: Bearer).
     func testSecretKeyHeaderUsedNotBearerAuth() async throws {
         let transport = makeMockTransport(secretKey: "my-test-secret")

@@ -374,6 +374,9 @@ struct WorkflowStartRunSheet: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @Environment(ExecutionService.self) private var executionService
+    @Environment(AppConfigurationStore.self) private var appConfigurationStore
+    @Environment(ProviderSettingsStore.self) private var providerSettingsStore
+    @Environment(ProviderRegistry.self) private var providerRegistry
 
     let idea: Idea
     var onRunPrepared: ((PreparedRunStart) -> Void)? = nil
@@ -385,6 +388,10 @@ struct WorkflowStartRunSheet: View {
     @State private var isStarting = false
     @State private var selectedMode: ExecutionMode = .simulated
     @State private var selectedWorkflow: WorkflowPreset = .canonicalRelease
+    @State private var startOptions: RunStartOptions = .empty
+    @State private var preflightReport: PreflightReport?
+    @State private var showPreflightSheet = false
+    @State private var allowWarnStart = false
 
     private enum CompileState: Equatable {
         case idle
@@ -478,6 +485,18 @@ struct WorkflowStartRunSheet: View {
 
     private var liveModeRequiresConfiguration: Bool {
         selectedMode == .live && !liveModeConfigured
+    }
+
+    private var preflightBlocksStart: Bool {
+        preflightReport?.status == .fail
+    }
+
+    private var requiresCleanPreflight: Bool {
+        providerSettingsStore.settings.runStartRequiresCleanPreflight
+    }
+
+    private var warnRequiresConfirmation: Bool {
+        preflightReport?.status == .warn && !requiresCleanPreflight
     }
 
     var body: some View {
@@ -588,6 +607,17 @@ struct WorkflowStartRunSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if let compiledPlan {
+                GroupBox("Run Start Overrides") {
+                    RunStartOverridesView(
+                        plan: compiledPlan,
+                        providerRegistry: providerRegistry,
+                        startOptions: $startOptions
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
             GroupBox("Compilation Preview") {
                 VStack(alignment: .leading, spacing: 8) {
                     switch compileState {
@@ -639,6 +669,51 @@ struct WorkflowStartRunSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            GroupBox("Preflight") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let preflightReport {
+                        HStack {
+                            Label(preflightReport.status.rawValue.capitalized, systemImage: preflightIcon(preflightReport.status))
+                                .foregroundStyle(preflightColor(preflightReport.status))
+                            Spacer()
+                            Button("Review Report") {
+                                showPreflightSheet = true
+                            }
+                        }
+                        .font(.caption)
+
+                        Text("Configuration source: \(preflightReport.configurationSource.displayName)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        if preflightReport.status == .warn && !requiresCleanPreflight {
+                            Toggle("Allow start with warnings", isOn: $allowWarnStart)
+                                .toggleStyle(.checkbox)
+                                .font(.caption)
+                        } else if preflightReport.status == .warn && requiresCleanPreflight {
+                            Label("Run start is blocked until preflight is clean in current settings.", systemImage: "lock.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+
+                        if let firstBlockingIssue = preflightReport.blockingIssues.first {
+                            Text(firstBlockingIssue)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        } else if let firstWarning = preflightReport.warnings.first {
+                            Text(firstWarning)
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                    } else {
+                        Text("Preflight will run after compilation.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Spacer()
 
             HStack {
@@ -658,7 +733,15 @@ struct WorkflowStartRunSheet: View {
                     startRun()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(compiledPlan == nil || isStarting || compileState == .compiling || liveModeRequiresConfiguration)
+                .disabled(
+                    compiledPlan == nil
+                    || isStarting
+                    || compileState == .compiling
+                    || liveModeRequiresConfiguration
+                    || preflightBlocksStart
+                    || (preflightReport?.status == .warn && requiresCleanPreflight)
+                    || (warnRequiresConfirmation && allowWarnStart == false)
+                )
                 .accessibilityIdentifier("workflow-start-run-confirm-button")
             }
         }
@@ -679,12 +762,37 @@ struct WorkflowStartRunSheet: View {
         .onChange(of: selectedWorkflow) { _, _ in
             compile()
         }
+        .onChange(of: startOptions) { _, _ in
+            Task { await refreshPreflight() }
+        }
+        .sheet(isPresented: $showPreflightSheet) {
+            if let preflightReport {
+                NavigationStack {
+                    PreflightReportView(report: preflightReport)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { showPreflightSheet = false }
+                            }
+                        }
+                }
+                .frame(minWidth: 520, minHeight: 420)
+            }
+        }
     }
 
     private func resolveURLs() {
         workflowURLs = Dictionary(uniqueKeysWithValues: WorkflowPreset.allCases.compactMap { preset in
             let bundleURL = preset.bundleResourceName.flatMap { Bundle.main.url(forResource: $0, withExtension: "yaml") }
+            let configuredWorkflowURL: URL? = {
+                switch preset {
+                case .canonicalRelease:
+                    return URL(fileURLWithPath: appConfigurationStore.configuration.workflowSourcePath)
+                case .proposalLoopLive:
+                    return nil
+                }
+            }()
             guard let url = resolveExistingFile(at: [
+                configuredWorkflowURL,
                 URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(preset.relativePath),
                 URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/\(preset.relativePath)"),
                 bundleURL
@@ -695,6 +803,7 @@ struct WorkflowStartRunSheet: View {
         })
 
         catalogURL = resolveExistingFile(at: [
+            URL(fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("examples/agents/agents.yaml"),
             URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml"),
             Bundle.main.url(forResource: "agents", withExtension: "yaml")
@@ -712,6 +821,7 @@ struct WorkflowStartRunSheet: View {
         guard let workflowURL = selectedWorkflowURL, let catalogURL else {
             compileState = .error("Unable to locate workflow or agent catalog")
             compiledPlan = nil
+            preflightReport = nil
             return
         }
 
@@ -725,30 +835,97 @@ struct WorkflowStartRunSheet: View {
 
             compiledPlan = plan
             compileState = .success(stateCount: plan.states.count, agentCount: plan.agentBindings.count)
+            Task { await refreshPreflight() }
         } catch {
             compiledPlan = nil
             compileState = .error(error.localizedDescription)
+            preflightReport = nil
         }
     }
 
     private func startRun() {
-        guard let compiledPlan, let workflowURL = selectedWorkflowURL else { return }
+        guard let compiledPlan,
+              let workflowURL = selectedWorkflowURL,
+              let catalogURL,
+              !preflightBlocksStart,
+              !(preflightReport?.status == .warn && requiresCleanPreflight),
+              !warnRequiresConfirmation || allowWarnStart else { return }
         isStarting = true
 
         do {
+            let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
+            let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions)
+            let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
             let compiler = RunPlanCompiler(modelContext: modelContext)
             let (run, workspace) = try compiler.createRun(
                 for: idea,
-                plan: compiledPlan,
+                plan: adjustedPlan,
                 workflowSourcePath: workflowURL.path,
-                catalogSourcePath: catalogURL?.path ?? ""
+                catalogSourcePath: catalogURL.path
             )
-            let preparedRun = PreparedRunStart(run: run, plan: compiledPlan, workspace: workspace)
+            run.providerBindingSnapshotJSON = encodeProviderBindings(providerBindings)
+            run.startOptionsJSON = encodeStartOptions(startOptions)
+            let preparedRun = PreparedRunStart(run: run, plan: adjustedPlan, workspace: workspace)
             onRunPrepared?(preparedRun)
             dismiss()
         } catch {
             compileState = .error("Failed to start run: \(error.localizedDescription)")
             isStarting = false
+        }
+    }
+
+    private func refreshPreflight() async {
+        guard let workflowURL = selectedWorkflowURL,
+              let catalogURL else {
+            preflightReport = nil
+            return
+        }
+        let preflight = PreflightService(
+            appConfigurationStore: appConfigurationStore,
+            providerRegistry: providerRegistry
+        )
+        preflightReport = await preflight.runReport(
+            workflowURL: workflowURL,
+            catalogURL: catalogURL,
+            plan: compiledPlan,
+            startOptions: startOptions
+        )
+        if preflightReport?.status != .warn {
+            allowWarnStart = false
+        }
+    }
+
+    private func encodeProviderBindings(_ bindings: [String: ResolvedProviderBinding]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(bindings)
+    }
+
+    private func encodeStartOptions(_ options: RunStartOptions) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(options)
+    }
+
+    private func preflightIcon(_ status: PreflightStatus) -> String {
+        switch status {
+        case .pass:
+            return "checkmark.circle.fill"
+        case .warn:
+            return "exclamationmark.triangle.fill"
+        case .fail:
+            return "xmark.circle.fill"
+        }
+    }
+
+    private func preflightColor(_ status: PreflightStatus) -> Color {
+        switch status {
+        case .pass:
+            return .green
+        case .warn:
+            return .orange
+        case .fail:
+            return .red
         }
     }
 }

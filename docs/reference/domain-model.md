@@ -132,7 +132,7 @@ Tracks a single agent's work within a stage.
 | `startedAt` | `Date` | When agent started |
 | `completedAt` | `Date?` | When agent finished |
 | `status` | `AgentStatus` | Current lifecycle state |
-| `provider` | `String` | `claude_code` or `codex` |
+| `provider` | `String` | `claude_code`, `codex`, or `gemini` |
 | `effort` | `String` | `low` · `medium` · `high` · `critical` |
 | `costCents` | `Int64?` | Cost in minor units; `$0.73` = `73` |
 | `logSnippet` | `String?` | Last N lines of log for quick preview |

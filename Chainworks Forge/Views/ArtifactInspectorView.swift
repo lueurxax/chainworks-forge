@@ -138,21 +138,52 @@ struct ArtifactInspectorView: View {
                 }
             }
 
-            // Consumed-by (via input bindings)
-            if let agentExec = artifact.agentExecution,
-               let inputData = agentExec.consumedInputArtifactNamesJSON,
-               let inputNames = try? JSONDecoder().decode([String].self, from: inputData) {
-                ForEach(inputNames, id: \.self) { inputName in
+            // Downstream consumers — find agents that consumed THIS artifact
+            let consumers = downstreamConsumers
+            if !consumers.isEmpty {
+                ForEach(consumers, id: \.id) { consumer in
                     HStack {
                         Image(systemName: "arrow.left.circle")
                             .foregroundStyle(.blue)
-                        Text("Consumed input:")
+                        Text("Consumed by")
                             .font(.caption)
-                        Text(inputName)
+                        Text("\(consumer.agentTitle) (\(consumer.taskName))")
                             .font(.caption.monospaced())
                     }
                 }
+            } else {
+                HStack {
+                    Image(systemName: "circle.dashed")
+                        .foregroundStyle(.secondary)
+                    Text("No downstream consumers found")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
+        }
+    }
+
+    /// P005-OPS §9.3: Find downstream consumers via inputBindingsJSON (preferred)
+    /// with consumedInputArtifactNamesJSON as fallback.
+    private var downstreamConsumers: [AgentExecution] {
+        let allAgents = run.stageExecutions.flatMap { $0.agentExecutions }
+        return allAgents.filter { agent in
+            // Exclude the producing agent itself
+            guard agent.id != artifact.agentExecution?.id else { return false }
+
+            // Preferred: use structured inputBindingsJSON (§9.3 contract)
+            if let bindingsData = agent.inputBindingsJSON,
+               let bindings = try? JSONDecoder().decode([InputBinding].self, from: bindingsData) {
+                return bindings.contains { $0.artifactName == artifact.name }
+            }
+
+            // Fallback: legacy consumedInputArtifactNamesJSON
+            if let inputData = agent.consumedInputArtifactNamesJSON,
+               let inputNames = try? JSONDecoder().decode([String].self, from: inputData) {
+                return inputNames.contains(artifact.name)
+            }
+
+            return false
         }
     }
 

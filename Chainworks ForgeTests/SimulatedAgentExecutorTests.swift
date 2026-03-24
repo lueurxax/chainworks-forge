@@ -33,7 +33,8 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: "Test idea"
+            ideaBody: "Test idea",
+            providerBinding: nil
         )
     }
 

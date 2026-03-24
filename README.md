@@ -43,7 +43,7 @@ For the current MVP slice, the system is intended to support:
 
 - one active run per idea
 - SwiftData as the durable local store
-- Codex and Claude Code as required providers
+- Codex, Claude Code, and Gemini as the MVP provider set
 - automatic run resume on app launch
 - three human checkpoints:
   - after the first proposal
@@ -88,7 +88,7 @@ For the current MVP slice, the system is intended to support:
 
 ## Not In MVP
 
-- Gemini and other post-MVP providers
+- provider families beyond Codex, Claude Code, and Gemini
 - parallel write-capable agents in one worktree
 - distributed workers
 - cloud sync

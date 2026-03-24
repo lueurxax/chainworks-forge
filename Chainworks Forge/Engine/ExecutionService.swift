@@ -275,6 +275,16 @@ final class ExecutionService {
         pendingApprovals.count
     }
 
+    /// P005-OPS §10: Number of blocked runs requiring attention.
+    var blockedRunCount: Int {
+        activeOrchestrators.values.filter { $0.run.status == .blocked }.count
+    }
+
+    /// P005-OPS §10: Number of failed runs requiring attention.
+    var failedRunCount: Int {
+        activeOrchestrators.values.filter { $0.run.status == .failed }.count
+    }
+
     /// Get the orchestrator for a specific run.
     func orchestrator(for runID: UUID) -> WorkflowOrchestrator? {
         activeOrchestrators[runID]

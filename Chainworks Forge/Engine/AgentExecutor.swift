@@ -36,6 +36,8 @@ struct ExecutionContext: Sendable {
     let variables: [String: AnyCodableValue]
     /// The idea body text for the run.
     let ideaBody: String
+    /// Resolved provider binding frozen at run start.
+    let providerBinding: ResolvedProviderBinding?
 }
 
 // MARK: - AgentResult
@@ -57,6 +59,14 @@ struct AgentResult: Sendable {
     let sessionID: String?
     /// Wall-clock duration of execution in seconds (§6.1).
     let durationSeconds: Double
+    /// Normalized provider receipt for operator/debug surfaces.
+    let providerReceipt: ProviderExecutionReceipt?
+    /// Resolved model actually used for execution.
+    let resolvedModel: String?
+    /// Configured provider that satisfied the binding.
+    let configuredProviderID: UUID?
+    /// Adapter version used to execute.
+    let adapterVersion: String?
 }
 
 // MARK: - Output Contract Resolution

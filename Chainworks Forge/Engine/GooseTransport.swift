@@ -51,6 +51,12 @@ class GooseTransport: GooseTransportProtocol, @unchecked Sendable {
     /// Request timeout in seconds.
     let requestTimeout: TimeInterval
 
+    // MARK: - Lifecycle
+
+    deinit {
+        session.invalidateAndCancel()
+    }
+
     // MARK: - Init
 
     nonisolated init(
@@ -98,7 +104,7 @@ class GooseTransport: GooseTransportProtocol, @unchecked Sendable {
         prompt: GoosePromptRequest
     ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     let url = baseURL.appendingPathComponent("/api/sessions/\(sessionID)/messages")
                     var httpRequest = URLRequest(url: url)
@@ -119,6 +125,8 @@ class GooseTransport: GooseTransportProtocol, @unchecked Sendable {
                     var eventData = ""
 
                     for try await byte in bytes {
+                        try Task.checkCancellation()
+
                         let char = Character(UnicodeScalar(byte))
 
                         if char == "\n" {
@@ -159,9 +167,15 @@ class GooseTransport: GooseTransportProtocol, @unchecked Sendable {
                         continuation.yield(event)
                     }
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }

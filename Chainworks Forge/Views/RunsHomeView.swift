@@ -227,6 +227,7 @@ struct CompatibilityChecker {
 struct RunsHomeRow: View {
     let run: Run
     let attentionLevel: AttentionLevel
+
     // §5.4: Real executable action callbacks — only non-nil actions are shown
     let onOpen: () -> Void
     let onOpenGate: (() -> Void)?

@@ -42,7 +42,7 @@ Leading indicator (Proposal 001 scaffold): verified 2026-03-22 via automated UI 
 - The app stores job/run state in SwiftData.
 - The workflow model supports explicit approval gates, including the three required checkpoints.
 - Completed ideas expose a readable report with summary, time, and cost.
-- Multi-provider execution is supported from the first version, with Codex and Claude Code as required providers.
+- Multi-provider execution is supported from the first version, with Codex, Claude Code, and Gemini as the MVP provider set.
 - Interrupted runs are resumed automatically on app launch.
 
 ## 3. Requirements
@@ -61,7 +61,7 @@ Leading indicator (Proposal 001 scaffold): verified 2026-03-22 via automated UI 
 - The system must show a list of active agents and let the engineer open each agent so that raw logs, markdown summaries, and structured outputs can be inspected during execution.
 - The system must pause at workflow-defined approval gates using `approval: required` so that the engineer can approve or stop execution after the initial proposal, before implementation, and before push/distribution.
 - The system must show completed ideas with a generated work report containing summary, elapsed time, and cost so that the engineer can review the result of the run after completion.
-- The system must support multiple providers from the first version so that agents can run against different model backends in one workflow, with Codex and Claude Code required in v1.
+- The system must support multiple providers from the first version so that agents can run against different model backends in one workflow, with Codex, Claude Code, and Gemini required in v1.
 - The system must treat workflow actions such as push or distribution as workflow-defined capabilities so that examples like Connect remain optional and not product-defining.
 - The system must automatically resume interrupted runs on app launch so that the engineer does not need to restore workflow progress manually.
 - The system must never silently auto-resume stages with external side effects; those stages must return to `waiting_approval` or `blocked`.
@@ -84,7 +84,7 @@ At a high level:
 
 - **Ideas and runs layer**: stores idea records, workflow bindings, a single active run per idea, stage state, approval history, and completion reports in SwiftData.
 - **Workflow execution layer**: reads `workflow.yaml`, resolves stages/agents/approval gates, and drives execution.
-- **Provider layer**: routes agent calls to multiple backends behind a common internal contract, with Codex and Claude Code mandatory in v1.
+- **Provider layer**: routes agent calls to multiple backends behind a common internal contract, with Codex, Claude Code, and Gemini mandatory in v1.
 - **UI layer**: shows in-progress ideas, workflow stage chains, active agents, raw/markdown/structured output views, approvals, and completed reports.
 - **Artifact/report layer**: stores or references outputs needed for agent inspection, final reporting, and automatic run recovery.
 
@@ -129,7 +129,7 @@ Artifacts are first-class runtime objects, not just log by-products.
 
 ### 4.6 Out of scope for MVP
 
-- Gemini and other provider integrations beyond Codex and Claude Code
+- provider integrations beyond Codex, Claude Code, and Gemini
 - parallel write-capable agents in the same worktree
 - distributed workers or cloud execution
 - cloud sync and multi-user orchestration

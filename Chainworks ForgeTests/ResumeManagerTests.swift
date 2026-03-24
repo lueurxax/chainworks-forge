@@ -404,9 +404,9 @@ final class ResumeManagerTests: XCTestCase {
 
         service.resumeInterruptedRuns(compiler: compiler)
 
-        let deadline = Date().addingTimeInterval(2)
-        while service.pendingApprovalCount == 0 && Date() < deadline {
-            await Task.yield()
+        // Wait for approval restoration using pollUntil instead of manual deadline loop
+        try await pollUntil(timeout: 3.0, message: "Waiting approval should be restored") {
+            service.pendingApprovalCount > 0
         }
 
         XCTAssertEqual(service.pendingApprovalCount, 1, "Waiting approval should be restored into the app shell")

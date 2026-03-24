@@ -12,6 +12,8 @@ struct ContentView: View {
         case approvals = "Approvals"
         case agentCatalog = "Agent Catalog"
         case workflowInspector = "Workflow Inspector"
+        case pilotReadiness = "Pilot Readiness"
+        case providerSettings = "Settings"
     }
 
     init() {
@@ -75,6 +77,26 @@ struct ContentView: View {
             .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
             .tag(Tab.workflowInspector)
             .accessibilityIdentifier("tab-workflow-inspector")
+
+            PilotReadinessView()
+                .tabItem { Label("Pilot Readiness", systemImage: "checkmark.shield") }
+                .tag(Tab.pilotReadiness)
+                .accessibilityIdentifier("tab-pilot-readiness")
+
+            ProviderSettingsView()
+                .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
+                .tag(Tab.providerSettings)
+                .accessibilityIdentifier("tab-provider-settings")
+        }
+        // P005-OPS §10: Foreground banner as bottom overlay — avoids conflicting with macOS tab bar
+        .overlay(alignment: .bottom) {
+            ForegroundBannerView(
+                waitingApprovalCount: executionService.pendingApprovalCount,
+                blockedCount: executionService.blockedRunCount,
+                failedCount: executionService.failedRunCount,
+                onTap: { selectedTab = .runsHome }
+            )
+            .padding(.bottom, 8)
         }
         .task(id: forcedInitialTab?.rawValue ?? "default") {
             guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }

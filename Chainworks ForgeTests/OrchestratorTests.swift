@@ -393,10 +393,9 @@ final class OrchestratorTests: XCTestCase {
         // Allow fire-and-forget live event routing tasks to complete.
         // configureLiveEventBridge() schedules MainActor tasks via Task { @MainActor in ... },
         // which may not have run yet when start() returns.
-        // Poll with timeout until the timeline is populated.
-        for _ in 0..<30 {
-            if !orchestrator.liveTimeline.isEmpty { break }
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        // Uses pollUntil instead of manual for-loop with sleep.
+        try? await pollUntil(timeout: 5.0, message: "Live timeline should populate after execution") {
+            !orchestrator.liveTimeline.isEmpty
         }
 
         XCTAssertFalse(orchestrator.liveTimeline.isEmpty, "Live timeline should have entries after execution")
@@ -576,10 +575,12 @@ final class OrchestratorTests: XCTestCase {
         // Grant approval — this triggers resume
         orchestrator.resolveApproval(stageID: "start", granted: true, comment: "Approved")
 
-        // Wait for resume to complete
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        // Wait for resume to complete using pollUntil instead of fixed sleep
+        try? await pollUntil(timeout: 3.0, message: "Run should complete after approval") {
+            run.status == .completed
+        }
 
-        XCTAssertEqual(run.status, .completed)
+        assertRunCompleted(run)
     }
 
     // MARK: - Agent Failure
@@ -963,14 +964,16 @@ final class OrchestratorTests: XCTestCase {
         // Grant approval — triggers run_after_approval + transitions
         orchestrator.resolveApproval(stageID: "start", granted: true, comment: "Approved")
 
-        // Wait for the post-approval work + transition to complete
-        try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+        // Wait for the post-approval work + transition to complete using pollUntil
+        try? await pollUntil(timeout: 5.0, message: "Run should complete after post-approval work") {
+            run.status == .completed
+        }
 
         // Verify the post-approval block executed
         XCTAssertEqual(executor.executedTasks.count, 2, "Should execute both pre- and post-approval blocks")
         XCTAssertEqual(executor.executedTasks[1].agentID, "a2", "Post-approval should use agent a2")
         XCTAssertEqual(executor.executedTasks[1].task, "post_approval_work")
-        XCTAssertEqual(run.status, .completed, "Run should complete after post-approval work + transition")
+        assertRunCompleted(run)
     }
 
     func testMalformedReviewJSONFailsBeforeTransitionEvaluation() async {
@@ -1047,7 +1050,11 @@ final class OrchestratorTests: XCTestCase {
             succeeded: true,
             errorMessage: nil,
             sessionID: "test-session",
-            durationSeconds: 0.1
+            durationSeconds: 0.1,
+            providerReceipt: nil,
+            resolvedModel: "fixture-model",
+            configuredProviderID: nil,
+            adapterVersion: nil
         )
 
         let orchestrator = WorkflowOrchestrator(

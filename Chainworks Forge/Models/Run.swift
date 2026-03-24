@@ -41,6 +41,8 @@ import SwiftData
     var latestImmutableReportArtifactID: UUID?
     var latestReportVersion: Int = 0
     var runtimeTrustLevel: String?    // "fixture_verified" | "server_unverified" | "server_verified"
+    var providerBindingSnapshotJSON: Data?
+    var startOptionsJSON: Data?
 
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?

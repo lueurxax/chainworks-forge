@@ -113,7 +113,7 @@ If the engineer still has to leave the app and manually glue together the repo/r
 
 Proposal 007 is only done when all of the following are true at once:
 
-1. the 10-state workflow is executable end-to-end in a repo-backed mode;
+1. the 12-state workflow, including its three explicit manual gates, is executable end-to-end in a repo-backed mode;
 2. write-capable execution is isolated to one dedicated worktree per run;
 3. release side effects happen only behind explicit manual approval and deterministic services;
 4. the system can produce one happy-path evidence pack and one non-happy-path evidence pack;
@@ -142,7 +142,7 @@ Two tightly scoped layers.
 
 | Component | Responsibility |
 |---|---|
-| **Full MVP Live Workflow** | First executable 10-state repo-backed workflow preset |
+| **Full MVP Live Workflow** | First executable 12-state repo-backed workflow preset |
 | **Dogfood Start Preset** | Opinionated safe defaults for repo, workflow, providers, and release target |
 | **Evidence Pack Builder** | Export the screenshots, reports, receipts, and support bundle needed to review a dogfood session |
 | **Sample Repo Profile** | A small repeatable repository target for first live runs |
@@ -154,11 +154,13 @@ Two tightly scoped layers.
 
 ### In scope
 
-1. The first **repo-backed** end-to-end execution path for the existing 10-state workflow model:
+1. The first **repo-backed** end-to-end execution path for the existing 12-state workflow model:
    - idea received
    - proposal drafted
+   - initial proposal approval
    - proposal reviewed
    - proposal refined
+   - implementation approval
    - implementation started
    - implementation continued
    - implementation reviewed
@@ -223,14 +225,16 @@ This is the first **repo-backed** dogfood workflow.
 |---|---|---|---|
 | `state_1_idea_received` | Idea received | `lead_orchestrator` | Normalize the idea and prepare brief/context |
 | `state_2_proposal_drafted` | Proposal drafted | `proposal_writer` | Produce initial proposal artifacts |
-| `state_3_proposal_reviewed` | Proposal reviewed | `lead_orchestrator` | Parallel PO / UX / UI / Architect review, then aggregate |
-| `state_4_proposal_refined` | Proposal refined | `proposal_writer` | Refine until proposal score target passes |
-| `state_5_implementation_started` | Implementation started | `lead_orchestrator` | Freeze approved proposal, provision worktree, generate plan/backlog, start initial implementation |
-| `state_6_implementation_continued` | Implementation continued until seemingly complete | `code_writer` | Continue work until self-assessment says “seemingly complete” |
-| `state_7_implementation_reviewed` | Implementation reviewed against proposal | `lead_orchestrator` | Security/docs review first, then auditor, then pre-push review, then aggregate |
-| `state_8_implementation_refined` | Implementation refined | `code_writer` | Apply findings, sync docs, loop until status is `Implemented` |
-| `state_9_manual_release` | Manual release | `lead_orchestrator` | Human approval, then deterministic commit/push and archive/distribute |
-| `state_10_workflow_complete` | Workflow complete | `lead_orchestrator` | Terminal state with final receipts/report |
+| `state_3_initial_proposal_approval` | Initial proposal approval | `lead_orchestrator` | Explicit manual gate: confirm the initial draft matches intent before broad review |
+| `state_4_proposal_reviewed` | Proposal reviewed | `lead_orchestrator` | Parallel PO / UX / UI / Architect review, then aggregate |
+| `state_5_proposal_refined` | Proposal refined | `proposal_writer` | Refine until proposal score target passes |
+| `state_6_implementation_approval` | Implementation approval | `lead_orchestrator` | Explicit manual gate: approve the reviewed proposal before any repo-backed implementation starts |
+| `state_7_implementation_started` | Implementation started | `lead_orchestrator` | Freeze approved proposal, provision worktree, generate plan/backlog, start initial implementation |
+| `state_8_implementation_continued` | Implementation continued until seemingly complete | `code_writer` | Continue work until self-assessment says “seemingly complete” |
+| `state_9_implementation_reviewed` | Implementation reviewed against proposal | `lead_orchestrator` | Security/docs review first, then auditor, then pre-push review, then aggregate |
+| `state_10_implementation_refined` | Implementation refined | `code_writer` | Apply findings, sync docs, loop until status is `Implemented` |
+| `state_11_manual_release` | Manual release | `lead_orchestrator` | Explicit manual gate, then deterministic commit/push and archive/distribute via `run_after_approval` |
+| `state_12_workflow_complete` | Workflow complete | `lead_orchestrator` | Terminal state with final receipts/report |
 
 ### 5.2 Why a separate live workflow preset exists
 
@@ -240,7 +244,7 @@ The original canonical workflow is a strong design baseline, but Proposal 007 ne
 - release receipt sequencing,
 - and operator-facing release context.
 
-That means `full-mvp-live.yaml` can and should be slightly more explicit than the earlier abstract design baseline.
+That means `full-mvp-live.yaml` can and should be slightly more explicit than the earlier abstract design baseline while still staying honest about the real 12-state topology and its three explicit manual gates.
 
 ### 5.3 Important workflow refinement for consistency
 
@@ -248,7 +252,7 @@ There is one practical rule Proposal 007 should lock:
 
 > `docs_report` must exist before the implementation auditor consumes it.
 
-For the repo-backed live preset, `state_7_implementation_reviewed` should therefore run in this order:
+For the repo-backed live preset, `state_9_implementation_reviewed` should therefore run in this order:
 
 1. **parallel**
    - `security_checker`
@@ -316,6 +320,61 @@ That makes the most dangerous part of the workflow:
 - easier to recover,
 - and much less likely to leak across workspaces or repositories.
 
+### 6.4 Delivery configuration is a first-class boundary
+
+Proposal 007 needs one explicit pre-run source of truth for repo-backed delivery.
+
+Proposal 006 `AppConfiguration` can provide defaults and remembered paths, but it is **not** the authoritative per-run delivery contract.
+The authoritative contract is a frozen `DeliveryConfiguration` captured before the run starts.
+
+Recommended shape:
+
+```swift
+struct DeliveryConfiguration: Codable, Sendable {
+    let profileID: String?          // nil for direct/manual entry
+    let profileLabel: String?
+    let sampleProfileID: String?    // dogfood fixture identity when applicable
+    let repoIdentifier: String
+    let repoRoot: String
+    let baseBranch: String
+    let worktreeBasePath: String
+    let targetBranch: String
+    let releaseTargetID: String
+    let releaseTargetLabel: String
+    let releaseMode: ReleaseMode
+}
+```
+
+Ownership rule:
+
+- Start Run owns the mutable draft of this object.
+- `DeliveryPreflightService` validates that same draft and emits a preflight summary.
+- `createRun()` freezes the validated draft into `DeliveryConfiguration` and persists it on the `Run`.
+- `WorktreeProvisioner`, `RepoSafetyGuard`, `ReleaseOpsCoordinator`, evidence export, and resume all read the frozen configuration from the `Run`, never from live UI state or app defaults.
+
+This is the configuration boundary Proposal 007 was previously missing.
+Repo profiles and dogfood presets are only convenience producers of `DeliveryConfiguration`, not parallel truths.
+
+### 6.5 Sample repo profile schema stays subordinate
+
+The sample dogfood repo profile should be explicit, but it must resolve into the same `DeliveryConfiguration` contract instead of inventing its own runtime state.
+
+Recommended minimum schema:
+
+```swift
+struct RepositoryProfile: Codable, Sendable {
+    let id: String
+    let label: String
+    let repoIdentifier: String
+    let repoRoot: String
+    let defaultBaseBranch: String
+    let defaultWorktreeBasePath: String
+    let defaultTargetBranch: String
+    let defaultReleaseTargetID: String
+    let sampleProfileID: String?
+}
+```
+
 ---
 
 ## 7. Dedicated worktrees and repo safety
@@ -349,20 +408,26 @@ Example:
 
 ### 7.3 Persisted metadata
 
-Proposal 007 should persist enough worktree/repo data to recover and inspect the run cleanly.
+Proposal 007 should persist enough pre-run and runtime delivery data to recover and inspect the run cleanly.
 
 Recommended additions to `Run`:
 
 ```swift
 // Added to Run
+var deliveryConfigurationJSON: Data?   // authoritative frozen pre-run config
+var deliveryPreflightJSON: Data?       // latest validated preflight snapshot at run creation
 var worktreeRoot: String?
-var repoIdentifier: String?      // stable logical repo id or path hash
+var repoIdentifier: String?      // denormalized mirror of deliveryConfiguration.repoIdentifier
+var repoRoot: String?
 var baseBranch: String?
 var baseRevision: String?        // commit SHA used when the worktree was created
 var targetBranch: String?        // release branch / push target
 var releaseTargetID: String?     // sandbox/staging destination id
 var releaseMode: String?         // sandbox | staging
 ```
+
+`deliveryConfigurationJSON` is the source of truth.
+The mirrored scalar fields exist only for reporting, querying, and simpler UI binding after the run has been created.
 
 Recommended additions to `AgentExecution`:
 
@@ -419,7 +484,7 @@ This is the repo-backed extension of the workspace-isolation rule already docume
 
 ## 8.1 Handoff from approved proposal
 
-When the proposal passes its approval gate, the system enters `state_5_implementation_started`.
+When the proposal passes `state_6_implementation_approval`, the system enters `state_7_implementation_started`.
 
 That stage should do three things in order:
 
@@ -444,7 +509,7 @@ That stage should do three things in order:
 
 ## 8.2 Continue until seemingly complete
 
-`state_6_implementation_continued` is the first real implementation loop.
+`state_8_implementation_continued` is the first real implementation loop.
 
 It is intentionally simple:
 
@@ -465,7 +530,7 @@ This is where the repo-backed slice becomes real.
 The app is no longer only moving text artifacts around.
 It is comparing a live code change against the approved intent.
 
-Recommended execution order for `state_7_implementation_reviewed`:
+Recommended execution order for `state_9_implementation_reviewed`:
 
 ### Parallel phase
 - `security_checker`
@@ -496,7 +561,7 @@ At minimum, this stage should persist:
 
 ## 8.4 Implementation refined
 
-If review status is not `Implemented`, the run enters `state_8_implementation_refined`.
+If review status is not `Implemented`, the run enters `state_10_implementation_refined`.
 
 Recommended sequence:
 
@@ -513,7 +578,7 @@ Recommended sequence:
      - `docs_report`
      - `docs_delta`
 
-Then loop back to `state_7_implementation_reviewed`.
+Then loop back to `state_9_implementation_reviewed`.
 
 ### Practical rule
 
@@ -529,7 +594,7 @@ The roles stay narrow:
 
 ## 9.1 Release must remain explicit
 
-`state_9_manual_release` is not a polite formality.
+`state_11_manual_release` is not a polite formality.
 It is the point where the app crosses from “thinking and editing” into “changing remote state”.
 
 Proposal 007 keeps that boundary hard.
@@ -652,6 +717,7 @@ Production is intentionally excluded from the initial dogfood slice.
 
 Proposal 006 owns provider/platform diagnostics.
 Proposal 007 must add the missing delivery checks before a repo-backed run can cross into implementation or release.
+Those checks validate the mutable `DeliveryConfiguration` draft and persist the accepted snapshot onto the run before execution proceeds.
 
 At minimum, delivery preflight must verify:
 - target repository identity and expected root,
@@ -678,7 +744,11 @@ A new start surface or preset should make it easy to launch the full flow withou
 
 Required inputs:
 - workflow preset: `Full MVP Live`
-- repo/workspace target
+- repo profile or direct repo target
+- base branch
+- worktree base path
+- target branch
+- release target
 - release mode: sandbox or staging
 - provider binding summary (already available from Proposal 006)
 - preflight summary
@@ -686,12 +756,14 @@ Required inputs:
 This surface is the point where Proposal 006 hands off to Proposal 007 in the UI:
 - provider settings and provider diagnostics come from Proposal 006,
 - repo target, release target, and delivery safety context are added here by Proposal 007.
+- the editable form is a `DeliveryConfiguration` draft, and the started run stores the frozen validated snapshot.
 
 Suggested summary block:
 
 ```text
 Workflow: Full MVP Live
-Repo: /path/to/repo
+Repo: sample-repo-profile -> /path/to/repo
+Branch: main -> dogfood/full-mvp
 Release target: Sandbox
 Providers: proposal/review/implementation/release bindings resolved
 Safety: dedicated worktree, manual release gate, deterministic release services
@@ -857,9 +929,9 @@ Non-happy path:
 One engineer should be able to run this in a single focused session:
 
 1. Launch app
-2. Choose sample repo
+2. Choose sample repo profile (or direct repo), confirm base branch/worktree base path/release target
 3. Create idea
-4. Start `Full MVP Live`
+4. Start `Full MVP Live` after delivery preflight is green
 5. Approve proposal
 6. Watch worktree provision
 7. Watch implementation loop
@@ -884,7 +956,7 @@ If this cannot be repeated with low drama, the system is still too theoretical.
 
 ### Workflow / implementation loop
 - `testFullMVPLiveWorkflowCompiles()`
-- `testImplementationState5ProvisionsWorktreeBeforeCodeWriter()`
+- `testImplementationState7ProvisionsWorktreeBeforeCodeWriter()`
 - `testImplementationLoopStopsWhenSeeminglyComplete()`
 - `testImplementationReviewOrderGuaranteesDocsReportBeforeAudit()`
 - `testImplementationRefineLoopReentersReview()`
@@ -929,11 +1001,12 @@ Required review evidence:
 - [ ] Repo identity and base revision are recorded for the run
 
 ### Workflow
-- [ ] `full-mvp-live.yaml` compiles into a valid executable plan
-- [ ] The 10-state workflow can move from approved proposal into repo-backed implementation
-- [ ] `state_7_implementation_reviewed` produces `docs_report`, `audit_report`, `security_report`, `prepush_review_report`, and `implementation_review_summary`
-- [ ] `state_8_implementation_refined` can loop back into review until `status == Implemented`
-- [ ] `state_9_manual_release` blocks on explicit human approval
+- [ ] `full-mvp-live.yaml` compiles into a valid executable 12-state plan
+- [ ] Initial proposal approval, implementation approval, and manual release remain explicit workflow states, not hidden side conditions
+- [ ] The 12-state workflow can move from approved proposal into repo-backed implementation
+- [ ] `state_9_implementation_reviewed` produces `docs_report`, `audit_report`, `security_report`, `prepush_review_report`, and `implementation_review_summary`
+- [ ] `state_10_implementation_refined` can loop back into review until `status == Implemented`
+- [ ] `state_11_manual_release` blocks on explicit human approval
 
 ### Release
 - [ ] Release side effects execute only through deterministic services
@@ -944,6 +1017,7 @@ Required review evidence:
 
 ### UI / operator experience
 - [ ] Start Run supports the `Full MVP Live` preset
+- [ ] Start Run, delivery preflight, run creation, and resume all use the same frozen `DeliveryConfiguration`
 - [ ] Run Progress view shows worktree-aware implementation progress
 - [ ] Release Gate View presents enough context for an informed approval
 - [ ] Existing report/recovery/comparison surfaces from Proposal 005 work for repo-backed runs
@@ -978,6 +1052,7 @@ Required review evidence:
 | ARCH-072 | Default release targets are sandbox/staging only | Keep the first dogfood slice honest but safe |
 | ARCH-073 | Partial release failure returns to blocked/operator recovery, not hidden rollback | Trustworthy receipts beat magical recovery |
 | ARCH-074 | Proposal 003 remains adjacent, not critical path; Proposal 007 emits the artifacts and telemetry Steward will later benefit from | Keep first full-loop delivery moving |
+| ARCH-075 | Approval gates remain explicit workflow states in `full-mvp-live.yaml` | Aligns Proposal 007 with the current DSL/runtime execution model |
 
 ---
 
@@ -999,9 +1074,9 @@ Required review evidence:
 
 | Day | Deliverable |
 |---|---|
-| Day 1 | `full-mvp-live.yaml`, `approval_policy` parsing, model additions for worktree/repo metadata |
+| Day 1 | `full-mvp-live.yaml`, `approval_policy` parsing, delivery-configuration boundary, model additions for worktree/repo metadata |
 | Day 2 | `WorktreeProvisioner` + `RepoSafetyGuard` + tests |
-| Day 3 | Implementation handoff/state 5 integration + code-writer repo context |
+| Day 3 | Implementation handoff/state 7 integration + code-writer repo context |
 | Day 4 | Implementation review/refine loop wiring, including docs-before-audit ordering |
 | Day 5 | `ReleaseOpsCoordinator` + `GitReleaseService` + `ConnectPublishService` |
 | Day 6 | Release Gate UI + dogfood preset + worktree-aware progress affordances |

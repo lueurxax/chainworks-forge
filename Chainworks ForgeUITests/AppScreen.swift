@@ -6,7 +6,7 @@ import XCTest
 struct AppScreen {
     let app: XCUIApplication
 
-    private static let knownTabLabels = ["Runs Home", "Ideas", "Approvals", "Agent Catalog", "Workflow Inspector"]
+    private static let knownTabLabels = ["Runs Home", "Ideas", "Approvals", "Agent Catalog", "Workflow Inspector", "Pilot Readiness", "Settings"]
 
     /// The primary app window. macOS may restore previous windows from scene state,
     /// so we always scope element queries to a single window to prevent ambiguity.
@@ -32,15 +32,26 @@ struct AppScreen {
     }
 
     /// Finds a tab by label scoped to the primary window.
-    /// Tries radioButtons, tabs, buttons, then predicate fallback.
+    /// Tries exact match on radioButtons, tabs, buttons first.
+    /// Falls back to CONTAINS-based predicate matching to handle macOS SwiftUI
+    /// badge-modified accessibility labels (e.g. "Approvals" → "Approvals, 1 item").
     func tab(_ label: String) -> XCUIElement {
         let win = primaryWindow
+        // Exact match
         let radio = win.radioButtons[label]
         if radio.exists { return radio }
         let t = win.tabs[label]
         if t.exists { return t }
         let btn = win.buttons[label]
         if btn.exists { return btn }
+        // CONTAINS fallback for badge-modified labels
+        let predicate = NSPredicate(format: "label BEGINSWITH %@", label)
+        let radioMatch = win.radioButtons.matching(predicate).firstMatch
+        if radioMatch.exists { return radioMatch }
+        let tabMatch = win.tabs.matching(predicate).firstMatch
+        if tabMatch.exists { return tabMatch }
+        let btnMatch = win.buttons.matching(predicate).firstMatch
+        if btnMatch.exists { return btnMatch }
         return win.buttons[label].firstMatch
     }
 

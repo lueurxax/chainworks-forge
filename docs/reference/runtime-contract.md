@@ -102,5 +102,5 @@ Minimum MVP policy:
 
 MVP provider boundary:
 
-- required now: `codex`, `claude_code`
-- post-MVP via provider adapter extension: Gemini and other backends
+- required now: `codex`, `claude_code`, `gemini`
+- post-MVP via provider adapter extension: additional backends beyond the MVP provider set

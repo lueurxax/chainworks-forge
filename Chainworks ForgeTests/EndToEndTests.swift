@@ -127,28 +127,24 @@ final class EndToEndTests: XCTestCase {
         // Start execution
         await orchestrator.start()
 
-        // If we hit approval gates, resolve them and continue
-        var maxIterations = 20
-        while orchestrator.isPaused && maxIterations > 0 {
-            maxIterations -= 1
-
-            // Auto-approve all gates
-            for request in approvalRequests {
-                orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "E2E auto-approve")
+        // Auto-approve gates and wait for completion.
+        // The canonical workflow has approval gates that pause execution.
+        // We poll until completion, auto-approving any gates that appear.
+        try await pollUntil(timeout: 20.0, message: "Canonical workflow should complete with auto-approved gates") {
+            // Check if we need to approve something
+            if orchestrator.isPaused && !approvalRequests.isEmpty {
+                for request in approvalRequests {
+                    orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "E2E auto-approve")
+                }
+                approvalRequests.removeAll()
             }
-            approvalRequests.removeAll()
-
-            // Wait for the resume to process
-            try await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            return run.status == .completed || run.status == .failed || run.status == .cancelled
         }
 
-        // Verify completion
-        // The orchestrator may not reach .completed if the workflow has approval gates
-        // that create a complex state machine. We verify what we can:
-        XCTAssertTrue(
-            run.status == .completed || run.status == .waitingApproval || run.status == .blocked,
-            "Run should have progressed from pending — actual: \(run.status.rawValue)"
-        )
+        // Verify completion — assert the specific expected terminal state.
+        // The canonical workflow with auto-approved gates should reach .completed.
+        // If it doesn't, the test should fail loudly rather than silently accepting any state.
+        assertRunCompleted(run)
 
         // Verify stage executions were created lazily
         XCTAssertFalse(run.stageExecutions.isEmpty, "Should have created stage executions")
@@ -197,15 +193,19 @@ final class EndToEndTests: XCTestCase {
 
         await orchestrator.start()
 
-        // Auto-approve all gates
-        var maxIterations = 20
-        while orchestrator.isPaused && maxIterations > 0 {
-            maxIterations -= 1
+        // Auto-approve all gates using pollUntil instead of sleep loop
+        try await pollUntil(timeout: 10.0, message: "Compact workflow should finish or pause") {
+            !orchestrator.isRunning || orchestrator.isPaused
+        }
+
+        while orchestrator.isPaused {
             for request in approvalRequests {
                 orchestrator.resolveApproval(stageID: request.stageID, granted: true)
             }
             approvalRequests.removeAll()
-            try await Task.sleep(nanoseconds: 200_000_000)
+            try await pollUntil(timeout: 5.0, message: "Compact workflow should resume after approval") {
+                !orchestrator.isPaused || !approvalRequests.isEmpty
+            }
         }
 
         // Verify progress
@@ -238,17 +238,19 @@ final class EndToEndTests: XCTestCase {
         XCTAssertTrue(service.hasActiveRuns)
         XCTAssertNotNil(service.orchestrator(for: run.id))
 
-        // Wait for initial execution
-        try await Task.sleep(nanoseconds: 500_000_000)
+        // Wait for initial execution using pollUntil instead of fixed sleep
+        try await pollUntil(timeout: 5.0, message: "Service should execute at least one agent") {
+            !executor.executedTasks.isEmpty || !service.pendingApprovals.isEmpty
+        }
 
         // If there are pending approvals, resolve them
-        var maxIterations = 10
-        while !service.pendingApprovals.isEmpty && maxIterations > 0 {
-            maxIterations -= 1
+        while !service.pendingApprovals.isEmpty {
             for (id, _) in service.pendingApprovals {
                 service.resolveApproval(approvalID: id, granted: true, comment: "E2E approve")
             }
-            try await Task.sleep(nanoseconds: 300_000_000)
+            try await pollUntil(timeout: 3.0, message: "Approvals should be processed") {
+                service.pendingApprovals.isEmpty || !executor.executedTasks.isEmpty
+            }
         }
 
         // Verify the service tracked the execution
@@ -275,26 +277,30 @@ final class EndToEndTests: XCTestCase {
             catalog: catalog
         )
 
-        orchestrator.onApprovalRequest = { _ in }
+        var approvalRequests: [ApprovalRequest] = []
+        orchestrator.onApprovalRequest = { request in
+            approvalRequests.append(request)
+        }
 
         await orchestrator.start()
 
-        // Auto-approve if needed
+        // Auto-approve if needed, using pollUntil for reliable sync
         if orchestrator.isPaused {
-            let pendingStageIDs = run.approvals
-                .filter { $0.decision == .requested }
-                .map(\.stageID)
-            for stageID in pendingStageIDs {
-                orchestrator.resolveApproval(stageID: stageID, granted: true)
+            for request in approvalRequests {
+                orchestrator.resolveApproval(stageID: request.stageID, granted: true)
             }
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            try await pollUntil(timeout: 5.0, message: "Orchestrator should resume after approval") {
+                !orchestrator.isPaused
+            }
         }
 
-        // After some execution, cost should be aggregated
-        if executor.executedTasks.count > 1 {
-            XCTAssertNotNil(run.totalCostCents, "Cost should be tracked")
-            XCTAssertTrue(run.totalCostCents! > 0, "Cost should be positive")
-        }
+        // Assert explicitly that tasks executed — do NOT silently skip the assertion.
+        // Previous version wrapped this in `if executor.executedTasks.count > 1` which
+        // meant the test passed vacuously when nothing executed.
+        XCTAssertGreaterThan(executor.executedTasks.count, 0,
+                             "At least one agent must execute for cost tracking to be meaningful")
+        XCTAssertNotNil(run.totalCostCents, "Cost should be tracked after agent execution")
+        XCTAssertTrue(run.totalCostCents! > 0, "Cost should be positive after agent execution")
     }
 
     func testLiveProposalLoopFixtureReachesApprovalAndCompletes() async throws {
@@ -326,14 +332,13 @@ final class EndToEndTests: XCTestCase {
 
         await orchestrator.start()
 
-        var pausePollsRemaining = 100
-        while run.status != .waitingApproval && run.status != .completed && pausePollsRemaining > 0 {
-            pausePollsRemaining -= 1
-            try await Task.sleep(nanoseconds: 100_000_000)
+        // Wait for the run to reach a stable state using pollUntil
+        try await pollUntil(timeout: 15.0, message: "Fixture live workflow should reach approval gate or complete") {
+            run.status == .waitingApproval || run.status == .completed || run.status == .blocked
         }
 
-        // Allow fire-and-forget live event routing tasks to complete
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        // Allow fire-and-forget live event routing tasks to settle
+        try await Task.sleep(nanoseconds: 300_000_000)
 
         XCTAssertTrue(
             run.status == .waitingApproval || run.status == .completed || run.status == .blocked,
@@ -353,10 +358,8 @@ final class EndToEndTests: XCTestCase {
                 orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "Fixture test approval")
             }
 
-            var completionPollsRemaining = 100
-            while run.status != .completed && completionPollsRemaining > 0 {
-                completionPollsRemaining -= 1
-                try await Task.sleep(nanoseconds: 100_000_000)
+            try await pollUntil(timeout: 15.0, message: "Fixture live workflow should complete after approval") {
+                run.status == .completed || run.status == .blocked
             }
         }
 

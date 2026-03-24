@@ -20,6 +20,7 @@ struct RunComparisonView: View {
                         comparisonHeader(comparison)
                         snapshotSection(comparison)
                         trustSection(comparison)
+                        bindingsSection(comparison)
                         timingCostSection(comparison)
                         stageSection(comparison)
                         approvalSection(comparison)
@@ -151,6 +152,59 @@ struct RunComparisonView: View {
                 comparisonRow("Rejected", valueA: "\(c.approvalDelta.rejectedA)", valueB: "\(c.approvalDelta.rejectedB)", delta: nil)
             }
         }
+    }
+
+    // MARK: - Provider/Model/Effort Bindings (§8.2)
+
+    @ViewBuilder
+    private func bindingsSection(_ c: RunComparison) -> some View {
+        if !c.bindingsA.isEmpty || !c.bindingsB.isEmpty {
+            GroupBox("Provider / Model / Effort Bindings") {
+                let allAgentIDs = Set(c.bindingsA.map(\.agentID)).union(c.bindingsB.map(\.agentID)).sorted()
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(allAgentIDs, id: \.self) { agentID in
+                        let bindingA = c.bindingsA.first(where: { $0.agentID == agentID })
+                        let bindingB = c.bindingsB.first(where: { $0.agentID == agentID })
+                        let changed = bindingA?.provider != bindingB?.provider
+                            || bindingA?.model != bindingB?.model
+                            || bindingA?.effort != bindingB?.effort
+                        HStack {
+                            Image(systemName: changed ? "arrow.triangle.2.circlepath" : "equal.circle")
+                                .foregroundStyle(changed ? .orange : .green)
+                            Text(agentID)
+                                .font(.caption.monospaced().bold())
+                                .frame(width: 100, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 1) {
+                                HStack(spacing: 4) {
+                                    Text("A:")
+                                        .font(.caption2)
+                                        .foregroundStyle(.blue)
+                                    Text(bindingSummary(bindingA))
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.blue)
+                                }
+                                HStack(spacing: 4) {
+                                    Text("B:")
+                                        .font(.caption2)
+                                        .foregroundStyle(.purple)
+                                    Text(bindingSummary(bindingB))
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.purple)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func bindingSummary(_ binding: RunComparison.AgentBinding?) -> String {
+        guard let binding else { return "—" }
+        var parts = [binding.provider]
+        if let model = binding.model { parts.append(model) }
+        parts.append(binding.effort)
+        return parts.joined(separator: " / ")
     }
 
     @ViewBuilder

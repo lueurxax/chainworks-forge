@@ -83,12 +83,17 @@ final class NotificationService {
     /// Update dock badge with count of runs requiring attention.
     func updateDockBadge(waitingApprovalCount: Int, blockedCount: Int) {
         pendingAttentionCount = waitingApprovalCount + blockedCount
-        NSApp.dockTile.badgeLabel = pendingAttentionCount > 0 ? "\(pendingAttentionCount)" : nil
+        // Guard against unit-test contexts where NSApp may not be initialized
+        if let app = NSApp {
+            app.dockTile.badgeLabel = pendingAttentionCount > 0 ? "\(pendingAttentionCount)" : nil
+        }
     }
 
     func clearDockBadge() {
         pendingAttentionCount = 0
-        NSApp.dockTile.badgeLabel = nil
+        if let app = NSApp {
+            app.dockTile.badgeLabel = nil
+        }
     }
 
     // MARK: - Menu Bar (§10)
@@ -106,6 +111,8 @@ final class NotificationService {
     // MARK: - Helpers
 
     private func scheduleNotification(id: String, content: UNNotificationContent) {
+        // Guard: skip scheduling in unit-test contexts where notification center may not be available
+        guard NSApp != nil else { return }
         let request = UNNotificationRequest(
             identifier: id,
             content: content,
@@ -120,6 +127,8 @@ final class NotificationService {
 
     private func incrementAttention() {
         pendingAttentionCount += 1
-        NSApp.dockTile.badgeLabel = "\(pendingAttentionCount)"
+        if let app = NSApp {
+            app.dockTile.badgeLabel = "\(pendingAttentionCount)"
+        }
     }
 }

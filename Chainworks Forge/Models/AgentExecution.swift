@@ -21,6 +21,14 @@ import SwiftData
     var transcriptArtifactPath: String?
     var resolvedBackendProfileID: String?
     var consumedInputArtifactNamesJSON: Data?
+    var providerReceiptJSON: Data?
+    var resolvedModel: String?
+    var configuredProviderID: UUID?
+    var adapterVersion: String?
+
+    // P005-OPS §9.3: Structured input bindings for traceability
+    // Stores [InputBinding] — maps declared input names to source artifact names and producing agents.
+    var inputBindingsJSON: Data?
 
     // Steward data model additions (Proposal 003 — optional, lightweight migration)
     var agentConfigHash: String?
@@ -45,6 +53,13 @@ import SwiftData
         self.provider = provider
         self.effort = effort
     }
+}
+
+/// P005-OPS §9.3: Structured input binding for traceability.
+struct InputBinding: Codable, Sendable {
+    let inputName: String
+    let artifactName: String
+    let producingAgentID: String?
 }
 
 enum AgentStatus: String, Codable {
