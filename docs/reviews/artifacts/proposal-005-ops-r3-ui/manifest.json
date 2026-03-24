@@ -1,0 +1,50 @@
+[
+  {
+    "attachments" : [
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "EDB7983E-C578-4856-8A85-13AADECE76B2.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "REQ011_Approvals_0_A5125588-4A92-4FF3-BEE5-AC3F09B3638B.png",
+        "timestamp" : 1774300521.779
+      }
+    ],
+    "testIdentifier" : "Chainworks_ForgeUITests/testApprovalInboxReachable()",
+    "testIdentifierURL" : "test://com.apple.xcode/Chainworks%20Forge/Chainworks%20ForgeUITests/Chainworks_ForgeUITests/testApprovalInboxReachable"
+  },
+  {
+    "attachments" : [
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "49716512-D78E-45EF-B767-3FE27C3DBC05.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "REQ011_RunProgress_Sections_0_CDAE5765-89F8-4E36-8C3E-64711949ECAB.png",
+        "timestamp" : 1774300556.113
+      },
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "81B1A9D9-D32C-41E7-A491-C9C936D91B7B.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "REQ011_RunProgress_Overview_0_1876E7B1-3EA9-44FA-86F4-DAC471877880.png",
+        "timestamp" : 1774300555.676
+      },
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "F3F8D646-BC54-4A4D-822F-391734DEDB86.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "REQ011_RunProgress_Entry_0_01FDE9F7-AB44-4B98-A476-F815A814ECEB.png",
+        "timestamp" : 1774300555.258
+      }
+    ],
+    "testIdentifier" : "Chainworks_ForgeUITests/testRunProgressViewSurface()",
+    "testIdentifierURL" : "test://com.apple.xcode/Chainworks%20Forge/Chainworks%20ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
+  }
+]

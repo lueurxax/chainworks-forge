@@ -54,9 +54,30 @@ struct OutputContractTemplates {
         stageID: String,
         catalog: AgentCatalog? = nil
     ) -> (data: Data, format: ArtifactFormat) {
-        // If the agent has an output contract, use it
-        if let contractID = agent.outputContract {
-            return generate(contractID: contractID, agentID: agent.id, stageID: stageID)
+        if let contractID = OutputContractResolver.contractID(
+            for: outputName,
+            agent: agent,
+            catalog: catalog
+        ) {
+            let data = generate(contractID: contractID, agentID: agent.id, stageID: stageID).data
+            let format = OutputContractResolver.contract(
+                for: outputName,
+                agent: agent,
+                catalog: catalog
+            ).map { artifactFormat(from: $0.format) } ?? .report
+            return (data, format)
+        }
+
+        if let hintedPath = catalog?.artifacts[outputName] {
+            let format = ArtifactFormat.detect(from: hintedPath, contract: nil)
+            switch format {
+            case .json, .report:
+                return (genericJSON(outputName: outputName, stageID: stageID, agentID: agent.id), format)
+            case .markdown:
+                return (genericMarkdown(stageID: stageID, agentID: agent.id), format)
+            case .diff:
+                return (genericDiff(outputName: outputName, agentID: agent.id), format)
+            }
         }
 
         // Look up the contract from the catalog if available
@@ -80,8 +101,11 @@ struct OutputContractTemplates {
         let json: [String: Any] = [
             "agent_id": agentID,
             "role": "reviewer",
-            "score": 85,
+            "score": 8.5,
+            "decision": "approve_with_suggestions",
             "verdict": "approve_with_suggestions",
+            "summary": "The proposal is viable with a small set of follow-up refinements.",
+            "issues": ["Clarify edge-case behavior for missing attachments"],
             "blocking_issues": [] as [String],
             "non_blocking_issues": ["Consider edge case handling for empty inputs"],
             "suggestions": ["Add more unit tests for boundary conditions"],
@@ -92,9 +116,13 @@ struct OutputContractTemplates {
 
     private static func proposalReviewSummary() -> Data {
         let json: [String: Any] = [
-            "aggregate_score": 87,
-            "min_individual_score": 80,
+            "pass": true,
+            "average_score": 8.7,
+            "aggregate_score": 8.7,
+            "min_individual_score": 8.0,
             "blocker_count": 0,
+            "summary": "The proposal clears the review threshold and can move to approval.",
+            "required_changes": [] as [String],
             "recurring_themes": ["Testing coverage", "Error handling"],
             "decision": "proceed"
         ]
@@ -199,6 +227,29 @@ struct OutputContractTemplates {
         represent actual agent output.
         """
         return Data(md.utf8)
+    }
+
+    private static func genericJSON(outputName: String, stageID: String, agentID: String) -> Data {
+        let json: [String: Any] = [
+            "output_name": outputName,
+            "stage_id": stageID,
+            "agent_id": agentID,
+            "generated_at": ISO8601DateFormatter().string(from: Date()),
+            "status": "simulated"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func genericDiff(outputName: String, agentID: String) -> Data {
+        let diff = """
+        diff --git a/\(outputName) b/\(outputName)
+        --- a/\(outputName)
+        +++ b/\(outputName)
+        @@ -1 +1 @@
+        -Simulated placeholder
+        +Updated by \(agentID)
+        """
+        return Data(diff.utf8)
     }
 
     // MARK: - Steward Contract Templates (Proposal 003)

@@ -42,6 +42,25 @@ struct ApprovalGateView: View {
                         .font(.caption)
                 }
 
+                // Preceding artifacts (§8.2, §11.4)
+                if !request.precedingArtifacts.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Key artifacts for review:")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(request.precedingArtifacts, id: \.self) { name in
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.text")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Text(name)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+
                 // Comment field
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Comment (optional)")
@@ -106,11 +125,21 @@ struct ApprovalInboxView: View {
         ScrollView {
             VStack(spacing: 12) {
                 if sortedApprovals.isEmpty {
-                    ContentUnavailableView(
-                        "No Pending Approvals",
-                        systemImage: "checkmark.seal",
-                        description: Text("All approval gates have been resolved.")
-                    )
+                    VStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                        Text("No Pending Approvals")
+                            .font(.headline)
+                            .accessibilityIdentifier("approval-inbox-empty-title")
+                        Text("All approval gates have been resolved.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 180)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("approval-inbox-empty-state")
                 } else {
                     ForEach(sortedApprovals) { request in
                         ApprovalGateView(request: request)

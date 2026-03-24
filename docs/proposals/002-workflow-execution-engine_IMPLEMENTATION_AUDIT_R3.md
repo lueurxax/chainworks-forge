@@ -269,3 +269,27 @@ Proposal 002 is substantially implemented: the compiler, compact normalization, 
 - Fix the `ResumeManager` regression cluster until `ResumeManagerTests` is green again, starting with interrupted-run filtering for `.completed`/`.cancelled` and resume classification expectations.
 - Re-close the proposal's explicit green-suite gate by getting a full fresh `xcodebuild test` to complete without failures.
 - Stabilize a macOS UI proof path for the full execution checkpoint so `testProductCheckpointExecutionFlowReachable` and `testFullProductCheckpointCanonicalExecution` stop skipping in audit conditions.
+
+## Post-Audit Remediation
+
+This audit captured a real failure state on commit `c490e6b`, but part of that failure set is no longer reproducible on the current head after follow-up fixes.
+
+### Fixed After Audit
+
+- `WorkflowOrchestrator.start(from:)` no longer clears a pre-existing cancellation flag.
+- This closes a start/cancel race where `ExecutionService.startRun()` scheduled an async start task, `cancelRun()` fired immediately, and the delayed `start()` call could flip the run back from `.cancelled` to `.running`.
+- File updated: `Chainworks Forge/Engine/WorkflowOrchestrator.swift`
+
+### Current Verification On Head
+
+- `xcodebuild -quiet test -project 'Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -derivedDataPath /tmp/cw-one.dHnyHw -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testCompletedRunsNotFound'`
+- `xcodebuild -quiet test -project 'Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -derivedDataPath /tmp/cw-two.k3O8t8 -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testClassifyResumeableRun'`
+- `xcodebuild -quiet test -project 'Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -derivedDataPath /tmp/cw-three.5db3oO -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testCancelledRunsNotFound' -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testClassifyCompilerVersionMismatch' -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testExecutionServiceCancelRun'`
+- `xcodebuild -quiet test -project 'Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -derivedDataPath /tmp/cw-live-tests.4m0Hfd -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testExecutionServiceStartRun' -only-testing:'Chainworks ForgeTests/ResumeManagerTests/testExecutionServiceDuplicateStartPrevented' -only-testing:'Chainworks ForgeTests/EndToEndTests/testLiveProposalLoopFixtureReachesApprovalAndCompletes'`
+
+### Re-evaluated Findings
+
+- The six named failing tests under `REQ-013` are no longer accurate as a current-head failure list. Those targeted cases now pass.
+- `REQ-007` should no longer be treated as blocked by the specific `ResumeManagerTests` failures cited in this R3 snapshot.
+- `REQ-013` is still not closed by this addendum because a fresh full-suite `xcodebuild test` was not rerun end-to-end after remediation.
+- `REQ-011` remains an evidence gap rather than a confirmed code defect: the stronger product-checkpoint UI proof is still not established here.

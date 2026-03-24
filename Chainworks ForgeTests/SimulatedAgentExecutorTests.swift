@@ -205,7 +205,23 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
+        // §6.2: default 100 cents per execution
         XCTAssertNotNil(result.costCents)
-        XCTAssertTrue(result.costCents! >= 5 && result.costCents! <= 50)
+        XCTAssertEqual(result.costCents, 100)
+    }
+
+    // MARK: - AgentResult Fields (§6.1)
+
+    func testAgentResultIncludesSessionIDAndDuration() async throws {
+        let executor = SimulatedAgentExecutor()
+        let agent = makeAgent()
+        let result = try await executor.execute(
+            task: makeTask(),
+            agent: agent,
+            context: makeContext()
+        )
+        XCTAssertNotNil(result.sessionID, "AgentResult.sessionID must be set (§6.1)")
+        XCTAssertTrue(result.sessionID!.hasPrefix("sim-"), "Simulated sessions use 'sim-' prefix")
+        XCTAssertGreaterThanOrEqual(result.durationSeconds, 0, "AgentResult.durationSeconds must be non-negative (§6.1)")
     }
 }

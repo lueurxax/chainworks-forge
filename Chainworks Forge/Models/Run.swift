@@ -36,6 +36,12 @@ import SwiftData
     var stack: String?
     var experimentCohortID: UUID?
 
+    // P005-OPS §6.5: Report and runtime trust additions
+    var latestSummaryArtifactID: UUID?
+    var latestImmutableReportArtifactID: UUID?
+    var latestReportVersion: Int = 0
+    var runtimeTrustLevel: String?    // "fixture_verified" | "server_unverified" | "server_verified"
+
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?
 

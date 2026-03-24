@@ -11,4 +11,5 @@ Implementation-oriented reference docs live here.
 ## Runtime contracts
 
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
+- [live-provider-execution-slice.md](live-provider-execution-slice.md) — Implemented live proposal-loop slice: Goose execution seam, read-only runtime contract, app surfaces, artifacts, and proof boundary
 - [workspace-isolation-risk.md](workspace-isolation-risk.md) — Goose backend isolation risk, failure modes, required guardrails around workspace-bound execution

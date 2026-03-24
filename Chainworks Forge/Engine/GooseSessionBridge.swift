@@ -14,11 +14,12 @@ final class GooseSessionBridge: Sendable {
 
     // MARK: - Dependencies
 
-    let transport: GooseTransport
+    /// Proposal 005: depends on `GooseTransportProtocol`, not concrete `GooseTransport`.
+    let transport: any GooseTransportProtocol
 
     // MARK: - Init
 
-    nonisolated init(transport: GooseTransport) {
+    nonisolated init(transport: any GooseTransportProtocol) {
         self.transport = transport
     }
 
@@ -45,6 +46,13 @@ final class GooseSessionBridge: Sendable {
             workingDirectory: context.workspace.workspaceRoot.path,
             model: model,
             provider: provider,
+            executionPolicy: GooseExecutionPolicy(
+                permissionProfileID: agent.permissionProfile,
+                workspaceMode: "read_only",
+                gitOperationsAllowed: false,
+                releaseOperationsAllowed: false,
+                repoWritesAllowed: false
+            ),
             metadata: [
                 "run_id": context.workspace.runID.uuidString,
                 "stage_id": context.stageID,
@@ -55,6 +63,9 @@ final class GooseSessionBridge: Sendable {
         )
 
         let sessionResponse = try await transport.createSession(request: sessionRequest)
+        guard sessionResponse.policyAcknowledgement?.accepted == true else {
+            throw GooseSessionBridgeError.policyAcknowledgementMissing
+        }
 
         // Step 4: Submit the task prompt and get streaming events
         let promptRequest = GoosePromptRequest(
@@ -83,11 +94,18 @@ final class GooseSessionBridge: Sendable {
         task: AgentTask,
         context: ExecutionContext
     ) -> ExecutionPacket {
+        let expectedOutputs = OutputContractResolver.expectedOutputs(for: task, agent: agent)
+
         // 1. System prompt
-        let systemPrompt = buildSystemPrompt(agent: agent)
+        let systemPrompt = buildSystemPrompt(agent: agent, expectedOutputs: expectedOutputs)
 
         // 2. Task directive
-        let taskDirective = buildTaskDirective(agent: agent, task: task, context: context)
+        let taskDirective = buildTaskDirective(
+            agent: agent,
+            task: task,
+            context: context,
+            expectedOutputs: expectedOutputs
+        )
 
         // 3. Context attachments (input artifacts + workspace info)
         var attachments: [GooseContextAttachment] = []
@@ -138,7 +156,10 @@ final class GooseSessionBridge: Sendable {
 
     // MARK: - Private: System Prompt
 
-    private static func buildSystemPrompt(agent: ResolvedAgent) -> String {
+    private static func buildSystemPrompt(
+        agent: ResolvedAgent,
+        expectedOutputs: [String]
+    ) -> String {
         var parts: [String] = []
 
         // Agent role
@@ -157,7 +178,9 @@ final class GooseSessionBridge: Sendable {
             parts.append("")
             parts.append("## Output Contract")
             parts.append("You must produce outputs conforming to contract: \(contract)")
-            parts.append("Required outputs: \(agent.outputs.joined(separator: ", "))")
+            if !expectedOutputs.isEmpty {
+                parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
+            }
         }
 
         // Boundaries
@@ -176,7 +199,8 @@ final class GooseSessionBridge: Sendable {
     private static func buildTaskDirective(
         agent: ResolvedAgent,
         task: AgentTask,
-        context: ExecutionContext
+        context: ExecutionContext,
+        expectedOutputs: [String]
     ) -> String {
         var parts: [String] = []
 
@@ -193,10 +217,10 @@ final class GooseSessionBridge: Sendable {
         }
 
         // Expected outputs
-        if !agent.outputs.isEmpty {
+        if !expectedOutputs.isEmpty {
             parts.append("### Expected Outputs")
             parts.append("You MUST produce the following output files in the artifact directory:")
-            for output in agent.outputs {
+            for output in expectedOutputs {
                 parts.append("- \(output)")
             }
             parts.append("")
@@ -241,10 +265,11 @@ struct ExecutionPacket: Sendable {
 // MARK: - GooseSessionExecution
 
 /// Represents an in-flight execution within an isolated Goose session.
+/// Proposal 005: uses `GooseTransportProtocol` instead of concrete `GooseTransport`.
 struct GooseSessionExecution: Sendable {
     let sessionID: String
     let eventStream: AsyncThrowingStream<GooseStreamEvent, Error>
-    let transport: GooseTransport
+    let transport: any GooseTransportProtocol
 
     /// Close the session after execution completes.
     func closeSession() async {
@@ -274,6 +299,7 @@ enum GooseSessionBridgeError: Error, LocalizedError {
     case implicitCWDRejected
     case workspaceRootMissing
     case sessionCreationFailed(reason: String)
+    case policyAcknowledgementMissing
 
     var errorDescription: String? {
         switch self {
@@ -283,6 +309,8 @@ enum GooseSessionBridgeError: Error, LocalizedError {
             return "Workspace root is not set"
         case .sessionCreationFailed(let reason):
             return "Goose session creation failed: \(reason)"
+        case .policyAcknowledgementMissing:
+            return "Live execution blocked: backend did not acknowledge the required read-only execution policy"
         }
     }
 }

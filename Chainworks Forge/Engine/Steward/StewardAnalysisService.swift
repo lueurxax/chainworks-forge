@@ -337,6 +337,7 @@ final class StewardAnalysisService {
             id: agentDef.id,
             title: agentDef.title,
             mode: agentDef.mode,
+            backendProfileID: agentDef.backendProfile,
             provider: backend.provider,
             model: backend.model,
             effort: backend.effort,

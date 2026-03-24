@@ -42,8 +42,8 @@
 		CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-po-reviewer.yaml"; sourceTree = "<group>"; };
 		CE89156B2F700957006EC77C /* proposal-to-release.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-to-release.yaml"; sourceTree = "<group>"; };
 		CE89156C2F700957006EC77C /* workflow.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = workflow.yaml; sourceTree = "<group>"; };
-		CE8915762F700957006EC77C /* proposal-loop-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-loop-live.yaml"; sourceTree = "<group>"; };
 		CE89156E2F700957006EC77C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		CE8915762F700957006EC77C /* proposal-loop-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-loop-live.yaml"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */

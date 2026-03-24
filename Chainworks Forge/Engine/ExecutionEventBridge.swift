@@ -113,8 +113,15 @@ final class ExecutionEventBridge: @unchecked Sendable {
                 detail: detail,
                 sessionID: sessionID
             )
-        case .promptSubmitted:
-            return ExecutionEvent(type: .promptSubmitted, timestamp: timestamp, detail: "Prompt submitted")
+        case .promptSubmitted(let raw):
+            let requestID = parseMetadataValue(from: raw, keys: ["request_id", "requestId", "id"])
+            let detail = requestID.map { "Prompt submitted: \($0)" } ?? "Prompt submitted"
+            return ExecutionEvent(
+                type: .promptSubmitted,
+                timestamp: timestamp,
+                detail: detail,
+                requestID: requestID
+            )
         case .toolCallStarted(let toolName, _):
             return ExecutionEvent(
                 type: .toolCallStarted,
@@ -189,6 +196,7 @@ struct ExecutionEvent: Sendable, Identifiable {
     let timestamp: Date
     let detail: String
     let sessionID: String?
+    let requestID: String?
     let toolName: String?
 
     init(
@@ -196,12 +204,14 @@ struct ExecutionEvent: Sendable, Identifiable {
         timestamp: Date,
         detail: String,
         sessionID: String? = nil,
+        requestID: String? = nil,
         toolName: String? = nil
     ) {
         self.type = type
         self.timestamp = timestamp
         self.detail = detail
         self.sessionID = sessionID
+        self.requestID = requestID
         self.toolName = toolName
     }
 

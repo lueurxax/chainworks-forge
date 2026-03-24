@@ -26,8 +26,9 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     // MARK: - Init
 
+    /// Proposal 005: accepts `any GooseTransportProtocol` instead of concrete `GooseTransport`.
     init(
-        transport: GooseTransport,
+        transport: any GooseTransportProtocol,
         override: LiveExecutionOverride? = nil
     ) {
         self.sessionBridge = GooseSessionBridge(transport: transport)
@@ -42,6 +43,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         context: ExecutionContext
     ) async throws -> AgentResult {
         let startedAt = Date()
+        let expectedOutputs = OutputContractResolver.expectedOutputs(for: task, agent: agent)
 
         // Step 1: Validate workspace (ARCH-025)
         try GooseSessionBridge.validateWorkspace(context.workspace)
@@ -61,7 +63,9 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 logSnippet: "Session creation failed: \(error.localizedDescription)",
                 costCents: nil,
                 succeeded: false,
-                errorMessage: "Session creation failed: \(error.localizedDescription)"
+                errorMessage: "Session creation failed: \(error.localizedDescription)",
+                sessionID: nil,
+                durationSeconds: Date().timeIntervalSince(startedAt)
             )
         }
 
@@ -79,15 +83,65 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 }
             )
         } catch {
-            // Stream failed — still close the session
+            // Stream failed — still close the session and check for files on disk.
+            // Proposal 005 fix: goosed agents write files via developer tools BEFORE
+            // the SSE stream completes. If the stream errors (timeout, disconnect),
+            // the agent's output may already be on disk. We must still collect it
+            // and generate a receipt for audit evidence.
             await sessionExecution.closeSession()
 
+            let completedAt = Date()
+            let resolvedProvider = override?.provider ?? agent.provider
+            let resolvedModel = override?.model ?? agent.model
+            let resolvedEffort = override?.effort ?? agent.effort
+
+            // Check for files the agent already wrote to disk
+            var salvaged: [String: Data] = [:]
+            let outputDir = context.workspace.artifactRoot
+                .appendingPathComponent("\(context.stageID).\(context.iteration)", isDirectory: true)
+                .appendingPathComponent(agent.id, isDirectory: true)
+                .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
+
+            for outputName in expectedOutputs {
+                let outputPath = outputDir.appendingPathComponent(outputName)
+                if FileManager.default.fileExists(atPath: outputPath.path),
+                   let data = try? Data(contentsOf: outputPath) {
+                    salvaged[outputName] = data
+                }
+            }
+
+            // Generate receipt even on stream failure
+            let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
+                agentID: agent.id,
+                sessionID: sessionExecution.sessionID,
+                stageID: context.stageID,
+                iteration: context.iteration,
+                attemptNumber: context.attemptNumber,
+                startedAt: startedAt,
+                completedAt: completedAt,
+                events: eventBridge.eventLog,
+                toolCalls: eventBridge.toolCalls,
+                finalContent: nil,
+                succeeded: !salvaged.isEmpty,
+                errorMessage: "Stream processing failed: \(error.localizedDescription)",
+                provider: resolvedProvider,
+                model: resolvedModel,
+                effort: resolvedEffort
+            )
+            for (name, data) in receiptArtifacts {
+                salvaged[name] = data
+            }
+
+            let salvagedOutputs = !salvaged.keys.contains(where: { !$0.hasSuffix("_receipt.json") && !$0.hasSuffix("_transcript.md") })
+
             return AgentResult(
-                outputs: [:],
-                logSnippet: "Stream processing failed: \(error.localizedDescription)",
+                outputs: salvaged,
+                logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts from disk. Error: \(error.localizedDescription)",
                 costCents: nil,
-                succeeded: false,
-                errorMessage: "Stream processing failed: \(error.localizedDescription)"
+                succeeded: !salvagedOutputs && !salvaged.isEmpty,
+                errorMessage: salvagedOutputs ? "Stream processing failed: \(error.localizedDescription)" : nil,
+                sessionID: sessionExecution.sessionID,
+                durationSeconds: completedAt.timeIntervalSince(startedAt)
             )
         }
 
@@ -128,7 +182,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             .appendingPathComponent(agent.id, isDirectory: true)
             .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
 
-        for outputName in agent.outputs {
+        for outputName in expectedOutputs {
             let outputPath = outputDir.appendingPathComponent(outputName)
             if FileManager.default.fileExists(atPath: outputPath.path) {
                 do {
@@ -144,7 +198,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         // If the final output contains content but no files were written,
         // try to use the final content as the primary output
         if outputs.isEmpty, let content = streamResult.finalContent, !content.isEmpty {
-            if let primaryOutput = agent.outputs.first {
+            if let primaryOutput = expectedOutputs.first {
                 outputs[primaryOutput] = content.data(using: .utf8) ?? Data()
             }
         }
@@ -155,7 +209,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         }
 
         // Step 7: Validate required outputs (Section 8.3)
-        let missingOutputs = agent.outputs.filter { outputs[$0] == nil }
+        let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
 
         if !missingOutputs.isEmpty {
             // Stage should fail loudly — silent success is worse than a visible crash
@@ -165,7 +219,9 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 logSnippet: "Missing required outputs: \(missingList). Session: \(sessionExecution.sessionID)",
                 costCents: estimateCost(streamResult: streamResult),
                 succeeded: false,
-                errorMessage: "Required outputs missing: \(missingList)"
+                errorMessage: "Required outputs missing: \(missingList)",
+                sessionID: sessionExecution.sessionID,
+                durationSeconds: completedAt.timeIntervalSince(startedAt)
             )
         }
 
@@ -183,7 +239,9 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             logSnippet: logSnippet,
             costCents: estimateCost(streamResult: streamResult),
             succeeded: true,
-            errorMessage: nil
+            errorMessage: nil,
+            sessionID: sessionExecution.sessionID,
+            durationSeconds: completedAt.timeIntervalSince(startedAt)
         )
     }
 

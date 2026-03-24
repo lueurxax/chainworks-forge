@@ -307,8 +307,7 @@ final class EndToEndTests: XCTestCase {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace, plan: plan)
         let transport = FixtureGooseTransport(
-            scenario: .proposalLoopSuccess,
-            baseURL: URL(string: "http://fixture.local")!
+            scenario: .proposalLoopSuccess
         )
         let executor = GooseAgentExecutor(transport: transport)
         let orchestrator = WorkflowOrchestrator(
@@ -365,12 +364,38 @@ final class EndToEndTests: XCTestCase {
             run.status == .completed || run.status == .blocked || run.status == .waitingApproval,
             "Fixture live workflow should complete or reach a stable state, got: \(run.status.rawValue)"
         )
-        XCTAssertNotNil(run.completedAt)
+
+        // completedAt is only set when the run reaches .completed
+        if run.status == .completed {
+            XCTAssertNotNil(run.completedAt)
+        }
+
         XCTAssertTrue(
             run.stageExecutions
                 .flatMap(\.agentExecutions)
                 .contains { ($0.providerSessionID ?? "").hasPrefix("fixture-") },
             "At least one live agent execution should capture a fixture provider session id"
         )
+
+        let allArtifacts = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .flatMap(\.artifacts)
+
+        if let summaryArtifact = allArtifacts.first(where: { $0.name == "proposal_review_summary" }) {
+            let data = try ArtifactStorage.read(filePath: summaryArtifact.filePath, workspaceRoot: workspace.workspaceRoot)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(json["pass"] as? Bool, true)
+            XCTAssertNotNil(json["average_score"] as? Double)
+            XCTAssertNotNil(json["required_changes"] as? [Any])
+        } else {
+            XCTFail("Expected proposal_review_summary artifact to be persisted")
+        }
+
+        if run.status == .completed {
+            let descriptor = FetchDescriptor<Artifact>()
+            let reports = try context.fetch(descriptor)
+                .filter { $0.runID == run.id && $0.name == "final_feature_report" }
+            XCTAssertEqual(reports.count, 1, "Completed live run should persist a final feature report")
+        }
     }
 }

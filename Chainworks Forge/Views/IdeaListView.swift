@@ -72,6 +72,7 @@ struct IdeaListView: View {
             .sheet(isPresented: $showNewIdeaSheet) {
                 newIdeaSheet
             }
+            .accessibilityIdentifier("ideas-root-view")
         } detail: {
             Text("Select an idea")
                 .foregroundStyle(.secondary)
@@ -96,10 +97,17 @@ struct IdeaListView: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             }
-            if executionService.pendingApprovalCount > 0 {
-                Label("\(executionService.pendingApprovalCount) approvals", systemImage: "checkmark.circle")
+            switch executionService.liveRuntimeReadiness {
+            case .ready(_, let source):
+                Label("Live ready (\(source))", systemImage: "bolt.horizontal.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .accessibilityIdentifier("live-runtime-ready")
+            case .unavailable:
+                Label("Live unavailable", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
+                    .accessibilityIdentifier("live-runtime-unavailable")
             }
         }
         .font(.caption)
@@ -200,95 +208,124 @@ struct IdeaDetailView: View {
     @Environment(ExecutionService.self) private var executionService
     let idea: Idea
     @State private var showStartRunSheet = false
-    @State private var autoOpenedRun: Run?
+    @State private var activeRun: Run?
 
     /// Whether this idea has an active run (prevents starting another).
     private var hasActiveRun: Bool {
         idea.runs.contains { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
     }
 
+    private var latestActiveRun: Run? {
+        idea.runs
+            .filter { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
+            .sorted { $0.startedAt > $1.startedAt }
+            .first
+    }
+
     var body: some View {
-        Form {
-            Section("Idea") {
-                LabeledContent("Title", value: idea.title)
-                LabeledContent("Status", value: idea.status.rawValue.capitalized)
-                LabeledContent("Created", value: idea.createdAt, format: .dateTime)
-                if let path = idea.attachmentPath {
-                    LabeledContent("Attachment", value: path)
-                }
-            }
-            Section("Body") {
-                Text(idea.body)
-                    .textSelection(.enabled)
-            }
+        Group {
+            if let activeRun {
+                WorkflowRunProgressView(run: activeRun)
+            } else {
+                Form {
+                    Section("Idea") {
+                        LabeledContent("Title", value: idea.title)
+                        LabeledContent("Status", value: idea.status.rawValue.capitalized)
+                        LabeledContent("Created", value: idea.createdAt, format: .dateTime)
+                        if let path = idea.attachmentPath {
+                            LabeledContent("Attachment", value: path)
+                        }
+                    }
 
-            // Proposal 002 + 004: Start New Run action
-            Section {
-                Button {
-                    showStartRunSheet = true
-                } label: {
-                    Label("Start New Run", systemImage: "play.fill")
-                }
-                .disabled(hasActiveRun)
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("start-new-run-button")
+                    Section("Body") {
+                        Text(idea.body)
+                            .textSelection(.enabled)
+                    }
 
-                if hasActiveRun {
-                    Text("An active run already exists for this idea.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Runs") {
-                if idea.runs.isEmpty {
-                    Text("No runs yet")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(idea.runs.sorted(by: { $0.startedAt > $1.startedAt })) { run in
-                        NavigationLink {
-                            WorkflowRunProgressView(run: run)
+                    // Proposal 002 + 004: Start New Run action
+                    Section {
+                        Button {
+                            showStartRunSheet = true
                         } label: {
-                            HStack {
-                                runStatusIcon(run.status)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(run.workflowTitle)
-                                        .font(.headline)
-                                    HStack(spacing: 8) {
-                                        Text(run.status.rawValue)
-                                            .font(.caption)
-                                            .foregroundStyle(statusColor(run.status))
-                                        Text(run.startedAt, format: .dateTime)
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                        if let cost = run.totalCostCents {
-                                            Text("\(cost)\u{00A2}")
-                                                .font(.caption2)
-                                                .foregroundStyle(.tertiary)
+                            Label("Start New Run", systemImage: "play.fill")
+                        }
+                        .disabled(hasActiveRun)
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("start-new-run-button")
+
+                        if hasActiveRun {
+                            Text("An active run already exists for this idea.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Section("Runs") {
+                        if idea.runs.isEmpty {
+                            Text("No runs yet")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(idea.runs.sorted(by: { $0.startedAt > $1.startedAt })) { run in
+                                Button {
+                                    activeRun = run
+                                } label: {
+                                    HStack {
+                                        runStatusIcon(run.status)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(run.workflowTitle)
+                                                .font(.headline)
+                                            HStack(spacing: 8) {
+                                                Text(run.status.rawValue)
+                                                    .font(.caption)
+                                                    .foregroundStyle(statusColor(run.status))
+                                                Text(run.startedAt, format: .dateTime)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.tertiary)
+                                                if let cost = run.totalCostCents {
+                                                    Text("\(cost)\u{00A2}")
+                                                        .font(.caption2)
+                                                        .foregroundStyle(.tertiary)
+                                                }
+                                            }
+                                        }
+                                        Spacer()
+                                        if run.status == .waitingApproval {
+                                            Image(systemName: "checkmark.seal.fill")
+                                                .foregroundStyle(.orange)
                                         }
                                     }
                                 }
-                                Spacer()
-                                if run.status == .waitingApproval {
-                                    Image(systemName: "checkmark.seal.fill")
-                                        .foregroundStyle(.orange)
-                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("run-row-\(run.workflowTitle)")
                             }
                         }
-                        .accessibilityIdentifier("run-row-\(run.workflowTitle)")
                     }
                 }
+            }
+        }
+        .task(id: idea.id) {
+            if activeRun == nil {
+                activeRun = latestActiveRun
             }
         }
         .formStyle(.grouped)
         .navigationTitle(idea.title)
         .sheet(isPresented: $showStartRunSheet) {
-            WorkflowStartRunSheet(idea: idea) { run in
-                autoOpenedRun = run
+            WorkflowStartRunSheet(idea: idea) { prepared in
+                showStartRunSheet = false
+                activeRun = prepared.run
+                Task { @MainActor in
+                    // Let the sheet dismiss and detail view render before mutating execution state.
+                    await Task.yield()
+                    idea.status = .active
+                    try? modelContext.save()
+                    executionService.startRun(
+                        run: prepared.run,
+                        plan: prepared.plan,
+                        workspace: prepared.workspace
+                    )
+                }
             }
-        }
-        .navigationDestination(item: $autoOpenedRun) { run in
-            WorkflowRunProgressView(run: run)
         }
     }
 
@@ -327,13 +364,19 @@ struct IdeaDetailView: View {
 // WorkflowArtifactInspectorView -> ArtifactInspectorView.swift
 
 #if true
+struct PreparedRunStart {
+    let run: Run
+    let plan: RunPlan
+    let workspace: RunWorkspace
+}
+
 struct WorkflowStartRunSheet: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @Environment(ExecutionService.self) private var executionService
 
     let idea: Idea
-    var onRunStarted: ((Run) -> Void)? = nil
+    var onRunPrepared: ((PreparedRunStart) -> Void)? = nil
 
     @State private var compileState: CompileState = .idle
     @State private var compiledPlan: RunPlan?
@@ -411,12 +454,26 @@ struct WorkflowStartRunSheet: View {
         workflowURLs[selectedWorkflow]
     }
 
+    private var workflowSelection: Binding<WorkflowPreset> {
+        Binding(
+            get: {
+                if availableWorkflows.contains(selectedWorkflow) {
+                    return selectedWorkflow
+                }
+                return availableWorkflows.first ?? .canonicalRelease
+            },
+            set: { newValue in
+                selectedWorkflow = newValue
+            }
+        )
+    }
+
     private var availableModes: [ExecutionMode] {
-        [.simulated]
+        executionService.supportsLiveExecution ? ExecutionMode.allCases : [.simulated]
     }
 
     private var liveModeConfigured: Bool {
-        false
+        executionService.supportsLiveExecution
     }
 
     private var liveModeRequiresConfiguration: Bool {
@@ -424,6 +481,10 @@ struct WorkflowStartRunSheet: View {
     }
 
     var body: some View {
+        launchConfigurationBody
+    }
+
+    private var launchConfigurationBody: some View {
         VStack(spacing: 16) {
             HStack(spacing: 12) {
                 Image(systemName: "play.circle.fill")
@@ -468,7 +529,7 @@ struct WorkflowStartRunSheet: View {
                     .pickerStyle(.segmented)
                     .accessibilityIdentifier("execution-mode-picker")
 
-                    Picker("Workflow", selection: $selectedWorkflow) {
+                    Picker("Workflow", selection: workflowSelection) {
                         ForEach(availableWorkflows) { workflow in
                             Text(workflow.title)
                                 .accessibilityIdentifier("workflow-preset-\(workflow.id)")
@@ -479,16 +540,45 @@ struct WorkflowStartRunSheet: View {
 
                     if !liveModeConfigured {
                         VStack(alignment: .leading, spacing: 6) {
-                            Label(
-                                "Live runtime is unavailable.",
-                                systemImage: "exclamationmark.triangle.fill"
-                            )
-                            Text("Missing prerequisite: `CHAINWORKS_GOOSE_BASE_URL` or `CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success`.")
-                            Text("Recovery: relaunch the app with live runtime configuration to unlock `Proposal Loop (Live)`.")
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                Text("Live runtime is unavailable.")
+                                    .accessibilityIdentifier("live-runtime-unavailable-title")
+                            }
+                            .accessibilityElement(children: .contain)
+                            .accessibilityIdentifier("live-runtime-unavailable-header")
+                            Text("Connect a Goose backend or enable the fixture backend to unlock `Proposal Loop (Live)`.")
+                                .accessibilityIdentifier("live-runtime-unavailable-guidance")
+                            Text("Advanced setup: `CHAINWORKS_GOOSE_BASE_URL` or `CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success`, then relaunch the app.")
+                                .accessibilityIdentifier("live-runtime-unavailable-advanced")
                         }
                         .font(.caption)
                         .foregroundStyle(.orange)
+                        .accessibilityElement(children: .contain)
                         .accessibilityIdentifier("live-runtime-missing-block")
+                    } else if selectedMode == .live {
+                        if let liveRuntimeConfiguration = executionService.liveRuntimeConfiguration {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label(
+                                    "Live runtime: \(liveRuntimeConfiguration.summary)",
+                                    systemImage: "bolt.horizontal.circle"
+                                )
+                                Label("Source: \(liveRuntimeConfiguration.sourceDescription)", systemImage: "server.rack")
+                                Label("Safety: read-only workspace, no git/release side effects", systemImage: "lock.shield")
+                                if let compiledPlan {
+                                    let liveAgents = compiledPlan.agentBindings.values
+                                        .sorted { $0.title < $1.title }
+                                        .map { "\($0.title) (\($0.id))" }
+                                    Label("Resolved live agents: \(liveAgents.count)", systemImage: "person.3.sequence")
+                                    Text(liveAgents.joined(separator: ", "))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                            .accessibilityIdentifier("live-runtime-config-block")
+                        }
                     } else {
                         Label("Simulated mode uses the canonical local executor.", systemImage: "checkmark.circle")
                             .font(.caption)
@@ -653,10 +743,8 @@ struct WorkflowStartRunSheet: View {
                 workflowSourcePath: workflowURL.path,
                 catalogSourcePath: catalogURL?.path ?? ""
             )
-            idea.status = .active
-            try? modelContext.save()
-            executionService.startRun(run: run, plan: compiledPlan, workspace: workspace)
-            onRunStarted?(run)
+            let preparedRun = PreparedRunStart(run: run, plan: compiledPlan, workspace: workspace)
+            onRunPrepared?(preparedRun)
             dismiss()
         } catch {
             compileState = .error("Failed to start run: \(error.localizedDescription)")
@@ -691,10 +779,17 @@ struct WorkflowRunProgressView: View {
     }
 
     private var latestArtifacts: [Artifact] {
-        sortedStages
-            .flatMap(\.agentExecutions)
-            .flatMap(\.artifacts)
-            .sorted { $0.createdAt > $1.createdAt }
+        let descriptor = FetchDescriptor<Artifact>(
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+
+        let artifacts = ((try? modelContext.fetch(descriptor)) ?? [])
+            .filter { $0.runID == run.id }
+        return artifacts.sorted { lhs, rhs in
+                if lhs.name == "final_feature_report" { return true }
+                if rhs.name == "final_feature_report" { return false }
+                return lhs.createdAt > rhs.createdAt
+            }
     }
 
     private var orchestrator: WorkflowOrchestrator? {
@@ -711,6 +806,39 @@ struct WorkflowRunProgressView: View {
 
     private var currentStageExecution: StageExecution? {
         sortedStages.last
+    }
+
+    private var approvalContextArtifacts: [Artifact] {
+        let priority = [
+            "proposal_revision_summary",
+            "proposal_review_summary",
+            "proposal_current",
+            "proposal_review_po",
+            "proposal_review_ux",
+            "proposal_review_ui",
+            "proposal_review_architect"
+        ]
+        var seen = Set<String>()
+        let indexed = Dictionary(uniqueKeysWithValues: priority.enumerated().map { ($1, $0) })
+
+        return latestArtifacts
+            .filter { indexed[$0.name] != nil }
+            .filter { seen.insert($0.name).inserted }
+            .sorted { (lhs, rhs) in
+                (indexed[lhs.name] ?? .max) < (indexed[rhs.name] ?? .max)
+            }
+    }
+
+    private var latestDebugArtifacts: [Artifact] {
+        var seen = Set<String>()
+        return latestArtifacts
+            .filter {
+                $0.name.hasSuffix("_receipt.json")
+                || $0.name.hasSuffix("_transcript.md")
+            }
+            .filter { seen.insert($0.name).inserted }
+            .prefix(4)
+            .map { $0 }
     }
 
     private var latestMeaningfulEvent: LiveExecutionTimelineEntry? {
@@ -745,10 +873,13 @@ struct WorkflowRunProgressView: View {
                 LabeledContent("Total Cost", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
             }
 
-            Section("Current Phase") {
+                Section("Current Phase") {
                 LabeledContent("Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
                 LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
                 LabeledContent("Latest Event", value: latestMeaningfulEvent?.event.detail ?? "Waiting for the next execution event")
+                if let sessionID = latestMeaningfulEvent?.event.sessionID {
+                    LabeledContent("Session ID", value: sessionID)
+                }
                 LabeledContent("Next Action", value: nextActionText)
             }
 
@@ -756,9 +887,62 @@ struct WorkflowRunProgressView: View {
                 Section("Approval Gate") {
                     Text("Run is waiting at \(pendingApprovalRequest.stageLabel).")
                         .font(.subheadline)
+                    LabeledContent("Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+                    if !approvalContextArtifacts.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Decision Context")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            ForEach(approvalContextArtifacts) { artifact in
+                                Button {
+                                    selectedArtifact = artifact
+                                } label: {
+                                    HStack {
+                                        Text(artifact.name)
+                                        Spacer()
+                                        Text(artifact.format.rawValue)
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Open \(artifact.name)")
+                                .accessibilityElement(children: .combine)
+                                .accessibilityIdentifier("artifact-button-\(artifact.name)")
+                            }
+                        }
+                    }
+                    if !latestDebugArtifacts.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Receipts & Traces")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            ForEach(latestDebugArtifacts) { artifact in
+                                Button {
+                                    selectedArtifact = artifact
+                                } label: {
+                                    HStack {
+                                        Text(artifact.name)
+                                        Spacer()
+                                        Text(artifact.format.rawValue)
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Open \(artifact.name)")
+                                .accessibilityElement(children: .combine)
+                                .accessibilityIdentifier("artifact-button-\(artifact.name)")
+                            }
+                        }
+                    }
                     TextField("Comment", text: $approvalComment, axis: .vertical)
                         .textFieldStyle(.roundedBorder)
-                    HStack {
+                HStack {
                         Button("Reject", role: .destructive) {
                             executionService.resolveApproval(
                                 approvalID: pendingApprovalRequest.id,
@@ -899,9 +1083,13 @@ struct WorkflowRunProgressView: View {
                                     .font(.caption2)
                                     .foregroundStyle(.tertiary)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("Open \(artifact.name)")
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("artifact-button-\(artifact.name)")
                     }
                 }
             }
@@ -1046,6 +1234,7 @@ struct WorkflowArtifactInspectorView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(artifact.name)
                     .font(.headline)
+                    .accessibilityIdentifier("artifact-inspector-title")
                 Text("\(artifact.stageID) · \(artifact.agentID) · \(artifact.format.rawValue)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1084,6 +1273,7 @@ struct WorkflowArtifactInspectorView: View {
                         .font(.system(.body, design: .monospaced))
                 }
             }
+            .accessibilityIdentifier("artifact-inspector-content")
         }
         .padding()
         .frame(minWidth: 640, minHeight: 480)

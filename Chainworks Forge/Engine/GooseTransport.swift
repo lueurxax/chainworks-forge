@@ -1,19 +1,41 @@
 import Foundation
 
-// MARK: - GooseTransport (HTTP/SSE client for Goose backend — ARCH-028)
+// MARK: - GooseTransportProtocol (Proposal 005 — LOCKED-001: transport protocol extraction)
 
-/// Low-level transport layer for communicating with a Goose backend over HTTP/SSE.
+/// Common interface for all Goose transport implementations.
+/// Both `GooseTransport` (bespoke) and `GooseServerTransport` (real goosed)
+/// conform to this protocol. `FixtureGooseTransport` also conforms directly.
+///
+/// Proposal 005: LOCKED-001 — transport protocol extraction is mandatory before
+/// adding the new adapter. Keeps both transports interchangeable without if/else branching.
+protocol GooseTransportProtocol: Sendable {
+    /// Create a new isolated Goose session.
+    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse
+
+    /// Submit a prompt to an existing session and stream SSE events.
+    func submitPrompt(sessionID: String, prompt: GoosePromptRequest) -> AsyncThrowingStream<GooseStreamEvent, Error>
+
+    /// Close a Goose session explicitly.
+    func closeSession(sessionID: String) async throws
+}
+
+// MARK: - GooseTransport (HTTP/SSE client for bespoke Goose API — ARCH-028)
+
+/// Low-level transport layer for communicating with a Goose backend over the
+/// original bespoke HTTP/SSE contract (`/api/sessions`).
 /// Proposal 004: locked decision — use HTTP/SSE, not ACP, for the first live slice.
+/// Proposal 005: conforms to `GooseTransportProtocol`; bespoke contract retained for
+/// backward compatibility. Real goosed communication uses `GooseServerTransport`.
 ///
 /// Responsibilities:
-/// - Create sessions
-/// - Submit prompts
+/// - Create sessions via POST /api/sessions
+/// - Submit prompts via POST /api/sessions/{id}/messages
 /// - Stream SSE events
-/// - Close sessions
+/// - Close sessions via DELETE /api/sessions/{id}
 ///
 /// Thread-safety: `GooseTransport` is injected as an immutable dependency.
 /// The class remains subclassable for test doubles.
-class GooseTransport: @unchecked Sendable {
+class GooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     // MARK: - Configuration
 
@@ -235,6 +257,8 @@ struct GooseSessionRequest: Codable, Sendable {
     let model: String?
     /// Provider to use for this session.
     let provider: String?
+    /// Explicit execution policy that the backend must acknowledge before live execution starts.
+    let executionPolicy: GooseExecutionPolicy?
     /// Additional session metadata.
     let metadata: [String: String]?
 }
@@ -243,6 +267,35 @@ struct GooseSessionRequest: Codable, Sendable {
 struct GooseSessionResponse: Codable, Sendable {
     let sessionId: String
     let status: String?
+    let policyAcknowledgement: GoosePolicyAcknowledgement?
+}
+
+struct GooseExecutionPolicy: Codable, Sendable {
+    let permissionProfileID: String
+    let workspaceMode: String
+    let gitOperationsAllowed: Bool
+    let releaseOperationsAllowed: Bool
+    let repoWritesAllowed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case workspaceMode = "workspace_mode"
+        case permissionProfileID = "permission_profile_id"
+        case gitOperationsAllowed = "git_operations_allowed"
+        case releaseOperationsAllowed = "release_operations_allowed"
+        case repoWritesAllowed = "repo_writes_allowed"
+    }
+}
+
+struct GoosePolicyAcknowledgement: Codable, Sendable {
+    let accepted: Bool
+    let capabilityToken: String?
+    let backendPolicyVersion: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accepted
+        case capabilityToken = "capability_token"
+        case backendPolicyVersion = "backend_policy_version"
+    }
 }
 
 /// Request to submit a prompt to a session.

@@ -57,9 +57,14 @@ final class OrchestratorTests: XCTestCase {
         return run
     }
 
-    private func makeAgent(id: String = "agent_1", outputs: [String] = ["output_1"]) -> ResolvedAgent {
+    private func makeAgent(
+        id: String = "agent_1",
+        backendProfileID: String? = nil,
+        outputs: [String] = ["output_1"]
+    ) -> ResolvedAgent {
         ResolvedAgent(
             id: id, title: "Agent \(id)", mode: "tool_use",
+            backendProfileID: backendProfileID,
             provider: "claude_code", model: "opus", effort: "high",
             maxTurns: 10, temperature: 0.0, permissionProfile: "ORCH",
             skillRef: "sk1", skillRole: nil, prompt: "test",
@@ -76,7 +81,15 @@ final class OrchestratorTests: XCTestCase {
         }
 
         override func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-            GooseSessionResponse(sessionId: "live-session-001", status: "active")
+            GooseSessionResponse(
+                sessionId: "live-session-001",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
         }
 
         override func submitPrompt(
@@ -95,6 +108,58 @@ final class OrchestratorTests: XCTestCase {
         }
 
         override func closeSession(sessionID: String) async throws {}
+    }
+
+    private struct StaticResultExecutor: AgentExecutor {
+        let result: AgentResult
+
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            result
+        }
+    }
+
+    private func makeReviewCatalog() -> AgentCatalog {
+        AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: ["claude_code", "codex"]
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: [:],
+            contracts: [
+                "proposal_review_v1": ArtifactContract(
+                    format: "json",
+                    requiredFields: [
+                        "agent_id",
+                        "role",
+                        "score",
+                        "decision",
+                        "verdict",
+                        "summary",
+                        "issues",
+                        "blocking_issues",
+                        "non_blocking_issues",
+                        "suggestions",
+                        "assumptions"
+                    ]
+                )
+            ],
+            backendProfiles: [:],
+            permissionProfiles: [:],
+            agents: []
+        )
     }
 
     // MARK: - Simple Linear Workflow
@@ -295,7 +360,11 @@ final class OrchestratorTests: XCTestCase {
             ],
             initialStateID: "start",
             agentBindings: [
-                "proposal_writer": makeAgent(id: "proposal_writer", outputs: ["proposal_current"])
+                "proposal_writer": makeAgent(
+                    id: "proposal_writer",
+                    backendProfileID: "claude_writer_high",
+                    outputs: ["proposal_current"]
+                )
             ],
             variables: [:],
             scoring: nil, failurePolicy: nil,
@@ -307,6 +376,7 @@ final class OrchestratorTests: XCTestCase {
         let transport = MockGooseTransport()
         transport.streamEvents = [
             .sessionStarted(raw: #"{"session_id":"live-session-001"}"#),
+            .promptSubmitted(raw: #"{"request_id":"request-123"}"#),
             .toolCallStarted(toolName: "read_artifact", raw: "{}"),
             .textChunk(text: "Drafting proposal..."),
             .finalOutput(content: "{\"proposal\":\"ready\"}"),
@@ -338,7 +408,83 @@ final class OrchestratorTests: XCTestCase {
 
         let agentExecution = try? XCTUnwrap(run.stageExecutions.first?.agentExecutions.first)
         XCTAssertEqual(agentExecution?.providerSessionID, "live-session-001")
+        XCTAssertEqual(agentExecution?.providerRequestID, "request-123")
+        XCTAssertEqual(agentExecution?.resolvedBackendProfileID, "claude_writer_high")
+        XCTAssertEqual(agentExecution?.gooseSessionID, "live-session-001")
         XCTAssertTrue(agentExecution?.logSnippet?.contains("Final output") == true)
+        XCTAssertNotNil(agentExecution?.transcriptArtifactPath)
+        if let consumed = agentExecution?.consumedInputArtifactNamesJSON {
+            let names = try? JSONDecoder().decode([String].self, from: consumed)
+            XCTAssertEqual(names, [])
+        } else {
+            XCTFail("Expected consumed input artifact names to be captured")
+        }
+    }
+
+    func testCompletedRunPersistsFinalFeatureReport() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "a1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a1", task: "t1", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a1",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["a1": makeAgent(id: "a1", backendProfileID: "claude_orchestrator_high")],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let executor = SimulatedAgentExecutor()
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: executor,
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        XCTAssertEqual(run.status, .completed)
+
+        let descriptor = FetchDescriptor<Artifact>()
+        let reports = try context.fetch(descriptor)
+            .filter { $0.runID == run.id && $0.name == "final_feature_report" }
+        XCTAssertEqual(reports.count, 1)
+
+        let report = try XCTUnwrap(reports.first)
+        let data = try ArtifactStorage.read(filePath: report.filePath, workspaceRoot: workspace.workspaceRoot)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["final_status"] as? String, RunStatus.completed.rawValue)
+        XCTAssertEqual(json["cost_currency"] as? String, "USD")
+        XCTAssertNotNil(json["summary"] as? String)
     }
 
     // MARK: - Approval Gate
@@ -825,5 +971,100 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertEqual(executor.executedTasks[1].agentID, "a2", "Post-approval should use agent a2")
         XCTAssertEqual(executor.executedTasks[1].task, "post_approval_work")
         XCTAssertEqual(run.status, .completed, "Run should complete after post-approval work + transition")
+    }
+
+    func testMalformedReviewJSONFailsBeforeTransitionEvaluation() async {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = ResolvedAgent(
+            id: "reviewer",
+            title: "Reviewer",
+            mode: "tool_use",
+            provider: "claude_code",
+            model: "sonnet",
+            effort: "high",
+            maxTurns: 8,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            skillRef: "sk-review",
+            skillRole: nil,
+            prompt: "Review the proposal.",
+            outputContract: "proposal_review_v1",
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_po"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Review",
+                    type: .start,
+                    ownerAgentID: "reviewer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "reviewer", task: "review", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "reviewer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["reviewer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: FailurePolicy(
+                onError: "fail_run",
+                onLoopBudgetExhausted: "fail_run",
+                preserveArtifacts: true
+            ),
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let result = AgentResult(
+            outputs: ["proposal_review_po": Data("not valid json".utf8)],
+            logSnippet: "malformed reviewer output",
+            costCents: 1,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "test-session",
+            durationSeconds: 0.1
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context,
+            catalog: makeReviewCatalog()
+        )
+
+        await orchestrator.start()
+
+        XCTAssertEqual(run.status, .failed)
+        XCTAssertEqual(run.stageExecutions.count, 1)
+        XCTAssertEqual(run.stageExecutions.first?.agentExecutions.first?.status, .failed)
+        XCTAssertTrue(run.stageExecutions.first?.agentExecutions.first?.logSnippet?.contains("not valid JSON") == true)
+        XCTAssertTrue(run.stageExecutions.first?.agentExecutions.first?.artifacts.isEmpty ?? true)
     }
 }

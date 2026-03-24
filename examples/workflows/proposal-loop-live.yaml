@@ -100,7 +100,7 @@ states:
           inputs:
             - proposal_current
           outputs:
-            - proposal_review_arch
+            - proposal_review_architect
       then:
         - agent: lead_orchestrator
           task: aggregate_proposal_reviews
@@ -108,7 +108,7 @@ states:
             - proposal_review_po
             - proposal_review_ux
             - proposal_review_ui
-            - proposal_review_arch
+            - proposal_review_architect
           outputs:
             - proposal_review_summary
     loop:

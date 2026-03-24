@@ -56,11 +56,16 @@ final class ArtifactManager {
                 agent: agent,
                 catalog: catalog
             )
+            let contractID = OutputContractResolver.contractID(
+                for: name,
+                agent: agent,
+                catalog: catalog
+            ) ?? "none"
 
             // Create SwiftData record
             let artifact = Artifact(
                 name: name,
-                contractID: agent.outputContract ?? "none",
+                contractID: contractID,
                 format: format,
                 filePath: storageResult.filePath,
                 runID: workspace.runID,
@@ -114,42 +119,73 @@ final class ArtifactManager {
         return Set(artifacts.map(\.name))
     }
 
+    /// Persist a system-generated artifact that is not attached to a specific agent execution.
+    @discardableResult
+    func persistSystemArtifact(
+        name: String,
+        data: Data,
+        contractID: String,
+        format: ArtifactFormat,
+        workspace: RunWorkspace,
+        stageID: String,
+        agentID: String,
+        provider: String,
+        model: String?,
+        effort: String?,
+        attemptNumber: Int
+    ) throws -> Artifact {
+        let storageResult = try ArtifactStorage.write(
+            data: data,
+            name: name,
+            stageID: stageID,
+            iteration: 1,
+            agentID: agentID,
+            attemptNumber: attemptNumber,
+            artifactRoot: workspace.artifactRoot,
+            workspaceRoot: workspace.workspaceRoot
+        )
+
+        let artifact = Artifact(
+            name: name,
+            contractID: contractID,
+            format: format,
+            filePath: storageResult.filePath,
+            runID: workspace.runID,
+            stageID: stageID,
+            agentID: agentID,
+            provider: provider,
+            attemptNumber: attemptNumber
+        )
+        artifact.checksumSHA256 = storageResult.checksumSHA256
+        artifact.sizeBytes = storageResult.sizeBytes
+        artifact.model = model
+        artifact.effort = effort
+
+        modelContext.insert(artifact)
+        return artifact
+    }
+
     // MARK: - Format Resolution
 
-    /// Resolve artifact format using catalog contract information (not hardcoded).
+    /// Resolve artifact format using the proposal §7.3 contract:
+    /// Priority: file extension > contract.format > .report fallback.
+    /// Delegates to `ArtifactFormat.detect(from:contract:)`.
     private func resolveFormat(
         outputName: String,
         agent: ResolvedAgent,
         catalog: AgentCatalog?
     ) -> ArtifactFormat {
-        // Check agent's output contract in catalog
-        if let contractID = agent.outputContract, let catalog = catalog {
-            if let contract = catalog.contracts[contractID] {
-                return formatFromString(contract.format)
-            }
+        let contract = OutputContractResolver.contract(
+            for: outputName,
+            agent: agent,
+            catalog: catalog
+        )
+
+        if contract == nil,
+           let hintedPath = catalog?.artifacts[outputName] {
+            return ArtifactFormat.detect(from: hintedPath, contract: nil)
         }
 
-        // Fallback: infer from output name patterns
-        if outputName.hasSuffix(".json") || outputName.contains("report") || outputName.contains("review") {
-            return .json
-        }
-        if outputName.hasSuffix(".md") || outputName.contains("proposal") || outputName.contains("brief") {
-            return .markdown
-        }
-        if outputName.hasSuffix(".diff") || outputName.contains("diff") {
-            return .diff
-        }
-
-        return .json
-    }
-
-    private func formatFromString(_ s: String) -> ArtifactFormat {
-        switch s.lowercased() {
-        case "json": return .json
-        case "markdown", "md": return .markdown
-        case "diff": return .diff
-        case "report": return .report
-        default: return .json
-        }
+        return ArtifactFormat.detect(from: outputName, contract: contract)
     }
 }

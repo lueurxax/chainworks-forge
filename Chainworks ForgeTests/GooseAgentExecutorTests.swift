@@ -32,28 +32,34 @@ final class GooseAgentExecutorTests: XCTestCase {
     // MARK: - Test Doubles
 
     /// Mock transport that returns pre-configured responses without real HTTP.
-    final class MockGooseTransport: GooseTransport {
+    /// Proposal 005: conforms to `GooseTransportProtocol` directly (no longer subclasses `GooseTransport`).
+    final class MockGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         var createSessionResult: GooseSessionResponse?
         var createSessionError: Error?
         var streamEvents: [GooseStreamEvent] = []
         var closeSessionCalled = false
         var lastSessionID: String?
+        var lastSessionRequest: GooseSessionRequest?
 
-        init() {
-            super.init(baseURL: URL(string: "http://localhost:0")!)
-        }
+        init() {}
 
-        override func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            lastSessionRequest = request
             if let error = createSessionError {
                 throw error
             }
             return createSessionResult ?? GooseSessionResponse(
                 sessionId: "test-session-\(UUID().uuidString.prefix(8))",
-                status: "active"
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
+                )
             )
         }
 
-        override func submitPrompt(
+        func submitPrompt(
             sessionID: String,
             prompt: GoosePromptRequest
         ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
@@ -69,7 +75,7 @@ final class GooseAgentExecutorTests: XCTestCase {
             }
         }
 
-        override func closeSession(sessionID: String) async throws {
+        func closeSession(sessionID: String) async throws {
             closeSessionCalled = true
         }
     }
@@ -145,7 +151,12 @@ final class GooseAgentExecutorTests: XCTestCase {
         let mockTransport = MockGooseTransport()
         mockTransport.createSessionResult = GooseSessionResponse(
             sessionId: "session-abc123",
-            status: "active"
+            status: "active",
+            policyAcknowledgement: GoosePolicyAcknowledgement(
+                accepted: true,
+                capabilityToken: "mock-read-only",
+                backendPolicyVersion: "mock-v1"
+            )
         )
         mockTransport.streamEvents = [
             .sessionStarted(raw: "{}"),
@@ -163,6 +174,11 @@ final class GooseAgentExecutorTests: XCTestCase {
 
         // Session should have been created and closed
         XCTAssertTrue(mockTransport.closeSessionCalled, "Session should be closed after execution")
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.permissionProfileID, "read_only")
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.workspaceMode, "read_only")
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.gitOperationsAllowed, false)
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.releaseOperationsAllowed, false)
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.repoWritesAllowed, false)
         // Result should contain receipt artifacts
         XCTAssertTrue(result.outputs.keys.contains(where: { $0.hasSuffix("_receipt.json") }),
                        "Result should contain receipt artifact")
@@ -312,5 +328,26 @@ final class GooseAgentExecutorTests: XCTestCase {
 
         XCTAssertFalse(result.succeeded)
         XCTAssertTrue(result.errorMessage?.contains("Session creation failed") == true)
+    }
+
+    @MainActor
+    func testGooseExecutorFailsWithoutPolicyAcknowledgement() async throws {
+        let mockTransport = MockGooseTransport()
+        mockTransport.createSessionResult = GooseSessionResponse(
+            sessionId: "session-missing-ack",
+            status: "active",
+            policyAcknowledgement: nil
+        )
+
+        let executor = GooseAgentExecutor(transport: mockTransport)
+        let agent = makeAgent(outputs: ["proposal_current"])
+        let task = makeTask()
+        let context = makeContext()
+        defer { cleanupContext(context) }
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        XCTAssertFalse(result.succeeded)
+        XCTAssertTrue(result.errorMessage?.contains("read-only execution policy") == true)
     }
 }

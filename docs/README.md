@@ -17,17 +17,18 @@ Reading order:
 5. [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md)
 6. [reference/architecture-decisions.md](reference/architecture-decisions.md)
 7. [reference/runtime-contract.md](reference/runtime-contract.md)
-8. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md)
-9. [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md)
-10. [proposals/003-forge-steward-sdlc-health-and-adaptation.md](proposals/003-forge-steward-sdlc-health-and-adaptation.md)
-11. [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
-12. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
+8. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md)
+9. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md)
+10. [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md)
+11. [proposals/003-forge-steward-sdlc-health-and-adaptation.md](proposals/003-forge-steward-sdlc-health-and-adaptation.md)
+12. [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
+13. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
 
 Status:
 
 - Owner: single-engineer working repo
-- Last updated: 2026-03-22
-- State: active, foundation + core runtime engine implemented, UI still inspection-first
+- Last updated: 2026-03-23
+- State: active, foundation + core runtime engine implemented, live proposal-loop slice documented in reference, UI still inspection-first
 
 ## Reference (implemented)
 
@@ -35,6 +36,7 @@ Status:
 - [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md) — YAML parsing, validation, compact workflow normalization, provenance hashing, verification scaffold UI
 - [reference/architecture-decisions.md](reference/architecture-decisions.md) — Key architecture decisions across foundation and runtime slices
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model, execution and resume contracts
+- [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Implemented live proposal-loop slice, runtime boundary, app surfaces, and proof standard
 - [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — Worktree isolation risk analysis
 - [reference/README.md](reference/README.md) — Reference section overview
 

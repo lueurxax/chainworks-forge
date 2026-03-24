@@ -4,12 +4,23 @@ import SwiftData
 struct ContentView: View {
     @Environment(ExecutionService.self) private var executionService
     @State private var selectedTab: Tab = .ideas
+    private let forcedInitialTab: Tab?
 
     enum Tab: String, CaseIterable {
+        case runsHome = "Runs Home"
         case ideas = "Ideas"
         case approvals = "Approvals"
         case agentCatalog = "Agent Catalog"
         case workflowInspector = "Workflow Inspector"
+    }
+
+    init() {
+        let environment = ProcessInfo.processInfo.environment
+        let initialTab = environment["CHAINWORKS_UI_TEST_INITIAL_TAB"]
+            .flatMap(Tab.init(rawValue:))
+        forcedInitialTab = initialTab
+        // P005-OPS §5: RunsHomeView is the primary operator landing surface
+        _selectedTab = State(initialValue: initialTab ?? .runsHome)
     }
 
     private func exampleFileURL(bundleName: String, bundledExtension: String = "yaml", repoRelativePath: String) -> URL? {
@@ -30,6 +41,12 @@ struct ContentView: View {
 
     var body: some View {
         TabView(selection: $selectedTab) {
+            // P005-OPS §5: Primary operator landing surface
+            RunsHomeView()
+                .tabItem { Label("Runs Home", systemImage: "house") }
+                .tag(Tab.runsHome)
+                .accessibilityIdentifier("tab-runs-home")
+
             IdeaListView()
                 .tabItem { Label("Ideas", systemImage: "lightbulb") }
                 .tag(Tab.ideas)
@@ -58,6 +75,11 @@ struct ContentView: View {
             .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
             .tag(Tab.workflowInspector)
             .accessibilityIdentifier("tab-workflow-inspector")
+        }
+        .task(id: forcedInitialTab?.rawValue ?? "default") {
+            guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
+            // UI tests need a deterministic landing tab even when macOS restores prior scene state.
+            selectedTab = forcedInitialTab
         }
         // Approval badge on Ideas tab when approvals are pending
         .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)

@@ -100,6 +100,7 @@ For the current MVP slice, the system is intended to support:
 - [MVP scope](docs/ps/chainworks-forge-mvp.md)
 - [Architecture research](docs/research/goose_swiftui_agent_architecture_research.md)
 - [Foundation/runtime reference](docs/reference/README.md)
+- [Live provider execution slice](docs/reference/live-provider-execution-slice.md)
 - [Proposal 002: Workflow execution engine](docs/proposals/002-workflow-execution-engine.md)
 - [Proposal 003: Forge Steward](docs/proposals/003-forge-steward-sdlc-health-and-adaptation.md)
 

@@ -11,6 +11,8 @@ struct ApprovalRequest: Identifiable, Sendable {
     let runID: UUID
     let stageID: String
     let stageLabel: String
+    /// Artifact names available for review (§5.2, §8.2).
+    let precedingArtifacts: [String]
     let requestedAt: Date
 }
 
@@ -110,20 +112,20 @@ final class WorkflowOrchestrator {
 
     /// Start executing the workflow from the initial state (or a resumed state).
     func start(from stateID: String? = nil) async {
-        guard !isRunning else { return }
-        isRunning = true
-        isCancelled = false
+        guard !isRunning, !isCancelled else { return }
 
         if let resumeState = stateID {
             currentStateID = resumeState
         }
 
-        run.status = .running
+        loadPersistedArtifacts()
 
-        // Load any already-produced artifacts
-        if let existingNames = try? artifactManager.producedArtifactNames(forRunID: workspace.runID) {
-            producedArtifactNames = existingNames
+        if restorePendingApprovalIfNeeded(for: currentStateID) {
+            return
         }
+
+        isRunning = true
+        run.status = .running
 
         // Main state machine loop
         await executeStateMachine()
@@ -222,6 +224,7 @@ final class WorkflowOrchestrator {
             if state.type == .end {
                 run.status = .completed
                 run.completedAt = Date()
+                persistFinalFeatureReportIfNeeded(finalStateID: state.id)
                 isRunning = false
                 onComplete?(true)
                 return
@@ -326,12 +329,13 @@ final class WorkflowOrchestrator {
             approval.run = run
             modelContext.insert(approval)
 
-            // Publish approval request
+            // Publish approval request with preceding artifact names (§5.2, §8.2)
             let request = ApprovalRequest(
                 id: approval.id,
                 runID: workspace.runID,
                 stageID: state.id,
                 stageLabel: state.label,
+                precedingArtifacts: Array(producedArtifactNames.sorted()),
                 requestedAt: Date()
             )
             onApprovalRequest?(request)
@@ -423,6 +427,8 @@ final class WorkflowOrchestrator {
 
         // Gather input artifacts
         let inputData = gatherInputs(for: task)
+        agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(inputData.keys).sorted())
+        agentExec.resolvedBackendProfileID = agent.backendProfileID
 
         // Build execution context
         let execContext = ExecutionContext(
@@ -454,12 +460,20 @@ final class WorkflowOrchestrator {
             existing: agentExec.logSnippet,
             result: result.logSnippet
         )
+        // Record sessionID from the executor (§6.1)
+        if let sessionID = result.sessionID {
+            agentExec.providerSessionID = sessionID
+            agentExec.gooseSessionID = sessionID
+        }
 
         if result.succeeded {
-            agentExec.status = .completed
-
             // Persist outputs via ArtifactManager (ARCH-030: sole disk writer)
             do {
+                let validatedFields = try validateStructuredOutputs(
+                    result.outputs,
+                    for: task,
+                    agent: agent
+                )
                 let artifacts = try artifactManager.persistOutputs(
                     outputs: result.outputs,
                     agent: agent,
@@ -475,24 +489,17 @@ final class WorkflowOrchestrator {
                 for artifact in artifacts {
                     producedArtifactNames.insert(artifact.name)
 
-                    // Extract fields from JSON artifacts for expression evaluation
-                    if artifact.format == .json {
-                        if let data = result.outputs[artifact.name],
-                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                            var fields: [String: AnyCodableValue] = [:]
-                            for (key, value) in json {
-                                if let intVal = value as? Int {
-                                    fields[key] = .int(intVal)
-                                } else if let doubleVal = value as? Double {
-                                    fields[key] = .double(doubleVal)
-                                } else if let stringVal = value as? String {
-                                    fields[key] = .string(stringVal)
-                                } else if let boolVal = value as? Bool {
-                                    fields[key] = .bool(boolVal)
-                                }
-                            }
-                            artifactFields[artifact.name] = fields
-                        }
+                    if let fields = validatedFields[artifact.name] {
+                        artifactFields[artifact.name] = fields
+                    } else if artifact.format == .json,
+                              let data = result.outputs[artifact.name],
+                              let fields = tryExtractScalarFields(from: data) {
+                        artifactFields[artifact.name] = fields
+                    }
+
+                    if artifact.name.hasSuffix("_transcript.md") {
+                        agentExec.transcriptArtifactPath = artifact.filePath
+                        agentExec.transcriptPath = artifact.filePath
                     }
                 }
 
@@ -500,9 +507,10 @@ final class WorkflowOrchestrator {
                 if let cost = result.costCents {
                     run.totalCostCents = (run.totalCostCents ?? 0) + cost
                 }
+                agentExec.status = .completed
             } catch {
                 agentExec.status = .failed
-                agentExec.logSnippet = "Artifact persistence error: \(error.localizedDescription)"
+                agentExec.logSnippet = "Output validation or persistence error: \(error.localizedDescription)"
                 unregisterLiveExecution(agentExec, for: agent.id)
                 return false
             }
@@ -551,18 +559,20 @@ final class WorkflowOrchestrator {
         // Execute all in parallel
         let results = await withTaskGroup(of: (Int, AgentResult?).self) { group in
             for (index, pair) in taskAgentPairs.enumerated() {
+                let gatheredInputs = gatherInputs(for: pair.task)
                 let execContext = ExecutionContext(
                     workspace: workspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: 1,
-                    inputArtifacts: gatherInputs(for: pair.task),
+                    inputArtifacts: gatheredInputs,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? ""
                 )
                 let task = pair.task
                 let agent = pair.agent
                 let executor = self.executor
+                pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(gatheredInputs.keys).sorted())
 
                 group.addTask {
                     do {
@@ -592,6 +602,7 @@ final class WorkflowOrchestrator {
             let pair = taskAgentPairs[index]
             let agentExec = pair.agentExec
             let agent = pair.agent
+            agentExec.resolvedBackendProfileID = agent.backendProfileID
 
             agentExec.completedAt = Date()
 
@@ -603,14 +614,22 @@ final class WorkflowOrchestrator {
                 continue
             }
 
-            agentExec.status = .completed
             agentExec.costCents = result.costCents
+            if let sessionID = result.sessionID {
+                agentExec.providerSessionID = sessionID
+                agentExec.gooseSessionID = sessionID
+            }
             agentExec.logSnippet = mergedLogSnippet(
                 existing: agentExec.logSnippet,
                 result: result.logSnippet
             )
 
             do {
+                let validatedFields = try validateStructuredOutputs(
+                    result.outputs,
+                    for: pair.task,
+                    agent: agent
+                )
                 let artifacts = try artifactManager.persistOutputs(
                     outputs: result.outputs,
                     agent: agent,
@@ -624,14 +643,27 @@ final class WorkflowOrchestrator {
 
                 for artifact in artifacts {
                     producedArtifactNames.insert(artifact.name)
+                    if let fields = validatedFields[artifact.name] {
+                        artifactFields[artifact.name] = fields
+                    } else if artifact.format == .json,
+                              let data = result.outputs[artifact.name],
+                              let fields = tryExtractScalarFields(from: data) {
+                        artifactFields[artifact.name] = fields
+                    }
+
+                    if artifact.name.hasSuffix("_transcript.md") {
+                        agentExec.transcriptArtifactPath = artifact.filePath
+                        agentExec.transcriptPath = artifact.filePath
+                    }
                 }
 
                 if let cost = result.costCents {
                     run.totalCostCents = (run.totalCostCents ?? 0) + cost
                 }
+                agentExec.status = .completed
             } catch {
                 agentExec.status = .failed
-                agentExec.logSnippet = "Artifact persistence error: \(error.localizedDescription)"
+                agentExec.logSnippet = "Output validation or persistence error: \(error.localizedDescription)"
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
@@ -654,6 +686,59 @@ final class WorkflowOrchestrator {
         run.approvals.contains { $0.stageID == stageID && $0.decision == .granted }
     }
 
+    private func loadPersistedArtifacts() {
+        guard let artifacts = try? artifactManager.artifacts(forRunID: workspace.runID) else {
+            return
+        }
+
+        producedArtifactNames = Set(artifacts.map(\.name))
+
+        for artifact in artifacts where artifact.format == .json {
+            guard let data = try? artifactManager.readArtifact(artifact, workspace: workspace),
+                  let fields = tryExtractScalarFields(from: data) else {
+                continue
+            }
+            artifactFields[artifact.name] = fields
+        }
+    }
+
+    private func restorePendingApprovalIfNeeded(for stateID: String) -> Bool {
+        guard run.status == .waitingApproval,
+              let state = plan.states[stateID],
+              state.approvalRequired else {
+            return false
+        }
+
+        let approval = existingOrRestoredApproval(for: state)
+        isRunning = false
+        isPaused = true
+        currentStateID = stateID
+        run.status = .waitingApproval
+
+        let request = ApprovalRequest(
+            id: approval.id,
+            runID: workspace.runID,
+            stageID: state.id,
+            stageLabel: state.label,
+            precedingArtifacts: Array(producedArtifactNames.sorted()),
+            requestedAt: approval.requestedAt
+        )
+        onApprovalRequest?(request)
+        return true
+    }
+
+    private func existingOrRestoredApproval(for state: ExecutableState) -> Approval {
+        if let existing = run.approvals.first(where: { $0.stageID == state.id && $0.decision == .requested }) {
+            return existing
+        }
+
+        let approval = Approval(stageID: state.id)
+        approval.decision = .requested
+        approval.run = run
+        modelContext.insert(approval)
+        return approval
+    }
+
     private func gatherInputs(for task: AgentTask) -> [String: Data] {
         var inputs: [String: Data] = [:]
         guard let inputNames = task.inputs else { return inputs }
@@ -668,6 +753,228 @@ final class WorkflowOrchestrator {
             }
         }
         return inputs
+    }
+
+    private func validateStructuredOutputs(
+        _ outputs: [String: Data],
+        for task: AgentTask,
+        agent: ResolvedAgent
+    ) throws -> [String: [String: AnyCodableValue]] {
+        var validated: [String: [String: AnyCodableValue]] = [:]
+
+        for outputName in OutputContractResolver.expectedOutputs(for: task, agent: agent) {
+            guard let data = outputs[outputName] else { continue }
+            guard let contractID = OutputContractResolver.contractID(
+                for: outputName,
+                agent: agent,
+                catalog: catalog
+            ),
+            let catalog,
+            let contract = catalog.contracts[contractID],
+            contract.format == "json" else {
+                continue
+            }
+            let json = try parseJSONObject(
+                data,
+                agentID: agent.id,
+                contractID: contractID,
+                outputName: outputName
+            )
+
+            for field in contract.requiredFields where json[field] == nil {
+                throw ExecutionError.outputContractViolation(
+                    agentID: agent.id,
+                    contractID: contractID,
+                    details: "Missing required field '\(field)' in '\(outputName)'"
+                )
+            }
+
+            try validateTypedFields(
+                json,
+                contractID: contractID,
+                agentID: agent.id,
+                outputName: outputName
+            )
+
+            validated[outputName] = scalarFields(from: json)
+        }
+
+        return validated
+    }
+
+    private func parseJSONObject(
+        _ data: Data,
+        agentID: String,
+        contractID: String,
+        outputName: String
+    ) throws -> [String: Any] {
+        let rawObject: Any
+        do {
+            rawObject = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw ExecutionError.outputContractViolation(
+                agentID: agentID,
+                contractID: contractID,
+                details: "'\(outputName)' is not valid JSON"
+            )
+        }
+
+        guard let json = rawObject as? [String: Any] else {
+            throw ExecutionError.outputContractViolation(
+                agentID: agentID,
+                contractID: contractID,
+                details: "'\(outputName)' must be a top-level JSON object"
+            )
+        }
+
+        return json
+    }
+
+    private func validateTypedFields(
+        _ json: [String: Any],
+        contractID: String,
+        agentID: String,
+        outputName: String
+    ) throws {
+        switch contractID {
+        case "proposal_review_v1":
+            try requireString(json["agent_id"], field: "agent_id", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireString(json["role"], field: "role", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireNumber(json["score"], field: "score", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireString(json["decision"], field: "decision", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireString(json["verdict"], field: "verdict", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireString(json["summary"], field: "summary", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["issues"], field: "issues", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["blocking_issues"], field: "blocking_issues", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["non_blocking_issues"], field: "non_blocking_issues", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["suggestions"], field: "suggestions", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["assumptions"], field: "assumptions", agentID: agentID, contractID: contractID, outputName: outputName)
+        case "proposal_review_summary_v1":
+            try requireBool(json["pass"], field: "pass", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireNumber(json["average_score"], field: "average_score", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireNumber(json["aggregate_score"], field: "aggregate_score", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireNumber(json["min_individual_score"], field: "min_individual_score", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireInt(json["blocker_count"], field: "blocker_count", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireString(json["summary"], field: "summary", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["required_changes"], field: "required_changes", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(json["recurring_themes"], field: "recurring_themes", agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireString(json["decision"], field: "decision", agentID: agentID, contractID: contractID, outputName: outputName)
+        default:
+            break
+        }
+    }
+
+    private func requireString(
+        _ value: Any?,
+        field: String,
+        agentID: String,
+        contractID: String,
+        outputName: String
+    ) throws {
+        guard value is String else {
+            throw ExecutionError.outputContractViolation(
+                agentID: agentID,
+                contractID: contractID,
+                details: "'\(outputName)' field '\(field)' must be a string"
+            )
+        }
+    }
+
+    private func requireNumber(
+        _ value: Any?,
+        field: String,
+        agentID: String,
+        contractID: String,
+        outputName: String
+    ) throws {
+        guard value is NSNumber || value is Int || value is Double else {
+            throw ExecutionError.outputContractViolation(
+                agentID: agentID,
+                contractID: contractID,
+                details: "'\(outputName)' field '\(field)' must be numeric"
+            )
+        }
+    }
+
+    private func requireInt(
+        _ value: Any?,
+        field: String,
+        agentID: String,
+        contractID: String,
+        outputName: String
+    ) throws {
+        if let number = value as? NSNumber,
+           CFGetTypeID(number) != CFBooleanGetTypeID(),
+           floor(number.doubleValue) == number.doubleValue {
+            return
+        }
+        guard value is Int else {
+            throw ExecutionError.outputContractViolation(
+                agentID: agentID,
+                contractID: contractID,
+                details: "'\(outputName)' field '\(field)' must be an integer"
+            )
+        }
+    }
+
+    private func requireBool(
+        _ value: Any?,
+        field: String,
+        agentID: String,
+        contractID: String,
+        outputName: String
+    ) throws {
+        if let boolValue = value as? Bool {
+            _ = boolValue
+            return
+        }
+        if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
+            return
+        }
+        throw ExecutionError.outputContractViolation(
+            agentID: agentID,
+            contractID: contractID,
+            details: "'\(outputName)' field '\(field)' must be a boolean"
+        )
+    }
+
+    private func requireArray(
+        _ value: Any?,
+        field: String,
+        agentID: String,
+        contractID: String,
+        outputName: String
+    ) throws {
+        guard value is [Any] else {
+            throw ExecutionError.outputContractViolation(
+                agentID: agentID,
+                contractID: contractID,
+                details: "'\(outputName)' field '\(field)' must be an array"
+            )
+        }
+    }
+
+    private func tryExtractScalarFields(from data: Data) -> [String: AnyCodableValue]? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return scalarFields(from: json)
+    }
+
+    private func scalarFields(from json: [String: Any]) -> [String: AnyCodableValue] {
+        var fields: [String: AnyCodableValue] = [:]
+        for (key, value) in json {
+            if let boolVal = value as? Bool {
+                fields[key] = .bool(boolVal)
+            } else if let intVal = value as? Int {
+                fields[key] = .int(intVal)
+            } else if let doubleVal = value as? Double {
+                fields[key] = .double(doubleVal)
+            } else if let stringVal = value as? String {
+                fields[key] = .string(stringVal)
+            }
+        }
+        return fields
     }
 
     // MARK: - Failure Handling
@@ -755,6 +1062,9 @@ final class WorkflowOrchestrator {
             agentExecution?.providerSessionID = sessionID
             agentExecution?.gooseSessionID = sessionID
         }
+        if let requestID = event.requestID {
+            agentExecution?.providerRequestID = requestID
+        }
 
         let existingSnippet = agentExecution?.logSnippet
         let eventSnippet = logSnippet(for: event, existing: existingSnippet)
@@ -825,5 +1135,68 @@ final class WorkflowOrchestrator {
 
         guard let result, !result.isEmpty else { return existing }
         return result
+    }
+
+    private func encodeArtifactNameList(_ names: [String]) -> Data? {
+        try? JSONEncoder().encode(names)
+    }
+
+    private func persistFinalFeatureReportIfNeeded(finalStateID: String) {
+        guard producedArtifactNames.contains("final_feature_report") == false else { return }
+
+        let report = buildFinalFeatureReport()
+        guard let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) else {
+            return
+        }
+
+        let reportProvider = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .last?.provider ?? "chainworks"
+        let reportModel = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .last?.artifacts
+            .last?.model
+        let reportEffort = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .last?.effort
+
+        if let artifact = try? artifactManager.persistSystemArtifact(
+            name: "final_feature_report",
+            data: data,
+            contractID: "final_feature_report_v1",
+            format: .json,
+            workspace: workspace,
+            stageID: finalStateID,
+            agentID: "system_reporter",
+            provider: reportProvider,
+            model: reportModel,
+            effort: reportEffort,
+            attemptNumber: 1
+        ) {
+            producedArtifactNames.insert(artifact.name)
+            if let fields = tryExtractScalarFields(from: data) {
+                artifactFields[artifact.name] = fields
+            }
+        }
+    }
+
+    private func buildFinalFeatureReport() -> [String: Any] {
+        let completedAt = run.completedAt ?? Date()
+        let durationSeconds = max(0, completedAt.timeIntervalSince(run.startedAt))
+        let stageCount = run.stageExecutions.count
+        let agentCount = run.stageExecutions.flatMap(\.agentExecutions).count
+        let artifactCount = run.stageExecutions.flatMap(\.agentExecutions).flatMap(\.artifacts).count
+        let approvalCount = run.approvals.count
+        let totalCostUSD = Double(run.totalCostCents ?? 0) / 100.0
+
+        return [
+            "final_status": run.status.rawValue,
+            "summary": "\(run.workflowTitle) completed with \(stageCount) stages, \(agentCount) agent executions, \(artifactCount) artifacts, and \(approvalCount) approval checkpoints.",
+            "started_at": ISO8601DateFormatter().string(from: run.startedAt),
+            "completed_at": ISO8601DateFormatter().string(from: completedAt),
+            "duration_seconds": durationSeconds,
+            "total_cost": totalCostUSD,
+            "cost_currency": "USD"
+        ]
     }
 }

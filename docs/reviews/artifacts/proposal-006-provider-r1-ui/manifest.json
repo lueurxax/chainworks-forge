@@ -1,0 +1,47 @@
+[
+  {
+    "attachments" : [
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "96E4E35E-F648-492B-A408-B63293687B02.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "REQ011_Approvals_0_5BA9E782-9948-4A47-970F-E241A08ECD35.png",
+        "timestamp" : 1774301040.714
+      }
+    ],
+    "testIdentifier" : "Chainworks_ForgeUITests/testApprovalInboxReachable()",
+    "testIdentifierURL" : "test://com.apple.xcode/Chainworks%20Forge/Chainworks%20ForgeUITests/Chainworks_ForgeUITests/testApprovalInboxReachable"
+  },
+  {
+    "attachments" : [
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "E95706F9-4816-42E1-B3D9-1C81FA80DFF2.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "P004_NonHappy_MissingRuntime_0_06F96A45-F47A-428F-B022-5B13CE39DD53.png",
+        "timestamp" : 1774301053.338
+      }
+    ],
+    "testIdentifier" : "Chainworks_ForgeUITests/testLiveRuntimeUnavailableShowsRecoveryGuidance()",
+    "testIdentifierURL" : "test://com.apple.xcode/Chainworks%20Forge/Chainworks%20ForgeUITests/Chainworks_ForgeUITests/testLiveRuntimeUnavailableShowsRecoveryGuidance"
+  },
+  {
+    "attachments" : [
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "00006000-0014108A2E02401E",
+        "deviceName" : "My Mac",
+        "exportedFileName" : "4B1BB70F-EAAB-41B5-8A87-123C57EF7883.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "REQ011_Sheet_0_CD0E6BC6-D432-407F-A44A-02A6E04A0659.png",
+        "timestamp" : 1774301068.173
+      }
+    ],
+    "testIdentifier" : "Chainworks_ForgeUITests/testStartRunSheetUI()",
+    "testIdentifierURL" : "test://com.apple.xcode/Chainworks%20Forge/Chainworks%20ForgeUITests/Chainworks_ForgeUITests/testStartRunSheetUI"
+  }
+]

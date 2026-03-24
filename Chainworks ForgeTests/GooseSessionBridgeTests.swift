@@ -193,6 +193,69 @@ final class GooseSessionBridgeTests: XCTestCase {
         XCTAssertFalse(packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
+    func testSessionBridgeExecutionRequestCarriesReadOnlyPolicy() async throws {
+        /// Proposal 005: conforms to `GooseTransportProtocol` directly.
+        final class RecordingTransport: GooseTransportProtocol, @unchecked Sendable {
+            var lastRequest: GooseSessionRequest?
+
+            init() {}
+
+            func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+                lastRequest = request
+                return GooseSessionResponse(
+                    sessionId: "bridge-session",
+                    status: "active",
+                    policyAcknowledgement: GoosePolicyAcknowledgement(
+                        accepted: true,
+                        capabilityToken: "mock-read-only",
+                        backendPolicyVersion: "mock-v1"
+                    )
+                )
+            }
+
+            func submitPrompt(
+                sessionID: String,
+                prompt: GoosePromptRequest
+            ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+                AsyncThrowingStream { continuation in
+                    continuation.finish()
+                }
+            }
+
+            func closeSession(sessionID: String) async throws {}
+        }
+
+        let transport = RecordingTransport()
+        let bridge = GooseSessionBridge(transport: transport)
+        let agent = makeAgent()
+        let task = makeTask()
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_1",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea"
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: task,
+            context: context,
+            override: nil
+        )
+
+        XCTAssertEqual(transport.lastRequest?.executionPolicy?.permissionProfileID, "read_only")
+        XCTAssertEqual(transport.lastRequest?.executionPolicy?.workspaceMode, "read_only")
+        XCTAssertEqual(transport.lastRequest?.executionPolicy?.gitOperationsAllowed, false)
+        XCTAssertEqual(transport.lastRequest?.executionPolicy?.releaseOperationsAllowed, false)
+        XCTAssertEqual(transport.lastRequest?.executionPolicy?.repoWritesAllowed, false)
+    }
+
     // MARK: - LiveExecutionOverride Tests
 
     func testLiveExecutionOverrideEncoding() throws {

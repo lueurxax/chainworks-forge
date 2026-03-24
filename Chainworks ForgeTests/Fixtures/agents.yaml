@@ -106,7 +106,10 @@ contracts:
     - agent_id
     - role
     - score
+    - decision
     - verdict
+    - summary
+    - issues
     - blocking_issues
     - non_blocking_issues
     - suggestions
@@ -114,9 +117,13 @@ contracts:
   proposal_review_summary_v1:
     format: json
     required_fields:
+    - pass
+    - average_score
     - aggregate_score
     - min_individual_score
     - blocker_count
+    - summary
+    - required_changes
     - recurring_themes
     - decision
   implementation_self_assessment_v1:

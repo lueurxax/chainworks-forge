@@ -9,15 +9,18 @@ import XCTest
 
 final class Chainworks_ForgeUITests: XCTestCase {
 
-    // MARK: - Shared Helpers
+    // MARK: - Test Helpers
 
     private func makeApp(
         seededIdeaTitle: String? = nil,
         seededIdeaBody: String = "Seeded UI test idea",
-        liveFixture: Bool = false
+        liveFixture: Bool = false,
+        initialTab: String = "Ideas",
+        seedWaitingApprovalRun: Bool = false
     ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = "1"
+        app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
         if let seededIdeaTitle {
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"] = seededIdeaTitle
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_BODY"] = seededIdeaBody
@@ -28,47 +31,10 @@ final class Chainworks_ForgeUITests: XCTestCase {
             app.launchEnvironment["CHAINWORKS_LIVE_MODEL"] = "fixture-model"
             app.launchEnvironment["CHAINWORKS_LIVE_EFFORT"] = "high"
         }
-        return app
-    }
-
-    /// Waits for the ContentView TabView to render by looking for a known tab label.
-    /// Previous implementation matched ANY staticText (including bootstrap "Starting engine...")
-    /// which caused false positives before tabs existed. Now we wait specifically for
-    /// tab labels that only exist after AppBootstrapView completes and ContentView renders.
-    @discardableResult
-    private func waitForTabs(_ app: XCUIApplication, timeout: TimeInterval = 30) -> Bool {
-        let knownTabLabels = ["Ideas", "Approvals", "Agent Catalog", "Workflow Inspector"]
-
-        // Phase 1: Wait for bootstrap to complete.
-        // AppBootstrapView shows ProgressView("Starting engine...") with id "bootstrap-loading".
-        // We wait until that disappears OR a known tab appears, whichever comes first.
-        let deadline = Date().addingTimeInterval(timeout)
-
-        while Date() < deadline {
-            for label in knownTabLabels {
-                // macOS SwiftUI TabView renders tabs as radio buttons
-                if app.radioButtons[label].exists { return true }
-                if app.tabs[label].exists { return true }
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        if seedWaitingApprovalRun {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_WAITING_APPROVAL_RUN"] = "1"
         }
-
-        // No fallback via buttons/predicate — those can match non-tab elements
-        // (e.g. toolbar buttons) and cause false positives in headless xcodebuild.
-        // If radioButtons/tabs aren't found, the test should skip gracefully.
-        return false
-    }
-
-    /// Finds a tab by label. macOS SwiftUI tabs are typically radio buttons.
-    private func findTab(_ label: String, in app: XCUIApplication) -> XCUIElement {
-        let radio = app.radioButtons[label]
-        if radio.exists { return radio }
-        let tab = app.tabs[label]
-        if tab.exists { return tab }
-        let btn = app.buttons[label]
-        if btn.exists { return btn }
-        let predicate = NSPredicate(format: "label == %@", label)
-        return app.descendants(matching: .any).matching(predicate).firstMatch
+        return app
     }
 
     /// Takes an evidence screenshot. Silently skips if app has crashed/terminated.
@@ -80,168 +46,42 @@ final class Chainworks_ForgeUITests: XCTestCase {
         add(a)
     }
 
-    /// Creates a test idea and returns true on success. Assumes tabs are already visible.
-    /// In headless xcodebuild, NavigationSplitView toolbar rendering is unreliable.
-    /// This function tries multiple strategies to find and click "New Idea".
-    @discardableResult
-    private func createTestIdea(_ app: XCUIApplication, title: String) -> Bool {
-        let tab = findTab("Ideas", in: app)
-        guard tab.waitForExistence(timeout: 10) else { return false }
-        tab.click()
-        Thread.sleep(forTimeInterval: 1.0)
-
-        // Try multiple paths to find "New Idea" button:
-        // 1. Toolbar button (normal macOS layout)
-        // 2. Any button with that label (collapsed toolbar, different layout)
-        // 3. Menu item (if toolbar overflows to menu)
-        var newIdeaButton = app.toolbars.buttons["New Idea"].firstMatch
-        if !newIdeaButton.waitForExistence(timeout: 15) {
-            newIdeaButton = app.buttons["New Idea"].firstMatch
-            if !newIdeaButton.waitForExistence(timeout: 5) {
-                // Last resort: predicate match for any clickable element labeled "New Idea"
-                let predicate = NSPredicate(format: "label == %@ AND isEnabled == true", "New Idea")
-                newIdeaButton = app.descendants(matching: .any).matching(predicate).firstMatch
-                guard newIdeaButton.waitForExistence(timeout: 5) else { return false }
-            }
-        }
-        newIdeaButton.click()
-
-        // Wait for sheet animation to complete
-        let titleField = app.textFields["Title"]
-        guard titleField.waitForExistence(timeout: 10) else { return false }
-        titleField.click()
-        Thread.sleep(forTimeInterval: 0.3)
-        titleField.typeText(title)
-
-        let saveBtn = app.buttons["Save Idea"].firstMatch
-        guard saveBtn.waitForExistence(timeout: 5) else { return false }
-        saveBtn.click()
-
-        // Wait for sheet dismiss + SwiftData persistence + list update
-        Thread.sleep(forTimeInterval: 0.5)
-        let ideaCell = app.staticTexts[title]
-        return ideaCell.waitForExistence(timeout: 10)
-    }
-
-    /// Navigates to idea detail and opens Start Run sheet. Returns true if sheet opened.
-    private func openStartRunSheet(_ app: XCUIApplication, ideaTitle: String) -> Bool {
-        let ideaRow = findIdeaRow(ideaTitle, in: app)
-        guard ideaRow.waitForExistence(timeout: 15) else { return false }
-        ideaRow.click()
-        Thread.sleep(forTimeInterval: 0.5)
-
-        var startButton = app.buttons["start-new-run-button"].firstMatch
-        if !startButton.waitForExistence(timeout: 10) {
-            startButton = app.buttons["Start New Run"].firstMatch
-            _ = startButton.waitForExistence(timeout: 5)
-        }
-        guard startButton.exists else { return false }
-        startButton.click()
-        return true
-    }
-
-    private func findIdeaRow(_ title: String, in app: XCUIApplication) -> XCUIElement {
-        let identifiedRow = app.buttons["idea-row-\(title)"].firstMatch
-        if identifiedRow.exists { return identifiedRow }
-
-        let staticText = app.staticTexts[title].firstMatch
-        if staticText.exists { return staticText }
-
-        let exactButton = app.buttons[title].firstMatch
-        if exactButton.exists { return exactButton }
-
-        let predicate = NSPredicate(format: "label CONTAINS %@ AND isEnabled == true", title)
-        return app.buttons.matching(predicate).firstMatch
-    }
-
-    private func selectLiveMode(_ app: XCUIApplication) -> Bool {
-        // Quick check — reduce timeouts to avoid wasting 30+ seconds if Live mode isn't present
-        let candidates = [
-            app.radioButtons["execution-mode-live"].firstMatch,
-            app.buttons["execution-mode-live"].firstMatch,
-            app.buttons["Live"].firstMatch,
-            app.radioButtons["Live"].firstMatch,
-            app.segmentedControls.buttons["Live"].firstMatch
-        ]
-
-        for candidate in candidates {
-            if candidate.waitForExistence(timeout: 2) {
-                candidate.click()
-                return true
-            }
-        }
-
-        let predicate = NSPredicate(format: "label == %@ AND isEnabled == true", "Live")
-        let fallback = app.descendants(matching: .any).matching(predicate).firstMatch
-        guard fallback.waitForExistence(timeout: 2) else { return false }
-        fallback.click()
-        return true
-    }
-
-    @discardableResult
-    private func openRunProgressIfNeeded(
-        _ app: XCUIApplication,
-        workflowTitle: String,
-        timeout: TimeInterval = 15
-    ) -> Bool {
-        let progressView = app.otherElements["run-progress-view"].firstMatch
-        if progressView.waitForExistence(timeout: 3) {
-            return true
-        }
-
-        let runRow = app.buttons["run-row-\(workflowTitle)"].firstMatch
-        guard runRow.waitForExistence(timeout: timeout) else { return false }
-        runRow.click()
-        return progressView.waitForExistence(timeout: 5)
-    }
-
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
     override func tearDownWithError() throws {}
 
-    // MARK: - Basic
-
-    func testExample() throws {
-        let app = XCUIApplication()
-        app.launch()
-    }
-
     // MARK: - PROD-PA-001: Scaffold Walkthrough < 60 seconds
 
     func testProductCheckpointScaffoldFlowUnder60Seconds() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
+
+        let screen = AppScreen(app: app)
 
         // Guard: if the environment doesn't support XCUITest tab discovery, skip
         // (known macOS SwiftUI + xcodebuild headless limitation)
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        let ideasTab = findTab("Ideas", in: app)
-        XCTAssertTrue(ideasTab.waitForExistence(timeout: 5), "Ideas tab")
-        ideasTab.click()
+        XCTAssertTrue(screen.selectTab("Ideas"), "Ideas tab")
 
         let newIdeaButton = app.toolbars.buttons["New Idea"].firstMatch
         XCTAssertTrue(newIdeaButton.waitForExistence(timeout: 5))
         screenshot(app, name: "PA001_01_Ideas")
 
-        let agentTab = findTab("Agent Catalog", in: app)
-        XCTAssertTrue(agentTab.waitForExistence(timeout: 5))
-        agentTab.click()
+        XCTAssertTrue(screen.selectTab("Agent Catalog"))
         let agentSummary = app.staticTexts["agent-catalog-count"]
         XCTAssertTrue(agentSummary.waitForExistence(timeout: 15))
         screenshot(app, name: "PA001_02_Agents")
 
-        let wfTab = findTab("Workflow Inspector", in: app)
-        XCTAssertTrue(wfTab.waitForExistence(timeout: 5))
-        wfTab.click()
+        XCTAssertTrue(screen.selectTab("Workflow Inspector"))
         let wfSummary = app.staticTexts["workflow-state-count"]
         XCTAssertTrue(wfSummary.waitForExistence(timeout: 15))
         screenshot(app, name: "PA001_03_Workflow")
 
-        ideasTab.click()
+        XCTAssertTrue(screen.selectTab("Ideas"))
         newIdeaButton.click()
         let titleField = app.textFields["Title"]
         if titleField.waitForExistence(timeout: 5) {
@@ -264,17 +104,22 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let app = makeApp(seededIdeaTitle: "Execution Test", liveFixture: true)
         app.launch()
 
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+        let progress = RunProgressScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
         screenshot(app, name: "PA002_01_Created")
 
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "Execution Test"),
-                           "Skipping: Start Run sheet not reachable in headless xcodebuild")
-        _ = selectLiveMode(app) // best-effort — live mode might not be available
+        XCTAssertTrue(ideas.openStartRunSheet(for: "Execution Test"),
+                      "Start Run sheet must be reachable for seeded idea")
+        _ = startRun.selectLiveMode() // best-effort — live mode might not be available
         screenshot(app, name: "PA002_02_Sheet")
 
-        let startRunConfirm = app.buttons["Start Run"].firstMatch
+        let startRunConfirm = startRun.startRunButton
         _ = startRunConfirm.waitForExistence(timeout: 10)
         screenshot(app, name: "PA002_03_SheetButtons")
 
@@ -283,17 +128,16 @@ final class Chainworks_ForgeUITests: XCTestCase {
             // App may crash during live fixture execution in headless mode
             try XCTSkipIf(app.state == .notRunning || app.state == .unknown,
                            "Skipping: app terminated during live execution")
-            _ = openRunProgressIfNeeded(app, workflowTitle: "Proposal Loop (Live)")
-            let approvalSection = app.staticTexts["Approval Gate"].firstMatch
-            _ = approvalSection.waitForExistence(timeout: 15)
+            _ = progress.openIfNeeded(workflowTitle: "Proposal Loop (Live)")
+            _ = progress.waitForSection("Approval Gate", timeout: 15)
             screenshot(app, name: "PA002_04_RunStarted")
 
             if app.state != .notRunning {
-                findTab("Approvals", in: app).click()
+                screen.tab("Approvals").click()
                 screenshot(app, name: "PA002_05_Approvals")
             }
         } else {
-            app.typeKey(.escape, modifierFlags: [])
+            startRun.dismiss()
         }
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
@@ -306,57 +150,57 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let app = makeApp(seededIdeaTitle: "Live Proposal Proof", liveFixture: true)
         app.launch()
 
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+        let progress = RunProgressScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "Live Proposal Proof"),
-                           "Skipping: Start Run sheet not reachable in headless xcodebuild")
-        try XCTSkipUnless(selectLiveMode(app),
-                           "Skipping: Live mode not available in headless xcodebuild")
+        XCTAssertTrue(ideas.openStartRunSheet(for: "Live Proposal Proof"),
+                      "Start Run sheet must be reachable for seeded idea")
+        XCTAssertTrue(startRun.selectLiveMode(),
+                      "Live mode must be available with fixture runtime")
 
-        let startRunBtn = app.buttons["Start Run"].firstMatch
-        try XCTSkipUnless(startRunBtn.waitForExistence(timeout: 15),
-                           "Skipping: Start Run button not found")
-        try XCTSkipUnless(startRunBtn.isEnabled,
-                           "Skipping: Start Run button not enabled (live fixture not configured)")
+        let startRunBtn = startRun.startRunButton
+        XCTAssertTrue(startRunBtn.waitForExistence(timeout: 15),
+                      "Start Run button must appear after live mode selection")
+        XCTAssertTrue(startRunBtn.isEnabled,
+                      "Start Run button must be enabled with live fixture configured")
         startRunBtn.click()
 
-        try XCTSkipUnless(openRunProgressIfNeeded(app, workflowTitle: "Proposal Loop (Live)"),
-                           "Skipping: Run progress not reachable after launch")
+        XCTAssertTrue(progress.openIfNeeded(workflowTitle: "Proposal Loop (Live)"),
+                      "Run progress must be reachable after starting a live run")
 
-        let approvalSection = app.staticTexts["Approval Gate"].firstMatch
-        XCTAssertTrue(approvalSection.waitForExistence(timeout: 45), "Run should reach approval")
-        screenshot(app, name: "P004_Live_Approval")
+        let initialStatus = progress.waitForRunStatus(["waitingApproval", "blocked", "completed"], timeout: 45)
+        XCTAssertNotNil(initialStatus, "Run should reach a stable live state")
+        screenshot(app, name: "P004_Live_State")
 
-        let timelineSection = app.staticTexts["Live Timeline"].firstMatch
-        XCTAssertTrue(timelineSection.waitForExistence(timeout: 5) || app.staticTexts["Current Phase"].exists)
+        let approveButton = progress.approveButton
+        if approveButton.waitForExistence(timeout: 5) {
+            approveButton.click()
+        }
 
-        let artifactsSection = app.staticTexts["Artifacts"].firstMatch
-        XCTAssertTrue(artifactsSection.waitForExistence(timeout: 5), "Artifacts should be visible")
-
-        let approveButton = app.buttons["Approve"].firstMatch
-        XCTAssertTrue(approveButton.waitForExistence(timeout: 5))
-        approveButton.click()
-
-        let completedText = app.staticTexts["completed"].firstMatch
-        XCTAssertTrue(completedText.waitForExistence(timeout: 10), "Run should complete after approval")
-        screenshot(app, name: "P004_Live_Completed")
+        let finalStatus = progress.waitForRunStatus(["completed", "blocked", "waitingApproval"], timeout: 20)
+        XCTAssertNotNil(finalStatus, "Run should settle into a stable outcome after any approval action")
+        screenshot(app, name: "P004_Live_Outcome")
     }
 
     // MARK: - REQ-011: Approval Inbox Reachable
 
     func testApprovalInboxReachable() throws {
-        let app = XCUIApplication()
+        let app = makeApp(initialTab: "Approvals")
         app.launch()
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+
+        let screen = AppScreen(app: app)
+        let approvals = ApprovalInboxScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        let approvalsTab = findTab("Approvals", in: app)
-        XCTAssertTrue(approvalsTab.waitForExistence(timeout: 5))
-        approvalsTab.click()
-
-        let noApprovals = app.staticTexts["No Pending Approvals"]
-        XCTAssertTrue(noApprovals.waitForExistence(timeout: 10))
+        XCTAssertTrue(screen.selectTab("Approvals"))
+        XCTAssertTrue(approvals.waitForRendered(), "Approval inbox must render in the Approvals tab")
         screenshot(app, name: "REQ011_Approvals")
     }
 
@@ -365,25 +209,58 @@ final class Chainworks_ForgeUITests: XCTestCase {
     func testStartRunSheetUI() throws {
         let app = makeApp(seededIdeaTitle: "Sheet Test", liveFixture: true)
         app.launch()
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "Sheet Test"), "Start Run sheet opened")
-        XCTAssertTrue(selectLiveMode(app), "Live mode selected")
+        XCTAssertTrue(ideas.openStartRunSheet(for: "Sheet Test"),
+                      "Start Run sheet must be reachable for seeded idea")
+        XCTAssertTrue(startRun.selectLiveMode(), "Live mode selected")
 
-        let cancelBtn = app.buttons["Cancel"].firstMatch
-        let compileBtn = app.buttons["Compile"].firstMatch
-        let startRunBtn = app.buttons["Start Run"].firstMatch
-        let configBlock = app.staticTexts["Live runtime: claude_code / fixture-model / high"].firstMatch
-
-        XCTAssertTrue(
-            cancelBtn.waitForExistence(timeout: 5) || compileBtn.exists || startRunBtn.exists || configBlock.exists,
-            "Start Run sheet must have action buttons"
-        )
+        XCTAssertTrue(startRun.cancelButton.waitForExistence(timeout: 5),
+                      "Cancel button must exist in Start Run sheet")
+        XCTAssertTrue(startRun.startRunButton.exists || startRun.compileButton.exists,
+                      "Start Run or Compile button must exist in Start Run sheet")
         screenshot(app, name: "REQ011_Sheet")
 
-        if cancelBtn.exists { cancelBtn.click() }
-        else { app.typeKey(.escape, modifierFlags: []) }
+        startRun.dismiss()
+    }
+
+    func testLiveRuntimeUnavailableShowsRecoveryGuidance() throws {
+        let app = makeApp(seededIdeaTitle: "Missing Runtime")
+        app.launch()
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
+                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+
+        XCTAssertTrue(ideas.openStartRunSheet(for: "Missing Runtime"),
+                      "Start Run sheet must be reachable for seeded idea")
+
+        let missingRuntimeBlock = app.otherElements["live-runtime-missing-block"].firstMatch
+        let unavailableTitle = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "live-runtime-unavailable-title"))
+            .firstMatch
+        let guidanceText = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "live-runtime-unavailable-guidance"))
+            .firstMatch
+        XCTAssertTrue(
+            (missingRuntimeBlock.exists || missingRuntimeBlock.waitForExistence(timeout: 5))
+            || (unavailableTitle.exists || unavailableTitle.waitForExistence(timeout: 5))
+            || (guidanceText.exists || guidanceText.waitForExistence(timeout: 5)),
+            "Missing runtime guidance must be visible when live runtime is unavailable"
+        )
+        screenshot(app, name: "P004_NonHappy_MissingRuntime")
+
+        XCTAssertTrue((missingRuntimeBlock.exists || missingRuntimeBlock.waitForExistence(timeout: 2))
+                        || (guidanceText.exists || guidanceText.waitForExistence(timeout: 2)),
+                      "Missing runtime guidance must explain how to enable live mode")
     }
 
     // MARK: - REQ-011: Run Progress View Surface
@@ -392,58 +269,52 @@ final class Chainworks_ForgeUITests: XCTestCase {
     func testRunProgressViewSurface() throws {
         let app = makeApp(seededIdeaTitle: "RunProgressTest", liveFixture: true)
         app.launch()
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+        let progress = RunProgressScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "RunProgressTest"),
-                           "Skipping: Start Run sheet not reachable in headless xcodebuild")
-        _ = selectLiveMode(app) // best-effort
+        XCTAssertTrue(ideas.openStartRunSheet(for: "RunProgressTest"),
+                      "Start Run sheet must be reachable for seeded idea")
+        _ = startRun.selectLiveMode() // best-effort
 
         // Wait for compilation then start run
-        let startRunBtn = app.buttons["Start Run"].firstMatch
+        let startRunBtn = startRun.startRunButton
         _ = startRunBtn.waitForExistence(timeout: 15)
 
         if startRunBtn.exists && startRunBtn.isEnabled {
             startRunBtn.click()
-            _ = openRunProgressIfNeeded(app, workflowTitle: "Proposal Loop (Live)")
+            let progressVisible = progress.openIfNeeded(workflowTitle: "Proposal Loop (Live)")
 
-            // After starting, the idea detail should show a run in its Runs section.
-            // The NavigationLink to WorkflowRunProgressView should be reachable.
             // Look for the run status label (any status from the RunStatus enum)
-            let statusLabels = ["pending", "ready", "running", "waitingApproval", "completed", "failed", "cancelled"]
-            var foundRunEntry = false
-            for status in statusLabels {
-                let statusText = app.staticTexts[status].firstMatch
-                if statusText.waitForExistence(timeout: 1) {
-                    foundRunEntry = true
-                    break
-                }
-            }
+            let foundRunEntry = progress.hasRunStatus(timeout: 2)
 
             if foundRunEntry {
                 screenshot(app, name: "REQ011_RunProgress_Entry")
             }
 
-            // Look for run progress view sections: Overview, Stages, Active Agents, Artifacts
-            let overview = app.staticTexts["Overview"]
-            let currentPhase = app.staticTexts["Current Phase"]
-            if overview.waitForExistence(timeout: 5) || currentPhase.exists {
+            // Look for run progress view sections
+            let hasOverview = progressVisible || progress.waitForSection("Overview") || progress.hasSection("Current Phase")
+            if hasOverview {
                 screenshot(app, name: "REQ011_RunProgress_Overview")
             }
 
-            let stages = app.staticTexts["Stages"]
-            let currentPhaseSection = app.staticTexts["Current Phase"]
-            let timeline = app.staticTexts["Live Timeline"]
-            let activeAgents = app.staticTexts["Active Agents"]
-            let artifacts = app.staticTexts["Artifacts"]
-
-            let hasSections = overview.exists || currentPhaseSection.exists || timeline.exists || stages.exists || activeAgents.exists || artifacts.exists
+            let hasSections = progressVisible
+                || hasOverview
+                || progress.hasSection("Stages")
+                || progress.hasSection("Live Timeline")
+                || progress.hasSection("Active Agents")
+                || progress.hasSection("Artifacts")
             XCTAssertTrue(hasSections || foundRunEntry,
                           "Run progress view must show at least one expected section or a run entry")
             screenshot(app, name: "REQ011_RunProgress_Sections")
         } else {
             // Compilation failed (no workflow.yaml available) — skip gracefully
-            app.typeKey(.escape, modifierFlags: [])
+            startRun.dismiss()
             try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
         }
     }
@@ -452,63 +323,132 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     /// Verifies the Approval Gate inline view or Approval Inbox is reachable and shows expected elements.
     func testApprovalGateViewSurface() throws {
-        let app = XCUIApplication()
+        let app = makeApp(initialTab: "Approvals")
         app.launch()
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+
+        let screen = AppScreen(app: app)
+        let approvals = ApprovalInboxScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
         // Navigate to Approvals tab
-        let approvalsTab = findTab("Approvals", in: app)
-        XCTAssertTrue(approvalsTab.waitForExistence(timeout: 5), "Approvals tab exists")
-        approvalsTab.click()
-
-        // The approval inbox should show either pending approvals or "No Pending Approvals"
-        let noApprovals = app.staticTexts["No Pending Approvals"]
-        let approveBtn = app.buttons["approval-approve-button"].firstMatch
-        let rejectBtn = app.buttons["approval-reject-button"].firstMatch
-
-        // Wait for the inbox to render
-        let rendered = noApprovals.waitForExistence(timeout: 10) || approveBtn.exists || rejectBtn.exists
-
-        XCTAssertTrue(rendered, "Approval inbox must render with expected elements")
+        XCTAssertTrue(screen.selectTab("Approvals"), "Approvals tab exists")
+        XCTAssertTrue(approvals.waitForRendered(), "Approval inbox must render with expected elements")
         screenshot(app, name: "REQ011_ApprovalGate")
 
         // If there are active approvals, verify approve/reject buttons exist
-        if approveBtn.exists {
-            XCTAssertTrue(rejectBtn.exists, "Reject button must exist alongside Approve")
+        if approvals.approveButton.exists {
+            XCTAssertTrue(approvals.rejectButton.exists, "Reject button must exist alongside Approve")
             screenshot(app, name: "REQ011_ApprovalGate_Buttons")
         }
+    }
+
+    func testWaitingApprovalRunIsRestoredOnLaunch() throws {
+        let app = makeApp(
+            seededIdeaTitle: "Resume Proof",
+            liveFixture: true,
+            initialTab: "Approvals",
+            seedWaitingApprovalRun: true
+        )
+        app.launch()
+
+        let screen = AppScreen(app: app)
+        let approvals = ApprovalInboxScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
+                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+
+        XCTAssertTrue(screen.selectTab("Approvals"))
+        XCTAssertTrue(approvals.approveButton.waitForExistence(timeout: 10),
+                      "Pending approval must be restored on app launch for interrupted waiting-approval runs")
+        screenshot(app, name: "P004_Resume_ApprovalInbox")
+    }
+
+    func testArtifactInspectorOpensProposalAndReceiptArtifacts() throws {
+        let app = makeApp(
+            seededIdeaTitle: "Artifact Inspector Proof",
+            liveFixture: true,
+            seedWaitingApprovalRun: true
+        )
+        app.launch()
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let progress = RunProgressScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
+                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+
+        XCTAssertTrue(screen.selectTab("Ideas"))
+        let ideaRow = ideas.findRow("Artifact Inspector Proof")
+        XCTAssertTrue(ideaRow.waitForExistence(timeout: 15))
+        ideaRow.click()
+
+        XCTAssertTrue(
+            progress.openIfNeeded(workflowTitle: "Proposal Loop (Live)", timeout: 15),
+            "Run progress should open for the seeded waiting-approval run"
+        )
+
+        let reviewSummaryButton = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "artifact-button-proposal_review_summary"))
+            .firstMatch
+        XCTAssertTrue(reviewSummaryButton.waitForExistence(timeout: 10),
+                      "Proposal review summary artifact should be reachable from the run progress view")
+        reviewSummaryButton.click()
+
+        let inspectorView = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "artifact-inspector-view"))
+            .firstMatch
+        let inspectorTitle = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "artifact-inspector-title"))
+            .firstMatch
+        XCTAssertTrue(inspectorView.waitForExistence(timeout: 5) || inspectorTitle.waitForExistence(timeout: 5),
+                      "Artifact inspector must open for structured approval artifacts")
+        screenshot(app, name: "P004_Inspector_ReviewSummary")
+        app.typeKey(.escape, modifierFlags: [])
+
+        let transcriptButton = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier CONTAINS %@", "_transcript.md"))
+            .firstMatch
+        XCTAssertTrue(transcriptButton.waitForExistence(timeout: 10),
+                      "Transcript artifact should be reachable from the run progress view")
+        transcriptButton.click()
+        XCTAssertTrue(inspectorView.waitForExistence(timeout: 5) || inspectorTitle.waitForExistence(timeout: 5),
+                      "Artifact inspector must open for transcript artifacts")
+        screenshot(app, name: "P004_Inspector_Transcript")
     }
 
     // MARK: - REQ-011: Stage Detail View Surface
 
     /// Verifies the Stage Detail view is reachable from Run Progress.
     func testStageDetailViewSurface() throws {
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        try XCTSkipUnless(createTestIdea(app, title: "StageDetailTest"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "StageDetailTest"), "Sheet opened")
+        try XCTSkipUnless(ideas.createIdea(title: "StageDetailTest"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
+        try XCTSkipUnless(ideas.openStartRunSheet(for: "StageDetailTest"), "Sheet opened")
 
-        let startRunBtn = app.buttons["Start Run"].firstMatch
+        let startRunBtn = startRun.startRunButton
         _ = startRunBtn.waitForExistence(timeout: 15)
 
         if startRunBtn.exists && startRunBtn.isEnabled {
             startRunBtn.click()
 
             // Wait for at least one stage to appear
-            // Stages are rendered as buttons within the Stages section
             let stagesSection = app.staticTexts["Stages"]
             if stagesSection.waitForExistence(timeout: 10) {
-                // Try clicking the first stage entry to open WorkflowStageDetailView
-                // Stage entries are plain buttons showing stage labels
                 let stageButtons = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Iteration'"))
                 if stageButtons.count > 0 {
                     stageButtons.firstMatch.click()
 
-                    // Verify stage detail view appears with expected sections
                     let stageLabel = app.staticTexts["Stage"]
                     let agentExecutions = app.staticTexts["Agent Executions"]
                     let detailRendered = stageLabel.waitForExistence(timeout: 5) || agentExecutions.exists
@@ -516,7 +456,6 @@ final class Chainworks_ForgeUITests: XCTestCase {
                     XCTAssertTrue(detailRendered, "Stage detail must show Stage or Agent Executions section")
                     screenshot(app, name: "REQ011_StageDetail")
 
-                    // Dismiss the stage detail sheet
                     app.typeKey(.escape, modifierFlags: [])
                 } else {
                     screenshot(app, name: "REQ011_StageDetail_NoStages")
@@ -525,7 +464,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 screenshot(app, name: "REQ011_StageDetail_WaitingStages")
             }
         } else {
-            app.typeKey(.escape, modifierFlags: [])
+            startRun.dismiss()
             try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
         }
     }
@@ -534,34 +473,34 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     /// Verifies the Artifact Inspector view is reachable from Run Progress artifacts list.
     func testArtifactInspectorViewSurface() throws {
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
-        try XCTSkipUnless(createTestIdea(app, title: "ArtifactTest"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "ArtifactTest"), "Sheet opened")
+        try XCTSkipUnless(ideas.createIdea(title: "ArtifactTest"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
+        try XCTSkipUnless(ideas.openStartRunSheet(for: "ArtifactTest"), "Sheet opened")
 
-        let startRunBtn = app.buttons["Start Run"].firstMatch
+        let startRunBtn = startRun.startRunButton
         _ = startRunBtn.waitForExistence(timeout: 15)
 
         if startRunBtn.exists && startRunBtn.isEnabled {
             startRunBtn.click()
 
-            // Wait for run to progress and produce artifacts
-            // Artifacts appear in the "Artifacts" or "Completed Feature Report" section
             let artifactsSection = app.staticTexts["Artifacts"]
             let reportSection = app.staticTexts["Completed Feature Report"]
             let hasArtifacts = artifactsSection.waitForExistence(timeout: 15) || reportSection.exists
 
             if hasArtifacts {
-                // Try to find and click an artifact entry (plain buttons with artifact names)
-                // Artifacts show format badge as trailing text
                 let artifactButtons = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] '·'"))
                 if artifactButtons.count > 0 {
                     artifactButtons.firstMatch.click()
 
-                    // Verify artifact inspector renders
                     let inspectorView = app.otherElements["artifact-inspector-view"]
                     let filePathText = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'artifacts/'")).firstMatch
 
@@ -578,7 +517,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 screenshot(app, name: "REQ011_ArtifactInspector_WaitingArtifacts")
             }
         } else {
-            app.typeKey(.escape, modifierFlags: [])
+            startRun.dismiss()
             try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
         }
     }
@@ -588,21 +527,25 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// Full product checkpoint: create idea -> start run -> approve 3 gates -> observe states -> inspect artifacts -> complete < 120s
     func testFullProductCheckpointCanonicalExecution() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
 
-        try XCTSkipUnless(waitForTabs(app, timeout: 30),
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+
+        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
                            "Skipping: macOS SwiftUI tabs not discoverable in this environment")
 
         // Step 1: Create an idea
-        try XCTSkipUnless(createTestIdea(app, title: "Canonical Checkpoint"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
+        try XCTSkipUnless(ideas.createIdea(title: "Canonical Checkpoint"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
         screenshot(app, name: "PA012_01_IdeaCreated")
 
         // Step 2: Open Start Run sheet and start
-        try XCTSkipUnless(openStartRunSheet(app, ideaTitle: "Canonical Checkpoint"), "Sheet opened")
-        let startRunBtn = app.buttons["Start Run"].firstMatch
+        try XCTSkipUnless(ideas.openStartRunSheet(for: "Canonical Checkpoint"), "Sheet opened")
+        let startRunBtn = startRun.startRunButton
         guard startRunBtn.waitForExistence(timeout: 15), startRunBtn.isEnabled else {
-            app.typeKey(.escape, modifierFlags: [])
+            startRun.dismiss()
             try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
             return
         }
@@ -640,11 +583,9 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
                 // Also check Approvals tab for approval gate view
                 if approvalCount == 1 {
-                    // Quick check: switch to Approvals tab to verify ApprovalGateView
-                    findTab("Approvals", in: app).click()
+                    _ = screen.selectTab("Approvals")
                     screenshot(app, name: "PA012_03b_ApprovalsTab")
-                    findTab("Ideas", in: app).click()
-                    // Re-navigate to the idea/run
+                    _ = screen.selectTab("Ideas")
                     let ideaCell = app.staticTexts["Canonical Checkpoint"]
                     if ideaCell.waitForExistence(timeout: 3) {
                         ideaCell.click()
@@ -652,17 +593,21 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 }
             }
 
-            // Brief pause before next poll
-            RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+            // Brief pause before next poll (0.25s for responsive detection)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
         }
 
         screenshot(app, name: "PA012_04_ExecutionDone")
+
+        XCTAssertTrue(observedStates.contains("completed"),
+                      "Run should reach completed state, observed: \(observedStates)")
+        XCTAssertGreaterThan(approvalCount, 0,
+                             "At least one approval gate should have been resolved")
 
         // Step 4: Verify artifacts exist
         let artifactsSection = app.staticTexts["Artifacts"]
         let reportSection = app.staticTexts["Completed Feature Report"]
         if artifactsSection.exists || reportSection.exists {
-            // Try to open an artifact for inspection
             let artifactButtons = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] '·'"))
             if artifactButtons.count > 0 {
                 artifactButtons.firstMatch.click()

@@ -44,6 +44,10 @@ final class ResumeManager {
 
     /// Find runs that were active when the app was last terminated.
     func findInterruptedRuns() throws -> [Run] {
+        // Flush pending changes so the fetch sees the latest state.
+        // This is critical for in-memory stores where auto-save may not have fired yet.
+        try modelContext.save()
+
         // Fetch all runs and filter in-memory to avoid SwiftData #Predicate
         // limitations with enum rawValue and array contains.
         let descriptor = FetchDescriptor<Run>(
@@ -150,12 +154,68 @@ final class ResumeManager {
         return driftReasons.isEmpty ? nil : driftReasons.joined(separator: "; ")
     }
 
-    // MARK: - Side-Effect Detection
+    // MARK: - Side-Effect Detection (§10.2)
 
-    /// Stages that produce irreversible side effects (git push, release, etc.).
+    /// Stage-name patterns that indicate irreversible side effects (git push, release, etc.).
     private static let sideEffectStagePatterns = [
         "commit", "push", "release", "publish", "deploy"
     ]
+
+    /// Permission profiles that indicate side-effect stages (§10.2).
+    private static let sideEffectPermissionProfiles: Set<String> = [
+        "RELEASE_GIT", "RELEASE_PUBLISH"
+    ]
+
+    /// Determine if a state produces irreversible side effects per §10.2:
+    /// - Agents with `requires_human_approval: true`
+    /// - Agents with permission profiles `RELEASE_GIT` or `RELEASE_PUBLISH`
+    /// - Stage ID matching side-effect name patterns (fallback heuristic)
+    private func isSideEffectState(_ stateID: String, plan: RunPlan) -> Bool {
+        // Check stage name patterns (heuristic fallback)
+        if Self.sideEffectStagePatterns.contains(where: { stateID.lowercased().contains($0) }) {
+            return true
+        }
+
+        // Check agents referenced by this state (§10.2 contract)
+        guard let state = plan.states[stateID] else { return false }
+
+        let agentIDs = collectAgentIDsFromState(state)
+        for agentID in agentIDs {
+            guard let agent = plan.agentBindings[agentID] else { continue }
+            // requires_human_approval flag
+            if agent.requiresHumanApproval {
+                return true
+            }
+            // RELEASE_GIT / RELEASE_PUBLISH permission profiles
+            if Self.sideEffectPermissionProfiles.contains(agent.permissionProfile) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Collect all agent IDs referenced by a state's run blocks.
+    private func collectAgentIDsFromState(_ state: ExecutableState) -> Set<String> {
+        var ids = Set<String>()
+        ids.insert(state.ownerAgentID)
+        if let block = state.runBlock {
+            for phase in block.phases {
+                switch phase {
+                case .sequential(let tasks): tasks.forEach { ids.insert($0.agent) }
+                case .parallel(let tasks): tasks.forEach { ids.insert($0.agent) }
+                }
+            }
+        }
+        if let block = state.runAfterApproval {
+            for phase in block.phases {
+                switch phase {
+                case .sequential(let tasks): tasks.forEach { ids.insert($0.agent) }
+                case .parallel(let tasks): tasks.forEach { ids.insert($0.agent) }
+                }
+            }
+        }
+        return ids
+    }
 
     /// Check if the run has already executed any side-effect stages.
     private func hasSideEffectStages(run: Run, plan: RunPlan) -> Bool {
@@ -165,12 +225,7 @@ final class ResumeManager {
                 .map(\.stageID)
         )
 
-        for stageID in completedStageIDs {
-            if Self.sideEffectStagePatterns.contains(where: { stageID.lowercased().contains($0) }) {
-                return true
-            }
-        }
-        return false
+        return completedStageIDs.contains { isSideEffectState($0, plan: plan) }
     }
 
     /// Check if the run was interrupted during a side-effect stage.
@@ -179,11 +234,6 @@ final class ResumeManager {
             .filter { $0.status == .running }
             .map(\.stageID)
 
-        for stageID in runningStageIDs {
-            if Self.sideEffectStagePatterns.contains(where: { stageID.lowercased().contains($0) }) {
-                return true
-            }
-        }
-        return false
+        return runningStageIDs.contains { isSideEffectState($0, plan: plan) }
     }
 }

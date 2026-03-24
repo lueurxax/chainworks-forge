@@ -35,6 +35,8 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> AgentResult {
+        let expectedOutputs = OutputContractResolver.expectedOutputs(for: task, agent: agent)
+
         // Record execution
         _lock.lock()
         _executedTasks.append((agentID: agent.id, task: task.task, stageID: context.stageID))
@@ -52,14 +54,16 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
                 logSnippet: "Simulated failure for agent '\(agent.id)'",
                 costCents: 0,
                 succeeded: false,
-                errorMessage: "Simulated failure for agent '\(agent.id)'"
+                errorMessage: "Simulated failure for agent '\(agent.id)'",
+                sessionID: nil,
+                durationSeconds: simulatedDelay
             )
         }
 
         // Generate outputs based on agent's declared outputs
         var outputs: [String: Data] = [:]
 
-        for outputName in agent.outputs {
+        for outputName in expectedOutputs {
             let (data, _) = OutputContractTemplates.generateForOutput(
                 outputName: outputName,
                 agent: agent,
@@ -82,9 +86,11 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         return AgentResult(
             outputs: outputs,
             logSnippet: "Simulated execution of '\(agent.id)' for task '\(task.task)' completed successfully",
-            costCents: Int64.random(in: 5...50),
+            costCents: 100,  // §6.2: default 100 cents per execution
             succeeded: true,
-            errorMessage: nil
+            errorMessage: nil,
+            sessionID: "sim-\(UUID().uuidString.prefix(8))",
+            durationSeconds: simulatedDelay
         )
     }
 

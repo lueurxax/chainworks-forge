@@ -18,6 +18,13 @@ import SwiftData
     var effort: String?
     var attemptNumber: Int
 
+    // P005-OPS §6.5: Report and inspector additions
+    var isPinned: Bool = false
+    var displayRole: String?
+    var reportKind: String?           // "immutable_history" | "latest_summary"
+    var reportVersion: Int?
+    var supersedesArtifactID: UUID?
+
     @Relationship(inverse: \AgentExecution.artifacts)
     var agentExecution: AgentExecution?
 
@@ -38,4 +45,25 @@ import SwiftData
 
 enum ArtifactFormat: String, Codable {
     case json, markdown, diff, report
+}
+
+// MARK: - ArtifactFormat.detect (§7.3 — strict priority order)
+
+extension ArtifactFormat {
+    /// Detect format. Priority: explicit extension > contract.format > fallback.
+    /// `contract` is the resolved ArtifactContract from the agent catalog (if the agent has one).
+    static func detect(from name: String, contract: ArtifactContract?) -> ArtifactFormat {
+        // 1. File extension takes precedence
+        if name.hasSuffix(".json") { return .json }
+        if name.hasSuffix(".md") { return .markdown }
+        if name.hasSuffix(".diff") || name.hasSuffix(".patch") { return .diff }
+
+        // 2. If an output contract exists, use its declared format
+        if let contract {
+            return ArtifactFormat(rawValue: contract.format) ?? .json
+        }
+
+        // 3. Fallback: treat as report (generic structured output)
+        return .report
+    }
 }

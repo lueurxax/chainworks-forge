@@ -114,6 +114,7 @@ struct ResolvedAgent: Sendable {
     let id: String
     let title: String
     let mode: String
+    let backendProfileID: String?
     let provider: String
     let model: String
     let effort: String
@@ -127,6 +128,44 @@ struct ResolvedAgent: Sendable {
     let requiresHumanApproval: Bool
     let inputs: [String]
     let outputs: [String]
+
+    init(
+        id: String,
+        title: String,
+        mode: String,
+        backendProfileID: String? = nil,
+        provider: String,
+        model: String,
+        effort: String,
+        maxTurns: Int,
+        temperature: Double,
+        permissionProfile: String,
+        skillRef: String,
+        skillRole: String?,
+        prompt: String,
+        outputContract: String?,
+        requiresHumanApproval: Bool,
+        inputs: [String],
+        outputs: [String]
+    ) {
+        self.id = id
+        self.title = title
+        self.mode = mode
+        self.backendProfileID = backendProfileID
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+        self.maxTurns = maxTurns
+        self.temperature = temperature
+        self.permissionProfile = permissionProfile
+        self.skillRef = skillRef
+        self.skillRole = skillRole
+        self.prompt = prompt
+        self.outputContract = outputContract
+        self.requiresHumanApproval = requiresHumanApproval
+        self.inputs = inputs
+        self.outputs = outputs
+    }
 }
 
 // MARK: - Compilation Errors
@@ -135,6 +174,7 @@ enum CompilationError: Error, LocalizedError {
     case validationFailed([ValidationIssue])
     case agentNotFound(agentID: String, stateID: String)
     case backendProfileNotFound(profileID: String, agentID: String)
+    case circularTransitions(stateIDs: [String])
     case noInitialState
     case noEndState
     case unreachableStates([String])
@@ -151,6 +191,8 @@ enum CompilationError: Error, LocalizedError {
             return "Agent '\(agentID)' not found in catalog (referenced in state '\(stateID)')"
         case .backendProfileNotFound(let profileID, let agentID):
             return "Backend profile '\(profileID)' not found (agent '\(agentID)')"
+        case .circularTransitions(let stateIDs):
+            return "Circular transitions detected: \(stateIDs.joined(separator: " → "))"
         case .noInitialState:
             return "Workflow has no initial state"
         case .noEndState:

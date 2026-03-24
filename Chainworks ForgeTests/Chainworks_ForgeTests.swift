@@ -169,14 +169,6 @@ struct IdeaTests {
         #expect(idea.status == .draft)
         #expect(idea.runs.isEmpty)
     }
-
-    @Test func ideaWithoutWorkflow() throws {
-        let context = try makeContext()
-        let idea = Idea(title: "Test", body: "Body")
-        context.insert(idea)
-        // Idea intentionally does NOT carry workflowID
-        #expect(idea.runs.isEmpty)
-    }
 }
 
 @Suite("Run Model", .serialized)

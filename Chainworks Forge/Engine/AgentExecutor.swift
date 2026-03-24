@@ -53,6 +53,61 @@ struct AgentResult: Sendable {
     let succeeded: Bool
     /// Error message if execution failed.
     let errorMessage: String?
+    /// Provider session identifier (§6.1).
+    let sessionID: String?
+    /// Wall-clock duration of execution in seconds (§6.1).
+    let durationSeconds: Double
+}
+
+// MARK: - Output Contract Resolution
+
+enum OutputContractResolver {
+    static func expectedOutputs(for task: AgentTask, agent: ResolvedAgent) -> [String] {
+        task.outputs ?? agent.outputs
+    }
+
+    static func contractID(
+        for outputName: String,
+        agent: ResolvedAgent,
+        catalog: AgentCatalog?
+    ) -> String? {
+        if let explicit = agent.outputContract {
+            return explicit
+        }
+
+        switch outputName {
+        case "proposal_review_po", "proposal_review_ux", "proposal_review_ui", "proposal_review_architect":
+            return "proposal_review_v1"
+        case "proposal_review_summary":
+            return "proposal_review_summary_v1"
+        case "final_feature_report":
+            return "final_feature_report_v1"
+        default:
+            break
+        }
+
+        guard let catalog else { return nil }
+        if catalog.contracts[outputName] != nil {
+            return outputName
+        }
+        let versioned = "\(outputName)_v1"
+        if catalog.contracts[versioned] != nil {
+            return versioned
+        }
+        return nil
+    }
+
+    static func contract(
+        for outputName: String,
+        agent: ResolvedAgent,
+        catalog: AgentCatalog?
+    ) -> ArtifactContract? {
+        guard let catalog,
+              let contractID = contractID(for: outputName, agent: agent, catalog: catalog) else {
+            return nil
+        }
+        return catalog.contracts[contractID]
+    }
 }
 
 // MARK: - Execution Errors

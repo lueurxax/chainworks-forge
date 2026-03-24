@@ -1,7 +1,9 @@
 import Foundation
 
 /// Deterministic Goose transport used for Proposal 004 integration/UI proof without a real backend.
-final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
+/// Proposal 005: conforms to `GooseTransportProtocol` directly (no longer subclasses `GooseTransport`).
+/// LOCKED-004: Fixture mode is not touched — fixture transport continues to work unchanged behind the protocol.
+final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     enum Scenario {
         case proposalLoopSuccess
     }
@@ -10,29 +12,29 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
     private let stateQueue = DispatchQueue(label: "FixtureGooseTransport.state")
     private var sessionRequests: [String: GooseSessionRequest] = [:]
 
-    nonisolated override init(
-        baseURL: URL,
-        apiKey: String? = nil,
-        requestTimeout: TimeInterval = 300
-    ) {
-        self.scenario = .proposalLoopSuccess
-        super.init(baseURL: baseURL, apiKey: apiKey, requestTimeout: requestTimeout)
-    }
-
-    nonisolated init(scenario: Scenario, baseURL: URL) {
+    nonisolated init(scenario: Scenario = .proposalLoopSuccess) {
         self.scenario = scenario
-        super.init(baseURL: baseURL)
     }
 
-    override func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+    // MARK: - GooseTransportProtocol
+
+    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
         let sessionID = "fixture-\(UUID().uuidString.prefix(8))"
         stateQueue.sync {
             sessionRequests[sessionID] = request
         }
-        return GooseSessionResponse(sessionId: sessionID, status: "active")
+        return GooseSessionResponse(
+            sessionId: sessionID,
+            status: "active",
+            policyAcknowledgement: GoosePolicyAcknowledgement(
+                accepted: true,
+                capabilityToken: "fixture-read-only",
+                backendPolicyVersion: "fixture-v1"
+            )
+        )
     }
 
-    override func submitPrompt(
+    func submitPrompt(
         sessionID: String,
         prompt: GoosePromptRequest
     ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
@@ -49,11 +51,13 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
         }
     }
 
-    override func closeSession(sessionID: String) async throws {
+    func closeSession(sessionID: String) async throws {
         _ = stateQueue.sync {
             sessionRequests.removeValue(forKey: sessionID)
         }
     }
+
+    // MARK: - Private: Event Building
 
     private func buildEvents(
         sessionID: String,
@@ -89,7 +93,7 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
 
         return [
             .sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#),
-            .promptSubmitted(raw: #"{"task":"\#(taskName)"}"#),
+            .promptSubmitted(raw: #"{"task":"\#(taskName)","request_id":"fixture-request-\#(sessionID)"}"#),
             .toolCallStarted(toolName: "read_workspace", raw: "{}"),
             .toolCallFinished(toolName: "read_workspace", raw: "{}"),
             .textChunk(text: "Fixture backend executing \(taskName)..."),
@@ -97,6 +101,8 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
             .sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#)
         ]
     }
+
+    // MARK: - Private: Prompt Parsing
 
     private func parseTaskName(from prompt: String) -> String {
         guard let line = prompt
@@ -133,6 +139,8 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
         guard !path.isEmpty else { return nil }
         return URL(fileURLWithPath: path, isDirectory: true)
     }
+
+    // MARK: - Private: Fixture Output Writing
 
     private func writeFixtureOutputs(
         for taskName: String,
@@ -181,21 +189,28 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
             This proposal is ready for review and approval.
             """
         case "review_proposal_from_product_perspective":
-            return reviewerJSON(role: "product_owner", score: 9.4)
+            return reviewerJSON(agentID: agentID, role: "product_owner", score: 9.4)
         case "review_proposal_from_ux_perspective":
-            return reviewerJSON(role: "ux", score: 9.2)
+            return reviewerJSON(agentID: agentID, role: "ux", score: 9.2)
         case "review_proposal_from_ui_perspective":
-            return reviewerJSON(role: "ui", score: 9.1)
+            return reviewerJSON(agentID: agentID, role: "ui", score: 9.1)
         case "review_proposal_from_architecture_perspective":
-            return reviewerJSON(role: "architect", score: 9.3)
+            return reviewerJSON(agentID: agentID, role: "architect", score: 9.3)
         case "aggregate_proposal_reviews":
             return """
             {
+              "pass": true,
+              "average_score": 9.25,
               "aggregate_score": 9.25,
               "min_individual_score": 9.1,
               "blocker_count": 0,
-              "passes": true,
-              "summary": "Proposal passes the review target."
+              "summary": "Proposal passes the review target.",
+              "required_changes": [],
+              "recurring_themes": [
+                "Scope is clear",
+                "Approval context is strong"
+              ],
+              "decision": "proceed"
             }
             """
         default:
@@ -209,13 +224,27 @@ final class FixtureGooseTransport: GooseTransport, @unchecked Sendable {
         }
     }
 
-    private func reviewerJSON(role: String, score: Double) -> String {
+    private func reviewerJSON(agentID: String, role: String, score: Double) -> String {
         """
         {
+          "agent_id": "\(agentID)",
           "role": "\(role)",
           "score": \(score),
+          "decision": "approve_with_suggestions",
+          "verdict": "approve_with_suggestions",
+          "summary": "Looks good for the live proposal loop.",
+          "issues": [],
           "blocker_count": 0,
-          "summary": "Looks good for the live proposal loop."
+          "blocking_issues": [],
+          "non_blocking_issues": [
+            "Refine final polish before implementation."
+          ],
+          "suggestions": [
+            "Carry the approval summary into the completed run report."
+          ],
+          "assumptions": [
+            "The current app-facing live slice remains read-only."
+          ]
         }
         """
     }
