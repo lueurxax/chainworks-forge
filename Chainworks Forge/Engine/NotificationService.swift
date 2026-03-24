@@ -15,7 +15,7 @@ final class NotificationService {
     private(set) var isMenuBarEnabled: Bool = false
     private var preferences: NotificationPreferences
 
-    init(preferences: NotificationPreferences = .default) {
+    init(preferences: NotificationPreferences = .defaultPreferences) {
         self.preferences = preferences
     }
 

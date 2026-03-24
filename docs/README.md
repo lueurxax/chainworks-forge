@@ -1,63 +1,63 @@
 # Docs Index
 
-Repository documentation is organized by purpose:
+Repository documentation for Chainworks Forge.
 
-- `ps/` holds product/problem statements and MVP framing.
-- `proposals/` holds implementation proposals and delivery slices.
-- `reviews/` holds review outputs, evidence packs, and attached artifacts.
-- `research/` holds product vision notes, long-form architecture notes, investigations, and comparative analysis.
-- `reference/` holds implementation-oriented runtime contracts, state models, architecture decisions, and schema-level notes.
+## Organization
 
-Reading order:
+- `reference/` — implemented system documentation: architecture, runtime contracts, engine, transport, steward
+- `proposals/` — active proposals for features not yet implemented
+- `evidence/` — integration proof artifacts (live Goose connection, etc.)
+- `research/` — product vision, architecture investigations, comparative analysis
+- `ps/` — product/problem statements and MVP framing
 
-1. [research/chainworks_core_idea.md](research/chainworks_core_idea.md)
-2. [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md)
-3. [research/goose_swiftui_agent_architecture_research.md](research/goose_swiftui_agent_architecture_research.md)
-4. [reference/domain-model.md](reference/domain-model.md)
-5. [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md)
-6. [reference/architecture-decisions.md](reference/architecture-decisions.md)
-7. [reference/runtime-contract.md](reference/runtime-contract.md)
-8. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md)
-9. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md)
-10. [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md)
-11. [proposals/003-forge-steward-sdlc-health-and-adaptation.md](proposals/003-forge-steward-sdlc-health-and-adaptation.md)
-12. [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
-13. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
+## Reading Order
 
-Status:
+1. [research/chainworks_core_idea.md](research/chainworks_core_idea.md) — product vision
+2. [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md) — MVP problem statement
+3. [reference/domain-model.md](reference/domain-model.md) — persistence layer
+4. [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md) — YAML DSL
+5. [reference/architecture-decisions.md](reference/architecture-decisions.md) — AD log
+6. [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — execution engine
+7. [reference/runtime-contract.md](reference/runtime-contract.md) — runtime contracts
+8. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — live proposal loop
+9. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
+10. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
+11. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
+12. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
+13. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+
+## Status
 
 - Owner: single-engineer working repo
-- Last updated: 2026-03-23
-- State: active, foundation + core runtime engine implemented, live proposal-loop slice documented in reference, UI still inspection-first
+- Last updated: 2026-03-24
+- State: active — foundation, execution engine, live Goose transport, and Steward V1 implemented
 
 ## Reference (implemented)
 
-- [reference/domain-model.md](reference/domain-model.md) — SwiftData persistence layer, run/stage/agent state, approvals, artifacts, Steward records, provenance, drift detection
-- [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md) — YAML parsing, validation, compact workflow normalization, provenance hashing, verification scaffold UI
-- [reference/architecture-decisions.md](reference/architecture-decisions.md) — Key architecture decisions across foundation and runtime slices
-- [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model, execution and resume contracts
-- [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Implemented live proposal-loop slice, runtime boundary, app surfaces, and proof standard
-- [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — Worktree isolation risk analysis
-- [reference/README.md](reference/README.md) — Reference section overview
+See [reference/README.md](reference/README.md) for the full index. Key docs:
 
-## Product
+- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
+- [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
+- [reference/forge-steward.md](reference/forge-steward.md) — V1 observer: metrics, anomaly detection, cohorting, triggers
+- [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
+- [reference/domain-model.md](reference/domain-model.md) — SwiftData models and persistence
+- [reference/architecture-decisions.md](reference/architecture-decisions.md) — AD log
 
-- [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md) — MVP problem statement
+## Proposals (active, not yet implemented)
 
-## Proposals
+- [proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md](proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md) — multi-provider routing, settings, diagnostics
+- [proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) — worktrees, implementation loop, release, dogfooding
 
-- [proposals/002-workflow-execution-engine.md](proposals/002-workflow-execution-engine.md) — workflow execution engine slice
-- [proposals/003-forge-steward-sdlc-health-and-adaptation.md](proposals/003-forge-steward-sdlc-health-and-adaptation.md) — Steward analysis and adaptation slice
+## Evidence
 
-## Reviews
-
-- [reviews/001-proposal-002-gate.md](reviews/001-proposal-002-gate.md) — Go/no-go gate for Proposal 002
-- [reviews/002-workflow-execution-engine-review.md](reviews/002-workflow-execution-engine-review.md)
-- [reviews/002-workflow-execution-engine-evidence-pack.md](reviews/002-workflow-execution-engine-evidence-pack.md)
-- [reviews/003-forge-steward-sdlc-health-and-adaptation-review.md](reviews/003-forge-steward-sdlc-health-and-adaptation-review.md)
-- [reviews/003-forge-steward-sdlc-health-and-adaptation-evidence-pack.md](reviews/003-forge-steward-sdlc-health-and-adaptation-evidence-pack.md)
+- [evidence/goose-server-transport-verification.md](evidence/goose-server-transport-verification.md) -- Goose server transport verification record
+- [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON
 
 ## Research
 
 - [research/chainworks_core_idea.md](research/chainworks_core_idea.md)
 - [research/goose_swiftui_agent_architecture_research.md](research/goose_swiftui_agent_architecture_research.md)
+
+## Product
+
+- [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md) — MVP problem statement

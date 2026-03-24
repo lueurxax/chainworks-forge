@@ -6,18 +6,18 @@ It describes the current fixture-backed live runtime contract, the app surfaces 
 
 ## Status
 
-- State: implemented
+- State: implemented and proven against real Goose.app (2026-03-24)
 - Scope owner: current app runtime and UI shell
 - Backing workflow: `examples/workflows/proposal-loop-live.yaml`
-- Follow-on boundary: real network-backed Goose server transport belongs to Proposal 005
+- Live transport: GooseServerTransport (real goosed API) or FixtureGooseTransport (deterministic tests)
 
 ## Related Docs
 
 - [runtime-contract.md](runtime-contract.md)
 - [workspace-isolation-risk.md](workspace-isolation-risk.md)
 - [architecture-decisions.md](architecture-decisions.md)
-- [002-workflow-execution-engine.md](../proposals/002-workflow-execution-engine.md)
-- [005-goose-server-transport-adapter.md](../proposals/005-goose-server-transport-adapter.md)
+- [workflow-execution-engine.md](workflow-execution-engine.md)
+- [goose-server-transport.md](goose-server-transport.md)
 
 ## 1. Purpose
 
@@ -53,7 +53,6 @@ This slice proves the control-plane model without introducing writable repo side
 - code-writing stages
 - per-agent provider routing
 - ACP as the primary transport
-- the first real network-backed Goose server run
 
 ## 3. Runtime Shape
 
@@ -63,7 +62,7 @@ SwiftUI App
     -> WorkflowOrchestrator
       -> GooseAgentExecutor
         -> GooseSessionBridge
-          -> GooseTransport or FixtureGooseTransport
+          -> GooseServerTransport, GooseTransport, or FixtureGooseTransport
       -> ArtifactManager / ArtifactStorage
       -> Approval flow
 ```
@@ -266,18 +265,26 @@ Primary verification files:
 
 ## 9. Verification Standard
 
-The canonical proof standard for this slice is fixture-backed app evidence on current HEAD:
+The live slice is proven at two levels:
 
+**Fixture-backed proof:**
 - Start Run sheet launches the live slice from inside the app
-- run progress, approval, and stable outcome are reachable
-- artifact inspector opens proposal and receipt-style artifacts
-- at least one non-happy path is proven
-- waiting-approval restore is proven on relaunch
+- Run progress, approval, and stable outcome are reachable
+- Artifact inspector opens proposal and receipt-style artifacts
+- At least one non-happy path is proven
+- Waiting-approval restore is proven on relaunch
 
-This slice does not require the first real network-backed Goose run for sign-off. That handoff belongs to Proposal 005.
+**Real Goose proof (2026-03-24):**
+- `GooseServerTransport` connected to real Goose.app on `https://127.0.0.1:51200`
+- Session `20260324_28` created via `/agent/start` + `/agent/update_provider`
+- Prompt submitted, SSE response received: `CHAINWORKS_PROOF_OK`
+- Full `GooseAgentExecutor` pipeline executed with receipt generation
+- Evidence: `docs/evidence/live_goose_connection_proof.json`
+
+See [goose-server-transport.md](goose-server-transport.md) for transport details.
 
 ## 10. Follow-On Boundary
 
-This document stops at the implemented fixture-backed live runtime contract.
+This document covers the implemented live runtime contract for the proposal loop.
 
-Proposal 005 extends the system by replacing the fixture-backed transport proof with the first real Goose server adapter path. Later operator-shell, provider-settings, and delivery-slice proposals build on top of this baseline rather than redefining it.
+The transport layer supports both fixture-backed and real Goose server execution. Later operator-shell, provider-settings, and delivery-slice work builds on top of this baseline rather than redefining it.

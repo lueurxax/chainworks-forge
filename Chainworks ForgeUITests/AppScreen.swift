@@ -1,10 +1,18 @@
 import XCTest
 
 /// Page Object for the main app shell — tab navigation and bootstrap waiting.
+/// Uses `.windows.firstMatch` to scope queries and avoid multiple-window
+/// ambiguity caused by macOS scene restoration across test runs.
 struct AppScreen {
     let app: XCUIApplication
 
-    private static let knownTabLabels = ["Ideas", "Approvals", "Agent Catalog", "Workflow Inspector"]
+    private static let knownTabLabels = ["Runs Home", "Ideas", "Approvals", "Agent Catalog", "Workflow Inspector"]
+
+    /// The primary app window. macOS may restore previous windows from scene state,
+    /// so we always scope element queries to a single window to prevent ambiguity.
+    private var primaryWindow: XCUIElement {
+        app.windows.firstMatch
+    }
 
     /// Waits for the ContentView TabView to render by looking for a known tab label.
     /// macOS SwiftUI TabView renders tabs as radio buttons; in some environments
@@ -13,24 +21,27 @@ struct AppScreen {
     func waitForTabs(timeout: TimeInterval = 30) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
+            let win = primaryWindow
             for label in Self.knownTabLabels {
-                if app.radioButtons[label].exists { return true }
-                if app.tabs[label].exists { return true }
+                if win.radioButtons[label].exists { return true }
+                if win.tabs[label].exists { return true }
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
         return false
     }
 
-    /// Finds a tab by label. Tries radioButtons, tabs, buttons, then predicate fallback.
+    /// Finds a tab by label scoped to the primary window.
+    /// Tries radioButtons, tabs, buttons, then predicate fallback.
     func tab(_ label: String) -> XCUIElement {
-        let radio = app.radioButtons[label]
+        let win = primaryWindow
+        let radio = win.radioButtons[label]
         if radio.exists { return radio }
-        let t = app.tabs[label]
+        let t = win.tabs[label]
         if t.exists { return t }
-        let btn = app.buttons[label]
+        let btn = win.buttons[label]
         if btn.exists { return btn }
-        return app.buttons[label].firstMatch
+        return win.buttons[label].firstMatch
     }
 
     @discardableResult

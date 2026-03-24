@@ -10,6 +10,7 @@ import SwiftUI
 struct RecoverySheet: View {
     let run: Run
     @Environment(\.modelContext) private var modelContext
+    @Environment(ExecutionService.self) private var executionService
     @Environment(\.dismiss) private var dismiss
     @State private var recoveryContext: RecoveryContext?
     @State private var isExecuting = false
@@ -19,26 +20,22 @@ struct RecoverySheet: View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 16) {
                 if let context = recoveryContext {
-                    // Reason
                     GroupBox("Blocked Reason") {
                         Text(context.reason)
                             .font(.body)
                     }
 
-                    // Most recent stage
                     GroupBox("Most Recent Stage") {
                         Text(context.mostRecentStage)
                             .font(.headline)
                     }
 
-                    // Trust / provenance summary
                     GroupBox("Runtime Trust") {
                         RuntimeProvenanceBadge(trustLevel: context.trustSummary)
                     }
 
                     Divider()
 
-                    // Suggested action
                     if let suggested = context.suggestedAction {
                         GroupBox("Suggested Action") {
                             HStack {
@@ -62,7 +59,6 @@ struct RecoverySheet: View {
                         }
                     }
 
-                    // All allowed actions
                     GroupBox("All Available Actions") {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(context.allowedActions) { action in
@@ -81,7 +77,6 @@ struct RecoverySheet: View {
                         }
                     }
 
-                    // Error message
                     if let error = errorMessage {
                         Text(error)
                             .font(.caption)
@@ -120,17 +115,66 @@ struct RecoverySheet: View {
             switch action {
             case .retryAgent(let stageID, let agentID):
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
+                dismiss()
+
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
+                dismiss()
+
             case .resumeFromApprovalGate(let stageID):
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
+                dismiss()
+
             case .cloneRunFrozenSnapshot:
-                // Needs compiler — simplified for now
-                errorMessage = "Clone requires RunPlanCompiler. Use from Run context."
+                guard let idea = run.idea else {
+                    errorMessage = "No idea associated with this run"
+                    break
+                }
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                let clone = try coordinator.cloneRunFrozenSnapshot(
+                    original: run,
+                    idea: idea,
+                    compiler: compiler
+                )
+                // Start the cloned run
+                let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: clone)
+                executionService.startRun(run: clone, plan: plan, workspace: workspace)
+                dismiss()
+
             case .cloneRunCurrentConfig:
-                errorMessage = "Clone requires workflow + catalog. Use from Run context."
-            }
-            if errorMessage == nil {
+                guard let idea = run.idea else {
+                    errorMessage = "No idea associated with this run"
+                    break
+                }
+                guard let catalog = executionService.catalog else {
+                    errorMessage = "No agent catalog available"
+                    break
+                }
+                // Load workflow from source path
+                guard let workflow = try? YAMLParser.loadWorkflow(
+                    from: URL(fileURLWithPath: run.workflowSourcePath)
+                ) else {
+                    errorMessage = "Cannot load workflow from \(run.workflowSourcePath)"
+                    break
+                }
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                let clone = try coordinator.cloneRunCurrentConfig(
+                    original: run,
+                    idea: idea,
+                    workflow: workflow,
+                    catalog: catalog,
+                    compiler: compiler,
+                    workflowSourcePath: run.workflowSourcePath,
+                    catalogSourcePath: run.catalogSourcePath
+                )
+                let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+                let (_, workspace) = try compiler.createRun(
+                    for: idea,
+                    plan: plan,
+                    workflowSourcePath: run.workflowSourcePath,
+                    catalogSourcePath: run.catalogSourcePath
+                )
+                executionService.startRun(run: clone, plan: plan, workspace: workspace)
                 dismiss()
             }
         } catch {

@@ -1100,7 +1100,7 @@ struct WorkflowRunProgressView: View {
             WorkflowStageDetailView(stageExecution: stage, run: run)
         }
         .sheet(item: $selectedArtifact) { artifact in
-            WorkflowArtifactInspectorView(run: run, artifact: artifact)
+            ArtifactInspectorView(artifact: artifact, run: run)
         }
     }
 
@@ -1214,7 +1214,7 @@ struct WorkflowStageDetailView: View {
         .frame(minWidth: 560, minHeight: 420)
         .accessibilityIdentifier("stage-detail-view")
         .sheet(item: $selectedArtifact) { artifact in
-            WorkflowArtifactInspectorView(run: run, artifact: artifact)
+            ArtifactInspectorView(artifact: artifact, run: run)
         }
     }
 }

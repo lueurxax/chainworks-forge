@@ -11,7 +11,7 @@ struct NotificationPreferences: Codable, Sendable {
     var runCompleted: Bool
     var menuBarEnabled: Bool
 
-    static let `default` = NotificationPreferences(
+    nonisolated static let defaultPreferences = NotificationPreferences(
         approvalRequired: true,
         runBlocked: true,
         runFailed: true,
@@ -32,7 +32,7 @@ struct NotificationPreferences: Codable, Sendable {
     static func load() -> NotificationPreferences {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let prefs = try? JSONDecoder().decode(NotificationPreferences.self, from: data) else {
-            return .default
+            return .defaultPreferences
         }
         return prefs
     }

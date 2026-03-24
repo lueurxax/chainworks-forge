@@ -70,6 +70,25 @@ That means:
 - provider/platform/settings/diagnostics surfaces from Proposal 006 stay valid,
 - Proposal 007 is about **using those surfaces to complete the first full delivery path**, not replacing them.
 
+### 1.1 Explicit handoff from Proposal 006
+
+Nothing provider/platform-specific was removed from Proposal 006.
+But Proposal 006 deliberately stops at provider readiness for the current control-plane baseline.
+Any capability that becomes repo-backed, writable, release-aware, or delivery-specific is owned here in Proposal 007.
+
+That handoff includes:
+- repo-backed start presets built on top of Proposal 006 provider/settings resolution,
+- delivery-specific preflight that extends Proposal 006 with repo identity, branch, worktree, git auth, and release-target checks,
+- repository profile and target-repository selection for dogfood runs,
+- writable worktree provisioning and recovery semantics,
+- release-target configuration and release-gate context,
+- repo-backed evidence/support export for full delivery runs.
+
+Rule of thumb:
+
+> If a feature can be completed without touching a real repository or release target, it belongs in Proposal 006.
+> If it requires a writable repo, a dedicated worktree, commit/push, archive/upload, or delivery-specific recovery, it belongs in Proposal 007.
+
 ---
 
 ## 2. Product question this proposal must answer
@@ -164,6 +183,12 @@ Two tightly scoped layers.
 4. Manual release gating with deterministic side-effect services.
 
 5. A dogfooding-ready workflow preset and evidence export.
+
+6. Repo-backed extensions of Proposal 006 surfaces, specifically:
+   - delivery preflight in addition to provider preflight,
+   - repo/profile selection for full runs,
+   - release-target selection and release-context summaries,
+   - dogfood-oriented onboarding for the first full repository-backed session.
 
 ### Out of scope
 
@@ -623,6 +648,23 @@ enum ReleaseMode: String, Codable {
 
 Production is intentionally excluded from the initial dogfood slice.
 
+## 9.6 Delivery preflight extends Proposal 006
+
+Proposal 006 owns provider/platform diagnostics.
+Proposal 007 must add the missing delivery checks before a repo-backed run can cross into implementation or release.
+
+At minimum, delivery preflight must verify:
+- target repository identity and expected root,
+- selected base branch exists,
+- worktree base path is writable and inside the configured allowed root,
+- git auth/push target is usable for the selected branch,
+- selected release target is valid for the chosen `ReleaseMode`,
+- no repo-safety contract violation exists between the run and the chosen repository.
+
+This is intentionally an extension of Proposal 006, not a replacement for it:
+- provider health remains Proposal 006 territory,
+- repo/release readiness becomes Proposal 007 territory.
+
 ---
 
 ## 10. UI surfaces
@@ -640,6 +682,10 @@ Required inputs:
 - release mode: sandbox or staging
 - provider binding summary (already available from Proposal 006)
 - preflight summary
+
+This surface is the point where Proposal 006 hands off to Proposal 007 in the UI:
+- provider settings and provider diagnostics come from Proposal 006,
+- repo target, release target, and delivery safety context are added here by Proposal 007.
 
 Suggested summary block:
 

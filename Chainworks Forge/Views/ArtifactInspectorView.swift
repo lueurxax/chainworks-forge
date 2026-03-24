@@ -27,6 +27,7 @@ struct ArtifactInspectorView: View {
                     VStack(alignment: .leading) {
                         Text(artifact.name)
                             .font(.title2)
+                            .accessibilityIdentifier("artifact-inspector-title")
                         Text(artifact.format.rawValue.uppercased())
                             .font(.caption)
                             .padding(.horizontal, 6)
@@ -77,6 +78,8 @@ struct ArtifactInspectorView: View {
             }
             .padding()
         }
+        .frame(minWidth: 640, minHeight: 480)
+        .accessibilityIdentifier("artifact-inspector-view")
         .navigationTitle("Artifact Inspector")
         .task {
             content = try? String(contentsOfFile: artifact.filePath, encoding: .utf8)

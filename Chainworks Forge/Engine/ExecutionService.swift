@@ -99,14 +99,16 @@ final class ExecutionService {
         catalog: AgentCatalog? = nil,
         stewardConfig: StewardConfig? = nil,
         liveRuntimeConfiguration: LiveRuntimeConfiguration? = nil,
-        notificationService: NotificationService = NotificationService()
+        notificationService: NotificationService? = nil
     ) {
         self.modelContext = modelContext
         self.executor = executor
         self.catalog = catalog
         self.stewardConfig = stewardConfig
         self.liveRuntimeConfiguration = liveRuntimeConfiguration
-        self.notificationService = notificationService
+        self.notificationService = notificationService ?? MainActor.assumeIsolated {
+            NotificationService()
+        }
     }
 
     // MARK: - Start Run
@@ -137,6 +139,10 @@ final class ExecutionService {
         // Wire up approval callback
         orchestrator.onApprovalRequest = { [weak self] request in
             self?.pendingApprovals[request.id] = request
+            // P005-OPS §10: Fire approval-required notification and update dock badge
+            let stageLabel = run.stageExecutions.first(where: { $0.stageID == request.stageID })?.label ?? request.stageID
+            self?.notificationService.notifyApprovalRequired(run: run, stageLabel: stageLabel)
+            self?.refreshDockBadge()
         }
 
         // Wire up completion callback
@@ -144,6 +150,13 @@ final class ExecutionService {
             self?.activeOrchestrators.removeValue(forKey: run.id)
             // Clean up any pending approvals for this run
             self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
+
+            // P005-OPS §6: Emit report on stable checkpoint
+            self?.emitReportIfNeeded(for: run)
+
+            // P005-OPS §10: Fire notifications
+            self?.fireCompletionNotification(for: run)
+
             // Steward V1: post-run hook trigger
             if run.status == .completed {
                 self?.notifyRunCompleted()
@@ -186,11 +199,17 @@ final class ExecutionService {
 
                     orchestrator.onApprovalRequest = { [weak self] request in
                         self?.pendingApprovals[request.id] = request
+                        // P005-OPS §10: Fire approval notification + badge on resume path too
+                        let stageLabel = run.stageExecutions.first(where: { $0.stageID == request.stageID })?.label ?? request.stageID
+                        self?.notificationService.notifyApprovalRequired(run: run, stageLabel: stageLabel)
+                        self?.refreshDockBadge()
                     }
 
                     orchestrator.onComplete = { [weak self] _ in
                         self?.activeOrchestrators.removeValue(forKey: run.id)
                         self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
+                        self?.emitReportIfNeeded(for: run)
+                        self?.fireCompletionNotification(for: run)
                     }
 
                     activeOrchestrators[run.id] = orchestrator
@@ -399,5 +418,44 @@ final class ExecutionService {
             configChangeAnalysisScheduled = true
             print("[Steward] Config change detected (steward: \(lastAnalysis.stewardConfigSnapshotHash != currentStewardHash), catalog: \(lastAnalysis.workflowCatalogSnapshotHash != currentCatalogHash)). Scheduling analysis after next completed run.")
         }
+    }
+
+    // MARK: - P005-OPS Report & Notification Hooks
+
+    /// Emit an immutable report if the run is at a stable checkpoint (§6.3).
+    private func emitReportIfNeeded(for run: Run) {
+        if reportBuilder == nil {
+            reportBuilder = RunReportBuilder(modelContext: modelContext)
+        }
+        guard let builder = reportBuilder, builder.shouldEmitReport(for: run) else { return }
+        do {
+            _ = try builder.emitReport(for: run)
+        } catch {
+            print("[P005-OPS] Report emission failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Fire the appropriate notification for a run status change (§10).
+    private func fireCompletionNotification(for run: Run) {
+        switch run.status {
+        case .completed:
+            notificationService.notifyRunCompleted(run: run)
+        case .failed:
+            notificationService.notifyRunFailed(run: run)
+        case .blocked:
+            notificationService.notifyRunBlocked(run: run, reason: run.driftDetails ?? "Unknown")
+        default:
+            break
+        }
+        refreshDockBadge()
+    }
+
+    /// Refresh dock badge based on current run states (§10).
+    func refreshDockBadge() {
+        let descriptor = FetchDescriptor<Run>()
+        let allRuns = (try? modelContext.fetch(descriptor)) ?? []
+        let waitingApproval = allRuns.filter { $0.status == .waitingApproval }.count
+        let blocked = allRuns.filter { $0.status == .blocked }.count
+        notificationService.updateDockBadge(waitingApprovalCount: waitingApproval, blockedCount: blocked)
     }
 }

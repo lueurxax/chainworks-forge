@@ -6,7 +6,7 @@ Run reports, recovery, comparison, notifications, and artifact ergonomics for th
 | Field | Value |
 |---|---|
 | Date | 2026-03-24 |
-| Status | Draft |
+| Status | Implemented |
 | Author | Engineer (single-engineer project) |
 | Proposal Alias | `P005-OPS` |
 | Depends on | Proposal 001, Proposal 002, Proposal 003, [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [005-goose-server-transport-adapter.md](005-goose-server-transport-adapter.md) |
@@ -415,57 +415,57 @@ Chainworks Forge/
 
 ### Runs Home
 
-- [ ] `RunsHomeView` is the primary operator landing surface
-- [ ] Runs are grouped into `Waiting Approval`, `Blocked`, `Running`, and `Recently Completed`
-- [ ] Each row shows current stage, elapsed time, cost, attention level, and runtime trust/provenance
-- [ ] No row shows an action that cannot be executed from that row
+- [x] `RunsHomeView` is the primary operator landing surface
+- [x] Runs are grouped into `Waiting Approval`, `Blocked`, `Running`, and `Recently Completed`
+- [x] Each row shows current stage, elapsed time, cost, attention level, and runtime trust/provenance
+- [x] No row shows an action that cannot be executed from that row
 
 ### Reports
 
-- [ ] Every stable checkpoint emits immutable `run_report_v{n}.md/json`
-- [ ] Latest summary artifacts exist separately from immutable history
-- [ ] Recovery never overwrites a historical report
-- [ ] Reports include runtime trust/provenance and drift notes
+- [x] Every stable checkpoint emits immutable `run_report_v{n}.md/json`
+- [x] Latest summary artifacts exist separately from immutable history
+- [x] Recovery never overwrites a historical report
+- [x] Reports include runtime trust/provenance and drift notes
 
 ### Recovery
 
-- [ ] Proposal-loop read-only runs support retry/re-arm/clone actions defined in this proposal
-- [ ] Recovery UI only exposes actions allowed for the current run type
-- [ ] No repo-write, release, or publish recovery is implemented here
+- [x] Proposal-loop read-only runs support retry/re-arm/clone actions defined in this proposal
+- [x] Recovery UI only exposes actions allowed for the current run type
+- [x] No repo-write, release, or publish recovery is implemented here
 
 ### Comparison
 
-- [ ] Operator can compare compatible proposal-loop runs in the UI
-- [ ] Comparison shows snapshot, timing, cost, approval, and trust deltas
-- [ ] Comparison does not claim repo-backed or release-specific diff support
+- [x] Operator can compare compatible proposal-loop runs in the UI
+- [x] Comparison shows snapshot, timing, cost, approval, and trust deltas
+- [x] Comparison does not claim repo-backed or release-specific diff support
 
 ### Artifact Inspector V2
 
-- [ ] Inspector renders markdown, JSON, diff, and text
-- [ ] Inspector shows provenance, attempt metadata, and runtime trust level
-- [ ] Inspector supports produced-by / consumed-by traceability
-- [ ] Inspector supports pin / unpin and reveal-on-disk
+- [x] Inspector renders markdown, JSON, diff, and text
+- [x] Inspector shows provenance, attempt metadata, and runtime trust level
+- [x] Inspector supports produced-by / consumed-by traceability
+- [x] Inspector supports pin / unpin and reveal-on-disk
 
 ### Notifications
 
-- [ ] Local notifications fire for approval, blocked, failed, and completed
-- [ ] Dock badge reflects runs requiring attention
-- [ ] Menu bar extra is optional but supported
+- [x] Local notifications fire for approval, blocked, failed, and completed
+- [x] Dock badge reflects runs requiring attention
+- [x] Menu bar extra is optional but supported
 
 ### Sequential implementation gates
 
-- [ ] No Proposal 001 / 002 / 003 / 004 runtime or UI tests regress
-- [ ] The targeted live/recovery baseline from Proposal 004 and `P005-TRANSPORT` compiles and passes before `P005-OPS` implementation starts
-- [ ] `xcodebuild build && xcodebuild test` is green before sign-off
+- [x] No Proposal 001 / 002 / 003 / 004 runtime or UI tests regress
+- [x] The targeted live/recovery baseline from Proposal 004 and `P005-TRANSPORT` compiles and passes before `P005-OPS` implementation starts
+- [x] `xcodebuild build && xcodebuild test` is green before sign-off
 
 ### Product checkpoint (`PROD-PA-005-OPS`)
 
-- [ ] One engineer can leave the app, return later, and understand in under 30 seconds:
+- [x] One engineer can leave the app, return later, and understand in under 30 seconds:
   - what happened,
   - what needs attention,
   - what trust level the run has,
   - and what safe action is available.
-- [ ] One engineer can recover a proposal-loop blocked or failed run without touching raw files or database state.
+- [x] One engineer can recover a proposal-loop blocked or failed run without touching raw files or database state.
 
 ## 13. What is explicitly not in scope
 

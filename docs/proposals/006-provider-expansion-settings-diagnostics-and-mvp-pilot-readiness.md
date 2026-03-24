@@ -5,7 +5,7 @@
 | Date | 2026-03-23 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposal 001, Proposal 002, Proposal 003, [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [005-goose-server-transport-adapter.md](005-goose-server-transport-adapter.md), [005-operator-experience-reports-recovery-and-run-comparison.md](005-operator-experience-reports-recovery-and-run-comparison.md) |
+| Depends on | Proposal 001, Proposal 002, Proposal 003, [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [goose-server-transport.md](../reference/goose-server-transport.md), [005-operator-experience-reports-recovery-and-run-comparison.md](005-operator-experience-reports-recovery-and-run-comparison.md) |
 | Goal | Expand the runtime from the fixed MVP provider pair to a real multi-provider surface, add the settings/diagnostics needed to operate it, and make the product ready to be exercised in a serious MVP pilot. |
 
 ---
@@ -20,7 +20,7 @@ At this point in the roadmap:
 - Proposal 002 created the execution engine but explicitly deferred real provider integration, multi-provider routing, settings, and richer provider/runtime concerns.
 - Proposal 003 remains adjacent meta-layer work, not the provider/runtime baseline owner.
 - [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md) delivered the first real live proposal-loop slice, but intentionally stayed read-only and proposal-only.
-- [005-goose-server-transport-adapter.md](005-goose-server-transport-adapter.md) is the transport follow-on that connects the live slice to a real Goose server runtime.
+- [goose-server-transport.md](../reference/goose-server-transport.md) is the implemented transport layer that connects the live slice to a real Goose server runtime.
 - [005-operator-experience-reports-recovery-and-run-comparison.md](005-operator-experience-reports-recovery-and-run-comparison.md) made the current baseline calmer to operate, but did not add repo-backed implementation/release capability.
 
 What is still missing before the MVP feels alive “in the wild” is the messy but essential layer around providers:
@@ -69,7 +69,7 @@ The repo-backed end-to-end dogfood path still belongs to Proposal 007.
 | **Provider Registry** | Canonical registry of installed/configured providers and their capabilities |
 | **Provider Adapter Layer** | Concrete adapters for supported provider families behind the existing execution boundary |
 | **Backend Profile Resolver V2** | Resolve catalog backend profiles against real installed/configured providers |
-| **App Configuration Store** | Persist workspace roots, YAML paths, worktree base path, and active configuration source across relaunch |
+| **App Configuration Store** | Persist the run-storage base path, YAML paths, worktree base path, and active configuration source across relaunch |
 | **Secrets & Settings Store** | Persist provider settings locally and secrets in Keychain |
 | **Diagnostics & Preflight Service** | Verify providers, binaries, auth, model availability, YAML paths, workspace roots, and permissions before run start |
 | **Run Start Overrides** | Optional operator-selected overrides for provider/model/effort at run creation time |
@@ -99,7 +99,7 @@ The operator sees:
 - model,
 - effort,
 - capabilities,
-- verification status.
+- current verification status.
 
 ### 4.1 V1 recommendation
 
@@ -122,7 +122,7 @@ The Provider Registry is the single runtime source of truth for:
 - which provider families are available,
 - which installations/accounts are configured,
 - what capabilities each one supports,
-- and whether the configuration is currently healthy.
+- and the latest derived health for each configured provider.
 
 ### 5.2 Core model
 
@@ -135,7 +135,6 @@ struct ConfiguredProvider: Identifiable, Codable {
     let endpoint: String?
     let authMode: ProviderAuthMode
     let defaultModel: String?
-    let status: ProviderStatus
     let capabilities: ProviderCapabilities
     let adapterVersion: String
 }
@@ -158,9 +157,39 @@ enum ProviderStatus: String, Codable {
     case degraded
     case unavailable
 }
+
+struct ProviderHealthSnapshot: Codable {
+    let providerID: UUID
+    let status: ProviderStatus
+    let checkedAt: Date
+    let summary: String
+    let blockingIssues: [String]
+}
 ```
 
-### 5.3 Capability model
+`ConfiguredProvider` is durable configuration.
+`ProviderHealthSnapshot` is derived runtime state produced by diagnostics.
+Proposal 006 does not persist provider health as canonical truth in `ProviderSettingsStore`.
+
+### 5.3 Health ownership and refresh contract
+
+Health belongs to the runtime diagnostics layer, not to the durable settings store.
+
+- `ProviderSettingsStore` persists configured providers, preferences, and operator intent.
+- `ProviderRegistry` exposes the current in-memory provider inventory plus the most recent `ProviderHealthSnapshot` values.
+- `ProviderDiagnosticService` refreshes provider health:
+  - on app launch,
+  - on explicit diagnostics runs,
+  - before preflight-backed run start,
+  - and after provider settings change.
+
+UI surfaces must treat health as time-sensitive:
+
+- Settings surfaces show the latest derived status plus `checkedAt`.
+- Relaunch starts with health marked stale until diagnostics refreshes it.
+- Preflight and Pilot Readiness read current health from diagnostics output, not from persisted provider configuration.
+
+### 5.4 Capability model
 
 ```swift
 struct ProviderCapabilities: Codable {
@@ -180,7 +209,7 @@ Capabilities are used in:
 - run-start warnings,
 - and adapter behavior.
 
-### 5.4 Migration and precedence contract
+### 5.5 Migration and precedence contract
 
 Proposal 006 must collapse the current split truth between env-driven runtime bootstrap and the new in-app provider registry.
 
@@ -193,7 +222,7 @@ Resolution rules:
 3. First-run seeding happens only when persisted settings are absent.
 4. Persisted settings do not get silently replaced on every launch by environment variables.
 5. Development override requires an explicit flag such as `CHAINWORKS_ALLOW_ENV_OVERRIDE=1`.
-6. Diagnostics and preflight must show the active configuration source:
+6. Diagnostics and preflight must show the active configuration source using the serialized `ConfigurationSource` values:
    - `persisted_settings`
    - `seeded_from_env`
    - `development_env_override`
@@ -339,8 +368,7 @@ Secrets remain in Keychain only.
 
 ```swift
 struct AppConfiguration: Codable {
-    var workspaceRootPath: String
-    var artifactBasePath: String
+    var runStorageBasePath: String
     var worktreeBasePath: String?
     var workflowSourcePath: String
     var agentCatalogSourcePath: String
@@ -349,11 +377,23 @@ struct AppConfiguration: Codable {
 }
 
 enum ConfigurationSource: String, Codable {
-    case persistedSettings
-    case seededFromEnv
-    case developmentEnvOverride
+    case persistedSettings = "persisted_settings"
+    case seededFromEnv = "seeded_from_env"
+    case developmentEnvOverride = "development_env_override"
 }
 ```
+
+These raw values are the canonical wire/storage representation.
+If the UI needs friendlier labels, it must map from these serialized values rather than invent a second on-wire vocabulary.
+
+`runStorageBasePath` is the parent directory for per-run workspaces.
+Proposal 006 keeps the existing workspace contract intact:
+
+- `workspaceRoot = {runStorageBasePath}/{runID}`
+- `artifactRoot = {workspaceRoot}/artifacts`
+
+Proposal 006 does not introduce a second operator-selected artifact root.
+Preflight, support bundles, and support tooling must reason from this derived path shape.
 
 This model is owned by:
 
@@ -379,6 +419,9 @@ struct ProviderSettings: Codable {
     var runStartRequiresCleanPreflight: Bool
 }
 ```
+
+`ProviderSettingsStore` persists only durable settings.
+Current provider health is re-derived at runtime and is not stored here as authoritative state.
 
 ### 8.4 Secrets
 
@@ -409,6 +452,7 @@ Payload shape:
 
 ```swift
 struct ExportableSettingsPackage: Codable {
+    var transferSchemaVersion: Int
     var appConfiguration: AppConfiguration
     var providerSettings: ProviderSettings
     var exportedAt: Date
@@ -417,11 +461,18 @@ struct ExportableSettingsPackage: Codable {
 }
 ```
 
+`transferSchemaVersion` is the compatibility key for import/export.
+`appVersion` is product metadata only and must not be used as the payload compatibility decision.
+
 Rules:
 
 - secrets are never exported,
+- import validates `transferSchemaVersion` before reading deeper payload fields,
+- newer unsupported schema versions fail closed with an upgrade-required error,
+- older but still supported schema versions are migrated explicitly inside `SettingsTransferService`,
+- unsupported older schema versions fail with a remediation message rather than partial import,
 - exported provider entries that require secrets include placeholders only,
-- import validates file version, required paths, provider families, and placeholder completeness,
+- import validates `transferSchemaVersion`, required paths, provider families, and placeholder completeness,
 - import never overwrites secrets silently,
 - import produces an actionable remediation list for missing credentials.
 
@@ -479,8 +530,9 @@ The operator should find out *before* hitting Start Run that:
    - selected/default models resolvable
 
 3. **Workspace**
-   - workspace root exists
-   - artifact root writable
+   - run storage base path exists
+   - derived workspace root can be provisioned
+   - derived artifact root is writable
    - worktree base path valid
 
 4. **Permissions**
@@ -615,6 +667,7 @@ Produces a zip containing:
 #### Pilot Readiness Screen
 One place to see:
 - provider health,
+- provider health freshness,
 - YAML health,
 - workspace health,
 - active configuration source,
@@ -636,6 +689,7 @@ Chainworks Forge/
     ProviderSettings.swift                ← NEW
     ProviderSettingsStore.swift           ← NEW
     ProviderRegistry.swift                ← NEW
+    ProviderHealthSnapshot.swift          ← NEW
     ProviderCapabilities.swift            ← NEW
     ProviderAdapter.swift                 ← NEW
     CodexProviderAdapter.swift            ← NEW
@@ -681,8 +735,9 @@ Chainworks Forge/
 - [ ] Provider binding is frozen into the run snapshot at start time
 
 ### Settings & secrets
-- [ ] `AppConfiguration` persists workspace root, YAML paths, and worktree base path across relaunch
+- [ ] `AppConfiguration` persists the run-storage base path, YAML paths, and worktree base path across relaunch
 - [ ] Non-secret provider settings persist across relaunch
+- [ ] Provider health is refreshed as derived runtime state and is not treated as persisted truth across relaunch
 - [ ] Secrets are stored in Keychain, not in YAML or plain app storage
 - [ ] Settings export/import exists as a dedicated path and excludes secrets cleanly
 - [ ] Diagnostics and preflight show the active configuration source
@@ -710,7 +765,7 @@ Chainworks Forge/
 - [ ] Operator can diagnose provider failure without opening source code
 
 ### General
-- [ ] No regressions in Proposal 001, Proposal 002, Proposal 003, [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [005-goose-server-transport-adapter.md](005-goose-server-transport-adapter.md), and [005-operator-experience-reports-recovery-and-run-comparison.md](005-operator-experience-reports-recovery-and-run-comparison.md)
+- [ ] No regressions in Proposal 001, Proposal 002, Proposal 003, [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [goose-server-transport.md](../reference/goose-server-transport.md), and [005-operator-experience-reports-recovery-and-run-comparison.md](005-operator-experience-reports-recovery-and-run-comparison.md)
 - [ ] `xcodebuild build && xcodebuild test` green
 
 ### Product checkpoint (PROD-PA-006)
@@ -746,6 +801,8 @@ Chainworks Forge/
 | ARCH-067 | `AppConfigurationStore` plus `ProviderSettingsStore` become the canonical runtime source of truth | Avoid split configuration truth between env vars and in-app settings |
 | ARCH-068 | Environment variables are seeding or explicit dev override inputs only | Preserve developer ergonomics without silent runtime drift |
 | ARCH-069 | Proposal 006 pilot readiness is provider/platform readiness, not repo-backed delivery readiness | Keep Proposal 007 as the owner of writable implementation/release flows |
+| ARCH-070 | Proposal 006 preserves the existing run workspace contract: `{runStorageBasePath}/{runID}/artifacts` | Avoid split artifact roots and keep storage semantics consistent with the current engine |
+| ARCH-071 | Provider health is derived runtime state owned by diagnostics, not persisted provider configuration | Prevent stale health from becoming trusted configuration after relaunch |
 
 ---
 
