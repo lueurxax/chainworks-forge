@@ -7,16 +7,23 @@
 | Author | Engineer (single-engineer project) |
 | Depends on | None (internal quality improvement, orthogonal to feature proposals) |
 | Adjacent work | [008-mvp-hardening-and-sign-off.md](008-mvp-hardening-and-sign-off.md) (sign-off evidence includes test health) |
-| Goal | Migrate 19 XCTest-based unit test files to Swift Testing, eliminate assertion and setup boilerplate through parameterized tests and struct-based suites, and upgrade shared test infrastructure to support both frameworks during the transition. |
+| Goal | Migrate 17 XCTest-based unit test files to Swift Testing, eliminate assertion and setup boilerplate through parameterized tests and struct-based suites, upgrade shared test infrastructure (2 helper files) to support both frameworks during the transition, and introduce Xcode Test Plans as the tag-driven gate mechanism. |
 
 ---
 
 ## 1. Context
 
-The Chainworks Forge test suite currently contains 21 test files (~9,100 lines):
+The Chainworks Forge unit test target (`Chainworks ForgeTests/`) currently contains 20 Swift files:
 
-- 20 unit test files (19 XCTest, 1 Swift Testing)
-- 1 UI test file (XCUITest)
+| Category | Count | Files |
+|---|---|---|
+| Executable XCTest unit tests | 17 | `ArtifactManagerTests`, `ArtifactValidationTests`, `EndToEndTests`, `GooseAgentExecutorTests`, `GooseServerLiveIntegrationTests`, `GooseServerTransportTests`, `GooseSessionBridgeTests`, `GooseStreamEventMapperTests`, `LiveGooseConnectionProofTests`, `LiveProposalWorkflowTests`, `OrchestratorTests`, `ProviderPlatformTests`, `ResumeManagerTests`, `RunPlanCompilerTests`, `SimulatedAgentExecutorTests`, `TransitionEvaluatorTests`, `WorkspaceIsolationTests` |
+| Executable Swift Testing unit tests | 1 | `Chainworks_ForgeTests` |
+| Shared helper files (not executable tests) | 2 | `TestSupport`, `SharedMocks` |
+
+A separate UI test target (`Chainworks ForgeUITests/`) contains 1 XCUITest file.
+
+Total across both targets: 21 files (~9,100 lines).
 
 The project already targets macOS 26.2, builds with Xcode 16+, and uses Swift 5.
 Full Swift Testing support has been available since Xcode 16 (WWDC 2024).
@@ -26,19 +33,30 @@ Apple's current guidance is explicit:
 > Continue to use XCTest for user interface tests and performance tests."
 
 One file (`Chainworks_ForgeTests.swift`) already uses Swift Testing with `@Suite`, `@Test`, `#expect`, and `#require`.
-The remaining 19 unit test files still use `XCTestCase`, `XCTAssert*`, `override func setUp()`, and `override func tearDown()`.
+The remaining 17 executable XCTest unit test files still use `XCTestCase`, `XCTAssert*`, `override func setUp()`, and `override func tearDown()`.
+The 2 helper files (`TestSupport.swift`, `SharedMocks.swift`) provide shared infrastructure; they are not executable test files but must be upgraded to support Swift Testing APIs.
 
 The test suite is architecturally sound:
 
-- full async/await adoption (18/20 files),
-- @MainActor isolation (16/20 files),
+- full async/await adoption (16/17 XCTest files),
+- @MainActor isolation (14/17 XCTest files),
 - protocol-based mocking,
 - centralized test factories (`TestSupport.swift`),
 - thread-safe shared mocks (`SharedMocks.swift`),
 - custom domain assertions (`assertRunCompleted`, `assertArtifactExists`),
-- layered CI gates (`test-gate.sh` with 6 levels).
+- layered CI gates (`test-gate.sh` with 6 levels, driven by `xcodebuild` + `-only-testing:` arrays).
 
 The modernization target is framework adoption and boilerplate reduction, not architectural redesign.
+
+### 1.0.1 Current CI tooling baseline
+
+The project currently has:
+
+- **no `Package.swift`** — builds exclusively through `Chainworks Forge.xcodeproj`;
+- **no `.xctestplan`** — gate selection is done via hard-coded `-only-testing:` arrays in `test-gate.sh`;
+- **no SwiftPM test invocation path** — `swift test` is not available.
+
+This means any tag-based gate mechanism must work through `xcodebuild` and Xcode Test Plans, not `swift test`.
 
 ### 1.1 What this proposal is not
 
@@ -52,12 +70,12 @@ Proposal 009 is **not**:
 
 It is a systematic framework-level upgrade that:
 
-- replaces `XCTestCase` classes with `@Suite` structs,
+- replaces `XCTestCase` classes with `@Suite` structs (17 files),
 - replaces `XCTAssert*` assertions with `#expect` / `#require`,
 - eliminates duplicated test methods through parameterized tests,
 - replaces `setUp` / `tearDown` with `init`,
-- upgrades shared infrastructure to support Swift Testing natively,
-- introduces tags for declarative CI gate configuration.
+- upgrades shared infrastructure (2 helper files) to support Swift Testing natively,
+- introduces Swift Testing tags with Xcode Test Plans (`.xctestplan`) as the Xcode-native gate mechanism.
 
 ---
 
@@ -65,20 +83,20 @@ It is a systematic framework-level upgrade that:
 
 After Proposal 009, the engineer must be able to answer all of these:
 
-1. Can every non-UI unit test file be authored and maintained using Swift Testing exclusively?
-2. Does the shared test infrastructure (`TestSupport.swift`, `SharedMocks.swift`) work identically with both frameworks during the transition?
+1. Can every non-UI executable unit test file (17 files) be authored and maintained using Swift Testing exclusively?
+2. Does the shared test infrastructure (2 helper files: `TestSupport.swift`, `SharedMocks.swift`) work identically with both frameworks during the transition?
 3. Are repetitive test methods consolidated into parameterized tests without losing individual test-case visibility in Xcode Test Navigator?
-4. Can CI gates (`test-gate.sh`) select tests by declarative tags instead of hard-coded class lists?
-5. Are all mocks `Sendable`-safe without `@unchecked`?
+4. Can CI gates (`test-gate.sh`) select tests by Xcode Test Plans with tag filters instead of hard-coded `-only-testing:` class lists?
+5. Do observation-heavy transport tests preserve request/session/close visibility after mock migration?
 
 ### Definition of done
 
 Proposal 009 is done only when all of the following are true at once:
 
-1. all 19 XCTest unit test files are migrated to Swift Testing;
-2. `TestSupport.swift` provides `#expect`-based assertion helpers alongside (or replacing) XCTest variants;
+1. all 17 executable XCTest unit test files are migrated to Swift Testing;
+2. both helper files (`TestSupport.swift`, `SharedMocks.swift`) provide Swift Testing-compatible APIs;
 3. at least 3 test files use parameterized tests to consolidate previously duplicated methods;
-4. CI gates can be expressed with Swift Testing tags;
+4. at least one `.xctestplan` file exists and `test-gate.sh` can use it for tag-filtered gate execution;
 5. no test regression: all tests that passed before continue to pass;
 6. `Chainworks_ForgeUITests.swift` remains on XCTest unchanged.
 
@@ -92,16 +110,17 @@ Three scoped layers.
 
 | Component | Responsibility |
 |---|---|
-| **TestSupport.swift** | Add `#expect`-based assertion helpers (`expectRunCompleted`, `expectRunBlocked`, `expectArtifactExists`, `expectArtifactNonEmpty`); add `confirmation()`-based async polling; retain XCTest variants until full migration completes |
-| **SharedMocks.swift** | Replace `@unchecked Sendable` class mocks with `Sendable` struct-based mocks using `@Sendable` closure injection; remove `NSLock` where struct value semantics eliminate shared mutable state |
+| **TestSupport.swift** | Add `#expect`-based assertion helpers (`expectRunCompleted`, `expectRunBlocked`, `expectArtifactExists`, `expectArtifactNonEmpty`); add `confirmation()`-based async polling; retain XCTest variants until full migration completes; replace `try XCTUnwrap(...)` with `try #require(...)` in fixture loaders |
+| **SharedMocks.swift** | Introduce two mock lanes (see section 6.3): lightweight `StubGooseTransport` for pure stream/result tests, and `ObservableGooseTransport` actor for tests that assert on request/session/close side effects; deprecate `@unchecked Sendable` class mocks |
 | **Tag definitions** | Define `Tag` extensions for CI gate categories: `.fast`, `.smoke`, `.integration`, `.live`, `.provider` |
+| **Xcode Test Plans** | Create `.xctestplan` files for `fast`, `provider`, and `full` gates with tag-based test selection; update `test-gate.sh` to use `-testPlan` flag |
 | **TestBundleMarker** | Retain `NSObject`-based marker for `Bundle(for:)` fixture loading (Swift Testing has no bundle-discovery equivalent) |
 
 ### Layer N: File-by-File Migration
 
 | Component | Responsibility |
 |---|---|
-| **19 XCTest unit test files** | Replace `import XCTest` → `import Testing`; convert `XCTestCase` class → `@Suite` struct; convert `func test*()` → `@Test func`; convert all `XCTAssert*` → `#expect` / `#require`; convert `setUp` → `init`; remove `tearDown` where struct lifecycle eliminates the need |
+| **17 executable XCTest unit test files** | Replace `import XCTest` → `import Testing`; convert `XCTestCase` class → `@Suite` struct; convert `func test*()` → `@Test func`; convert all `XCTAssert*` → `#expect` / `#require`; convert `setUp` → `init`; remove `tearDown` where struct lifecycle eliminates the need |
 
 ### Layer O: Parameterization and Tag Adoption
 
@@ -376,9 +395,28 @@ func awaitCondition(
 }
 ```
 
-### 6.3 SharedMocks.swift — Sendable struct mocks
+### 6.3 SharedMocks.swift — two-lane mock strategy
 
-Replace `@unchecked Sendable` class mocks with struct-based protocol witnesses:
+The current `SharedMockGooseTransport` is a `final class ... @unchecked Sendable` that serves two distinct roles:
+
+1. **Stimulus injection**: pre-configuring `createSessionResult`, `createSessionError`, and `streamEvents` to drive the code under test.
+2. **Observation**: recording `closeSessionCalled`, `lastSessionRequest`, `createSessionCallCount`, and `submitPromptCallCount` so tests can assert on transport-side effects after execution.
+
+Current observation-heavy tests (`GooseAgentExecutorTests`, `GooseSessionBridgeTests`, `OrchestratorTests`) assert on:
+
+- `closeSessionCalled` — whether the session was properly closed
+- `lastSessionRequest?.executionPolicy?.permissionProfileID` — policy propagation
+- `lastSessionRequest?.executionPolicy?.workspaceMode` — workspace mode forwarding
+- `lastSessionRequest?.executionPolicy?.gitOperationsAllowed` — git permission forwarding
+- `lastSessionRequest?.executionPolicy?.releaseOperationsAllowed` — release permission forwarding
+- `lastSessionRequest?.executionPolicy?.repoWritesAllowed` — repo write permission forwarding
+- `createSessionCallCount` / `submitPromptCallCount` — call counting
+
+A minimal struct stub cannot replace these observation requirements without losing test signal. Therefore this proposal introduces **two explicit mock lanes**:
+
+#### Lane A: `StubGooseTransport` — lightweight value witness
+
+For tests that only need stimulus injection (pre-configured responses and event streams) and do **not** assert on transport-side effects:
 
 ```swift
 struct StubGooseTransport: GooseTransportProtocol, Sendable {
@@ -411,11 +449,88 @@ struct StubGooseTransport: GooseTransportProtocol, Sendable {
 }
 ```
 
-Rules:
+**Applicable to**: `GooseStreamEventMapperTests`, `SimulatedAgentExecutorTests`, stream-only tests in `GooseServerTransportTests`, and any new test that does not need observation.
+
+#### Lane B: `ObservableGooseTransport` — actor-backed observable mock
+
+For tests that need to assert on request content, session lifecycle, and call counts after execution:
+
+```swift
+actor ObservableGooseTransport: GooseTransportProtocol {
+    // Stimulus configuration
+    var createSessionResult: GooseSessionResponse?
+    var createSessionError: Error?
+    var streamEvents: [GooseStreamEvent] = []
+
+    // Observable state
+    private(set) var closeSessionCalled = false
+    private(set) var lastSessionID: String?
+    private(set) var lastSessionRequest: GooseSessionRequest?
+    private(set) var createSessionCallCount = 0
+    private(set) var submitPromptCallCount = 0
+
+    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        createSessionCallCount += 1
+        lastSessionRequest = request
+        if let error = createSessionError { throw error }
+        return createSessionResult ?? GooseSessionResponse(
+            sessionId: "obs-\(UUID().uuidString.prefix(8))",
+            status: "active",
+            policyAcknowledgement: GoosePolicyAcknowledgement(
+                accepted: true, capabilityToken: "obs", backendPolicyVersion: "v1"
+            )
+        )
+    }
+
+    func submitPrompt(
+        sessionID: String,
+        prompt: GoosePromptRequest
+    ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+        submitPromptCallCount += 1
+        lastSessionID = sessionID
+        let events = streamEvents
+        return AsyncThrowingStream { c in
+            Task { for e in events { c.yield(e) }; c.finish() }
+        }
+    }
+
+    func closeSession(sessionID: String) async throws {
+        closeSessionCalled = true
+    }
+
+    func reset() {
+        closeSessionCalled = false
+        lastSessionID = nil
+        lastSessionRequest = nil
+        createSessionCallCount = 0
+        submitPromptCallCount = 0
+    }
+}
+```
+
+**Applicable to**: `GooseAgentExecutorTests` (asserts on `closeSessionCalled`, `lastSessionRequest.executionPolicy.*`), `GooseSessionBridgeTests` (asserts on session lifecycle), `OrchestratorTests` (asserts on call counts and request propagation).
+
+**Key difference from current `SharedMockGooseTransport`**: `actor` provides compiler-verified `Sendable` safety without `@unchecked`. Observable state is accessed via `await` from tests, which is natural in `async` test functions.
+
+#### Lane assignment per test file
+
+| Test file | Current mock | Target lane | Reason |
+|---|---|---|---|
+| `GooseStreamEventMapperTests` | None (direct API) | N/A | No transport mock needed |
+| `SimulatedAgentExecutorTests` | `SharedStaticResultExecutor` | Lane A (`StubGooseTransport`) if transport added | Stateless result injection |
+| `GooseServerTransportTests` | Local class mock | Lane A for stream tests, Lane B for session tests | Mixed: some tests check streams only, others check session state |
+| `GooseAgentExecutorTests` | Local `MockGooseTransport` class | **Lane B** (`ObservableGooseTransport`) | Asserts on `closeSessionCalled`, `lastSessionRequest.executionPolicy.*` |
+| `GooseSessionBridgeTests` | `SharedMockGooseTransport` | **Lane B** (`ObservableGooseTransport`) | Asserts on session lifecycle |
+| `OrchestratorTests` | `SharedMockGooseTransport` | **Lane B** (`ObservableGooseTransport`) | Asserts on call counts and request propagation |
+| `EndToEndTests` | `SharedStaticResultExecutor` | Lane A | Stateless result injection |
+| All other test files | Various | Lane A or N/A | No transport observation needed |
+
+#### Transition rules
 
 - retain `SharedMockGooseTransport` (class-based) during transition for files not yet migrated;
-- new tests must use `StubGooseTransport` (struct-based);
-- remove class-based mocks once all dependents are migrated.
+- new tests must use `StubGooseTransport` or `ObservableGooseTransport` depending on observation needs;
+- `GooseAgentExecutorTests`'s local `MockGooseTransport` class is deleted when that file migrates to Lane B;
+- remove `SharedMockGooseTransport` only after all dependents (`OrchestratorTests`, `GooseSessionBridgeTests`) are migrated to `ObservableGooseTransport`.
 
 ### 6.4 Tag definitions
 
@@ -427,6 +542,7 @@ extension Tag {
     @Tag static var fast: Self
 
     /// UI smoke tests for the `ui-smoke` CI gate.
+    /// Note: UI tests remain on XCTest; this tag is for unit-level smoke coverage only.
     @Tag static var smoke: Self
 
     /// Tests requiring external provider connectivity.
@@ -440,14 +556,86 @@ extension Tag {
 }
 ```
 
-Tag-to-gate mapping (replaces hard-coded class lists in `test-gate.sh`):
+### 6.5 Xcode Test Plans — the gate execution mechanism
 
-| CI gate | Current mechanism | New mechanism |
-|---|---|---|
-| `fast` | Hard-coded class list: `ProviderPlatformTests`, `OrchestratorTests`, `ResumeManagerTests`, `ArtifactManagerTests`, `RunTests` | `swift test --filter .tags(.fast)` or Xcode Test Plan with tag filter |
-| `ui-smoke` | Hard-coded method list | Remains XCTest (no tag migration for UI tests) |
-| `proposal-006` | Hard-coded class + method list | `swift test --filter .tags(.provider)` |
-| `full` | `xcodebuild test` | No change |
+#### Problem
+
+The project currently has no `Package.swift` and no SwiftPM test invocation path.
+`swift test --filter .tags(...)` is **not available** for this project.
+All CI gates run through `xcodebuild` with `-only-testing:` arrays in `test-gate.sh`.
+
+#### Solution
+
+Xcode 16+ supports Swift Testing tags in `.xctestplan` files as test selection criteria.
+This proposal introduces `.xctestplan` files as the Xcode-native bridge between Swift Testing tags and `xcodebuild` gate execution.
+
+#### New project artifacts
+
+```text
+Chainworks Forge/
+  TestPlans/
+    FastGate.xctestplan          ← NEW
+    ProviderGate.xctestplan      ← NEW
+    FullGate.xctestplan          ← NEW
+```
+
+Each `.xctestplan` file is a JSON document that Xcode manages through the Test Plan editor. The plan specifies:
+
+- which test target(s) to include,
+- which tags to include/exclude,
+- environment variables and launch arguments.
+
+Example structure for `FastGate.xctestplan` (human-readable summary; actual file is Xcode-managed JSON):
+
+- **Included targets**: `Chainworks ForgeTests`
+- **Tag filter**: include tests tagged `.fast`
+- **Excluded targets**: `Chainworks ForgeUITests` (UI smoke has its own plan/gate)
+
+#### Updated `test-gate.sh` invocations
+
+```bash
+# Current (hard-coded class list):
+FAST_TESTS=(
+  "Chainworks ForgeTests/ProviderPlatformTests"
+  "Chainworks ForgeTests/OrchestratorTests"
+  "Chainworks ForgeTests/ResumeManagerTests"
+  "Chainworks ForgeTests/ArtifactManagerTests"
+  "Chainworks ForgeTests/RunTests"
+)
+xcodebuild test -only-testing:"${FAST_TESTS[@]}" ...
+
+# After (test plan with tag filter):
+xcodebuild test \
+  -project "$PROJECT_PATH" \
+  -scheme "$SCHEME_NAME" \
+  -destination "$DESTINATION" \
+  -testPlan FastGate \
+  -derivedDataPath "$derived_data" \
+  -resultBundlePath "$result_bundle"
+```
+
+#### Tag-to-gate mapping
+
+| CI gate | Current mechanism | New mechanism | Test plan |
+|---|---|---|---|
+| `fast` | Hard-coded `-only-testing:` array of 5 class names | `-testPlan FastGate` with tag `.fast` | `FastGate.xctestplan` |
+| `ui-smoke` | Hard-coded `-only-testing:` array of 5 method names | **No change** — remains `-only-testing:` (XCUITest, not tag-eligible) | N/A |
+| `proposal-006` | Hard-coded `-only-testing:` mixed unit + UI | `-testPlan ProviderGate` for unit tests (tag `.provider`); UI tests remain `-only-testing:` | `ProviderGate.xctestplan` |
+| `full` | `xcodebuild test` (all tests) | `-testPlan FullGate` or no change | `FullGate.xctestplan` (optional) |
+
+#### Backward compatibility
+
+During migration, `test-gate.sh` must support both paths:
+
+1. If the `.xctestplan` file exists and the `USE_TEST_PLANS=1` environment variable is set, use `-testPlan`.
+2. Otherwise, fall back to the current `-only-testing:` arrays.
+
+This allows incremental adoption and prevents CI breakage during the transition.
+
+#### What stays on `-only-testing:`
+
+- **UI smoke gate** (`ui-smoke`): XCUITest methods are not eligible for Swift Testing tags. This gate continues to use hard-coded `-only-testing:` method references.
+- **proposal-006 UI portion**: the 3 UI test methods in `PROPOSAL_006_TESTS` remain `-only-testing:`-selected.
 
 ---
 
@@ -455,37 +643,43 @@ Tag-to-gate mapping (replaces hard-coded class lists in `test-gate.sh`):
 
 ### 7.1 Priority tiers
 
-| Priority | File | Lines | Complexity | Key change |
-|---|---|---|---|---|
-| **Tier 1: Infrastructure** | | | | |
-| 1a | `TestSupport.swift` | 314 | Medium | Add `#expect` helpers; retain XCTest variants |
-| 1b | `SharedMocks.swift` | 128 | Medium | Add `StubGooseTransport`; retain class mocks |
-| 1c | Tag definitions (new file) | ~20 | Low | Define `Tag` extensions |
-| **Tier 2: Pure logic (no SwiftData, no async)** | | | | |
-| 2a | `TransitionEvaluatorTests.swift` | 218 | Low | Parameterize 25 → 10 tests |
-| 2b | `GooseStreamEventMapperTests.swift` | 195 | Low | Parameterize ignored + mapping tests |
-| **Tier 3: SwiftData + sync** | | | | |
-| 3a | `RunPlanCompilerTests.swift` | 289 | Medium | `init()` replaces setUp; shared fixture loading |
-| 3b | `ArtifactValidationTests.swift` | 264 | Medium | Parameterize contract validations |
-| 3c | `ArtifactManagerTests.swift` | 347 | Medium | `init()` replaces setUp/tearDown; temp dir via UUID |
-| **Tier 4: SwiftData + async** | | | | |
-| 4a | `SimulatedAgentExecutorTests.swift` | 228 | Medium | Struct suite with `@MainActor` |
-| 4b | `ResumeManagerTests.swift` | 418 | Medium | `.serialized` trait; tag `.fast` |
-| 4c | `WorkspaceIsolationTests.swift` | 336 | Medium | `.serialized` trait |
-| **Tier 5: Complex async + mocks** | | | | |
-| 5a | `GooseAgentExecutorTests.swift` | 371 | High | Struct mocks; async stream testing |
-| 5b | `GooseSessionBridgeTests.swift` | 307 | High | `confirmation()` replaces polling |
-| 5c | `GooseServerTransportTests.swift` | 652 | High | Complex async stream assertions |
-| 5d | `ProviderPlatformTests.swift` | 719 | High | Tag `.fast` + `.provider` |
-| 5e | `OrchestratorTests.swift` | 1077 | High | Largest file; `.serialized`; tag `.fast` |
-| **Tier 6: Integration / live** | | | | |
-| 6a | `EndToEndTests.swift` | 404 | High | Tag `.integration` |
-| 6b | `LiveGooseConnectionProofTests.swift` | 595 | High | Tag `.live`; `.disabled` trait |
-| 6c | `GooseServerLiveIntegrationTests.swift` | 185 | High | Tag `.live`; `.timeLimit(.minutes(2))` |
-| 6d | `LiveProposalWorkflowTests.swift` | 230 | High | Tag `.live`; `.disabled` trait |
-| **No migration** | | | | |
-| — | `Chainworks_ForgeTests.swift` | 1086 | — | Already on Swift Testing |
-| — | `Chainworks_ForgeUITests.swift` | — | — | Remains XCTest (UI tests) |
+**Migration scope: 17 executable XCTest unit test files.**
+Helper files (`TestSupport.swift`, `SharedMocks.swift`) are upgraded in Tier 1 but are not counted as migration targets because they contain no executable tests.
+
+| Priority | File | Lines | Complexity | Key change | Mock lane |
+|---|---|---|---|---|---|
+| **Tier 1: Infrastructure (2 helper files + 2 new files)** | | | | | |
+| 1a | `TestSupport.swift` | 314 | Medium | Add `#expect` helpers; retain XCTest variants | — |
+| 1b | `SharedMocks.swift` | 128 | Medium | Add `StubGooseTransport` (Lane A) + `ObservableGooseTransport` (Lane B); retain class mocks | — |
+| 1c | `TestTags.swift` (new) | ~20 | Low | Define `Tag` extensions | — |
+| 1d | `TestPlans/` (new) | — | Low | Create `FastGate.xctestplan`, `ProviderGate.xctestplan`, `FullGate.xctestplan` | — |
+| **Tier 2: Pure logic — no SwiftData, no async (2 files)** | | | | | |
+| 2a | `TransitionEvaluatorTests.swift` | 218 | Low | Parameterize 25 → 10 tests | N/A |
+| 2b | `GooseStreamEventMapperTests.swift` | 195 | Low | Parameterize ignored + mapping tests | N/A |
+| **Tier 3: SwiftData + sync (3 files)** | | | | | |
+| 3a | `RunPlanCompilerTests.swift` | 289 | Medium | `init()` replaces setUp; shared fixture loading | N/A |
+| 3b | `ArtifactValidationTests.swift` | 264 | Medium | Parameterize contract validations | N/A |
+| 3c | `ArtifactManagerTests.swift` | 347 | Medium | `init()` replaces setUp/tearDown; temp dir via UUID | N/A |
+| **Tier 4: SwiftData + async (3 files)** | | | | | |
+| 4a | `SimulatedAgentExecutorTests.swift` | 228 | Medium | Struct suite with `@MainActor` | Lane A |
+| 4b | `ResumeManagerTests.swift` | 418 | Medium | `.serialized` trait; tag `.fast` | N/A |
+| 4c | `WorkspaceIsolationTests.swift` | 336 | Medium | `.serialized` trait | N/A |
+| **Tier 5: Complex async + mocks (5 files)** | | | | | |
+| 5a | `GooseAgentExecutorTests.swift` | 371 | High | Delete local `MockGooseTransport` class; use `ObservableGooseTransport` (Lane B); assert on `closeSessionCalled`, `lastSessionRequest.executionPolicy.*` via `await` | **Lane B** |
+| 5b | `GooseSessionBridgeTests.swift` | 307 | High | `confirmation()` replaces polling; `ObservableGooseTransport` (Lane B) | **Lane B** |
+| 5c | `GooseServerTransportTests.swift` | 652 | High | Stream-only tests use Lane A; session lifecycle tests use Lane B | **Lane A + B** |
+| 5d | `ProviderPlatformTests.swift` | 719 | High | Tag `.fast` + `.provider` | N/A |
+| 5e | `OrchestratorTests.swift` | 1077 | High | Largest file; `.serialized`; tag `.fast`; `ObservableGooseTransport` (Lane B) | **Lane B** |
+| **Tier 6: Integration / live (4 files)** | | | | | |
+| 6a | `EndToEndTests.swift` | 404 | High | Tag `.integration` | Lane A |
+| 6b | `LiveGooseConnectionProofTests.swift` | 595 | High | Tag `.live`; `.disabled` trait | N/A |
+| 6c | `GooseServerLiveIntegrationTests.swift` | 185 | High | Tag `.live`; `.timeLimit(.minutes(2))` | N/A |
+| 6d | `LiveProposalWorkflowTests.swift` | 230 | High | Tag `.live`; `.disabled` trait | N/A |
+| **Not migrated** | | | | | |
+| — | `Chainworks_ForgeTests.swift` | 1086 | — | Already on Swift Testing | — |
+| — | `Chainworks_ForgeUITests.swift` | — | — | Remains XCTest (UI tests) | — |
+
+**Verification**: Tiers 2–6 contain exactly **17 files** (2 + 3 + 3 + 5 + 4), matching the executable XCTest unit test inventory from section 1.
 
 ### 7.2 Migration sequence constraint
 
@@ -621,7 +815,76 @@ func transitionConditionState3() throws {
 }
 ```
 
-### 8.3 Live tests — traits for conditional execution
+### 8.3 GooseAgentExecutorTests — observable mock migration (Lane B)
+
+**Before** (class-based `@unchecked Sendable` mock with direct property access):
+
+```swift
+import XCTest
+@testable import Chainworks_Forge
+
+final class GooseAgentExecutorTests: XCTestCase {
+    final class MockGooseTransport: GooseTransportProtocol, @unchecked Sendable {
+        var closeSessionCalled = false
+        var lastSessionRequest: GooseSessionRequest?
+        // ...
+    }
+
+    @MainActor
+    func testGooseExecutorCreatesSession() async throws {
+        let mockTransport = MockGooseTransport()
+        // ... configure and execute ...
+        XCTAssertTrue(mockTransport.closeSessionCalled)
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.permissionProfileID, "read_only")
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.workspaceMode, "read_only")
+        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.gitOperationsAllowed, false)
+    }
+}
+```
+
+**After** (actor-based `Sendable` observable mock with `await` access):
+
+```swift
+import Testing
+@testable import Chainworks_Forge
+
+@Suite("GooseAgentExecutor")
+@MainActor
+struct GooseAgentExecutorTests {
+    @Test("creates session with correct execution policy")
+    func createsSession() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "session-abc123", status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true, capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            events: [
+                .sessionStarted(raw: "{}"),
+                .finalOutput(content: "# Test Output"),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let executor = GooseAgentExecutor(transport: transport)
+        _ = try await executor.execute(task: makeTask(), agent: makeAgent(), context: makeContext())
+
+        // Observable state accessed via await — compiler-verified Sendable safety
+        #expect(await transport.closeSessionCalled, "Session should be closed after execution")
+        let request = await transport.lastSessionRequest
+        #expect(request?.executionPolicy?.permissionProfileID == "read_only")
+        #expect(request?.executionPolicy?.workspaceMode == "read_only")
+        #expect(request?.executionPolicy?.gitOperationsAllowed == false)
+    }
+}
+```
+
+**Key changes**: `XCTAssertTrue(mock.prop)` → `#expect(await transport.prop)`. The `await` is natural in `async` test functions and provides compiler-verified thread safety without `@unchecked Sendable`.
+
+### 8.4 Live tests — traits for conditional execution
 
 **Before:**
 
@@ -654,13 +917,23 @@ struct LiveGooseConnectionProofTests {
 
 - [ ] `TestSupport.swift` provides `expectRunCompleted`, `expectRunBlocked`, `expectRunWaitingApproval`, `expectArtifactExists`, `expectArtifactNonEmpty` using `#expect`
 - [ ] `TestSupport.swift` provides `awaitCondition()` using `confirmation()`
-- [ ] `SharedMocks.swift` provides `StubGooseTransport` as a `Sendable` struct
-- [ ] Tag extensions define `.fast`, `.smoke`, `.integration`, `.live`, `.provider`
+- [ ] `TestSupport.swift` replaces `try XCTUnwrap(...)` in fixture loaders with `try #require(...)`
+- [ ] `SharedMocks.swift` provides `StubGooseTransport` (Lane A) as a `Sendable` struct
+- [ ] `SharedMocks.swift` provides `ObservableGooseTransport` (Lane B) as a `Sendable` actor with request/session/close observability
+- [ ] Tag extensions define `.fast`, `.smoke`, `.integration`, `.live`, `.provider` in `TestTags.swift`
 - [ ] `TestBundleMarker` remains functional for fixture loading
+
+### Mock migration
+
+- [ ] `GooseAgentExecutorTests` uses `ObservableGooseTransport` (Lane B) and asserts on `closeSessionCalled`, `lastSessionRequest.executionPolicy.*` via `await`
+- [ ] `GooseSessionBridgeTests` uses `ObservableGooseTransport` (Lane B) for session lifecycle assertions
+- [ ] `OrchestratorTests` uses `ObservableGooseTransport` (Lane B) for call count and request propagation assertions
+- [ ] Local `MockGooseTransport` class in `GooseAgentExecutorTests` is deleted
+- [ ] `SharedMockGooseTransport` class is removed only after all dependents are migrated
 
 ### Migration
 
-- [ ] All 19 XCTest unit test files use `import Testing` instead of `import XCTest`
+- [ ] All 17 executable XCTest unit test files use `import Testing` instead of `import XCTest`
 - [ ] All test classes are replaced with `@Suite` structs (or actors where required)
 - [ ] All `XCTAssert*` calls are replaced with `#expect` / `#require`
 - [ ] All `override func setUp()` are replaced with `init()`
@@ -680,7 +953,11 @@ struct LiveGooseConnectionProofTests {
 - [ ] Suites matching the `fast` CI gate are tagged `.fast`
 - [ ] Live/integration test suites are tagged `.live` or `.integration`
 - [ ] Provider-specific suites are tagged `.provider`
-- [ ] `test-gate.sh` can optionally use tag-based filtering (backward-compatible with class-based filtering)
+- [ ] `FastGate.xctestplan` exists and selects tests by `.fast` tag
+- [ ] `ProviderGate.xctestplan` exists and selects tests by `.provider` tag
+- [ ] `test-gate.sh` supports `-testPlan` invocation when `USE_TEST_PLANS=1` is set
+- [ ] `test-gate.sh` retains backward-compatible `-only-testing:` fallback when `USE_TEST_PLANS` is not set
+- [ ] UI smoke gate (`ui-smoke`) remains on `-only-testing:` (XCUITest, not tag-eligible)
 
 ### Regression
 
@@ -698,10 +975,10 @@ struct LiveGooseConnectionProofTests {
 | UI test migration | Swift Testing has no `XCUIApplication` equivalent |
 | Performance test migration | Swift Testing has no `measure {}` equivalent |
 | New test coverage | This proposal modernizes framework usage, not coverage breadth |
-| CI pipeline redesign | Tag-based filtering is additive; existing gates remain functional |
+| `test-gate.sh` full rewrite | Script receives optional `USE_TEST_PLANS` path but retains backward-compatible `-only-testing:` fallback |
+| `Package.swift` / SwiftPM adoption | The project remains Xcode-project-only; `swift test` is not a goal of this proposal |
 | Third-party testing frameworks (Quick, Nimble, etc.) | Swift Testing is Apple's first-party replacement |
 | Swift 6 strict concurrency migration | Orthogonal to test framework migration; may be addressed separately |
-| `test-gate.sh` rewrite | Script receives optional tag support but retains backward compatibility |
 
 ---
 
@@ -712,9 +989,9 @@ struct LiveGooseConnectionProofTests {
 | TEST-001 | All new unit tests must use Swift Testing (`import Testing`) | Apple's current guidance; project already on Xcode 16+ |
 | TEST-002 | XCTest remains exclusively for UI tests and performance tests | Swift Testing has no equivalent for `XCUIApplication` or `measure {}` |
 | TEST-003 | Migrated suites must use structs, not classes | Value-type semantics provide better test isolation and concurrency safety |
-| TEST-004 | `@unchecked Sendable` class mocks are replaced with `Sendable` struct mocks | Compiler-verified concurrency safety eliminates a class of runtime bugs |
+| TEST-004 | `@unchecked Sendable` class mocks are replaced with either `Sendable` struct stubs (Lane A) or `Sendable` actor observables (Lane B) depending on observation requirements | Compiler-verified concurrency safety; observation-heavy tests retain request/session/close visibility |
 | TEST-005 | Parameterized tests must be used when 3+ methods differ only in input data | Reduces maintenance burden and improves test readability |
-| TEST-006 | CI gate categories are expressed as `Tag` extensions | Declarative, compiler-checked, and visible in Xcode Test Plans |
+| TEST-006 | CI gate categories are expressed as `Tag` extensions and selected via Xcode Test Plans (`.xctestplan`), not `swift test --filter` | The project has no `Package.swift`; `xcodebuild -testPlan` is the only Xcode-native tag-selection path |
 | TEST-007 | `TestBundleMarker` (NSObject) is retained for fixture loading | No Swift Testing alternative exists for `Bundle(for:)` |
 | TEST-008 | Migration is file-atomic: each file moves completely from XCTest to Swift Testing | No per-file mixing of `XCTAssert*` and `#expect` |
 | TEST-009 | Infrastructure tier (TestSupport, SharedMocks, Tags) completes before any test file migration | Prevents dual-maintenance of assertion helpers |
@@ -726,29 +1003,32 @@ struct LiveGooseConnectionProofTests {
 
 | Metric | Before | After | Change |
 |---|---|---|---|
-| Files using XCTest | 19 | 0 (unit) + 1 (UI) | -19 unit files |
-| Files using Swift Testing | 1 | 20 | +19 |
+| Executable XCTest unit files | 17 | 0 | -17 |
+| Executable Swift Testing unit files | 1 | 18 | +17 |
+| Helper files upgraded | 0 | 2 (`TestSupport`, `SharedMocks`) | +2 (not counted as migration targets) |
+| UI test files (XCTest, unchanged) | 1 | 1 | 0 |
 | Total test methods | ~180 | ~130 | ~-28% (parameterization) |
 | `XCTAssert*` call sites | ~350 | 0 | -100% |
 | `override func setUp` | 7 | 0 | -100% |
 | `override func tearDown` | 6 | 0 | -100% |
 | Force-unwrapped test properties (`!`) | ~30 | 0 | -100% |
-| `@unchecked Sendable` test doubles | 2 | 0 | -100% |
+| `@unchecked Sendable` test doubles | 2+ (class-based) | 0 (struct Lane A + actor Lane B) | -100% |
+| Xcode Test Plans | 0 | 3 (`FastGate`, `ProviderGate`, `FullGate`) | +3 |
 | Lines of test code (estimated) | ~9,100 | ~7,500 | ~-18% |
 
 ---
 
 ## 13. Execution plan
 
-| Day | Deliverable |
-|---|---|
-| Day 1 | Tier 1: upgrade `TestSupport.swift` with dual-mode helpers; add `StubGooseTransport` to `SharedMocks.swift`; create tag definitions file |
-| Day 2 | Tier 2: migrate `TransitionEvaluatorTests` and `GooseStreamEventMapperTests` with full parameterization |
-| Day 3 | Tier 3: migrate `RunPlanCompilerTests`, `ArtifactValidationTests`, `ArtifactManagerTests` |
-| Day 4 | Tier 4: migrate `SimulatedAgentExecutorTests`, `ResumeManagerTests`, `WorkspaceIsolationTests` |
-| Day 5 | Tier 5: migrate `GooseAgentExecutorTests`, `GooseSessionBridgeTests`, `GooseServerTransportTests`, `ProviderPlatformTests`, `OrchestratorTests` |
-| Day 6 | Tier 6: migrate `EndToEndTests`, `LiveGooseConnectionProofTests`, `GooseServerLiveIntegrationTests`, `LiveProposalWorkflowTests` |
-| Day 7 | Remove XCTest assertion helpers from `TestSupport.swift`; remove class-based mocks from `SharedMocks.swift`; update `test-gate.sh` with optional tag-based filtering; final CI verification |
+| Day | Deliverable | Files touched |
+|---|---|---|
+| Day 1 | Tier 1: upgrade `TestSupport.swift` with dual-mode helpers; add `StubGooseTransport` (Lane A) + `ObservableGooseTransport` (Lane B) to `SharedMocks.swift`; create `TestTags.swift`; create `TestPlans/FastGate.xctestplan`, `ProviderGate.xctestplan`, `FullGate.xctestplan` | 2 helpers + 4 new files |
+| Day 2 | Tier 2: migrate `TransitionEvaluatorTests` and `GooseStreamEventMapperTests` with full parameterization | 2 of 17 |
+| Day 3 | Tier 3: migrate `RunPlanCompilerTests`, `ArtifactValidationTests`, `ArtifactManagerTests` | 5 of 17 |
+| Day 4 | Tier 4: migrate `SimulatedAgentExecutorTests`, `ResumeManagerTests`, `WorkspaceIsolationTests` | 8 of 17 |
+| Day 5 | Tier 5: migrate `GooseAgentExecutorTests` (Lane B), `GooseSessionBridgeTests` (Lane B), `GooseServerTransportTests` (Lane A+B), `ProviderPlatformTests`, `OrchestratorTests` (Lane B) | 13 of 17 |
+| Day 6 | Tier 6: migrate `EndToEndTests`, `LiveGooseConnectionProofTests`, `GooseServerLiveIntegrationTests`, `LiveProposalWorkflowTests` | 17 of 17 |
+| Day 7 | Remove XCTest assertion helpers from `TestSupport.swift`; remove `SharedMockGooseTransport` class and local `MockGooseTransport` classes from `SharedMocks.swift`; update `test-gate.sh` with `USE_TEST_PLANS` support; final CI verification on all gates | Cleanup + CI |
 
 ---
 
@@ -758,9 +1038,9 @@ Proposal 009 converts the test suite from a framework that Apple recommends migr
 
 It enables:
 
-- a test suite that uses the same framework conventions as `Chainworks_ForgeTests.swift` (already migrated),
+- a test suite where all 18 unit test files use the same framework conventions as `Chainworks_ForgeTests.swift` (already migrated),
 - parameterized tests that reduce maintenance burden by ~28% in method count and ~18% in line count,
-- compiler-verified `Sendable` safety in all test doubles,
-- declarative CI gate configuration through tags instead of hard-coded class lists,
+- compiler-verified `Sendable` safety in all test doubles (struct stubs for stateless tests, actor observables for side-effect assertions),
+- declarative CI gate configuration through Xcode Test Plans with tag filters instead of hard-coded `-only-testing:` class lists,
 - a foundation for Swift 6 strict concurrency adoption in the test target,
 - and a codebase where new tests are written using modern idioms from day one.
