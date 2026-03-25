@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Proposal | `docs/proposals/009-test-suite-modernization-swift-testing-migration.md` |
-| Prepared At | `2026-03-25T11:57:38+0200` |
+| Prepared At | `2026-03-25T14:29:54+0200` |
 | Proposal MD5 | `6f4f7127bfd0cf24aa60874232fdad7f` |
 | Proposal MTime | `2026-03-25 11:50:33 +0200` |
-| Repository SHA | `3459c9471b16d3ff776c33ddf1829e117279fd87` |
+| Repository SHA | `25cb0b29ed52b7f4967a8edab9382551f78efb49` |
 | Evidence Completeness | `Partial` |
 
 ## Scope
@@ -14,7 +14,7 @@
 Review target:
 - current Proposal 009 draft readiness
 - current-head baseline for test inventory, mock requirements, and gate tooling
-- fresh current-round build/test proof against the repo's existing gate script
+- fresh current-round proof against the repo's existing gate script
 
 Out of scope for live review:
 - user-facing app UI, because Proposal 009 is an internal test-suite modernization slice
@@ -42,6 +42,18 @@ Out of scope for live review:
     - `2` helper files
   - the CI/tag path is now `.xctestplan` + `xcodebuild -testPlan`
   - the mock strategy now explicitly distinguishes stateless vs observation-heavy tests
+
+### E-P009-001A — Repeat-round freshness check
+
+- Commands / checks:
+  - proposal MD5 comparison against the previous review
+  - `git rev-parse HEAD`
+- Result:
+  - current proposal MD5 is unchanged from the last reviewed revision
+  - repository HEAD moved from `3459c9471b16d3ff776c33ddf1829e117279fd87` to `25cb0b29ed52b7f4967a8edab9382551f78efb49`
+- Meaning:
+  - proposal-text evidence was safe to reuse after freshness check
+  - the impacted slice to refresh was the current repo proof gate, not the proposal wording
 
 ### E-P009-002 — Fresh current-head unit-test inventory baseline
 
@@ -88,18 +100,7 @@ Out of scope for live review:
 - Meaning:
   - the proposal's move from `swift test --filter` to `.xctestplan` is now aligned with primary-source Xcode guidance
 
-### E-P009-005 — Fresh current-round build gate
-
-- Command:
-  - `./scripts/test-gate.sh build`
-- Result:
-  - `passed`
-  - `** BUILD SUCCEEDED **`
-- Meaning:
-  - the old network/package-resolution blocker from the previous round is no longer the current issue
-  - this round has a valid green build baseline
-
-### E-P009-006 — Fresh current-round fast gate
+### E-P009-005 — Fresh current-round fast gate
 
 - Command:
   - `./scripts/test-gate.sh fast`
@@ -108,21 +109,23 @@ Out of scope for live review:
   - `result = Failed`
   - `passedTests = 63`
   - `failedTests = 1`
+  - build phase in the same gate run succeeded
 - Failure:
   - `RunTests/noDirectRunConstruction()`
   - failure text: `Caught error: lookbehind is not currently supported`
 - Result artifact:
-  - `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/fast-20260325-115350.xcresult`
+  - `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/fast-20260325-142902.xcresult`
 - Meaning:
-  - current-round proof is blocked by a real repository test failure, not by environment/package resolution
+  - current-round proof is still blocked by a real repository test failure, not by environment/package resolution
+  - the same blocker reproduced on the new HEAD
 
-### E-P009-007 — Fresh current workspace-state check
+### E-P009-006 — Fresh current workspace-state check
 
 - Commands:
   - `git rev-parse HEAD`
   - file mtime/MD5 for the proposal source
 - Result:
-  - repository SHA: `3459c9471b16d3ff776c33ddf1829e117279fd87`
+  - repository SHA: `25cb0b29ed52b7f4967a8edab9382551f78efb49`
   - proposal mtime: `2026-03-25 11:50:33 +0200`
   - proposal MD5: `6f4f7127bfd0cf24aa60874232fdad7f`
 - Meaning:
@@ -130,7 +133,7 @@ Out of scope for live review:
 
 ## Attempted But Missing
 
-- No green current-round `fast` proof exists because the fresh run failed in `RunTests/noDirectRunConstruction()`.
+- No green current-round `fast` proof exists because the fresh run again failed in `RunTests/noDirectRunConstruction()`.
 - No platform UI screenshots or XCUITest attachments were collected for Proposal 009 because this slice does not define a direct user-facing app flow.
 - No `.xctestplan` implementation artifact exists in the repo yet; Proposal 009 is still at draft-review stage, not implementation-review stage.
 

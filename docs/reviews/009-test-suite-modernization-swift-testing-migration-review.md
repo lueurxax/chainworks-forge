@@ -4,8 +4,8 @@
 |---|---|
 | Proposal | `docs/proposals/009-test-suite-modernization-swift-testing-migration.md` |
 | Repository Root | `.` |
-| Git SHA | `3459c9471b16d3ff776c33ddf1829e117279fd87` |
-| Reviewed At | `2026-03-25T11:57:38+0200` |
+| Git SHA | `25cb0b29ed52b7f4967a8edab9382551f78efb49` |
+| Reviewed At | `2026-03-25T14:29:54+0200` |
 | Proposal Source MD5 | `6f4f7127bfd0cf24aa60874232fdad7f` |
 | Proposal Source MTime | `2026-03-25 11:50:33 +0200` |
 | Review Mode | `full-review` |
@@ -16,7 +16,7 @@
 
 ## Verdict
 
-Current Proposal 009 rereads cleanly as a draft. The three live proposal-text gaps from the previous round are closed in the current version:
+Current Proposal 009 rereads cleanly as a draft. This was a no-delta repeat round on the proposal text: the current source MD5 still matches the version reviewed in the previous pass. The three live proposal-text gaps from the earlier round remain closed:
 
 - the migration inventory is now re-baselined on `17` executable XCTest unit files, `1` executable Swift Testing unit file, and `2` helper files;
 - the CI/tagging path is now Xcode-native, using `.xctestplan` files and `xcodebuild -testPlan` instead of a nonexistent SwiftPM path;
@@ -24,7 +24,7 @@ Current Proposal 009 rereads cleanly as a draft. The three live proposal-text ga
 
 No new proposal-text findings surfaced in this reread.
 
-This is still not a full sign-off. Fresh repo evidence is no longer blocked by package resolution, and `./scripts/test-gate.sh build` is green, but the fresh `./scripts/test-gate.sh fast` run is not green on current HEAD. The current blocker is a real baseline failure in `RunTests/noDirectRunConstruction()` (`Caught error: lookbehind is not currently supported`). Proposal 009 also has no direct operator-facing app flow, so this review is necessarily anchored to repo/test evidence rather than runtime UI proof.
+This is still not a full sign-off. I refreshed the impacted proof slice on the new current HEAD, and the fresh `./scripts/test-gate.sh fast` run reproduced the same baseline failure. The blocker remains `RunTests/noDirectRunConstruction()` (`Caught error: lookbehind is not currently supported`). Proposal 009 also has no direct operator-facing app flow, so this review is necessarily anchored to repo/test evidence rather than runtime UI proof.
 
 ## Findings
 
@@ -36,6 +36,9 @@ No live proposal-text findings surfaced in the current draft.
   - inventory/count references are internally consistent
   - migration scope is explicitly `17` executable XCTest unit files
   - helper files are no longer counted as executable migration targets
+- `E-P009-001A`: Repeat-round freshness check
+  - current proposal MD5 matches the last reviewed revision
+  - the proposal-text verdict is therefore unchanged
 - `E-P009-002`: Fresh current-head inventory baseline
   - `17` executable XCTest unit files
   - `1` executable Swift Testing unit file
@@ -47,14 +50,12 @@ No live proposal-text findings surfaced in the current draft.
 - `E-P009-004`: Fresh external primary-source confirmation from Apple
   - Swift Testing applies to Xcode projects, not only SwiftPM
   - WWDC24 `Go further with Swift Testing` explicitly shows saving tag preferences into Xcode Test Plans and filtering plans by tags
-- `E-P009-005`: Fresh `./scripts/test-gate.sh build` run
-  - `BUILD SUCCEEDED`
-- `E-P009-006`: Fresh `./scripts/test-gate.sh fast` run
+- `E-P009-005`: Fresh `./scripts/test-gate.sh fast` run
   - build phase succeeded
   - test phase failed with `1` failing test, `63` passing tests
   - failing test: `RunTests/noDirectRunConstruction()`
   - failure text: `Caught error: lookbehind is not currently supported`
-- `E-P009-007`: Fresh current workspace-state check
+- `E-P009-006`: Fresh current workspace-state check
   - review is anchored to current local draft and current HEAD
 
 ## Missing Evidence
