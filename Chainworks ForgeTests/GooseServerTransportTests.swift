@@ -7,13 +7,18 @@ import Foundation
 /// Unit and integration tests for GooseServerTransport.
 /// Covers initialization, protocol conformance, ChatRequest encoding (REQ-010),
 /// and full mock-HTTP round-trip (REQ-011).
-@Suite("GooseServerTransport")
+@Suite("GooseServerTransport", .serialized)
 struct GooseServerTransportTests {
 
     // MARK: - MockURLProtocol
 
     /// URLProtocol subclass that intercepts HTTP requests for testing.
     /// Records all requests and returns pre-configured responses.
+    ///
+    /// `@unchecked Sendable` is required and cannot be eliminated per TEST-004:
+    /// `URLProtocol` is an ObjC class requiring subclassing (no struct/actor
+    /// alternative exists), and the URL loading system calls instances from
+    /// arbitrary threads. Static state is manually synchronized via `logQueue`.
     final class MockURLProtocol: URLProtocol, @unchecked Sendable {
         /// Recorded requests (thread-safe via queue).
         nonisolated(unsafe) static var requestLog: [(url: String, method: String, headers: [String: String], body: Data?)] = []

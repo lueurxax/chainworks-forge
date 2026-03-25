@@ -77,6 +77,9 @@ struct PilotReadinessView: View {
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                 }
+                                if let report = providerRegistry.troubleshootingReport(for: provider.id) {
+                                    ProviderTroubleshootingPanel(report: report)
+                                }
                             }
                         }
                     }
@@ -246,7 +249,7 @@ struct PilotReadinessView: View {
     }
 
     private func refreshReadiness() async {
-        await providerRegistry.refreshHealth()
+        await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
         let preflight = PreflightService(
             appConfigurationStore: appConfigurationStore,
             providerRegistry: providerRegistry
@@ -305,4 +308,20 @@ struct PilotReadinessView: View {
             return .red
         }
     }
+}
+
+#Preview("Pilot Readiness — Seeded") {
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let appConfigurationStore = PreviewSupport.makeAppConfigurationStore()
+    let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
+    let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+
+    return PilotReadinessView()
+        .modelContainer(container)
+        .environment(executionService)
+        .environment(appConfigurationStore)
+        .environment(providerSettingsStore)
+        .environment(providerRegistry)
+        .frame(width: 1100, height: 820)
 }

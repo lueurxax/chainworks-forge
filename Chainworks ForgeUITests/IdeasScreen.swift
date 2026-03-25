@@ -48,14 +48,24 @@ struct IdeasScreen {
         return app.buttons.matching(predicate).firstMatch
     }
 
-    /// Navigates to idea detail and opens Start Run sheet. Returns true if sheet opened.
-    func openStartRunSheet(for ideaTitle: String) -> Bool {
+    @discardableResult
+    func openIdea(named ideaTitle: String) -> Bool {
+        let ideaRow = findRow(ideaTitle)
+        if ideaRow.waitForExistence(timeout: 10) {
+            ideaRow.click()
+            return true
+        }
+
         let screen = AppScreen(app: app)
         guard screen.selectTab("Ideas") else { return false }
-
-        let ideaRow = findRow(ideaTitle)
-        guard ideaRow.waitForExistence(timeout: 15) else { return false }
+        guard ideaRow.waitForExistence(timeout: 10) else { return false }
         ideaRow.click()
+        return true
+    }
+
+    /// Navigates to idea detail and opens Start Run sheet. Returns true if sheet opened.
+    func openStartRunSheet(for ideaTitle: String) -> Bool {
+        guard openIdea(named: ideaTitle) else { return false }
 
         var startButton = app.buttons["start-new-run-button"].firstMatch
         if !startButton.waitForExistence(timeout: 10) {

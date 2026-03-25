@@ -69,6 +69,32 @@ enum ProviderAdapterSupport {
         )
     }
 
+    static func verifyGooseServerProvider(
+        provider: ConfiguredProvider,
+        summaryPrefix: String,
+        secretStore: KeychainSecretStore
+    ) async -> ProviderHealthSnapshot {
+        var issues: [String] = []
+
+        if provider.endpoint?.isEmpty != false {
+            issues.append("Goose server base URL is missing")
+        } else if let endpoint = provider.endpoint, URL(string: endpoint) == nil {
+            issues.append("Goose server base URL is invalid")
+        }
+
+        if !hasRequiredCredential(provider: provider, secretStore: secretStore) {
+            issues.append(credentialIssue(for: provider))
+        }
+
+        return ProviderHealthSnapshot(
+            providerID: provider.id,
+            status: issues.isEmpty ? .healthy : .degraded,
+            checkedAt: Date(),
+            summary: issues.isEmpty ? "\(summaryPrefix) Goose path is configured" : "\(summaryPrefix) Goose path requires attention",
+            blockingIssues: issues
+        )
+    }
+
     static func availableModels(for provider: ConfiguredProvider) -> [String] {
         if let defaultModel = provider.defaultModel, !defaultModel.isEmpty {
             return [defaultModel]

@@ -271,6 +271,190 @@ struct ProviderPlatformTests {
         #expect(bindings?["proposal_reviewer"]?.providerIdentifier == "gemini")
     }
 
+    @Test("Provider troubleshooting reports Goose-first guidance for Codex")
+    mutating func providerTroubleshootingReportsGooseFirstGuidanceForCodex() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let appConfiguration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: appConfiguration
+        ))
+        let provider = ConfiguredProvider(
+            family: .codex,
+            displayName: "Codex Goose",
+            transport: .gooseServer,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .none,
+            defaultModel: "gpt-5-codex"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [provider],
+                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.goose-first")
+        ))
+
+        await registry.refreshDiagnostics(appConfiguration: appStore.configuration)
+        let report = try #require(registry.troubleshootingReport(for: provider.id))
+
+        #expect(report.status == .healthy || report.status == .warning)
+        #expect(report.gooseFirstGuidance != nil)
+        #expect(report.evidence.contains { $0.label == "Endpoint" })
+    }
+
+    @Test("Provider troubleshooting blocks Goose-backed provider without endpoint")
+    mutating func providerTroubleshootingBlocksMissingGooseEndpoint() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let appConfiguration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+        let provider = ConfiguredProvider(
+            family: .codex,
+            displayName: "Codex Goose",
+            transport: .gooseServer,
+            endpoint: nil,
+            authMode: .none,
+            defaultModel: "gpt-5-codex"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [provider],
+                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.goose-endpoint")
+        ))
+
+        let service = ProviderTroubleshootingService()
+        let report = await service.report(
+            for: provider,
+            providerRegistry: registry,
+            appConfiguration: appConfiguration
+        )
+
+        #expect(report.status == .blocked)
+        #expect(report.failureLayer == .gooseEndpoint)
+        #expect(report.evidence.contains { $0.label == "Endpoint" && $0.state == .blocked })
+    }
+
+    @Test("Provider troubleshooting blocks Codex CLI fallback when executable is missing")
+    mutating func providerTroubleshootingBlocksMissingCLIExecutable() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let appConfiguration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+        let provider = ConfiguredProvider(
+            family: .codex,
+            displayName: "Codex CLI",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gpt-5-codex"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [provider],
+                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.missing-cli")
+        ))
+
+        let service = ProviderTroubleshootingService(whichExecutable: { _ in nil })
+        let report = await service.report(
+            for: provider,
+            providerRegistry: registry,
+            appConfiguration: appConfiguration
+        )
+
+        #expect(report.status == .blocked)
+        #expect(report.failureLayer == .cliExecutable)
+        #expect(report.remediation.contains { $0.contains("Goose Server transport") })
+    }
+
+    @Test("Provider registry caches troubleshooting reports after refresh")
+    mutating func providerRegistryCachesTroubleshootingReports() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let appConfiguration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+        let provider = ConfiguredProvider(
+            family: .claude,
+            displayName: "Claude Goose",
+            transport: .gooseServer,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .apiKey,
+            defaultModel: "claude-opus-4"
+        )
+        let secretStore = makeTestSecretStore("com.chainworks.tests.cached-reports")
+        try secretStore.store(secret: "test-key", for: ProviderAdapterSupport.secretKey(for: provider))
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [provider],
+                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: provider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: secretStore
+        ))
+
+        await registry.refreshDiagnostics(appConfiguration: appConfiguration)
+
+        let report = try #require(registry.troubleshootingReport(for: provider.id))
+        #expect(report.displayName == "Claude Goose")
+        #expect(registry.lastRefreshedAt != nil)
+    }
+
     @Test("Settings transfer exports schema version")
     mutating func settingsTransferExportsSchemaVersion() throws {
         let tempDirectory = try makeTempDirectory()

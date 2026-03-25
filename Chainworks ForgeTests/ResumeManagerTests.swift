@@ -12,7 +12,7 @@ struct ResumeManagerTests {
 
     init() throws {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
-        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let config = ModelConfiguration("ResumeManagerTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
         context = container.mainContext
         compiler = RunPlanCompiler(modelContext: context)
@@ -71,55 +71,35 @@ struct ResumeManagerTests {
         return (run, plan, workspace)
     }
 
-    // MARK: - Find Interrupted Runs
+    // MARK: - Find Interrupted Runs (parameterized — Proposal 009 REQ-005)
 
-    @Test("Find interrupted runs")
-    func findInterruptedRuns() async throws {
-        let (run, _, _) = try makeRunFromPlan()
-        run.status = .running
-        try context.save()
-
-        let manager = ResumeManager(modelContext: context)
-        let interrupted = try manager.findInterruptedRuns()
-
-        #expect(interrupted.count == 1)
-        #expect(interrupted[0].id == run.id)
+    struct InterruptedRunCase: CustomStringConvertible, Sendable {
+        let status: RunStatus
+        let shouldBeFound: Bool
+        var description: String { "\(status.rawValue) → \(shouldBeFound ? "found" : "not found")" }
     }
 
-    @Test("Find interrupted runs waiting approval")
-    func findInterruptedRunsWaitingApproval() async throws {
+    @Test("findInterruptedRuns classifies status correctly", arguments: [
+        InterruptedRunCase(status: .running, shouldBeFound: true),
+        InterruptedRunCase(status: .waitingApproval, shouldBeFound: true),
+        InterruptedRunCase(status: .completed, shouldBeFound: false),
+        InterruptedRunCase(status: .cancelled, shouldBeFound: false),
+        InterruptedRunCase(status: .failed, shouldBeFound: false),
+    ])
+    func findInterruptedRunsByStatus(testCase: InterruptedRunCase) async throws {
         let (run, _, _) = try makeRunFromPlan()
-        run.status = .waitingApproval
+        run.status = testCase.status
         try context.save()
 
         let manager = ResumeManager(modelContext: context)
         let interrupted = try manager.findInterruptedRuns()
 
-        #expect(interrupted.count == 1)
-    }
-
-    @Test("Completed runs not found")
-    func completedRunsNotFound() async throws {
-        let (run, _, _) = try makeRunFromPlan()
-        run.status = .completed
-        try context.save()
-
-        let manager = ResumeManager(modelContext: context)
-        let interrupted = try manager.findInterruptedRuns()
-
-        #expect(interrupted.isEmpty, "Completed runs should not be found as interrupted")
-    }
-
-    @Test("Cancelled runs not found")
-    func cancelledRunsNotFound() async throws {
-        let (run, _, _) = try makeRunFromPlan()
-        run.status = .cancelled
-        try context.save()
-
-        let manager = ResumeManager(modelContext: context)
-        let interrupted = try manager.findInterruptedRuns()
-
-        #expect(interrupted.isEmpty, "Cancelled runs should not be found as interrupted")
+        if testCase.shouldBeFound {
+            #expect(interrupted.count == 1, "\(testCase.status.rawValue) should be found as interrupted")
+            #expect(interrupted.first?.id == run.id)
+        } else {
+            #expect(interrupted.isEmpty, "\(testCase.status.rawValue) should NOT be found as interrupted")
+        }
     }
 
     // MARK: - Classification
@@ -300,6 +280,8 @@ struct ResumeManagerTests {
             return
         }
         #expect(orchestrator.executor is GooseAgentExecutor)
+
+        service.cancelRun(runID: run.id)
     }
 
     @Test("ExecutionService blocks live workflow without runtime config")

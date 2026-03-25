@@ -29,6 +29,9 @@ struct FirstRunSetupWizard: View {
                         Button("First Run Setup Ready") {}
                             .buttonStyle(.plain)
                             .accessibilityIdentifier("first-run-setup-surface-ready")
+                        Button("First Run Setup Root") {}
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("first-run-setup-wizard")
                     }
                 }
                 Section("Workspace & YAML") {
@@ -45,22 +48,18 @@ struct FirstRunSetupWizard: View {
                 }
 
                 Section("Suggested Providers") {
-                    Button("Add Codex CLI") {
-                        providerSettingsStore.upsert(provider: ConfiguredProvider(
+                    Button("Add Codex via Goose") {
+                        providerSettingsStore.upsert(provider: gooseFirstProvider(
                             family: .codex,
-                            displayName: "Codex CLI",
-                            transport: .cli,
-                            authMode: .none,
+                            displayName: "Codex Goose",
                             defaultModel: "gpt-5-codex"
                         ))
                     }
                     .accessibilityIdentifier("first-run-add-codex")
-                    Button("Add Claude CLI") {
-                        providerSettingsStore.upsert(provider: ConfiguredProvider(
+                    Button("Add Claude via Goose") {
+                        providerSettingsStore.upsert(provider: gooseFirstProvider(
                             family: .claude,
-                            displayName: "Claude CLI",
-                            transport: .cli,
-                            authMode: .none,
+                            displayName: "Claude Goose",
                             defaultModel: "claude-sonnet-4"
                         ))
                     }
@@ -81,12 +80,15 @@ struct FirstRunSetupWizard: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("first-run-provider-count")
+                    Text("Codex and Claude are Goose-first in the app. Use Goose-backed transport unless you intentionally need CLI fallback.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Verification") {
-                    Button("Refresh Provider Health") {
+                    Button("Refresh Provider Diagnostics") {
                         Task {
-                            await providerRegistry.refreshHealth()
+                            await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
                             await refreshPreflight()
                         }
                     }
@@ -177,7 +179,7 @@ struct FirstRunSetupWizard: View {
                     Button("Save") {
                         persistConfiguration()
                         Task {
-                            await providerRegistry.refreshHealth()
+                            await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
                             await refreshPreflight()
                         }
                         isPresented = false
@@ -223,6 +225,17 @@ struct FirstRunSetupWizard: View {
         }
     }
 
+    private func gooseFirstProvider(family: ProviderFamily, displayName: String, defaultModel: String) -> ConfiguredProvider {
+        ConfiguredProvider(
+            family: family,
+            displayName: displayName,
+            transport: .gooseServer,
+            endpoint: ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_BASE_URL"],
+            authMode: ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey,
+            defaultModel: defaultModel
+        )
+    }
+
     private func refreshPreflight() async {
         let workflowURL = URL(fileURLWithPath: workflowSourcePath.isEmpty ? appConfigurationStore.configuration.workflowSourcePath : workflowSourcePath)
         let catalogURL = URL(fileURLWithPath: agentCatalogSourcePath.isEmpty ? appConfigurationStore.configuration.agentCatalogSourcePath : agentCatalogSourcePath)
@@ -239,7 +252,7 @@ struct FirstRunSetupWizard: View {
 
     private func saveAndLaunchSampleRun() async {
         persistConfiguration()
-        await providerRegistry.refreshHealth()
+        await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
         await refreshPreflight()
 
         let launcher = SampleRunLauncher(
@@ -301,11 +314,28 @@ struct FirstRunSetupWizard: View {
             supportBundleExportPath = appConfigurationStore.configuration.supportBundleExportPath ?? ""
             transferMessage = "Imported settings from \(fileURL.lastPathComponent)"
             Task {
-                await providerRegistry.refreshHealth()
+                await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
                 await refreshPreflight()
             }
         } catch {
             transferMessage = error.localizedDescription
         }
     }
+}
+
+#Preview("First Run Setup — Seeded") {
+    @Previewable @State var isPresented = true
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let appConfigurationStore = PreviewSupport.makeAppConfigurationStore()
+    let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
+    let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+
+    return FirstRunSetupWizard(isPresented: $isPresented)
+        .modelContainer(container)
+        .environment(executionService)
+        .environment(appConfigurationStore)
+        .environment(providerSettingsStore)
+        .environment(providerRegistry)
+        .frame(width: 760, height: 860)
 }

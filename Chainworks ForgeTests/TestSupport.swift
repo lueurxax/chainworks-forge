@@ -21,7 +21,7 @@ func makeTestModelContext() throws -> ModelContext {
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self
     ])
-    let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+    let config = ModelConfiguration("TestContext-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
     let container = try ModelContainer(for: schema, configurations: [config])
     return container.mainContext
 }
@@ -33,7 +33,7 @@ func makeTestModelContainer() throws -> (container: ModelContainer, context: Mod
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self
     ])
-    let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+    let config = ModelConfiguration("TestContainer-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
     let container = try ModelContainer(for: schema, configurations: [config])
     return (container, container.mainContext)
 }
@@ -185,13 +185,19 @@ final class TestBundleMarker: NSObject {}
 
 /// Loads the canonical workflow fixture from the test bundle.
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
-    let url = Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml")!
+    let url = try #require(
+        Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
+        "workflow.yaml fixture must be bundled with tests"
+    )
     return try YAMLParser.loadWorkflow(from: url)
 }
 
 /// Loads the canonical agent catalog fixture from the test bundle.
 func loadTestCanonicalCatalog() throws -> AgentCatalog {
-    let url = Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml")!
+    let url = try #require(
+        Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml"),
+        "agents.yaml fixture must be bundled with tests"
+    )
     return try YAMLParser.loadAgentCatalog(from: url)
 }
 
@@ -206,7 +212,10 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
 
 /// Loads the compact workflow fixture from the test bundle.
 func loadTestCompactWorkflow() throws -> CompactWorkflowDefinition {
-    let url = Bundle(for: TestBundleMarker.self).url(forResource: "proposal-to-release", withExtension: "yaml")!
+    let url = try #require(
+        Bundle(for: TestBundleMarker.self).url(forResource: "proposal-to-release", withExtension: "yaml"),
+        "proposal-to-release.yaml fixture must be bundled with tests"
+    )
     return try YAMLParser.loadCompactWorkflow(from: url)
 }
 
@@ -287,7 +296,9 @@ func expectArtifactNonEmpty(
 // MARK: - Async Polling Helper (Swift Testing)
 
 /// Confirmation-based async polling for Swift Testing.
-/// Replaces `pollUntil` in migrated test files.
+/// Uses `confirmation()` so that a timeout is reported as an unconfirmed
+/// expectation rather than a plain `Issue.record`, matching the proposal's
+/// §6.2 contract.
 @MainActor
 func awaitCondition(
     _ description: String = "condition met",
@@ -295,12 +306,12 @@ func awaitCondition(
     interval: TimeInterval = 0.05,
     condition: @escaping @MainActor () -> Bool
 ) async {
-    let deadline = Date().addingTimeInterval(timeout)
-    while await !condition() {
-        if Date() > deadline {
-            Issue.record(Comment(rawValue: "\(description): timed out after \(timeout)s"))
-            return
+    await confirmation(Comment(rawValue: description)) { confirm in
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { return }
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
-        try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        confirm()
     }
 }

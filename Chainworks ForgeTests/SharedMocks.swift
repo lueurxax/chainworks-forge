@@ -1,4 +1,5 @@
 import Foundation
+import os
 @testable import Chainworks_Forge
 
 // MARK: - Shared Mock Objects
@@ -135,27 +136,21 @@ struct SharedStaticResultExecutor: AgentExecutor {
 
 // MARK: - Thread-Safe Event Collector
 
-/// Thread-safe collector for execution events.
+/// Thread-safe collector for execution events (compiler-verified Sendable via OSAllocatedUnfairLock).
 /// Use in GooseAgentExecutor tests to avoid unsafe mutation of captured vars in @Sendable closures.
-final class SharedEventCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _events: [ExecutionEvent] = []
+/// Replaces the former `@unchecked Sendable` class per TEST-004.
+final class SharedEventCollector: Sendable {
+    private let storage = OSAllocatedUnfairLock(initialState: [ExecutionEvent]())
 
     func append(_ event: ExecutionEvent) {
-        lock.lock()
-        _events.append(event)
-        lock.unlock()
+        storage.withLock { $0.append(event) }
     }
 
     var events: [ExecutionEvent] {
-        lock.lock()
-        defer { lock.unlock() }
-        return _events
+        storage.withLock { Array($0) }
     }
 
     var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _events.count
+        storage.withLock { $0.count }
     }
 }

@@ -6,8 +6,10 @@ final class ProviderRegistry {
     let settingsStore: ProviderSettingsStore
     let secretStore: KeychainSecretStore
     private let diagnosticService: ProviderDiagnosticService
+    private let troubleshootingService: ProviderTroubleshootingService
 
     @MainActor private(set) var latestHealthByProviderID: [UUID: ProviderHealthSnapshot] = [:]
+    @MainActor private(set) var latestTroubleshootingByProviderID: [UUID: ProviderTroubleshootingReport] = [:]
     @MainActor private(set) var lastRefreshedAt: Date?
 
     @MainActor
@@ -21,6 +23,7 @@ final class ProviderRegistry {
         self.settingsStore = settingsStore
         self.secretStore = resolvedSecretStore
         self.diagnosticService = ProviderDiagnosticService(secretStore: resolvedSecretStore, adapters: resolvedAdapters)
+        self.troubleshootingService = ProviderTroubleshootingService()
     }
 
     @MainActor
@@ -56,7 +59,27 @@ final class ProviderRegistry {
     }
 
     @MainActor
+    func refreshDiagnostics(appConfiguration: AppConfiguration) async {
+        await refreshHealth()
+        var reports: [UUID: ProviderTroubleshootingReport] = [:]
+        for provider in configuredProviders {
+            reports[provider.id] = await troubleshootingService.report(
+                for: provider,
+                providerRegistry: self,
+                appConfiguration: appConfiguration
+            )
+        }
+        latestTroubleshootingByProviderID = reports
+        lastRefreshedAt = Date()
+    }
+
+    @MainActor
     func healthSnapshot(for providerID: UUID) -> ProviderHealthSnapshot? {
         latestHealthByProviderID[providerID]
+    }
+
+    @MainActor
+    func troubleshootingReport(for providerID: UUID) -> ProviderTroubleshootingReport? {
+        latestTroubleshootingByProviderID[providerID]
     }
 }

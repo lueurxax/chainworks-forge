@@ -489,25 +489,8 @@ struct LiveGooseConnectionProofTests {
 
         let executor = GooseAgentExecutor(transport: transport)
 
-        // Collect live execution events
-        final class EventCollector: @unchecked Sendable {
-            private let lock = NSLock()
-            private var _events: [ExecutionEvent] = []
-
-            func append(_ event: ExecutionEvent) {
-                lock.lock()
-                _events.append(event)
-                lock.unlock()
-            }
-
-            var events: [ExecutionEvent] {
-                lock.lock()
-                defer { lock.unlock() }
-                return _events
-            }
-        }
-
-        let collector = EventCollector()
+        // Collect live execution events (uses SharedEventCollector per TEST-004)
+        let collector = SharedEventCollector()
         executor.onExecutionEvent = { _, event in
             collector.append(event)
         }

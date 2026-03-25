@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
@@ -11,7 +12,7 @@ struct RunPlanCompilerTests {
 
     init() throws {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
-        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let config = ModelConfiguration("RunPlanCompilerTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
         context = container.mainContext
         compiler = RunPlanCompiler(modelContext: context)

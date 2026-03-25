@@ -341,6 +341,57 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "P006_PilotReadiness_Refresh")
     }
 
+    func testIdeaArchiveFlowSurface() throws {
+        let app = makeApp(
+            seededIdeaTitle: "Archive Candidate",
+            directSurface: "idea_archive"
+        )
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-idea_archive")
+        XCTAssertTrue(directSurface.waitForExistence(timeout: 20),
+                      "Archive direct surface must finish bootstrap")
+
+        let archiveButton = app.buttons["archive-idea-button"].firstMatch
+        XCTAssertTrue(archiveButton.waitForExistence(timeout: 10),
+                      "Idea detail must expose archive action for an eligible idea")
+        archiveButton.click()
+
+        let archiveMessage = app.staticTexts["archive-idea-message"].firstMatch
+        XCTAssertTrue(archiveMessage.waitForExistence(timeout: 10),
+                      "Archiving an idea should surface a confirmation message")
+
+        let restoreButton = app.buttons["restore-idea-button"].firstMatch
+        XCTAssertTrue(restoreButton.waitForExistence(timeout: 10),
+                      "Archived idea detail should immediately expose restore action")
+        screenshot(app, name: "P010_IdeaArchive")
+    }
+
+    func testWorkflowMapSurfaceShowsAfterRunStart() throws {
+        let app = makeApp(
+            seededIdeaTitle: "Workflow Map Test",
+            liveFixture: true,
+            seedWaitingApprovalRun: true,
+            directSurface: "workflow_map"
+        )
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-workflow_map")
+        XCTAssertTrue(directSurface.waitForExistence(timeout: 20),
+                      "Workflow map direct surface must finish bootstrap")
+
+        let workflowMap = anyElement(app, identifier: "workflow-map-view")
+        XCTAssertTrue(workflowMap.waitForExistence(timeout: 20),
+                      "Workflow map surface must render the workflow map owner pane")
+        XCTAssertTrue(anyElement(app, identifier: "workflow-map-topology").waitForExistence(timeout: 10),
+                      "Workflow map must render topology")
+        XCTAssertTrue(anyElement(app, identifier: "workflow-map-agents").waitForExistence(timeout: 10),
+                      "Workflow map must render agent panels")
+        XCTAssertTrue(anyElement(app, identifier: "workflow-map-loops").waitForExistence(timeout: 10),
+                      "Workflow map must render loop telemetry")
+        screenshot(app, name: "P010_WorkflowMap")
+    }
+
     // MARK: - REQ-011: Start Run Sheet UI
 
     func testStartRunSheetUI() throws {

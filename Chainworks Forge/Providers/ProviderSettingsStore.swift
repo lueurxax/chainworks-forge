@@ -88,16 +88,18 @@ final class ProviderSettingsStore {
         var providers: [ConfiguredProvider] = seedsInMemory ? [
             ConfiguredProvider(
                 family: .codex,
-                displayName: "Codex CLI",
-                transport: .cli,
-                authMode: .none,
+                displayName: "Codex Goose",
+                transport: .gooseServer,
+                endpoint: environment["CHAINWORKS_GOOSE_BASE_URL"],
+                authMode: environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey,
                 defaultModel: "gpt-5-codex"
             ),
             ConfiguredProvider(
                 family: .claude,
-                displayName: "Claude CLI",
-                transport: .cli,
-                authMode: .none,
+                displayName: "Claude Goose",
+                transport: .gooseServer,
+                endpoint: environment["CHAINWORKS_GOOSE_BASE_URL"],
+                authMode: environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey,
                 defaultModel: "claude-sonnet-4"
             ),
             ConfiguredProvider(
@@ -111,13 +113,14 @@ final class ProviderSettingsStore {
 
         if let liveProvider = environment["CHAINWORKS_LIVE_PROVIDER"],
            let family = ProviderFamily.from(runtimeIdentifier: liveProvider) {
-            let transport: ProviderTransport = environment["CHAINWORKS_GOOSE_BASE_URL"] == nil ? .cli : .httpAPI
+            let gooseBaseURL = environment["CHAINWORKS_GOOSE_BASE_URL"]
+            let transport: ProviderTransport = gooseBaseURL == nil ? .cli : .gooseServer
             let authMode: ProviderAuthMode = environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey
-            let endpoint = environment["CHAINWORKS_GOOSE_BASE_URL"]
+            let endpoint = gooseBaseURL
             providers.removeAll { $0.family == family }
             providers.append(ConfiguredProvider(
                 family: family,
-                displayName: "\(family.displayName) Seeded",
+                displayName: transport == .gooseServer ? "\(family.displayName) Goose" : "\(family.displayName) Seeded",
                 transport: transport,
                 endpoint: endpoint,
                 authMode: authMode,

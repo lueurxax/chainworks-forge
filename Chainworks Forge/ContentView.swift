@@ -21,6 +21,8 @@ struct ContentView: View {
         case providerSettings = "provider_settings"
         case pilotReadiness = "pilot_readiness"
         case firstRunSetup = "first_run_setup"
+        case ideaArchive = "idea_archive"
+        case workflowMap = "workflow_map"
     }
 
     init() {
@@ -134,22 +136,42 @@ struct ContentView: View {
         case .pilotReadiness:
             PilotReadinessView()
         case .firstRunSetup:
-            EmptyView()
+            FirstRunSetupWizard(isPresented: .constant(true))
+        case .ideaArchive:
+            UITestIdeaArchiveSurface()
+        case .workflowMap:
+            UITestWorkflowMapSurface()
         }
     }
 }
 
 #Preview {
-    ContentView()
-        .modelContainer(
-            for: [Idea.self],
-            inMemory: true
-        )
-        .environment(ExecutionService(
-            modelContext: try! ModelContainer(
-                for: Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self]),
-                configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
-            ).mainContext,
-            executor: SimulatedAgentExecutor()
-        ))
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let appConfigurationStore = PreviewSupport.makeAppConfigurationStore()
+    let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
+    let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+
+    return ContentView()
+        .modelContainer(container)
+        .environment(executionService)
+        .environment(appConfigurationStore)
+        .environment(providerSettingsStore)
+        .environment(providerRegistry)
+}
+
+#Preview("Content Shell — Seeded") {
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let appConfigurationStore = PreviewSupport.makeAppConfigurationStore()
+    let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
+    let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+
+    return ContentView()
+        .modelContainer(container)
+        .environment(executionService)
+        .environment(appConfigurationStore)
+        .environment(providerSettingsStore)
+        .environment(providerRegistry)
+        .frame(width: 1280, height: 820)
 }

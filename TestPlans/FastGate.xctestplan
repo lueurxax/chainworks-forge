@@ -17,6 +17,13 @@
   },
   "testTargets" : [
     {
+      "selectedTests" : [
+        "ArtifactManagerTests",
+        "OrchestratorTests",
+        "ProviderPlatformTests",
+        "ResumeManagerTests",
+        "RunTests"
+      ],
       "target" : {
         "containerPath" : "container:Chainworks Forge.xcodeproj",
         "identifier" : "CE8913472F6FC30A006EC77C",

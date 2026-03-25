@@ -8,6 +8,16 @@ struct IdeaListView: View {
     @State private var newTitle = ""
     @State private var newBody = ""
     @State private var newAttachmentPath = ""
+    @State private var showNewIdeaSheet = false
+    @State private var showArchivedIdeas = false
+
+    private var activeIdeas: [Idea] {
+        ideas.filter { !$0.isArchived }
+    }
+
+    private var archivedIdeas: [Idea] {
+        ideas.filter(\.isArchived)
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -16,24 +26,27 @@ struct IdeaListView: View {
                 summaryStrip
 
                 Group {
-                    if ideas.isEmpty {
+                    if activeIdeas.isEmpty {
                         ContentUnavailableView(
-                            "No ideas yet",
+                            archivedIdeas.isEmpty ? "No ideas yet" : "No active ideas",
                             systemImage: "lightbulb",
-                            description: Text("Create your first idea to get started.")
+                            description: Text(archivedIdeas.isEmpty ? "Create your first idea to get started." : "Open the archive lane to restore an idea or create a new one.")
                         )
                     } else {
                         List {
-                            ForEach(ideas) { idea in
+                            ForEach(activeIdeas) { idea in
                                 NavigationLink {
                                     IdeaDetailView(idea: idea)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(idea.title).font(.headline)
-                                        HStack {
-                                            Text(idea.status.rawValue.capitalized)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
+                                        HStack(spacing: 8) {
+                                            IdeaLifecycleBadge(idea: idea)
+                                            if idea.isArchived {
+                                                Image(systemName: "archivebox.fill")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
                                             if idea.attachmentPath != nil {
                                                 Image(systemName: "paperclip")
                                                     .font(.caption2)
@@ -47,6 +60,9 @@ struct IdeaListView: View {
                                             }
                                         }
                                     }
+                                }
+                                .contextMenu {
+                                    ideaArchiveMenu(for: idea)
                                 }
                                 .accessibilityIdentifier("idea-row-\(idea.title)")
                             }
@@ -64,6 +80,12 @@ struct IdeaListView: View {
             .navigationSplitViewColumnWidth(min: 200, ideal: 250)
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
+                    Button(action: { showArchivedIdeas = true }) {
+                        Label("Archive", systemImage: "archivebox")
+                    }
+                    .accessibilityIdentifier("ideas-open-archive")
+                }
+                ToolbarItem(placement: .primaryAction) {
                     Button(action: { showNewIdeaSheet = true }) {
                         Label("New Idea", systemImage: "plus")
                     }
@@ -72,6 +94,10 @@ struct IdeaListView: View {
             .sheet(isPresented: $showNewIdeaSheet) {
                 newIdeaSheet
             }
+            .sheet(isPresented: $showArchivedIdeas) {
+                ArchivedIdeasView()
+                    .environment(\.modelContext, modelContext)
+            }
             .accessibilityIdentifier("ideas-root-view")
         } detail: {
             Text("Select an idea")
@@ -79,18 +105,26 @@ struct IdeaListView: View {
         }
     }
 
-    @State private var showNewIdeaSheet = false
-
     // MARK: - Summary Strip
 
     private var summaryStrip: some View {
-        let draftCount = ideas.filter { $0.status == .draft }.count
-        let activeCount = ideas.filter { $0.status == .active }.count
+        let draftCount = activeIdeas.filter { $0.status == .draft }.count
+        let activeCount = activeIdeas.filter { $0.status == .active }.count
 
         return HStack {
             Image(systemName: "lightbulb.fill")
                 .foregroundStyle(.blue)
-            Text("\(ideas.count) ideas \u{00B7} \(draftCount) drafts \u{00B7} \(activeCount) active")
+            Text("\(activeIdeas.count) ideas \u{00B7} \(draftCount) drafts \u{00B7} \(activeCount) active")
+            if !archivedIdeas.isEmpty {
+                Button {
+                    showArchivedIdeas = true
+                } label: {
+                    Label("\(archivedIdeas.count) archived", systemImage: "archivebox")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("ideas-summary-open-archive")
+            }
             Spacer()
             if executionService.hasActiveRuns {
                 Label("\(executionService.activeOrchestrators.count) running", systemImage: "bolt.fill")
@@ -184,9 +218,37 @@ struct IdeaListView: View {
 
     private func deleteIdeas(offsets: IndexSet) {
         for index in offsets {
-            modelContext.delete(ideas[index])
+            modelContext.delete(activeIdeas[index])
         }
         try? modelContext.save()
+    }
+
+    private func statusLabel(for idea: Idea) -> String {
+        if idea.isArchived {
+            return "Archived"
+        }
+        return idea.status.rawValue.capitalized
+    }
+
+    @MainActor
+    @ViewBuilder
+    private func ideaArchiveMenu(for idea: Idea) -> some View {
+        let service = IdeaArchiveService(modelContext: modelContext)
+
+        if idea.isArchived {
+            Button("Restore") {
+                try? service.restore(idea)
+            }
+        } else {
+            let eligibility = IdeaArchivePolicy.eligibility(for: idea)
+            Button("Archive") {
+                try? service.archive(idea)
+            }
+            .disabled(!eligibility.canArchive)
+            if let reason = eligibility.reason {
+                Text(reason)
+            }
+        }
     }
 
     private func browseAttachment() {
@@ -209,6 +271,7 @@ struct IdeaDetailView: View {
     let idea: Idea
     @State private var showStartRunSheet = false
     @State private var activeRun: Run?
+    @State private var archiveMessage: String?
 
     /// Whether this idea has an active run (prevents starting another).
     private var hasActiveRun: Bool {
@@ -232,6 +295,9 @@ struct IdeaDetailView: View {
                         LabeledContent("Title", value: idea.title)
                         LabeledContent("Status", value: idea.status.rawValue.capitalized)
                         LabeledContent("Created", value: idea.createdAt, format: .dateTime)
+                        if let archivedAt = idea.archivedAt {
+                            LabeledContent("Archived", value: archivedAt, format: .dateTime)
+                        }
                         if let path = idea.attachmentPath {
                             LabeledContent("Attachment", value: path)
                         }
@@ -242,6 +308,48 @@ struct IdeaDetailView: View {
                             .textSelection(.enabled)
                     }
 
+                    Section("Archive") {
+                        if idea.isArchived {
+                            Label("Archived ideas stay visible here and in the archive lane until restored.", systemImage: "archivebox.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button {
+                                restoreIdea()
+                            } label: {
+                                Label("Restore Idea", systemImage: "arrow.uturn.backward")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("restore-idea-button")
+                        } else {
+                            let eligibility = IdeaArchivePolicy.eligibility(for: idea)
+                            Button {
+                                archiveIdea()
+                            } label: {
+                                Label("Archive Idea", systemImage: "archivebox")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!eligibility.canArchive)
+                            .accessibilityIdentifier("archive-idea-button")
+
+                            if let reason = eligibility.reason {
+                                Text(reason)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityIdentifier("archive-idea-reason")
+                            } else {
+                                Text("Archive the idea when it is draft or its latest run is terminal.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let archiveMessage {
+                            Text(archiveMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("archive-idea-message")
+                        }
+                    }
+
                     // Proposal 002 + 004: Start New Run action
                     Section {
                         Button {
@@ -249,11 +357,15 @@ struct IdeaDetailView: View {
                         } label: {
                             Label("Start New Run", systemImage: "play.fill")
                         }
-                        .disabled(hasActiveRun)
+                        .disabled(hasActiveRun || idea.isArchived)
                         .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("start-new-run-button")
 
-                        if hasActiveRun {
+                        if idea.isArchived {
+                            Text("Restore the idea before starting a new run.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if hasActiveRun {
                             Text("An active run already exists for this idea.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -329,6 +441,28 @@ struct IdeaDetailView: View {
         }
     }
 
+    @MainActor
+    private func archiveIdea() {
+        let service = IdeaArchiveService(modelContext: modelContext)
+        do {
+            try service.archive(idea)
+            archiveMessage = "Archived idea."
+        } catch {
+            archiveMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func restoreIdea() {
+        let service = IdeaArchiveService(modelContext: modelContext)
+        do {
+            try service.restore(idea)
+            archiveMessage = "Restored idea."
+        } catch {
+            archiveMessage = error.localizedDescription
+        }
+    }
+
     private func runStatusIcon(_ status: RunStatus) -> some View {
         let (icon, color): (String, Color) = {
             switch status {
@@ -392,6 +526,7 @@ struct WorkflowStartRunSheet: View {
     @State private var preflightReport: PreflightReport?
     @State private var showPreflightSheet = false
     @State private var allowWarnStart = false
+    @State private var showAdvancedOverrides = false
 
     private enum CompileState: Equatable {
         case idle
@@ -505,6 +640,8 @@ struct WorkflowStartRunSheet: View {
 
     private var launchConfigurationBody: some View {
         VStack(spacing: 16) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
                 Image(systemName: "play.circle.fill")
                     .font(.title2)
@@ -607,14 +744,32 @@ struct WorkflowStartRunSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if let compiledPlan {
-                GroupBox("Run Start Overrides") {
-                    RunStartOverridesView(
-                        plan: compiledPlan,
-                        providerRegistry: providerRegistry,
-                        startOptions: $startOptions
-                    )
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            if let compiledPlan, selectedMode == .live {
+                GroupBox {
+                    DisclosureGroup(isExpanded: $showAdvancedOverrides) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Optional per-profile provider/model/effort overrides for debugging or targeted experiments.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            RunStartOverridesView(
+                                plan: compiledPlan,
+                                providerRegistry: providerRegistry,
+                                startOptions: $startOptions
+                            )
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Advanced Provider Overrides")
+                                .font(.subheadline.bold())
+                            Text("Usually leave this collapsed and use the catalog defaults.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .accessibilityIdentifier("advanced-provider-overrides")
                 }
             }
 
@@ -713,8 +868,10 @@ struct WorkflowStartRunSheet: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+                } // end ScrollView inner VStack
+            } // end ScrollView
 
-            Spacer()
+            Divider()
 
             HStack {
                 Button("Cancel", role: .cancel) {
@@ -1050,6 +1207,10 @@ struct WorkflowRunProgressView: View {
                 LabeledContent("Total Cost", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
             }
 
+            Section("Workflow Map") {
+                WorkflowMapView(run: run)
+            }
+
                 Section("Current Phase") {
                 LabeledContent("Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
                 LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
@@ -1185,57 +1346,9 @@ struct WorkflowRunProgressView: View {
                 }
             }
 
-            if !liveTimeline.isEmpty {
-                Section("Live Timeline") {
-                    ForEach(liveTimeline) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(entry.agentTitle)
-                                    .font(.headline)
-                                Spacer()
-                                Text(entry.event.type.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(entry.event.detail)
-                                .font(.caption)
-                            HStack(spacing: 10) {
-                                Text(entry.stageID)
-                                if let sessionID = entry.event.sessionID {
-                                    Text("Session \(sessionID)")
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                }
-                                Text(entry.event.timestamp, format: .dateTime.hour().minute().second())
-                            }
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
-            }
-
-            Section("Active Agents") {
-                if activeAgents.isEmpty {
-                    Text(run.status == .completed ? "No active agents." : "No agents are currently executing.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(activeAgents) { agentExecution in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(agentExecution.agentTitle)
-                                .font(.headline)
-                            Text(agentExecution.taskName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            if let logSnippet = blankToNil(agentExecution.logSnippet) {
-                                Text(logSnippet)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                    }
-                }
+            Section("Workflow Map") {
+                WorkflowMapView(run: run)
+                    .accessibilityIdentifier("workflow-map-section")
             }
 
             Section(run.status == .completed ? "Completed Feature Report" : "Artifacts") {
@@ -1539,3 +1652,34 @@ struct WorkflowArtifactInspectorView: View {
     }
 }
 #endif
+
+#Preview("Ideas — Operator List") {
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+
+    return IdeaListView()
+        .modelContainer(container)
+        .environment(executionService)
+        .frame(width: 1280, height: 820)
+}
+
+#Preview("Start New Run — Live") {
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let appConfigurationStore = PreviewSupport.makeAppConfigurationStore()
+    let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
+    let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+    let idea = Idea(
+        title: "Investigate provider setup",
+        body: "Make Codex and Claude configuration legible and Goose-backed.",
+        attachmentPath: "/Users/user/Documents/specs/provider-setup.md"
+    )
+
+    return WorkflowStartRunSheet(idea: idea)
+        .modelContainer(container)
+        .environment(executionService)
+        .environment(appConfigurationStore)
+        .environment(providerSettingsStore)
+        .environment(providerRegistry)
+        .frame(width: 560, height: 860)
+}

@@ -54,6 +54,15 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
         rawValue.capitalized
     }
 
+    var gooseFirstPreferred: Bool {
+        switch self {
+        case .codex, .claude:
+            return true
+        case .gemini:
+            return false
+        }
+    }
+
     static func from(runtimeIdentifier: String) -> ProviderFamily? {
         switch runtimeIdentifier {
         case "codex":
@@ -72,6 +81,24 @@ enum ProviderTransport: String, Codable, CaseIterable, Sendable {
     case cli
     case localBridge
     case httpAPI
+    case gooseServer = "goose_server"
+
+    var displayName: String {
+        switch self {
+        case .cli:
+            return "CLI"
+        case .localBridge:
+            return "Local Bridge"
+        case .httpAPI:
+            return "HTTP API"
+        case .gooseServer:
+            return "Goose Server"
+        }
+    }
+
+    var isGooseBacked: Bool {
+        self == .gooseServer
+    }
 }
 
 enum ProviderAuthMode: String, Codable, CaseIterable, Sendable {

@@ -101,7 +101,7 @@ struct RunProgressScreen {
         let statusLabel = app.descendants(matching: .staticText)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", "run-status-"))
             .firstMatch
-        let sectionTitles = ["Overview", "Current Phase", "Stages", "Live Timeline", "Active Agents", "Artifacts", "Approval Gate"]
+        let sectionTitles = ["Overview", "Current Phase", "Stages", "Workflow Map", "Artifacts", "Approval Gate"]
         let sections = sectionTitles.map { sectionLabel($0) }
 
         let predicate = NSPredicate { _, _ in

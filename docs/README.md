@@ -53,6 +53,7 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 - [proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) — worktrees, implementation loop, release, dogfooding
 - [proposals/008-mvp-hardening-and-sign-off.md](proposals/008-mvp-hardening-and-sign-off.md) — MVP validation, boundary freeze, recovery UX, launch gate
+- [proposals/010-operator-clarity-idea-archive-provider-troubleshooting-and-live-workflow-visualization.md](proposals/010-operator-clarity-idea-archive-provider-troubleshooting-and-live-workflow-visualization.md) — idea archive, provider troubleshooting, live workflow map
 
 ## Evidence
 

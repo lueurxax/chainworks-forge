@@ -363,6 +363,16 @@ struct RunsHomeRow: View {
     }
 }
 
+#Preview("Runs Home — Mixed States") {
+    let container = PreviewSupport.makeModelContainer(seed: PreviewSupport.seedOperatorData)
+    let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+
+    return RunsHomeView()
+        .modelContainer(container)
+        .environment(executionService)
+        .frame(width: 1280, height: 820)
+}
+
 // MARK: - Runtime Provenance Badge (§5.3)
 
 struct RuntimeProvenanceBadge: View {
@@ -466,6 +476,12 @@ struct RunDetailPanel: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Divider()
+
+                Text("Workflow Map")
+                    .font(.headline)
+                WorkflowMapView(run: run)
 
                 Divider()
 

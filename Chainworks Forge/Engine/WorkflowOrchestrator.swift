@@ -693,12 +693,14 @@ final class WorkflowOrchestrator {
     // MARK: - Helpers
 
     private func currentIteration(for stageID: String) -> Int {
+        guard !run.isDeleted, run.modelContext != nil else { return 1 }
         let existing = run.stageExecutions.filter { $0.stageID == stageID }
         return existing.count + 1
     }
 
     private func isApprovalGranted(for stageID: String) -> Bool {
-        run.approvals.contains { $0.stageID == stageID && $0.decision == .granted }
+        guard !run.isDeleted, run.modelContext != nil else { return false }
+        return run.approvals.contains { $0.stageID == stageID && $0.decision == .granted }
     }
 
     private func loadPersistedArtifacts() {
@@ -788,7 +790,8 @@ final class WorkflowOrchestrator {
     }
 
     private func persistedArtifacts() -> [Artifact] {
-        run.stageExecutions
+        guard !run.isDeleted, run.modelContext != nil else { return [] }
+        return run.stageExecutions
             .sorted { $0.startedAt < $1.startedAt }
             .flatMap { stage in
                 stage.agentExecutions

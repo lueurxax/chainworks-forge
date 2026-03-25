@@ -19,6 +19,12 @@ struct CodexProviderAdapter: ProviderAdapter {
                 summaryPrefix: "Codex",
                 secretStore: secretStore
             )
+        case .gooseServer:
+            return await ProviderAdapterSupport.verifyGooseServerProvider(
+                provider: provider,
+                summaryPrefix: "Codex",
+                secretStore: secretStore
+            )
         }
     }
 

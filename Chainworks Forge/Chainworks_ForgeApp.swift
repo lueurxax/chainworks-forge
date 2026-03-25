@@ -334,6 +334,18 @@ struct AppBootstrapView: View {
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
+                    case .ideaArchive:
+                        UITestIdeaArchiveSurface()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                    case .workflowMap:
+                        UITestWorkflowMapSurface()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

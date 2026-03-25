@@ -151,6 +151,9 @@ struct AppScreen {
     @discardableResult
     func selectTab(_ label: String, timeout: TimeInterval = 10) -> Bool {
         _ = revealCompactNavigationIfNeeded()
+        if expectedRootVisible(for: label) {
+            return true
+        }
         let target = tab(label)
         guard target.waitForExistence(timeout: timeout) else { return false }
 
