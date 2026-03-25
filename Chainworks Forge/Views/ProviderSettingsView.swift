@@ -13,14 +13,26 @@ struct ProviderSettingsView: View {
     @State private var exportPath: String?
     @State private var showWizard = false
     @State private var availableModelsByProviderID: [UUID: [String]] = [:]
+    private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
     var body: some View {
         NavigationStack {
             List {
+                if showsUITestReadyMarker {
+                    Section {
+                        Button("Provider Settings Ready") {}
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("provider-settings-surface-ready")
+                    }
+                }
                 Section {
                     Text("Provider Settings")
                         .font(.title3.bold())
                         .accessibilityIdentifier("provider-settings-title")
+                    Button("Open First Run Wizard") {
+                        showWizard = true
+                    }
+                    .accessibilityIdentifier("provider-settings-open-wizard")
                 }
                 configurationSection
                 providerSection
@@ -33,9 +45,15 @@ struct ProviderSettingsView: View {
                     Button("Refresh Health") {
                         Task { await refreshDiagnostics() }
                     }
+                    .accessibilityIdentifier("provider-settings-refresh-health")
+                    Button("Export Settings") {
+                        exportSettings()
+                    }
+                    .accessibilityIdentifier("provider-settings-toolbar-export")
                     Button("First Run Wizard") {
                         showWizard = true
                     }
+                    .accessibilityIdentifier("provider-settings-open-wizard")
                 }
             }
             .task {
@@ -76,6 +94,22 @@ struct ProviderSettingsView: View {
                 }
             ))
             .accessibilityIdentifier("provider-settings-catalog-path")
+
+            TextField("Worktree Base Path", text: Binding(
+                get: { appConfigurationStore.configuration.worktreeBasePath ?? "" },
+                set: { newValue in
+                    appConfigurationStore.update { $0.worktreeBasePath = newValue.isEmpty ? nil : newValue }
+                }
+            ))
+            .accessibilityIdentifier("provider-settings-worktree-path")
+
+            TextField("Support Bundle Export Path", text: Binding(
+                get: { appConfigurationStore.configuration.supportBundleExportPath ?? "" },
+                set: { newValue in
+                    appConfigurationStore.update { $0.supportBundleExportPath = newValue.isEmpty ? nil : newValue }
+                }
+            ))
+            .accessibilityIdentifier("provider-settings-export-path")
 
             Text("Configuration Source: \(appConfigurationStore.configuration.activeConfigurationSource.displayName)")
                 .font(.caption)
@@ -176,24 +210,31 @@ struct ProviderSettingsView: View {
                         Text(family.displayName).tag(family)
                     }
                 }
+                .accessibilityIdentifier("provider-settings-family-picker")
 
                 Picker("Transport", selection: $draft.transport) {
                     ForEach(ProviderTransport.allCases, id: \.self) { transport in
                         Text(transport.rawValue).tag(transport)
                     }
                 }
+                .accessibilityIdentifier("provider-settings-transport-picker")
 
                 Picker("Auth", selection: $draft.authMode) {
                     ForEach(ProviderAuthMode.allCases, id: \.self) { authMode in
                         Text(authMode.rawValue).tag(authMode)
                     }
                 }
+                .accessibilityIdentifier("provider-settings-auth-picker")
 
                 TextField("Display Name", text: $draft.displayName)
+                    .accessibilityIdentifier("provider-settings-display-name")
                 TextField("Default Model", text: $draft.defaultModel)
+                    .accessibilityIdentifier("provider-settings-default-model")
                 TextField("Endpoint (optional)", text: $draft.endpoint)
+                    .accessibilityIdentifier("provider-settings-endpoint")
                 if draft.authMode != .none {
                     SecureField("Secret", text: $secret)
+                        .accessibilityIdentifier("provider-settings-secret")
                 }
 
                 Button("Save Provider") {
@@ -211,11 +252,13 @@ struct ProviderSettingsView: View {
                 Text("Last export: \(exportPath)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("provider-settings-export-message")
             }
             if let importMessage {
                 Text(importMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("provider-settings-import-message")
             }
 
             Button("Export Settings") {

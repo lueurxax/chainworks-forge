@@ -7,7 +7,7 @@ import SwiftData
 /// Limited to: same idea, same workflow family, current proposal-loop baseline.
 /// Does NOT compare worktree paths, git receipts, or release artifacts (Proposal 007).
 @MainActor
-final class RunComparisonService {
+struct RunComparisonService {
 
     private let modelContext: ModelContext
 

@@ -1,21 +1,42 @@
 import SwiftUI
 import SwiftData
+#if os(macOS)
+import AppKit
+#endif
+
+private enum UIAutomationDiagnostics {
+    private static let logURL = URL(fileURLWithPath: "/tmp/chainworks-ui-automation.log")
+
+    static func log(_ message: String) {
+        guard Chainworks_ForgeApp.isUIAutomationHost else { return }
+
+        let formatter = ISO8601DateFormatter()
+        let line = "[\(formatter.string(from: Date()))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+
+        if FileManager.default.fileExists(atPath: logURL.path) == false {
+            try? data.write(to: logURL, options: .atomic)
+            return
+        }
+
+        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            // Ignore diagnostics failures in app bootstrap.
+        }
+    }
+}
 
 @main
 struct Chainworks_ForgeApp: App {
-
-    /// Disable macOS window/scene restoration when running under UI tests.
-    /// Without this, `WindowGroup` restores the previous session's window,
-    /// creating two overlapping windows that cause XCUITest element queries
-    /// to find (and click) elements hidden behind the wrong window — leading
-    /// to indefinite hangs.
-    init() {
-        if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
-            UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
-        }
-    }
-
-    var sharedModelContainer: ModelContainer = {
+    static let processEnvironment = ProcessInfo.processInfo.environment
+    static let isTestHost = processEnvironment["XCTestConfigurationFilePath"] != nil
+    static let isUIAutomationHost = processEnvironment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
+    static let isUnitTestHost = isTestHost && !isUIAutomationHost
+    static let sharedModelContainer: ModelContainer = {
         let environment = ProcessInfo.processInfo.environment
         let schema = Schema([
             Idea.self,
@@ -42,19 +63,118 @@ struct Chainworks_ForgeApp: App {
         }
     }()
 
-    var body: some Scene {
-        WindowGroup {
-            AppBootstrapView()
-        }
-        .modelContainer(sharedModelContainer)
+    @NSApplicationDelegateAdaptor(AutomationFallbackAppDelegate.self) private var automationFallbackAppDelegate
 
-        // P005-OPS §10: Optional menu bar extra
-        MenuBarExtra("Chainworks Forge", systemImage: "hammer.circle") {
-            AppBootstrapMenuBarView()
-                .modelContainer(sharedModelContainer)
+    /// Disable macOS window/scene restoration when running under UI tests.
+    /// Without this, `WindowGroup` restores the previous session's window,
+    /// creating two overlapping windows that cause XCUITest element queries
+    /// to find (and click) elements hidden behind the wrong window — leading
+    /// to indefinite hangs.
+    init() {
+        if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+            UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         }
+        UIAutomationDiagnostics.log(
+            "app.init uiAutomation=\(Self.isUIAutomationHost) unitTest=\(Self.isUnitTestHost) " +
+            "directSurface=\(Self.processEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] ?? "nil")"
+        )
     }
 
+    var body: some Scene {
+        Window("Chainworks Forge", id: "main-window") {
+            RootHostView()
+        }
+        .modelContainer(Self.sharedModelContainer)
+        .defaultSize(width: 1200, height: 800)
+    }
+
+}
+
+final class AutomationFallbackAppDelegate: NSObject, NSApplicationDelegate {
+    private var fallbackWindow: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard Chainworks_ForgeApp.isUIAutomationHost else { return }
+        UIAutomationDiagnostics.log("applicationDidFinishLaunching windows=\(NSApp.windows.count)")
+
+        Task { @MainActor in
+            if !NSApp.windows.isEmpty {
+                UIAutomationDiagnostics.log("nativeWindowDetected attempt=0 count=\(NSApp.windows.count)")
+                return
+            }
+
+            try? await Task.sleep(for: .milliseconds(100))
+
+            if !NSApp.windows.isEmpty {
+                UIAutomationDiagnostics.log("nativeWindowDetected attempt=1 count=\(NSApp.windows.count)")
+                return
+            }
+
+            UIAutomationDiagnostics.log("creatingFallbackWindow")
+
+            let hostingController = NSHostingController(
+                rootView: RootHostView()
+                    .modelContainer(Chainworks_ForgeApp.sharedModelContainer)
+            )
+            let window = NSWindow(contentViewController: hostingController)
+            window.title = "Chainworks Forge"
+            window.identifier = NSUserInterfaceItemIdentifier("chainworks-fallback-window")
+            window.setContentSize(NSSize(width: 1200, height: 800))
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+
+            NSApp.setActivationPolicy(.regular)
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+            NSApp.activate(ignoringOtherApps: true)
+
+            fallbackWindow = window
+            UIAutomationDiagnostics.log("fallbackWindowCreated windows=\(NSApp.windows.count) isVisible=\(window.isVisible)")
+        }
+    }
+}
+
+private struct UnitTestHostView: View {
+    var body: some View {
+        Color.clear
+            .accessibilityIdentifier("unit-test-host")
+    }
+}
+
+private struct RootHostView: View {
+    var body: some View {
+        Group {
+            if Chainworks_ForgeApp.isUnitTestHost {
+                UnitTestHostView()
+            } else {
+                AppBootstrapView()
+            }
+        }
+        .task {
+            guard Chainworks_ForgeApp.isUIAutomationHost else { return }
+            #if os(macOS)
+            UIAutomationDiagnostics.log("rootHost.task.begin windows=\(NSApp.windows.count)")
+            NSApp.setActivationPolicy(.regular)
+            for attempt in 0..<20 {
+                if attempt > 0 {
+                    try? await Task.sleep(for: .milliseconds(150))
+                }
+                await MainActor.run {
+                    NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+                    NSApp.activate(ignoringOtherApps: true)
+                    for window in NSApp.windows {
+                        window.collectionBehavior.remove(.transient)
+                        window.makeKeyAndOrderFront(nil)
+                        window.orderFrontRegardless()
+                    }
+                }
+                UIAutomationDiagnostics.log("rootHost.task.activation attempt=\(attempt) windows=\(NSApp.windows.count)")
+            }
+            UIAutomationDiagnostics.log("rootHost.task.end windows=\(NSApp.windows.count)")
+            #endif
+        }
+    }
 }
 
 // MARK: - Menu Bar Bootstrap (P005-OPS §10)
@@ -89,24 +209,20 @@ struct AppBootstrapView: View {
     @State private var providerSettingsStore: ProviderSettingsStore?
     @State private var providerRegistry: ProviderRegistry?
     @State private var showFirstRunWizard = false
+    private let forcedUISurface = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
+        .flatMap(ContentView.UISurface.init(rawValue:))
 
     var body: some View {
         if let service = executionService,
            let appConfigurationStore,
            let providerSettingsStore,
            let providerRegistry {
-            ContentView()
-                .environment(service)
-                .environment(appConfigurationStore)
-                .environment(providerSettingsStore)
-                .environment(providerRegistry)
-                .sheet(isPresented: $showFirstRunWizard) {
-                    FirstRunSetupWizard(isPresented: $showFirstRunWizard)
-                        .environment(service)
-                        .environment(appConfigurationStore)
-                        .environment(providerSettingsStore)
-                        .environment(providerRegistry)
-                }
+            bootstrappedRoot(
+                service: service,
+                appConfigurationStore: appConfigurationStore,
+                providerSettingsStore: providerSettingsStore,
+                providerRegistry: providerRegistry
+            )
         } else {
             ProgressView("Starting engine...")
                 .accessibilityIdentifier("bootstrap-loading")
@@ -119,6 +235,12 @@ struct AppBootstrapView: View {
     @MainActor
     private func bootstrapService() {
         guard executionService == nil else { return }
+        UIAutomationDiagnostics.log("bootstrapService.begin")
+
+        let environment = ProcessInfo.processInfo.environment
+        let isTestHost = environment["XCTestConfigurationFilePath"] != nil
+        let isUIAutomationHost = environment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
+        let isUnitTestHost = isTestHost && !isUIAutomationHost
 
         let appConfigurationStore = AppConfigurationStore()
         let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
@@ -127,10 +249,16 @@ struct AppBootstrapView: View {
         self.appConfigurationStore = appConfigurationStore
         self.providerSettingsStore = providerSettingsStore
         self.providerRegistry = providerRegistry
+        UIAutomationDiagnostics.log(
+            "bootstrapService.config directSurface=\(environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] ?? "nil") " +
+            "inMemory=\(environment["CHAINWORKS_IN_MEMORY_STORE"] ?? "nil")"
+        )
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
-        let liveRuntimeConfiguration = Self.loadLiveRuntimeConfiguration()
+        let liveRuntimeConfiguration = isUnitTestHost
+            ? nil
+            : Self.loadLiveRuntimeConfiguration()
         // The simulated executor remains the safe default, but Proposal 004 live runs
         // are resolved per-plan inside ExecutionService using `liveRuntimeConfiguration`.
         let executor = SimulatedAgentExecutor(simulatedDelay: 0.5, catalog: catalog)
@@ -146,14 +274,18 @@ struct AppBootstrapView: View {
         Self.seedIdeaIfRequested(modelContext: modelContext)
         Self.seedWaitingApprovalRunIfRequested(modelContext: modelContext, catalog: catalog)
 
-        let compiler = RunPlanCompiler(modelContext: modelContext)
-        service.resumeInterruptedRuns(compiler: compiler)
+        if !isUnitTestHost {
+            let compiler = RunPlanCompiler(modelContext: modelContext)
+            service.resumeInterruptedRuns(compiler: compiler)
 
-        // Proposal 003 — REQ-008: Check if config has changed since last analysis.
-        service.checkForConfigChange()
+            // Proposal 003 — REQ-008: Check if config has changed since last analysis.
+            service.checkForConfigChange()
+        }
 
-        Task { @MainActor in
-            await providerRegistry.refreshHealth()
+        if !isUnitTestHost {
+            Task { @MainActor in
+                await providerRegistry.refreshHealth()
+            }
         }
 
         if shouldPresentFirstRunWizard(
@@ -161,6 +293,67 @@ struct AppBootstrapView: View {
             providerSettings: providerSettingsStore.settings
         ) {
             showFirstRunWizard = true
+        }
+        UIAutomationDiagnostics.log("bootstrapService.end showFirstRunWizard=\(showFirstRunWizard)")
+    }
+
+    @ViewBuilder
+    private func bootstrappedRoot(
+        service: ExecutionService,
+        appConfigurationStore: AppConfigurationStore,
+        providerSettingsStore: ProviderSettingsStore,
+        providerRegistry: ProviderRegistry
+    ) -> some View {
+        if let forcedUISurface {
+            VStack(spacing: 0) {
+                Button("UI Test Surface: \(forcedUISurface.rawValue)") {}
+                    .buttonStyle(.plain)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .accessibilityIdentifier("ui-test-direct-surface-ready-\(forcedUISurface.rawValue)")
+
+                Group {
+                    switch forcedUISurface {
+                    case .providerSettings:
+                        ProviderSettingsView()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                    case .pilotReadiness:
+                        PilotReadinessView()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                    case .firstRunSetup:
+                        FirstRunSetupWizard(isPresented: .constant(true))
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(minWidth: 960, minHeight: 720)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("ui-test-direct-surface-container-\(forcedUISurface.rawValue)")
+        } else {
+            ContentView()
+                .environment(service)
+                .environment(appConfigurationStore)
+                .environment(providerSettingsStore)
+                .environment(providerRegistry)
+                .sheet(isPresented: $showFirstRunWizard) {
+                    FirstRunSetupWizard(isPresented: $showFirstRunWizard)
+                        .environment(service)
+                        .environment(appConfigurationStore)
+                        .environment(providerSettingsStore)
+                        .environment(providerRegistry)
+                }
         }
     }
 

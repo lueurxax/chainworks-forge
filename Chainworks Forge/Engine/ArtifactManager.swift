@@ -5,10 +5,10 @@ import SwiftData
 
 /// Bridges nonisolated ArtifactStorage (disk I/O) with @MainActor SwiftData metadata.
 /// Uses ArtifactContract.format for format detection, not hardcoded assumptions.
-@MainActor
 final class ArtifactManager {
     private let modelContext: ModelContext
 
+    @MainActor
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
     }
@@ -25,6 +25,7 @@ final class ArtifactManager {
     ///   - catalog: Optional agent catalog for contract-based format detection.
     /// - Returns: The created Artifact records.
     @discardableResult
+    @MainActor
     func persistOutputs(
         outputs: [String: Data],
         agent: ResolvedAgent,
@@ -88,6 +89,7 @@ final class ArtifactManager {
     }
 
     /// Read artifact data from disk, validating path boundaries.
+    @MainActor
     func readArtifact(_ artifact: Artifact, workspace: RunWorkspace) throws -> Data {
         try ArtifactStorage.read(
             filePath: artifact.filePath,
@@ -96,24 +98,27 @@ final class ArtifactManager {
     }
 
     /// Query all artifacts for a run.
+    @MainActor
     func artifacts(forRunID runID: UUID) throws -> [Artifact] {
         let descriptor = FetchDescriptor<Artifact>(
-            predicate: #Predicate<Artifact> { $0.runID == runID },
             sortBy: [SortDescriptor(\.createdAt)]
         )
         return try modelContext.fetch(descriptor)
+            .filter { $0.runID == runID }
     }
 
     /// Query artifacts by stage.
+    @MainActor
     func artifacts(forRunID runID: UUID, stageID: String) throws -> [Artifact] {
         let descriptor = FetchDescriptor<Artifact>(
-            predicate: #Predicate<Artifact> { $0.runID == runID && $0.stageID == stageID },
             sortBy: [SortDescriptor(\.createdAt)]
         )
         return try modelContext.fetch(descriptor)
+            .filter { $0.runID == runID && $0.stageID == stageID }
     }
 
     /// Get the set of produced artifact names for a run (for TransitionEvaluator).
+    @MainActor
     func producedArtifactNames(forRunID runID: UUID) throws -> Set<String> {
         let artifacts = try artifacts(forRunID: runID)
         return Set(artifacts.map(\.name))
@@ -121,6 +126,7 @@ final class ArtifactManager {
 
     /// Persist a system-generated artifact that is not attached to a specific agent execution.
     @discardableResult
+    @MainActor
     func persistSystemArtifact(
         name: String,
         data: Data,

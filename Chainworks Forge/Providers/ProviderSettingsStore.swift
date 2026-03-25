@@ -1,12 +1,12 @@
 import Foundation
 import Observation
 
-@MainActor
 @Observable
 final class ProviderSettingsStore {
     private let fileURL: URL
-    private(set) var settings: ProviderSettings
+    @MainActor private(set) var settings: ProviderSettings
 
+    @MainActor
     init(fileURL: URL? = nil, initialSettings: ProviderSettings? = nil) {
         let resolvedURL = fileURL ?? Self.defaultFileURL()
         self.fileURL = resolvedURL
@@ -25,11 +25,13 @@ final class ProviderSettingsStore {
         }
     }
 
+    @MainActor
     func replace(with settings: ProviderSettings) {
         self.settings = settings
         try? persist()
     }
 
+    @MainActor
     func upsert(provider: ConfiguredProvider) {
         var providers = settings.configuredProviders
         if let index = providers.firstIndex(where: { $0.id == provider.id }) {
@@ -45,6 +47,7 @@ final class ProviderSettingsStore {
         try? persist()
     }
 
+    @MainActor
     func removeProvider(id: UUID) {
         guard let provider = settings.configuredProviders.first(where: { $0.id == id }) else { return }
         settings.configuredProviders.removeAll { $0.id == id }
@@ -55,6 +58,7 @@ final class ProviderSettingsStore {
         try? persist()
     }
 
+    @MainActor
     func setPreferredProvider(id: UUID, for family: ProviderFamily) {
         settings.preferredProviderIDsByFamily[family.rawValue] = id
         try? persist()

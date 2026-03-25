@@ -13,10 +13,19 @@ struct PilotReadinessView: View {
     @State private var sampleRunMessage: String?
     @State private var readinessReport: PreflightReport?
     @State private var showWizard = false
+    @State private var showPreflightReport = false
+    private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
     var body: some View {
         NavigationStack {
             List {
+                if showsUITestReadyMarker {
+                    Section {
+                        Button("Pilot Readiness Ready") {}
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("pilot-readiness-surface-ready")
+                    }
+                }
                 Section {
                     Text("Pilot Readiness")
                         .font(.title3.bold())
@@ -55,6 +64,14 @@ struct PilotReadinessView: View {
                                 Text(providerRegistry.healthSnapshot(for: provider.id)?.summary ?? "Health not refreshed")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if let blockingIssues = providerRegistry.healthSnapshot(for: provider.id)?.blockingIssues,
+                                   !blockingIssues.isEmpty {
+                                    ForEach(blockingIssues, id: \.self) { issue in
+                                        Text(issue)
+                                            .font(.caption2)
+                                            .foregroundStyle(.red)
+                                    }
+                                }
                                 if let checkedAt = providerRegistry.healthSnapshot(for: provider.id)?.checkedAt {
                                     Text("Checked \(checkedAt.formatted(date: .omitted, time: .shortened))")
                                         .font(.caption2)
@@ -68,7 +85,13 @@ struct PilotReadinessView: View {
                 Section("Diagnostics") {
                     if let readinessReport {
                         LabeledContent("Preflight", value: readinessReport.status.rawValue.capitalized)
+                            .accessibilityIdentifier("pilot-readiness-preflight-status")
                         LabeledContent("Source", value: readinessReport.configurationSource.displayName)
+                            .accessibilityIdentifier("pilot-readiness-source")
+
+                        ForEach(readinessChecks(category: "Providers")) { check in
+                            readinessCheckRow(check)
+                        }
 
                         ForEach(readinessChecks(category: "Catalog")) { check in
                             readinessCheckRow(check)
@@ -76,6 +99,40 @@ struct PilotReadinessView: View {
 
                         ForEach(readinessChecks(category: "Workspace")) { check in
                             readinessCheckRow(check)
+                        }
+
+                        ForEach(readinessChecks(category: "Permissions")) { check in
+                            readinessCheckRow(check)
+                        }
+
+                        ForEach(readinessChecks(category: "Environment")) { check in
+                            readinessCheckRow(check)
+                        }
+
+                        if !readinessReport.warnings.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Warnings")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                ForEach(readinessReport.warnings, id: \.self) { warning in
+                                    Text(warning)
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                        }
+
+                        if !readinessReport.blockingIssues.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Blocking Issues")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                ForEach(readinessReport.blockingIssues, id: \.self) { issue in
+                                    Text(issue)
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
+                            }
                         }
                     } else {
                         Text("Readiness checks run after refresh.")
@@ -96,16 +153,19 @@ struct PilotReadinessView: View {
                     Button("Open First Run Wizard") {
                         showWizard = true
                     }
+                    .accessibilityIdentifier("pilot-readiness-open-wizard")
 
                     Button("Launch Sample Run Path") {
                         Task { await launchSampleRun() }
                     }
                     .disabled(providerSettingsStore.settings.configuredProviders.isEmpty)
+                    .accessibilityIdentifier("pilot-readiness-launch-sample-run")
 
                     if let sampleRunMessage {
                         Text(sampleRunMessage)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("pilot-readiness-sample-run-message")
                     }
                 }
 
@@ -113,18 +173,39 @@ struct PilotReadinessView: View {
                     Button("Refresh Readiness") {
                         Task { await refreshReadiness() }
                     }
+                    .accessibilityIdentifier("pilot-readiness-refresh")
+                    if readinessReport != nil {
+                        Button("View Preflight Report") {
+                            showPreflightReport = true
+                        }
+                        .accessibilityIdentifier("pilot-readiness-view-preflight-report")
+                    }
                     Button("Export Support Bundle") {
                         Task { await exportSupportBundle() }
                     }
+                    .accessibilityIdentifier("pilot-readiness-export-support")
                     if let exportMessage {
                         Text(exportMessage)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("pilot-readiness-export-message")
                     }
                 }
             }
             .navigationTitle("Pilot Readiness")
             .accessibilityIdentifier("pilot-readiness-view")
+            .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Refresh Readiness") {
+                        Task { await refreshReadiness() }
+                    }
+                    .accessibilityIdentifier("pilot-readiness-toolbar-refresh")
+                    Button("Open First Run Wizard") {
+                        showWizard = true
+                    }
+                    .accessibilityIdentifier("pilot-readiness-open-wizard")
+                }
+            }
             .task {
                 await refreshReadiness()
             }
@@ -134,6 +215,19 @@ struct PilotReadinessView: View {
                     .environment(appConfigurationStore)
                     .environment(providerSettingsStore)
                     .environment(providerRegistry)
+            }
+            .sheet(isPresented: $showPreflightReport) {
+                if let readinessReport {
+                    NavigationStack {
+                        PreflightReportView(report: readinessReport)
+                            .toolbar {
+                                ToolbarItem(placement: .cancellationAction) {
+                                    Button("Done") { showPreflightReport = false }
+                                }
+                            }
+                    }
+                    .frame(minWidth: 520, minHeight: 420)
+                }
             }
         }
     }

@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  fast-gate:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -15,26 +15,17 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Guard direct Run insertion
-        run: |
-          if grep -rn 'Run(' --include='*.swift' "Chainworks Forge/" \
-             | grep -v 'RunRepository.swift' | grep -v 'Run.swift' \
-             | grep -v 'RunStatus' | grep -v 'RunRepositoryError' \
-             | grep -v '// RunRepository-exempt' | grep -q '.'; then
-            echo "::error::Direct Run construction found outside RunRepository"
-            exit 1
-          fi
+      - name: Fast Gate
+        run: ./scripts/test-gate.sh fast
 
-      - name: Build
-        run: |
-          xcodebuild -project 'Chainworks Forge.xcodeproj' \
-            -scheme 'Chainworks Forge' \
-            -destination 'platform=macOS' \
-            build
+  ui-smoke-gate:
+    runs-on: macos-15
+    needs: fast-gate
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Test
-        run: |
-          xcodebuild -project 'Chainworks Forge.xcodeproj' \
-            -scheme 'Chainworks Forge' \
-            -destination 'platform=macOS' \
-            test
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: UI Smoke Gate
+        run: ./scripts/test-gate.sh ui-smoke

@@ -1364,6 +1364,7 @@ struct WorkflowStageDetailView: View {
                             Text(execution.taskName)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            agentMetadataRow(for: execution)
                             if let logSnippet = execution.logSnippet, !logSnippet.isEmpty {
                                 Text(logSnippet)
                                     .font(.caption2)
@@ -1393,6 +1394,54 @@ struct WorkflowStageDetailView: View {
         .sheet(item: $selectedArtifact) { artifact in
             ArtifactInspectorView(artifact: artifact, run: run)
         }
+    }
+
+    @ViewBuilder
+    private func agentMetadataRow(for execution: AgentExecution) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Text(execution.provider)
+                if let model = execution.resolvedModel, !model.isEmpty {
+                    Text(model)
+                }
+                Text(execution.effort)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                Text(durationString(from: execution.startedAt, to: execution.completedAt ?? Date()))
+                if let cost = execution.costCents {
+                    Text("\(cost) cents")
+                }
+                if let adapterVersion = execution.adapterVersion, !adapterVersion.isEmpty {
+                    Text(adapterVersion)
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+
+            if receiptArtifact(for: execution) != nil {
+                Button("Open Provider Receipt") {
+                    selectedArtifact = receiptArtifact(for: execution)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption2)
+            }
+        }
+    }
+
+    private func receiptArtifact(for execution: AgentExecution) -> Artifact? {
+        execution.artifacts.first { $0.name.hasSuffix("_receipt.json") }
+            ?? execution.artifacts.first { $0.contractID == "provider_receipt" }
+    }
+
+    private func durationString(from start: Date, to end: Date) -> String {
+        let formatter = DateComponentsFormatter()
+        let interval = max(0, end.timeIntervalSince(start))
+        formatter.allowedUnits = interval >= 3600 ? [.hour, .minute] : [.minute, .second]
+        formatter.unitsStyle = .abbreviated
+        return formatter.string(from: interval) ?? "0s"
     }
 }
 

@@ -19,23 +19,14 @@ struct RunProgressScreen {
             app.staticTexts[workflowTitle].firstMatch
         ]
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if hasProgressSurface(timeout: 1) { return true }
-
-            for candidate in candidates {
-                if candidate.exists || candidate.waitForExistence(timeout: 1) {
-                    candidate.click()
-                    if hasProgressSurface(timeout: 5) {
-                        return true
-                    }
-                }
+        for candidate in candidates {
+            if candidate.waitForExistence(timeout: 2) {
+                candidate.click()
+                if hasProgressSurface(timeout: 3) { return true }
             }
-
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
         }
 
-        return hasProgressSurface(timeout: 1)
+        return hasProgressSurface(timeout: timeout)
     }
 
     /// The Approve button in the run progress view.
@@ -73,17 +64,20 @@ struct RunProgressScreen {
 
     /// Waits for the run to enter one of the expected statuses.
     func waitForRunStatus(_ statuses: Set<String>, timeout: TimeInterval = 20) -> String? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let status = currentRunStatus(), statuses.contains(status) {
-                return status
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        let statusElement = app.descendants(matching: .staticText)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "run-status-"))
+            .firstMatch
+        let predicate = NSPredicate { _, _ in
+            guard statusElement.exists else { return false }
+            let id = statusElement.identifier
+            guard id.hasPrefix("run-status-") else { return false }
+            return statuses.contains(String(id.dropFirst("run-status-".count)))
         }
-        if let status = currentRunStatus(), statuses.contains(status) {
-            return status
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+        guard XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed else {
+            return nil
         }
-        return nil
+        return currentRunStatus()
     }
 
     /// Checks if a named section label exists.
@@ -102,25 +96,20 @@ struct RunProgressScreen {
     }
 
     private func hasProgressSurface(timeout: TimeInterval) -> Bool {
-        let progressCandidates = [
-            app.outlines["run-progress-view"].firstMatch,
-            app.otherElements["run-progress-view"].firstMatch
-        ]
-        for candidate in progressCandidates where candidate.waitForExistence(timeout: timeout) {
-            return true
-        }
-
+        let progressOutline = app.outlines["run-progress-view"].firstMatch
+        let progressOther = app.otherElements["run-progress-view"].firstMatch
         let statusLabel = app.descendants(matching: .staticText)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", "run-status-"))
             .firstMatch
-        if statusLabel.waitForExistence(timeout: timeout) {
-            return true
-        }
-
         let sectionTitles = ["Overview", "Current Phase", "Stages", "Live Timeline", "Active Agents", "Artifacts", "Approval Gate"]
-        return sectionTitles.contains { title in
-            sectionLabel(title).waitForExistence(timeout: 1)
+        let sections = sectionTitles.map { sectionLabel($0) }
+
+        let predicate = NSPredicate { _, _ in
+            if progressOutline.exists || progressOther.exists || statusLabel.exists { return true }
+            return sections.contains { $0.exists }
         }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 
     private func sectionLabel(_ name: String) -> XCUIElement {

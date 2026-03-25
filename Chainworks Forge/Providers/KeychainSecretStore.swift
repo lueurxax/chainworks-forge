@@ -15,19 +15,23 @@ enum SecretStoreError: Error, LocalizedError {
     }
 }
 
-final class KeychainSecretStore: @unchecked Sendable {
+struct KeychainSecretStore: Sendable {
     private let serviceName: String
     private let usesInMemoryStore: Bool
-    private var inMemorySecrets: [String: String] = [:]
+    private static let inMemorySecrets = InMemorySecretBox()
 
-    init(serviceName: String = "com.chainworks.forge.secrets") {
+    init(
+        serviceName: String = "com.chainworks.forge.secrets",
+        useInMemoryStore: Bool? = nil
+    ) {
         self.serviceName = serviceName
-        self.usesInMemoryStore = ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
+        self.usesInMemoryStore = useInMemoryStore
+            ?? (ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1")
     }
 
     func setSecret(_ value: String, for key: String) throws {
         if usesInMemoryStore {
-            inMemorySecrets[key] = value
+            Self.inMemorySecrets.set(value, for: scopedKey(key))
             return
         }
 
@@ -46,7 +50,7 @@ final class KeychainSecretStore: @unchecked Sendable {
 
     func secret(for key: String) throws -> String? {
         if usesInMemoryStore {
-            return inMemorySecrets[key]
+            return Self.inMemorySecrets.secret(for: scopedKey(key))
         }
 
         var query = baseQuery(for: key)
@@ -70,7 +74,7 @@ final class KeychainSecretStore: @unchecked Sendable {
 
     func deleteSecret(for key: String) throws {
         if usesInMemoryStore {
-            inMemorySecrets.removeValue(forKey: key)
+            Self.inMemorySecrets.deleteSecret(for: scopedKey(key))
             return
         }
 
@@ -96,5 +100,32 @@ final class KeychainSecretStore: @unchecked Sendable {
             kSecAttrService as String: serviceName,
             kSecAttrAccount as String: key
         ]
+    }
+
+    private func scopedKey(_ key: String) -> String {
+        "\(serviceName)::\(key)"
+    }
+}
+
+private final class InMemorySecretBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var secrets: [String: String] = [:]
+
+    func set(_ value: String, for key: String) {
+        lock.lock()
+        secrets[key] = value
+        lock.unlock()
+    }
+
+    func secret(for key: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return secrets[key]
+    }
+
+    func deleteSecret(for key: String) {
+        lock.lock()
+        secrets.removeValue(forKey: key)
+        lock.unlock()
     }
 }

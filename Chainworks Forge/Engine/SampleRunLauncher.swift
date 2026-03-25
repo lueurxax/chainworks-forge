@@ -8,7 +8,7 @@ struct SampleRunLauncher {
     let appConfigurationStore: AppConfigurationStore
     let providerRegistry: ProviderRegistry
 
-    func launchSampleRun() async throws -> Run {
+    func launchSampleRun(autostart: Bool = true) async throws -> Run {
         let workflowURL = try resolveWorkflowURL()
         let catalogURL = try resolveCatalogURL()
 
@@ -52,7 +52,9 @@ struct SampleRunLauncher {
         idea.status = .active
         try modelContext.save()
 
-        executionService.startRun(run: run, plan: adjustedPlan, workspace: workspace)
+        if autostart {
+            executionService.startRun(run: run, plan: adjustedPlan, workspace: workspace)
+        }
         return run
     }
 

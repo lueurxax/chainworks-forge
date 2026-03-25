@@ -4,6 +4,22 @@ import SwiftData
 
 @MainActor
 final class ProviderPlatformTests: XCTestCase {
+    private static var retainedObjects: [AnyObject] = []
+    private static var retainedRegistries: [ProviderRegistry] = []
+
+    private func makeTestSecretStore(_ serviceName: String) -> KeychainSecretStore {
+        KeychainSecretStore(serviceName: serviceName, useInMemoryStore: true)
+    }
+
+    private func retain<T: AnyObject>(_ object: T) -> T {
+        Self.retainedObjects.append(object)
+        return object
+    }
+
+    private func retain(_ registry: ProviderRegistry) -> ProviderRegistry {
+        Self.retainedRegistries.append(registry)
+        return registry
+    }
 
     private func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -131,10 +147,10 @@ final class ProviderPlatformTests: XCTestCase {
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
-        let store = AppConfigurationStore(
+        let store = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: persisted
-        )
+        ))
 
         let resolved = BootstrapConfigurationResolver.resolve(store: store, environment: [:])
         XCTAssertEqual(resolved, persisted)
@@ -175,14 +191,14 @@ final class ProviderPlatformTests: XCTestCase {
             notificationOnProviderFailure: true,
             runStartRequiresCleanPreflight: true
         )
-        let store = ProviderSettingsStore(
+        let store = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: settings
-        )
-        let registry = ProviderRegistry(
+        ))
+        let registry = retain(ProviderRegistry(
             settingsStore: store,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.backend-profile")
-        )
+            secretStore: makeTestSecretStore("com.chainworks.tests.backend-profile")
+        ))
         let resolver = BackendProfileResolverV2(providerRegistry: registry)
 
         var startOptions = RunStartOptions.empty
@@ -223,7 +239,7 @@ final class ProviderPlatformTests: XCTestCase {
             authMode: .none,
             defaultModel: "gemini-2.5-pro"
         )
-        let store = ProviderSettingsStore(
+        let store = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [codex, gemini],
@@ -234,11 +250,11 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
-        )
-        let registry = ProviderRegistry(
+        ))
+        let registry = retain(ProviderRegistry(
             settingsStore: store,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.mixed-providers")
-        )
+            secretStore: makeTestSecretStore("com.chainworks.tests.mixed-providers")
+        ))
         let resolver = BackendProfileResolverV2(providerRegistry: registry)
 
         let bindings = try? resolver.resolveBindings(
@@ -262,11 +278,11 @@ final class ProviderPlatformTests: XCTestCase {
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: configuration
-        )
-        let providerStore = ProviderSettingsStore(
+        ))
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [
@@ -282,12 +298,12 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
-        )
+        ))
 
         let service = SettingsTransferService(
             appConfigurationStore: appStore,
             providerSettingsStore: providerStore,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.settings")
+            secretStore: makeTestSecretStore("com.chainworks.tests.settings")
         )
 
         let exportURL = try service.exportSettings(to: tempDirectory)
@@ -320,11 +336,11 @@ final class ProviderPlatformTests: XCTestCase {
             defaultModel: "gpt-5-codex"
         )
 
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: initialConfiguration
-        )
-        let providerStore = ProviderSettingsStore(
+        ))
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [initialProvider],
@@ -332,7 +348,7 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
-        )
+        ))
 
         let importProvider = ConfiguredProvider(
             family: .gemini,
@@ -371,7 +387,7 @@ final class ProviderPlatformTests: XCTestCase {
         let service = SettingsTransferService(
             appConfigurationStore: appStore,
             providerSettingsStore: providerStore,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.import-empty")
+            secretStore: makeTestSecretStore("com.chainworks.tests.import-empty")
         )
 
         XCTAssertThrowsError(try service.importSettings(from: packageURL))
@@ -393,15 +409,15 @@ final class ProviderPlatformTests: XCTestCase {
             activeConfigurationSource: .persistedSettings
         )
 
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: configuration
-        )
-        let providerStore = ProviderSettingsStore(
+        ))
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: .empty
-        )
-        let registry = ProviderRegistry(settingsStore: providerStore)
+        ))
+        let registry = retain(ProviderRegistry(settingsStore: providerStore))
         let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
 
         let report = await preflight.runReport(
@@ -428,10 +444,10 @@ final class ProviderPlatformTests: XCTestCase {
             activeConfigurationSource: .persistedSettings
         )
 
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: configuration
-        )
+        ))
         let provider = ConfiguredProvider(
             family: .gemini,
             displayName: "Gemini API",
@@ -440,7 +456,7 @@ final class ProviderPlatformTests: XCTestCase {
             authMode: .apiKey,
             defaultModel: "gemini-2.5-pro"
         )
-        let providerStore = ProviderSettingsStore(
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [provider],
@@ -448,11 +464,11 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
-        )
-        let registry = ProviderRegistry(
+        ))
+        let registry = retain(ProviderRegistry(
             settingsStore: providerStore,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.missing-gemini-secret")
-        )
+            secretStore: makeTestSecretStore("com.chainworks.tests.missing-gemini-secret")
+        ))
         let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
 
         let report = await preflight.runReport(
@@ -479,10 +495,10 @@ final class ProviderPlatformTests: XCTestCase {
             activeConfigurationSource: .persistedSettings
         )
 
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: configuration
-        )
+        ))
         let claude = ConfiguredProvider(
             family: .claude,
             displayName: "Claude CLI",
@@ -490,7 +506,7 @@ final class ProviderPlatformTests: XCTestCase {
             authMode: .none,
             defaultModel: "claude-sonnet-4"
         )
-        let providerStore = ProviderSettingsStore(
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [claude],
@@ -498,11 +514,11 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
-        )
-        let registry = ProviderRegistry(
+        ))
+        let registry = retain(ProviderRegistry(
             settingsStore: providerStore,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.unavailable-model")
-        )
+            secretStore: makeTestSecretStore("com.chainworks.tests.unavailable-model")
+        ))
         let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
 
         var startOptions = RunStartOptions.empty
@@ -539,32 +555,35 @@ final class ProviderPlatformTests: XCTestCase {
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: configuration
-        )
-        let providerStore = ProviderSettingsStore(
+        ))
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
                         family: .codex,
-                        displayName: "Codex CLI",
-                        transport: .cli,
+                        displayName: "Codex API",
+                        transport: .httpAPI,
+                        endpoint: "https://codex.test.local",
                         authMode: .none,
                         defaultModel: "gpt-5-codex"
                     ),
                     ConfiguredProvider(
                         family: .claude,
-                        displayName: "Claude CLI",
-                        transport: .cli,
+                        displayName: "Claude API",
+                        transport: .httpAPI,
+                        endpoint: "https://claude.test.local",
                         authMode: .none,
                         defaultModel: "claude-sonnet-4"
                     ),
                     ConfiguredProvider(
                         family: .gemini,
-                        displayName: "Gemini CLI",
-                        transport: .cli,
+                        displayName: "Gemini API",
+                        transport: .httpAPI,
+                        endpoint: "https://gemini.test.local",
                         authMode: .none,
                         defaultModel: "gemini-2.5-pro"
                     )
@@ -573,11 +592,11 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: false
             )
-        )
-        let registry = ProviderRegistry(
+        ))
+        let registry = retain(ProviderRegistry(
             settingsStore: providerStore,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.sample-run")
-        )
+            secretStore: makeTestSecretStore("com.chainworks.tests.sample-run")
+        ))
         let executor = SimulatedAgentExecutor()
         let executionService = ExecutionService(
             modelContext: context,
@@ -590,7 +609,7 @@ final class ProviderPlatformTests: XCTestCase {
             providerRegistry: registry
         )
 
-        let run = try await launcher.launchSampleRun()
+        let run = try await launcher.launchSampleRun(autostart: false)
 
         XCTAssertNotNil(run.providerBindingSnapshotJSON)
         XCTAssertNotNil(run.startOptionsJSON)
@@ -605,7 +624,8 @@ final class ProviderPlatformTests: XCTestCase {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let (_, context) = try makeTestModelContainer()
+        let (container, context) = try makeTestModelContainer()
+        _ = container
         let workspace = makeTestWorkspace(tempDir: tempDirectory)
         let run = makeTestRun(workspace: workspace, context: context)
         run.status = .completed
@@ -647,7 +667,7 @@ final class ProviderPlatformTests: XCTestCase {
         context.insert(artifact)
         try context.save()
 
-        let appStore = AppConfigurationStore(
+        let appStore = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
             initialConfiguration: AppConfiguration(
                 runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
@@ -657,8 +677,8 @@ final class ProviderPlatformTests: XCTestCase {
                 supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
                 activeConfigurationSource: .persistedSettings
             )
-        )
-        let providerStore = ProviderSettingsStore(
+        ))
+        let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [
@@ -674,12 +694,11 @@ final class ProviderPlatformTests: XCTestCase {
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
-        )
-        let registry = ProviderRegistry(
+        ))
+        let registry = retain(ProviderRegistry(
             settingsStore: providerStore,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.bundle")
-        )
-        await registry.refreshHealth()
+            secretStore: makeTestSecretStore("com.chainworks.tests.bundle")
+        ))
 
         let exporter = SupportBundleExporter(
             modelContext: context,

@@ -19,16 +19,15 @@ struct AppScreen {
     /// they may appear as `.tabs` instead.
     @discardableResult
     func waitForTabs(timeout: TimeInterval = 30) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let win = primaryWindow
-            for label in Self.knownTabLabels {
-                if win.radioButtons[label].exists { return true }
-                if win.tabs[label].exists { return true }
+        let win = primaryWindow
+        let labels = Self.knownTabLabels
+        let predicate = NSPredicate { _, _ in
+            labels.contains { label in
+                win.radioButtons[label].exists || win.tabs[label].exists
             }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
-        return false
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 
     /// Finds a tab by label scoped to the primary window.
@@ -60,24 +59,21 @@ struct AppScreen {
         let target = tab(label)
         guard target.waitForExistence(timeout: timeout) else { return false }
 
-        if isTabSelected(label) {
+        if isTabSelected(label) { return true }
+        if target.isEnabled { target.click() }
+
+        let predicate = NSPredicate { _, _ in
+            if let number = target.value as? NSNumber { return number.intValue == 1 }
+            if let string = target.value as? String { return string == "1" || string.lowercased() == "selected" }
+            return false
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+        if XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed {
             return true
         }
 
-        if target.isEnabled {
-            target.click()
-        }
-
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if isTabSelected(label) {
-                return true
-            }
-            if target.isEnabled {
-                target.click()
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-        }
+        // Single retry — badge-modified accessibility labels may need a second click
+        if target.isEnabled { target.click() }
         return isTabSelected(label)
     }
 

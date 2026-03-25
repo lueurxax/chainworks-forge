@@ -387,6 +387,7 @@ struct RunTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Chainworks Forge")
+        let directRunPattern = try Regex(#"(?<![A-Za-z0-9_])Run\s*\("#)
 
         let enumerator = FileManager.default.enumerator(
             at: sourceDir,
@@ -400,7 +401,7 @@ struct RunTests {
         for case let file as URL in enumerator where file.pathExtension == "swift" {
             guard !exempted.contains(file.lastPathComponent) else { continue }
             let content = try String(contentsOf: file, encoding: .utf8)
-            if content.contains("Run(") && !content.contains("RunStatus")
+            if content.contains(directRunPattern) && !content.contains("RunStatus")
                 && !content.contains("RunRepositoryError")
                 && !content.contains("// RunRepository-exempt") {
                 violations.append(file.lastPathComponent)

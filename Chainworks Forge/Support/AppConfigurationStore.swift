@@ -1,12 +1,12 @@
 import Foundation
 import Observation
 
-@MainActor
 @Observable
 final class AppConfigurationStore {
     private let fileURL: URL
-    private(set) var configuration: AppConfiguration
+    @MainActor private(set) var configuration: AppConfiguration
 
+    @MainActor
     init(fileURL: URL? = nil, initialConfiguration: AppConfiguration? = nil) {
         let resolvedURL = fileURL ?? Self.defaultFileURL()
         self.fileURL = resolvedURL
@@ -25,11 +25,13 @@ final class AppConfigurationStore {
         }
     }
 
+    @MainActor
     func replace(with configuration: AppConfiguration) {
         self.configuration = configuration
         try? persist()
     }
 
+    @MainActor
     func update(_ mutate: (inout AppConfiguration) -> Void) {
         var copy = configuration
         mutate(&copy)
@@ -37,12 +39,14 @@ final class AppConfigurationStore {
         try? persist()
     }
 
+    @MainActor
     func reload() {
         if let loaded = try? Self.load(from: fileURL) {
             configuration = loaded
         }
     }
 
+    @MainActor
     func hasPersistedConfiguration() -> Bool {
         FileManager.default.fileExists(atPath: fileURL.path)
     }

@@ -5,6 +5,7 @@ struct ContentView: View {
     @Environment(ExecutionService.self) private var executionService
     @State private var selectedTab: Tab = .ideas
     private let forcedInitialTab: Tab?
+    private let forcedUISurface: UISurface?
 
     enum Tab: String, CaseIterable {
         case runsHome = "Runs Home"
@@ -16,10 +17,18 @@ struct ContentView: View {
         case providerSettings = "Settings"
     }
 
+    enum UISurface: String {
+        case providerSettings = "provider_settings"
+        case pilotReadiness = "pilot_readiness"
+        case firstRunSetup = "first_run_setup"
+    }
+
     init() {
         let environment = ProcessInfo.processInfo.environment
         let initialTab = environment["CHAINWORKS_UI_TEST_INITIAL_TAB"]
             .flatMap(Tab.init(rawValue:))
+        forcedUISurface = environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
+            .flatMap(UISurface.init(rawValue:))
         forcedInitialTab = initialTab
         // P005-OPS §5: RunsHomeView is the primary operator landing surface
         _selectedTab = State(initialValue: initialTab ?? .runsHome)
@@ -42,6 +51,16 @@ struct ContentView: View {
     }
 
     var body: some View {
+        Group {
+            if let forcedUISurface {
+                directSurfaceView(for: forcedUISurface)
+            } else {
+                tabShell
+            }
+        }
+    }
+
+    private var tabShell: some View {
         TabView(selection: $selectedTab) {
             // P005-OPS §5: Primary operator landing surface
             RunsHomeView()
@@ -105,6 +124,18 @@ struct ContentView: View {
         }
         // Approval badge on Ideas tab when approvals are pending
         .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
+    }
+
+    @ViewBuilder
+    private func directSurfaceView(for surface: UISurface) -> some View {
+        switch surface {
+        case .providerSettings:
+            ProviderSettingsView()
+        case .pilotReadiness:
+            PilotReadinessView()
+        case .firstRunSetup:
+            EmptyView()
+        }
     }
 }
 

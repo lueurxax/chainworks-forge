@@ -702,9 +702,7 @@ final class WorkflowOrchestrator {
     }
 
     private func loadPersistedArtifacts() {
-        guard let artifacts = try? artifactManager.artifacts(forRunID: workspace.runID) else {
-            return
-        }
+        let artifacts = persistedArtifacts()
 
         producedArtifactNames = Set(artifacts.map(\.name))
 
@@ -757,11 +755,11 @@ final class WorkflowOrchestrator {
     private func gatherInputs(for task: AgentTask) -> [String: Data] {
         var inputs: [String: Data] = [:]
         guard let inputNames = task.inputs else { return inputs }
+        let artifacts = persistedArtifacts()
 
         for name in inputNames {
             // Look up from already-produced artifacts
-            if let artifacts = try? artifactManager.artifacts(forRunID: workspace.runID),
-               let artifact = artifacts.last(where: { $0.name == name }) {
+            if let artifact = artifacts.last(where: { $0.name == name }) {
                 if let data = try? artifactManager.readArtifact(artifact, workspace: workspace) {
                     inputs[name] = data
                 }
@@ -774,10 +772,10 @@ final class WorkflowOrchestrator {
     private func buildInputBindings(for task: AgentTask) -> Data? {
         guard let inputNames = task.inputs, !inputNames.isEmpty else { return nil }
         var bindings: [InputBinding] = []
+        let artifacts = persistedArtifacts()
         for name in inputNames {
             var producingAgentID: String?
-            if let artifacts = try? artifactManager.artifacts(forRunID: workspace.runID),
-               let artifact = artifacts.last(where: { $0.name == name }) {
+            if let artifact = artifacts.last(where: { $0.name == name }) {
                 producingAgentID = artifact.agentID
             }
             bindings.append(InputBinding(
@@ -787,6 +785,17 @@ final class WorkflowOrchestrator {
             ))
         }
         return try? JSONEncoder().encode(bindings)
+    }
+
+    private func persistedArtifacts() -> [Artifact] {
+        run.stageExecutions
+            .sorted { $0.startedAt < $1.startedAt }
+            .flatMap { stage in
+                stage.agentExecutions
+                    .sorted { $0.startedAt < $1.startedAt }
+                    .flatMap(\.artifacts)
+            }
+            .sorted { $0.createdAt < $1.createdAt }
     }
 
     private func validateStructuredOutputs(

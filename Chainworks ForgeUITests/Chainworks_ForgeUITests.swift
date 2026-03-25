@@ -16,7 +16,8 @@ final class Chainworks_ForgeUITests: XCTestCase {
         seededIdeaBody: String = "Seeded UI test idea",
         liveFixture: Bool = false,
         initialTab: String = "Ideas",
-        seedWaitingApprovalRun: Bool = false
+        seedWaitingApprovalRun: Bool = false,
+        directSurface: String? = nil
     ) -> XCUIApplication {
         let app = XCUIApplication()
         // Prevent macOS scene restoration from opening stale windows that
@@ -25,6 +26,9 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = "1"
         app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
         app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
+        if let directSurface {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
+        }
         if let seededIdeaTitle {
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"] = seededIdeaTitle
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_BODY"] = seededIdeaBody
@@ -46,14 +50,8 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// and attempts to bring the primary window to front.
     private func launchClean(_ app: XCUIApplication) {
         app.launch()
-        // If scene restoration still created extra windows, bring primary to front
-        if app.windows.count > 1 {
-            let primaryWindow = app.windows.firstMatch
-            if primaryWindow.exists {
-                primaryWindow.click()
-                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
-            }
-        }
+        app.activate()
+        RunLoop.current.run(until: Date().addingTimeInterval(1.0))
     }
 
     /// Takes an evidence screenshot. Silently skips if app has crashed/terminated.
@@ -63,6 +61,20 @@ final class Chainworks_ForgeUITests: XCTestCase {
         a.name = name
         a.lifetime = .keepAlways
         add(a)
+    }
+
+    private func pageDown(_ app: XCUIApplication, times: Int = 1) {
+        guard times > 0 else { return }
+        for _ in 0..<times {
+            app.typeKey(.pageDown, modifierFlags: [])
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        }
+    }
+
+    private func anyElement(_ app: XCUIApplication, identifier: String) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", identifier))
+            .firstMatch
     }
 
     override func setUpWithError() throws {
@@ -263,6 +275,70 @@ final class Chainworks_ForgeUITests: XCTestCase {
             "Pilot readiness surface must render in the Pilot Readiness tab"
         )
         screenshot(app, name: "P006_PilotReadiness")
+    }
+
+    func testProviderSettingsWizardFlowSurface() throws {
+        let app = makeApp(
+            initialTab: "Settings",
+            directSurface: "first_run_setup"
+        )
+        launchClean(app)
+
+        let surfaceReady = anyElement(app, identifier: "first-run-setup-surface-ready")
+        XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "First run setup direct surface must finish bootstrap")
+
+        let wizardRoot = anyElement(app, identifier: "first-run-setup-wizard")
+        let runStorageField = app.textFields["first-run-run-storage-path"].firstMatch
+        let refreshHealthButton = app.buttons["first-run-refresh-health"].firstMatch
+        XCTAssertTrue(
+            wizardRoot.waitForExistence(timeout: 20)
+            || runStorageField.waitForExistence(timeout: 20)
+            || refreshHealthButton.waitForExistence(timeout: 20),
+            "First run wizard must render from pilot readiness"
+        )
+        screenshot(app, name: "P006_Wizard_Surface")
+    }
+
+    func testProviderSettingsExportSurface() throws {
+        let app = makeApp(
+            initialTab: "Settings",
+            directSurface: "provider_settings"
+        )
+        launchClean(app)
+
+        let surfaceReady = anyElement(app, identifier: "provider-settings-surface-ready")
+        XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "Provider settings direct surface must finish bootstrap")
+
+        let exportButton = app.buttons["provider-settings-toolbar-export"].firstMatch
+        XCTAssertTrue(exportButton.waitForExistence(timeout: 20),
+                      "Provider settings must expose settings export")
+        exportButton.click()
+
+        let exportMessage = app.staticTexts["provider-settings-export-message"].firstMatch
+        XCTAssertTrue(exportMessage.waitForExistence(timeout: 20),
+                      "Exporting settings should show the exported path")
+        screenshot(app, name: "P006_Settings_Export")
+    }
+
+    func testPilotReadinessRefreshSurface() throws {
+        let app = makeApp(
+            initialTab: "Pilot Readiness",
+            directSurface: "pilot_readiness"
+        )
+        launchClean(app)
+
+        let surfaceReady = anyElement(app, identifier: "pilot-readiness-surface-ready")
+        XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "Pilot readiness direct surface must finish bootstrap")
+
+        let refreshButton = app.buttons["pilot-readiness-toolbar-refresh"].firstMatch
+        XCTAssertTrue(refreshButton.waitForExistence(timeout: 20),
+                      "Pilot readiness must expose refresh action")
+        refreshButton.click()
+
+        let preflightStatus = app.staticTexts["pilot-readiness-preflight-status"].firstMatch
+        XCTAssertTrue(preflightStatus.waitForExistence(timeout: 20),
+                      "Pilot readiness should render the preflight summary after refresh")
+        screenshot(app, name: "P006_PilotReadiness_Refresh")
     }
 
     // MARK: - REQ-011: Start Run Sheet UI
@@ -621,19 +697,14 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let executionDeadline = Date().addingTimeInterval(90) // leave 30s margin for 120s total
 
         while Date() < executionDeadline {
-            // Check for completion
-            let completedText = app.staticTexts["completed"]
-            if completedText.exists {
-                observedStates.insert("completed")
-                break
-            }
-
             // Collect observed status texts
             for status in ["pending", "ready", "running", "waitingApproval", "completed", "failed"] {
                 if app.staticTexts[status].exists {
                     observedStates.insert(status)
                 }
             }
+
+            if observedStates.contains("completed") { break }
 
             // Check for approval gate — look for inline Approve button in run progress
             let approveButton = app.buttons["Approve"].firstMatch
@@ -654,8 +725,14 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 }
             }
 
-            // Brief pause before next poll (0.25s for responsive detection)
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+            // Wait for a meaningful state change instead of fixed-interval polling
+            let completedEl = app.staticTexts["completed"]
+            let approveEl = app.buttons["Approve"].firstMatch
+            let changePredicate = NSPredicate { _, _ in
+                completedEl.exists || (approveEl.exists && approveEl.isEnabled)
+            }
+            let changeExpectation = XCTNSPredicateExpectation(predicate: changePredicate, object: nil)
+            _ = XCTWaiter().wait(for: [changeExpectation], timeout: 2)
         }
 
         screenshot(app, name: "PA012_04_ExecutionDone")

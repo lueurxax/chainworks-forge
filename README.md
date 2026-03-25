@@ -174,7 +174,25 @@ xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -des
 Run tests:
 
 ```bash
-xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+./scripts/test-gate.sh fast
+```
+
+Proposal-specific gate:
+
+```bash
+./scripts/test-gate.sh proposal-006
+```
+
+UI smoke gate:
+
+```bash
+./scripts/test-gate.sh ui-smoke
+```
+
+Full sign-off gate:
+
+```bash
+./scripts/test-gate.sh full
 ```
 
 Run the live fixture slice locally:
@@ -186,3 +204,7 @@ CHAINWORKS_LIVE_MODEL=fixture-model \
 CHAINWORKS_LIVE_EFFORT=high \
 open "Chainworks Forge.xcodeproj"
 ```
+
+Test gate reference:
+
+- [docs/reference/test-gates.md](docs/reference/test-gates.md)

@@ -17,14 +17,16 @@ struct ApprovalInboxScreen {
 
     @discardableResult
     func waitForRendered(timeout: TimeInterval = 10) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if isRendered() {
-                return true
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        let inbox = inboxView
+        let empty = emptyState
+        let title = emptyTitle
+        let approve = approveButton
+        let reject = rejectButton
+        let predicate = NSPredicate { _, _ in
+            inbox.exists || empty.exists || title.exists || approve.exists || reject.exists
         }
-        return isRendered()
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 
     func isRendered() -> Bool {

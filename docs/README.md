@@ -23,8 +23,9 @@ Repository documentation for Chainworks Forge.
 9. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
 10. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
 11. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
-12. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
-13. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+12. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
+13. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
+14. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
 
 ## Status
 
@@ -42,6 +43,7 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 - [reference/domain-model.md](reference/domain-model.md) — SwiftData models and persistence
 - [reference/architecture-decisions.md](reference/architecture-decisions.md) — AD log
+- [reference/test-gates.md](reference/test-gates.md) — layered fast/UI/proposal/full gates
 
 ## Proposals (active, not yet implemented)
 
