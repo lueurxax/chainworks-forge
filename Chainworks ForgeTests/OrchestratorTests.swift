@@ -1,14 +1,16 @@
-import XCTest
+import Testing
 import SwiftData
+import Foundation
 @testable import Chainworks_Forge
 
 @MainActor
-final class OrchestratorTests: XCTestCase {
-    var container: ModelContainer!
-    var context: ModelContext!
-    var tempDir: URL!
+@Suite("Orchestrator", .serialized, .tags(.fast))
+struct OrchestratorTests {
+    let container: ModelContainer
+    let context: ModelContext
+    let tempDir: URL
 
-    override func setUp() async throws {
+    init() throws {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
         let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
@@ -17,12 +19,6 @@ final class OrchestratorTests: XCTestCase {
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrchestratorTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    }
-
-    override func tearDown() async throws {
-        if let dir = tempDir, FileManager.default.fileExists(atPath: dir.path) {
-            try? FileManager.default.removeItem(at: dir)
-        }
     }
 
     // MARK: - Helpers
@@ -71,43 +67,6 @@ final class OrchestratorTests: XCTestCase {
             outputContract: nil, requiresHumanApproval: false,
             inputs: [], outputs: outputs
         )
-    }
-
-    private final class MockGooseTransport: GooseTransport, @unchecked Sendable {
-        var streamEvents: [GooseStreamEvent] = []
-
-        init() {
-            super.init(baseURL: URL(string: "http://localhost:0")!)
-        }
-
-        override func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-            GooseSessionResponse(
-                sessionId: "live-session-001",
-                status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
-                    accepted: true,
-                    capabilityToken: "mock-read-only",
-                    backendPolicyVersion: "mock-v1"
-                )
-            )
-        }
-
-        override func submitPrompt(
-            sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
-            let events = streamEvents
-            return AsyncThrowingStream { continuation in
-                Task {
-                    for event in events {
-                        continuation.yield(event)
-                    }
-                    continuation.finish()
-                }
-            }
-        }
-
-        override func closeSession(sessionID: String) async throws {}
     }
 
     private struct StaticResultExecutor: AgentExecutor {
@@ -164,7 +123,8 @@ final class OrchestratorTests: XCTestCase {
 
     // MARK: - Simple Linear Workflow
 
-    func testSimpleLinearWorkflow() async {
+    @Test("Simple linear workflow completes successfully")
+    func simpleLinearWorkflow() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
         let agent = makeAgent()
@@ -206,21 +166,22 @@ final class OrchestratorTests: XCTestCase {
         var completed = false
         orchestrator.onComplete = { success in
             completed = true
-            XCTAssertTrue(success)
+            #expect(success)
         }
 
         await orchestrator.start()
 
-        XCTAssertTrue(completed)
-        XCTAssertEqual(run.status, .completed)
-        XCTAssertNotNil(run.completedAt)
-        XCTAssertEqual(executor.executedTasks.count, 1)
-        XCTAssertFalse(run.stageExecutions.isEmpty)
+        #expect(completed)
+        #expect(run.status == .completed)
+        #expect(run.completedAt != nil)
+        #expect(executor.executedTasks.count == 1)
+        #expect(!run.stageExecutions.isEmpty)
     }
 
     // MARK: - Multi-State Workflow
 
-    func testMultiStateWorkflow() async {
+    @Test("Multi-state workflow executes agents in order")
+    func multiStateWorkflow() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -273,15 +234,16 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .completed)
-        XCTAssertEqual(executor.executedTasks.count, 2)
-        XCTAssertEqual(executor.executedTasks[0].agentID, "a1")
-        XCTAssertEqual(executor.executedTasks[1].agentID, "a2")
+        #expect(run.status == .completed)
+        #expect(executor.executedTasks.count == 2)
+        #expect(executor.executedTasks[0].agentID == "a1")
+        #expect(executor.executedTasks[1].agentID == "a2")
     }
 
     // MARK: - Parallel Execution
 
-    func testParallelExecution() async {
+    @Test("Parallel execution runs all agents concurrently")
+    func parallelExecution() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -329,13 +291,14 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .completed)
-        XCTAssertEqual(executor.executedTasks.count, 3)
+        #expect(run.status == .completed)
+        #expect(executor.executedTasks.count == 3)
         let executedAgentIDs = Set(executor.executedTasks.map(\.agentID))
-        XCTAssertEqual(executedAgentIDs, Set(["a1", "a2", "a3"]))
+        #expect(executedAgentIDs == Set(["a1", "a2", "a3"]))
     }
 
-    func testLiveExecutorPublishesTimelineEvents() async {
+    @Test("Live executor publishes timeline events")
+    func liveExecutorPublishesTimelineEvents() async throws {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -373,15 +336,26 @@ final class OrchestratorTests: XCTestCase {
             planCompilerVersion: 1
         )
 
-        let transport = MockGooseTransport()
-        transport.streamEvents = [
-            .sessionStarted(raw: #"{"session_id":"live-session-001"}"#),
-            .promptSubmitted(raw: #"{"request_id":"request-123"}"#),
-            .toolCallStarted(toolName: "read_artifact", raw: "{}"),
-            .textChunk(text: "Drafting proposal..."),
-            .finalOutput(content: "{\"proposal\":\"ready\"}"),
-            .sessionClosed(raw: "{}")
-        ]
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "live-session-001",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            events: [
+                .sessionStarted(raw: #"{"session_id":"live-session-001"}"#),
+                .promptSubmitted(raw: #"{"request_id":"request-123"}"#),
+                .toolCallStarted(toolName: "read_artifact", raw: "{}"),
+                .textChunk(text: "Drafting proposal..."),
+                .finalOutput(content: "{\"proposal\":\"ready\"}"),
+                .sessionClosed(raw: "{}")
+            ]
+        )
         let executor = GooseAgentExecutor(transport: transport)
         let orchestrator = WorkflowOrchestrator(
             run: run, plan: plan, workspace: workspace,
@@ -393,34 +367,36 @@ final class OrchestratorTests: XCTestCase {
         // Allow fire-and-forget live event routing tasks to complete.
         // configureLiveEventBridge() schedules MainActor tasks via Task { @MainActor in ... },
         // which may not have run yet when start() returns.
-        // Uses pollUntil instead of manual for-loop with sleep.
-        try? await pollUntil(timeout: 5.0, message: "Live timeline should populate after execution") {
+        // Uses awaitCondition instead of pollUntil.
+        await awaitCondition("Live timeline should populate after execution", timeout: 5.0) {
             !orchestrator.liveTimeline.isEmpty
         }
 
-        XCTAssertFalse(orchestrator.liveTimeline.isEmpty, "Live timeline should have entries after execution")
+        #expect(!orchestrator.liveTimeline.isEmpty, "Live timeline should have entries after execution")
         if !orchestrator.liveTimeline.isEmpty {
-            XCTAssertTrue(orchestrator.liveTimeline.contains { $0.event.type == .sessionStarted })
-            XCTAssertTrue(orchestrator.liveTimeline.contains { $0.event.type == .toolCallStarted })
-            XCTAssertTrue(orchestrator.liveTimeline.contains { $0.event.type == .finalOutput })
+            #expect(orchestrator.liveTimeline.contains { $0.event.type == .sessionStarted })
+            #expect(orchestrator.liveTimeline.contains { $0.event.type == .toolCallStarted })
+            #expect(orchestrator.liveTimeline.contains { $0.event.type == .finalOutput })
         }
 
-        let agentExecution = try? XCTUnwrap(run.stageExecutions.first?.agentExecutions.first)
-        XCTAssertEqual(agentExecution?.providerSessionID, "live-session-001")
-        XCTAssertEqual(agentExecution?.providerRequestID, "request-123")
-        XCTAssertEqual(agentExecution?.resolvedBackendProfileID, "claude_writer_high")
-        XCTAssertEqual(agentExecution?.gooseSessionID, "live-session-001")
-        XCTAssertTrue(agentExecution?.logSnippet?.contains("Final output") == true)
-        XCTAssertNotNil(agentExecution?.transcriptArtifactPath)
+        let agentExecution = run.stageExecutions.first?.agentExecutions.first
+        try #require(agentExecution != nil)
+        #expect(agentExecution?.providerSessionID == "live-session-001")
+        #expect(agentExecution?.providerRequestID == "request-123")
+        #expect(agentExecution?.resolvedBackendProfileID == "claude_writer_high")
+        #expect(agentExecution?.gooseSessionID == "live-session-001")
+        #expect(agentExecution?.logSnippet?.contains("Final output") == true)
+        #expect(agentExecution?.transcriptArtifactPath != nil)
         if let consumed = agentExecution?.consumedInputArtifactNamesJSON {
             let names = try? JSONDecoder().decode([String].self, from: consumed)
-            XCTAssertEqual(names, [])
+            #expect(names == [])
         } else {
-            XCTFail("Expected consumed input artifact names to be captured")
+            Issue.record("Expected consumed input artifact names to be captured")
         }
     }
 
-    func testCompletedRunPersistsFinalFeatureReport() async throws {
+    @Test("Completed run persists final feature report")
+    func completedRunPersistsFinalFeatureReport() async throws {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -471,24 +447,25 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .completed)
+        #expect(run.status == .completed)
 
         let descriptor = FetchDescriptor<Artifact>()
         let reports = try context.fetch(descriptor)
             .filter { $0.runID == run.id && $0.name == "final_feature_report" }
-        XCTAssertEqual(reports.count, 1)
+        #expect(reports.count == 1)
 
-        let report = try XCTUnwrap(reports.first)
+        let report = try #require(reports.first)
         let data = try ArtifactStorage.read(filePath: report.filePath, workspaceRoot: workspace.workspaceRoot)
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(json["final_status"] as? String, RunStatus.completed.rawValue)
-        XCTAssertEqual(json["cost_currency"] as? String, "USD")
-        XCTAssertNotNil(json["summary"] as? String)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(json["final_status"] as? String == RunStatus.completed.rawValue)
+        #expect(json["cost_currency"] as? String == "USD")
+        #expect(json["summary"] as? String != nil)
     }
 
     // MARK: - Approval Gate
 
-    func testApprovalGatePausesExecution() async {
+    @Test("Approval gate pauses execution")
+    func approvalGatePausesExecution() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -529,13 +506,14 @@ final class OrchestratorTests: XCTestCase {
         await orchestrator.start()
 
         // Should be paused waiting for approval
-        XCTAssertEqual(run.status, .waitingApproval)
-        XCTAssertTrue(orchestrator.isPaused)
-        XCTAssertNotNil(receivedApprovalRequest)
-        XCTAssertEqual(receivedApprovalRequest?.stageID, "start")
+        #expect(run.status == .waitingApproval)
+        #expect(orchestrator.isPaused)
+        #expect(receivedApprovalRequest != nil)
+        #expect(receivedApprovalRequest?.stageID == "start")
     }
 
-    func testApprovalGrantedResumesExecution() async {
+    @Test("Approval granted resumes execution")
+    func approvalGrantedResumesExecution() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -570,22 +548,23 @@ final class OrchestratorTests: XCTestCase {
         )
 
         await orchestrator.start()
-        XCTAssertEqual(run.status, .waitingApproval)
+        #expect(run.status == .waitingApproval)
 
         // Grant approval — this triggers resume
         orchestrator.resolveApproval(stageID: "start", granted: true, comment: "Approved")
 
-        // Wait for resume to complete using pollUntil instead of fixed sleep
-        try? await pollUntil(timeout: 3.0, message: "Run should complete after approval") {
+        // Wait for resume to complete using awaitCondition instead of pollUntil
+        await awaitCondition("Run should complete after approval", timeout: 3.0) {
             run.status == .completed
         }
 
-        assertRunCompleted(run)
+        expectRunCompleted(run)
     }
 
     // MARK: - Agent Failure
 
-    func testAgentFailurePausesRun() async {
+    @Test("Agent failure pauses run with failure policy")
+    func agentFailurePausesRun() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -628,12 +607,13 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .blocked)
+        #expect(run.status == .blocked)
     }
 
     // MARK: - Cancellation
 
-    func testCancellation() async {
+    @Test("Cancellation stops the run")
+    func cancellation() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -679,12 +659,13 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .cancelled)
+        #expect(run.status == .cancelled)
     }
 
     // MARK: - Transition Conditions
 
-    func testArtifactExistsTransition() async {
+    @Test("Artifact-exists transition advances to next state")
+    func artifactExistsTransition() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -736,17 +717,18 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .completed)
-        XCTAssertEqual(executor.executedTasks.count, 2)
+        #expect(run.status == .completed)
+        #expect(executor.executedTasks.count == 2)
     }
 
     // MARK: - Lazy Stage Creation (ARCH-027)
 
-    func testStageExecutionsCreatedLazily() async {
+    @Test("Stage executions are created lazily during run")
+    func stageExecutionsCreatedLazily() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
-        XCTAssertTrue(run.stageExecutions.isEmpty, "No stage executions before start")
+        #expect(run.stageExecutions.isEmpty, "No stage executions before start")
 
         let plan = RunPlan(
             workflowID: "wf", workflowTitle: "WF",
@@ -784,15 +766,16 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertFalse(run.stageExecutions.isEmpty, "Stage executions created during run")
+        #expect(!run.stageExecutions.isEmpty, "Stage executions created during run")
         let startStage = run.stageExecutions.first { $0.stageID == "start" }
-        XCTAssertNotNil(startStage)
-        XCTAssertEqual(startStage?.status, .completed)
+        #expect(startStage != nil)
+        #expect(startStage?.status == .completed)
     }
 
     // MARK: - Cost Aggregation
 
-    func testCostAggregation() async {
+    @Test("Cost is aggregated from executed agents")
+    func costAggregation() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -838,14 +821,15 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertNotNil(run.totalCostCents)
-        XCTAssertTrue(run.totalCostCents! > 0, "Cost should be aggregated from executed agents")
+        #expect(run.totalCostCents != nil)
+        #expect(run.totalCostCents! > 0, "Cost should be aggregated from executed agents")
     }
 
     // MARK: - Approval Rejection (REQ-005: rejection cancels, not fails)
 
     /// Proposal contract: approval rejection must cancel the run, not mark it as failed.
-    func testApprovalRejectedCancels() async {
+    @Test("Approval rejection cancels the run")
+    func approvalRejectedCancels() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -887,31 +871,32 @@ final class OrchestratorTests: XCTestCase {
         }
 
         await orchestrator.start()
-        XCTAssertEqual(run.status, .waitingApproval)
-        XCTAssertTrue(orchestrator.isPaused)
+        #expect(run.status == .waitingApproval)
+        #expect(orchestrator.isPaused)
 
         // Reject the approval
         orchestrator.resolveApproval(stageID: "start", granted: false, comment: "Rejected in test")
 
         // Proposal contract: rejection cancels (not fails)
-        XCTAssertEqual(run.status, .cancelled, "Rejected approval must cancel the run, not fail it")
-        XCTAssertTrue(orchestrator.isCancelled, "Orchestrator must be marked cancelled")
-        XCTAssertFalse(orchestrator.isRunning, "Orchestrator must stop running")
-        XCTAssertTrue(completionCalled, "onComplete must fire on rejection")
-        XCTAssertFalse(completionSuccess, "onComplete should report failure")
+        #expect(run.status == .cancelled, "Rejected approval must cancel the run, not fail it")
+        #expect(orchestrator.isCancelled, "Orchestrator must be marked cancelled")
+        #expect(!orchestrator.isRunning, "Orchestrator must stop running")
+        #expect(completionCalled, "onComplete must fire on rejection")
+        #expect(!completionSuccess, "onComplete should report failure")
 
         // Verify the approval record was updated
         let rejectedApproval = run.approvals.first { $0.stageID == "start" }
-        XCTAssertNotNil(rejectedApproval)
-        XCTAssertEqual(rejectedApproval?.decision, .rejected)
-        XCTAssertNotNil(rejectedApproval?.decidedAt)
-        XCTAssertEqual(rejectedApproval?.comment, "Rejected in test")
+        #expect(rejectedApproval != nil)
+        #expect(rejectedApproval?.decision == .rejected)
+        #expect(rejectedApproval?.decidedAt != nil)
+        #expect(rejectedApproval?.comment == "Rejected in test")
     }
 
     // MARK: - Run After Approval (REQ-005: run_after_approval block)
 
     /// Verifies that the run_after_approval block executes after approval is granted.
-    func testRunAfterApproval() async {
+    @Test("Run-after-approval block executes post approval")
+    func runAfterApproval() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -957,26 +942,27 @@ final class OrchestratorTests: XCTestCase {
         await orchestrator.start()
 
         // Should have executed the pre-approval work
-        XCTAssertEqual(run.status, .waitingApproval)
-        XCTAssertEqual(executor.executedTasks.count, 1, "Should execute pre-approval block")
-        XCTAssertEqual(executor.executedTasks[0].task, "pre_approval_work")
+        #expect(run.status == .waitingApproval)
+        #expect(executor.executedTasks.count == 1, "Should execute pre-approval block")
+        #expect(executor.executedTasks[0].task == "pre_approval_work")
 
         // Grant approval — triggers run_after_approval + transitions
         orchestrator.resolveApproval(stageID: "start", granted: true, comment: "Approved")
 
-        // Wait for the post-approval work + transition to complete using pollUntil
-        try? await pollUntil(timeout: 5.0, message: "Run should complete after post-approval work") {
+        // Wait for the post-approval work + transition to complete using awaitCondition
+        await awaitCondition("Run should complete after post-approval work", timeout: 5.0) {
             run.status == .completed
         }
 
         // Verify the post-approval block executed
-        XCTAssertEqual(executor.executedTasks.count, 2, "Should execute both pre- and post-approval blocks")
-        XCTAssertEqual(executor.executedTasks[1].agentID, "a2", "Post-approval should use agent a2")
-        XCTAssertEqual(executor.executedTasks[1].task, "post_approval_work")
-        assertRunCompleted(run)
+        #expect(executor.executedTasks.count == 2, "Should execute both pre- and post-approval blocks")
+        #expect(executor.executedTasks[1].agentID == "a2", "Post-approval should use agent a2")
+        #expect(executor.executedTasks[1].task == "post_approval_work")
+        expectRunCompleted(run)
     }
 
-    func testMalformedReviewJSONFailsBeforeTransitionEvaluation() async {
+    @Test("Malformed review JSON fails before transition evaluation")
+    func malformedReviewJSONFailsBeforeTransitionEvaluation() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
         let agent = ResolvedAgent(
@@ -1068,10 +1054,10 @@ final class OrchestratorTests: XCTestCase {
 
         await orchestrator.start()
 
-        XCTAssertEqual(run.status, .failed)
-        XCTAssertEqual(run.stageExecutions.count, 1)
-        XCTAssertEqual(run.stageExecutions.first?.agentExecutions.first?.status, .failed)
-        XCTAssertTrue(run.stageExecutions.first?.agentExecutions.first?.logSnippet?.contains("not valid JSON") == true)
-        XCTAssertTrue(run.stageExecutions.first?.agentExecutions.first?.artifacts.isEmpty ?? true)
+        #expect(run.status == .failed)
+        #expect(run.stageExecutions.count == 1)
+        #expect(run.stageExecutions.first?.agentExecutions.first?.status == .failed)
+        #expect(run.stageExecutions.first?.agentExecutions.first?.logSnippet?.contains("not valid JSON") == true)
+        #expect(run.stageExecutions.first?.agentExecutions.first?.artifacts.isEmpty ?? true)
     }
 }

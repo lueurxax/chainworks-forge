@@ -1,4 +1,4 @@
-import XCTest
+import Testing
 import Foundation
 @testable import Chainworks_Forge
 
@@ -7,7 +7,8 @@ import Foundation
 /// Unit and integration tests for GooseServerTransport.
 /// Covers initialization, protocol conformance, ChatRequest encoding (REQ-010),
 /// and full mock-HTTP round-trip (REQ-011).
-final class GooseServerTransportTests: XCTestCase {
+@Suite("GooseServerTransport")
+struct GooseServerTransportTests {
 
     // MARK: - MockURLProtocol
 
@@ -97,32 +98,29 @@ final class GooseServerTransportTests: XCTestCase {
         )
     }
 
-    override func setUp() {
-        super.setUp()
+    init() {
         MockURLProtocol.reset()
-    }
-
-    override func tearDown() {
-        MockURLProtocol.reset()
-        super.tearDown()
     }
 
     // MARK: - Transport API Selection
 
-    func testGooseTransportAPIRawValues() {
-        XCTAssertEqual(GooseTransportAPI.bespoke.rawValue, "bespoke")
-        XCTAssertEqual(GooseTransportAPI.gooseServer.rawValue, "goose_server")
+    @Test("GooseTransportAPI raw values match expected strings")
+    func gooseTransportAPIRawValues() {
+        #expect(GooseTransportAPI.bespoke.rawValue == "bespoke")
+        #expect(GooseTransportAPI.gooseServer.rawValue == "goose_server")
     }
 
-    func testGooseTransportAPIFromRawValue() {
-        XCTAssertEqual(GooseTransportAPI(rawValue: "bespoke"), .bespoke)
-        XCTAssertEqual(GooseTransportAPI(rawValue: "goose_server"), .gooseServer)
-        XCTAssertNil(GooseTransportAPI(rawValue: "invalid"))
+    @Test("GooseTransportAPI initializes from valid raw values and returns nil for invalid")
+    func gooseTransportAPIFromRawValue() {
+        #expect(GooseTransportAPI(rawValue: "bespoke") == .bespoke)
+        #expect(GooseTransportAPI(rawValue: "goose_server") == .gooseServer)
+        #expect(GooseTransportAPI(rawValue: "invalid") == nil)
     }
 
     // MARK: - GooseServerTransport Initialization
 
-    func testServerTransportInitialization() {
+    @Test("GooseServerTransport stores initialization parameters correctly")
+    func serverTransportInitialization() {
         let transport = GooseServerTransport(
             baseURL: URL(string: "https://127.0.0.1:51200")!,
             secretKey: "test-secret",
@@ -130,49 +128,54 @@ final class GooseServerTransportTests: XCTestCase {
             model: "default"
         )
 
-        XCTAssertEqual(transport.baseURL.absoluteString, "https://127.0.0.1:51200")
-        XCTAssertEqual(transport.secretKey, "test-secret")
-        XCTAssertEqual(transport.provider, "claude-code")
-        XCTAssertEqual(transport.model, "default")
-        XCTAssertEqual(transport.requestTimeout, 300)
+        #expect(transport.baseURL.absoluteString == "https://127.0.0.1:51200")
+        #expect(transport.secretKey == "test-secret")
+        #expect(transport.provider == "claude-code")
+        #expect(transport.model == "default")
+        #expect(transport.requestTimeout == 300)
     }
 
-    func testServerTransportCustomTimeout() {
+    @Test("GooseServerTransport accepts custom timeout")
+    func serverTransportCustomTimeout() {
         let transport = GooseServerTransport(
             baseURL: URL(string: "https://127.0.0.1:51200")!,
             requestTimeout: 600
         )
-        XCTAssertEqual(transport.requestTimeout, 600)
+        #expect(transport.requestTimeout == 600)
     }
 
     // MARK: - Protocol Conformance
 
-    func testServerTransportConformsToProtocol() {
+    @Test("GooseServerTransport conforms to GooseTransportProtocol")
+    func serverTransportConformsToProtocol() {
         let transport: any GooseTransportProtocol = GooseServerTransport(
             baseURL: URL(string: "https://127.0.0.1:51200")!,
             secretKey: "test-secret"
         )
-        XCTAssertNotNil(transport)
+        #expect(transport != nil)
     }
 
-    func testBespokeTransportConformsToProtocol() {
+    @Test("GooseTransport (bespoke) conforms to GooseTransportProtocol")
+    func bespokeTransportConformsToProtocol() {
         let transport: any GooseTransportProtocol = GooseTransport(
             baseURL: URL(string: "http://localhost:3000")!,
             apiKey: "test-key"
         )
-        XCTAssertNotNil(transport)
+        #expect(transport != nil)
     }
 
-    func testFixtureTransportConformsToProtocol() {
+    @Test("FixtureGooseTransport conforms to GooseTransportProtocol")
+    func fixtureTransportConformsToProtocol() {
         let transport: any GooseTransportProtocol = FixtureGooseTransport(
             scenario: .proposalLoopSuccess
         )
-        XCTAssertNotNil(transport)
+        #expect(transport != nil)
     }
 
     // MARK: - LiveRuntimeConfiguration with transportAPI
 
-    func testLiveRuntimeConfigurationWithGooseServer() {
+    @Test("LiveRuntimeConfiguration with gooseServer transport API")
+    func liveRuntimeConfigurationWithGooseServer() {
         let config = LiveRuntimeConfiguration(
             baseURL: URL(string: "https://127.0.0.1:51200")!,
             apiKey: "test-secret",
@@ -186,11 +189,12 @@ final class GooseServerTransportTests: XCTestCase {
             transportAPI: .gooseServer
         )
 
-        XCTAssertEqual(config.transportAPI, .gooseServer)
-        XCTAssertTrue(config.sourceDescription.contains("goosed"))
+        #expect(config.transportAPI == .gooseServer)
+        #expect(config.sourceDescription.contains("goosed"))
     }
 
-    func testLiveRuntimeConfigurationWithBespoke() {
+    @Test("LiveRuntimeConfiguration with bespoke transport API")
+    func liveRuntimeConfigurationWithBespoke() {
         let config = LiveRuntimeConfiguration(
             baseURL: URL(string: "http://localhost:3000")!,
             apiKey: "test-key",
@@ -199,11 +203,12 @@ final class GooseServerTransportTests: XCTestCase {
             transportAPI: .bespoke
         )
 
-        XCTAssertEqual(config.transportAPI, .bespoke)
-        XCTAssertTrue(config.sourceDescription.contains("bespoke"))
+        #expect(config.transportAPI == .bespoke)
+        #expect(config.sourceDescription.contains("bespoke"))
     }
 
-    func testLiveRuntimeConfigurationFixtureMode() {
+    @Test("LiveRuntimeConfiguration in fixture mode")
+    func liveRuntimeConfigurationFixtureMode() {
         let config = LiveRuntimeConfiguration(
             baseURL: URL(string: "http://fixture.local")!,
             apiKey: nil,
@@ -212,14 +217,15 @@ final class GooseServerTransportTests: XCTestCase {
             transportAPI: .bespoke
         )
 
-        XCTAssertTrue(config.sourceDescription.contains("Fixture"))
+        #expect(config.sourceDescription.contains("Fixture"))
     }
 
     // MARK: - REQ-010: ChatRequest Encoding Unit Tests
 
     /// Verifies that submitPrompt() encodes metadata.userVisible and metadata.agentVisible
     /// in the /reply request body (Proposal 005, Section 4.3 — required fields).
-    func testChatRequestEncodingContainsRequiredMetadata() async throws {
+    @Test("ChatRequest encoding contains required metadata fields (REQ-010)")
+    func chatRequestEncodingContainsRequiredMetadata() async throws {
         let transport = makeMockTransport()
 
         // Set up mock handler that captures and returns a minimal SSE response
@@ -240,48 +246,49 @@ final class GooseServerTransportTests: XCTestCase {
         // Find the /reply request
         let requests = MockURLProtocol.recordedRequests()
         let replyRequest = requests.first { $0.url.contains("/reply") }
-        XCTAssertNotNil(replyRequest, "Should have sent a POST /reply request")
+        let unwrappedReply = try #require(replyRequest, "Should have sent a POST /reply request")
 
-        guard let body = replyRequest?.body,
-              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            XCTFail("Request body should be valid JSON")
-            return
-        }
+        let body = try #require(unwrappedReply.body, "Request should have a body")
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: body) as? [String: Any],
+            "Request body should be valid JSON"
+        )
 
         // Verify session_id
-        XCTAssertEqual(json["session_id"] as? String, "test-session-1")
+        #expect(json["session_id"] as? String == "test-session-1")
 
         // Verify user_message structure
-        guard let userMessage = json["user_message"] as? [String: Any] else {
-            XCTFail("Request body should contain user_message")
-            return
-        }
+        let userMessage = try #require(
+            json["user_message"] as? [String: Any],
+            "Request body should contain user_message"
+        )
 
-        XCTAssertEqual(userMessage["role"] as? String, "user")
-        XCTAssertNotNil(userMessage["created"] as? Int, "created must be a Unix timestamp integer")
+        #expect(userMessage["role"] as? String == "user")
+        #expect(userMessage["created"] as? Int != nil, "created must be a Unix timestamp integer")
 
         // Verify content array
-        guard let content = userMessage["content"] as? [[String: Any]],
-              let firstContent = content.first else {
-            XCTFail("user_message.content should be a non-empty array")
-            return
-        }
-        XCTAssertEqual(firstContent["type"] as? String, "text")
-        XCTAssertTrue((firstContent["text"] as? String)?.contains("Test prompt for encoding verification") == true)
+        let content = try #require(
+            userMessage["content"] as? [[String: Any]],
+            "user_message.content should be a non-empty array"
+        )
+        let firstContent = try #require(content.first, "user_message.content should be a non-empty array")
+        #expect(firstContent["type"] as? String == "text")
+        #expect((firstContent["text"] as? String)?.contains("Test prompt for encoding verification") == true)
 
         // REQ-010 critical assertion: metadata.userVisible and metadata.agentVisible are REQUIRED
-        guard let metadata = userMessage["metadata"] as? [String: Any] else {
-            XCTFail("user_message.metadata must be present (server returns 422 without it)")
-            return
-        }
-        XCTAssertEqual(metadata["userVisible"] as? Bool, true,
-                       "metadata.userVisible must be true (required by goosed, 422 without it)")
-        XCTAssertEqual(metadata["agentVisible"] as? Bool, true,
-                       "metadata.agentVisible must be true (required by goosed, 422 without it)")
+        let metadata = try #require(
+            userMessage["metadata"] as? [String: Any],
+            "user_message.metadata must be present (server returns 422 without it)"
+        )
+        #expect(metadata["userVisible"] as? Bool == true,
+                "metadata.userVisible must be true (required by goosed, 422 without it)")
+        #expect(metadata["agentVisible"] as? Bool == true,
+                "metadata.agentVisible must be true (required by goosed, 422 without it)")
     }
 
     /// Verifies that context attachments are serialized into the message text.
-    func testChatRequestEncodingIncludesContextAttachments() async throws {
+    @Test("ChatRequest encoding includes context attachments")
+    func chatRequestEncodingIncludesContextAttachments() async throws {
         let transport = makeMockTransport()
 
         MockURLProtocol.requestHandler = { request in
@@ -303,24 +310,25 @@ final class GooseServerTransportTests: XCTestCase {
         let requests = MockURLProtocol.recordedRequests()
         let replyRequest = requests.first { $0.url.contains("/reply") }
 
-        guard let body = replyRequest?.body,
-              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let userMessage = json["user_message"] as? [String: Any],
-              let content = userMessage["content"] as? [[String: Any]],
-              let text = content.first?["text"] as? String else {
-            XCTFail("Should have a valid /reply request with text content")
-            return
-        }
+        let body = try #require(replyRequest?.body, "Should have a valid /reply request body")
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: body) as? [String: Any],
+            "Should have valid JSON body"
+        )
+        let userMessage = try #require(json["user_message"] as? [String: Any], "Should have user_message")
+        let content = try #require(userMessage["content"] as? [[String: Any]], "Should have content array")
+        let text = try #require(content.first?["text"] as? String, "Should have text content")
 
         // Context attachments should be embedded in the message text
-        XCTAssertTrue(text.contains("Main task prompt"), "Should contain the main prompt")
-        XCTAssertTrue(text.contains("workspace_context"), "Should contain workspace_context attachment")
-        XCTAssertTrue(text.contains("input_artifact"), "Should contain input_artifact attachment")
-        XCTAssertTrue(text.contains("artifact content here"), "Should contain attachment content")
+        #expect(text.contains("Main task prompt"), "Should contain the main prompt")
+        #expect(text.contains("workspace_context"), "Should contain workspace_context attachment")
+        #expect(text.contains("input_artifact"), "Should contain input_artifact attachment")
+        #expect(text.contains("artifact content here"), "Should contain attachment content")
     }
 
     /// Verifies that the session system prompt is embedded into the /reply payload for goosed.
-    func testChatRequestEncodingIncludesSessionSystemPrompt() async throws {
+    @Test("ChatRequest encoding includes session system prompt")
+    func chatRequestEncodingIncludesSessionSystemPrompt() async throws {
         let transport = makeMockTransport()
 
         MockURLProtocol.requestHandler = { request in
@@ -354,22 +362,23 @@ final class GooseServerTransportTests: XCTestCase {
         let requests = MockURLProtocol.recordedRequests()
         let replyRequest = requests.first { $0.url.contains("/reply") }
 
-        guard let body = replyRequest?.body,
-              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let userMessage = json["user_message"] as? [String: Any],
-              let content = userMessage["content"] as? [[String: Any]],
-              let text = content.first?["text"] as? String else {
-            XCTFail("Should have a valid /reply request with text content")
-            return
-        }
+        let body = try #require(replyRequest?.body, "Should have a valid /reply request body")
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: body) as? [String: Any],
+            "Should have valid JSON body"
+        )
+        let userMessage = try #require(json["user_message"] as? [String: Any], "Should have user_message")
+        let content = try #require(userMessage["content"] as? [[String: Any]], "Should have content array")
+        let text = try #require(content.first?["text"] as? String, "Should have text content")
 
-        XCTAssertTrue(text.contains("Do not call xcode_mcp."),
-                      "System prompt must be embedded in the goosed /reply payload")
-        XCTAssertTrue(text.contains("Reply with exactly ok"))
+        #expect(text.contains("Do not call xcode_mcp."),
+                "System prompt must be embedded in the goosed /reply payload")
+        #expect(text.contains("Reply with exactly ok"))
     }
 
     /// Verifies that X-Secret-Key header is used (not Authorization: Bearer).
-    func testSecretKeyHeaderUsedNotBearerAuth() async throws {
+    @Test("Secret key header is used instead of Bearer auth")
+    func secretKeyHeaderUsedNotBearerAuth() async throws {
         let transport = makeMockTransport(secretKey: "my-test-secret")
 
         MockURLProtocol.requestHandler = { request in
@@ -384,17 +393,18 @@ final class GooseServerTransportTests: XCTestCase {
         let requests = MockURLProtocol.recordedRequests()
         let replyRequest = requests.first { $0.url.contains("/reply") }
 
-        XCTAssertEqual(replyRequest?.headers["X-Secret-Key"], "my-test-secret",
-                       "Should use X-Secret-Key header")
-        XCTAssertNil(replyRequest?.headers["Authorization"],
-                     "Should NOT use Authorization header (goosed uses X-Secret-Key)")
+        #expect(replyRequest?.headers["X-Secret-Key"] == "my-test-secret",
+                "Should use X-Secret-Key header")
+        #expect(replyRequest?.headers["Authorization"] == nil,
+                "Should NOT use Authorization header (goosed uses X-Secret-Key)")
     }
 
     // MARK: - REQ-011: Mock-HTTP Integration Test — Full Round-Trip
 
-    /// Full round-trip integration test: createSession → (update_provider) → submitPrompt → closeSession.
+    /// Full round-trip integration test: createSession -> (update_provider) -> submitPrompt -> closeSession.
     /// Uses MockURLProtocol to simulate goosed responses without a real server.
-    func testFullRoundTripCreateSubmitClose() async throws {
+    @Test("Full round-trip: createSession, submitPrompt, closeSession (REQ-011)")
+    func fullRoundTripCreateSubmitClose() async throws {
         let transport = makeMockTransport(secretKey: "integration-secret", provider: "claude-code", model: "test-model")
 
         MockURLProtocol.requestHandler = { request in
@@ -413,7 +423,7 @@ final class GooseServerTransportTests: XCTestCase {
             }
 
             if url.hasSuffix("/reply") {
-                // Simulate goosed SSE stream: Ping → Message → Finish
+                // Simulate goosed SSE stream: Ping -> Message -> Finish
                 let sseBody = """
                 data: {"type":"Ping"}
 
@@ -443,39 +453,39 @@ final class GooseServerTransportTests: XCTestCase {
         )
         let sessionResponse = try await transport.createSession(request: sessionRequest)
 
-        XCTAssertEqual(sessionResponse.sessionId, "mock-session-42",
-                       "Session ID should come from the mock /agent/start response")
-        XCTAssertEqual(sessionResponse.policyAcknowledgement?.accepted, true,
-                       "GooseServerTransport synthesizes policy acknowledgement")
+        #expect(sessionResponse.sessionId == "mock-session-42",
+                "Session ID should come from the mock /agent/start response")
+        #expect(sessionResponse.policyAcknowledgement?.accepted == true,
+                "GooseServerTransport synthesizes policy acknowledgement")
 
         // Verify the request sequence so far
         let requestsSoFar = MockURLProtocol.recordedRequests()
         let startRequest = requestsSoFar.first { $0.url.contains("/agent/start") }
-        XCTAssertNotNil(startRequest, "Should have called /agent/start")
-        XCTAssertEqual(startRequest?.method, "POST")
-        XCTAssertEqual(startRequest?.headers["X-Secret-Key"], "integration-secret")
+        let unwrappedStart = try #require(startRequest, "Should have called /agent/start")
+        #expect(unwrappedStart.method == "POST")
+        #expect(unwrappedStart.headers["X-Secret-Key"] == "integration-secret")
 
         // Verify /agent/start body contains working_dir
-        if let startBody = startRequest?.body,
-           let startJSON = try? JSONSerialization.jsonObject(with: startBody) as? [String: Any] {
-            XCTAssertEqual(startJSON["working_dir"] as? String, "/tmp/test-workspace")
-        } else {
-            XCTFail("Start request should have JSON body with working_dir")
-        }
+        let startBody = try #require(unwrappedStart.body, "Start request should have a body")
+        let startJSON = try #require(
+            try JSONSerialization.jsonObject(with: startBody) as? [String: Any],
+            "Start request should have JSON body with working_dir"
+        )
+        #expect(startJSON["working_dir"] as? String == "/tmp/test-workspace")
 
         let providerRequest = requestsSoFar.first { $0.url.contains("/agent/update_provider") }
-        XCTAssertNotNil(providerRequest, "Should have called /agent/update_provider")
-        XCTAssertEqual(providerRequest?.method, "POST")
+        let unwrappedProvider = try #require(providerRequest, "Should have called /agent/update_provider")
+        #expect(unwrappedProvider.method == "POST")
 
         // Verify /agent/update_provider body
-        if let providerBody = providerRequest?.body,
-           let providerJSON = try? JSONSerialization.jsonObject(with: providerBody) as? [String: Any] {
-            XCTAssertEqual(providerJSON["session_id"] as? String, "mock-session-42")
-            XCTAssertEqual(providerJSON["provider"] as? String, "claude-code")
-            XCTAssertEqual(providerJSON["model"] as? String, "test-model")
-        } else {
-            XCTFail("Provider request should have JSON body with session_id, provider, model")
-        }
+        let providerBody = try #require(unwrappedProvider.body, "Provider request should have a body")
+        let providerJSON = try #require(
+            try JSONSerialization.jsonObject(with: providerBody) as? [String: Any],
+            "Provider request should have JSON body with session_id, provider, model"
+        )
+        #expect(providerJSON["session_id"] as? String == "mock-session-42")
+        #expect(providerJSON["provider"] as? String == "claude-code")
+        #expect(providerJSON["model"] as? String == "test-model")
 
         // Step 2: Submit prompt and collect events
         let promptRequest = GoosePromptRequest(
@@ -505,37 +515,34 @@ final class GooseServerTransportTests: XCTestCase {
             }
         }
 
-        XCTAssertTrue(eventTypes.contains("sessionStarted"), "Should emit sessionStarted")
-        XCTAssertTrue(eventTypes.contains("promptSubmitted"), "Should emit promptSubmitted")
-        XCTAssertTrue(eventTypes.contains("textChunk"), "Should emit textChunk from Message event")
-        XCTAssertTrue(eventTypes.contains("finalOutput"), "Should emit finalOutput from Finish event")
-        XCTAssertTrue(eventTypes.contains("sessionClosed"), "Should emit sessionClosed after Finish")
+        #expect(eventTypes.contains("sessionStarted"), "Should emit sessionStarted")
+        #expect(eventTypes.contains("promptSubmitted"), "Should emit promptSubmitted")
+        #expect(eventTypes.contains("textChunk"), "Should emit textChunk from Message event")
+        #expect(eventTypes.contains("finalOutput"), "Should emit finalOutput from Finish event")
+        #expect(eventTypes.contains("sessionClosed"), "Should emit sessionClosed after Finish")
 
         // Verify the text content
         let textChunks = events.compactMap { event -> String? in
             if case .textChunk(let text) = event { return text }
             return nil
         }
-        XCTAssertTrue(textChunks.contains("Hello from mock goosed"),
-                      "Text chunk should contain the mock response")
+        #expect(textChunks.contains("Hello from mock goosed"),
+                "Text chunk should contain the mock response")
 
         // Step 3: Close session
-        do {
-            try await transport.closeSession(sessionID: sessionResponse.sessionId)
-        } catch {
-            XCTFail("closeSession should not throw: \(error)")
-        }
+        try await transport.closeSession(sessionID: sessionResponse.sessionId)
 
         // Verify DELETE was called
         let allRequests = MockURLProtocol.recordedRequests()
         let deleteRequest = allRequests.first { $0.method == "DELETE" && $0.url.contains("/sessions/") }
-        XCTAssertNotNil(deleteRequest, "Should have called DELETE /sessions/{id}")
-        XCTAssertTrue(deleteRequest?.url.contains("mock-session-42") == true,
-                      "DELETE should target the correct session ID")
+        let unwrappedDelete = try #require(deleteRequest, "Should have called DELETE /sessions/{id}")
+        #expect(unwrappedDelete.url.contains("mock-session-42"),
+                "DELETE should target the correct session ID")
     }
 
     /// Tests that createSession fails gracefully when /agent/start returns an error.
-    func testCreateSessionFailsOnServerError() async throws {
+    @Test("createSession fails on server error with httpError")
+    func createSessionFailsOnServerError() async throws {
         let transport = makeMockTransport()
 
         MockURLProtocol.requestHandler = { _ in
@@ -551,20 +558,20 @@ final class GooseServerTransportTests: XCTestCase {
             metadata: nil
         )
 
-        do {
+        await #expect {
             _ = try await transport.createSession(request: request)
-            XCTFail("Should have thrown on 500 error")
-        } catch let error as GooseTransportError {
-            if case .httpError(let code, _) = error {
-                XCTAssertEqual(code, 500)
-            } else {
-                XCTFail("Expected httpError, got \(error)")
+        } throws: { error in
+            guard let transportError = error as? GooseTransportError,
+                  case .httpError(let code, _) = transportError else {
+                return false
             }
+            return code == 500
         }
     }
 
     /// Tests that SSE error events are properly mapped.
-    func testSubmitPromptMapsErrorEvent() async throws {
+    @Test("submitPrompt maps SSE error events correctly")
+    func submitPromptMapsErrorEvent() async throws {
         let transport = makeMockTransport()
 
         MockURLProtocol.requestHandler = { request in
@@ -584,13 +591,14 @@ final class GooseServerTransportTests: XCTestCase {
             if case .error(let msg) = event { return msg }
             return nil
         }
-        XCTAssertTrue(errorEvents.contains("Provider not set"),
-                      "Should map Error event with the correct message")
+        #expect(errorEvents.contains("Provider not set"),
+                "Should map Error event with the correct message")
     }
 
     // MARK: - Fixture Transport Unchanged
 
-    func testFixtureTransportCreateSession() async throws {
+    @Test("FixtureGooseTransport createSession returns fixture session")
+    func fixtureTransportCreateSession() async throws {
         let transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
         let request = GooseSessionRequest(
             systemPrompt: "Test prompt",
@@ -602,11 +610,12 @@ final class GooseServerTransportTests: XCTestCase {
         )
 
         let response = try await transport.createSession(request: request)
-        XCTAssertTrue(response.sessionId.hasPrefix("fixture-"))
-        XCTAssertEqual(response.policyAcknowledgement?.accepted, true)
+        #expect(response.sessionId.hasPrefix("fixture-"))
+        #expect(response.policyAcknowledgement?.accepted == true)
     }
 
-    func testFixtureTransportSubmitPrompt() async throws {
+    @Test("FixtureGooseTransport submitPrompt produces expected event sequence")
+    func fixtureTransportSubmitPrompt() async throws {
         let transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
 
         let request = GooseSessionRequest(
@@ -630,23 +639,20 @@ final class GooseServerTransportTests: XCTestCase {
             events.append(event)
         }
 
-        XCTAssertTrue(events.count >= 5, "Fixture should produce multiple events")
+        #expect(events.count >= 5, "Fixture should produce multiple events")
 
         let hasSessionStarted = events.contains { if case .sessionStarted = $0 { return true }; return false }
         let hasFinalOutput = events.contains { if case .finalOutput = $0 { return true }; return false }
         let hasSessionClosed = events.contains { if case .sessionClosed = $0 { return true }; return false }
 
-        XCTAssertTrue(hasSessionStarted)
-        XCTAssertTrue(hasFinalOutput)
-        XCTAssertTrue(hasSessionClosed)
+        #expect(hasSessionStarted)
+        #expect(hasFinalOutput)
+        #expect(hasSessionClosed)
     }
 
-    func testFixtureTransportCloseSession() async throws {
+    @Test("FixtureGooseTransport closeSession does not throw")
+    func fixtureTransportCloseSession() async throws {
         let transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
-        do {
-            try await transport.closeSession(sessionID: "fixture-test")
-        } catch {
-            XCTFail("closeSession should not throw: \(error)")
-        }
+        try await transport.closeSession(sessionID: "fixture-test")
     }
 }

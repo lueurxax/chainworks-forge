@@ -1,4 +1,4 @@
-import XCTest
+import Testing
 import Foundation
 @testable import Chainworks_Forge
 
@@ -7,7 +7,8 @@ import Foundation
 /// Unit tests for GooseSessionBridge.
 /// Tests workspace validation, packet construction, and session isolation.
 @MainActor
-final class GooseSessionBridgeTests: XCTestCase {
+@Suite("GooseSessionBridge")
+struct GooseSessionBridgeTests {
 
     // MARK: - Helpers
 
@@ -53,16 +54,18 @@ final class GooseSessionBridgeTests: XCTestCase {
     // MARK: - Workspace Validation Tests
 
     /// testSessionBridgeBindsWorkspaceExplicitly — Section 12.1
-    func testSessionBridgeBindsWorkspaceExplicitly() throws {
+    @Test("Session bridge binds workspace explicitly")
+    func sessionBridgeBindsWorkspaceExplicitly() throws {
         let workspace = makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
 
         // Should not throw for a valid workspace
-        XCTAssertNoThrow(try GooseSessionBridge.validateWorkspace(workspace))
+        #expect(throws: Never.self) { try GooseSessionBridge.validateWorkspace(workspace) }
     }
 
     /// testSessionBridgeRejectsImplicitCWD — Section 12.1
-    func testSessionBridgeRejectsImplicitCWD() {
+    @Test("Session bridge rejects implicit CWD")
+    func sessionBridgeRejectsImplicitCWD() {
         // Workspace with cwd as root should be rejected
         let cwdWorkspace = RunWorkspace(
             runID: UUID(),
@@ -71,13 +74,14 @@ final class GooseSessionBridgeTests: XCTestCase {
             worktreeRoot: nil
         )
 
-        XCTAssertThrowsError(try GooseSessionBridge.validateWorkspace(cwdWorkspace)) { error in
-            XCTAssertTrue(error is GooseSessionBridgeError)
+        #expect(throws: GooseSessionBridgeError.self) {
+            try GooseSessionBridge.validateWorkspace(cwdWorkspace)
         }
     }
 
     /// testSessionBridgeRejectsRootPath
-    func testSessionBridgeRejectsRootPath() {
+    @Test("Session bridge rejects root path")
+    func sessionBridgeRejectsRootPath() {
         let rootWorkspace = RunWorkspace(
             runID: UUID(),
             workspaceRoot: URL(fileURLWithPath: "/"),
@@ -85,13 +89,14 @@ final class GooseSessionBridgeTests: XCTestCase {
             worktreeRoot: nil
         )
 
-        XCTAssertThrowsError(try GooseSessionBridge.validateWorkspace(rootWorkspace)) { error in
-            XCTAssertTrue(error is GooseSessionBridgeError)
+        #expect(throws: GooseSessionBridgeError.self) {
+            try GooseSessionBridge.validateWorkspace(rootWorkspace)
         }
     }
 
     /// testSessionBridgeRejectsEmptyPath
-    func testSessionBridgeRejectsEmptyPath() {
+    @Test("Session bridge rejects empty path")
+    func sessionBridgeRejectsEmptyPath() {
         let emptyWorkspace = RunWorkspace(
             runID: UUID(),
             workspaceRoot: URL(fileURLWithPath: ""),
@@ -99,13 +104,16 @@ final class GooseSessionBridgeTests: XCTestCase {
             worktreeRoot: nil
         )
 
-        XCTAssertThrowsError(try GooseSessionBridge.validateWorkspace(emptyWorkspace))
+        #expect(throws: (any Error).self) {
+            try GooseSessionBridge.validateWorkspace(emptyWorkspace)
+        }
     }
 
     // MARK: - Execution Packet Tests
 
     /// testSessionBridgeUsesOneSessionPerExecution — Section 12.1
-    func testPacketContainsSystemPrompt() {
+    @Test("Packet contains system prompt")
+    func packetContainsSystemPrompt() {
         let agent = makeAgent()
         let task = makeTask()
         let workspace = makeWorkspace()
@@ -125,16 +133,17 @@ final class GooseSessionBridgeTests: XCTestCase {
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         // System prompt should contain agent info
-        XCTAssertTrue(packet.systemPrompt.contains("Test Agent"))
-        XCTAssertTrue(packet.systemPrompt.contains("test_agent"))
-        XCTAssertTrue(packet.systemPrompt.contains("autonomous"))
+        #expect(packet.systemPrompt.contains("Test Agent"))
+        #expect(packet.systemPrompt.contains("test_agent"))
+        #expect(packet.systemPrompt.contains("autonomous"))
 
         // System prompt should contain boundaries
-        XCTAssertTrue(packet.systemPrompt.contains("Do not perform any git operations"))
-        XCTAssertTrue(packet.systemPrompt.contains("Do not modify files outside the workspace root"))
+        #expect(packet.systemPrompt.contains("Do not perform any git operations"))
+        #expect(packet.systemPrompt.contains("Do not modify files outside the workspace root"))
     }
 
-    func testPacketCanDisableXcodeMCPViaEnvironment() {
+    @Test("Packet can disable Xcode MCP via environment")
+    func packetCanDisableXcodeMCPViaEnvironment() {
         setenv("CHAINWORKS_DISABLE_XCODE_MCP", "1", 1)
         defer { unsetenv("CHAINWORKS_DISABLE_XCODE_MCP") }
 
@@ -156,11 +165,12 @@ final class GooseSessionBridgeTests: XCTestCase {
 
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
-        XCTAssertTrue(packet.systemPrompt.contains("Do not call xcode_mcp"),
-                      "Test env should append explicit xcode_mcp suppression to the system prompt")
+        #expect(packet.systemPrompt.contains("Do not call xcode_mcp"),
+                "Test env should append explicit xcode_mcp suppression to the system prompt")
     }
 
-    func testPacketContainsTaskDirective() {
+    @Test("Packet contains task directive")
+    func packetContainsTaskDirective() {
         let agent = makeAgent()
         let task = makeTask()
         let workspace = makeWorkspace()
@@ -180,22 +190,23 @@ final class GooseSessionBridgeTests: XCTestCase {
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         // Task directive should contain task name
-        XCTAssertTrue(packet.taskDirective.contains("test_task"))
+        #expect(packet.taskDirective.contains("test_task"))
 
         // Should reference expected outputs
-        XCTAssertTrue(packet.taskDirective.contains("output_artifact"))
+        #expect(packet.taskDirective.contains("output_artifact"))
 
         // Context attachments should include workspace context
-        XCTAssertTrue(packet.contextAttachments.contains { $0.name == "workspace_context" })
+        #expect(packet.contextAttachments.contains { $0.name == "workspace_context" })
 
         // Context attachments should include input artifacts
-        XCTAssertTrue(packet.contextAttachments.contains { $0.name == "input_artifact" })
+        #expect(packet.contextAttachments.contains { $0.name == "input_artifact" })
 
         // Context attachments should include idea body
-        XCTAssertTrue(packet.contextAttachments.contains { $0.name == "idea_body" })
+        #expect(packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
-    func testPacketWithoutInputArtifacts() {
+    @Test("Packet without input artifacts")
+    func packetWithoutInputArtifacts() {
         let agent = makeAgent()
         let task = makeTask()
         let workspace = makeWorkspace()
@@ -215,46 +226,28 @@ final class GooseSessionBridgeTests: XCTestCase {
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         // Should still have workspace context
-        XCTAssertTrue(packet.contextAttachments.contains { $0.name == "workspace_context" })
+        #expect(packet.contextAttachments.contains { $0.name == "workspace_context" })
 
         // Should not have artifact or idea attachments
-        XCTAssertFalse(packet.contextAttachments.contains { $0.type == "artifact" })
-        XCTAssertFalse(packet.contextAttachments.contains { $0.name == "idea_body" })
+        #expect(!packet.contextAttachments.contains { $0.type == "artifact" })
+        #expect(!packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
-    func testSessionBridgeExecutionRequestCarriesReadOnlyPolicy() async throws {
-        /// Proposal 005: conforms to `GooseTransportProtocol` directly.
-        final class RecordingTransport: GooseTransportProtocol, @unchecked Sendable {
-            var lastRequest: GooseSessionRequest?
-
-            init() {}
-
-            func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-                lastRequest = request
-                return GooseSessionResponse(
-                    sessionId: "bridge-session",
-                    status: "active",
-                    policyAcknowledgement: GoosePolicyAcknowledgement(
-                        accepted: true,
-                        capabilityToken: "mock-read-only",
-                        backendPolicyVersion: "mock-v1"
-                    )
+    @Test("Execution request carries read-only policy")
+    func sessionBridgeExecutionRequestCarriesReadOnlyPolicy() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "bridge-session",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
                 )
-            }
+            )
+        )
 
-            func submitPrompt(
-                sessionID: String,
-                prompt: GoosePromptRequest
-            ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
-                AsyncThrowingStream { continuation in
-                    continuation.finish()
-                }
-            }
-
-            func closeSession(sessionID: String) async throws {}
-        }
-
-        let transport = RecordingTransport()
         let bridge = GooseSessionBridge(transport: transport)
         let agent = makeAgent()
         let task = makeTask()
@@ -279,16 +272,18 @@ final class GooseSessionBridgeTests: XCTestCase {
             override: nil
         )
 
-        XCTAssertEqual(transport.lastRequest?.executionPolicy?.permissionProfileID, "read_only")
-        XCTAssertEqual(transport.lastRequest?.executionPolicy?.workspaceMode, "read_only")
-        XCTAssertEqual(transport.lastRequest?.executionPolicy?.gitOperationsAllowed, false)
-        XCTAssertEqual(transport.lastRequest?.executionPolicy?.releaseOperationsAllowed, false)
-        XCTAssertEqual(transport.lastRequest?.executionPolicy?.repoWritesAllowed, false)
+        let lastRequest = await transport.lastSessionRequest
+        #expect(lastRequest?.executionPolicy?.permissionProfileID == "read_only")
+        #expect(lastRequest?.executionPolicy?.workspaceMode == "read_only")
+        #expect(lastRequest?.executionPolicy?.gitOperationsAllowed == false)
+        #expect(lastRequest?.executionPolicy?.releaseOperationsAllowed == false)
+        #expect(lastRequest?.executionPolicy?.repoWritesAllowed == false)
     }
 
     // MARK: - LiveExecutionOverride Tests
 
-    func testLiveExecutionOverrideEncoding() throws {
+    @Test("LiveExecutionOverride encoding round-trips")
+    func liveExecutionOverrideEncoding() throws {
         let override = LiveExecutionOverride(
             enabled: true,
             provider: "claude_code",
@@ -299,9 +294,9 @@ final class GooseSessionBridgeTests: XCTestCase {
         let data = try JSONEncoder().encode(override)
         let decoded = try JSONDecoder().decode(LiveExecutionOverride.self, from: data)
 
-        XCTAssertEqual(decoded.enabled, true)
-        XCTAssertEqual(decoded.provider, "claude_code")
-        XCTAssertEqual(decoded.model, "claude-sonnet-4-20250514")
-        XCTAssertEqual(decoded.effort, "high")
+        #expect(decoded.enabled == true)
+        #expect(decoded.provider == "claude_code")
+        #expect(decoded.model == "claude-sonnet-4-20250514")
+        #expect(decoded.effort == "high")
     }
 }

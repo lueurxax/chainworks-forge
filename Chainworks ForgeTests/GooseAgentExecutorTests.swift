@@ -1,4 +1,4 @@
-import XCTest
+import Testing
 import Foundation
 @testable import Chainworks_Forge
 
@@ -6,92 +6,8 @@ import Foundation
 
 /// Unit tests for GooseAgentExecutor.
 /// Tests session creation, streaming, receipt persistence, output validation, and result building.
-final class GooseAgentExecutorTests: XCTestCase {
-
-    // MARK: - Temp Directory Tracking
-
-    /// Tracks all temp directories created during this test for reliable cleanup.
-    /// This ensures cleanup happens even when assertions fail (where `defer` may not execute).
-    private var createdTempDirs: [URL] = []
-
-    override func tearDown() async throws {
-        for dir in createdTempDirs {
-            try? FileManager.default.removeItem(at: dir)
-        }
-        createdTempDirs.removeAll()
-    }
-
-    // MARK: - Thread-Safe Event Collector (use SharedEventCollector for new tests)
-
-    /// Thread-safe collector for execution events.
-    /// Avoids unsafe mutation of captured vars in @Sendable closures.
-    final class EventCollector: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _events: [ExecutionEvent] = []
-
-        func append(_ event: ExecutionEvent) {
-            lock.lock()
-            _events.append(event)
-            lock.unlock()
-        }
-
-        var events: [ExecutionEvent] {
-            lock.lock()
-            defer { lock.unlock() }
-            return _events
-        }
-    }
-
-    // MARK: - Test Doubles
-
-    /// Mock transport that returns pre-configured responses without real HTTP.
-    /// Proposal 005: conforms to `GooseTransportProtocol` directly (no longer subclasses `GooseTransport`).
-    final class MockGooseTransport: GooseTransportProtocol, @unchecked Sendable {
-        var createSessionResult: GooseSessionResponse?
-        var createSessionError: Error?
-        var streamEvents: [GooseStreamEvent] = []
-        var closeSessionCalled = false
-        var lastSessionID: String?
-        var lastSessionRequest: GooseSessionRequest?
-
-        init() {}
-
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-            lastSessionRequest = request
-            if let error = createSessionError {
-                throw error
-            }
-            return createSessionResult ?? GooseSessionResponse(
-                sessionId: "test-session-\(UUID().uuidString.prefix(8))",
-                status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
-                    accepted: true,
-                    capabilityToken: "mock-read-only",
-                    backendPolicyVersion: "mock-v1"
-                )
-            )
-        }
-
-        func submitPrompt(
-            sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
-            lastSessionID = sessionID
-            let events = streamEvents
-            return AsyncThrowingStream { continuation in
-                Task {
-                    for event in events {
-                        continuation.yield(event)
-                    }
-                    continuation.finish()
-                }
-            }
-        }
-
-        func closeSession(sessionID: String) async throws {
-            closeSessionCalled = true
-        }
-    }
+@Suite("GooseAgentExecutor")
+struct GooseAgentExecutorTests {
 
     // MARK: - Helpers
 
@@ -134,9 +50,6 @@ final class GooseAgentExecutorTests: XCTestCase {
         // Create directories
         try? FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
 
-        // Track for reliable cleanup in tearDown (even on assertion failure)
-        createdTempDirs.append(tempDir)
-
         let workspace = RunWorkspace(
             runID: runID,
             workspaceRoot: tempDir,
@@ -156,59 +69,61 @@ final class GooseAgentExecutorTests: XCTestCase {
         )
     }
 
-    /// Explicit cleanup for backward compatibility. tearDown also handles this.
-    private func cleanupContext(_ context: ExecutionContext) {
-        try? FileManager.default.removeItem(at: context.workspace.workspaceRoot)
-    }
-
     // MARK: - Tests
 
     /// testGooseExecutorCreatesSession — Section 12.1
     @MainActor
-    func testGooseExecutorCreatesSession() async throws {
-        let mockTransport = MockGooseTransport()
-        mockTransport.createSessionResult = GooseSessionResponse(
-            sessionId: "session-abc123",
-            status: "active",
-            policyAcknowledgement: GoosePolicyAcknowledgement(
-                accepted: true,
-                capabilityToken: "mock-read-only",
-                backendPolicyVersion: "mock-v1"
-            )
+    @Test("Executor creates session with correct policy and produces receipt/transcript artifacts")
+    func gooseExecutorCreatesSession() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "session-abc123",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            events: [
+                .sessionStarted(raw: "{}"),
+                .finalOutput(content: "# Test Output\n\nThis is a test proposal."),
+                .sessionClosed(raw: "{}")
+            ]
         )
-        mockTransport.streamEvents = [
-            .sessionStarted(raw: "{}"),
-            .finalOutput(content: "# Test Output\n\nThis is a test proposal."),
-            .sessionClosed(raw: "{}")
-        ]
 
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let executor = GooseAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["test_output.md"])
         let task = makeTask()
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
         // Session should have been created and closed
-        XCTAssertTrue(mockTransport.closeSessionCalled, "Session should be closed after execution")
-        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.permissionProfileID, "read_only")
-        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.workspaceMode, "read_only")
-        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.gitOperationsAllowed, false)
-        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.releaseOperationsAllowed, false)
-        XCTAssertEqual(mockTransport.lastSessionRequest?.executionPolicy?.repoWritesAllowed, false)
+        let closeSessionCalled = await transport.closeSessionCalled
+        #expect(closeSessionCalled, "Session should be closed after execution")
+
+        let lastSessionRequest = await transport.lastSessionRequest
+        #expect(lastSessionRequest?.executionPolicy?.permissionProfileID == "read_only")
+        #expect(lastSessionRequest?.executionPolicy?.workspaceMode == "read_only")
+        #expect(lastSessionRequest?.executionPolicy?.gitOperationsAllowed == false)
+        #expect(lastSessionRequest?.executionPolicy?.releaseOperationsAllowed == false)
+        #expect(lastSessionRequest?.executionPolicy?.repoWritesAllowed == false)
+
         // Result should contain receipt artifacts
-        XCTAssertTrue(result.outputs.keys.contains(where: { $0.hasSuffix("_receipt.json") }),
-                       "Result should contain receipt artifact")
-        XCTAssertTrue(result.outputs.keys.contains(where: { $0.hasSuffix("_transcript.md") }),
-                       "Result should contain transcript artifact")
+        #expect(result.outputs.keys.contains(where: { $0.hasSuffix("_receipt.json") }),
+                "Result should contain receipt artifact")
+        #expect(result.outputs.keys.contains(where: { $0.hasSuffix("_transcript.md") }),
+                "Result should contain transcript artifact")
     }
 
     /// testGooseExecutorStreamsEvents — Section 12.1
     @MainActor
-    func testGooseExecutorStreamsEvents() async throws {
-        let mockTransport = MockGooseTransport()
-        mockTransport.streamEvents = [
+    @Test("Executor streams events to event callback during execution")
+    func gooseExecutorStreamsEvents() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(events: [
             .sessionStarted(raw: "{}"),
             .promptSubmitted(raw: "{}"),
             .toolCallStarted(toolName: "write_file", raw: "{}"),
@@ -216,11 +131,11 @@ final class GooseAgentExecutorTests: XCTestCase {
             .textChunk(text: "Working on it..."),
             .finalOutput(content: "Done!"),
             .sessionClosed(raw: "{}")
-        ]
+        ])
 
         // Use thread-safe collection to avoid concurrent mutation of captured var
-        let eventCollector = EventCollector()
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let eventCollector = SharedEventCollector()
+        let executor = GooseAgentExecutor(transport: transport)
         executor.onExecutionEvent = { _, event in
             eventCollector.append(event)
         }
@@ -228,144 +143,146 @@ final class GooseAgentExecutorTests: XCTestCase {
         let agent = makeAgent(outputs: ["test_output.md"])
         let task = makeTask()
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         _ = try await executor.execute(task: task, agent: agent, context: context)
 
         // Should have received multiple events
         let receivedEvents = eventCollector.events
-        XCTAssertTrue(receivedEvents.count >= 5, "Should receive at least 5 events, got \(receivedEvents.count)")
+        #expect(receivedEvents.count >= 5, "Should receive at least 5 events, got \(receivedEvents.count)")
 
         let eventTypes = receivedEvents.map(\.type)
-        XCTAssertTrue(eventTypes.contains(.sessionStarted))
-        XCTAssertTrue(eventTypes.contains(.promptSubmitted))
-        XCTAssertTrue(eventTypes.contains(.toolCallStarted))
-        XCTAssertTrue(eventTypes.contains(.finalOutput))
+        #expect(eventTypes.contains(.sessionStarted))
+        #expect(eventTypes.contains(.promptSubmitted))
+        #expect(eventTypes.contains(.toolCallStarted))
+        #expect(eventTypes.contains(.finalOutput))
     }
 
     /// testGooseExecutorPersistsReceiptArtifact — Section 12.1
     @MainActor
-    func testGooseExecutorPersistsReceiptArtifact() async throws {
-        let mockTransport = MockGooseTransport()
-        mockTransport.streamEvents = [
+    @Test("Executor persists receipt artifact with correct agent ID and version")
+    func gooseExecutorPersistsReceiptArtifact() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(events: [
             .sessionStarted(raw: "{}"),
             .finalOutput(content: "Test output"),
             .sessionClosed(raw: "{}")
-        ]
+        ])
 
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let executor = GooseAgentExecutor(transport: transport)
         let agent = makeAgent(id: "proposal_writer", outputs: ["proposal_current"])
         let task = makeTask(agent: "proposal_writer", task: "draft_initial_proposal")
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
         // Should have receipt artifacts
-        let receiptKey = result.outputs.keys.first { $0.contains("_receipt.json") }
-        XCTAssertNotNil(receiptKey, "Should produce a receipt artifact")
+        let receiptKey = try #require(result.outputs.keys.first { $0.contains("_receipt.json") })
 
-        if let key = receiptKey, let data = result.outputs[key] {
+        if let data = result.outputs[receiptKey] {
             // Parse the receipt JSON (must match encoder's .iso8601 date strategy)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let receipt = try decoder.decode(ExecutionReceipt.self, from: data)
-            XCTAssertEqual(receipt.agentID, "proposal_writer")
-            XCTAssertTrue(receipt.succeeded)
-            XCTAssertEqual(receipt.receiptVersion, "1.0")
+            #expect(receipt.agentID == "proposal_writer")
+            #expect(receipt.succeeded)
+            #expect(receipt.receiptVersion == "1.0")
         }
     }
 
     /// testGooseExecutorFailsWhenRequiredOutputsMissing — Section 12.1
     @MainActor
-    func testGooseExecutorFailsWhenRequiredOutputsMissing() async throws {
-        let mockTransport = MockGooseTransport()
+    @Test("Executor fails when required outputs are missing from stream")
+    func gooseExecutorFailsWhenRequiredOutputsMissing() async throws {
+        let transport = ObservableGooseTransport()
         // Stream completes but no files are written and no final output
-        mockTransport.streamEvents = [
+        await transport.configure(events: [
             .sessionStarted(raw: "{}"),
             .sessionClosed(raw: "{}")
-        ]
+        ])
 
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let executor = GooseAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["required_output.json"])
         let task = makeTask()
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
         // Should fail because required output is missing
-        XCTAssertFalse(result.succeeded, "Should fail when required outputs are missing")
-        XCTAssertNotNil(result.errorMessage)
-        XCTAssertTrue(result.errorMessage?.contains("required_output.json") == true)
+        #expect(!result.succeeded, "Should fail when required outputs are missing")
+        #expect(result.errorMessage != nil)
+        #expect(result.errorMessage?.contains("required_output.json") == true)
     }
 
     /// testGooseExecutorReturnsAgentResult — Section 12.1
     @MainActor
-    func testGooseExecutorReturnsAgentResult() async throws {
-        let mockTransport = MockGooseTransport()
-        mockTransport.streamEvents = [
+    @Test("Executor returns agent result with log snippet and cost estimate")
+    func gooseExecutorReturnsAgentResult() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(events: [
             .sessionStarted(raw: "{}"),
             .toolCallStarted(toolName: "read_file", raw: "{}"),
             .toolCallFinished(toolName: "read_file", raw: "{}"),
             .finalOutput(content: "# My Proposal\n\nThis is a great proposal."),
             .sessionClosed(raw: "{}")
-        ]
+        ])
 
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let executor = GooseAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["proposal_current"])
         let task = makeTask()
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
         // Final output should be used as primary output when no files written
-        XCTAssertTrue(result.succeeded || result.outputs.keys.contains("proposal_current"),
-                      "Result should either succeed or contain the primary output")
-        XCTAssertNotNil(result.logSnippet, "Should have a log snippet")
-        XCTAssertNotNil(result.costCents, "Should have a cost estimate")
+        #expect(result.succeeded || result.outputs.keys.contains("proposal_current"),
+                "Result should either succeed or contain the primary output")
+        #expect(result.logSnippet != nil, "Should have a log snippet")
+        #expect(result.costCents != nil, "Should have a cost estimate")
     }
 
     /// testGooseExecutorSessionCreationFailure
     @MainActor
-    func testGooseExecutorSessionCreationFailure() async throws {
-        let mockTransport = MockGooseTransport()
-        mockTransport.createSessionError = GooseTransportError.httpError(
-            statusCode: 500,
-            body: "Internal server error"
+    @Test("Executor handles session creation failure gracefully")
+    func gooseExecutorSessionCreationFailure() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionError: GooseTransportError.httpError(
+                statusCode: 500,
+                body: "Internal server error"
+            )
         )
 
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let executor = GooseAgentExecutor(transport: transport)
         let agent = makeAgent()
         let task = makeTask()
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
-        XCTAssertFalse(result.succeeded)
-        XCTAssertTrue(result.errorMessage?.contains("Session creation failed") == true)
+        #expect(!result.succeeded)
+        #expect(result.errorMessage?.contains("Session creation failed") == true)
     }
 
     @MainActor
-    func testGooseExecutorFailsWithoutPolicyAcknowledgement() async throws {
-        let mockTransport = MockGooseTransport()
-        mockTransport.createSessionResult = GooseSessionResponse(
-            sessionId: "session-missing-ack",
-            status: "active",
-            policyAcknowledgement: nil
+    @Test("Executor fails without policy acknowledgement in session response")
+    func gooseExecutorFailsWithoutPolicyAcknowledgement() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "session-missing-ack",
+                status: "active",
+                policyAcknowledgement: nil
+            )
         )
 
-        let executor = GooseAgentExecutor(transport: mockTransport)
+        let executor = GooseAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["proposal_current"])
         let task = makeTask()
         let context = makeContext()
-        defer { cleanupContext(context) }
 
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
-        XCTAssertFalse(result.succeeded)
-        XCTAssertTrue(result.errorMessage?.contains("read-only execution policy") == true)
+        #expect(!result.succeeded)
+        #expect(result.errorMessage?.contains("read-only execution policy") == true)
     }
 }

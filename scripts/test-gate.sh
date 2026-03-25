@@ -6,6 +6,7 @@ PROJECT_PATH="$ROOT_DIR/Chainworks Forge.xcodeproj"
 SCHEME_NAME="Chainworks Forge"
 DESTINATION="platform=macOS"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
+TEST_PLANS_DIR="$ROOT_DIR/TestPlans"
 
 FAST_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
@@ -120,6 +121,27 @@ run_build() {
     build
 }
 
+run_test_plan() {
+  local gate_name="$1"
+  local plan_name="$2"
+
+  local stamp derived_data result_bundle
+  stamp="$(make_stamp)"
+  derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
+  result_bundle="$TMP_BASE/${gate_name}-${stamp}.xcresult"
+  mkdir -p "$TMP_BASE"
+
+  log "Test gate (test plan): $gate_name — plan=$plan_name"
+  xcodebuild test \
+    -project "$PROJECT_PATH" \
+    -scheme "$SCHEME_NAME" \
+    -destination "$DESTINATION" \
+    -testPlan "$plan_name" \
+    -derivedDataPath "$derived_data" \
+    -resultBundlePath "$result_bundle"
+  log "Result bundle: $result_bundle"
+}
+
 run_targeted_tests() {
   local gate_name="$1"
   shift
@@ -228,7 +250,11 @@ case "$GATE" in
     fi
     guard_direct_run_insertion
     run_build "fast"
-    run_targeted_tests "fast" "${FAST_TESTS[@]}"
+    if [[ "${USE_TEST_PLANS:-}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/FastGate.xctestplan" ]]; then
+      run_test_plan "fast" "FastGate"
+    else
+      run_targeted_tests "fast" "${FAST_TESTS[@]}"
+    fi
     ;;
   ui-smoke)
     check_idle_environment
@@ -247,7 +273,11 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     guard_direct_run_insertion
-    run_targeted_tests "proposal-006" "${PROPOSAL_006_TESTS[@]}"
+    if [[ "${USE_TEST_PLANS:-}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/ProviderGate.xctestplan" ]]; then
+      run_test_plan "proposal-006" "ProviderGate"
+    else
+      run_targeted_tests "proposal-006" "${PROPOSAL_006_TESTS[@]}"
+    fi
     ;;
   full)
     check_idle_environment
@@ -258,7 +288,11 @@ case "$GATE" in
     fi
     guard_direct_run_insertion
     run_build "full"
-    run_full_suite
+    if [[ "${USE_TEST_PLANS:-}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/FullGate.xctestplan" ]]; then
+      run_test_plan "full" "FullGate"
+    else
+      run_full_suite
+    fi
     ;;
   *)
     print_usage >&2

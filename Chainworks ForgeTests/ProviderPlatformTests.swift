@@ -1,9 +1,11 @@
-import XCTest
+import Testing
 import SwiftData
+import Foundation
 @testable import Chainworks_Forge
 
 @MainActor
-final class ProviderPlatformTests: XCTestCase {
+@Suite("ProviderPlatform", .tags(.fast, .provider))
+struct ProviderPlatformTests {
     private static var retainedObjects: [AnyObject] = []
     private static var retainedRegistries: [ProviderRegistry] = []
 
@@ -11,12 +13,12 @@ final class ProviderPlatformTests: XCTestCase {
         KeychainSecretStore(serviceName: serviceName, useInMemoryStore: true)
     }
 
-    private func retain<T: AnyObject>(_ object: T) -> T {
+    private mutating func retain<T: AnyObject>(_ object: T) -> T {
         Self.retainedObjects.append(object)
         return object
     }
 
-    private func retain(_ registry: ProviderRegistry) -> ProviderRegistry {
+    private mutating func retain(_ registry: ProviderRegistry) -> ProviderRegistry {
         Self.retainedRegistries.append(registry)
         return registry
     }
@@ -33,7 +35,7 @@ final class ProviderPlatformTests: XCTestCase {
         process.arguments = ["-qq", archiveURL.path, "-d", destinationURL.path]
         try process.run()
         process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0, "Expected unzip to succeed for \(archiveURL.path)")
+        #expect(process.terminationStatus == 0, "Expected unzip to succeed for \(archiveURL.path)")
     }
 
     private func makePlan(provider: String, backendProfileID: String = "reviewer_profile") -> RunPlan {
@@ -135,7 +137,8 @@ final class ProviderPlatformTests: XCTestCase {
         )
     }
 
-    func testBootstrapResolverUsesPersistedSettingsUnlessEnvOverrideEnabled() throws {
+    @Test("Bootstrap resolver uses persisted settings unless env override enabled")
+    mutating func bootstrapResolverUsesPersistedSettingsUnlessEnvOverrideEnabled() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -153,7 +156,7 @@ final class ProviderPlatformTests: XCTestCase {
         ))
 
         let resolved = BootstrapConfigurationResolver.resolve(store: store, environment: [:])
-        XCTAssertEqual(resolved, persisted)
+        #expect(resolved == persisted)
 
         let overridden = BootstrapConfigurationResolver.resolve(
             store: store,
@@ -162,12 +165,13 @@ final class ProviderPlatformTests: XCTestCase {
                 "CHAINWORKS_WORKFLOW_SOURCE_PATH": "/tmp/override-workflow.yaml"
             ]
         )
-        XCTAssertEqual(overridden.workflowSourcePath, "/tmp/override-workflow.yaml")
-        XCTAssertEqual(overridden.activeConfigurationSource, .developmentEnvOverride)
+        #expect(overridden.workflowSourcePath == "/tmp/override-workflow.yaml")
+        #expect(overridden.activeConfigurationSource == .developmentEnvOverride)
     }
 
-    func testBackendProfileResolverResolvesPreferredProviderAndOverrides() {
-        let tempDirectory = try! makeTempDirectory()
+    @Test("Backend profile resolver resolves preferred provider and overrides")
+    mutating func backendProfileResolverResolvesPreferredProviderAndOverrides() throws {
+        let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let claude = ConfiguredProvider(
@@ -214,14 +218,15 @@ final class ProviderPlatformTests: XCTestCase {
         )
 
         let binding = bindings?["proposal_writer"]
-        XCTAssertEqual(binding?.configuredProviderID, alternateClaude.id)
-        XCTAssertEqual(binding?.model, "claude-custom")
-        XCTAssertEqual(binding?.effort, "high")
-        XCTAssertEqual(binding?.providerIdentifier, "claude_code")
+        #expect(binding?.configuredProviderID == alternateClaude.id)
+        #expect(binding?.model == "claude-custom")
+        #expect(binding?.effort == "high")
+        #expect(binding?.providerIdentifier == "claude_code")
     }
 
-    func testBackendProfileResolverSupportsMixedProvidersAcrossAgents() {
-        let tempDirectory = try! makeTempDirectory()
+    @Test("Backend profile resolver supports mixed providers across agents")
+    mutating func backendProfileResolverSupportsMixedProvidersAcrossAgents() throws {
+        let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let codex = ConfiguredProvider(
@@ -262,11 +267,12 @@ final class ProviderPlatformTests: XCTestCase {
             startOptions: .empty
         )
 
-        XCTAssertEqual(bindings?["proposal_writer"]?.providerIdentifier, "codex")
-        XCTAssertEqual(bindings?["proposal_reviewer"]?.providerIdentifier, "gemini")
+        #expect(bindings?["proposal_writer"]?.providerIdentifier == "codex")
+        #expect(bindings?["proposal_reviewer"]?.providerIdentifier == "gemini")
     }
 
-    func testSettingsTransferExportsSchemaVersion() throws {
+    @Test("Settings transfer exports schema version")
+    mutating func settingsTransferExportsSchemaVersion() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -312,11 +318,12 @@ final class ProviderPlatformTests: XCTestCase {
         decoder.dateDecodingStrategy = .iso8601
         let package = try decoder.decode(ExportableSettingsPackage.self, from: data)
 
-        XCTAssertEqual(package.transferSchemaVersion, SettingsTransferService.currentSchemaVersion)
-        XCTAssertEqual(package.providerSettings.configuredProviders.count, 1)
+        #expect(package.transferSchemaVersion == SettingsTransferService.currentSchemaVersion)
+        #expect(package.providerSettings.configuredProviders.count == 1)
     }
 
-    func testSettingsImportFailsClosedWhenSecretsAreMissing() throws {
+    @Test("Settings import fails closed when secrets are missing")
+    mutating func settingsImportFailsClosedWhenSecretsAreMissing() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -390,12 +397,15 @@ final class ProviderPlatformTests: XCTestCase {
             secretStore: makeTestSecretStore("com.chainworks.tests.import-empty")
         )
 
-        XCTAssertThrowsError(try service.importSettings(from: packageURL))
-        XCTAssertEqual(appStore.configuration, initialConfiguration)
-        XCTAssertEqual(providerStore.settings.configuredProviders.map(\.displayName), ["Initial Codex"])
+        #expect(throws: (any Error).self) {
+            try service.importSettings(from: packageURL)
+        }
+        #expect(appStore.configuration == initialConfiguration)
+        #expect(providerStore.settings.configuredProviders.map(\.displayName) == ["Initial Codex"])
     }
 
-    func testPreflightFailsWhenRequiredProviderFamilyIsMissing() async throws {
+    @Test("Preflight fails when required provider family is missing")
+    mutating func preflightFailsWhenRequiredProviderFamilyIsMissing() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -426,11 +436,12 @@ final class ProviderPlatformTests: XCTestCase {
             plan: makePlan(provider: "claude_code")
         )
 
-        XCTAssertEqual(report.status, .fail)
-        XCTAssertTrue(report.blockingIssues.contains { $0.contains("Claude") || $0.contains("No provider configured") })
+        #expect(report.status == .fail)
+        #expect(report.blockingIssues.contains { $0.contains("Claude") || $0.contains("No provider configured") })
     }
 
-    func testPreflightFailsWhenProviderCredentialIsMissing() async throws {
+    @Test("Preflight fails when provider credential is missing")
+    mutating func preflightFailsWhenProviderCredentialIsMissing() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -477,11 +488,12 @@ final class ProviderPlatformTests: XCTestCase {
             plan: makePlan(provider: "gemini")
         )
 
-        XCTAssertEqual(report.status, .fail)
-        XCTAssertTrue(report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("API key is missing") })
+        #expect(report.status == .fail)
+        #expect(report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("API key is missing") })
     }
 
-    func testPreflightFailsWhenOverrideSelectsUnavailableModel() async throws {
+    @Test("Preflight fails when override selects unavailable model")
+    mutating func preflightFailsWhenOverrideSelectsUnavailableModel() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -535,11 +547,12 @@ final class ProviderPlatformTests: XCTestCase {
             startOptions: startOptions
         )
 
-        XCTAssertEqual(report.status, .fail)
-        XCTAssertTrue(report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("not available") })
+        #expect(report.status == .fail)
+        #expect(report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("not available") })
     }
 
-    func testSampleRunLauncherCreatesFrozenProviderBindingSnapshot() async throws {
+    @Test("Sample run launcher creates frozen provider binding snapshot")
+    mutating func sampleRunLauncherCreatesFrozenProviderBindingSnapshot() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -611,16 +624,17 @@ final class ProviderPlatformTests: XCTestCase {
 
         let run = try await launcher.launchSampleRun(autostart: false)
 
-        XCTAssertNotNil(run.providerBindingSnapshotJSON)
-        XCTAssertNotNil(run.startOptionsJSON)
+        #expect(run.providerBindingSnapshotJSON != nil)
+        #expect(run.startOptionsJSON != nil)
 
         let decoder = JSONDecoder()
-        let bindings = try decoder.decode([String: ResolvedProviderBinding].self, from: try XCTUnwrap(run.providerBindingSnapshotJSON))
-        XCTAssertFalse(bindings.isEmpty)
-        XCTAssertEqual(run.workflowID, "proposal_to_release")
+        let bindings = try decoder.decode([String: ResolvedProviderBinding].self, from: try #require(run.providerBindingSnapshotJSON))
+        #expect(!bindings.isEmpty)
+        #expect(run.workflowID == "proposal_to_release")
     }
 
-    func testSupportBundleExportIncludesArtifactIndexAndSelectedArtifacts() async throws {
+    @Test("Support bundle export includes artifact index and selected artifacts")
+    mutating func supportBundleExportIncludesArtifactIndexAndSelectedArtifacts() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -711,9 +725,9 @@ final class ProviderPlatformTests: XCTestCase {
         try unzipArchive(archiveURL, to: unzipURL)
 
         let contents = try FileManager.default.subpathsOfDirectory(atPath: unzipURL.path)
-        XCTAssertTrue(contents.contains { $0.hasSuffix("app-version.json") })
-        XCTAssertTrue(contents.contains { $0.hasSuffix("provider-health.json") })
-        XCTAssertTrue(contents.contains { $0.hasSuffix("artifact-index.json") })
-        XCTAssertTrue(contents.contains { $0.hasSuffix("artifacts/proposal.md") })
+        #expect(contents.contains { $0.hasSuffix("app-version.json") })
+        #expect(contents.contains { $0.hasSuffix("provider-health.json") })
+        #expect(contents.contains { $0.hasSuffix("artifact-index.json") })
+        #expect(contents.contains { $0.hasSuffix("artifacts/proposal.md") })
     }
 }

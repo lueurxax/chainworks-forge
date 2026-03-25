@@ -1,4 +1,4 @@
-import XCTest
+import Testing
 import Foundation
 @testable import Chainworks_Forge
 
@@ -19,7 +19,8 @@ import Foundation
 ///
 /// This test is intentionally **not** part of the CI fast-test target — it requires a real Goose runtime.
 @MainActor
-final class LiveGooseConnectionProofTests: XCTestCase {
+@Suite("Live Goose Connection", .tags(.live), .timeLimit(.minutes(2)))
+struct LiveGooseConnectionProofTests {
 
     // MARK: - Environment Discovery
 
@@ -141,7 +142,7 @@ final class LiveGooseConnectionProofTests: XCTestCase {
                     if let jsonEnd = jsonCandidate.range(of: "}") {
                         let jsonStr = String(jsonCandidate[...jsonEnd.lowerBound])
                         if let jsonData = jsonStr.data(using: .utf8),
-                           let env = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                           let _ = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
                             // The secret key isn't directly in this JSON — it's in the server env
                             // But we can verify the port matches
                             break
@@ -200,11 +201,13 @@ final class LiveGooseConnectionProofTests: XCTestCase {
     // MARK: - Tests
 
     /// PROOF: App can create a session on real Goose, send a prompt, receive SSE response, close session.
-    func testAppLaunchedRealGooseConnection() async throws {
+    @Test("App-launched real Goose connection proof",
+          .disabled("Requires running Goose server; enable for manual validation"))
+    func appLaunchedRealGooseConnection() async throws {
         // Step 0: Discover Goose runtime
         guard let runtime = discoverGooseRuntime() else {
-            // Skip gracefully when Goose is not running (CI environments)
-            throw XCTSkip("Goose.app is not running — GOOSE_PORT or GOOSE_SERVER__SECRET_KEY not set. This test requires a live Goose instance.")
+            Issue.record("Goose.app is not running — GOOSE_PORT or GOOSE_SERVER__SECRET_KEY not set. This test requires a live Goose instance.")
+            return
         }
 
         let testStart = Date()
@@ -239,13 +242,13 @@ final class LiveGooseConnectionProofTests: XCTestCase {
         do {
             sessionResponse = try await transport.createSession(request: sessionRequest)
         } catch {
-            XCTFail("Session creation failed on real Goose: \(error.localizedDescription)")
+            Issue.record("Session creation failed on real Goose: \(error.localizedDescription)")
             return
         }
         let sessionCreateDuration = Date().timeIntervalSince(sessionCreateStart)
 
-        XCTAssertFalse(sessionResponse.sessionId.isEmpty, "Session ID must not be empty")
-        XCTAssertEqual(sessionResponse.policyAcknowledgement?.accepted, true, "Policy must be acknowledged")
+        #expect(!sessionResponse.sessionId.isEmpty, "Session ID must not be empty")
+        #expect(sessionResponse.policyAcknowledgement?.accepted == true, "Policy must be acknowledged")
 
         // Step 2: Submit a prompt and collect SSE events
         let promptStart = Date()
@@ -376,42 +379,39 @@ final class LiveGooseConnectionProofTests: XCTestCase {
         let evidencePath = evidenceDir.appendingPathComponent("live_goose_connection_proof.json")
         try evidenceData.write(to: evidencePath)
 
-        // Attach evidence to test report
-        let attachment = XCTAttachment(contentsOfFile: evidencePath)
-        attachment.name = "live_goose_connection_proof.json"
-        attachment.lifetime = .keepAlways
-        add(attachment)
-
         // Log evidence path for manual inspection
-        print("╔══════════════════════════════════════════════════════════════╗")
-        print("║  LIVE GOOSE CONNECTION PROOF                               ║")
-        print("╠══════════════════════════════════════════════════════════════╣")
-        print("║  Verdict: \(verdict)")
-        print("║  Session ID: \(sessionResponse.sessionId)")
-        print("║  Goose URL: \(runtime.baseURL.absoluteString)")
-        print("║  SSE events: \(eventLog.count)")
-        print("║  Session create: \(String(format: "%.2f", sessionCreateDuration))s")
-        print("║  Prompt round-trip: \(String(format: "%.2f", promptRoundTripDuration))s")
-        print("║  Total duration: \(String(format: "%.2f", totalDuration))s")
-        print("║  Session closed cleanly: \(sessionClosedCleanly)")
-        print("║  Evidence: \(evidencePath.path)")
-        print("╚══════════════════════════════════════════════════════════════╝")
+        print("======================================================================")
+        print("  LIVE GOOSE CONNECTION PROOF")
+        print("======================================================================")
+        print("  Verdict: \(verdict)")
+        print("  Session ID: \(sessionResponse.sessionId)")
+        print("  Goose URL: \(runtime.baseURL.absoluteString)")
+        print("  SSE events: \(eventLog.count)")
+        print("  Session create: \(String(format: "%.2f", sessionCreateDuration))s")
+        print("  Prompt round-trip: \(String(format: "%.2f", promptRoundTripDuration))s")
+        print("  Total duration: \(String(format: "%.2f", totalDuration))s")
+        print("  Session closed cleanly: \(sessionClosedCleanly)")
+        print("  Evidence: \(evidencePath.path)")
+        print("======================================================================")
 
         // Assertions
-        XCTAssertFalse(sessionResponse.sessionId.isEmpty, "Must have a valid session ID from real Goose")
-        XCTAssertGreaterThan(eventLog.count, 0, "Must receive at least one SSE event from real Goose")
-        XCTAssertTrue(receivedSessionClosed || receivedFinalOutput,
-                      "Stream should end with session_closed or final_output")
-        XCTAssertTrue(
+        #expect(!sessionResponse.sessionId.isEmpty, "Must have a valid session ID from real Goose")
+        #expect(eventLog.count > 0, "Must receive at least one SSE event from real Goose")
+        #expect(receivedSessionClosed || receivedFinalOutput,
+                "Stream should end with session_closed or final_output")
+        #expect(
             receivedMeaningfulResponse,
             "Must receive text_chunk or final_output from real Goose. Events: \(eventLog.map(\.type).joined(separator: ", "))"
         )
     }
 
     /// PROOF: GooseServerTransport correctly uses X-Secret-Key auth (not Bearer token).
-    func testTransportAuthHeaderIsSecretKey() async throws {
+    @Test("Transport auth header uses X-Secret-Key",
+          .disabled("Requires running Goose server; enable for manual validation"))
+    func transportAuthHeaderIsSecretKey() async throws {
         guard let runtime = discoverGooseRuntime() else {
-            throw XCTSkip("Goose.app is not running")
+            Issue.record("Goose.app is not running")
+            return
         }
 
         // Create a transport with the real secret key — session creation proves auth works
@@ -433,14 +433,16 @@ final class LiveGooseConnectionProofTests: XCTestCase {
 
         // If this succeeds, the X-Secret-Key header is correct
         let response = try await transport.createSession(request: sessionRequest)
-        XCTAssertFalse(response.sessionId.isEmpty, "Auth with X-Secret-Key must produce a valid session")
+        #expect(!response.sessionId.isEmpty, "Auth with X-Secret-Key must produce a valid session")
 
         // Clean up
         try? await transport.closeSession(sessionID: response.sessionId)
     }
 
     /// PROOF: App environment correctly discovers Goose.app runtime parameters.
-    func testGooseRuntimeDiscovery() throws {
+    @Test("Goose runtime discovery from environment",
+          .disabled("Requires running Goose server; enable for manual validation"))
+    func gooseRuntimeDiscovery() throws {
         let env = ProcessInfo.processInfo.environment
 
         // When running inside Goose.app, these must be present
@@ -448,30 +450,34 @@ final class LiveGooseConnectionProofTests: XCTestCase {
         let gooseSecretKey = env["GOOSE_SERVER__SECRET_KEY"]
 
         if goosePort == nil && gooseSecretKey == nil {
-            throw XCTSkip("Not running inside Goose.app — GOOSE_PORT not set")
+            Issue.record("Not running inside Goose.app — GOOSE_PORT not set")
+            return
         }
 
-        XCTAssertNotNil(goosePort, "GOOSE_PORT must be set when running inside Goose.app")
-        XCTAssertNotNil(gooseSecretKey, "GOOSE_SERVER__SECRET_KEY must be set when running inside Goose.app")
+        #expect(goosePort != nil, "GOOSE_PORT must be set when running inside Goose.app")
+        #expect(gooseSecretKey != nil, "GOOSE_SERVER__SECRET_KEY must be set when running inside Goose.app")
 
         if let port = goosePort {
             let portInt = Int(port)
-            XCTAssertNotNil(portInt, "GOOSE_PORT must be a valid integer")
-            XCTAssertGreaterThan(portInt ?? 0, 0, "GOOSE_PORT must be > 0")
-            XCTAssertLessThan(portInt ?? 70000, 65536, "GOOSE_PORT must be < 65536")
+            #expect(portInt != nil, "GOOSE_PORT must be a valid integer")
+            #expect((portInt ?? 0) > 0, "GOOSE_PORT must be > 0")
+            #expect((portInt ?? 70000) < 65536, "GOOSE_PORT must be < 65536")
         }
 
         if let key = gooseSecretKey {
-            XCTAssertGreaterThan(key.count, 16, "Secret key should be reasonably long")
+            #expect(key.count > 16, "Secret key should be reasonably long")
         }
 
         print("[GooseRuntimeDiscovery] GOOSE_PORT=\(goosePort ?? "nil"), key length=\(gooseSecretKey?.count ?? 0)")
     }
 
-    /// PROOF: Full GooseAgentExecutor pipeline works against real Goose (session → prompt → events → result).
-    func testFullAgentExecutorPipelineWithRealGoose() async throws {
+    /// PROOF: Full GooseAgentExecutor pipeline works against real Goose (session -> prompt -> events -> result).
+    @Test("Full agent executor pipeline with real Goose",
+          .disabled("Requires running Goose server; enable for manual validation"))
+    func fullAgentExecutorPipelineWithRealGoose() async throws {
         guard let runtime = discoverGooseRuntime() else {
-            throw XCTSkip("Goose.app is not running")
+            Issue.record("Goose.app is not running")
+            return
         }
 
         let transport = GooseServerTransport(
@@ -547,7 +553,7 @@ final class LiveGooseConnectionProofTests: XCTestCase {
             worktreeRoot: nil
         )
 
-        let context = ExecutionContext(
+        let executionContext = ExecutionContext(
             workspace: workspace,
             stageID: "proof_stage",
             iteration: 1,
@@ -560,36 +566,36 @@ final class LiveGooseConnectionProofTests: XCTestCase {
 
         // Execute through the full pipeline
         let startTime = Date()
-        let result = try await executor.execute(task: task, agent: agent, context: context)
+        let result = try await executor.execute(task: task, agent: agent, context: executionContext)
         let duration = Date().timeIntervalSince(startTime)
 
         // Assertions
-        XCTAssertNotNil(result.sessionID, "Must have a real session ID")
-        XCTAssertGreaterThan(result.durationSeconds, 0, "Duration must be positive")
-        XCTAssertGreaterThan(collector.events.count, 0, "Must receive live execution events")
+        #expect(result.sessionID != nil, "Must have a real session ID")
+        #expect(result.durationSeconds > 0, "Duration must be positive")
+        #expect(collector.events.count > 0, "Must receive live execution events")
 
         // The receipt must be present regardless of success
         let hasReceipt = result.outputs.keys.contains { $0.hasSuffix("_receipt.json") }
-        XCTAssertTrue(hasReceipt, "Must produce an execution receipt")
+        #expect(hasReceipt, "Must produce an execution receipt")
 
         // If the receipt exists, verify it's valid JSON
         if let receiptData = result.outputs.first(where: { $0.key.hasSuffix("_receipt.json") })?.value {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let receipt = try decoder.decode(ExecutionReceipt.self, from: receiptData)
-            XCTAssertEqual(receipt.agentID, "proof_agent")
-            XCTAssertFalse(receipt.sessionID.isEmpty, "Receipt must capture real session ID")
+            #expect(receipt.agentID == "proof_agent")
+            #expect(!receipt.sessionID.isEmpty, "Receipt must capture real session ID")
         }
 
-        print("╔══════════════════════════════════════════════════════════════╗")
-        print("║  FULL PIPELINE PROOF                                       ║")
-        print("╠══════════════════════════════════════════════════════════════╣")
-        print("║  Session ID: \(result.sessionID ?? "nil")")
-        print("║  Succeeded: \(result.succeeded)")
-        print("║  Duration: \(String(format: "%.2f", duration))s")
-        print("║  Events received: \(collector.events.count)")
-        print("║  Outputs: \(result.outputs.keys.sorted().joined(separator: ", "))")
-        print("║  Error: \(result.errorMessage ?? "none")")
-        print("╚══════════════════════════════════════════════════════════════╝")
+        print("======================================================================")
+        print("  FULL PIPELINE PROOF")
+        print("======================================================================")
+        print("  Session ID: \(result.sessionID ?? "nil")")
+        print("  Succeeded: \(result.succeeded)")
+        print("  Duration: \(String(format: "%.2f", duration))s")
+        print("  Events received: \(collector.events.count)")
+        print("  Outputs: \(result.outputs.keys.sorted().joined(separator: ", "))")
+        print("  Error: \(result.errorMessage ?? "none")")
+        print("======================================================================")
     }
 }

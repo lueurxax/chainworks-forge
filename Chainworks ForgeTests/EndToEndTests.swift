@@ -1,4 +1,5 @@
-import XCTest
+import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
@@ -8,12 +9,13 @@ import SwiftData
 /// of the canonical workflow, verifying sequential/parallel execution,
 /// approval gates, loop handling, transition evaluation, and artifact persistence.
 @MainActor
-final class EndToEndTests: XCTestCase {
-    var container: ModelContainer!
-    var context: ModelContext!
-    var tempDir: URL!
+@Suite("EndToEnd", .tags(.integration))
+struct EndToEndTests {
+    let container: ModelContainer
+    let context: ModelContext
+    let tempDir: URL
 
-    override func setUp() async throws {
+    init() throws {
         let schema = Schema([
             Idea.self, Run.self, StageExecution.self,
             AgentExecution.self, Approval.self, Artifact.self
@@ -27,31 +29,7 @@ final class EndToEndTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
 
-    override func tearDown() async throws {
-        if let dir = tempDir, FileManager.default.fileExists(atPath: dir.path) {
-            try? FileManager.default.removeItem(at: dir)
-        }
-    }
-
     // MARK: - Helpers
-
-    private func loadCanonicalWorkflow() throws -> WorkflowDefinition {
-        let url = Bundle(for: type(of: self)).url(forResource: "workflow", withExtension: "yaml")!
-        return try YAMLParser.loadWorkflow(from: url)
-    }
-
-    private func loadCanonicalCatalog() throws -> AgentCatalog {
-        let url = Bundle(for: type(of: self)).url(forResource: "agents", withExtension: "yaml")!
-        return try YAMLParser.loadAgentCatalog(from: url)
-    }
-
-    private func loadLiveWorkflow() throws -> WorkflowDefinition {
-        let url = try XCTUnwrap(
-            Bundle(for: type(of: self)).url(forResource: "proposal-loop-live", withExtension: "yaml"),
-            "proposal-loop-live.yaml fixture must be bundled with tests"
-        )
-        return try YAMLParser.loadWorkflow(from: url)
-    }
 
     private func makeWorkspace() -> RunWorkspace {
         let runID = UUID()
@@ -88,18 +66,19 @@ final class EndToEndTests: XCTestCase {
 
     /// Section 12 required test: full canonical workflow executes through all states
     /// with correct agent execution order, approval handling, and artifact production.
-    func testFullCanonicalWorkflow() async throws {
-        let workflow = try loadCanonicalWorkflow()
-        let catalog = try loadCanonicalCatalog()
+    @Test("Full canonical workflow executes through all states")
+    func fullCanonicalWorkflow() async throws {
+        let workflow = try loadTestCanonicalWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
 
         // Phase 1: Preview compile
         let compiler = RunPlanCompiler(modelContext: context)
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
 
         // Verify compilation results
-        XCTAssertFalse(plan.states.isEmpty, "Plan should have states")
-        XCTAssertFalse(plan.agentBindings.isEmpty, "Plan should have agent bindings")
-        XCTAssertEqual(plan.planCompilerVersion, RunPlan.currentCompilerVersion)
+        #expect(!plan.states.isEmpty, "Plan should have states")
+        #expect(!plan.agentBindings.isEmpty, "Plan should have agent bindings")
+        #expect(plan.planCompilerVersion == RunPlan.currentCompilerVersion)
 
         // Phase 2: Create orchestrator (using simulated executor)
         let workspace = makeWorkspace()
@@ -130,7 +109,7 @@ final class EndToEndTests: XCTestCase {
         // Auto-approve gates and wait for completion.
         // The canonical workflow has approval gates that pause execution.
         // We poll until completion, auto-approving any gates that appear.
-        try await pollUntil(timeout: 20.0, message: "Canonical workflow should complete with auto-approved gates") {
+        await awaitCondition("Canonical workflow should complete with auto-approved gates", timeout: 20.0) {
             // Check if we need to approve something
             if orchestrator.isPaused && !approvalRequests.isEmpty {
                 for request in approvalRequests {
@@ -144,37 +123,39 @@ final class EndToEndTests: XCTestCase {
         // Verify completion — assert the specific expected terminal state.
         // The canonical workflow with auto-approved gates should reach .completed.
         // If it doesn't, the test should fail loudly rather than silently accepting any state.
-        assertRunCompleted(run)
+        expectRunCompleted(run)
 
         // Verify stage executions were created lazily
-        XCTAssertFalse(run.stageExecutions.isEmpty, "Should have created stage executions")
+        #expect(!run.stageExecutions.isEmpty, "Should have created stage executions")
 
         // Verify agents executed
-        XCTAssertFalse(executor.executedTasks.isEmpty, "Should have executed at least one agent")
+        #expect(!executor.executedTasks.isEmpty, "Should have executed at least one agent")
 
         // Verify provenance
-        XCTAssertEqual(run.workflowSnapshotHash, plan.workflowSnapshotHash)
-        XCTAssertEqual(run.catalogSnapshotHash, plan.catalogSnapshotHash)
+        #expect(run.workflowSnapshotHash == plan.workflowSnapshotHash)
+        #expect(run.catalogSnapshotHash == plan.catalogSnapshotHash)
     }
 
     // MARK: - Compact Workflow End-to-End
 
     /// Tests the compact workflow normalization + compilation + execution path.
-    func testCompactWorkflowEndToEnd() async throws {
-        guard let compactURL = Bundle(for: type(of: self))
-            .url(forResource: "proposal-to-release", withExtension: "yaml") else {
+    @Test("Compact workflow normalization, compilation, and execution")
+    func compactWorkflowEndToEnd() async throws {
+        let compact: CompactWorkflowDefinition
+        do {
+            compact = try loadTestCompactWorkflow()
+        } catch {
             // Skip if compact workflow not in test bundle
             return
         }
 
-        let catalog = try loadCanonicalCatalog()
-        let compact = try YAMLParser.loadCompactWorkflow(from: compactURL)
+        let catalog = try loadTestCanonicalCatalog()
 
         let compiler = RunPlanCompiler(modelContext: context)
         let plan = try compiler.previewCompileCompact(compact: compact, catalog: catalog)
 
-        XCTAssertFalse(plan.states.isEmpty)
-        XCTAssertFalse(plan.agentBindings.isEmpty)
+        #expect(!plan.states.isEmpty)
+        #expect(!plan.agentBindings.isEmpty)
 
         // Execute with simulated agents
         let workspace = makeWorkspace()
@@ -193,8 +174,8 @@ final class EndToEndTests: XCTestCase {
 
         await orchestrator.start()
 
-        // Auto-approve all gates using pollUntil instead of sleep loop
-        try await pollUntil(timeout: 10.0, message: "Compact workflow should finish or pause") {
+        // Auto-approve all gates using awaitCondition instead of sleep loop
+        await awaitCondition("Compact workflow should finish or pause", timeout: 10.0) {
             !orchestrator.isRunning || orchestrator.isPaused
         }
 
@@ -203,22 +184,23 @@ final class EndToEndTests: XCTestCase {
                 orchestrator.resolveApproval(stageID: request.stageID, granted: true)
             }
             approvalRequests.removeAll()
-            try await pollUntil(timeout: 5.0, message: "Compact workflow should resume after approval") {
+            await awaitCondition("Compact workflow should resume after approval", timeout: 5.0) {
                 !orchestrator.isPaused || !approvalRequests.isEmpty
             }
         }
 
         // Verify progress
-        XCTAssertFalse(run.stageExecutions.isEmpty, "Compact workflow should execute stages")
-        XCTAssertFalse(executor.executedTasks.isEmpty, "Compact workflow should execute agents")
+        #expect(!run.stageExecutions.isEmpty, "Compact workflow should execute stages")
+        #expect(!executor.executedTasks.isEmpty, "Compact workflow should execute agents")
     }
 
     // MARK: - ExecutionService Integration E2E
 
     /// Tests the full flow through ExecutionService: start, execute, complete.
-    func testExecutionServiceEndToEnd() async throws {
-        let workflow = try loadCanonicalWorkflow()
-        let catalog = try loadCanonicalCatalog()
+    @Test("ExecutionService full flow: start, execute, complete")
+    func executionServiceEndToEnd() async throws {
+        let workflow = try loadTestCanonicalWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
 
         let compiler = RunPlanCompiler(modelContext: context)
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -235,11 +217,11 @@ final class EndToEndTests: XCTestCase {
 
         // Start via service
         service.startRun(run: run, plan: plan, workspace: workspace)
-        XCTAssertTrue(service.hasActiveRuns)
-        XCTAssertNotNil(service.orchestrator(for: run.id))
+        #expect(service.hasActiveRuns)
+        #expect(service.orchestrator(for: run.id) != nil)
 
-        // Wait for initial execution using pollUntil instead of fixed sleep
-        try await pollUntil(timeout: 5.0, message: "Service should execute at least one agent") {
+        // Wait for initial execution using awaitCondition instead of fixed sleep
+        await awaitCondition("Service should execute at least one agent", timeout: 5.0) {
             !executor.executedTasks.isEmpty || !service.pendingApprovals.isEmpty
         }
 
@@ -248,21 +230,22 @@ final class EndToEndTests: XCTestCase {
             for (id, _) in service.pendingApprovals {
                 service.resolveApproval(approvalID: id, granted: true, comment: "E2E approve")
             }
-            try await pollUntil(timeout: 3.0, message: "Approvals should be processed") {
+            await awaitCondition("Approvals should be processed", timeout: 3.0) {
                 service.pendingApprovals.isEmpty || !executor.executedTasks.isEmpty
             }
         }
 
         // Verify the service tracked the execution
-        XCTAssertFalse(executor.executedTasks.isEmpty, "Service should have executed agents")
+        #expect(!executor.executedTasks.isEmpty, "Service should have executed agents")
     }
 
     // MARK: - Cost Aggregation E2E
 
     /// Verifies cost tracking aggregates across multiple agent executions.
-    func testCostAggregationEndToEnd() async throws {
-        let workflow = try loadCanonicalWorkflow()
-        let catalog = try loadCanonicalCatalog()
+    @Test("Cost tracking aggregates across agent executions")
+    func costAggregationEndToEnd() async throws {
+        let workflow = try loadTestCanonicalWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
 
         let compiler = RunPlanCompiler(modelContext: context)
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -284,12 +267,12 @@ final class EndToEndTests: XCTestCase {
 
         await orchestrator.start()
 
-        // Auto-approve if needed, using pollUntil for reliable sync
+        // Auto-approve if needed, using awaitCondition for reliable sync
         if orchestrator.isPaused {
             for request in approvalRequests {
                 orchestrator.resolveApproval(stageID: request.stageID, granted: true)
             }
-            try await pollUntil(timeout: 5.0, message: "Orchestrator should resume after approval") {
+            await awaitCondition("Orchestrator should resume after approval", timeout: 5.0) {
                 !orchestrator.isPaused
             }
         }
@@ -297,15 +280,16 @@ final class EndToEndTests: XCTestCase {
         // Assert explicitly that tasks executed — do NOT silently skip the assertion.
         // Previous version wrapped this in `if executor.executedTasks.count > 1` which
         // meant the test passed vacuously when nothing executed.
-        XCTAssertGreaterThan(executor.executedTasks.count, 0,
-                             "At least one agent must execute for cost tracking to be meaningful")
-        XCTAssertNotNil(run.totalCostCents, "Cost should be tracked after agent execution")
-        XCTAssertTrue(run.totalCostCents! > 0, "Cost should be positive after agent execution")
+        #expect(executor.executedTasks.count > 0,
+                "At least one agent must execute for cost tracking to be meaningful")
+        #expect(run.totalCostCents != nil, "Cost should be tracked after agent execution")
+        #expect(run.totalCostCents! > 0, "Cost should be positive after agent execution")
     }
 
-    func testLiveProposalLoopFixtureReachesApprovalAndCompletes() async throws {
-        let workflow = try loadLiveWorkflow()
-        let catalog = try loadCanonicalCatalog()
+    @Test("Live proposal loop fixture reaches approval and completes")
+    func liveProposalLoopFixtureReachesApprovalAndCompletes() async throws {
+        let workflow = try loadTestLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
 
         let compiler = RunPlanCompiler(modelContext: context)
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -332,19 +316,19 @@ final class EndToEndTests: XCTestCase {
 
         await orchestrator.start()
 
-        // Wait for the run to reach a stable state using pollUntil
-        try await pollUntil(timeout: 15.0, message: "Fixture live workflow should reach approval gate or complete") {
+        // Wait for the run to reach a stable state using awaitCondition
+        await awaitCondition("Fixture live workflow should reach approval gate or complete", timeout: 15.0) {
             run.status == .waitingApproval || run.status == .completed || run.status == .blocked
         }
 
         // Allow fire-and-forget live event routing tasks to settle
         try await Task.sleep(nanoseconds: 300_000_000)
 
-        XCTAssertTrue(
+        #expect(
             run.status == .waitingApproval || run.status == .completed || run.status == .blocked,
             "Fixture live workflow should reach approval gate, complete, or block, got: \(run.status.rawValue)"
         )
-        XCTAssertFalse(run.stageExecutions.isEmpty, "Run should have executed stages")
+        #expect(!run.stageExecutions.isEmpty, "Run should have executed stages")
 
         // If paused at approval gate or blocked, approve and wait for completion
         if (run.status == .waitingApproval || run.status == .blocked) && !approvalRequests.isEmpty {
@@ -352,28 +336,28 @@ final class EndToEndTests: XCTestCase {
                 .flatMap(\.agentExecutions)
                 .flatMap(\.artifacts)
                 .count
-            XCTAssertGreaterThan(artifactCountBeforeApproval, 0, "Fixture live workflow should persist artifacts before approval")
+            #expect(artifactCountBeforeApproval > 0, "Fixture live workflow should persist artifacts before approval")
 
             for request in approvalRequests {
                 orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "Fixture test approval")
             }
 
-            try await pollUntil(timeout: 15.0, message: "Fixture live workflow should complete after approval") {
+            await awaitCondition("Fixture live workflow should complete after approval", timeout: 15.0) {
                 run.status == .completed || run.status == .blocked
             }
         }
 
-        XCTAssertTrue(
+        #expect(
             run.status == .completed || run.status == .blocked || run.status == .waitingApproval,
             "Fixture live workflow should complete or reach a stable state, got: \(run.status.rawValue)"
         )
 
         // completedAt is only set when the run reaches .completed
         if run.status == .completed {
-            XCTAssertNotNil(run.completedAt)
+            #expect(run.completedAt != nil)
         }
 
-        XCTAssertTrue(
+        #expect(
             run.stageExecutions
                 .flatMap(\.agentExecutions)
                 .contains { ($0.providerSessionID ?? "").hasPrefix("fixture-") },
@@ -386,19 +370,19 @@ final class EndToEndTests: XCTestCase {
 
         if let summaryArtifact = allArtifacts.first(where: { $0.name == "proposal_review_summary" }) {
             let data = try ArtifactStorage.read(filePath: summaryArtifact.filePath, workspaceRoot: workspace.workspaceRoot)
-            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-            XCTAssertEqual(json["pass"] as? Bool, true)
-            XCTAssertNotNil(json["average_score"] as? Double)
-            XCTAssertNotNil(json["required_changes"] as? [Any])
+            let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            #expect(json["pass"] as? Bool == true)
+            #expect(json["average_score"] as? Double != nil)
+            #expect(json["required_changes"] as? [Any] != nil)
         } else {
-            XCTFail("Expected proposal_review_summary artifact to be persisted")
+            Issue.record("Expected proposal_review_summary artifact to be persisted")
         }
 
         if run.status == .completed {
             let descriptor = FetchDescriptor<Artifact>()
             let reports = try context.fetch(descriptor)
                 .filter { $0.runID == run.id && $0.name == "final_feature_report" }
-            XCTAssertEqual(reports.count, 1, "Completed live run should persist a final feature report")
+            #expect(reports.count == 1, "Completed live run should persist a final feature report")
         }
     }
 }

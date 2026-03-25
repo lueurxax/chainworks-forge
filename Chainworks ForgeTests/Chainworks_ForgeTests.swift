@@ -387,7 +387,7 @@ struct RunTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Chainworks Forge")
-        let directRunPattern = try Regex(#"(?<![A-Za-z0-9_])Run\s*\("#)
+        let directRunPattern = try Regex(#"\bRun\s*\("#)
 
         let enumerator = FileManager.default.enumerator(
             at: sourceDir,

@@ -1,54 +1,93 @@
-import XCTest
 import Foundation
 @testable import Chainworks_Forge
 
 // MARK: - Shared Mock Objects
 //
-// Consolidated test doubles extracted from OrchestratorTests and GooseAgentExecutorTests.
-// Prevents duplicate MockGooseTransport implementations with divergent behavior.
+// Two-lane test double strategy for GooseTransportProtocol:
+// - Lane A (StubGooseTransport): lightweight Sendable struct for stimulus-only tests
+// - Lane B (ObservableGooseTransport): actor-backed observable for side-effect assertions
 
-// MARK: - MockGooseTransportProtocol
+// MARK: - Lane A: StubGooseTransport (lightweight value witness)
 
-/// Protocol-conformant mock transport for GooseAgentExecutor tests.
-/// Tracks session lifecycle and returns pre-configured responses without real HTTP.
+/// Lightweight struct stub for tests that only need stimulus injection (pre-configured
+/// responses and event streams) and do NOT assert on transport-side effects.
 ///
-/// Consolidated from:
-///   - OrchestratorTests.MockGooseTransport (subclass-based)
-///   - GooseAgentExecutorTests.MockGooseTransport (protocol-based)
-final class SharedMockGooseTransport: GooseTransportProtocol, @unchecked Sendable {
-    // MARK: - Configuration
+/// Applicable to: GooseStreamEventMapperTests, SimulatedAgentExecutorTests,
+/// stream-only tests in GooseServerTransportTests, EndToEndTests, and any
+/// new test that does not need observation.
+struct StubGooseTransport: GooseTransportProtocol, Sendable {
+    var onCreateSession: @Sendable (GooseSessionRequest) async throws -> GooseSessionResponse = { _ in
+        GooseSessionResponse(
+            sessionId: "stub-\(UUID().uuidString.prefix(8))",
+            status: "active",
+            policyAcknowledgement: GoosePolicyAcknowledgement(
+                accepted: true, capabilityToken: "stub", backendPolicyVersion: "v1"
+            )
+        )
+    }
+    var events: [GooseStreamEvent] = []
+
+    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        try await onCreateSession(request)
+    }
+
+    func submitPrompt(
+        sessionID: String,
+        prompt: GoosePromptRequest
+    ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+        let events = self.events
+        return AsyncThrowingStream { c in
+            Task { for e in events { c.yield(e) }; c.finish() }
+        }
+    }
+
+    func closeSession(sessionID: String) async throws {}
+}
+
+// MARK: - Lane B: ObservableGooseTransport (actor-backed observable mock)
+
+/// Actor-backed observable mock for tests that need to assert on request content,
+/// session lifecycle, and call counts after execution.
+///
+/// Applicable to: GooseAgentExecutorTests, GooseSessionBridgeTests, OrchestratorTests,
+/// and session-lifecycle tests in GooseServerTransportTests.
+///
+/// Key difference from SharedMockGooseTransport: `actor` provides compiler-verified
+/// Sendable safety without `@unchecked`. Observable state is accessed via `await`
+/// from tests, which is natural in async test functions.
+actor ObservableGooseTransport: GooseTransportProtocol {
+    // Stimulus configuration
     var createSessionResult: GooseSessionResponse?
     var createSessionError: Error?
     var streamEvents: [GooseStreamEvent] = []
 
-    // MARK: - Observation
+    // Observable state
     private(set) var closeSessionCalled = false
     private(set) var lastSessionID: String?
     private(set) var lastSessionRequest: GooseSessionRequest?
     private(set) var createSessionCallCount = 0
     private(set) var submitPromptCallCount = 0
 
-    init() {}
-
-    /// Convenience init for common "happy path" scenario.
-    convenience init(events: [GooseStreamEvent]) {
-        self.init()
+    /// Convenience configuration method for test setup.
+    func configure(
+        sessionResult: GooseSessionResponse? = nil,
+        sessionError: Error? = nil,
+        events: [GooseStreamEvent] = []
+    ) {
+        self.createSessionResult = sessionResult
+        self.createSessionError = sessionError
         self.streamEvents = events
     }
 
     func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
         createSessionCallCount += 1
         lastSessionRequest = request
-        if let error = createSessionError {
-            throw error
-        }
+        if let error = createSessionError { throw error }
         return createSessionResult ?? GooseSessionResponse(
-            sessionId: "mock-session-\(UUID().uuidString.prefix(8))",
+            sessionId: "obs-\(UUID().uuidString.prefix(8))",
             status: "active",
             policyAcknowledgement: GoosePolicyAcknowledgement(
-                accepted: true,
-                capabilityToken: "mock-read-only",
-                backendPolicyVersion: "mock-v1"
+                accepted: true, capabilityToken: "obs", backendPolicyVersion: "v1"
             )
         )
     }
@@ -60,13 +99,8 @@ final class SharedMockGooseTransport: GooseTransportProtocol, @unchecked Sendabl
         submitPromptCallCount += 1
         lastSessionID = sessionID
         let events = streamEvents
-        return AsyncThrowingStream { continuation in
-            Task {
-                for event in events {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
+        return AsyncThrowingStream { c in
+            Task { for e in events { c.yield(e) }; c.finish() }
         }
     }
 
@@ -74,7 +108,6 @@ final class SharedMockGooseTransport: GooseTransportProtocol, @unchecked Sendabl
         closeSessionCalled = true
     }
 
-    /// Resets all observation state for reuse across tests.
     func reset() {
         closeSessionCalled = false
         lastSessionID = nil

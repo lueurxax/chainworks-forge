@@ -1,0 +1,35 @@
+{
+  "configurations" : [
+    {
+      "id" : "C3D4E5F6-A7B8-9012-CDEF-123456789012",
+      "name" : "Configuration 1",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:Chainworks Forge.xcodeproj",
+      "identifier" : "CE8913472F6FC30A006EC77C",
+      "name" : "Chainworks ForgeTests"
+    }
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:Chainworks Forge.xcodeproj",
+        "identifier" : "CE8913472F6FC30A006EC77C",
+        "name" : "Chainworks ForgeTests"
+      }
+    },
+    {
+      "target" : {
+        "containerPath" : "container:Chainworks Forge.xcodeproj",
+        "identifier" : "CE8913512F6FC30A006EC77C",
+        "name" : "Chainworks ForgeUITests"
+      }
+    }
+  ],
+  "version" : 1
+}

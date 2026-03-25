@@ -1,7 +1,9 @@
-import XCTest
+import Testing
+import Foundation
 @testable import Chainworks_Forge
 
-final class SimulatedAgentExecutorTests: XCTestCase {
+@Suite("SimulatedAgentExecutor")
+struct SimulatedAgentExecutorTests {
 
     // MARK: - Helpers
 
@@ -44,7 +46,8 @@ final class SimulatedAgentExecutorTests: XCTestCase {
 
     // MARK: - Basic Execution
 
-    func testSuccessfulExecution() async throws {
+    @Test("Successful execution")
+    func successfulExecution() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent()
         let result = try await executor.execute(
@@ -52,13 +55,14 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
-        XCTAssertTrue(result.succeeded)
-        XCTAssertNil(result.errorMessage)
-        XCTAssertFalse(result.outputs.isEmpty)
-        XCTAssertNotNil(result.logSnippet)
+        #expect(result.succeeded)
+        #expect(result.errorMessage == nil)
+        #expect(!result.outputs.isEmpty)
+        #expect(result.logSnippet != nil)
     }
 
-    func testOutputsGeneratedForDeclaredOutputs() async throws {
+    @Test("Outputs generated for declared outputs")
+    func outputsGeneratedForDeclaredOutputs() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent(outputs: ["proposal_current", "idea_brief"])
         let result = try await executor.execute(
@@ -66,13 +70,14 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
-        XCTAssertTrue(result.succeeded)
-        XCTAssertEqual(result.outputs.count, 2)
-        XCTAssertNotNil(result.outputs["proposal_current"])
-        XCTAssertNotNil(result.outputs["idea_brief"])
+        #expect(result.succeeded)
+        #expect(result.outputs.count == 2)
+        #expect(result.outputs["proposal_current"] != nil)
+        #expect(result.outputs["idea_brief"] != nil)
     }
 
-    func testDefaultOutputWhenNoOutputsDeclared() async throws {
+    @Test("Default output when no outputs declared")
+    func defaultOutputWhenNoOutputsDeclared() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent(outputs: [])
         let result = try await executor.execute(
@@ -80,14 +85,15 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
-        XCTAssertTrue(result.succeeded)
-        XCTAssertEqual(result.outputs.count, 1)
-        XCTAssertNotNil(result.outputs["test_agent_output"])
+        #expect(result.succeeded)
+        #expect(result.outputs.count == 1)
+        #expect(result.outputs["test_agent_output"] != nil)
     }
 
     // MARK: - Contract-Aware Output
 
-    func testContractAwareOutput() async throws {
+    @Test("Contract-aware output")
+    func contractAwareOutput() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent(
             id: "reviewer",
@@ -99,19 +105,20 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
-        XCTAssertTrue(result.succeeded)
+        #expect(result.succeeded)
 
         // Verify JSON is valid and has required fields
         let data = result.outputs["review"]!
         let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-        XCTAssertNotNil(json["agent_id"])
-        XCTAssertNotNil(json["score"])
-        XCTAssertNotNil(json["verdict"])
+        #expect(json["agent_id"] != nil)
+        #expect(json["score"] != nil)
+        #expect(json["verdict"] != nil)
     }
 
     // MARK: - Failure Injection
 
-    func testFailingAgent() async throws {
+    @Test("Failing agent")
+    func failingAgent() async throws {
         let executor = SimulatedAgentExecutor()
         executor.failingAgentIDs = ["bad_agent"]
         let agent = makeAgent(id: "bad_agent")
@@ -120,14 +127,15 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
-        XCTAssertFalse(result.succeeded)
-        XCTAssertNotNil(result.errorMessage)
-        XCTAssertTrue(result.outputs.isEmpty)
+        #expect(!result.succeeded)
+        #expect(result.errorMessage != nil)
+        #expect(result.outputs.isEmpty)
     }
 
     // MARK: - Execution Tracking
 
-    func testExecutionTracking() async throws {
+    @Test("Execution tracking")
+    func executionTracking() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent(id: "tracked_agent")
 
@@ -142,25 +150,27 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             context: makeContext(stageID: "stage_2")
         )
 
-        XCTAssertEqual(executor.executedTasks.count, 2)
-        XCTAssertEqual(executor.executedTasks[0].task, "task_1")
-        XCTAssertEqual(executor.executedTasks[1].stageID, "stage_2")
+        #expect(executor.executedTasks.count == 2)
+        #expect(executor.executedTasks[0].task == "task_1")
+        #expect(executor.executedTasks[1].stageID == "stage_2")
     }
 
-    func testReset() async throws {
+    @Test("Reset")
+    func reset() async throws {
         let executor = SimulatedAgentExecutor()
         executor.failingAgentIDs = ["a"]
         let agent = makeAgent()
         _ = try await executor.execute(task: makeTask(), agent: agent, context: makeContext())
 
         executor.reset()
-        XCTAssertTrue(executor.executedTasks.isEmpty)
-        XCTAssertTrue(executor.failingAgentIDs.isEmpty)
+        #expect(executor.executedTasks.isEmpty)
+        #expect(executor.failingAgentIDs.isEmpty)
     }
 
     // MARK: - OutputContractTemplates Coverage
 
-    func testAllContractTemplatesProduceValidJSON() throws {
+    @Test("All contract templates produce valid JSON")
+    func allContractTemplatesProduceValidJSON() throws {
         let contractIDs = [
             "proposal_review_v1",
             "proposal_review_summary_v1",
@@ -180,25 +190,27 @@ final class SimulatedAgentExecutorTests: XCTestCase {
                 agentID: "test",
                 stageID: "stage"
             )
-            XCTAssertEqual(format, .json, "Contract \(contractID) should be JSON")
+            #expect(format == .json, "Contract \(contractID) should be JSON")
             // Verify valid JSON
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            XCTAssertNotNil(json, "Contract \(contractID) should produce valid JSON dictionary")
+            #expect(json != nil, "Contract \(contractID) should produce valid JSON dictionary")
         }
     }
 
-    func testUnknownContractProducesMarkdown() {
+    @Test("Unknown contract produces markdown")
+    func unknownContractProducesMarkdown() {
         let (data, format) = OutputContractTemplates.generate(
             contractID: "unknown_contract",
             agentID: "test",
             stageID: "stage"
         )
-        XCTAssertEqual(format, .markdown)
+        #expect(format == .markdown)
         let text = String(data: data, encoding: .utf8)!
-        XCTAssertTrue(text.contains("Simulated Output"))
+        #expect(text.contains("Simulated Output"))
     }
 
-    func testCostTracking() async throws {
+    @Test("Cost tracking")
+    func costTracking() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent()
         let result = try await executor.execute(
@@ -207,13 +219,14 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             context: makeContext()
         )
         // §6.2: default 100 cents per execution
-        XCTAssertNotNil(result.costCents)
-        XCTAssertEqual(result.costCents, 100)
+        #expect(result.costCents != nil)
+        #expect(result.costCents == 100)
     }
 
     // MARK: - AgentResult Fields (§6.1)
 
-    func testAgentResultIncludesSessionIDAndDuration() async throws {
+    @Test("AgentResult includes sessionID and duration")
+    func agentResultIncludesSessionIDAndDuration() async throws {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent()
         let result = try await executor.execute(
@@ -221,8 +234,8 @@ final class SimulatedAgentExecutorTests: XCTestCase {
             agent: agent,
             context: makeContext()
         )
-        XCTAssertNotNil(result.sessionID, "AgentResult.sessionID must be set (§6.1)")
-        XCTAssertTrue(result.sessionID!.hasPrefix("sim-"), "Simulated sessions use 'sim-' prefix")
-        XCTAssertGreaterThanOrEqual(result.durationSeconds, 0, "AgentResult.durationSeconds must be non-negative (§6.1)")
+        #expect(result.sessionID != nil, "AgentResult.sessionID must be set (§6.1)")
+        #expect(result.sessionID!.hasPrefix("sim-"), "Simulated sessions use 'sim-' prefix")
+        #expect(result.durationSeconds >= 0, "AgentResult.durationSeconds must be non-negative (§6.1)")
     }
 }

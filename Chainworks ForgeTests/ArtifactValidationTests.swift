@@ -1,4 +1,5 @@
-import XCTest
+import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
@@ -12,12 +13,13 @@ import SwiftData
 // Improvement #8: Empty artifact rejection test.
 
 @MainActor
-final class ArtifactValidationTests: XCTestCase {
-    var container: ModelContainer!
-    var context: ModelContext!
-    var tempDir: URL!
+@Suite("ArtifactValidation")
+struct ArtifactValidationTests {
+    let container: ModelContainer
+    let context: ModelContext
+    let tempDir: URL
 
-    override func setUp() async throws {
+    init() throws {
         let (c, ctx) = try makeTestModelContainer()
         container = c
         context = ctx
@@ -25,12 +27,6 @@ final class ArtifactValidationTests: XCTestCase {
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ArtifactValidationTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    }
-
-    override func tearDown() async throws {
-        if let dir = tempDir, FileManager.default.fileExists(atPath: dir.path) {
-            try? FileManager.default.removeItem(at: dir)
-        }
     }
 
     // MARK: - Helpers
@@ -47,7 +43,8 @@ final class ArtifactValidationTests: XCTestCase {
 
     /// When an agent produces no outputs for a declared output contract,
     /// the orchestrator should detect the failure and block/fail the run.
-    func testPipelineBlocksWhenRequiredArtifactIsMissing() async throws {
+    @Test("Pipeline blocks when required artifact is missing")
+    func pipelineBlocksWhenRequiredArtifactIsMissing() async throws {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -104,9 +101,9 @@ final class ArtifactValidationTests: XCTestCase {
         await orchestrator.start()
 
         // The run should NOT be completed — it should be blocked because the agent failed
-        XCTAssertNotEqual(run.status, .completed,
-                          "Run must not complete when required artifact agent fails")
-        XCTAssertTrue(
+        #expect(run.status != .completed,
+                "Run must not complete when required artifact agent fails")
+        #expect(
             run.status == .blocked || run.status == .failed,
             "Run should be blocked or failed when agent cannot produce required artifact, got: \(run.status.rawValue)"
         )
@@ -114,7 +111,8 @@ final class ArtifactValidationTests: XCTestCase {
 
     /// When a transition requires an artifact that was never produced,
     /// the pipeline should not advance to the next state.
-    func testTransitionBlockedWhenArtifactNeverProduced() async throws {
+    @Test("Transition blocked when artifact never produced")
+    func transitionBlockedWhenArtifactNeverProduced() async throws {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -161,16 +159,17 @@ final class ArtifactValidationTests: XCTestCase {
 
         // The agent runs, but the transition condition (artifactExists("missing_artifact")) should fail
         // because the agent only produces "some_other_output", not "missing_artifact".
-        XCTAssertNotEqual(run.status, .completed,
-                          "Run must not complete when required transition artifact is missing")
+        #expect(run.status != .completed,
+                "Run must not complete when required transition artifact is missing")
         // Agent should have executed
-        XCTAssertFalse(executor.executedTasks.isEmpty, "Agent should have executed")
+        #expect(!executor.executedTasks.isEmpty, "Agent should have executed")
     }
 
     // MARK: - #8: Empty artifact rejection
 
     /// ArtifactStorage should reject writes with empty data or detect zero-byte artifacts.
-    func testEmptyArtifactDetected() throws {
+    @Test("Empty artifact detected with zero bytes")
+    func emptyArtifactDetected() throws {
         let workspace = makeWorkspace()
         let emptyData = Data()
 
@@ -188,17 +187,18 @@ final class ArtifactValidationTests: XCTestCase {
         )
 
         // Whether the system allows empty writes or not, we verify detectability:
-        XCTAssertEqual(result.sizeBytes, 0,
-                       "Empty artifact should report 0 bytes, enabling downstream validation to catch it")
+        #expect(result.sizeBytes == 0,
+                "Empty artifact should report 0 bytes, enabling downstream validation to catch it")
 
         // Verify the file exists but is empty
         let data = try Data(contentsOf: URL(fileURLWithPath: result.filePath))
-        XCTAssertTrue(data.isEmpty, "Written file should be empty")
+        #expect(data.isEmpty, "Written file should be empty")
     }
 
     /// Verify that ArtifactManager correctly records zero-byte artifacts,
     /// enabling validation gates to reject them.
-    func testArtifactManagerRecordsEmptyArtifactSize() throws {
+    @Test("ArtifactManager records empty artifact size")
+    func artifactManagerRecordsEmptyArtifactSize() throws {
         let workspace = makeWorkspace()
         let agent = makeTestAgent(id: "empty_agent")
 
@@ -223,15 +223,16 @@ final class ArtifactValidationTests: XCTestCase {
             attemptNumber: 1
         )
 
-        XCTAssertEqual(artifacts.count, 1, "Empty data should still create an artifact record")
-        XCTAssertEqual(artifacts[0].sizeBytes, 0, "Empty artifact must report 0 bytes for validation")
-        XCTAssertNotNil(artifacts[0].checksumSHA256, "Even empty artifacts should have a checksum")
+        #expect(artifacts.count == 1, "Empty data should still create an artifact record")
+        #expect(artifacts[0].sizeBytes == 0, "Empty artifact must report 0 bytes for validation")
+        #expect(artifacts[0].checksumSHA256 != nil, "Even empty artifacts should have a checksum")
     }
 
     // MARK: - Transition evaluator with empty artifact set
 
     /// TransitionEvaluator should return false for artifactExists when no artifacts produced.
-    func testTransitionEvaluatorRejectsEmptyArtifactSet() {
+    @Test("TransitionEvaluator rejects empty artifact set")
+    func transitionEvaluatorRejectsEmptyArtifactSet() {
         let ctx = TransitionEvaluator.EvaluationContext(
             producedArtifactNames: [],
             approvalGranted: false,
@@ -239,14 +240,15 @@ final class ArtifactValidationTests: XCTestCase {
             artifactFields: [:]
         )
 
-        XCTAssertFalse(
-            TransitionEvaluator.evaluate(.artifactExists("any_artifact"), context: ctx),
+        #expect(
+            !TransitionEvaluator.evaluate(.artifactExists("any_artifact"), context: ctx),
             "artifactExists must return false when no artifacts exist"
         )
     }
 
     /// TransitionEvaluator evaluateFirst should return nil when no transitions match (no artifacts).
-    func testEvaluateFirstReturnsNilWhenAllRequireArtifacts() {
+    @Test("evaluateFirst returns nil when all require artifacts")
+    func evaluateFirstReturnsNilWhenAllRequireArtifacts() {
         let transitions = [
             ExecutableTransition(to: "a", condition: .artifactExists("missing_1")),
             ExecutableTransition(to: "b", condition: .artifactExists("missing_2")),
@@ -259,6 +261,6 @@ final class ArtifactValidationTests: XCTestCase {
         )
 
         let result = TransitionEvaluator.evaluateFirst(transitions: transitions, context: ctx)
-        XCTAssertNil(result, "No transition should match when all require missing artifacts")
+        #expect(result == nil, "No transition should match when all require missing artifacts")
     }
 }

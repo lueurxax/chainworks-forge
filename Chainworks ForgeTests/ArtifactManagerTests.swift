@@ -1,15 +1,17 @@
-import XCTest
+import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
 @MainActor
-final class ArtifactManagerTests: XCTestCase {
-    var container: ModelContainer!
-    var context: ModelContext!
-    var manager: ArtifactManager!
-    var tempDir: URL!
+@Suite("ArtifactManager", .tags(.fast))
+struct ArtifactManagerTests {
+    let container: ModelContainer
+    let context: ModelContext
+    let manager: ArtifactManager
+    let tempDir: URL
 
-    override func setUp() async throws {
+    init() throws {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
         let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
@@ -20,12 +22,6 @@ final class ArtifactManagerTests: XCTestCase {
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ArtifactManagerTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    }
-
-    override func tearDown() async throws {
-        if let dir = tempDir, FileManager.default.fileExists(atPath: dir.path) {
-            try? FileManager.default.removeItem(at: dir)
-        }
     }
 
     // MARK: - Helpers
@@ -66,7 +62,8 @@ final class ArtifactManagerTests: XCTestCase {
 
     // MARK: - Persist Outputs
 
-    func testPersistOutputsWritesToDiskAndSwiftData() throws {
+    @Test("persistOutputs writes to disk and SwiftData")
+    func persistOutputsWritesToDiskAndSwiftData() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
         let stageExec = StageExecution(stageID: "stage_1", label: "Test Stage")
@@ -87,24 +84,25 @@ final class ArtifactManagerTests: XCTestCase {
         )
 
         // Verify SwiftData record created
-        XCTAssertEqual(artifacts.count, 1)
+        #expect(artifacts.count == 1)
         let artifact = artifacts[0]
-        XCTAssertEqual(artifact.name, "test_output")
-        XCTAssertEqual(artifact.stageID, "stage_1")
-        XCTAssertEqual(artifact.agentID, "test_agent")
-        XCTAssertEqual(artifact.runID, workspace.runID)
-        XCTAssertNotNil(artifact.checksumSHA256)
-        XCTAssertEqual(artifact.sizeBytes, Int64(testData.count))
+        #expect(artifact.name == "test_output")
+        #expect(artifact.stageID == "stage_1")
+        #expect(artifact.agentID == "test_agent")
+        #expect(artifact.runID == workspace.runID)
+        #expect(artifact.checksumSHA256 != nil)
+        #expect(artifact.sizeBytes == Int64(testData.count))
 
         // Verify file on disk
-        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.filePath))
+        #expect(FileManager.default.fileExists(atPath: artifact.filePath))
 
         // Verify data round-trips
         let readBack = try Data(contentsOf: URL(fileURLWithPath: artifact.filePath))
-        XCTAssertEqual(readBack, testData)
+        #expect(readBack == testData)
     }
 
-    func testPersistMultipleOutputs() throws {
+    @Test("persistOutputs handles multiple outputs")
+    func persistMultipleOutputs() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
         let stageExec = StageExecution(stageID: "stage_1", label: "Test")
@@ -127,14 +125,15 @@ final class ArtifactManagerTests: XCTestCase {
             attemptNumber: 1
         )
 
-        XCTAssertEqual(artifacts.count, 3)
+        #expect(artifacts.count == 3)
         let names = Set(artifacts.map(\.name))
-        XCTAssertEqual(names, Set(["output_a", "output_b", "output_c"]))
+        #expect(names == Set(["output_a", "output_b", "output_c"]))
     }
 
     // MARK: - Path Structure
 
-    func testPathStructure() throws {
+    @Test("Artifact path structure follows convention")
+    func pathStructure() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent(id: "my_agent")
         let stageExec = StageExecution(stageID: "s5", label: "Test")
@@ -153,36 +152,35 @@ final class ArtifactManagerTests: XCTestCase {
 
         let path = artifacts[0].filePath
         // Expected: {artifactRoot}/s5.2/my_agent/3/result.json
-        XCTAssertTrue(path.contains("s5.2"), "Path should contain stageID.iteration")
-        XCTAssertTrue(path.contains("my_agent"), "Path should contain agentID")
-        XCTAssertTrue(path.contains("/3/"), "Path should contain attemptNumber")
-        XCTAssertTrue(path.hasSuffix("result.json"))
+        #expect(path.contains("s5.2"), "Path should contain stageID.iteration")
+        #expect(path.contains("my_agent"), "Path should contain agentID")
+        #expect(path.contains("/3/"), "Path should contain attemptNumber")
+        #expect(path.hasSuffix("result.json"))
     }
 
     // MARK: - Path Security
 
-    func testRejectsPathOutsideBoundary() {
+    @Test("Rejects path outside workspace boundary")
+    func rejectsPathOutsideBoundary() {
         // Use a very deep traversal to escape the workspace root entirely
         let workspace = makeWorkspace()
 
         // Attempt to read from a path outside the workspace
-        XCTAssertThrowsError(
+        #expect {
             try ArtifactStorage.read(
                 filePath: "/etc/passwd",
                 workspaceRoot: workspace.workspaceRoot
             )
-        ) { error in
-            if case ArtifactStorageError.pathOutsideBoundary = error {
-                // Expected
-            } else {
-                XCTFail("Expected pathOutsideBoundary error, got: \(error)")
-            }
+        } throws: { error in
+            guard let storageError = error as? ArtifactStorageError else { return false }
+            if case .pathOutsideBoundary = storageError { return true }
+            return false
         }
 
         // Also test that write rejects absolute external paths via crafted stageID
         // The name ".." would try to traverse up, but after path normalization
         // the check catches it.
-        XCTAssertThrowsError(
+        #expect {
             try ArtifactStorage.write(
                 data: Data("malicious".utf8),
                 name: "test",
@@ -193,18 +191,17 @@ final class ArtifactManagerTests: XCTestCase {
                 artifactRoot: URL(fileURLWithPath: "/tmp/other"),
                 workspaceRoot: workspace.workspaceRoot
             )
-        ) { error in
-            if case ArtifactStorageError.pathOutsideBoundary = error {
-                // Expected — /tmp/other is outside workspace root
-            } else {
-                XCTFail("Expected pathOutsideBoundary error for external artifactRoot, got: \(error)")
-            }
+        } throws: { error in
+            guard let storageError = error as? ArtifactStorageError else { return false }
+            if case .pathOutsideBoundary = storageError { return true }
+            return false
         }
     }
 
     // MARK: - Read Artifact
 
-    func testReadArtifact() throws {
+    @Test("readArtifact returns persisted data")
+    func readArtifact() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
         let stageExec = StageExecution(stageID: "s1", label: "Test")
@@ -223,12 +220,13 @@ final class ArtifactManagerTests: XCTestCase {
         )
 
         let readData = try manager.readArtifact(artifacts[0], workspace: workspace)
-        XCTAssertEqual(readData, originalData)
+        #expect(readData == originalData)
     }
 
     // MARK: - Query Artifacts
 
-    func testQueryArtifactsByRunID() throws {
+    @Test("Query artifacts by run ID")
+    func queryArtifactsByRunID() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
         let stageExec = StageExecution(stageID: "s1", label: "Test")
@@ -246,10 +244,11 @@ final class ArtifactManagerTests: XCTestCase {
         )
 
         let found = try manager.artifacts(forRunID: workspace.runID)
-        XCTAssertEqual(found.count, 2)
+        #expect(found.count == 2)
     }
 
-    func testQueryArtifactsByStage() throws {
+    @Test("Query artifacts by stage")
+    func queryArtifactsByStage() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
 
@@ -278,17 +277,18 @@ final class ArtifactManagerTests: XCTestCase {
         )
 
         let s1Artifacts = try manager.artifacts(forRunID: workspace.runID, stageID: "s1")
-        XCTAssertEqual(s1Artifacts.count, 1)
-        XCTAssertEqual(s1Artifacts[0].name, "a")
+        #expect(s1Artifacts.count == 1)
+        #expect(s1Artifacts[0].name == "a")
 
         let s2Artifacts = try manager.artifacts(forRunID: workspace.runID, stageID: "s2")
-        XCTAssertEqual(s2Artifacts.count, 1)
-        XCTAssertEqual(s2Artifacts[0].name, "b")
+        #expect(s2Artifacts.count == 1)
+        #expect(s2Artifacts[0].name == "b")
     }
 
     // MARK: - Produced Artifact Names
 
-    func testProducedArtifactNames() throws {
+    @Test("Produced artifact names returns correct set")
+    func producedArtifactNames() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
         let stageExec = StageExecution(stageID: "s1", label: "Test")
@@ -302,12 +302,13 @@ final class ArtifactManagerTests: XCTestCase {
         )
 
         let names = try manager.producedArtifactNames(forRunID: workspace.runID)
-        XCTAssertEqual(names, Set(["proposal_current", "idea_brief"]))
+        #expect(names == Set(["proposal_current", "idea_brief"]))
     }
 
     // MARK: - SHA256 Checksum
 
-    func testChecksumConsistency() throws {
+    @Test("Checksum consistency across writes of same data")
+    func checksumConsistency() throws {
         let workspace = makeWorkspace()
         let agent = makeAgent()
         let stageExec = StageExecution(stageID: "s1", label: "Test")
@@ -321,8 +322,8 @@ final class ArtifactManagerTests: XCTestCase {
             workspace: workspace, stageID: "s1", iteration: 1, attemptNumber: 1
         )
 
-        XCTAssertNotNil(artifacts[0].checksumSHA256)
-        XCTAssertFalse(artifacts[0].checksumSHA256!.isEmpty)
+        #expect(artifacts[0].checksumSHA256 != nil)
+        #expect(!artifacts[0].checksumSHA256!.isEmpty)
 
         // Write same data again with different location
         let workspace2 = RunWorkspace(
@@ -342,6 +343,6 @@ final class ArtifactManagerTests: XCTestCase {
         )
 
         // Same data should produce same checksum
-        XCTAssertEqual(artifacts[0].checksumSHA256, artifacts2[0].checksumSHA256)
+        #expect(artifacts[0].checksumSHA256 == artifacts2[0].checksumSHA256)
     }
 }

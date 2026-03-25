@@ -1,4 +1,5 @@
-import XCTest
+import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
@@ -7,12 +8,13 @@ import SwiftData
 /// Verifies that each run's workspace is isolated, artifact paths follow the canonical
 /// convention, and cross-run boundary violations are rejected.
 @MainActor
-final class WorkspaceIsolationTests: XCTestCase {
-    var container: ModelContainer!
-    var context: ModelContext!
-    var tempDir: URL!
+@Suite("WorkspaceIsolation", .serialized)
+struct WorkspaceIsolationTests {
+    let container: ModelContainer
+    let context: ModelContext
+    let tempDir: URL
 
-    override func setUp() async throws {
+    init() throws {
         let schema = Schema([
             Idea.self, Run.self, StageExecution.self,
             AgentExecution.self, Approval.self, Artifact.self
@@ -24,12 +26,6 @@ final class WorkspaceIsolationTests: XCTestCase {
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("WsIsoTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    }
-
-    override func tearDown() async throws {
-        if let dir = tempDir, FileManager.default.fileExists(atPath: dir.path) {
-            try? FileManager.default.removeItem(at: dir)
-        }
     }
 
     // MARK: - Helpers
@@ -67,45 +63,49 @@ final class WorkspaceIsolationTests: XCTestCase {
     // MARK: - Workspace Provisioning
 
     /// RunWorkspace directories are created at run time and match ARCH-025 layout.
-    func testWorkspaceProvisionedCorrectly() throws {
+    @Test("Workspace provisioned correctly")
+    func workspaceProvisionedCorrectly() throws {
         let runID = UUID()
 
         // Use reflection-like approach: provision workspace creates correct structure
         let workspace = makeWorkspace(runID: runID)
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.workspaceRoot.path),
-                       "Workspace root must exist on disk")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.artifactRoot.path),
-                       "Artifact root must exist on disk")
-        XCTAssertTrue(workspace.artifactRoot.path.hasPrefix(workspace.workspaceRoot.path),
-                       "Artifact root must be inside workspace root")
+        #expect(FileManager.default.fileExists(atPath: workspace.workspaceRoot.path),
+                "Workspace root must exist on disk")
+        #expect(FileManager.default.fileExists(atPath: workspace.artifactRoot.path),
+                "Artifact root must exist on disk")
+        #expect(workspace.artifactRoot.path.hasPrefix(workspace.workspaceRoot.path),
+                "Artifact root must be inside workspace root")
     }
 
     /// Two runs get distinct workspace roots (ARCH-025).
-    func testTwoRunsGetDistinctWorkspaces() {
+    @Test("Two runs get distinct workspaces")
+    func twoRunsGetDistinctWorkspaces() {
         let ws1 = makeWorkspace(runID: UUID())
         let ws2 = makeWorkspace(runID: UUID())
 
-        XCTAssertNotEqual(ws1.workspaceRoot.path, ws2.workspaceRoot.path,
-                           "Two runs must get distinct workspace roots")
-        XCTAssertNotEqual(ws1.artifactRoot.path, ws2.artifactRoot.path,
-                           "Two runs must get distinct artifact roots")
+        #expect(ws1.workspaceRoot.path != ws2.workspaceRoot.path,
+                "Two runs must get distinct workspace roots")
+        #expect(ws1.artifactRoot.path != ws2.artifactRoot.path,
+                "Two runs must get distinct artifact roots")
     }
 
     /// ArtifactRoot has no extra runID nesting (ARCH-026).
-    func testArtifactRootNoExtraRunIDNesting() {
+    @Test("Artifact root no extra runID nesting")
+    func artifactRootNoExtraRunIDNesting() {
         let workspace = makeWorkspace()
 
         // ARCH-026: artifactRoot = {workspaceRoot}/artifacts/ — no extra runID folder
         let expectedSuffix = "/artifacts"
-        XCTAssertTrue(workspace.artifactRoot.path.hasSuffix(expectedSuffix),
-                       "ArtifactRoot should end with /artifacts, not runID/artifacts")
+        #expect(workspace.artifactRoot.path.hasSuffix(expectedSuffix),
+                "ArtifactRoot should end with /artifacts, not runID/artifacts")
     }
 
     // MARK: - Artifact Path Isolation
 
     /// Artifacts written in one run cannot be read via another run's workspace.
-    func testCrossRunArtifactReadBlocked() throws {
+    @Test("Cross-run artifact read blocked")
+    func crossRunArtifactReadBlocked() throws {
         // Create two workspaces
         let ws1 = makeWorkspace(runID: UUID())
         let ws2 = makeWorkspace(runID: UUID())
@@ -129,40 +129,36 @@ final class WorkspaceIsolationTests: XCTestCase {
             .appendingPathComponent("stage_1.1/agent_1/1/test_output")
             .path
 
-        XCTAssertThrowsError(
+        #expect {
             try ArtifactStorage.read(filePath: ws1ArtifactPath, workspaceRoot: ws2.workspaceRoot)
-        ) { error in
+        } throws: { error in
             // Should be a path boundary violation
             let desc = "\(error)".lowercased()
-            XCTAssertTrue(
-                desc.contains("boundary") || desc.contains("outside"),
-                "Should reject cross-workspace read: \(error)"
-            )
+            return desc.contains("boundary") || desc.contains("outside")
         }
     }
 
     /// Path traversal attacks are rejected (../../etc/passwd).
-    func testPathTraversalAttackBlocked() {
+    @Test("Path traversal attack blocked")
+    func pathTraversalAttackBlocked() {
         let workspace = makeWorkspace()
 
-        XCTAssertThrowsError(
+        #expect {
             try ArtifactStorage.read(
                 filePath: workspace.artifactRoot.path + "/../../etc/passwd",
                 workspaceRoot: workspace.workspaceRoot
             )
-        ) { error in
+        } throws: { error in
             let desc = "\(error)".lowercased()
-            XCTAssertTrue(
-                desc.contains("boundary") || desc.contains("outside") || desc.contains("traversal"),
-                "Should reject path traversal: \(error)"
-            )
+            return desc.contains("boundary") || desc.contains("outside") || desc.contains("traversal")
         }
     }
 
     // MARK: - Artifact Path Convention
 
     /// Artifact write path follows canonical convention: {stageID}.{iteration}/{agentID}/{attemptNumber}/{name}.
-    func testArtifactPathConvention() throws {
+    @Test("Artifact path convention")
+    func artifactPathConvention() throws {
         let workspace = makeWorkspace()
 
         let data = Data("canonical path test".utf8)
@@ -178,14 +174,15 @@ final class WorkspaceIsolationTests: XCTestCase {
         )
 
         // Path should contain the canonical components
-        XCTAssertTrue(result.filePath.contains("review_stage.2"), "Path should include stageID.iteration")
-        XCTAssertTrue(result.filePath.contains("security_reviewer"), "Path should include agentID")
-        XCTAssertTrue(result.filePath.contains("/3/"), "Path should include attempt number")
-        XCTAssertTrue(result.filePath.hasSuffix("report.json"), "Path should end with artifact name")
+        #expect(result.filePath.contains("review_stage.2"), "Path should include stageID.iteration")
+        #expect(result.filePath.contains("security_reviewer"), "Path should include agentID")
+        #expect(result.filePath.contains("/3/"), "Path should include attempt number")
+        #expect(result.filePath.hasSuffix("report.json"), "Path should end with artifact name")
     }
 
     /// Written artifacts produce valid SHA256 checksums.
-    func testArtifactChecksumProduced() throws {
+    @Test("Artifact checksum produced")
+    func artifactChecksumProduced() throws {
         let workspace = makeWorkspace()
 
         let data = Data("checksum test content".utf8)
@@ -200,12 +197,13 @@ final class WorkspaceIsolationTests: XCTestCase {
             workspaceRoot: workspace.workspaceRoot
         )
 
-        XCTAssertFalse(result.checksumSHA256.isEmpty, "SHA256 checksum must be computed")
-        XCTAssertEqual(result.checksumSHA256.count, 64, "SHA256 hex string should be 64 chars")
+        #expect(!result.checksumSHA256.isEmpty, "SHA256 checksum must be computed")
+        #expect(result.checksumSHA256.count == 64, "SHA256 hex string should be 64 chars")
     }
 
     /// Written artifacts record correct size.
-    func testArtifactSizeTracked() throws {
+    @Test("Artifact size tracked")
+    func artifactSizeTracked() throws {
         let workspace = makeWorkspace()
 
         let content = "size tracking test"
@@ -221,13 +219,14 @@ final class WorkspaceIsolationTests: XCTestCase {
             workspaceRoot: workspace.workspaceRoot
         )
 
-        XCTAssertEqual(result.sizeBytes, Int64(data.count), "Written size must match data count")
+        #expect(result.sizeBytes == Int64(data.count), "Written size must match data count")
     }
 
     // MARK: - Artifact Manager + Workspace
 
     /// ArtifactManager.persistOutputs correctly uses the workspace for path computation.
-    func testArtifactManagerUsesWorkspace() async throws {
+    @Test("ArtifactManager uses workspace")
+    func artifactManagerUsesWorkspace() async throws {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -262,19 +261,20 @@ final class WorkspaceIsolationTests: XCTestCase {
             attemptNumber: 1
         )
 
-        XCTAssertEqual(artifacts.count, 1)
+        #expect(artifacts.count == 1)
         let artifact = artifacts[0]
-        XCTAssertTrue(artifact.filePath.hasPrefix(workspace.workspaceRoot.path),
-                       "Artifact path must be within workspace: \(artifact.filePath)")
-        XCTAssertEqual(artifact.runID, workspace.runID)
+        #expect(artifact.filePath.hasPrefix(workspace.workspaceRoot.path),
+                "Artifact path must be within workspace: \(artifact.filePath)")
+        #expect(artifact.runID == workspace.runID)
 
         // Read it back to verify round-trip
         let readData = try manager.readArtifact(artifact, workspace: workspace)
-        XCTAssertEqual(String(data: readData, encoding: .utf8), "# Workspace Test")
+        #expect(String(data: readData, encoding: .utf8) == "# Workspace Test")
     }
 
     /// Two concurrent runs produce artifacts in their own workspaces without interference.
-    func testConcurrentRunWorkspaceIsolation() async throws {
+    @Test("Concurrent run workspace isolation")
+    func concurrentRunWorkspaceIsolation() async throws {
         let ws1 = makeWorkspace()
         let ws2 = makeWorkspace()
         let run1 = makeRun(workspace: ws1)
@@ -319,18 +319,18 @@ final class WorkspaceIsolationTests: XCTestCase {
         )
 
         // Both should succeed
-        XCTAssertEqual(artifacts1.count, 1)
-        XCTAssertEqual(artifacts2.count, 1)
+        #expect(artifacts1.count == 1)
+        #expect(artifacts2.count == 1)
 
         // Read back and verify they have distinct content
         let data1 = try manager.readArtifact(artifacts1[0], workspace: ws1)
         let data2 = try manager.readArtifact(artifacts2[0], workspace: ws2)
 
-        XCTAssertTrue(String(data: data1, encoding: .utf8)!.contains("\"run\":1"))
-        XCTAssertTrue(String(data: data2, encoding: .utf8)!.contains("\"run\":2"))
+        #expect(String(data: data1, encoding: .utf8)!.contains("\"run\":1"))
+        #expect(String(data: data2, encoding: .utf8)!.contains("\"run\":2"))
 
         // Verify paths are in distinct workspaces
-        XCTAssertTrue(artifacts1[0].filePath.contains(ws1.runID.uuidString))
-        XCTAssertTrue(artifacts2[0].filePath.contains(ws2.runID.uuidString))
+        #expect(artifacts1[0].filePath.contains(ws1.runID.uuidString))
+        #expect(artifacts2[0].filePath.contains(ws2.runID.uuidString))
     }
 }

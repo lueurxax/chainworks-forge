@@ -1,4 +1,5 @@
-import XCTest
+import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
@@ -196,7 +197,7 @@ func loadTestCanonicalCatalog() throws -> AgentCatalog {
 
 /// Loads the live proposal loop workflow fixture from the test bundle.
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
-    let url = try XCTUnwrap(
+    let url = try #require(
         Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
         "proposal-loop-live.yaml fixture must be bundled with tests"
     )
@@ -209,106 +210,97 @@ func loadTestCompactWorkflow() throws -> CompactWorkflowDefinition {
     return try YAMLParser.loadCompactWorkflow(from: url)
 }
 
-// MARK: - Custom Assertion Helpers
+// MARK: - Custom Assertion Helpers (removed — all callers migrated to Swift Testing variants below)
 
-/// Asserts that a Run has reached the `.completed` status.
-/// Provides a clear diagnostic message on failure.
-func assertRunCompleted(_ run: Run, file: StaticString = #filePath, line: UInt = #line) {
-    XCTAssertEqual(
-        run.status, .completed,
-        "Expected run to be .completed, but got .\(run.status.rawValue). "
-        + "Stage executions: \(run.stageExecutions.map { "\($0.stageID)=\($0.status.rawValue)" }.joined(separator: ", "))",
-        file: file, line: line
+// MARK: - Swift Testing Assertion Helpers
+
+/// Expects that a Run has reached the `.completed` status (Swift Testing variant).
+func expectRunCompleted(_ run: Run, sourceLocation: SourceLocation = #_sourceLocation) {
+    let stages = run.stageExecutions.map { "\($0.stageID)=\($0.status.rawValue)" }.joined(separator: ", ")
+    #expect(
+        run.status == .completed,
+        Comment(rawValue: "Expected .completed, got .\(run.status.rawValue). Stages: \(stages)"),
+        sourceLocation: sourceLocation
     )
 }
 
-/// Asserts that a Run has reached the `.blocked` status.
-func assertRunBlocked(_ run: Run, file: StaticString = #filePath, line: UInt = #line) {
-    XCTAssertEqual(
-        run.status, .blocked,
-        "Expected run to be .blocked, but got .\(run.status.rawValue)",
-        file: file, line: line
+/// Expects that a Run has reached the `.blocked` status (Swift Testing variant).
+func expectRunBlocked(_ run: Run, sourceLocation: SourceLocation = #_sourceLocation) {
+    #expect(
+        run.status == .blocked,
+        "Expected .blocked, got .\(run.status.rawValue)",
+        sourceLocation: sourceLocation
     )
 }
 
-/// Asserts that a Run is waiting for approval.
-func assertRunWaitingApproval(_ run: Run, file: StaticString = #filePath, line: UInt = #line) {
-    XCTAssertEqual(
-        run.status, .waitingApproval,
-        "Expected run to be .waitingApproval, but got .\(run.status.rawValue)",
-        file: file, line: line
+/// Expects that a Run is waiting for approval (Swift Testing variant).
+func expectRunWaitingApproval(_ run: Run, sourceLocation: SourceLocation = #_sourceLocation) {
+    #expect(
+        run.status == .waitingApproval,
+        "Expected .waitingApproval, got .\(run.status.rawValue)",
+        sourceLocation: sourceLocation
     )
 }
 
-/// Asserts that an artifact with the given name exists in the run's stage executions.
-func assertArtifactExists(
+/// Expects that an artifact with the given name exists in the run's stage executions (Swift Testing variant).
+func expectArtifactExists(
     _ name: String,
     in run: Run,
-    file: StaticString = #filePath,
-    line: UInt = #line
+    sourceLocation: SourceLocation = #_sourceLocation
 ) {
     let allArtifacts = run.stageExecutions
         .flatMap(\.agentExecutions)
         .flatMap(\.artifacts)
-    let found = allArtifacts.contains { $0.name == name }
-    XCTAssertTrue(
-        found,
-        "Expected artifact '\(name)' not found. Available: \(allArtifacts.map(\.name).joined(separator: ", "))",
-        file: file, line: line
+    #expect(
+        allArtifacts.contains { $0.name == name },
+        "Artifact '\(name)' not found. Available: \(allArtifacts.map(\.name).joined(separator: ", "))",
+        sourceLocation: sourceLocation
     )
 }
 
-/// Asserts that an artifact with the given name exists on disk and is non-empty.
-func assertArtifactNonEmpty(
+/// Expects that an artifact with the given name exists on disk and is non-empty (Swift Testing variant).
+func expectArtifactNonEmpty(
     _ name: String,
     in run: Run,
     workspace: RunWorkspace,
-    file: StaticString = #filePath,
-    line: UInt = #line
+    sourceLocation: SourceLocation = #_sourceLocation
 ) {
     let allArtifacts = run.stageExecutions
         .flatMap(\.agentExecutions)
         .flatMap(\.artifacts)
     guard let artifact = allArtifacts.first(where: { $0.name == name }) else {
-        XCTFail("Artifact '\(name)' not found in run", file: file, line: line)
+        Issue.record("Artifact '\(name)' not found in run", sourceLocation: sourceLocation)
         return
     }
-    XCTAssertTrue(
+    #expect(
         FileManager.default.fileExists(atPath: artifact.filePath),
-        "Artifact '\(name)' file does not exist at: \(artifact.filePath)",
-        file: file, line: line
+        "Artifact '\(name)' file missing: \(artifact.filePath)",
+        sourceLocation: sourceLocation
     )
-    XCTAssertGreaterThan(
-        artifact.sizeBytes ?? 0, 0,
+    #expect(
+        (artifact.sizeBytes ?? 0) > 0,
         "Artifact '\(name)' is empty (0 bytes)",
-        file: file, line: line
+        sourceLocation: sourceLocation
     )
 }
 
-// MARK: - Async Polling Helper
+// MARK: - Async Polling Helper (Swift Testing)
 
-/// Polls a condition with timeout, yielding between checks.
-/// Replaces fragile `Task.sleep` polling loops throughout the test suite.
-///
-/// Usage:
-/// ```
-/// try await pollUntil(timeout: 2.0) { run.status == .completed }
-/// ```
+/// Confirmation-based async polling for Swift Testing.
+/// Replaces `pollUntil` in migrated test files.
 @MainActor
-func pollUntil(
+func awaitCondition(
+    _ description: String = "condition met",
     timeout: TimeInterval = 3.0,
     interval: TimeInterval = 0.05,
-    file: StaticString = #filePath,
-    line: UInt = #line,
-    message: String = "Condition not met within timeout",
-    condition: @escaping () -> Bool
-) async throws {
+    condition: @escaping @MainActor () -> Bool
+) async {
     let deadline = Date().addingTimeInterval(timeout)
-    while !condition() {
+    while await !condition() {
         if Date() > deadline {
-            XCTFail(message, file: file, line: line)
+            Issue.record(Comment(rawValue: "\(description): timed out after \(timeout)s"))
             return
         }
-        try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
     }
 }

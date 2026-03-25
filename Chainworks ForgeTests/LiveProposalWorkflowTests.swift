@@ -1,4 +1,4 @@
-import XCTest
+import Testing
 import Foundation
 @testable import Chainworks_Forge
 
@@ -6,40 +6,34 @@ import Foundation
 
 /// Tests for the live proposal loop workflow compilation, agent resolution,
 /// and fan-out parallelism recording.
-final class LiveProposalWorkflowTests: XCTestCase {
+@MainActor
+@Suite("Live Proposal Workflow", .tags(.live))
+struct LiveProposalWorkflowTests {
 
     // MARK: - Helpers
 
     private func loadLiveWorkflowAndCatalog() throws -> (WorkflowDefinition, AgentCatalog) {
-        let bundle = Bundle(for: type(of: self))
-        let workflowURL = try XCTUnwrap(
-            bundle.url(forResource: "proposal-loop-live", withExtension: "yaml"),
-            "proposal-loop-live.yaml fixture must be bundled with tests"
-        )
-        let catalogURL = try XCTUnwrap(
-            bundle.url(forResource: "agents", withExtension: "yaml"),
-            "agents.yaml fixture must be bundled with tests"
-        )
-        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
-        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+        let workflow = try loadTestLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
         return (workflow, catalog)
     }
 
     // MARK: - Tests
 
     /// testLiveProposalWorkflowCompiles — Section 12.1
-    func testLiveProposalWorkflowCompiles() throws {
+    @Test("Live proposal workflow compiles with expected states")
+    func liveProposalWorkflowCompiles() throws {
         let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // Workflow ID should match
-        XCTAssertEqual(workflow.workflow.id, "proposal_loop_live")
-        XCTAssertEqual(workflow.workflow.name, "Proposal Loop (Live)")
+        #expect(workflow.workflow.id == "proposal_loop_live")
+        #expect(workflow.workflow.name == "Proposal Loop (Live)")
 
         // Should have 6 states
-        XCTAssertEqual(workflow.states.count, 6, "Live proposal workflow should have 6 states")
+        #expect(workflow.states.count == 6, "Live proposal workflow should have 6 states")
 
         // Should have an initial state
-        XCTAssertEqual(workflow.initialState, "state_1_idea_received")
+        #expect(workflow.initialState == "state_1_idea_received")
 
         // Validate state IDs
         let expectedStates = [
@@ -51,19 +45,20 @@ final class LiveProposalWorkflowTests: XCTestCase {
             "state_6_workflow_complete"
         ]
         for stateID in expectedStates {
-            XCTAssertTrue(workflow.states.keys.contains(stateID), "Missing state: \(stateID)")
+            #expect(workflow.states.keys.contains(stateID), "Missing state: \(stateID)")
         }
 
         // Start and end states
-        XCTAssertEqual(workflow.states["state_1_idea_received"]?.type, "start")
-        XCTAssertEqual(workflow.states["state_6_workflow_complete"]?.type, "end")
+        #expect(workflow.states["state_1_idea_received"]?.type == "start")
+        #expect(workflow.states["state_6_workflow_complete"]?.type == "end")
 
         // Approval gate
-        XCTAssertEqual(workflow.states["state_5_proposal_approval"]?.approval, "required")
+        #expect(workflow.states["state_5_proposal_approval"]?.approval == "required")
     }
 
     /// testLiveProposalWorkflowUsesExpectedAgents — Section 12.1
-    func testLiveProposalWorkflowUsesExpectedAgents() throws {
+    @Test("Live proposal workflow references expected agents")
+    func liveProposalWorkflowUsesExpectedAgents() throws {
         let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // Collect all agent IDs referenced in the workflow
@@ -92,65 +87,69 @@ final class LiveProposalWorkflowTests: XCTestCase {
         ]
 
         for agent in expectedAgents {
-            XCTAssertTrue(referencedAgents.contains(agent),
-                         "Workflow should reference agent: \(agent)")
+            #expect(referencedAgents.contains(agent),
+                    "Workflow should reference agent: \(agent)")
         }
     }
 
     /// testReviewFanoutParallelismIsRecordedCorrectly — Section 12.1
-    func testReviewFanoutParallelismIsRecordedCorrectly() throws {
+    @Test("Review fan-out parallelism is recorded correctly")
+    func reviewFanoutParallelismIsRecordedCorrectly() throws {
         let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // state_3_proposal_reviewed should have a parallel block with 4 reviewers
         guard let reviewState = workflow.states["state_3_proposal_reviewed"] else {
-            XCTFail("Missing state: state_3_proposal_reviewed")
+            Issue.record("Missing state: state_3_proposal_reviewed")
             return
         }
 
         let parallelTasks = reviewState.run?.parallel ?? []
-        XCTAssertEqual(parallelTasks.count, 4,
-                      "Review fan-out should have 4 parallel reviewer tasks")
+        #expect(parallelTasks.count == 4,
+                "Review fan-out should have 4 parallel reviewer tasks")
 
         let parallelAgents = Set(parallelTasks.map(\.agent))
-        XCTAssertTrue(parallelAgents.contains("proposal_reviewer_product_owner"))
-        XCTAssertTrue(parallelAgents.contains("proposal_reviewer_ux"))
-        XCTAssertTrue(parallelAgents.contains("proposal_reviewer_ui"))
-        XCTAssertTrue(parallelAgents.contains("proposal_reviewer_architect"))
+        #expect(parallelAgents.contains("proposal_reviewer_product_owner"))
+        #expect(parallelAgents.contains("proposal_reviewer_ux"))
+        #expect(parallelAgents.contains("proposal_reviewer_ui"))
+        #expect(parallelAgents.contains("proposal_reviewer_architect"))
 
         // Should also have a 'then' block with the lead_orchestrator aggregation
         let thenTasks = reviewState.run?.then ?? []
-        XCTAssertEqual(thenTasks.count, 1, "Should have one aggregation task after parallel")
-        XCTAssertEqual(thenTasks.first?.agent, "lead_orchestrator")
+        #expect(thenTasks.count == 1, "Should have one aggregation task after parallel")
+        #expect(thenTasks.first?.agent == "lead_orchestrator")
     }
 
     /// testLiveWorkflowHasLoopConfig
-    func testLiveWorkflowHasLoopConfig() throws {
+    @Test("Live workflow has loop configuration")
+    func liveWorkflowHasLoopConfig() throws {
         let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         // state_3 should have a loop config
         guard let reviewState = workflow.states["state_3_proposal_reviewed"] else {
-            XCTFail("Missing state: state_3_proposal_reviewed")
+            Issue.record("Missing state: state_3_proposal_reviewed")
             return
         }
 
-        XCTAssertNotNil(reviewState.loop, "Review state should have a loop config")
-        XCTAssertEqual(reviewState.loop?.counter, "proposal_revision_count")
-        XCTAssertEqual(reviewState.loop?.max, "vars.max_proposal_revision_cycles")
+        #expect(reviewState.loop != nil, "Review state should have a loop config")
+        #expect(reviewState.loop?.counter == "proposal_revision_count")
+        #expect(reviewState.loop?.max == "vars.max_proposal_revision_cycles")
     }
 
     /// testLiveWorkflowVariables
-    func testLiveWorkflowVariables() throws {
+    @Test("Live workflow has expected variables")
+    func liveWorkflowVariables() throws {
         let (workflow, _) = try loadLiveWorkflowAndCatalog()
 
         let variables = workflow.variables ?? [:]
-        XCTAssertNotNil(variables["max_proposal_revision_cycles"])
-        XCTAssertNotNil(variables["proposal_score_target"])
-        XCTAssertNotNil(variables["min_individual_proposal_score"])
+        #expect(variables["max_proposal_revision_cycles"] != nil)
+        #expect(variables["proposal_score_target"] != nil)
+        #expect(variables["min_individual_proposal_score"] != nil)
     }
 
     // MARK: - Receipt Builder Tests
 
-    func testReceiptBuilderProducesValidJSON() throws {
+    @Test("Receipt builder produces valid JSON")
+    func receiptBuilderProducesValidJSON() throws {
         let receipt = ExecutionReceiptBuilder.buildReceipt(
             agentID: "test_agent",
             sessionID: "session-123",
@@ -175,33 +174,34 @@ final class LiveProposalWorkflowTests: XCTestCase {
         )
 
         // Should produce receipt and transcript
-        XCTAssertTrue(receipt.keys.contains("test_agent_receipt.json"))
-        XCTAssertTrue(receipt.keys.contains("test_agent_transcript.md"))
+        #expect(receipt.keys.contains("test_agent_receipt.json"))
+        #expect(receipt.keys.contains("test_agent_transcript.md"))
 
         // Receipt JSON should be valid
         if let data = receipt["test_agent_receipt.json"] {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let decoded = try decoder.decode(ExecutionReceipt.self, from: data)
-            XCTAssertEqual(decoded.agentID, "test_agent")
-            XCTAssertEqual(decoded.sessionID, "session-123")
-            XCTAssertTrue(decoded.succeeded)
-            XCTAssertEqual(decoded.toolCallCount, 1)
-            XCTAssertEqual(decoded.eventCount, 2)
+            #expect(decoded.agentID == "test_agent")
+            #expect(decoded.sessionID == "session-123")
+            #expect(decoded.succeeded)
+            #expect(decoded.toolCallCount == 1)
+            #expect(decoded.eventCount == 2)
         }
 
         // Transcript should be non-empty markdown
         if let data = receipt["test_agent_transcript.md"],
            let text = String(data: data, encoding: .utf8) {
-            XCTAssertTrue(text.contains("# Execution Transcript"))
-            XCTAssertTrue(text.contains("test_agent"))
-            XCTAssertTrue(text.contains("session-123"))
+            #expect(text.contains("# Execution Transcript"))
+            #expect(text.contains("test_agent"))
+            #expect(text.contains("session-123"))
         }
     }
 
     // MARK: - Event Bridge Tests
 
-    func testEventBridgeProcessesStream() async throws {
+    @Test("Event bridge processes SSE stream correctly")
+    func eventBridgeProcessesStream() async throws {
         let bridge = ExecutionEventBridge()
 
         let stream = AsyncThrowingStream<GooseStreamEvent, Error> { continuation in
@@ -220,11 +220,11 @@ final class LiveProposalWorkflowTests: XCTestCase {
             events.append(event)
         }
 
-        XCTAssertTrue(result.succeeded)
-        XCTAssertEqual(result.accumulatedText, "Hello World")
-        XCTAssertEqual(result.toolCalls.count, 1)
-        XCTAssertEqual(result.toolCalls.first?.toolName, "test_tool")
-        XCTAssertEqual(result.finalContent, "Done")
-        XCTAssertTrue(events.count >= 6)
+        #expect(result.succeeded)
+        #expect(result.accumulatedText == "Hello World")
+        #expect(result.toolCalls.count == 1)
+        #expect(result.toolCalls.first?.toolName == "test_tool")
+        #expect(result.finalContent == "Done")
+        #expect(events.count >= 6)
     }
 }

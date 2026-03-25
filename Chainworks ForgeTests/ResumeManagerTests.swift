@@ -1,14 +1,16 @@
-import XCTest
+import Testing
+import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
 @MainActor
-final class ResumeManagerTests: XCTestCase {
-    var container: ModelContainer!
-    var context: ModelContext!
-    var compiler: RunPlanCompiler!
+@Suite("ResumeManager", .serialized, .tags(.fast))
+struct ResumeManagerTests {
+    let container: ModelContainer
+    let context: ModelContext
+    let compiler: RunPlanCompiler
 
-    override func setUp() async throws {
+    init() throws {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
         let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
@@ -19,13 +21,11 @@ final class ResumeManagerTests: XCTestCase {
     // MARK: - Helpers
 
     private func loadCanonicalWorkflow() throws -> WorkflowDefinition {
-        let url = Bundle(for: type(of: self)).url(forResource: "workflow", withExtension: "yaml")!
-        return try YAMLParser.loadWorkflow(from: url)
+        try loadTestCanonicalWorkflow()
     }
 
     private func loadCanonicalCatalog() throws -> AgentCatalog {
-        let url = Bundle(for: type(of: self)).url(forResource: "agents", withExtension: "yaml")!
-        return try YAMLParser.loadAgentCatalog(from: url)
+        try loadTestCanonicalCatalog()
     }
 
     /// Create a run directly in SwiftData with proper snapshot data, avoiding filesystem ops.
@@ -73,7 +73,8 @@ final class ResumeManagerTests: XCTestCase {
 
     // MARK: - Find Interrupted Runs
 
-    func testFindInterruptedRuns() async throws {
+    @Test("Find interrupted runs")
+    func findInterruptedRuns() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
         try context.save()
@@ -81,11 +82,12 @@ final class ResumeManagerTests: XCTestCase {
         let manager = ResumeManager(modelContext: context)
         let interrupted = try manager.findInterruptedRuns()
 
-        XCTAssertEqual(interrupted.count, 1)
-        XCTAssertEqual(interrupted[0].id, run.id)
+        #expect(interrupted.count == 1)
+        #expect(interrupted[0].id == run.id)
     }
 
-    func testFindInterruptedRunsWaitingApproval() async throws {
+    @Test("Find interrupted runs waiting approval")
+    func findInterruptedRunsWaitingApproval() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .waitingApproval
         try context.save()
@@ -93,10 +95,11 @@ final class ResumeManagerTests: XCTestCase {
         let manager = ResumeManager(modelContext: context)
         let interrupted = try manager.findInterruptedRuns()
 
-        XCTAssertEqual(interrupted.count, 1)
+        #expect(interrupted.count == 1)
     }
 
-    func testCompletedRunsNotFound() async throws {
+    @Test("Completed runs not found")
+    func completedRunsNotFound() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .completed
         try context.save()
@@ -104,10 +107,11 @@ final class ResumeManagerTests: XCTestCase {
         let manager = ResumeManager(modelContext: context)
         let interrupted = try manager.findInterruptedRuns()
 
-        XCTAssertTrue(interrupted.isEmpty, "Completed runs should not be found as interrupted")
+        #expect(interrupted.isEmpty, "Completed runs should not be found as interrupted")
     }
 
-    func testCancelledRunsNotFound() async throws {
+    @Test("Cancelled runs not found")
+    func cancelledRunsNotFound() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .cancelled
         try context.save()
@@ -115,12 +119,13 @@ final class ResumeManagerTests: XCTestCase {
         let manager = ResumeManager(modelContext: context)
         let interrupted = try manager.findInterruptedRuns()
 
-        XCTAssertTrue(interrupted.isEmpty, "Cancelled runs should not be found as interrupted")
+        #expect(interrupted.isEmpty, "Cancelled runs should not be found as interrupted")
     }
 
     // MARK: - Classification
 
-    func testClassifyResumeableRun() async throws {
+    @Test("Classify resumeable run")
+    func classifyResumeableRun() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
         try context.save()
@@ -128,35 +133,37 @@ final class ResumeManagerTests: XCTestCase {
         let manager = ResumeManager(modelContext: context)
         let actions = try manager.classifyInterruptedRuns(compiler: compiler)
 
-        XCTAssertEqual(actions.count, 1)
+        #expect(actions.count == 1)
 
         switch actions[0] {
         case .resume(let resumeRun, let resumePlan, let resumeWorkspace):
-            XCTAssertEqual(resumeRun.id, run.id)
-            XCTAssertEqual(resumePlan.workflowID, "proposal_to_release")
-            XCTAssertEqual(resumeWorkspace.runID, run.id)
+            #expect(resumeRun.id == run.id)
+            #expect(resumePlan.workflowID == "proposal_to_release")
+            #expect(resumeWorkspace.runID == run.id)
         default:
-            XCTFail("Expected .resume action, got \(actions[0])")
+            Issue.record("Expected .resume action, got \(actions[0])")
         }
     }
 
-    func testClassifyCompilerVersionMismatch() async throws {
+    @Test("Classify compiler version mismatch")
+    func classifyCompilerVersionMismatch() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
         try context.save()
 
         let manager = ResumeManager(modelContext: context)
         let actions = try manager.classifyInterruptedRuns(compiler: compiler)
-        XCTAssertEqual(actions.count, 1)
+        #expect(actions.count == 1)
 
         if case .resume(_, let plan, _) = actions[0] {
-            XCTAssertEqual(plan.planCompilerVersion, RunPlan.currentCompilerVersion)
+            #expect(plan.planCompilerVersion == RunPlan.currentCompilerVersion)
         }
     }
 
     // MARK: - Side-Effect Detection
 
-    func testSideEffectStageDetected() async throws {
+    @Test("Side-effect stage detected")
+    func sideEffectStageDetected() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
 
@@ -168,9 +175,9 @@ final class ResumeManagerTests: XCTestCase {
         let manager = ResumeManager(modelContext: context)
         let actions = try manager.classifyInterruptedRuns(compiler: compiler)
 
-        XCTAssertEqual(actions.count, 1)
+        #expect(actions.count == 1)
         if case .needsDecision(_, let reason) = actions[0] {
-            XCTAssertTrue(reason.contains("side-effect"), "Should mention side-effect: \(reason)")
+            #expect(reason.contains("side-effect"), "Should mention side-effect: \(reason)")
         } else if case .resume = actions[0] {
             // Also acceptable if no drift detected — the side-effect check is for running stages
         }
@@ -178,37 +185,40 @@ final class ResumeManagerTests: XCTestCase {
 
     // MARK: - ExecutionService
 
-    func testExecutionServiceStartRun() async throws {
+    @Test("ExecutionService start run")
+    func executionServiceStartRun() async throws {
         let (run, plan, workspace) = try makeRunFromPlan()
 
         let executor = SimulatedAgentExecutor()
         let service = ExecutionService(modelContext: context, executor: executor)
 
-        XCTAssertFalse(service.hasActiveRuns)
+        #expect(!service.hasActiveRuns)
 
         service.startRun(run: run, plan: plan, workspace: workspace)
 
-        XCTAssertTrue(service.hasActiveRuns)
-        XCTAssertNotNil(service.orchestrator(for: run.id))
+        #expect(service.hasActiveRuns)
+        #expect(service.orchestrator(for: run.id) != nil)
 
         service.cancelRun(runID: run.id)
     }
 
-    func testExecutionServiceCancelRun() async throws {
+    @Test("ExecutionService cancel run")
+    func executionServiceCancelRun() async throws {
         let (run, plan, workspace) = try makeRunFromPlan()
 
         let executor = SimulatedAgentExecutor(simulatedDelay: 5.0)
         let service = ExecutionService(modelContext: context, executor: executor)
 
         service.startRun(run: run, plan: plan, workspace: workspace)
-        XCTAssertTrue(service.hasActiveRuns)
+        #expect(service.hasActiveRuns)
 
         service.cancelRun(runID: run.id)
-        XCTAssertFalse(service.hasActiveRuns)
-        XCTAssertEqual(run.status, .cancelled)
+        #expect(!service.hasActiveRuns)
+        #expect(run.status == .cancelled)
     }
 
-    func testExecutionServiceDuplicateStartPrevented() async throws {
+    @Test("ExecutionService duplicate start prevented")
+    func executionServiceDuplicateStartPrevented() async throws {
         let (run, plan, workspace) = try makeRunFromPlan()
 
         let executor = SimulatedAgentExecutor(simulatedDelay: 5.0)
@@ -217,7 +227,7 @@ final class ResumeManagerTests: XCTestCase {
         service.startRun(run: run, plan: plan, workspace: workspace)
         service.startRun(run: run, plan: plan, workspace: workspace) // No-op
 
-        XCTAssertEqual(service.activeOrchestrators.count, 1)
+        #expect(service.activeOrchestrators.count == 1)
 
         service.cancelRun(runID: run.id)
     }
@@ -231,14 +241,11 @@ final class ResumeManagerTests: XCTestCase {
     }
 
     private func loadLiveWorkflow() throws -> WorkflowDefinition {
-        let url = try XCTUnwrap(
-            Bundle(for: type(of: self)).url(forResource: "proposal-loop-live", withExtension: "yaml"),
-            "proposal-loop-live.yaml fixture must be bundled with tests"
-        )
-        return try YAMLParser.loadWorkflow(from: url)
+        try loadTestLiveWorkflow()
     }
 
-    func testExecutionServiceUsesLiveExecutorForLiveWorkflow() async throws {
+    @Test("ExecutionService uses live executor for live workflow")
+    func executionServiceUsesLiveExecutorForLiveWorkflow() async throws {
         let workflow = try loadLiveWorkflow()
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -289,13 +296,14 @@ final class ResumeManagerTests: XCTestCase {
         service.startRun(run: run, plan: plan, workspace: workspace)
 
         guard let orchestrator = service.orchestrator(for: run.id) else {
-            XCTFail("Expected live orchestrator to be created")
+            Issue.record("Expected live orchestrator to be created")
             return
         }
-        XCTAssertTrue(orchestrator.executor is GooseAgentExecutor)
+        #expect(orchestrator.executor is GooseAgentExecutor)
     }
 
-    func testExecutionServiceBlocksLiveWorkflowWithoutRuntimeConfig() async throws {
+    @Test("ExecutionService blocks live workflow without runtime config")
+    func executionServiceBlocksLiveWorkflowWithoutRuntimeConfig() async throws {
         let workflow = try loadLiveWorkflow()
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -333,12 +341,13 @@ final class ResumeManagerTests: XCTestCase {
 
         service.startRun(run: run, plan: plan, workspace: workspace)
 
-        XCTAssertNil(service.orchestrator(for: run.id))
-        XCTAssertEqual(run.status, .blocked)
-        XCTAssertTrue(run.driftDetails?.contains("Live runtime is not configured") == true)
+        #expect(service.orchestrator(for: run.id) == nil)
+        #expect(run.status == .blocked)
+        #expect(run.driftDetails?.contains("Live runtime is not configured") == true)
     }
 
-    func testExecutionServiceResumeWaitingApprovalRestoresPendingApprovalWithoutReexecutingStage() async throws {
+    @Test("ExecutionService resume waiting approval restores pending approval without re-executing stage")
+    func executionServiceResumeWaitingApprovalRestoresPendingApprovalWithoutReexecutingStage() async throws {
         let workflow = try loadLiveWorkflow()
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -404,15 +413,15 @@ final class ResumeManagerTests: XCTestCase {
 
         service.resumeInterruptedRuns(compiler: compiler)
 
-        // Wait for approval restoration using pollUntil instead of manual deadline loop
-        try await pollUntil(timeout: 3.0, message: "Waiting approval should be restored") {
+        // Wait for approval restoration using awaitCondition instead of pollUntil
+        await awaitCondition("Waiting approval should be restored", timeout: 3.0) {
             service.pendingApprovalCount > 0
         }
 
-        XCTAssertEqual(service.pendingApprovalCount, 1, "Waiting approval should be restored into the app shell")
-        XCTAssertEqual(executor.executedTasks.count, 0, "Approval restore must not re-execute the paused stage")
-        XCTAssertEqual(run.status, .waitingApproval)
-        XCTAssertEqual(run.stageExecutions.count, 1, "Approval restore must not duplicate the waiting stage")
-        XCTAssertNotNil(service.orchestrator(for: run.id), "Resumed live run should still be attached to an orchestrator")
+        #expect(service.pendingApprovalCount == 1, "Waiting approval should be restored into the app shell")
+        #expect(executor.executedTasks.count == 0, "Approval restore must not re-execute the paused stage")
+        #expect(run.status == .waitingApproval)
+        #expect(run.stageExecutions.count == 1, "Approval restore must not duplicate the waiting stage")
+        #expect(service.orchestrator(for: run.id) != nil, "Resumed live run should still be attached to an orchestrator")
     }
 }
