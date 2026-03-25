@@ -111,7 +111,7 @@ Command:
 
 ### `proposal-006`
 
-Proposal-specific gate for provider/settings/readiness work.
+Provider-platform gate for settings/diagnostics/readiness work.
 
 Scope:
 
@@ -122,7 +122,7 @@ Scope:
 
 Use when:
 
-- changing Proposal 006 implementation or sign-off evidence
+- changing provider-platform implementation or sign-off evidence
 
 Command:
 
@@ -165,7 +165,7 @@ Command:
 ./scripts/test-gate.sh ui-smoke
 ```
 
-### Proposal 006 work
+### Provider-platform work
 
 ```bash
 ./scripts/test-gate.sh proposal-006

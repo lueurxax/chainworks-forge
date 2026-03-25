@@ -5,7 +5,7 @@
 | Date | 2026-03-23 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposal 001 (foundation, now stabilized as documentation), Proposal 002 (workflow execution engine), Proposal 004 (live provider proposal slice), Proposal 005 (operator experience), Proposal 006 (provider expansion, settings, diagnostics, pilot readiness) |
+| Depends on | Proposal 001 (foundation, now stabilized as documentation), Proposal 002 (workflow execution engine), [live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [operator-experience.md](../reference/operator-experience.md), [provider-platform.md](../reference/provider-platform.md) |
 | Adjacent work | Proposal 003 (Forge Steward) remains valuable but is **not** on the critical path for first end-to-end dogfooding |
 | Goal | Complete the first real repo-backed MVP path: idea → proposal → implementation → implementation review → manual release → durable receipts, with enough safety and evidence to dogfood the product on a real repository without improvising the orchestration by hand. |
 
@@ -27,14 +27,14 @@ Proposal 004 then proved the first **live** slice, but it was intentionally narr
 - real approval,
 - but only for the **proposal loop**.
 
-Proposal 005 turned the app into something calmer to operate:
+The operator-experience baseline turned the app into something calmer to operate:
 - reports,
 - recovery flows,
 - comparison,
 - notifications,
 - better artifact ergonomics.
 
-Proposal 006 made the provider layer viable in practice:
+The provider-platform baseline made the provider layer viable in practice:
 - multiple provider families,
 - settings and secrets,
 - preflight diagnostics,
@@ -62,23 +62,23 @@ Proposal 007 closes that gap.
 
 ### Important framing
 
-Proposal 007 does **not** change Proposals 005 or 006.
+Proposal 007 does **not** replace the operator or provider-platform baselines.
 It consumes them as-is.
 
 That means:
-- operator report/recovery/comparison surfaces from Proposal 005 stay valid,
-- provider/platform/settings/diagnostics surfaces from Proposal 006 stay valid,
+- operator report/recovery/comparison surfaces from [operator-experience.md](../reference/operator-experience.md) stay valid,
+- provider/platform/settings/diagnostics surfaces from [provider-platform.md](../reference/provider-platform.md) stay valid,
 - Proposal 007 is about **using those surfaces to complete the first full delivery path**, not replacing them.
 
-### 1.1 Explicit handoff from Proposal 006
+### 1.1 Explicit handoff from the provider-platform baseline
 
-Nothing provider/platform-specific was removed from Proposal 006.
-But Proposal 006 deliberately stops at provider readiness for the current control-plane baseline.
+Nothing provider/platform-specific was removed from the provider-platform baseline.
+But that baseline deliberately stops at provider readiness for the current control-plane slice.
 Any capability that becomes repo-backed, writable, release-aware, or delivery-specific is owned here in Proposal 007.
 
 That handoff includes:
-- repo-backed start presets built on top of Proposal 006 provider/settings resolution,
-- delivery-specific preflight that extends Proposal 006 with repo identity, branch, worktree, git auth, and release-target checks,
+- repo-backed start presets built on top of provider/settings resolution,
+- delivery-specific preflight that extends the provider-platform baseline with repo identity, branch, worktree, git auth, and release-target checks,
 - repository profile and target-repository selection for dogfood runs,
 - writable worktree provisioning and recovery semantics,
 - release-target configuration and release-gate context,
@@ -86,7 +86,7 @@ That handoff includes:
 
 Rule of thumb:
 
-> If a feature can be completed without touching a real repository or release target, it belongs in Proposal 006.
+> If a feature can be completed without touching a real repository or release target, it belongs in the provider-platform baseline.
 > If it requires a writable repo, a dedicated worktree, commit/push, archive/upload, or delivery-specific recovery, it belongs in Proposal 007.
 
 ---
@@ -186,7 +186,7 @@ Two tightly scoped layers.
 
 5. A dogfooding-ready workflow preset and evidence export.
 
-6. Repo-backed extensions of Proposal 006 surfaces, specifically:
+6. Repo-backed extensions of the provider-platform surfaces, specifically:
    - delivery preflight in addition to provider preflight,
    - repo/profile selection for full runs,
    - release-target selection and release-context summaries,
@@ -280,7 +280,7 @@ SwiftUI App
          -> GitReleaseService
          -> ConnectPublishService
       -> ArtifactManager / ArtifactStorage
-      -> Approval + Recovery + Reports (from Proposal 005)
+      -> Approval + Recovery + Reports (from the operator baseline)
 ```
 
 ### 6.1 Control plane stays in the app
@@ -324,7 +324,7 @@ That makes the most dangerous part of the workflow:
 
 Proposal 007 needs one explicit pre-run source of truth for repo-backed delivery.
 
-Proposal 006 `AppConfiguration` can provide defaults and remembered paths, but it is **not** the authoritative per-run delivery contract.
+The provider-platform `AppConfiguration` can provide defaults and remembered paths, but it is **not** the authoritative per-run delivery contract.
 The authoritative contract is a frozen `DeliveryConfiguration` captured before the run starts.
 
 Recommended shape:
@@ -435,7 +435,7 @@ Recommended additions to `AgentExecution`:
 // Added to AgentExecution
 var repoRevisionBefore: String?
 var repoRevisionAfter: String?
-var consumedArtifactIDsJSON: Data?   // if not already added in Proposal 005 implementation
+var consumedArtifactIDsJSON: Data?   // if not already added in the operator baseline implementation
 ```
 
 ### 7.4 Provisioning rules
@@ -689,12 +689,12 @@ When it does:
 - receipts remain persisted,
 - run becomes `blocked`,
 - operator sees exactly which sub-step succeeded,
-- recovery happens through the operator surfaces defined in Proposal 005,
+- recovery happens through the operator surfaces defined in [operator-experience.md](../reference/operator-experience.md),
 - the system does **not** invent a hidden rollback.
 
 ### Recovery rule
 
-Proposal 005 already set the tone:
+The operator baseline already set the tone:
 side-effect retries should re-enter through an approval boundary or a cloned run, not through a silent direct rerun.
 
 Proposal 007 respects that.
@@ -713,9 +713,9 @@ enum ReleaseMode: String, Codable {
 
 Production is intentionally excluded from the initial dogfood slice.
 
-## 9.6 Delivery preflight extends Proposal 006
+## 9.6 Delivery preflight extends the provider-platform baseline
 
-Proposal 006 owns provider/platform diagnostics.
+The provider-platform baseline owns provider/platform diagnostics.
 Proposal 007 must add the missing delivery checks before a repo-backed run can cross into implementation or release.
 Those checks validate the mutable `DeliveryConfiguration` draft and persist the accepted snapshot onto the run before execution proceeds.
 
@@ -727,15 +727,15 @@ At minimum, delivery preflight must verify:
 - selected release target is valid for the chosen `ReleaseMode`,
 - no repo-safety contract violation exists between the run and the chosen repository.
 
-This is intentionally an extension of Proposal 006, not a replacement for it:
-- provider health remains Proposal 006 territory,
+This is intentionally an extension of that baseline, not a replacement for it:
+- provider health remains provider-platform territory,
 - repo/release readiness becomes Proposal 007 territory.
 
 ---
 
 ## 10. UI surfaces
 
-Proposal 005 already added the operator spine.
+The operator baseline already added the operator spine.
 Proposal 007 only adds the extra surfaces needed for the repo-backed slice.
 
 ## 10.1 Dogfood Start Run preset
@@ -750,11 +750,11 @@ Required inputs:
 - target branch
 - release target
 - release mode: sandbox or staging
-- provider binding summary (already available from Proposal 006)
+- provider binding summary (already available from the provider-platform baseline)
 - preflight summary
 
-This surface is the point where Proposal 006 hands off to Proposal 007 in the UI:
-- provider settings and provider diagnostics come from Proposal 006,
+This surface is the point where the provider-platform baseline hands off to Proposal 007 in the UI:
+- provider settings and provider diagnostics come from the provider-platform baseline,
 - repo target, release target, and delivery safety context are added here by Proposal 007.
 - the editable form is a `DeliveryConfiguration` draft, and the started run stores the frozen validated snapshot.
 
@@ -809,7 +809,7 @@ Quick actions:
 
 ## 10.4 Worktree / diff affordances
 
-Proposal 005’s Artifact Inspector V2 already covers artifact viewing.
+The operator baseline already covers artifact viewing through Artifact Inspector V2.
 Proposal 007 should simply add the repo-backed shortcuts:
 - open worktree in Finder
 - reveal diff summary
@@ -907,7 +907,7 @@ Every full dogfood run should be exportable as one pack containing:
 - diff summary
 - git push receipt
 - connect upload receipt
-- support bundle from Proposal 006
+- support bundle from the provider-platform baseline
 - screenshot checklist
 
 ### Suggested required screenshots
@@ -1020,8 +1020,8 @@ Required review evidence:
 - [ ] Start Run, delivery preflight, run creation, and resume all use the same frozen `DeliveryConfiguration`
 - [ ] Run Progress view shows worktree-aware implementation progress
 - [ ] Release Gate View presents enough context for an informed approval
-- [ ] Existing report/recovery/comparison surfaces from Proposal 005 work for repo-backed runs
-- [ ] Provider diagnostics/preflight from Proposal 006 apply cleanly to the full workflow
+- [ ] Existing report/recovery/comparison surfaces from the operator baseline work for repo-backed runs
+- [ ] Provider diagnostics/preflight from the provider-platform baseline apply cleanly to the full workflow
 
 ### Dogfooding
 - [ ] A single engineer can complete a full happy-path run on a sample repo from inside the app
@@ -1066,7 +1066,7 @@ Required review evidence:
 | Release services are the first truly dangerous side effects | Loss of trust after one bad push/upload | Manual gate, sandbox/staging default, deterministic services, preserved receipts |
 | Sample repo hides pain that real repos have | False confidence | Keep sample repo small for first proof, then add one second, messier repo after sign-off |
 | Full-loop run is technically correct but emotionally clumsy | Product still feels like scaffolding | Dogfood preset, release gate summary, evidence pack, calm operator surfaces |
-| Proposal 006 provider matrix adds too many moving parts | Hard-to-debug live failures | Use one known-good preset for dogfood first, mixed-provider breadth second |
+| Provider-platform matrix adds too many moving parts | Hard-to-debug live failures | Use one known-good preset for dogfood first, mixed-provider breadth second |
 
 ---
 

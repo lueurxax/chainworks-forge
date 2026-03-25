@@ -5,7 +5,7 @@
 | Date | 2026-03-24 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [ps/chainworks-forge-mvp.md](../ps/chainworks-forge-mvp.md), [reference/runtime-contract.md](../reference/runtime-contract.md), [006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md](006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md), [007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) |
+| Depends on | [ps/chainworks-forge-mvp.md](../ps/chainworks-forge-mvp.md), [reference/runtime-contract.md](../reference/runtime-contract.md), [reference/provider-platform.md](../reference/provider-platform.md), [007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) |
 | Adjacent work | Proposal 003 (Forge Steward) and backend extraction remain explicitly post-MVP |
 | Goal | Convert the post-007 product from a believable dogfood slice into a sign-off-ready MVP by freezing the final boundary, proving the PS success metric, hardening repo-backed operator UX, and defining an explicit go/no-go launch gate. |
 

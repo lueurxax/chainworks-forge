@@ -21,11 +21,13 @@ Repository documentation for Chainworks Forge.
 7. [reference/runtime-contract.md](reference/runtime-contract.md) — runtime contracts
 8. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — live proposal loop
 9. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
-10. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
-11. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
-12. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
-13. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
-14. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+10. [reference/operator-experience.md](reference/operator-experience.md) — operator shell baseline
+11. [reference/provider-platform.md](reference/provider-platform.md) — provider/settings baseline
+12. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
+13. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
+14. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
+15. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
+16. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
 
 ## Status
 
@@ -39,6 +41,8 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
 - [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
+- [reference/operator-experience.md](reference/operator-experience.md) — Stable operator shell baseline and contracts
+- [reference/provider-platform.md](reference/provider-platform.md) — Stable multi-provider/settings/diagnostics baseline
 - [reference/forge-steward.md](reference/forge-steward.md) — V1 observer: metrics, anomaly detection, cohorting, triggers
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 - [reference/domain-model.md](reference/domain-model.md) — SwiftData models and persistence
@@ -47,7 +51,6 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 ## Proposals (active, not yet implemented)
 
-- [proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md](proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md) — multi-provider routing, settings, diagnostics
 - [proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) — worktrees, implementation loop, release, dogfooding
 - [proposals/008-mvp-hardening-and-sign-off.md](proposals/008-mvp-hardening-and-sign-off.md) — MVP validation, boundary freeze, recovery UX, launch gate
 

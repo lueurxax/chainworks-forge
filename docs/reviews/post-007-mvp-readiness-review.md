@@ -5,7 +5,7 @@
 - Evidence completeness: `Partial`
 - Documents / repo inputs reviewed:
   - `/Users/user/Documents/Chainworks Forge/docs/ps/chainworks-forge-mvp.md`
-  - `/Users/user/Documents/Chainworks Forge/docs/proposals/006-provider-expansion-settings-diagnostics-and-mvp-pilot-readiness.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/reference/provider-platform.md`
   - `/Users/user/Documents/Chainworks Forge/docs/proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/runtime-contract.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reviews/post-007-mvp-readiness-evidence-pack.md`
@@ -176,4 +176,3 @@
 ### Open Questions
 - QUESTION-01: Should Proposal 006 be narrowed to the PS/runtime-contract MVP provider boundary, or should the PS/runtime contract be consciously widened instead?
 - QUESTION-02: Which attachment file types are truly required in MVP validation runs?
-
