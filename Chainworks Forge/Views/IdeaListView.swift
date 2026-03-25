@@ -552,6 +552,7 @@ struct WorkflowStartRunSheet: View {
     private enum WorkflowPreset: String, CaseIterable, Identifiable {
         case canonicalRelease
         case proposalLoopLive
+        case fullMVPLive
 
         var id: String { rawValue }
 
@@ -559,6 +560,7 @@ struct WorkflowStartRunSheet: View {
             switch self {
             case .canonicalRelease: return .simulated
             case .proposalLoopLive: return .live
+            case .fullMVPLive: return .live
             }
         }
 
@@ -566,6 +568,7 @@ struct WorkflowStartRunSheet: View {
             switch self {
             case .canonicalRelease: return "Canonical Workflow"
             case .proposalLoopLive: return "Proposal Loop (Live)"
+            case .fullMVPLive: return "Full MVP (Live)"
             }
         }
 
@@ -575,6 +578,8 @@ struct WorkflowStartRunSheet: View {
                 return "examples/workflows/workflow.yaml"
             case .proposalLoopLive:
                 return "examples/workflows/proposal-loop-live.yaml"
+            case .fullMVPLive:
+                return "examples/workflows/full-mvp-live.yaml"
             }
         }
 
@@ -584,6 +589,8 @@ struct WorkflowStartRunSheet: View {
                 return "workflow"
             case .proposalLoopLive:
                 return "proposal-loop-live"
+            case .fullMVPLive:
+                return "full-mvp-live"
             }
         }
     }
@@ -946,6 +953,8 @@ struct WorkflowStartRunSheet: View {
                     return URL(fileURLWithPath: appConfigurationStore.configuration.workflowSourcePath)
                 case .proposalLoopLive:
                     return nil
+                case .fullMVPLive:
+                    return nil
                 }
             }()
             guard let url = resolveExistingFile(at: [
@@ -1022,6 +1031,27 @@ struct WorkflowStartRunSheet: View {
             )
             run.providerBindingSnapshotJSON = encodeProviderBindings(providerBindings)
             run.startOptionsJSON = encodeStartOptions(startOptions)
+
+            // Gap 3 (Proposal 007): Freeze DeliveryConfiguration for fullMVPLive preset
+            if selectedWorkflow == .fullMVPLive {
+                let repoRoot = FileManager.default.currentDirectoryPath
+                let deliveryConfig = DeliveryConfiguration(
+                    profileID: "dogfood_self",
+                    profileLabel: "Self (Dogfood)",
+                    sampleProfileID: nil,
+                    repoIdentifier: URL(fileURLWithPath: repoRoot).lastPathComponent,
+                    repoRoot: repoRoot,
+                    baseBranch: "main",
+                    worktreeBasePath: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+                        .appendingPathComponent("Chainworks Forge/worktrees").path,
+                    targetBranch: "release/\(run.id.uuidString.prefix(8))",
+                    releaseTargetID: "sandbox_local",
+                    releaseTargetLabel: "Local Sandbox",
+                    releaseMode: .sandbox
+                )
+                run.deliveryConfigurationJSON = try? JSONEncoder().encode(deliveryConfig)
+            }
+
             let preparedRun = PreparedRunStart(run: run, plan: adjustedPlan, workspace: workspace)
             onRunPrepared?(preparedRun)
             dismiss()
@@ -1222,6 +1252,31 @@ struct WorkflowRunProgressView: View {
             }
 
             if let pendingApprovalRequest {
+                // Gap 1 (Proposal 007): Show ReleaseGateView for manual_release approvals on delivery runs
+                if run.deliveryConfigurationJSON != nil,
+                   (pendingApprovalRequest.stageID.contains("manual_release") || pendingApprovalRequest.stageID.contains("state_11")) {
+                    Section("Release Gate") {
+                        ReleaseGateView(
+                            run: run,
+                            onApprove: {
+                                executionService.resolveApproval(
+                                    approvalID: pendingApprovalRequest.id,
+                                    granted: true,
+                                    comment: blankToNil(approvalComment)
+                                )
+                                approvalComment = ""
+                            },
+                            onReject: {
+                                executionService.resolveApproval(
+                                    approvalID: pendingApprovalRequest.id,
+                                    granted: false,
+                                    comment: blankToNil(approvalComment)
+                                )
+                                approvalComment = ""
+                            }
+                        )
+                    }
+                } else {
                 Section("Approval Gate") {
                     Text("Run is waiting at \(pendingApprovalRequest.stageLabel).")
                         .font(.subheadline)
@@ -1301,6 +1356,7 @@ struct WorkflowRunProgressView: View {
                         .buttonStyle(.borderedProminent)
                     }
                 }
+                } // end else (generic approval gate)
             }
 
             Section("Stages") {

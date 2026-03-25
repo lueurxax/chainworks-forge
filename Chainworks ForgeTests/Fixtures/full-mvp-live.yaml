@@ -1,0 +1,370 @@
+schema_version: 1
+workflow:
+  id: full_mvp_live
+  name: Full MVP Live
+  uses_agent_catalog: ./agents.yaml
+  description: First repo-backed end-to-end dogfood workflow. Idea through proposal, implementation in a dedicated worktree, review quartet, manual release gate, and durable receipts.
+  idea_input:
+    mode: text_with_optional_file
+  execution:
+    single_active_run_per_idea: true
+    resume_policy: automatic_on_launch
+  required_providers:
+  - codex
+  - claude_code
+variables:
+  proposal_score_target: 9.1
+  min_individual_proposal_score: 8.5
+  implementation_target_status: Implemented
+  max_proposal_revision_cycles: 6
+  max_implementation_progress_cycles: 10
+  max_implementation_revision_cycles: 8
+failure_policy:
+  on_error: pause_and_require_human
+  on_loop_budget_exhausted: pause_and_require_human
+  preserve_artifacts: true
+scoring:
+  proposal:
+    aggregate_formula: round((po.score + ux.score + ui.score + architect.score) / 4, 2)
+    pass_when:
+    - aggregate_score > vars.proposal_score_target
+    - min_individual_score >= vars.min_individual_proposal_score
+    - blocker_count == 0
+  implementation:
+    implemented_when:
+    - audit_report.status == vars.implementation_target_status
+    - security_report.status == 'pass'
+    - prepush_review_report.status == 'pass'
+    - docs_report.status in ['pass', 'not_needed']
+    - tests_result.green == true
+initial_state: state_1_idea_received
+states:
+  state_1_idea_received:
+    label: Idea received
+    type: start
+    owner: lead_orchestrator
+    run:
+      sequence:
+      - agent: lead_orchestrator
+        task: normalize_idea_and_open_run
+        inputs:
+        - input.idea
+        - input.file
+        outputs:
+        - idea_brief
+        - run_state
+        - orchestrator_summary
+    transitions:
+    - to: state_2_proposal_drafted
+      when: exists('idea_brief')
+
+  state_2_proposal_drafted:
+    label: Proposal drafted
+    owner: proposal_writer
+    run:
+      sequence:
+      - agent: proposal_writer
+        task: draft_initial_proposal
+        inputs:
+        - idea_brief
+        - run_state
+        outputs:
+        - proposal_current
+        - proposal_revision_summary
+    transitions:
+    - to: state_3_initial_proposal_approval
+      when: exists('proposal_current')
+
+  state_3_initial_proposal_approval:
+    label: "Human approval: initial proposal matches intent"
+    type: manual_gate
+    owner: lead_orchestrator
+    approval: required
+    transitions:
+    - to: state_4_proposal_reviewed
+      when: approval.granted == true
+
+  state_4_proposal_reviewed:
+    label: Proposal reviewed
+    owner: lead_orchestrator
+    run:
+      parallel:
+      - agent: proposal_reviewer_product_owner
+        task: review_proposal_as_product_owner
+        inputs:
+        - idea_brief
+        - proposal_current
+        outputs:
+        - proposal_review_po
+      - agent: proposal_reviewer_ux
+        task: review_proposal_as_ux_designer
+        inputs:
+        - idea_brief
+        - proposal_current
+        outputs:
+        - proposal_review_ux
+      - agent: proposal_reviewer_ui
+        task: review_proposal_as_ui_designer
+        inputs:
+        - idea_brief
+        - proposal_current
+        outputs:
+        - proposal_review_ui
+      - agent: proposal_reviewer_architect
+        task: review_proposal_as_architect
+        inputs:
+        - idea_brief
+        - proposal_current
+        outputs:
+        - proposal_review_architect
+      then:
+      - agent: lead_orchestrator
+        task: aggregate_proposal_reviews
+        inputs:
+        - proposal_review_po
+        - proposal_review_ux
+        - proposal_review_ui
+        - proposal_review_architect
+        - proposal_current
+        outputs:
+        - proposal_review_summary
+        - orchestrator_summary
+        - run_state
+    transitions:
+    - to: state_5_proposal_refined
+      when: proposal_review_summary.aggregate_score <= vars.proposal_score_target
+    - to: state_6_implementation_approval
+      when: proposal_review_summary.aggregate_score > vars.proposal_score_target and proposal_review_summary.blocker_count == 0
+
+  state_5_proposal_refined:
+    label: Proposal refined
+    owner: proposal_writer
+    run:
+      sequence:
+      - agent: proposal_writer
+        task: refine_proposal
+        inputs:
+        - proposal_current
+        - proposal_review_summary
+        - run_state
+        outputs:
+        - proposal_current
+        - proposal_revision_summary
+    loop:
+      counter: proposal_revision_count
+      max: vars.max_proposal_revision_cycles
+    transitions:
+    - to: state_4_proposal_reviewed
+      when: 'true'
+
+  state_6_implementation_approval:
+    label: "Human approval: proceed to implementation"
+    type: manual_gate
+    owner: lead_orchestrator
+    approval: required
+    transitions:
+    - to: state_7_implementation_started
+      when: approval.granted == true
+
+  state_7_implementation_started:
+    label: Implementation started
+    owner: lead_orchestrator
+    run:
+      sequence:
+      - agent: lead_orchestrator
+        task: freeze_proposal_and_provision_worktree
+        inputs:
+        - proposal_current
+        - proposal_review_summary
+        - run_state
+        outputs:
+        - approved_proposal
+        - implementation_plan
+        - implementation_backlog
+        - run_state
+      - agent: code_writer
+        task: initial_implementation
+        inputs:
+        - approved_proposal
+        - implementation_plan
+        - implementation_backlog
+        outputs:
+        - implementation_progress
+        - implementation_self_assessment
+        - changed_files_manifest
+        - tests_result
+    transitions:
+    - to: state_8_implementation_continued
+      when: implementation_self_assessment.seemingly_complete == false
+    - to: state_9_implementation_reviewed
+      when: implementation_self_assessment.seemingly_complete == true
+
+  state_8_implementation_continued:
+    label: Implementation continued until seemingly complete
+    owner: code_writer
+    run:
+      sequence:
+      - agent: code_writer
+        task: continue_implementation
+        inputs:
+        - approved_proposal
+        - implementation_plan
+        - implementation_progress
+        - implementation_self_assessment
+        outputs:
+        - implementation_progress
+        - implementation_self_assessment
+        - changed_files_manifest
+        - tests_result
+    loop:
+      counter: implementation_progress_count
+      max: vars.max_implementation_progress_cycles
+    transitions:
+    - to: state_9_implementation_reviewed
+      when: implementation_self_assessment.seemingly_complete == true
+    - to: state_8_implementation_continued
+      when: implementation_self_assessment.seemingly_complete == false
+
+  state_9_implementation_reviewed:
+    label: Implementation reviewed against proposal
+    owner: lead_orchestrator
+    run:
+      parallel:
+      - agent: security_checker
+        task: check_implementation_security
+        inputs:
+        - approved_proposal
+        - changed_files_manifest
+        outputs:
+        - security_report
+      - agent: docs_guardian
+        task: review_and_sync_docs
+        inputs:
+        - approved_proposal
+        - changed_files_manifest
+        outputs:
+        - docs_report
+        - docs_delta
+      then:
+      - agent: proposal_implementation_auditor
+        task: audit_implementation_against_proposal
+        inputs:
+        - approved_proposal
+        - implementation_progress
+        - changed_files_manifest
+        - tests_result
+        - docs_report
+        outputs:
+        - audit_report
+      - agent: prepush_code_reviewer
+        task: prepush_review
+        inputs:
+        - approved_proposal
+        - changed_files_manifest
+        - audit_report
+        - security_report
+        outputs:
+        - prepush_review_report
+      - agent: lead_orchestrator
+        task: aggregate_implementation_reviews
+        inputs:
+        - security_report
+        - docs_report
+        - audit_report
+        - prepush_review_report
+        - approved_proposal
+        outputs:
+        - implementation_review_summary
+        - orchestrator_summary
+        - run_state
+    transitions:
+    - to: state_10_implementation_refined
+      when: audit_report.status != vars.implementation_target_status
+    - to: state_11_manual_release
+      when: audit_report.status == vars.implementation_target_status and security_report.status == 'pass' and prepush_review_report.status == 'pass'
+
+  state_10_implementation_refined:
+    label: Implementation refined
+    owner: code_writer
+    run:
+      sequence:
+      - agent: code_writer
+        task: refine_implementation
+        inputs:
+        - approved_proposal
+        - audit_report
+        - security_report
+        - prepush_review_report
+        - implementation_review_summary
+        outputs:
+        - implementation_progress
+        - implementation_self_assessment
+        - changed_files_manifest
+        - tests_result
+      - agent: docs_guardian
+        task: sync_docs_after_refinement
+        inputs:
+        - approved_proposal
+        - changed_files_manifest
+        outputs:
+        - docs_report
+        - docs_delta
+    loop:
+      counter: implementation_revision_count
+      max: vars.max_implementation_revision_cycles
+    transitions:
+    - to: state_9_implementation_reviewed
+      when: 'true'
+
+  state_11_manual_release:
+    label: Manual release
+    type: manual_gate
+    owner: lead_orchestrator
+    approval: required
+    approval_policy: manual_release
+    run_after_approval:
+      sequence:
+      - agent: commit_and_push_to_github
+        task: commit_and_push
+        inputs:
+        - approved_proposal
+        - implementation_review_summary
+        - docs_report
+        - prepush_review_report
+        outputs:
+        - release_manifest
+        - git_push_receipt
+      - agent: build_archive_and_push_connect
+        task: build_and_distribute
+        inputs:
+        - git_push_receipt
+        - release_manifest
+        outputs:
+        - release_bundle_manifest
+        - connect_upload_receipt
+    transitions:
+    - to: state_12_workflow_complete
+      when: exists('git_push_receipt')
+
+  state_12_workflow_complete:
+    label: Workflow complete
+    type: end
+    owner: lead_orchestrator
+    run:
+      sequence:
+      - agent: lead_orchestrator
+        task: finalize_run_and_produce_receipts
+        inputs:
+        - approved_proposal
+        - implementation_review_summary
+        - release_manifest
+        - git_push_receipt
+        - release_bundle_manifest
+        - connect_upload_receipt
+        outputs:
+        - delivery_receipt
+        - run_report
+        - run_state
+    transitions:
+    - to: state_12_workflow_complete
+      when: 'true'

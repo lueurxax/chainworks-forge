@@ -273,6 +273,7 @@ struct AppBootstrapView: View {
 
         Self.seedIdeaIfRequested(modelContext: modelContext)
         Self.seedWaitingApprovalRunIfRequested(modelContext: modelContext, catalog: catalog)
+        Self.seedWorkflowMapRunIfRequested(modelContext: modelContext)
 
         if !isUnitTestHost {
             let compiler = RunPlanCompiler(modelContext: modelContext)
@@ -532,6 +533,7 @@ struct AppBootstrapView: View {
     ) {
         let environment = ProcessInfo.processInfo.environment
         guard environment["CHAINWORKS_UI_TEST_SEED_WAITING_APPROVAL_RUN"] == "1",
+              environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != "workflow_map",
               let catalog,
               let workflow = loadBundledWorkflow(
                 named: "proposal-loop-live",
@@ -732,6 +734,25 @@ struct AppBootstrapView: View {
         } catch {
             print("Failed to seed waiting approval run: \(error.localizedDescription)")
         }
+    }
+
+    @MainActor
+    private static func seedWorkflowMapRunIfRequested(modelContext: ModelContext) {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] == "workflow_map" else {
+            return
+        }
+        guard environment["CHAINWORKS_UI_TEST_DISABLE_WORKFLOW_MAP_SEED"] != "1" else {
+            return
+        }
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let existingRuns = (try? modelContext.fetch(descriptor)) ?? []
+        if !existingRuns.isEmpty {
+            return
+        }
+
+        PreviewSupport.seedWorkflowMapPreviewData(context: modelContext)
     }
 
     private static func makeSeedWorkspace(runID: UUID, prefix: String) throws -> RunWorkspace {

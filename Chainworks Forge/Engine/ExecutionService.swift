@@ -309,7 +309,12 @@ final class ExecutionService {
     }
 
     func isLiveWorkflow(_ workflowID: String) -> Bool {
-        workflowID == "proposal_loop_live"
+        workflowID == "proposal_loop_live" || workflowID == "full_mvp_live"
+    }
+
+    /// Proposal 007: Whether a workflow is a repo-backed delivery workflow.
+    func isDeliveryWorkflow(_ workflowID: String) -> Bool {
+        workflowID == "full_mvp_live"
     }
 
     private func requiresLiveRuntimeConfiguration(for plan: RunPlan) -> Bool {

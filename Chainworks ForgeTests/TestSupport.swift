@@ -210,6 +210,15 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
     return try YAMLParser.loadWorkflow(from: url)
 }
 
+/// Loads the full MVP live workflow fixture from the test bundle.
+func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
+    let url = try #require(
+        Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
+        "full-mvp-live.yaml fixture must be bundled with tests"
+    )
+    return try YAMLParser.loadWorkflow(from: url)
+}
+
 /// Loads the compact workflow fixture from the test bundle.
 func loadTestCompactWorkflow() throws -> CompactWorkflowDefinition {
     let url = try #require(

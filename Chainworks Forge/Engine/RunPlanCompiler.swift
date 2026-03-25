@@ -119,11 +119,13 @@ final class RunPlanCompiler {
         let plan = try previewCompile(workflow: workflow, catalog: catalog)
 
         // Reconstruct workspace from persisted paths
+        // Proposal 007: restore worktreeRoot from persisted delivery config
+        let worktreeRoot: URL? = run.worktreeRoot.flatMap { URL(fileURLWithPath: $0) }
         let workspace = RunWorkspace(
             runID: run.id,
             workspaceRoot: URL(fileURLWithPath: run.workspaceRoot),
             artifactRoot: URL(fileURLWithPath: run.artifactRoot),
-            worktreeRoot: nil
+            worktreeRoot: worktreeRoot
         )
 
         return (plan, workspace)

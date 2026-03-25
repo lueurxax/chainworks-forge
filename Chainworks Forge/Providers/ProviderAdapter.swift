@@ -139,7 +139,7 @@ enum ProviderAdapterSupport {
 }
 
 enum ProcessSupport {
-    static func which(_ executable: String) -> String? {
+    nonisolated static func which(_ executable: String) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         process.arguments = [executable]

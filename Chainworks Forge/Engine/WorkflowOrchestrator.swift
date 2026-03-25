@@ -88,6 +88,14 @@ final class WorkflowOrchestrator {
     /// Frozen provider bindings captured at run start.
     private let providerBindingsByAgentID: [String: ResolvedProviderBinding]
 
+    // MARK: - Delivery Integration (Proposal 007)
+
+    /// Decoded delivery configuration from the Run's frozen JSON, if this is a repo-backed run.
+    private var deliveryConfig: DeliveryConfiguration? {
+        guard let data = run.deliveryConfigurationJSON else { return nil }
+        return try? JSONDecoder().decode(DeliveryConfiguration.self, from: data)
+    }
+
     // MARK: - Init
 
     init(
@@ -309,6 +317,16 @@ final class WorkflowOrchestrator {
         )
         stageExec.run = run
         modelContext.insert(stageExec)
+
+        // Proposal 007: Provision worktree before executing implementation states
+        do {
+            try await provisionWorktreeIfNeeded(for: state)
+        } catch {
+            stageExec.status = .failed
+            stageExec.completedAt = Date()
+            stageExec.label = "\(state.label) — worktree provisioning failed: \(error.localizedDescription)"
+            return .failed
+        }
 
         // Execute run block
         if let runBlock = state.runBlock {
@@ -688,6 +706,40 @@ final class WorkflowOrchestrator {
         }
 
         return allSucceeded
+    }
+
+    // MARK: - Delivery Worktree Provisioning (Proposal 007 — ARCH-067)
+
+    /// Provisions a dedicated worktree when entering the implementation_started state
+    /// for a repo-backed delivery run, if not already provisioned.
+    private func provisionWorktreeIfNeeded(for state: ExecutableState) async throws {
+        // Only provision for implementation-start states
+        guard state.id.contains("implementation_started") || state.id.contains("state_7") else {
+            return
+        }
+
+        // Only provision for delivery-configured runs
+        guard let config = deliveryConfig else { return }
+
+        // Skip if already provisioned
+        guard run.worktreeRoot == nil else { return }
+
+        let ideaSlug = run.idea?.title ?? "untitled"
+        let runShortID = String(run.id.uuidString.prefix(6)).lowercased()
+
+        let provisioner = WorktreeProvisioner()
+        let result = try await provisioner.provision(
+            repoIdentifier: config.repoIdentifier,
+            repoRoot: config.repoRoot,
+            baseBranch: config.baseBranch,
+            worktreeBasePath: config.worktreeBasePath,
+            ideaSlug: ideaSlug,
+            runShortID: runShortID
+        )
+
+        // Persist provisioning result on the Run
+        run.worktreeRoot = result.worktreeRoot.path
+        run.baseRevision = result.baseRevision
     }
 
     // MARK: - Helpers

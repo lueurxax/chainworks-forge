@@ -429,6 +429,8 @@ struct RunDetailPanel: View {
     let onViewReport: () -> Void
     let compatibilityChecker: CompatibilityChecker
 
+    @State private var evidenceExportMessage: String?
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -508,11 +510,47 @@ struct RunDetailPanel: View {
                         }
                         .buttonStyle(.bordered)
                     }
+
+                    // Gap 2 (Proposal 007): Export Evidence Pack for completed delivery runs
+                    if (run.status == .completed || run.status == .failed),
+                       run.deliveryConfigurationJSON != nil {
+                        Button("Export Evidence Pack", systemImage: "shippingbox") {
+                            exportEvidencePack()
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("export-evidence-pack-button")
+                    }
+                }
+
+                if let evidenceExportMessage {
+                    Text(evidenceExportMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
                 }
             }
             .padding()
         }
         .navigationTitle("Run Details")
+    }
+
+    private func exportEvidencePack() {
+        let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let workspace = RunWorkspace(
+            runID: run.id,
+            workspaceRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("evidence-export-\(run.id.uuidString.prefix(8))", isDirectory: true),
+            artifactRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("evidence-export-\(run.id.uuidString.prefix(8))/artifacts", isDirectory: true),
+            worktreeRoot: run.worktreeRoot.map { URL(fileURLWithPath: $0) }
+        )
+        do {
+            let pack = try EvidencePackBuilder.export(run: run, workspace: workspace, exportDirectory: desktopURL)
+            evidenceExportMessage = "Exported \(pack.itemCount) items to Desktop."
+        } catch {
+            evidenceExportMessage = "Export failed: \(error.localizedDescription)"
+        }
     }
 
     private var statusColor: Color {

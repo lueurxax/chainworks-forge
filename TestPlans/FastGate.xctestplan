@@ -19,10 +19,12 @@
     {
       "selectedTests" : [
         "ArtifactManagerTests",
+        "DeliveryServicesTests",
         "OrchestratorTests",
         "ProviderPlatformTests",
         "ResumeManagerTests",
-        "RunTests"
+        "RunTests",
+        "WorktreeProvisionerTests"
       ],
       "target" : {
         "containerPath" : "container:Chainworks Forge.xcodeproj",

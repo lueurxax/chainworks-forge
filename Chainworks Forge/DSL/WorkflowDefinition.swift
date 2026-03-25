@@ -41,6 +41,7 @@ struct WorkflowState: Codable, Sendable {
     let type: String?
     let owner: String
     let approval: String?
+    let approvalPolicy: String?
     let run: RunBlock?
     let runAfterApproval: RunBlock?
     let loop: LoopConfig?
@@ -48,7 +49,30 @@ struct WorkflowState: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case label, type, owner, approval, run, loop, transitions
+        case approvalPolicy = "approval_policy"
         case runAfterApproval = "run_after_approval"
+    }
+
+    init(
+        label: String,
+        type: String?,
+        owner: String,
+        approval: String?,
+        approvalPolicy: String? = nil,
+        run: RunBlock?,
+        runAfterApproval: RunBlock?,
+        loop: LoopConfig?,
+        transitions: [Transition]?
+    ) {
+        self.label = label
+        self.type = type
+        self.owner = owner
+        self.approval = approval
+        self.approvalPolicy = approvalPolicy
+        self.run = run
+        self.runAfterApproval = runAfterApproval
+        self.loop = loop
+        self.transitions = transitions
     }
 }
 

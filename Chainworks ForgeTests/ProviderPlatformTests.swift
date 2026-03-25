@@ -433,7 +433,7 @@ struct ProviderPlatformTests {
             defaultModel: "claude-opus-4"
         )
         let secretStore = makeTestSecretStore("com.chainworks.tests.cached-reports")
-        try secretStore.store(secret: "test-key", for: ProviderAdapterSupport.secretKey(for: provider))
+        try secretStore.setSecret("test-key", for: ProviderAdapterSupport.secretKey(for: provider))
         let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(

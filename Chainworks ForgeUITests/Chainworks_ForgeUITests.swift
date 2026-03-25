@@ -371,7 +371,6 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let app = makeApp(
             seededIdeaTitle: "Workflow Map Test",
             liveFixture: true,
-            seedWaitingApprovalRun: true,
             directSurface: "workflow_map"
         )
         launchClean(app)
@@ -383,13 +382,23 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let workflowMap = anyElement(app, identifier: "workflow-map-view")
         XCTAssertTrue(workflowMap.waitForExistence(timeout: 20),
                       "Workflow map surface must render the workflow map owner pane")
-        XCTAssertTrue(anyElement(app, identifier: "workflow-map-topology").waitForExistence(timeout: 10),
-                      "Workflow map must render topology")
-        XCTAssertTrue(anyElement(app, identifier: "workflow-map-agents").waitForExistence(timeout: 10),
-                      "Workflow map must render agent panels")
-        XCTAssertTrue(anyElement(app, identifier: "workflow-map-loops").waitForExistence(timeout: 10),
-                      "Workflow map must render loop telemetry")
+        XCTAssertTrue(anyElement(app, identifier: "ui-test-workflow-map-projection-ready").waitForExistence(timeout: 10),
+                      "Workflow map must render a projection-ready topology surface")
         screenshot(app, name: "P010_WorkflowMap")
+    }
+
+    func testWorkflowMapSurfaceShowsFallbackWhenUnavailable() throws {
+        let app = makeApp(directSurface: "workflow_map")
+        app.launchEnvironment["CHAINWORKS_UI_TEST_DISABLE_WORKFLOW_MAP_SEED"] = "1"
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-workflow_map")
+        XCTAssertTrue(directSurface.waitForExistence(timeout: 20),
+                      "Workflow map direct surface must finish bootstrap")
+
+        XCTAssertTrue(app.staticTexts["Workflow map unavailable"].firstMatch.waitForExistence(timeout: 10),
+                      "Workflow map fallback should explain that no seeded run is available")
+        screenshot(app, name: "P010_WorkflowMap_Fallback")
     }
 
     // MARK: - REQ-011: Start Run Sheet UI

@@ -37,6 +37,10 @@ import SwiftData
     var toolTracePath: String?
     var retryReason: String?
 
+    // Proposal 007: Repo-backed execution tracking
+    var repoRevisionBefore: String?
+    var repoRevisionAfter: String?
+
     @Relationship(inverse: \StageExecution.agentExecutions)
     var stageExecution: StageExecution?
 

@@ -44,6 +44,18 @@ import SwiftData
     var providerBindingSnapshotJSON: Data?
     var startOptionsJSON: Data?
 
+    // Proposal 007: Delivery configuration (frozen pre-run contract — ARCH-067 through ARCH-075)
+    var deliveryConfigurationJSON: Data?
+    var deliveryPreflightJSON: Data?
+    var worktreeRoot: String?
+    var repoIdentifier: String?
+    var repoRoot: String?
+    var baseBranch: String?
+    var baseRevision: String?
+    var targetBranch: String?
+    var releaseTargetID: String?
+    var releaseMode: String?
+
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?
 

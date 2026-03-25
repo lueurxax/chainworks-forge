@@ -288,4 +288,61 @@ struct RunPlanCompilerTests {
         let runs = try context.fetch(descriptor)
         #expect(runs.isEmpty, "previewCompile must not create any SwiftData records")
     }
+
+    // MARK: - Full MVP Live Workflow
+
+    @Test("Full MVP live workflow compiles with correct structure")
+    func fullMVPLiveWorkflowCompiles() throws {
+        let workflow = try loadTestFullMVPLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        // Basic identity
+        #expect(plan.workflowID == "full_mvp_live")
+        #expect(plan.initialStateID == "state_1_idea_received")
+        #expect(plan.planCompilerVersion == RunPlan.currentCompilerVersion)
+
+        // 12 states
+        #expect(plan.states.count == 12, "Full MVP live workflow has 12 states")
+
+        // Three manual gates
+        let manualGates = plan.states.values.filter { $0.approvalRequired }
+        #expect(manualGates.count == 3, "Full MVP live workflow has 3 manual gates")
+
+        let manualGateIDs = Set(manualGates.map(\.id))
+        #expect(manualGateIDs.contains("state_3_initial_proposal_approval"))
+        #expect(manualGateIDs.contains("state_6_implementation_approval"))
+        #expect(manualGateIDs.contains("state_11_manual_release"))
+
+        // Key agent bindings resolved
+        let expectedAgents = [
+            "lead_orchestrator",
+            "proposal_writer",
+            "proposal_reviewer_product_owner",
+            "proposal_reviewer_ux",
+            "proposal_reviewer_ui",
+            "proposal_reviewer_architect",
+            "code_writer",
+            "proposal_implementation_auditor",
+            "security_checker",
+            "prepush_code_reviewer",
+            "docs_guardian",
+            "commit_and_push_to_github",
+            "build_archive_and_push_connect"
+        ]
+        for agentID in expectedAgents {
+            #expect(plan.agentBindings[agentID] != nil, "Agent '\(agentID)' should be resolved in bindings")
+        }
+
+        // Verify lead_orchestrator binding details
+        let leadOrch = plan.agentBindings["lead_orchestrator"]
+        #expect(leadOrch?.provider == "claude_code")
+        #expect(leadOrch?.effort == "high")
+
+        // Verify code_writer binding details
+        let codeWriter = plan.agentBindings["code_writer"]
+        #expect(codeWriter?.provider == "codex")
+        #expect(codeWriter?.effort == "high")
+    }
 }

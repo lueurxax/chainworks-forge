@@ -15,6 +15,7 @@
 		CE8915732F700957006EC77C /* agents.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915682F700957006EC77C /* agents.yaml */; };
 		CE8915742F700957006EC77C /* workflow.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156C2F700957006EC77C /* workflow.yaml */; };
 		CE8915752F700957006EC77C /* proposal-loop-live.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915762F700957006EC77C /* proposal-loop-live.yaml */; };
+		CE8915772F700957006EC77C /* full-mvp-live.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915782F700957006EC77C /* full-mvp-live.yaml */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +45,7 @@
 		CE89156C2F700957006EC77C /* workflow.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = workflow.yaml; sourceTree = "<group>"; };
 		CE89156E2F700957006EC77C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		CE8915762F700957006EC77C /* proposal-loop-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-loop-live.yaml"; sourceTree = "<group>"; };
+		CE8915782F700957006EC77C /* full-mvp-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "full-mvp-live.yaml"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -124,6 +126,7 @@
 		CE89156D2F700957006EC77C /* workflows */ = {
 			isa = PBXGroup;
 			children = (
+				CE8915782F700957006EC77C /* full-mvp-live.yaml */,
 				CE89156B2F700957006EC77C /* proposal-to-release.yaml */,
 				CE8915762F700957006EC77C /* proposal-loop-live.yaml */,
 				CE89156C2F700957006EC77C /* workflow.yaml */,
@@ -272,6 +275,7 @@
 				CE8915752F700957006EC77C /* proposal-loop-live.yaml in Resources */,
 				CE8915732F700957006EC77C /* agents.yaml in Resources */,
 				CE8915742F700957006EC77C /* workflow.yaml in Resources */,
+				CE8915772F700957006EC77C /* full-mvp-live.yaml in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

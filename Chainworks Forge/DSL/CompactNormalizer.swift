@@ -126,6 +126,7 @@ struct CompactNormalizer {
                 type: finalType,
                 owner: owner,
                 approval: approval,
+                approvalPolicy: nil,
                 run: runBlock,
                 runAfterApproval: nil,
                 loop: nil,

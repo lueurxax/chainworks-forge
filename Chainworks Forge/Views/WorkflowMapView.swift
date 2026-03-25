@@ -96,20 +96,25 @@ private struct WorkflowMapTopologyView: View {
     let projection: WorkflowMapProjection
 
     var body: some View {
-        GroupBox("Topology") {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(alignment: .top, spacing: 12) {
-                    ForEach(projection.stages.indices, id: \.self) { index in
-                        let stage = projection.stages[index]
-                        if index > 0 {
-                            Image(systemName: "chevron.right")
-                                .foregroundStyle(.secondary)
-                                .padding(.top, 34)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Topology")
+                .font(.headline)
+                .accessibilityIdentifier("workflow-map-topology-title")
+            GroupBox {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(projection.stages.indices, id: \.self) { index in
+                            let stage = projection.stages[index]
+                            if index > 0 {
+                                Image(systemName: "chevron.right")
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 34)
+                            }
+                            WorkflowMapStageCard(stage: stage)
                         }
-                        WorkflowMapStageCard(stage: stage)
                     }
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
             }
         }
     }
@@ -382,26 +387,31 @@ private struct WorkflowMapAgentPanels: View {
             GridItem(.flexible(), spacing: 12)
         ]
 
-        GroupBox("Agents") {
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                WorkflowMapAgentPanel(
-                    title: "Active",
-                    icon: "bolt.fill",
-                    tint: .blue,
-                    occurrences: activeOccurrences
-                )
-                WorkflowMapAgentPanel(
-                    title: "Completed",
-                    icon: "checkmark.circle.fill",
-                    tint: .green,
-                    occurrences: completedOccurrences
-                )
-                WorkflowMapAgentPanel(
-                    title: "Pending",
-                    icon: "clock",
-                    tint: .secondary,
-                    occurrences: pendingOccurrences
-                )
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Agents")
+                .font(.headline)
+                .accessibilityIdentifier("workflow-map-agents-title")
+            GroupBox {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                    WorkflowMapAgentPanel(
+                        title: "Active",
+                        icon: "bolt.fill",
+                        tint: .blue,
+                        occurrences: activeOccurrences
+                    )
+                    WorkflowMapAgentPanel(
+                        title: "Completed",
+                        icon: "checkmark.circle.fill",
+                        tint: .green,
+                        occurrences: completedOccurrences
+                    )
+                    WorkflowMapAgentPanel(
+                        title: "Pending",
+                        icon: "clock",
+                        tint: .secondary,
+                        occurrences: pendingOccurrences
+                    )
+                }
             }
         }
     }
@@ -446,30 +456,35 @@ private struct WorkflowMapLoopTelemetryView: View {
     let projection: WorkflowMapProjection
 
     var body: some View {
-        GroupBox("Loop Telemetry") {
-            if projection.loops.isEmpty {
-                Text("No loop counters were declared in the frozen workflow snapshot.")
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(projection.loops) { loop in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(loop.stageLabel)
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text("\(loop.current)/\(loop.max)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Loop Telemetry")
+                .font(.headline)
+                .accessibilityIdentifier("workflow-map-loops-title")
+            GroupBox {
+                if projection.loops.isEmpty {
+                    Text("No loop counters were declared in the frozen workflow snapshot.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(projection.loops) { loop in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(loop.stageLabel)
+                                        .font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text("\(loop.current)/\(loop.max)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                ProgressView(value: loop.progress) {
+                                    Text(loop.counter)
+                                        .font(.caption)
+                                } currentValueLabel: {
+                                    Text(loop.exhausted ? "Budget reached" : "Budget available")
+                                        .font(.caption)
+                                }
+                                .tint(loop.exhausted ? .orange : .blue)
                             }
-                            ProgressView(value: loop.progress) {
-                                Text(loop.counter)
-                                    .font(.caption)
-                            } currentValueLabel: {
-                                Text(loop.exhausted ? "Budget reached" : "Budget available")
-                                    .font(.caption)
-                            }
-                            .tint(loop.exhausted ? .orange : .blue)
                         }
                     }
                 }
