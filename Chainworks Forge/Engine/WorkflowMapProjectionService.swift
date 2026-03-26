@@ -39,17 +39,17 @@ final class WorkflowMapProjectionService {
         let edges = stages.flatMap { $0.handoffs + $0.transitions }
         let loops = stages.compactMap(\.loopTelemetry)
 
-        let activeOccurrences = occurrences.filter { $0.panel == .active }.count
-        let completedOccurrences = occurrences.filter { $0.panel == .completed }.count
-        let pendingOccurrences = occurrences.filter { $0.panel == .pending }.count
-        let failedOccurrences = occurrences.filter { $0.panel == .failed }.count
+        let activeOccurrences = occurrences.filter { $0.state == .thinking }.count
+        let completedOccurrences = occurrences.filter { $0.state == .completed }.count
+        let pendingOccurrences = occurrences.filter { [.notStarted, .ready, .waitingInput].contains($0.state) }.count
+        let failedOccurrences = occurrences.filter { $0.state == .failed }.count
         let communicationCount = edges.count + occurrences.count
 
         return WorkflowMapProjection(
             runID: run.id,
             workflowID: plan.workflowID,
             workflowTitle: plan.workflowTitle,
-            runStatus: run.status,
+            runStatus: run.presentationStatus,
             currentStageID: run.currentStageID,
             currentStageLabel: run.currentStageID.flatMap { plan.states[$0]?.label },
             generatedAt: Date(),
@@ -145,7 +145,7 @@ final class WorkflowMapProjectionService {
                 in: stageExecutions
             )
             let providerData = providerBinding(for: descriptor.agentID, plan: plan, providerBindings: providerBindings)
-            let panel = mapOccurrencePanel(execution?.status)
+            let occurrenceState = mapOccurrenceState(execution?.status)
 
             return WorkflowMapOccurrenceProjection(
                 id: "\(stateID)::\(descriptor.agentID)::\(descriptor.taskName)::\(index)",
@@ -154,7 +154,7 @@ final class WorkflowMapProjectionService {
                 taskName: descriptor.taskName,
                 stageID: stateID,
                 stageLabel: state.label,
-                panel: panel,
+                state: occurrenceState,
                 provider: providerData.provider,
                 model: providerData.model,
                 effort: providerData.effort,
@@ -395,20 +395,20 @@ final class WorkflowMapProjectionService {
         return ("unknown", "unknown", "unknown")
     }
 
-    private func mapOccurrencePanel(_ status: AgentStatus?) -> WorkflowMapOccurrencePanel {
+    private func mapOccurrenceState(_ status: AgentStatus?) -> WorkflowMapOccurrenceState {
         switch status {
         case .running:
-            return .active
+            return .thinking
         case .completed:
             return .completed
         case .failed:
             return .failed
-        case .cancelled:
-            return .cancelled
-        case .skipped:
+        case .cancelled, .skipped:
             return .skipped
-        case .pending, .ready, nil:
-            return .pending
+        case .ready:
+            return .ready
+        case .pending, nil:
+            return .notStarted
         }
     }
 

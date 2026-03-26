@@ -49,6 +49,7 @@ enum RunStartOverrideResolver {
             variables: plan.variables,
             scoring: plan.scoring,
             failurePolicy: plan.failurePolicy,
+            requiresProjectAccess: plan.requiresProjectAccess,
             workflowSnapshotHash: plan.workflowSnapshotHash,
             catalogSnapshotHash: plan.catalogSnapshotHash,
             workflowSnapshotJSON: plan.workflowSnapshotJSON,

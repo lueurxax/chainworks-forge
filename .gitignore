@@ -10,6 +10,7 @@ xcuserdata/
 # Build products
 build/
 DerivedData/
+DerivedDataCodex/
 
 # Swift Package Manager
 .build/
@@ -17,3 +18,6 @@ DerivedData/
 # Temporary editor files
 *.swp
 *.swo
+
+# Local tool state
+.claude/

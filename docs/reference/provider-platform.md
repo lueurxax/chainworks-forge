@@ -17,6 +17,10 @@ The app must be able to:
 
 This document records that implemented baseline as a reference contract.
 
+Related stable doc:
+
+- [goose-provider-remediation.md](goose-provider-remediation.md)
+
 ## Supported MVP provider families
 
 The current MVP provider set is:
@@ -192,6 +196,8 @@ Run-start gate semantics:
 
 Preflight reads from persisted configuration stores, not ad hoc path state.
 
+For Goose-backed providers, preflight also consumes the remediation/verification truth described in [goose-provider-remediation.md](goose-provider-remediation.md).
+
 ## Usage receipts
 
 Providers expose different billing and usage shapes, so the app normalizes them into a common receipt surface.
@@ -236,12 +242,15 @@ The provider-platform baseline includes:
 - `ProviderSettingsView`
 - `PreflightReportView`
 - `PilotReadinessView`
+- `GooseProviderConnectionAssistant`
+- `ProviderSetupEvidencePanel`
 
 Those surfaces cover:
 
 - workspace/YAML selection,
 - provider configuration,
 - provider verification,
+- Goose-backed remediation for `codex` and `claude_code`,
 - sample-run bootstrap,
 - current provider/YAML/workspace health,
 - configuration source,
@@ -250,6 +259,19 @@ Those surfaces cover:
 - pending approvals.
 
 The goal is to make the system operable on a fresh machine, not just understandable to someone already living in the codebase.
+
+## Goose-backed remediation
+
+For `codex` and `claude_code`, the primary operator path is Goose-backed.
+
+That remediation slice is stable and implemented:
+
+- unhealthy provider rows and first-run setup can hand off into `GooseProviderConnectionAssistant`,
+- verification follows a stepwise Goose handshake rather than a generic "try again" loop,
+- `ProviderSetupEvidencePanel` exposes endpoint/provider/model/probe facts,
+- `PilotReadinessView` and run-start preflight consume the same derived truth.
+
+This avoids a split reality where runtime depends on Goose but operator setup validates something else.
 
 ## Boundaries
 

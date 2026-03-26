@@ -208,6 +208,7 @@ struct AppBootstrapView: View {
     @State private var appConfigurationStore: AppConfigurationStore?
     @State private var providerSettingsStore: ProviderSettingsStore?
     @State private var providerRegistry: ProviderRegistry?
+    @State private var gooseServerManager: GooseServerManager?
     @State private var showFirstRunWizard = false
     private let forcedUISurface = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
         .flatMap(ContentView.UISurface.init(rawValue:))
@@ -216,24 +217,26 @@ struct AppBootstrapView: View {
         if let service = executionService,
            let appConfigurationStore,
            let providerSettingsStore,
-           let providerRegistry {
+           let providerRegistry,
+           let gooseServerManager {
             bootstrappedRoot(
                 service: service,
                 appConfigurationStore: appConfigurationStore,
                 providerSettingsStore: providerSettingsStore,
-                providerRegistry: providerRegistry
+                providerRegistry: providerRegistry,
+                gooseServerManager: gooseServerManager
             )
         } else {
             ProgressView("Starting engine...")
                 .accessibilityIdentifier("bootstrap-loading")
                 .task {
-                    bootstrapService()
+                    await bootstrapService()
                 }
         }
     }
 
     @MainActor
-    private func bootstrapService() {
+    private func bootstrapService() async {
         guard executionService == nil else { return }
         UIAutomationDiagnostics.log("bootstrapService.begin")
 
@@ -246,9 +249,11 @@ struct AppBootstrapView: View {
         let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
         let providerSettingsStore = ProviderSettingsStore()
         let providerRegistry = ProviderRegistry(settingsStore: providerSettingsStore)
+        let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
         self.appConfigurationStore = appConfigurationStore
         self.providerSettingsStore = providerSettingsStore
         self.providerRegistry = providerRegistry
+        self.gooseServerManager = gooseServerManager
         UIAutomationDiagnostics.log(
             "bootstrapService.config directSurface=\(environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] ?? "nil") " +
             "inMemory=\(environment["CHAINWORKS_IN_MEMORY_STORE"] ?? "nil")"
@@ -256,9 +261,12 @@ struct AppBootstrapView: View {
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
+        if !isUnitTestHost {
+            await gooseServerManager.bootstrap()
+        }
         let liveRuntimeConfiguration = isUnitTestHost
             ? nil
-            : Self.loadLiveRuntimeConfiguration()
+            : Self.loadLiveRuntimeConfiguration(gooseServerManager: gooseServerManager)
         // The simulated executor remains the safe default, but Proposal 004 live runs
         // are resolved per-plan inside ExecutionService using `liveRuntimeConfiguration`.
         let executor = SimulatedAgentExecutor(simulatedDelay: 0.5, catalog: catalog)
@@ -267,7 +275,8 @@ struct AppBootstrapView: View {
             executor: executor,
             catalog: catalog,
             stewardConfig: stewardConfig,
-            liveRuntimeConfiguration: liveRuntimeConfiguration
+            liveRuntimeConfiguration: liveRuntimeConfiguration,
+            gooseServerManager: gooseServerManager
         )
         executionService = service
 
@@ -303,7 +312,8 @@ struct AppBootstrapView: View {
         service: ExecutionService,
         appConfigurationStore: AppConfigurationStore,
         providerSettingsStore: ProviderSettingsStore,
-        providerRegistry: ProviderRegistry
+        providerRegistry: ProviderRegistry,
+        gooseServerManager: GooseServerManager
     ) -> some View {
         if let forcedUISurface {
             VStack(spacing: 0) {
@@ -323,30 +333,42 @@ struct AppBootstrapView: View {
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
+                            .environment(gooseServerManager)
                     case .pilotReadiness:
                         PilotReadinessView()
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
+                            .environment(gooseServerManager)
                     case .firstRunSetup:
                         FirstRunSetupWizard(isPresented: .constant(true))
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
+                            .environment(gooseServerManager)
                     case .ideaArchive:
                         UITestIdeaArchiveSurface()
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
+                            .environment(gooseServerManager)
                     case .workflowMap:
                         UITestWorkflowMapSurface()
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
+                            .environment(gooseServerManager)
+                    case .gooseAssistant:
+                        UITestGooseAssistantSurface()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                            .environment(gooseServerManager)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -360,12 +382,14 @@ struct AppBootstrapView: View {
                 .environment(appConfigurationStore)
                 .environment(providerSettingsStore)
                 .environment(providerRegistry)
+                .environment(gooseServerManager)
                 .sheet(isPresented: $showFirstRunWizard) {
                     FirstRunSetupWizard(isPresented: $showFirstRunWizard)
                         .environment(service)
                         .environment(appConfigurationStore)
                         .environment(providerSettingsStore)
                         .environment(providerRegistry)
+                        .environment(gooseServerManager)
                 }
         }
     }
@@ -440,7 +464,7 @@ struct AppBootstrapView: View {
         return nil
     }
 
-    private static func loadLiveRuntimeConfiguration() -> LiveRuntimeConfiguration? {
+    private static func loadLiveRuntimeConfiguration(gooseServerManager: GooseServerManager?) -> LiveRuntimeConfiguration? {
         let environment = ProcessInfo.processInfo.environment
         if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal_loop_success" {
             let override = LiveExecutionOverride(
@@ -459,9 +483,7 @@ struct AppBootstrapView: View {
             )
         }
 
-        guard let baseURLString = environment["CHAINWORKS_GOOSE_BASE_URL"],
-              let baseURL = URL(string: baseURLString),
-              !baseURLString.isEmpty else {
+        guard let managed = gooseServerManager?.liveRuntimeConfiguration else {
             return nil
         }
 
@@ -483,23 +505,12 @@ struct AppBootstrapView: View {
             override = nil
         }
 
-        // Proposal 005: Read transport API from environment.
-        // Default to .gooseServer when CHAINWORKS_GOOSE_BASE_URL is set.
-        let transportAPIString = environment["CHAINWORKS_GOOSE_TRANSPORT_API"]
-        let transportAPI: GooseTransportAPI
-        if let transportAPIString, let parsed = GooseTransportAPI(rawValue: transportAPIString) {
-            transportAPI = parsed
-        } else {
-            // Default: gooseServer when a base URL is provided (Proposal 005 Section 5.5)
-            transportAPI = .gooseServer
-        }
-
         return LiveRuntimeConfiguration(
-            baseURL: baseURL,
-            apiKey: environment["CHAINWORKS_GOOSE_API_KEY"],
+            baseURL: managed.baseURL,
+            apiKey: managed.apiKey,
             override: override,
-            transportMode: .network,
-            transportAPI: transportAPI
+            transportMode: managed.transportMode,
+            transportAPI: managed.transportAPI
         )
     }
 

@@ -3,6 +3,13 @@ import Foundation
 struct GeminiProviderAdapter: ProviderAdapter {
     let family: ProviderFamily = .gemini
     let adapterVersion = "gemini-v1"
+    private let gooseProbe: @Sendable (URL) async -> GooseServerReachability
+
+    init(
+        gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = ProviderAdapterSupport.probeGooseServerStatus
+    ) {
+        self.gooseProbe = gooseProbe
+    }
 
     func verify(provider: ConfiguredProvider, secretStore: KeychainSecretStore) async -> ProviderHealthSnapshot {
         switch provider.transport {
@@ -23,7 +30,8 @@ struct GeminiProviderAdapter: ProviderAdapter {
             return await ProviderAdapterSupport.verifyGooseServerProvider(
                 provider: provider,
                 summaryPrefix: "Gemini",
-                secretStore: secretStore
+                secretStore: secretStore,
+                gooseProbe: gooseProbe
             )
         }
     }

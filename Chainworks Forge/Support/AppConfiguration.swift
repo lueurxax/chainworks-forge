@@ -6,7 +6,41 @@ struct AppConfiguration: Codable, Equatable, Sendable {
     var workflowSourcePath: String
     var agentCatalogSourcePath: String
     var supportBundleExportPath: String?
+    var gooseServerHost: String
+    var gooseServerPort: Int
+    var gooseServerTLS: Bool
+    var gooseServerAutostart: Bool
+    var gooseServerBinaryPath: String?
+    var gooseServerSecretKey: String?
     var activeConfigurationSource: ConfigurationSource
+
+    init(
+        runStorageBasePath: String,
+        worktreeBasePath: String?,
+        workflowSourcePath: String,
+        agentCatalogSourcePath: String,
+        supportBundleExportPath: String?,
+        gooseServerHost: String = "127.0.0.1",
+        gooseServerPort: Int = 51200,
+        gooseServerTLS: Bool = true,
+        gooseServerAutostart: Bool = true,
+        gooseServerBinaryPath: String? = AppConfiguration.defaultGooseServerBinaryPath(),
+        gooseServerSecretKey: String? = nil,
+        activeConfigurationSource: ConfigurationSource
+    ) {
+        self.runStorageBasePath = runStorageBasePath
+        self.worktreeBasePath = worktreeBasePath
+        self.workflowSourcePath = workflowSourcePath
+        self.agentCatalogSourcePath = agentCatalogSourcePath
+        self.supportBundleExportPath = supportBundleExportPath
+        self.gooseServerHost = gooseServerHost
+        self.gooseServerPort = gooseServerPort
+        self.gooseServerTLS = gooseServerTLS
+        self.gooseServerAutostart = gooseServerAutostart
+        self.gooseServerBinaryPath = gooseServerBinaryPath
+        self.gooseServerSecretKey = gooseServerSecretKey
+        self.activeConfigurationSource = activeConfigurationSource
+    }
 
     var runStorageBaseURL: URL {
         URL(fileURLWithPath: runStorageBasePath, isDirectory: true)
@@ -18,6 +52,14 @@ struct AppConfiguration: Codable, Equatable, Sendable {
 
     var agentCatalogSourceURL: URL {
         URL(fileURLWithPath: agentCatalogSourcePath)
+    }
+
+    var gooseServerBaseURL: URL? {
+        var components = URLComponents()
+        components.scheme = gooseServerTLS ? "https" : "http"
+        components.host = gooseServerHost
+        components.port = gooseServerPort
+        return components.url
     }
 
     static func seededDefault() -> AppConfiguration {
@@ -32,6 +74,12 @@ struct AppConfiguration: Codable, Equatable, Sendable {
             workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
             agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
             supportBundleExportPath: exportRoot.path,
+            gooseServerHost: "127.0.0.1",
+            gooseServerPort: 51200,
+            gooseServerTLS: true,
+            gooseServerAutostart: true,
+            gooseServerBinaryPath: defaultGooseServerBinaryPath(),
+            gooseServerSecretKey: nil,
             activeConfigurationSource: .persistedSettings
         )
     }
@@ -65,6 +113,17 @@ struct AppConfiguration: Codable, Equatable, Sendable {
             ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
 
         return appSupport.appendingPathComponent("Chainworks Forge", isDirectory: true)
+    }
+
+    static func defaultGooseServerBinaryPath() -> String? {
+        let candidates = [
+            "/Applications/Goose.app/Contents/Resources/bin/goosed",
+            NSHomeDirectory() + "/Applications/Goose.app/Contents/Resources/bin/goosed"
+        ]
+
+        return candidates.first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
     }
 }
 

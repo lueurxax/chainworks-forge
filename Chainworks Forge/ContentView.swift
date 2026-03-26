@@ -23,6 +23,7 @@ struct ContentView: View {
         case firstRunSetup = "first_run_setup"
         case ideaArchive = "idea_archive"
         case workflowMap = "workflow_map"
+        case gooseAssistant = "goose_assistant"
     }
 
     init() {
@@ -141,6 +142,8 @@ struct ContentView: View {
             UITestIdeaArchiveSurface()
         case .workflowMap:
             UITestWorkflowMapSurface()
+        case .gooseAssistant:
+            UITestGooseAssistantSurface()
         }
     }
 }
@@ -151,6 +154,7 @@ struct ContentView: View {
     let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
     let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+    let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
 
     return ContentView()
         .modelContainer(container)
@@ -158,6 +162,7 @@ struct ContentView: View {
         .environment(appConfigurationStore)
         .environment(providerSettingsStore)
         .environment(providerRegistry)
+        .environment(gooseServerManager)
 }
 
 #Preview("Content Shell — Seeded") {
@@ -166,6 +171,7 @@ struct ContentView: View {
     let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
     let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+    let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
 
     return ContentView()
         .modelContainer(container)
@@ -173,5 +179,6 @@ struct ContentView: View {
         .environment(appConfigurationStore)
         .environment(providerSettingsStore)
         .environment(providerRegistry)
+        .environment(gooseServerManager)
         .frame(width: 1280, height: 820)
 }

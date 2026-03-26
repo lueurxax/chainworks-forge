@@ -7,6 +7,7 @@ struct FirstRunSetupWizard: View {
     @Environment(AppConfigurationStore.self) private var appConfigurationStore
     @Environment(ProviderSettingsStore.self) private var providerSettingsStore
     @Environment(ProviderRegistry.self) private var providerRegistry
+    @Environment(GooseServerManager.self) private var gooseServerManager
 
     @Binding var isPresented: Bool
 
@@ -19,6 +20,7 @@ struct FirstRunSetupWizard: View {
     @State private var latestPreflight: PreflightReport?
     @State private var transferMessage: String?
     @State private var showPreflightReport = false
+    @State private var selectedAssistantProviderID: UUID?
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
     var body: some View {
@@ -83,6 +85,29 @@ struct FirstRunSetupWizard: View {
                     Text("Codex and Claude are Goose-first in the app. Use Goose-backed transport unless you intentionally need CLI fallback.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+
+                    ForEach(providerSettingsStore.settings.configuredProviders.filter { $0.family.gooseFirstPreferred }) { provider in
+                        Button("Open \(provider.family.displayName) Goose Assistant") {
+                            selectedAssistantProviderID = provider.id
+                        }
+                        .accessibilityIdentifier("first-run-open-assistant-\(provider.family.rawValue)")
+                    }
+                }
+
+                Section("Managed Goose Server") {
+                    LabeledContent("State", value: gooseServerManager.statusSummary)
+                        .accessibilityIdentifier("first-run-goose-state")
+                    if let baseURL = appConfigurationStore.configuration.gooseServerBaseURL {
+                        LabeledContent("Base URL", value: baseURL.absoluteString)
+                    }
+                    Button("Start Managed Server") {
+                        Task {
+                            await gooseServerManager.ensureRunning()
+                            await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
+                            await refreshPreflight()
+                        }
+                    }
+                    .accessibilityIdentifier("first-run-start-goose")
                 }
 
                 Section("Verification") {
@@ -209,6 +234,21 @@ struct FirstRunSetupWizard: View {
                     .frame(minWidth: 520, minHeight: 420)
                 }
             }
+            .sheet(isPresented: Binding(
+                get: { selectedAssistantProviderID != nil },
+                set: { if !$0 { selectedAssistantProviderID = nil } }
+            )) {
+                if let selectedAssistantProviderID {
+                    GooseProviderConnectionAssistantView(
+                        providerID: selectedAssistantProviderID,
+                        origin: .firstRunWizard
+                    )
+                        .environment(appConfigurationStore)
+                        .environment(providerSettingsStore)
+                        .environment(providerRegistry)
+                        .environment(gooseServerManager)
+                }
+            }
         }
         .frame(minWidth: 520, minHeight: 420)
         .accessibilityIdentifier("first-run-setup-wizard")
@@ -230,8 +270,8 @@ struct FirstRunSetupWizard: View {
             family: family,
             displayName: displayName,
             transport: .gooseServer,
-            endpoint: ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_BASE_URL"],
-            authMode: ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey,
+            endpoint: appConfigurationStore.configuration.gooseServerBaseURL?.absoluteString,
+            authMode: appConfigurationStore.configuration.gooseServerSecretKey == nil ? .none : .apiKey,
             defaultModel: defaultModel
         )
     }
@@ -330,6 +370,7 @@ struct FirstRunSetupWizard: View {
     let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
     let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+    let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
 
     return FirstRunSetupWizard(isPresented: $isPresented)
         .modelContainer(container)
@@ -337,5 +378,6 @@ struct FirstRunSetupWizard: View {
         .environment(appConfigurationStore)
         .environment(providerSettingsStore)
         .environment(providerRegistry)
+        .environment(gooseServerManager)
         .frame(width: 760, height: 860)
 }

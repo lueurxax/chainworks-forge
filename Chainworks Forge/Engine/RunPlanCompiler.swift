@@ -50,6 +50,7 @@ final class RunPlanCompiler {
             variables: workflow.variables ?? [:],
             scoring: workflow.scoring,
             failurePolicy: workflow.failurePolicy,
+            requiresProjectAccess: workflow.workflow.execution.requiresProjectAccess,
             workflowSnapshotHash: workflowHash,
             catalogSnapshotHash: catalogHash,
             workflowSnapshotJSON: workflowData,
@@ -183,7 +184,8 @@ final class RunPlanCompiler {
                 outputContract: agentDef.outputContract,
                 requiresHumanApproval: agentDef.requiresHumanApproval,
                 inputs: agentDef.inputs,
-                outputs: agentDef.outputs
+                outputs: agentDef.outputs,
+                worktreeWriteEnabled: agentDef.worktreePolicy?.writeEnabled ?? false
             )
         }
 
@@ -236,6 +238,7 @@ final class RunPlanCompiler {
                 runAfterApproval: execRunAfterApproval,
                 transitions: transitions,
                 approvalRequired: state.approval == "required",
+                approvalPolicy: state.approvalPolicy,
                 loop: loop
             )
         }

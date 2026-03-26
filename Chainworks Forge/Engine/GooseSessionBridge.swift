@@ -40,18 +40,29 @@ final class GooseSessionBridge: Sendable {
         let provider = override?.provider ?? agent.provider
         let model = override?.model ?? agent.model
 
+        // Proposal 007 §7.7: Validate path boundaries before write-capable execution
+        if agent.worktreeWriteEnabled, let worktreeRoot = context.workspace.worktreeRoot {
+            try RepoSafetyGuard.validateWorktreeReady(worktreeRoot: worktreeRoot.path)
+        }
+
         // Step 3: Create isolated session
+        // REQ-005: Use worktree as working directory with write access for write-enabled agents
+        let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
+        let workingDirectory = useWorktree
+            ? context.workspace.worktreeRoot!.path
+            : context.workspace.workspaceRoot.path
+
         let sessionRequest = GooseSessionRequest(
             systemPrompt: packet.systemPrompt,
-            workingDirectory: context.workspace.workspaceRoot.path,
+            workingDirectory: workingDirectory,
             model: model,
             provider: provider,
             executionPolicy: GooseExecutionPolicy(
                 permissionProfileID: agent.permissionProfile,
-                workspaceMode: "read_only",
-                gitOperationsAllowed: false,
+                workspaceMode: useWorktree ? "read_write" : "read_only",
+                gitOperationsAllowed: useWorktree,
                 releaseOperationsAllowed: false,
-                repoWritesAllowed: false
+                repoWritesAllowed: useWorktree
             ),
             metadata: [
                 "run_id": context.workspace.runID.uuidString,
@@ -111,6 +122,11 @@ final class GooseSessionBridge: Sendable {
         var attachments: [GooseContextAttachment] = []
 
         // Workspace context attachment
+        let worktreeRootDescription = context.workspace.worktreeRoot?.path ?? "not provisioned"
+        let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
+        let boundaryNote = useWorktree
+            ? "IMPORTANT: This agent has write access to the worktree root. All file operations must use explicit absolute paths within the worktree root."
+            : "IMPORTANT: No implicit working directory is allowed. All file operations must use explicit absolute paths within the workspace root."
         attachments.append(GooseContextAttachment(
             type: "text",
             name: "workspace_context",
@@ -121,7 +137,8 @@ final class GooseSessionBridge: Sendable {
             Attempt: \(context.attemptNumber)
             Workspace Root: \(context.workspace.workspaceRoot.path)
             Artifact Root: \(context.workspace.artifactRoot.path)
-            IMPORTANT: No implicit working directory is allowed. All file operations must use explicit absolute paths within the workspace root.
+            Worktree Root: \(worktreeRootDescription)
+            \(boundaryNote)
             """,
             path: nil
         ))

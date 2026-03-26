@@ -105,6 +105,17 @@ enum ProviderAuthMode: String, Codable, CaseIterable, Sendable {
     case none
     case apiKey
     case sessionToken
+
+    var displayName: String {
+        switch self {
+        case .none:
+            return "None"
+        case .apiKey:
+            return "API Key"
+        case .sessionToken:
+            return "Session Token"
+        }
+    }
 }
 
 enum ProviderStatus: String, Codable, CaseIterable, Sendable {

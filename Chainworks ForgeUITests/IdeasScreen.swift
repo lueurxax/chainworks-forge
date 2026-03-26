@@ -4,6 +4,22 @@ import XCTest
 struct IdeasScreen {
     let app: XCUIApplication
 
+    @discardableResult
+    private func revealSidebarIfNeeded() -> Bool {
+        let toggleLabels = ["Show Sidebar", "Hide Sidebar", "Toggle Sidebar", "Show Navigation", "Hide Navigation"]
+
+        for label in toggleLabels {
+            let button = app.buttons[label].firstMatch
+            if button.waitForExistence(timeout: 1), button.isHittable {
+                button.click()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+                return true
+            }
+        }
+
+        return false
+    }
+
     /// Creates a test idea and returns true on success. Assumes tabs are already visible.
     /// In headless xcodebuild, NavigationSplitView toolbar rendering is unreliable,
     /// so this function tries multiple strategies to find the "New Idea" button.
@@ -56,8 +72,15 @@ struct IdeasScreen {
             return true
         }
 
+        _ = revealSidebarIfNeeded()
+        if ideaRow.waitForExistence(timeout: 10) {
+            ideaRow.click()
+            return true
+        }
+
         let screen = AppScreen(app: app)
         guard screen.selectTab("Ideas") else { return false }
+        _ = revealSidebarIfNeeded()
         guard ideaRow.waitForExistence(timeout: 10) else { return false }
         ideaRow.click()
         return true

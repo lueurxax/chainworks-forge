@@ -75,8 +75,11 @@ final class ExecutionService {
     /// Optional catalog for contract-aware output generation.
     let catalog: AgentCatalog?
 
-    /// Optional live runtime configuration for Proposal 004 runs.
-    let liveRuntimeConfiguration: LiveRuntimeConfiguration?
+    /// Optional fixture or externally injected live runtime configuration.
+    private let fixedLiveRuntimeConfiguration: LiveRuntimeConfiguration?
+
+    /// Optional managed Goose server bridge.
+    let gooseServerManager: GooseServerManager?
 
     /// Steward config (loaded at app init, nil if not present).
     var stewardConfig: StewardConfig?
@@ -99,16 +102,22 @@ final class ExecutionService {
         catalog: AgentCatalog? = nil,
         stewardConfig: StewardConfig? = nil,
         liveRuntimeConfiguration: LiveRuntimeConfiguration? = nil,
+        gooseServerManager: GooseServerManager? = nil,
         notificationService: NotificationService? = nil
     ) {
         self.modelContext = modelContext
         self.executor = executor
         self.catalog = catalog
         self.stewardConfig = stewardConfig
-        self.liveRuntimeConfiguration = liveRuntimeConfiguration
+        self.fixedLiveRuntimeConfiguration = liveRuntimeConfiguration
+        self.gooseServerManager = gooseServerManager
         self.notificationService = notificationService ?? MainActor.assumeIsolated {
             NotificationService()
         }
+    }
+
+    var liveRuntimeConfiguration: LiveRuntimeConfiguration? {
+        fixedLiveRuntimeConfiguration ?? gooseServerManager?.liveRuntimeConfiguration
     }
 
     // MARK: - Start Run
@@ -254,12 +263,32 @@ final class ExecutionService {
 
     // MARK: - Cancel Run
 
-    /// Cancel an active run.
+    /// Cancel an active run using settlement-based cancellation (Proposal 011 — REQ-001, REQ-002).
+    /// Records `cancellationRequestedAt`, propagates to all agents, closes sessions,
+    /// and only transitions to `.cancelled` after full settlement.
     func cancelRun(runID: UUID) {
-        if let orchestrator = activeOrchestrators[runID] {
-            orchestrator.cancel()
-            activeOrchestrators.removeValue(forKey: runID)
-            pendingApprovals = pendingApprovals.filter { $0.value.runID != runID }
+        guard let orchestrator = activeOrchestrators[runID] else { return }
+
+        let run = orchestrator.run
+
+        // Use the settlement-based coordinator for truthful cancellation.
+        let coordinator = RunCancellationCoordinator(
+            run: run,
+            orchestrator: orchestrator,
+            modelContext: modelContext
+        )
+
+        // Remove from active orchestrators and clean up approvals immediately
+        // (the coordinator handles the terminal transition asynchronously).
+        activeOrchestrators.removeValue(forKey: runID)
+        pendingApprovals = pendingApprovals.filter { $0.value.runID != runID }
+
+        Task { @MainActor in
+            await coordinator.settle()
+
+            // P005-OPS: Fire notification for cancellation completion.
+            self.notificationService.notifyRunCancelled(run: run)
+            self.refreshDockBadge()
         }
     }
 
@@ -295,6 +324,31 @@ final class ExecutionService {
     }
 
     var liveRuntimeReadiness: LiveRuntimeReadiness {
+        if let gooseServerManager, let liveRuntimeConfiguration {
+            switch gooseServerManager.launchState {
+            case .running, .external:
+                return .ready(
+                    summary: liveRuntimeConfiguration.summary,
+                    source: liveRuntimeConfiguration.sourceDescription
+                )
+            case .starting:
+                return .unavailable(
+                    reason: "Managed Goose server is still starting",
+                    recovery: "Wait for the managed Goose server to finish booting, or refresh server status in Provider Settings."
+                )
+            case .failed(let reason):
+                return .unavailable(
+                    reason: "Managed Goose server is unavailable",
+                    recovery: reason
+                )
+            case .idle:
+                return .unavailable(
+                    reason: "Managed Goose server is not running",
+                    recovery: "Start the managed Goose server in Provider Settings or First Run Setup."
+                )
+            }
+        }
+
         if let liveRuntimeConfiguration {
             return .ready(
                 summary: liveRuntimeConfiguration.summary,

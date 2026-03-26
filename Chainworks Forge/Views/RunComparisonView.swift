@@ -69,6 +69,10 @@ struct RunComparisonView: View {
                 Text(c.runB_ID.uuidString.prefix(8))
                     .font(.caption.monospaced())
             }
+            HStack(spacing: 8) {
+                ParentIdeaArchiveBadge(title: "Run A parent", idea: runA.idea)
+                ParentIdeaArchiveBadge(title: "Run B parent", idea: runB.idea)
+            }
         }
     }
 

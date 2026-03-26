@@ -273,7 +273,7 @@ struct RunsHomeRow: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Divider().frame(height: 12)
-                Text(run.status.rawValue)
+                Text(run.presentationStatusLabel)
                     .font(.caption)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -286,6 +286,7 @@ struct RunsHomeRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
 
             HStack(spacing: 12) {
                 Label(elapsedTimeString, systemImage: "clock")
@@ -330,13 +331,14 @@ struct RunsHomeRow: View {
     // MARK: - Computed
 
     private var statusColor: Color {
-        switch run.status {
+        switch run.presentationStatus {
         case .completed: return .green
         case .failed: return .red
         case .blocked: return .red
         case .waitingApproval: return .orange
         case .running: return .blue
         case .cancelled: return .gray
+        case .cancelling: return .orange
         case .pending, .ready: return .secondary
         }
     }
@@ -420,6 +422,49 @@ struct RuntimeProvenanceBadge: View {
     }
 }
 
+// MARK: - Parent Idea Archive Badge
+
+/// Read-only truth surface for the parent idea lifecycle on run-centric screens.
+/// Does not expose any restore/modify action.
+struct ParentIdeaArchiveBadge: View {
+    let title: String
+    let idea: Idea?
+
+    var body: some View {
+        Label {
+            Text("\(title): \(statusText)")
+                .font(.caption2.weight(.semibold))
+        } icon: {
+            Image(systemName: statusIcon)
+                .font(.caption2)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(statusColor.opacity(0.14), in: Capsule())
+        .foregroundStyle(statusColor)
+        .accessibilityIdentifier("parent-idea-archive-\(sanitizedTitle)")
+    }
+
+    private var sanitizedTitle: String {
+        title.lowercased().replacingOccurrences(of: " ", with: "-")
+    }
+
+    private var statusText: String {
+        guard let idea else { return "Unavailable" }
+        return idea.isArchived ? "Archived" : "Active"
+    }
+
+    private var statusIcon: String {
+        guard let idea else { return "questionmark.circle" }
+        return idea.isArchived ? "archivebox.fill" : "lightbulb.fill"
+    }
+
+    private var statusColor: Color {
+        guard let idea else { return .secondary }
+        return idea.isArchived ? .secondary : .green
+    }
+}
+
 // MARK: - Run Detail Panel
 
 struct RunDetailPanel: View {
@@ -441,7 +486,7 @@ struct RunDetailPanel: View {
                         .font(.title3)
                         .foregroundStyle(.secondary)
                     HStack {
-                        Text(run.status.rawValue)
+                        Text(run.presentationStatusLabel)
                             .font(.headline)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
@@ -450,6 +495,7 @@ struct RunDetailPanel: View {
                             .clipShape(Capsule())
                         RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
                     }
+                    ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
                 }
 
                 Divider()
@@ -554,11 +600,13 @@ struct RunDetailPanel: View {
     }
 
     private var statusColor: Color {
-        switch run.status {
+        switch run.presentationStatus {
         case .completed: return .green
         case .failed, .blocked: return .red
         case .waitingApproval: return .orange
         case .running: return .blue
+        case .cancelling: return .orange
+        case .cancelled: return .gray
         default: return .secondary
         }
     }
@@ -623,7 +671,7 @@ struct RunComparisonPickerSheet: View {
                                 Text(target.workflowTitle)
                                     .font(.headline)
                                 HStack {
-                                    Text(target.status.rawValue)
+                                    Text(target.presentationStatusLabel)
                                         .font(.caption)
                                     Text("Started \(target.startedAt.formatted())")
                                         .font(.caption)

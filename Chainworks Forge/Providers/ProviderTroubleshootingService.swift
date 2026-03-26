@@ -13,6 +13,7 @@ enum ProviderTroubleshootingStatus: String, Codable, Sendable {
 enum ProviderTroubleshootingLayer: String, Codable, Sendable {
     case transport
     case gooseEndpoint
+    case gooseReachability
     case cliExecutable
     case credential
     case model
@@ -25,6 +26,8 @@ enum ProviderTroubleshootingLayer: String, Codable, Sendable {
             return "Transport"
         case .gooseEndpoint:
             return "Goose Endpoint"
+        case .gooseReachability:
+            return "Goose Reachability"
         case .cliExecutable:
             return "CLI Executable"
         case .credential:
@@ -125,6 +128,36 @@ struct ProviderTroubleshootingService {
             ))
         }
 
+        if provider.transport == .gooseServer {
+            if let health {
+                if let reachabilityIssue = ProviderAdapterSupport.gooseServerReachabilityIssue(from: health.blockingIssues) {
+                    evidence.append(ProviderTroubleshootingEvidence(
+                        label: "Goose server reachability",
+                        value: reachabilityIssue,
+                        state: .blocked
+                    ))
+                } else if let configuredEndpointValue {
+                    evidence.append(ProviderTroubleshootingEvidence(
+                        label: "Goose server reachability",
+                        value: "Reachable via \(ProviderAdapterSupport.gooseStatusURLString(for: configuredEndpointValue))",
+                        state: .info
+                    ))
+                } else {
+                    evidence.append(ProviderTroubleshootingEvidence(
+                        label: "Goose server reachability",
+                        value: "Reachability cannot be checked until an endpoint is configured",
+                        state: .warning
+                    ))
+                }
+            } else {
+                evidence.append(ProviderTroubleshootingEvidence(
+                    label: "Goose server reachability",
+                    value: "Reachability has not been checked yet",
+                    state: .warning
+                ))
+            }
+        }
+
         if let cliExecutable {
             evidence.append(ProviderTroubleshootingEvidence(
                 label: "CLI executable",
@@ -180,6 +213,27 @@ struct ProviderTroubleshootingService {
                         "Enter the Goose server base URL in the provider endpoint field.",
                         "Use a local goosed endpoint such as https://127.0.0.1:51200.",
                         "Refresh diagnostics after saving."
+                    ],
+                    evidence: evidence,
+                    availableModels: availableModels,
+                    gooseFirstGuidance: gooseGuidance
+                )
+            }
+
+            if let health, let reachabilityIssue = ProviderAdapterSupport.gooseServerReachabilityIssue(from: health.blockingIssues) {
+                return ProviderTroubleshootingReport(
+                    providerID: provider.id,
+                    family: provider.family,
+                    displayName: provider.displayName,
+                    transport: provider.transport,
+                    status: .blocked,
+                    headline: "\(provider.displayName) cannot reach Goose server",
+                    explanation: reachabilityIssue,
+                    failureLayer: .gooseReachability,
+                    remediation: [
+                        "Make sure goosed is running at the configured base URL.",
+                        "Verify the host, port, and local TLS trust for the Goose server.",
+                        "Refresh diagnostics after the server becomes reachable."
                     ],
                     evidence: evidence,
                     availableModels: availableModels,

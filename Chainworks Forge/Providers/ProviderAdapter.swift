@@ -15,6 +15,11 @@ protocol ProviderAdapter: Sendable {
     ) async -> [String]
 }
 
+enum GooseServerReachability: Equatable, Sendable {
+    case reachable(statusCode: Int)
+    case unreachable(reason: String)
+}
+
 enum ProviderAdapterFactory {
     static func makeAdapters() -> [ProviderFamily: any ProviderAdapter] {
         [
@@ -72,12 +77,17 @@ enum ProviderAdapterSupport {
     static func verifyGooseServerProvider(
         provider: ConfiguredProvider,
         summaryPrefix: String,
-        secretStore: KeychainSecretStore
+        secretStore: KeychainSecretStore,
+        gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = probeGooseServerStatus
     ) async -> ProviderHealthSnapshot {
         var issues: [String] = []
+        var reachableStatusCode: Int?
+        var baseURL: URL?
 
         if provider.endpoint?.isEmpty != false {
             issues.append("Goose server base URL is missing")
+        } else if let endpoint = provider.endpoint, let parsedURL = URL(string: endpoint) {
+            baseURL = parsedURL
         } else if let endpoint = provider.endpoint, URL(string: endpoint) == nil {
             issues.append("Goose server base URL is invalid")
         }
@@ -86,13 +96,91 @@ enum ProviderAdapterSupport {
             issues.append(credentialIssue(for: provider))
         }
 
+        if let baseURL {
+            switch await gooseProbe(baseURL) {
+            case .reachable(let statusCode):
+                reachableStatusCode = statusCode
+            case .unreachable(let reason):
+                issues.append(gooseServerReachabilityIssue(for: baseURL, reason: reason))
+            }
+        }
+
+        let hasReachabilityIssue = gooseServerReachabilityIssue(from: issues) != nil
+        let status: ProviderStatus
+        if hasReachabilityIssue {
+            status = .unavailable
+        } else if issues.isEmpty {
+            status = .healthy
+        } else {
+            status = .degraded
+        }
+
+        let summary: String
+        switch status {
+        case .healthy:
+            let responseSuffix = reachableStatusCode.map { " (HTTP \($0))" } ?? ""
+            summary = "\(summaryPrefix) Goose server is reachable\(responseSuffix)"
+        case .unavailable:
+            summary = "\(summaryPrefix) Goose server is unreachable"
+        case .degraded, .unknown:
+            if reachableStatusCode != nil {
+                summary = "\(summaryPrefix) Goose server is reachable, but provider requires attention"
+            } else {
+                summary = "\(summaryPrefix) Goose path requires attention"
+            }
+        }
+
         return ProviderHealthSnapshot(
             providerID: provider.id,
-            status: issues.isEmpty ? .healthy : .degraded,
+            status: status,
             checkedAt: Date(),
-            summary: issues.isEmpty ? "\(summaryPrefix) Goose path is configured" : "\(summaryPrefix) Goose path requires attention",
+            summary: summary,
             blockingIssues: issues
         )
+    }
+
+    static func gooseStatusURL(for baseURL: URL) -> URL {
+        baseURL.appendingPathComponent("status")
+    }
+
+    static func gooseStatusURLString(for endpoint: String) -> String {
+        guard let baseURL = URL(string: endpoint) else { return endpoint }
+        return gooseStatusURL(for: baseURL).absoluteString
+    }
+
+    static func gooseServerReachabilityIssue(from issues: [String]) -> String? {
+        issues.first { $0.hasPrefix(gooseReachabilityIssuePrefix) }
+    }
+
+    private static let gooseReachabilityIssuePrefix = "Goose server is unreachable at "
+
+    private static func gooseServerReachabilityIssue(for baseURL: URL, reason: String) -> String {
+        "\(gooseReachabilityIssuePrefix)\(gooseStatusURL(for: baseURL).absoluteString): \(reason)"
+    }
+
+    static func probeGooseServerStatus(at baseURL: URL) async -> GooseServerReachability {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.timeoutIntervalForRequest = 5
+        sessionConfiguration.timeoutIntervalForResource = 10
+        let delegate = LocalhostTrustDelegate()
+        let session = URLSession(configuration: sessionConfiguration, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+
+        var request = URLRequest(url: gooseStatusURL(for: baseURL))
+        request.httpMethod = "GET"
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .unreachable(reason: "Received a non-HTTP response")
+            }
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                return .unreachable(reason: "Server returned HTTP \(httpResponse.statusCode)")
+            }
+            return .reachable(statusCode: httpResponse.statusCode)
+        } catch {
+            return .unreachable(reason: error.localizedDescription)
+        }
     }
 
     static func availableModels(for provider: ConfiguredProvider) -> [String] {

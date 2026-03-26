@@ -78,6 +78,16 @@ final class NotificationService {
         scheduleNotification(id: "completed_\(run.id.uuidString)", content: content)
     }
 
+    /// Proposal 011 — REQ-002: Notify when a run has been fully cancelled after settlement.
+    func notifyRunCancelled(run: Run) {
+        let content = UNMutableNotificationContent()
+        content.title = "Run Cancelled"
+        content.body = "\(run.idea?.title ?? "Run") — \(run.workflowTitle)"
+        content.sound = .default
+        content.categoryIdentifier = "RUN_CANCELLED"
+        scheduleNotification(id: "cancelled_\(run.id.uuidString)", content: content)
+    }
+
     // MARK: - Dock Badge (§10)
 
     /// Update dock badge with count of runs requiring attention.

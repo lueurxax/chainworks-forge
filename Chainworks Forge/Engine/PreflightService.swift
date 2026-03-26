@@ -45,7 +45,8 @@ struct PreflightService {
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
-        startOptions: RunStartOptions = .empty
+        startOptions: RunStartOptions = .empty,
+        idea: Idea? = nil
     ) async -> PreflightReport {
         var checks: [PreflightCheck] = []
         var warnings: [String] = []
@@ -84,6 +85,11 @@ struct PreflightService {
             checks.append(checkDirectory(category: "Workspace", title: "Worktree Base", url: URL(fileURLWithPath: worktreeBasePath, isDirectory: true)))
         }
         checks.append(checkWorkspaceIsolation(runStorageURL: runStorageURL, worktreeBasePath: config.worktreeBasePath))
+
+        // Proposal 011 (REQ-005, REQ-006): Workspace readiness — fail-closed when requiresProjectAccess is true.
+        if let plan, plan.requiresProjectAccess {
+            checks.append(checkIdeaWorkspaceReadiness(idea: idea))
+        }
 
         let hasProviders = !providerRegistry.configuredProviders.isEmpty
         checks.append(PreflightCheck(
@@ -263,6 +269,46 @@ struct PreflightService {
         )
     }
 
+    // Proposal 011 (REQ-005, REQ-006): Validate idea has a valid, accessible workspace root.
+    private func checkIdeaWorkspaceReadiness(idea: Idea?) -> PreflightCheck {
+        guard let idea else {
+            return PreflightCheck(
+                category: "Workspace",
+                title: "Idea Workspace Root",
+                status: .fail,
+                message: "Workflow requires project access but no idea was provided to preflight"
+            )
+        }
+
+        guard let workspaceRootPath = idea.workspaceRootPath,
+              !workspaceRootPath.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return PreflightCheck(
+                category: "Workspace",
+                title: "Idea Workspace Root",
+                status: .fail,
+                message: "Workflow requires project access but idea has no workspace root path set"
+            )
+        }
+
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: workspaceRootPath, isDirectory: &isDirectory)
+        guard exists, isDirectory.boolValue else {
+            return PreflightCheck(
+                category: "Workspace",
+                title: "Idea Workspace Root",
+                status: .fail,
+                message: "Workspace root path is not a valid accessible directory: \(workspaceRootPath)"
+            )
+        }
+
+        return PreflightCheck(
+            category: "Workspace",
+            title: "Idea Workspace Root",
+            status: .pass,
+            message: workspaceRootPath
+        )
+    }
+
     private func supportBundleExportURL(for configuration: AppConfiguration) -> URL {
         if let supportBundleExportPath = configuration.supportBundleExportPath, !supportBundleExportPath.isEmpty {
             return URL(fileURLWithPath: supportBundleExportPath, isDirectory: true)
@@ -278,6 +324,28 @@ struct PreflightService {
         blockingIssues: inout [String]
     ) async {
         let snapshot = providerRegistry.healthSnapshot(for: provider.id)
+        if provider.transport == .gooseServer {
+            let reachabilityIssue = snapshot.flatMap { ProviderAdapterSupport.gooseServerReachabilityIssue(from: $0.blockingIssues) }
+            let title = "\(provider.displayName) Reachability"
+            if let reachabilityIssue {
+                checks.append(PreflightCheck(
+                    category: "Providers",
+                    title: title,
+                    status: .fail,
+                    message: reachabilityIssue
+                ))
+                blockingIssues.append(reachabilityIssue)
+            } else if let endpoint = provider.endpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !endpoint.isEmpty {
+                checks.append(PreflightCheck(
+                    category: "Providers",
+                    title: title,
+                    status: snapshot == nil ? .warn : .pass,
+                    message: snapshot == nil
+                        ? "Reachability has not been checked yet"
+                        : "Goose server is reachable at \(ProviderAdapterSupport.gooseStatusURLString(for: endpoint))"
+                ))
+            }
+        }
         let healthStatus = mapProviderStatus(snapshot)
         let healthMessage = snapshot?.summary ?? "Health not yet verified"
         checks.append(PreflightCheck(

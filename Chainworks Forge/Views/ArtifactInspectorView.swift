@@ -95,6 +95,9 @@ struct ArtifactInspectorView: View {
             provenanceChip("Stage", value: artifact.stageID, icon: "rectangle.stack")
             provenanceChip("Agent", value: artifact.agentID, icon: "person.circle")
             provenanceChip("Provider", value: artifact.provider, icon: "server.rack")
+            if let idea = run.idea {
+                provenanceChip("Parent Idea", value: idea.isArchived ? "archived" : "active", icon: idea.isArchived ? "archivebox.fill" : "lightbulb.fill")
+            }
             if let model = artifact.model {
                 provenanceChip("Model", value: model, icon: "cpu")
             }

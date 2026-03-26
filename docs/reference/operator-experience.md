@@ -13,14 +13,21 @@ Chainworks is only useful if one engineer can return to the app and understand:
 
 This document describes the implemented operator spine for the current baseline. It is not a future-state proposal.
 
+Related stable docs:
+
+- [idea-lifecycle.md](idea-lifecycle.md)
+- [live-workflow-map.md](live-workflow-map.md)
+
 ## Scope
 
 This reference covers the read-only and repo-agnostic operator layer:
 
 - `RunsHomeView` as the primary landing surface
+- idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries
 - safe recovery actions for non-destructive run states
 - deterministic run comparison
+- run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
@@ -58,6 +65,8 @@ Contextual actions are status-aware:
 - `View report` appears only when report artifacts exist
 
 The operator shell must not promise an action that cannot actually run from the current row.
+
+If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
 
 ## Runtime provenance
 
@@ -131,6 +140,17 @@ Out of scope here:
 - repo-backed side-effect re-entry.
 
 Those remain Proposal 007 territory.
+
+## Workflow map in run detail
+
+Run detail includes a workflow-topology surface rather than only a flat log/status view.
+
+That surface follows the stable contract in [live-workflow-map.md](live-workflow-map.md):
+
+- map stays inside existing run-detail ownership,
+- primary and fallback states are both first-class,
+- agent activity grouping is explicit,
+- loop direction and handoff counts are visible.
 
 ## Run comparison
 

@@ -44,6 +44,15 @@ import SwiftData
     var providerBindingSnapshotJSON: Data?
     var startOptionsJSON: Data?
 
+    // Proposal 011 (REQ-007): Frozen idea workspace root path at run creation time.
+    // Set once during startRun, not mutated afterward.
+    var frozenWorkspaceRootPath: String?
+
+    // Proposal 011: Cancellation settlement (REQ-002 — truthful run control)
+    var cancellationRequestedAt: Date?       // when operator pressed stop
+    var cancellationSettledAt: Date?         // when coordinator confirmed propagation
+    var cancellationSettlementLog: Data?     // JSON array of per-agent settlement entries
+
     // Proposal 007: Delivery configuration (frozen pre-run contract — ARCH-067 through ARCH-075)
     var deliveryConfigurationJSON: Data?
     var deliveryPreflightJSON: Data?
@@ -119,6 +128,38 @@ enum RunStatus: String, Codable {
     case completed
     case failed
     case cancelled
+    case cancelling
+}
+
+// MARK: - Run Presentation Status (Proposal 011 — REQ-002)
+
+extension Run {
+    /// Truthful presentation status: shows `.cancelling` when a cancellation has been
+    /// requested but not yet settled, and `.cancelled` only after full settlement.
+    var presentationStatus: RunStatus {
+        if cancellationRequestedAt != nil && cancellationSettledAt == nil {
+            return .cancelling
+        }
+        return status
+    }
+
+    /// Human-readable label for the current presentation status.
+    var presentationStatusLabel: String {
+        presentationStatus.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+}
+
+// MARK: - CancellationSettlementEntry (Proposal 011 — REQ-002)
+
+/// Records per-agent settlement details during cancellation propagation.
+struct CancellationSettlementEntry: Codable, Sendable {
+    let agentExecutionID: UUID
+    let agentID: String
+    let priorStatus: String              // status at cancellation-request time
+    let terminalStatus: String           // status after propagation
+    let sessionCloseAttempted: Bool
+    let sessionCloseSucceeded: Bool?     // nil if no session was open
+    let settledAt: Date
 }
 
 enum DriftDecision: String, Codable {

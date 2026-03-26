@@ -24,6 +24,9 @@ struct RunPlan: Sendable {
     /// Failure policy
     let failurePolicy: FailurePolicy?
 
+    /// Proposal 011 (REQ-004): whether this workflow requires a valid project directory.
+    let requiresProjectAccess: Bool
+
     /// Provenance
     let workflowSnapshotHash: String
     let catalogSnapshotHash: String
@@ -36,6 +39,38 @@ struct RunPlan: Sendable {
 
     /// Current compiler version constant.
     static let currentCompilerVersion: Int = 1
+
+    init(
+        workflowID: String,
+        workflowTitle: String,
+        states: [String: ExecutableState],
+        initialStateID: String,
+        agentBindings: [String: ResolvedAgent],
+        variables: [String: AnyCodableValue],
+        scoring: ScoringConfig?,
+        failurePolicy: FailurePolicy?,
+        requiresProjectAccess: Bool = false,
+        workflowSnapshotHash: String,
+        catalogSnapshotHash: String,
+        workflowSnapshotJSON: Data,
+        catalogSnapshotJSON: Data,
+        planCompilerVersion: Int
+    ) {
+        self.workflowID = workflowID
+        self.workflowTitle = workflowTitle
+        self.states = states
+        self.initialStateID = initialStateID
+        self.agentBindings = agentBindings
+        self.variables = variables
+        self.scoring = scoring
+        self.failurePolicy = failurePolicy
+        self.requiresProjectAccess = requiresProjectAccess
+        self.workflowSnapshotHash = workflowSnapshotHash
+        self.catalogSnapshotHash = catalogSnapshotHash
+        self.workflowSnapshotJSON = workflowSnapshotJSON
+        self.catalogSnapshotJSON = catalogSnapshotJSON
+        self.planCompilerVersion = planCompilerVersion
+    }
 }
 
 // MARK: - RunWorkspace (run-scoped isolation boundary — ARCH-025)
@@ -63,6 +98,8 @@ struct ExecutableState: Sendable {
     let runAfterApproval: ExecutableRunBlock?
     let transitions: [ExecutableTransition]
     let approvalRequired: Bool
+    /// Proposal 007 §11.1: approval_policy for tailored gate rendering (e.g. "manual_release").
+    let approvalPolicy: String?
     let loop: ResolvedLoopConfig?
 }
 
@@ -128,6 +165,8 @@ struct ResolvedAgent: Sendable {
     let requiresHumanApproval: Bool
     let inputs: [String]
     let outputs: [String]
+    /// Proposal 007 REQ-005: When true, the agent operates against the provisioned worktree with write access.
+    let worktreeWriteEnabled: Bool
 
     init(
         id: String,
@@ -146,7 +185,8 @@ struct ResolvedAgent: Sendable {
         outputContract: String?,
         requiresHumanApproval: Bool,
         inputs: [String],
-        outputs: [String]
+        outputs: [String],
+        worktreeWriteEnabled: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -165,6 +205,7 @@ struct ResolvedAgent: Sendable {
         self.requiresHumanApproval = requiresHumanApproval
         self.inputs = inputs
         self.outputs = outputs
+        self.worktreeWriteEnabled = worktreeWriteEnabled
     }
 }
 

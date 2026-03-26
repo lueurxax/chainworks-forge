@@ -12,12 +12,13 @@ enum WorkflowMapStageState: String, Sendable {
     case skipped
 }
 
-enum WorkflowMapOccurrencePanel: String, Sendable {
-    case active
+enum WorkflowMapOccurrenceState: String, Sendable, CaseIterable {
+    case notStarted = "not_started"
+    case ready
+    case thinking
+    case waitingInput = "waiting_input"
     case completed
-    case pending
     case failed
-    case cancelled
     case skipped
 }
 
@@ -52,19 +53,35 @@ struct WorkflowMapProjection: Sendable {
     let liveTimeline: [LiveExecutionTimelineEntry]
 
     var activeOccurrences: [WorkflowMapOccurrenceProjection] {
-        occurrences.filter { $0.panel == .active }
+        occurrences.filter { $0.state == .thinking }
     }
 
     var completedOccurrences: [WorkflowMapOccurrenceProjection] {
-        occurrences.filter { $0.panel == .completed }
+        occurrences.filter { $0.state == .completed }
     }
 
     var pendingOccurrences: [WorkflowMapOccurrenceProjection] {
-        occurrences.filter { $0.panel == .pending }
+        occurrences.filter { [.notStarted, .ready, .waitingInput].contains($0.state) }
     }
 
     var failedOccurrences: [WorkflowMapOccurrenceProjection] {
-        occurrences.filter { $0.panel == .failed }
+        occurrences.filter { $0.state == .failed }
+    }
+
+    var readyOccurrences: [WorkflowMapOccurrenceProjection] {
+        occurrences.filter { $0.state == .ready }
+    }
+
+    var notStartedOccurrences: [WorkflowMapOccurrenceProjection] {
+        occurrences.filter { $0.state == .notStarted }
+    }
+
+    var waitingInputOccurrences: [WorkflowMapOccurrenceProjection] {
+        occurrences.filter { $0.state == .waitingInput }
+    }
+
+    var skippedOccurrences: [WorkflowMapOccurrenceProjection] {
+        occurrences.filter { $0.state == .skipped }
     }
 }
 
@@ -97,7 +114,7 @@ struct WorkflowMapOccurrenceProjection: Identifiable, Sendable {
     let taskName: String
     let stageID: String
     let stageLabel: String
-    let panel: WorkflowMapOccurrencePanel
+    let state: WorkflowMapOccurrenceState
     let provider: String
     let model: String
     let effort: String

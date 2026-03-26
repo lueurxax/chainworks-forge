@@ -140,12 +140,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "agent_1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -196,7 +196,7 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "s2", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "s2": ExecutableState(
                     id: "s2", label: "Stage 2", type: nil,
@@ -206,12 +206,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "s3", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "s3": ExecutableState(
                     id: "s3", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "s1",
@@ -262,12 +262,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -313,12 +313,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "proposal_writer", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -412,6 +412,7 @@ struct OrchestratorTests {
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
                     approvalRequired: false,
+                    approvalPolicy: nil,
                     loop: nil
                 ),
                 "end": ExecutableState(
@@ -421,6 +422,7 @@ struct OrchestratorTests {
                     runAfterApproval: nil,
                     transitions: [],
                     approvalRequired: false,
+                    approvalPolicy: nil,
                     loop: nil
                 )
             ],
@@ -476,12 +478,12 @@ struct OrchestratorTests {
                     id: "start", label: "Approval Gate", type: .start,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
-                    approvalRequired: true, loop: nil
+                    approvalRequired: true, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -524,12 +526,12 @@ struct OrchestratorTests {
                     id: "start", label: "Gate", type: .start,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
-                    approvalRequired: true, loop: nil
+                    approvalRequired: true, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -579,12 +581,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -628,12 +630,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -682,7 +684,7 @@ struct OrchestratorTests {
                     transitions: [
                         ExecutableTransition(to: "middle", condition: .artifactExists("output_1"))
                     ],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "middle": ExecutableState(
                     id: "middle", label: "Middle", type: nil,
@@ -692,12 +694,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -741,12 +743,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -793,12 +795,12 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -840,12 +842,12 @@ struct OrchestratorTests {
                     id: "start", label: "Approval Gate", type: .start,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
-                    approvalRequired: true, loop: nil
+                    approvalRequired: true, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -913,12 +915,12 @@ struct OrchestratorTests {
                         .sequential([AgentTask(agent: "a2", task: "post_approval_work", inputs: nil, outputs: nil)])
                     ]),
                     transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
-                    approvalRequired: true, loop: nil
+                    approvalRequired: true, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -999,6 +1001,7 @@ struct OrchestratorTests {
                     runAfterApproval: nil,
                     transitions: [ExecutableTransition(to: "end", condition: .always)],
                     approvalRequired: false,
+                    approvalPolicy: nil,
                     loop: nil
                 ),
                 "end": ExecutableState(
@@ -1010,6 +1013,7 @@ struct OrchestratorTests {
                     runAfterApproval: nil,
                     transitions: [],
                     approvalRequired: false,
+                    approvalPolicy: nil,
                     loop: nil
                 )
             ],

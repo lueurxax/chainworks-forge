@@ -82,7 +82,8 @@ func makeTestAgent(
     outputContract: String? = nil,
     requiresHumanApproval: Bool = false,
     inputs: [String] = [],
-    outputs: [String] = ["output_1"]
+    outputs: [String] = ["output_1"],
+    worktreeWriteEnabled: Bool = false
 ) -> ResolvedAgent {
     ResolvedAgent(
         id: id,
@@ -101,7 +102,8 @@ func makeTestAgent(
         outputContract: outputContract,
         requiresHumanApproval: requiresHumanApproval,
         inputs: inputs,
-        outputs: outputs
+        outputs: outputs,
+        worktreeWriteEnabled: worktreeWriteEnabled
     )
 }
 

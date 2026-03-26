@@ -7,12 +7,14 @@ struct ProviderSettingsView: View {
     @Environment(AppConfigurationStore.self) private var appConfigurationStore
     @Environment(ProviderSettingsStore.self) private var providerSettingsStore
     @Environment(ProviderRegistry.self) private var providerRegistry
+    @Environment(GooseServerManager.self) private var gooseServerManager
 
     @State private var draft = ProviderDraft()
     @State private var secret = ""
     @State private var importMessage: String?
     @State private var exportPath: String?
     @State private var showWizard = false
+    @State private var selectedAssistantProviderID: UUID?
     @State private var availableModelsByProviderID: [UUID: [String]] = [:]
     @State private var gooseTroubleshootingByProviderID: [UUID: ProviderTroubleshootingReport] = [:]
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
@@ -39,6 +41,7 @@ struct ProviderSettingsView: View {
                     }
                     .accessibilityIdentifier("provider-settings-open-wizard")
                 }
+                managedGooseServerSection
                 providerSection
                 transferSection
                 configurationSection
@@ -70,6 +73,22 @@ struct ProviderSettingsView: View {
                     .environment(appConfigurationStore)
                     .environment(providerSettingsStore)
                     .environment(providerRegistry)
+                    .environment(gooseServerManager)
+            }
+            .sheet(isPresented: Binding(
+                get: { selectedAssistantProviderID != nil },
+                set: { if !$0 { selectedAssistantProviderID = nil } }
+            )) {
+                if let selectedAssistantProviderID {
+                    GooseProviderConnectionAssistantView(
+                        providerID: selectedAssistantProviderID,
+                        origin: .providerSettings
+                    )
+                        .environment(appConfigurationStore)
+                        .environment(providerSettingsStore)
+                        .environment(providerRegistry)
+                        .environment(gooseServerManager)
+                }
             }
         }
     }
@@ -203,6 +222,14 @@ struct ProviderSettingsView: View {
                         ProviderTroubleshootingPanel(report: report)
                     }
 
+                    if provider.family.gooseFirstPreferred {
+                        Button("Open Goose Assistant") {
+                            selectedAssistantProviderID = provider.id
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("provider-settings-open-assistant-\(provider.family.rawValue)")
+                    }
+
                     HStack {
                         Button("Prefer") {
                             providerSettingsStore.setPreferredProvider(id: provider.id, for: provider.family)
@@ -227,7 +254,7 @@ struct ProviderSettingsView: View {
                 }
                 .accessibilityIdentifier("provider-settings-family-picker")
                 .onChange(of: draft.family) { _, newFamily in
-                    draft.applyFamilyDefaults(newFamily)
+                    draft.applyFamilyDefaults(newFamily, configuration: appConfigurationStore.configuration)
                 }
 
                 Picker("Transport", selection: $draft.transport) {
@@ -268,7 +295,33 @@ struct ProviderSettingsView: View {
             }
         }
         .onAppear {
-            draft.applyFamilyDefaults(draft.family)
+            draft.applyFamilyDefaults(draft.family, configuration: appConfigurationStore.configuration)
+        }
+    }
+
+    private var managedGooseServerSection: some View {
+        Section("Managed Goose Server") {
+            LabeledContent("State", value: gooseServerManager.statusSummary)
+                .accessibilityIdentifier("provider-settings-goose-state")
+            if let baseURL = appConfigurationStore.configuration.gooseServerBaseURL {
+                LabeledContent("Base URL", value: baseURL.absoluteString)
+            }
+            LabeledContent("Autostart", value: appConfigurationStore.configuration.gooseServerAutostart ? "Enabled" : "Disabled")
+            if let binaryPath = appConfigurationStore.configuration.gooseServerBinaryPath {
+                LabeledContent("Binary", value: binaryPath)
+            }
+
+            HStack {
+                Button("Start Managed Server") {
+                    Task { await gooseServerManager.ensureRunning() }
+                }
+                .accessibilityIdentifier("provider-settings-start-goose")
+                Button("Refresh Server Status") {
+                    Task { await gooseServerManager.refreshStatus() }
+                }
+                .accessibilityIdentifier("provider-settings-refresh-goose")
+            }
+            .buttonStyle(.borderless)
         }
     }
 
@@ -306,7 +359,7 @@ struct ProviderSettingsView: View {
             try? providerRegistry.secretStore.setSecret(secret, for: ProviderAdapterSupport.secretKey(for: provider))
         }
         draft = ProviderDraft()
-        draft.applyFamilyDefaults(draft.family)
+        draft.applyFamilyDefaults(draft.family, configuration: appConfigurationStore.configuration)
         secret = ""
         Task { await refreshDiagnostics() }
     }
@@ -407,6 +460,7 @@ struct ProviderSettingsView: View {
     let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
     let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+    let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
 
     return ProviderSettingsView()
         .modelContainer(container)
@@ -414,6 +468,7 @@ struct ProviderSettingsView: View {
         .environment(appConfigurationStore)
         .environment(providerSettingsStore)
         .environment(providerRegistry)
+        .environment(gooseServerManager)
         .frame(width: 1100, height: 820)
 }
 
@@ -443,7 +498,7 @@ struct ProviderDraft {
         )
     }
 
-    mutating func applyFamilyDefaults(_ family: ProviderFamily) {
+    mutating func applyFamilyDefaults(_ family: ProviderFamily, configuration: AppConfiguration) {
         let previousFamily = self.family
         let previousGeneratedName = generatedDisplayName(for: previousFamily, transport: transport)
         let resolvedTransport: ProviderTransport
@@ -473,10 +528,10 @@ struct ProviderDraft {
 
         if transport == .gooseServer {
             if endpoint.isEmpty {
-                endpoint = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_BASE_URL"] ?? ""
+                endpoint = configuration.gooseServerBaseURL?.absoluteString ?? ""
             }
-            if authMode == .none {
-                authMode = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey
+            if authMode == .none, let secret = configuration.gooseServerSecretKey, !secret.isEmpty {
+                authMode = .apiKey
             }
         }
     }

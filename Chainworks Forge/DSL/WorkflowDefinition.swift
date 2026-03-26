@@ -114,10 +114,30 @@ struct FailurePolicy: Codable, Sendable {
 struct ExecutionConfig: Codable, Sendable {
     let singleActiveRunPerIdea: Bool
     let resumePolicy: String
+    /// Proposal 011 (REQ-004): when true, the workflow requires a valid project directory.
+    let requiresProjectAccess: Bool
 
     enum CodingKeys: String, CodingKey {
         case singleActiveRunPerIdea = "single_active_run_per_idea"
         case resumePolicy = "resume_policy"
+        case requiresProjectAccess = "requires_project_access"
+    }
+
+    init(
+        singleActiveRunPerIdea: Bool,
+        resumePolicy: String,
+        requiresProjectAccess: Bool = false
+    ) {
+        self.singleActiveRunPerIdea = singleActiveRunPerIdea
+        self.resumePolicy = resumePolicy
+        self.requiresProjectAccess = requiresProjectAccess
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        singleActiveRunPerIdea = try container.decode(Bool.self, forKey: .singleActiveRunPerIdea)
+        resumePolicy = try container.decode(String.self, forKey: .resumePolicy)
+        requiresProjectAccess = try container.decodeIfPresent(Bool.self, forKey: .requiresProjectAccess) ?? false
     }
 }
 

@@ -6,6 +6,8 @@ import SwiftData
     var title: String
     var body: String
     var attachmentPath: String?
+    /// Proposal 011 (REQ-006): operator-assigned project directory for this idea.
+    var workspaceRootPath: String?
     var createdAt: Date
     var archivedAt: Date?
     var status: IdeaStatus
@@ -18,6 +20,7 @@ import SwiftData
         title: String,
         body: String,
         attachmentPath: String? = nil,
+        workspaceRootPath: String? = nil,
         createdAt: Date = Date(),
         archivedAt: Date? = nil,
         status: IdeaStatus = .draft
@@ -26,6 +29,7 @@ import SwiftData
         self.title = title
         self.body = body
         self.attachmentPath = attachmentPath
+        self.workspaceRootPath = workspaceRootPath
         self.createdAt = createdAt
         self.archivedAt = archivedAt
         self.status = status

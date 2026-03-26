@@ -249,7 +249,7 @@ private struct WorkflowMapOccurrenceRow: View {
                 Text(occurrence.agentTitle)
                     .font(.caption.weight(.semibold))
                 Spacer()
-                Text(occurrence.panel.rawValue.capitalized)
+                Text(occurrence.state.rawValue.capitalized)
                     .font(.caption2)
                     .foregroundStyle(panelColor)
             }
@@ -267,19 +267,17 @@ private struct WorkflowMapOccurrenceRow: View {
     }
 
     private var panelColor: Color {
-        switch occurrence.panel {
-        case .active:
+        switch occurrence.state {
+        case .thinking:
             return .blue
         case .completed:
             return .green
-        case .pending:
+        case .notStarted, .ready, .waitingInput:
             return .secondary
         case .failed:
             return .red
-        case .cancelled:
-            return .gray
         case .skipped:
-            return .secondary
+            return .gray
         }
     }
 }

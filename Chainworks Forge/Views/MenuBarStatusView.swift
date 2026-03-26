@@ -34,7 +34,7 @@ struct MenuBarStatusView: View {
                             Text(run.idea?.title ?? "Run")
                                 .font(.caption)
                                 .lineLimit(1)
-                            Text(run.status.rawValue)
+                            Text(run.presentationStatusLabel)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

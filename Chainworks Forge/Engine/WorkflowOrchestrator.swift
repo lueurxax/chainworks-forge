@@ -14,6 +14,8 @@ struct ApprovalRequest: Identifiable, Sendable {
     /// Artifact names available for review (§5.2, §8.2).
     let precedingArtifacts: [String]
     let requestedAt: Date
+    /// Proposal 007 §11.1: approval policy for tailored gate rendering (e.g. "manual_release").
+    let approvalPolicy: String?
 }
 
 struct LiveExecutionTimelineEntry: Identifiable, Sendable {
@@ -142,10 +144,19 @@ final class WorkflowOrchestrator {
         await executeStateMachine()
     }
 
-    /// Cancel the current execution.
+    /// Cancel the current execution (legacy immediate path — still available for rejection flows).
     func cancel() {
         isCancelled = true
         run.status = .cancelled
+        run.completedAt = run.completedAt ?? Date()
+        isRunning = false
+    }
+
+    /// Proposal 011 — REQ-002: Signal the orchestrator to stop advancing stages
+    /// without directly setting the run to `.cancelled`. The cancellation coordinator
+    /// handles the terminal transition after settlement.
+    func signalCancellation() {
+        isCancelled = true
         isRunning = false
     }
 
@@ -357,7 +368,8 @@ final class WorkflowOrchestrator {
                 stageID: state.id,
                 stageLabel: state.label,
                 precedingArtifacts: Array(producedArtifactNames.sorted()),
-                requestedAt: Date()
+                requestedAt: Date(),
+                approvalPolicy: state.approvalPolicy
             )
             onApprovalRequest?(request)
             return .paused // Will resume when approval is resolved
@@ -464,6 +476,20 @@ final class WorkflowOrchestrator {
             providerBinding: providerBindingsByAgentID[agent.id]
         )
 
+        // Proposal 007 REQ-008 / REQ-011: Route release agents through ReleaseOpsCoordinator
+        // for delivery-configured runs instead of the generic executor path.
+        if let config = deliveryConfig,
+           (agent.id == "commit_and_push_to_github" || agent.id == "build_archive_and_push_connect") {
+            return await executeReleaseAgentTask(
+                agent: agent,
+                agentExec: agentExec,
+                stageExec: stageExec,
+                state: state,
+                deliveryConfig: config,
+                inputData: inputData
+            )
+        }
+
         // Execute off-MainActor, marshal results back
         let result: AgentResult
         do {
@@ -550,6 +576,157 @@ final class WorkflowOrchestrator {
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
+    }
+
+    // MARK: - Release Agent Execution (Proposal 007 REQ-008 / REQ-011)
+
+    /// Route release agents through deterministic ReleaseOpsCoordinator services
+    /// instead of the generic executor path. Persists receipts as artifacts and
+    /// handles partial failure per §9.4.
+    private func executeReleaseAgentTask(
+        agent: ResolvedAgent,
+        agentExec: AgentExecution,
+        stageExec: StageExecution,
+        state: ExecutableState,
+        deliveryConfig: DeliveryConfiguration,
+        inputData: [String: Data]
+    ) async -> Bool {
+        guard let worktreeRoot = workspace.worktreeRoot else {
+            agentExec.status = .failed
+            agentExec.completedAt = Date()
+            agentExec.logSnippet = "Release agent requires a provisioned worktree but none is available."
+            unregisterLiveExecution(agentExec, for: agent.id)
+            stageExec.status = .failed
+            return false
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        // Build commit message from approved_proposal artifact name
+        let proposalName = producedArtifactNames.first(where: { $0.contains("proposal") }) ?? "approved_proposal"
+        let commitMessage = "[\(deliveryConfig.repoIdentifier)] Apply \(proposalName) via Chainworks Forge"
+
+        if agent.id == "commit_and_push_to_github" {
+            let gitService = GitReleaseService()
+            do {
+                let (manifest, receipt) = try await gitService.commitAndPush(
+                    worktreeRoot: worktreeRoot,
+                    targetBranch: deliveryConfig.targetBranch,
+                    commitMessage: commitMessage
+                )
+
+                // Persist release_manifest and git_push_receipt as artifacts
+                var outputs: [String: Data] = [:]
+                if let manifestData = try? encoder.encode(manifest) {
+                    outputs["release_manifest"] = manifestData
+                }
+                if let receiptData = try? encoder.encode(receipt) {
+                    outputs["git_push_receipt"] = receiptData
+                }
+
+                let artifacts = try artifactManager.persistOutputs(
+                    outputs: outputs,
+                    agent: agent,
+                    agentExecution: agentExec,
+                    workspace: workspace,
+                    stageID: state.id,
+                    iteration: currentIteration(for: state.id),
+                    attemptNumber: 1,
+                    catalog: catalog
+                )
+                for artifact in artifacts {
+                    producedArtifactNames.insert(artifact.name)
+                }
+
+                agentExec.status = .completed
+                agentExec.completedAt = Date()
+                agentExec.logSnippet = "GitReleaseService: commit \(manifest.commitSHA.prefix(8)) pushed to \(manifest.branch)"
+                unregisterLiveExecution(agentExec, for: agent.id)
+                return true
+            } catch {
+                // REQ-011: Persist any partial receipts and propagate failure
+                agentExec.status = .failed
+                agentExec.completedAt = Date()
+                agentExec.logSnippet = "GitReleaseService failed: \(error.localizedDescription)"
+                stageExec.status = .failed
+                unregisterLiveExecution(agentExec, for: agent.id)
+                return false
+            }
+        } else if agent.id == "build_archive_and_push_connect" {
+            // Requires git_push_receipt and release_manifest from prior agent
+            guard let receiptData = inputData["git_push_receipt"],
+                  let manifestData = inputData["release_manifest"] else {
+                agentExec.status = .failed
+                agentExec.completedAt = Date()
+                agentExec.logSnippet = "ConnectPublishService requires git_push_receipt and release_manifest inputs."
+                stageExec.status = .failed
+                unregisterLiveExecution(agentExec, for: agent.id)
+                return false
+            }
+
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            do {
+                let gitReceipt = try decoder.decode(GitReleaseService.GitPushReceipt.self, from: receiptData)
+                let releaseManifest = try decoder.decode(GitReleaseService.ReleaseManifest.self, from: manifestData)
+
+                let publishService = ConnectPublishService()
+                let (bundle, uploadReceipt) = try await publishService.buildArchiveAndUpload(
+                    worktreeRoot: worktreeRoot,
+                    gitPushReceipt: gitReceipt,
+                    releaseManifest: releaseManifest,
+                    releaseTargetID: deliveryConfig.releaseTargetID,
+                    releaseMode: deliveryConfig.releaseMode
+                )
+
+                // Persist release_bundle_manifest and connect_upload_receipt as artifacts
+                var outputs: [String: Data] = [:]
+                if let bundleData = try? encoder.encode(bundle) {
+                    outputs["release_bundle_manifest"] = bundleData
+                }
+                if let uploadData = try? encoder.encode(uploadReceipt) {
+                    outputs["connect_upload_receipt"] = uploadData
+                }
+
+                let artifacts = try artifactManager.persistOutputs(
+                    outputs: outputs,
+                    agent: agent,
+                    agentExecution: agentExec,
+                    workspace: workspace,
+                    stageID: state.id,
+                    iteration: currentIteration(for: state.id),
+                    attemptNumber: 1,
+                    catalog: catalog
+                )
+                for artifact in artifacts {
+                    producedArtifactNames.insert(artifact.name)
+                }
+
+                agentExec.status = .completed
+                agentExec.completedAt = Date()
+                agentExec.logSnippet = "ConnectPublishService: bundle \(bundle.bundleVersion) uploaded to \(uploadReceipt.destination)"
+                unregisterLiveExecution(agentExec, for: agent.id)
+                return true
+            } catch {
+                // REQ-011: Persist partial receipts (git_push_receipt already persisted by prior agent)
+                // and propagate failure so run becomes .blocked via existing failure handling
+                agentExec.status = .failed
+                agentExec.completedAt = Date()
+                agentExec.logSnippet = "ConnectPublishService failed: \(error.localizedDescription)"
+                stageExec.status = .failed
+                unregisterLiveExecution(agentExec, for: agent.id)
+                return false
+            }
+        }
+
+        // Fallback: should not reach here for known release agents
+        agentExec.status = .failed
+        agentExec.completedAt = Date()
+        agentExec.logSnippet = "Unknown release agent: \(agent.id)"
+        unregisterLiveExecution(agentExec, for: agent.id)
+        return false
     }
 
     /// Execute tasks in parallel with proper actor isolation.
@@ -788,7 +965,8 @@ final class WorkflowOrchestrator {
             stageID: state.id,
             stageLabel: state.label,
             precedingArtifacts: Array(producedArtifactNames.sorted()),
-            requestedAt: approval.requestedAt
+            requestedAt: approval.requestedAt,
+            approvalPolicy: state.approvalPolicy
         )
         onApprovalRequest?(request)
         return true

@@ -46,6 +46,13 @@ struct RunReportView: View {
             .padding(.vertical, 4)
             .background(selectedTab == .latestSummary ? Color.orange.opacity(0.05) : Color.green.opacity(0.05))
 
+            HStack {
+                ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.top, 4)
+
             Divider()
 
             // Content

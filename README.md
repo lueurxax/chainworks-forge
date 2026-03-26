@@ -103,6 +103,9 @@ For the current MVP slice, the system is intended to support:
 - [Live provider execution slice](docs/reference/live-provider-execution-slice.md)
 - [Operator experience baseline](docs/reference/operator-experience.md)
 - [Provider platform baseline](docs/reference/provider-platform.md)
+- [Idea lifecycle baseline](docs/reference/idea-lifecycle.md)
+- [Goose provider remediation baseline](docs/reference/goose-provider-remediation.md)
+- [Live workflow map baseline](docs/reference/live-workflow-map.md)
 - [Proposal 002: Workflow execution engine](docs/proposals/002-workflow-execution-engine.md)
 - [Proposal 003: Forge Steward](docs/proposals/003-forge-steward-sdlc-health-and-adaptation.md)
 

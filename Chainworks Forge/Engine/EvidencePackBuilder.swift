@@ -61,7 +61,7 @@ final class EvidencePackBuilder {
             itemCount += 1
         }
 
-        // 4. Copy all artifacts
+        // 4. Copy ALL artifacts organized by category
         let artifactsDir = packDir.appendingPathComponent("artifacts", isDirectory: true)
         try fm.createDirectory(at: artifactsDir, withIntermediateDirectories: true)
 
@@ -80,7 +80,40 @@ final class EvidencePackBuilder {
             }
         }
 
-        // 5. Stage execution summary
+        // 5. Named deliverables directory (§12.2 explicit promised items)
+        let deliverablesDir = packDir.appendingPathComponent("deliverables", isDirectory: true)
+        try fm.createDirectory(at: deliverablesDir, withIntermediateDirectories: true)
+
+        let namedDeliverables: [(artifactName: String, deliverableName: String)] = [
+            ("proposal_current", "proposal-draft.json"),
+            ("approved_proposal", "approved-proposal.json"),
+            ("implementation_review_summary", "implementation-review-summary.json"),
+            ("docs_report", "docs-report.json"),
+            ("docs_delta", "docs-delta.json"),
+            ("security_report", "security-report.json"),
+            ("audit_report", "audit-report.json"),
+            ("prepush_review_report", "prepush-review-report.json"),
+            ("changed_files_manifest", "diff-summary.json"),
+            ("release_manifest", "release-manifest.json"),
+            ("git_push_receipt", "git-push-receipt.json"),
+            ("release_bundle_manifest", "release-bundle-manifest.json"),
+            ("connect_upload_receipt", "connect-upload-receipt.json"),
+            ("delivery_receipt", "delivery-receipt.json"),
+            ("run_report", "run-report.json"),
+            ("tests_result", "tests-result.json"),
+            ("orchestrator_summary", "orchestrator-summary.json")
+        ]
+
+        for (artifactName, deliverableName) in namedDeliverables {
+            if let artifact = allArtifacts.last(where: { $0.name == artifactName }),
+               fm.fileExists(atPath: artifact.filePath) {
+                let destPath = deliverablesDir.appendingPathComponent(deliverableName)
+                try? fm.copyItem(atPath: artifact.filePath, toPath: destPath.path)
+                itemCount += 1
+            }
+        }
+
+        // 6. Stage execution summary
         let stageSummary = run.stageExecutions
             .sorted { $0.startedAt < $1.startedAt }
             .map { stage -> [String: Any] in
@@ -100,7 +133,31 @@ final class EvidencePackBuilder {
             itemCount += 1
         }
 
-        // 6. Screenshot checklist template
+        // 7. Agent execution detail
+        let agentDetail = run.stageExecutions
+            .sorted { $0.startedAt < $1.startedAt }
+            .flatMap { stage in
+                stage.agentExecutions.map { agent -> [String: Any] in
+                    [
+                        "stageID": stage.stageID,
+                        "agentID": agent.agentID,
+                        "agentTitle": agent.agentTitle,
+                        "taskName": agent.taskName,
+                        "status": agent.status.rawValue,
+                        "provider": agent.provider ?? "unknown",
+                        "costCents": agent.costCents ?? 0,
+                        "repoRevisionBefore": agent.repoRevisionBefore ?? "none",
+                        "repoRevisionAfter": agent.repoRevisionAfter ?? "none"
+                    ] as [String: Any]
+                }
+            }
+
+        if let agentData = try? JSONSerialization.data(withJSONObject: agentDetail, options: [.prettyPrinted, .sortedKeys]) {
+            try agentData.write(to: packDir.appendingPathComponent("agent-execution-detail.json"))
+            itemCount += 1
+        }
+
+        // 8. Screenshot checklist template
         let checklist = """
         # Evidence Pack Screenshot Checklist
 

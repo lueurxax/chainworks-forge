@@ -67,12 +67,12 @@ struct ArtifactValidationTests {
                     transitions: [
                         ExecutableTransition(to: "end", condition: .artifactExists("required_report"))
                     ],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "empty_agent", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",
@@ -132,12 +132,12 @@ struct ArtifactValidationTests {
                         // This transition requires "missing_artifact" which a1 does NOT produce
                         ExecutableTransition(to: "end", condition: .artifactExists("missing_artifact"))
                     ],
-                    approvalRequired: false, loop: nil
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [], approvalRequired: false, loop: nil
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 )
             ],
             initialStateID: "start",

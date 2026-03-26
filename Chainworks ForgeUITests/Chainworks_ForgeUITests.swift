@@ -320,6 +320,87 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "P006_Settings_Export")
     }
 
+    func testGooseAssistantSurface() throws {
+        let app = makeApp(
+            initialTab: "Settings",
+            directSurface: "goose_assistant"
+        )
+        launchClean(app)
+
+        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
+        let assistantTitle = app.staticTexts["goose-assistant-title"].firstMatch
+        XCTAssertTrue(
+            assistantRoot.waitForExistence(timeout: 20)
+            || assistantTitle.waitForExistence(timeout: 20),
+            "Goose connection assistant surface must render"
+        )
+
+        let probeButton = app.buttons["goose-assistant-run-probe"].firstMatch
+        XCTAssertTrue(probeButton.waitForExistence(timeout: 20), "Assistant must expose handshake probe action")
+        probeButton.click()
+
+        let stateBadge = anyElement(app, identifier: "goose-assistant-state")
+        XCTAssertTrue(stateBadge.waitForExistence(timeout: 20), "Assistant must expose journey state")
+        screenshot(app, name: "P010_Goose_Assistant")
+    }
+
+    func testGooseAssistantOpensFromProviderSettings() throws {
+        let app = makeApp(
+            initialTab: "Settings",
+            directSurface: "provider_settings"
+        )
+        launchClean(app)
+
+        let surfaceReady = anyElement(app, identifier: "provider-settings-surface-ready")
+        XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "Provider settings direct surface must finish bootstrap")
+
+        let openAssistant = app.buttons["provider-settings-open-assistant-codex"].firstMatch
+        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Provider settings must expose Goose assistant entry")
+        openAssistant.click()
+
+        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
+        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Settings must open the Goose assistant owner path")
+        XCTAssertTrue(app.buttons["goose-assistant-save-and-verify"].firstMatch.waitForExistence(timeout: 20))
+    }
+
+    func testGooseAssistantOpensFromFirstRunWizard() throws {
+        let app = makeApp(
+            initialTab: "Settings",
+            directSurface: "first_run_setup"
+        )
+        launchClean(app)
+
+        let wizardReady = anyElement(app, identifier: "first-run-setup-surface-ready")
+        XCTAssertTrue(wizardReady.waitForExistence(timeout: 20), "First Run Wizard direct surface must finish bootstrap")
+
+        let openAssistant = app.buttons["first-run-open-assistant-codex"].firstMatch
+        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Wizard must expose Goose assistant entry")
+        openAssistant.click()
+
+        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
+        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Wizard must hand off into the Goose assistant")
+        XCTAssertTrue(app.buttons["goose-assistant-return"].firstMatch.waitForExistence(timeout: 20))
+    }
+
+    func testGooseAssistantOpensFromPilotReadiness() throws {
+        let app = makeApp(
+            initialTab: "Pilot Readiness",
+            directSurface: "pilot_readiness"
+        )
+        launchClean(app)
+
+        let surfaceReady = anyElement(app, identifier: "pilot-readiness-surface-ready")
+        XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "Pilot readiness direct surface must finish bootstrap")
+
+        let openAssistant = app.buttons["pilot-readiness-open-assistant-codex"].firstMatch
+        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Pilot readiness must expose Goose assistant handoff")
+        openAssistant.click()
+
+        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
+        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Pilot readiness must open the Goose assistant")
+        XCTAssertTrue(anyElement(app, identifier: "provider-setup-evidence-panel").waitForExistence(timeout: 20))
+    }
+
     func testPilotReadinessRefreshSurface() throws {
         let app = makeApp(
             initialTab: "Pilot Readiness",
@@ -410,9 +491,20 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
         let startRun = StartRunScreen(app: app)
-
-        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
-                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        let ideasRoot = anyElement(app, identifier: "ideas-root-view")
+        let ideasArchiveButton = app.buttons["ideas-open-archive"].firstMatch
+        let seededIdeaRow = ideas.findRow("Sheet Test")
+        if !(ideasRoot.waitForExistence(timeout: 10)
+             || ideasArchiveButton.waitForExistence(timeout: 10)
+             || seededIdeaRow.waitForExistence(timeout: 10)) {
+            _ = screen.selectTab("Ideas", timeout: 10)
+        }
+        XCTAssertTrue(
+            ideasRoot.waitForExistence(timeout: 10)
+                || ideasArchiveButton.waitForExistence(timeout: 10)
+                || seededIdeaRow.waitForExistence(timeout: 10),
+            "Ideas owner path must be reachable for seeded launches"
+        )
 
         XCTAssertTrue(ideas.openStartRunSheet(for: "Sheet Test"),
                       "Start Run sheet must be reachable for seeded idea")
@@ -464,56 +556,49 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     /// Verifies the Run Progress view renders its expected sections after starting a run.
     func testRunProgressViewSurface() throws {
-        let app = makeApp(seededIdeaTitle: "RunProgressTest", liveFixture: true)
+        let app = makeApp(
+            seededIdeaTitle: "RunProgressTest",
+            initialTab: "Ideas",
+            seedWaitingApprovalRun: true
+        )
         launchClean(app)
 
-        let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
-        let startRun = StartRunScreen(app: app)
         let progress = RunProgressScreen(app: app)
+        let ideasRoot = anyElement(app, identifier: "ideas-root-view")
+        let ideasArchiveButton = app.buttons["ideas-open-archive"].firstMatch
+        let seededIdeaRow = ideas.findRow("RunProgressTest")
+        XCTAssertTrue(
+            ideasRoot.waitForExistence(timeout: 10)
+                || ideasArchiveButton.waitForExistence(timeout: 10)
+                || seededIdeaRow.waitForExistence(timeout: 10),
+            "Ideas owner path must be reachable for seeded runs"
+        )
+        XCTAssertTrue(ideas.openIdea(named: "RunProgressTest"),
+                      "Seeded idea must open so the inline run progress surface can render")
 
-        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
-                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        let progressVisible = progress.isVisible(timeout: 10)
+        let foundRunEntry = progress.hasRunStatus(timeout: 5)
 
-        XCTAssertTrue(ideas.openStartRunSheet(for: "RunProgressTest"),
-                      "Start Run sheet must be reachable for seeded idea")
-        _ = startRun.selectLiveMode() // best-effort
-
-        // Wait for compilation then start run
-        let startRunBtn = startRun.startRunButton
-        _ = startRunBtn.waitForExistence(timeout: 15)
-
-        if startRunBtn.exists && startRunBtn.isEnabled {
-            startRunBtn.click()
-            let progressVisible = progress.openIfNeeded(workflowTitle: "Proposal Loop (Live)")
-
-            // Look for the run status label (any status from the RunStatus enum)
-            let foundRunEntry = progress.hasRunStatus(timeout: 2)
-
-            if foundRunEntry {
-                screenshot(app, name: "REQ011_RunProgress_Entry")
-            }
-
-            // Look for run progress view sections
-            let hasOverview = progressVisible || progress.waitForSection("Overview") || progress.hasSection("Current Phase")
-            if hasOverview {
-                screenshot(app, name: "REQ011_RunProgress_Overview")
-            }
-
-            let hasSections = progressVisible
-                || hasOverview
-                || progress.hasSection("Stages")
-                || progress.hasSection("Live Timeline")
-                || progress.hasSection("Active Agents")
-                || progress.hasSection("Artifacts")
-            XCTAssertTrue(hasSections || foundRunEntry,
-                          "Run progress view must show at least one expected section or a run entry")
-            screenshot(app, name: "REQ011_RunProgress_Sections")
-        } else {
-            // Compilation failed (no workflow.yaml available) — skip gracefully
-            startRun.dismiss()
-            try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
+        if foundRunEntry {
+            screenshot(app, name: "REQ011_RunProgress_Entry")
         }
+
+        let hasOverview = progressVisible || progress.waitForSection("Overview") || progress.hasSection("Current Phase")
+        if hasOverview {
+            screenshot(app, name: "REQ011_RunProgress_Overview")
+        }
+
+        let hasSections = progressVisible
+            || hasOverview
+            || progress.hasSection("Stages")
+            || progress.hasSection("Live Timeline")
+            || progress.hasSection("Active Agents")
+            || progress.hasSection("Artifacts")
+            || progress.hasSection("Approval Gate")
+        XCTAssertTrue(hasSections || foundRunEntry,
+                      "Run progress view must show at least one expected section or a run entry")
+        screenshot(app, name: "REQ011_RunProgress_Sections")
     }
 
     // MARK: - REQ-011: Approval Gate View Surface

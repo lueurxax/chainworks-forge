@@ -136,6 +136,7 @@ private struct OverrideRow: View {
         states: [:], initialStateID: "s1",
         agentBindings: agents, variables: [:],
         scoring: nil, failurePolicy: nil,
+        requiresProjectAccess: false,
         workflowSnapshotHash: "abc", catalogSnapshotHash: "def",
         workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
         planCompilerVersion: 1

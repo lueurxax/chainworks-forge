@@ -7,6 +7,7 @@ struct PilotReadinessView: View {
     @Environment(AppConfigurationStore.self) private var appConfigurationStore
     @Environment(ProviderSettingsStore.self) private var providerSettingsStore
     @Environment(ProviderRegistry.self) private var providerRegistry
+    @Environment(GooseServerManager.self) private var gooseServerManager
 
     @Query(sort: \Run.startedAt, order: .reverse) private var runs: [Run]
     @State private var exportMessage: String?
@@ -14,6 +15,7 @@ struct PilotReadinessView: View {
     @State private var readinessReport: PreflightReport?
     @State private var showWizard = false
     @State private var showPreflightReport = false
+    @State private var selectedAssistantProviderID: UUID?
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
     var body: some View {
@@ -36,9 +38,25 @@ struct PilotReadinessView: View {
                     LabeledContent("Workflow", value: appConfigurationStore.configuration.workflowSourcePath)
                     LabeledContent("Catalog", value: appConfigurationStore.configuration.agentCatalogSourcePath)
                     LabeledContent("Run Storage", value: appConfigurationStore.configuration.runStorageBasePath)
+                    if let gooseBaseURL = appConfigurationStore.configuration.gooseServerBaseURL {
+                        LabeledContent("Goose Base URL", value: gooseBaseURL.absoluteString)
+                    }
                     if let worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath {
                         LabeledContent("Worktree Base", value: worktreeBasePath)
                     }
+                }
+
+                Section("Managed Goose Server") {
+                    LabeledContent("State", value: gooseServerManager.statusSummary)
+                        .accessibilityIdentifier("pilot-readiness-goose-state")
+                    LabeledContent("Autostart", value: appConfigurationStore.configuration.gooseServerAutostart ? "Enabled" : "Disabled")
+                    Button("Start Managed Server") {
+                        Task {
+                            await gooseServerManager.ensureRunning()
+                            await refreshReadiness()
+                        }
+                    }
+                    .accessibilityIdentifier("pilot-readiness-start-goose")
                 }
 
                 Section("Providers") {
@@ -79,6 +97,13 @@ struct PilotReadinessView: View {
                                 }
                                 if let report = providerRegistry.troubleshootingReport(for: provider.id) {
                                     ProviderTroubleshootingPanel(report: report)
+                                }
+                                if provider.family.gooseFirstPreferred {
+                                    Button("Open Goose Assistant") {
+                                        selectedAssistantProviderID = provider.id
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .accessibilityIdentifier("pilot-readiness-open-assistant-\(provider.family.rawValue)")
                                 }
                             }
                         }
@@ -218,6 +243,7 @@ struct PilotReadinessView: View {
                     .environment(appConfigurationStore)
                     .environment(providerSettingsStore)
                     .environment(providerRegistry)
+                    .environment(gooseServerManager)
             }
             .sheet(isPresented: $showPreflightReport) {
                 if let readinessReport {
@@ -230,6 +256,21 @@ struct PilotReadinessView: View {
                             }
                     }
                     .frame(minWidth: 520, minHeight: 420)
+                }
+            }
+            .sheet(isPresented: Binding(
+                get: { selectedAssistantProviderID != nil },
+                set: { if !$0 { selectedAssistantProviderID = nil } }
+            )) {
+                if let selectedAssistantProviderID {
+                    GooseProviderConnectionAssistantView(
+                        providerID: selectedAssistantProviderID,
+                        origin: .pilotReadiness
+                    )
+                        .environment(appConfigurationStore)
+                        .environment(providerSettingsStore)
+                        .environment(providerRegistry)
+                        .environment(gooseServerManager)
                 }
             }
         }
@@ -316,6 +357,7 @@ struct PilotReadinessView: View {
     let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
     let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+    let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
 
     return PilotReadinessView()
         .modelContainer(container)
@@ -323,5 +365,6 @@ struct PilotReadinessView: View {
         .environment(appConfigurationStore)
         .environment(providerSettingsStore)
         .environment(providerRegistry)
+        .environment(gooseServerManager)
         .frame(width: 1100, height: 820)
 }

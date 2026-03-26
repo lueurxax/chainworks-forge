@@ -35,6 +35,9 @@ struct ReleaseGateView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
+                    // Above-the-fold: diff stat, spend, and change summary
+                    diffStatAndSpendSection
+
                     // Proposal summary
                     releaseContextSection
 
@@ -46,6 +49,9 @@ struct ReleaseGateView: View {
 
                     // Release target
                     releaseTargetSection
+
+                    // Quick actions for decision context
+                    quickActionsSection
                 }
                 .padding(.bottom, 20)
             }
@@ -188,6 +194,114 @@ struct ReleaseGateView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var diffStatAndSpendSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Change Summary", systemImage: "chart.bar.doc.horizontal")
+                    .font(.headline)
+
+                let allArtifacts = run.stageExecutions
+                    .flatMap(\.agentExecutions)
+                    .flatMap(\.artifacts)
+
+                // Diff stat
+                if let changedFiles = allArtifacts.first(where: { $0.name == "changed_files_manifest" }) {
+                    LabeledContent("Changed Files") {
+                        Text("Available")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                } else {
+                    LabeledContent("Changed Files") {
+                        Text("Not yet produced")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // Implementation loop iterations
+                if let implCount = run.loopCounters["implementation_progress_count"] {
+                    LabeledContent("Implementation Iterations") {
+                        Text("\(implCount)")
+                    }
+                }
+                if let revisionCount = run.loopCounters["implementation_revision_count"] {
+                    LabeledContent("Refinement Cycles") {
+                        Text("\(revisionCount)")
+                    }
+                }
+
+                // Spend
+                LabeledContent("Spend to Date") {
+                    if let cost = run.totalCostCents {
+                        Text("\(cost) cents")
+                            .font(.system(.body, design: .monospaced))
+                    } else {
+                        Text("Estimated / unavailable")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // Elapsed time
+                let elapsed = run.completedAt ?? Date()
+                let duration = elapsed.timeIntervalSince(run.startedAt)
+                let minutes = Int(duration) / 60
+                let seconds = Int(duration) % 60
+                LabeledContent("Elapsed") {
+                    Text("\(minutes)m \(seconds)s")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var quickActionsSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Decision Context", systemImage: "doc.text.magnifyingglass")
+                    .font(.headline)
+
+                let allArtifacts = run.stageExecutions
+                    .flatMap(\.agentExecutions)
+                    .flatMap(\.artifacts)
+
+                let contextArtifacts: [(name: String, label: String, icon: String)] = [
+                    ("approved_proposal", "Open Proposal", "doc.text"),
+                    ("changed_files_manifest", "Open Diff Summary", "doc.text.magnifyingglass"),
+                    ("docs_delta", "Open Docs Delta", "doc.richtext"),
+                    ("implementation_review_summary", "Open Review Summary", "checklist"),
+                    ("security_report", "Open Security Report", "lock.shield"),
+                    ("audit_report", "Open Audit Report", "checkmark.rectangle.stack"),
+                    ("prepush_review_report", "Open Pre-Push Review", "arrow.up.doc"),
+                    ("delivery_receipt", "Open Receipts/Report", "doc.badge.checkmark")
+                ]
+
+                ForEach(contextArtifacts, id: \.name) { item in
+                    let exists = allArtifacts.contains { $0.name == item.name }
+                    HStack {
+                        Label(item.label, systemImage: item.icon)
+                            .foregroundStyle(exists ? .primary : .secondary)
+                        Spacer()
+                        if exists {
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("—")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .font(.callout)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

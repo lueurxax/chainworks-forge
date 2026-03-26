@@ -15,17 +15,28 @@ struct UITestIdeaArchiveSurface: View {
     }
 
     var body: some View {
-        Group {
+        ZStack(alignment: .topLeading) {
+            Color(nsColor: .windowBackgroundColor)
+
             if let seededIdea {
-                IdeaDetailView(idea: seededIdea)
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Archive proof surface")
+                        .font(.headline)
+                        .accessibilityIdentifier("ui-test-idea-archive-surface-banner")
+
+                    IdeaDetailView(idea: seededIdea)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else {
                 ContentUnavailableView(
                     "Seeded idea unavailable",
                     systemImage: "archivebox",
                     description: Text("The UI test archive surface requires a seeded idea.")
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
         }
+        .frame(minWidth: 960, minHeight: 760)
         .accessibilityIdentifier("ui-test-idea-archive-surface")
     }
 }
@@ -63,7 +74,7 @@ struct UITestWorkflowMapSurface: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(targetRun.workflowTitle)
                                 .font(.title2.bold())
-                            Text("Status: \(targetRun.status.rawValue)")
+                            Text("Status: \(targetRun.presentationStatusLabel)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -97,5 +108,38 @@ struct UITestWorkflowMapSurface: View {
             }
         }
         .accessibilityIdentifier("ui-test-workflow-map-surface")
+    }
+}
+
+struct UITestGooseAssistantSurface: View {
+    @Environment(ProviderSettingsStore.self) private var providerSettingsStore
+    @Environment(AppConfigurationStore.self) private var appConfigurationStore
+    @Environment(ProviderRegistry.self) private var providerRegistry
+    @Environment(GooseServerManager.self) private var gooseServerManager
+
+    private var targetProvider: ConfiguredProvider? {
+        providerSettingsStore.settings.configuredProviders.first(where: { $0.family.gooseFirstPreferred })
+    }
+
+    var body: some View {
+        Group {
+            if let targetProvider {
+                GooseProviderConnectionAssistantView(
+                    providerID: targetProvider.id,
+                    origin: .providerSettings
+                )
+                    .environment(appConfigurationStore)
+                    .environment(providerSettingsStore)
+                    .environment(providerRegistry)
+                    .environment(gooseServerManager)
+            } else {
+                ContentUnavailableView(
+                    "Goose assistant unavailable",
+                    systemImage: "server.rack",
+                    description: Text("The UI test Goose assistant surface requires at least one Goose-first provider.")
+                )
+            }
+        }
+        .accessibilityIdentifier("ui-test-goose-assistant-surface")
     }
 }

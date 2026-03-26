@@ -33,6 +33,12 @@ enum PreviewSupport {
                 workflowSourcePath: "/Users/user/Documents/Chainworks Forge/examples/workflows/workflow.yaml",
                 agentCatalogSourcePath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml",
                 supportBundleExportPath: "/Users/user/Library/Application Support/Chainworks Forge/exports",
+                gooseServerHost: "127.0.0.1",
+                gooseServerPort: 51200,
+                gooseServerTLS: true,
+                gooseServerAutostart: true,
+                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
+                gooseServerSecretKey: "preview-secret",
                 activeConfigurationSource: .persistedSettings
             )
         )
@@ -375,6 +381,15 @@ enum PreviewSupport {
                 agentStatus: .cancelled,
                 logSnippet: "Run cancelled."
             )
+        case .cancelling:
+            return PreviewStateMapping(
+                stageID: "state_3_proposal_reviewed",
+                stageStatus: .running,
+                agentID: "proposal_reviewer_ux",
+                taskName: "review_proposal_from_ux_perspective",
+                agentStatus: .running,
+                logSnippet: "Cancellation in progress\u{2026}"
+            )
         }
     }
 
@@ -606,6 +621,7 @@ enum PreviewSupport {
         case .completed: return .completed
         case .failed: return .failed
         case .cancelled: return .skipped
+        case .cancelling: return .running
         }
     }
 
@@ -617,6 +633,7 @@ enum PreviewSupport {
         case .completed: return .completed
         case .failed: return .failed
         case .cancelled: return .cancelled
+        case .cancelling: return .running
         }
     }
 }

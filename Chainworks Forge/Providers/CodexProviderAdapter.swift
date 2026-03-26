@@ -3,6 +3,13 @@ import Foundation
 struct CodexProviderAdapter: ProviderAdapter {
     let family: ProviderFamily = .codex
     let adapterVersion = "codex-v1"
+    private let gooseProbe: @Sendable (URL) async -> GooseServerReachability
+
+    init(
+        gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = ProviderAdapterSupport.probeGooseServerStatus
+    ) {
+        self.gooseProbe = gooseProbe
+    }
 
     func verify(provider: ConfiguredProvider, secretStore: KeychainSecretStore) async -> ProviderHealthSnapshot {
         switch provider.transport {
@@ -23,7 +30,8 @@ struct CodexProviderAdapter: ProviderAdapter {
             return await ProviderAdapterSupport.verifyGooseServerProvider(
                 provider: provider,
                 summaryPrefix: "Codex",
-                secretStore: secretStore
+                secretStore: secretStore,
+                gooseProbe: gooseProbe
             )
         }
     }

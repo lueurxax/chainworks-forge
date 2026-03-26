@@ -100,7 +100,10 @@ struct AppScreen {
         case "Runs Home":
             return app.otherElements["runs-home-list"].exists
         case "Ideas":
-            return app.otherElements["ideas-root-view"].exists || app.otherElements["idea-list"].exists
+            return app.otherElements["ideas-root-view"].exists
+                || app.otherElements["idea-list"].exists
+                || app.buttons["ideas-open-archive"].exists
+                || app.buttons["ideas-summary-open-archive"].exists
         case "Approvals":
             return app.otherElements["approval-inbox-view"].exists
                 || app.otherElements["approval-inbox-empty-state"].exists
