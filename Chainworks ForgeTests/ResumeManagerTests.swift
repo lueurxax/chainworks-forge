@@ -179,7 +179,7 @@ struct ResumeManagerTests {
         #expect(service.hasActiveRuns)
         #expect(service.orchestrator(for: run.id) != nil)
 
-        service.cancelRun(runID: run.id)
+        await service.cancelRun(runID: run.id)
     }
 
     @Test("ExecutionService cancel run")
@@ -192,7 +192,7 @@ struct ResumeManagerTests {
         service.startRun(run: run, plan: plan, workspace: workspace)
         #expect(service.hasActiveRuns)
 
-        service.cancelRun(runID: run.id)
+        await service.cancelRun(runID: run.id)
         #expect(!service.hasActiveRuns)
         #expect(run.status == .cancelled)
     }
@@ -209,7 +209,7 @@ struct ResumeManagerTests {
 
         #expect(service.activeOrchestrators.count == 1)
 
-        service.cancelRun(runID: run.id)
+        await service.cancelRun(runID: run.id)
     }
 
     // MARK: - Live Executor Routing
@@ -281,7 +281,7 @@ struct ResumeManagerTests {
         }
         #expect(orchestrator.executor is GooseAgentExecutor)
 
-        service.cancelRun(runID: run.id)
+        await service.cancelRun(runID: run.id)
     }
 
     @Test("ExecutionService blocks live workflow without runtime config")

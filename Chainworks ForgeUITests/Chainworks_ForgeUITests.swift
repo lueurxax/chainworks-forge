@@ -482,6 +482,36 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "P010_WorkflowMap_Fallback")
     }
 
+    func testReleaseGateSurfaceShowsDecisionContextActions() throws {
+        let app = makeApp(directSurface: "release_gate")
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-release_gate")
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "Release gate direct surface must finish bootstrap"
+        )
+
+        let releaseGate = anyElement(app, identifier: "release-gate-view")
+        let decisionContext = anyElement(app, identifier: "release-gate-decision-context")
+        XCTAssertTrue(
+            releaseGate.waitForExistence(timeout: 20)
+                || decisionContext.waitForExistence(timeout: 20),
+            "Release gate surface must render the manual release gate owner pane"
+        )
+
+        XCTAssertTrue(
+            app.buttons["release-gate-open-approved_proposal"].firstMatch.waitForExistence(timeout: 10),
+            "Release gate must expose a real action for opening the approved proposal"
+        )
+        XCTAssertTrue(
+            app.buttons["release-gate-open-delivery_receipt"].firstMatch.waitForExistence(timeout: 10),
+            "Release gate must expose a real action for opening the delivery receipt"
+        )
+
+        screenshot(app, name: "P007_ReleaseGate")
+    }
+
     // MARK: - REQ-011: Start Run Sheet UI
 
     func testStartRunSheetUI() throws {

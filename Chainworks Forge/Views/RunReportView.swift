@@ -1,10 +1,14 @@
 import SwiftUI
 import SwiftData
 
-// MARK: - P005-OPS §6: Run Report View
+// MARK: - P005-OPS §6 + Proposal 008 §7.3–7.4: Run Report View
 
-/// Displays immutable run reports and latest summary.
-/// Clearly labels whether operator is reading immutable history or latest summary (§6.2).
+/// Displays immutable run reports, latest summary, completed-run export hub,
+/// and MVP sign-off summary.
+///
+/// Proposal 008 additions:
+/// - Export Hub tab (§7.3): dominant summary, receipts, evidence-pack status, export actions
+/// - Sign-Off Summary tab (§7.4): cohort/pair comparison, GO/HOLD result
 struct RunReportView: View {
     let run: Run
     @Environment(\.modelContext) private var modelContext
@@ -16,13 +20,15 @@ struct RunReportView: View {
     enum ReportTab: String, CaseIterable {
         case latestSummary = "Latest Summary"
         case immutableHistory = "Immutable History"
+        case exportHub = "Export Hub"
+        case signOffSummary = "Sign-Off"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Tab picker
             Picker("Report View", selection: $selectedTab) {
-                ForEach(ReportTab.allCases, id: \.self) { tab in
+                ForEach(availableTabs, id: \.self) { tab in
                     Text(tab.rawValue).tag(tab)
                 }
             }
@@ -33,18 +39,16 @@ struct RunReportView: View {
 
             // Trust label
             HStack {
-                Image(systemName: selectedTab == .latestSummary ? "arrow.clockwise" : "lock.fill")
-                Text(selectedTab == .latestSummary
-                     ? "Mutable latest summary — may change on recovery"
-                     : "Immutable history — never overwritten")
+                Image(systemName: trustIcon)
+                Text(trustLabel)
                     .font(.caption)
-                    .foregroundStyle(selectedTab == .latestSummary ? .orange : .green)
+                    .foregroundStyle(trustColor)
                 Spacer()
                 RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
             }
             .padding(.horizontal)
             .padding(.vertical, 4)
-            .background(selectedTab == .latestSummary ? Color.orange.opacity(0.05) : Color.green.opacity(0.05))
+            .background(trustColor.opacity(0.05))
 
             HStack {
                 ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
@@ -59,47 +63,16 @@ struct RunReportView: View {
             ScrollView {
                 switch selectedTab {
                 case .latestSummary:
-                    if let content = summaryContent {
-                        Text(content)
-                            .font(.body.monospaced())
-                            .textSelection(.enabled)
-                            .padding()
-                    } else {
-                        ContentUnavailableView(
-                            "No Summary",
-                            systemImage: "doc.text",
-                            description: Text("No latest summary has been generated yet.")
-                        )
-                    }
+                    latestSummaryContent
 
                 case .immutableHistory:
-                    if reportArtifacts.isEmpty {
-                        ContentUnavailableView(
-                            "No Reports",
-                            systemImage: "doc.text",
-                            description: Text("No immutable reports have been emitted yet.")
-                        )
-                    } else {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(reportArtifacts.sorted(by: {
-                                ($0.reportVersion ?? 0) > ($1.reportVersion ?? 0)
-                            })) { artifact in
-                                ReportVersionRow(artifact: artifact, isSelected: selectedReportContent != nil)
-                                    .onTapGesture {
-                                        loadReportContent(artifact)
-                                    }
-                            }
+                    immutableHistoryContent
 
-                            if let content = selectedReportContent {
-                                Divider()
-                                Text(content)
-                                    .font(.body.monospaced())
-                                    .textSelection(.enabled)
-                                    .padding()
-                            }
-                        }
-                        .padding()
-                    }
+                case .exportHub:
+                    CompletedRunExportHub(run: run)
+
+                case .signOffSummary:
+                    MVPSignOffSummaryView(run: run)
                 }
             }
         }
@@ -108,6 +81,105 @@ struct RunReportView: View {
             loadReportData()
         }
     }
+
+    // MARK: - Tab Availability
+
+    /// Only show Export Hub for completed/failed runs with delivery config.
+    /// Only show Sign-Off tab for runs that are part of a benchmark pair.
+    private var availableTabs: [ReportTab] {
+        var tabs: [ReportTab] = [.latestSummary, .immutableHistory]
+
+        if run.status == .completed || run.status == .failed {
+            tabs.append(.exportHub)
+        }
+
+        // Sign-off tab visible if run might be linked to a benchmark
+        if run.status == .completed || run.status == .failed {
+            tabs.append(.signOffSummary)
+        }
+
+        return tabs
+    }
+
+    // MARK: - Trust Badge
+
+    private var trustIcon: String {
+        switch selectedTab {
+        case .latestSummary: return "arrow.clockwise"
+        case .immutableHistory: return "lock.fill"
+        case .exportHub: return "shippingbox"
+        case .signOffSummary: return "checkmark.seal"
+        }
+    }
+
+    private var trustLabel: String {
+        switch selectedTab {
+        case .latestSummary: return "Mutable latest summary — may change on recovery"
+        case .immutableHistory: return "Immutable history — never overwritten"
+        case .exportHub: return "Export hub — completed run evidence and receipts"
+        case .signOffSummary: return "Sign-off summary — benchmark evaluation"
+        }
+    }
+
+    private var trustColor: Color {
+        switch selectedTab {
+        case .latestSummary: return .orange
+        case .immutableHistory: return .green
+        case .exportHub: return .blue
+        case .signOffSummary: return .purple
+        }
+    }
+
+    // MARK: - Content Views
+
+    @ViewBuilder
+    private var latestSummaryContent: some View {
+        if let content = summaryContent {
+            Text(content)
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+                .padding()
+        } else {
+            ContentUnavailableView(
+                "No Summary",
+                systemImage: "doc.text",
+                description: Text("No latest summary has been generated yet.")
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var immutableHistoryContent: some View {
+        if reportArtifacts.isEmpty {
+            ContentUnavailableView(
+                "No Reports",
+                systemImage: "doc.text",
+                description: Text("No immutable reports have been emitted yet.")
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(reportArtifacts.sorted(by: {
+                    ($0.reportVersion ?? 0) > ($1.reportVersion ?? 0)
+                })) { artifact in
+                    ReportVersionRow(artifact: artifact, isSelected: selectedReportContent != nil)
+                        .onTapGesture {
+                            loadReportContent(artifact)
+                        }
+                }
+
+                if let content = selectedReportContent {
+                    Divider()
+                    Text(content)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                        .padding()
+                }
+            }
+            .padding()
+        }
+    }
+
+    // MARK: - Data Loading
 
     private func loadReportData() {
         // Load immutable report artifacts

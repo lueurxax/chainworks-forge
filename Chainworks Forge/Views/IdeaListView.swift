@@ -437,7 +437,9 @@ struct IdeaDetailView: View {
                         }
                         .alert("Stop Run?", isPresented: $showStopConfirmation) {
                             Button("Stop", role: .destructive) {
-                                executionService.cancelRun(runID: runToStop.id)
+                                Task {
+                                    await executionService.cancelRun(runID: runToStop.id)
+                                }
                             }
                             Button("Keep Running", role: .cancel) { }
                         } message: {
@@ -1279,16 +1281,25 @@ struct WorkflowStartRunSheet: View {
             run.providerBindingSnapshotJSON = encodeProviderBindings(providerBindings)
             run.startOptionsJSON = encodeStartOptions(startOptions)
 
+            // Proposal 011 (REQ-009): Freeze binding provenance per agent at run start.
+            let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
+            run.bindingProvenanceJSON = encodeProvenances(provenances)
+
             // Proposal 011 (REQ-007): Freeze idea workspace root path into the Run record.
             run.frozenWorkspaceRootPath = idea.workspaceRootPath
 
             // Proposal 007 §6.4: Freeze DeliveryConfiguration for fullMVPLive preset.
-            // Proposal 011 (REQ-007): Use idea.workspaceRootPath instead of ambient cwd when available.
+            // Proposal 011 (REQ-007): No ambient cwd fallback — use frozen workspace or explicit config.
             // The editable form is a draft; the started run stores the frozen validated snapshot.
             if selectedWorkflow == .fullMVPLive {
-                let effectiveRepoRoot = idea.workspaceRootPath ?? (deliveryRepoRoot.isEmpty
-                    ? FileManager.default.currentDirectoryPath
-                    : deliveryRepoRoot)
+                let effectiveRepoRoot = idea.workspaceRootPath
+                    ?? run.frozenWorkspaceRootPath
+                    ?? (deliveryRepoRoot.isEmpty ? nil : deliveryRepoRoot)
+                guard let effectiveRepoRoot else {
+                    compileState = .error("Delivery workflow requires a project directory. Set the workspace root on the idea or provide a delivery repo root.")
+                    isStarting = false
+                    return
+                }
                 let effectiveTargetBranch = deliveryTargetBranch.isEmpty
                     ? "release/\(run.id.uuidString.prefix(8))"
                     : deliveryTargetBranch
@@ -1357,9 +1368,9 @@ struct WorkflowStartRunSheet: View {
     // MARK: - Delivery Preflight (Proposal 007 §9.6)
 
     private func runDeliveryPreflight() async {
-        let effectiveRepoRoot = deliveryRepoRoot.isEmpty
-            ? FileManager.default.currentDirectoryPath
-            : deliveryRepoRoot
+        let effectiveRepoRoot = idea.workspaceRootPath
+            ?? (deliveryRepoRoot.isEmpty ? nil : deliveryRepoRoot)
+            ?? "(no project directory set)"
         let effectiveTargetBranch = deliveryTargetBranch.isEmpty
             ? "dogfood/full-mvp"
             : deliveryTargetBranch
@@ -1397,6 +1408,12 @@ struct WorkflowStartRunSheet: View {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try? encoder.encode(bindings)
+    }
+
+    private func encodeProvenances(_ provenances: [String: FrozenBindingProvenance]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(provenances)
     }
 
     private func encodeStartOptions(_ options: RunStartOptions) -> Data? {
@@ -2008,15 +2025,45 @@ struct WorkflowStageDetailView: View {
         }
     }
 
+    /// Decode frozen provenances from the run's snapshot (Proposal 011 — REQ-009).
+    private func frozenProvenance(for agentID: String) -> FrozenBindingProvenance? {
+        guard let data = run.bindingProvenanceJSON else { return nil }
+        let decoded = try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data)
+        return decoded?[agentID]
+    }
+
+    /// Decode frozen binding from the run's snapshot (Proposal 011 — REQ-008).
+    private func frozenBinding(for agentID: String) -> ResolvedProviderBinding? {
+        guard let data = run.providerBindingSnapshotJSON else { return nil }
+        let decoded = try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)
+        return decoded?[agentID]
+    }
+
     @ViewBuilder
     private func agentMetadataRow(for execution: AgentExecution) -> some View {
+        let frozen = frozenBinding(for: execution.agentID)
+        let provenance = frozenProvenance(for: execution.agentID)
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 10) {
                 Text(execution.provider)
-                if let model = execution.resolvedModel, !model.isEmpty {
+                // Proposal 011 (REQ-008): Prefer frozen model truth.
+                let displayModel = frozen?.model ?? execution.resolvedModel
+                if let model = displayModel, !model.isEmpty {
                     Text(model)
                 }
                 Text(execution.effort)
+                // Proposal 011 (REQ-009): Show provenance source.
+                if let source = provenance?.source {
+                    Text("[\(source.rawValue)]")
+                        .foregroundStyle(.tertiary)
+                }
+                // Proposal 011 (REQ-010): Cross-family mismatch warning.
+                if frozen?.hasCrossFamilyMismatch == true {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                        .help("Cross-family binding: model '\(frozen?.model ?? "")' may not match provider family '\(frozen?.providerFamily ?? "")'")
+                        .accessibilityIdentifier("cross-family-warning")
+                }
             }
             .font(.caption2)
             .foregroundStyle(.secondary)

@@ -108,6 +108,25 @@ final class ResumeManager {
             )
         }
 
+        // Check 5 (Proposal 011 — REQ-005): Validate frozen workspace directory still exists.
+        if plan.requiresProjectAccess {
+            if let frozenPath = run.frozenWorkspaceRootPath, !frozenPath.isEmpty {
+                var isDirectory: ObjCBool = false
+                let exists = FileManager.default.fileExists(atPath: frozenPath, isDirectory: &isDirectory)
+                if !exists || !isDirectory.boolValue {
+                    return .cannotResume(
+                        run,
+                        reason: "Frozen workspace directory no longer exists or is not accessible: \(frozenPath)"
+                    )
+                }
+            } else {
+                return .cannotResume(
+                    run,
+                    reason: "Workflow requires project access but the run has no frozen workspace root path"
+                )
+            }
+        }
+
         // Safe to resume
         return .resume(run, plan, workspace)
     }

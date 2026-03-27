@@ -126,6 +126,15 @@ struct PreflightService {
             providerBindings = [:]
         }
 
+        // Proposal 011 (REQ-010): Cross-family coherence check.
+        for (agentID, binding) in providerBindings {
+            let coherenceResult = checkBindingCoherence(agentID: agentID, binding: binding)
+            if let warning = coherenceResult {
+                checks.append(warning)
+                warnings.append(warning.message)
+            }
+        }
+
         let requiredFamilies = Set(plan?.agentBindings.values.compactMap { ProviderFamily.from(runtimeIdentifier: $0.provider) } ?? [])
         for family in requiredFamilies.sorted(by: { $0.rawValue < $1.rawValue }) {
             guard let provider = providerRegistry.preferredProvider(for: family) else {
@@ -266,6 +275,18 @@ struct PreflightService {
             message: overlaps
                 ? "Worktree base overlaps run storage and violates workspace isolation"
                 : "Worktree base is isolated from run storage"
+        )
+    }
+
+    // Proposal 011 (REQ-010): Detect cross-family provider/model mismatches.
+    // Uses the shared `hasCrossFamilyMismatch` heuristic on ResolvedProviderBinding.
+    private func checkBindingCoherence(agentID: String, binding: ResolvedProviderBinding) -> PreflightCheck? {
+        guard binding.hasCrossFamilyMismatch else { return nil }
+        return PreflightCheck(
+            category: "Providers",
+            title: "Binding Coherence — \(agentID)",
+            status: .warn,
+            message: "Agent '\(agentID)' uses provider family '\(binding.providerFamily)' but resolved model '\(binding.model)' appears to belong to a different family. Verify this is intentional."
         )
     }
 

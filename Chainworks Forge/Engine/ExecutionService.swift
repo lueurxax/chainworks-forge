@@ -263,33 +263,48 @@ final class ExecutionService {
 
     // MARK: - Cancel Run
 
-    /// Cancel an active run using settlement-based cancellation (Proposal 011 — REQ-001, REQ-002).
-    /// Records `cancellationRequestedAt`, propagates to all agents, closes sessions,
-    /// and only transitions to `.cancelled` after full settlement.
-    func cancelRun(runID: UUID) {
+    /// Cancel an active run using two-phase settlement (Proposal 011 — REQ-001, REQ-002).
+    ///
+    /// **Phase 1** (synchronous): `beginSettlement()` — agents cancelled, preliminary log written,
+    /// `presentationStatus` returns `.cancelling`.
+    ///
+    /// **Session close** (async): Goose sessions are closed with per-session timeouts.
+    /// Outcomes are recorded as observed truth, not optimistic placeholders.
+    ///
+    /// **Phase 2** (synchronous): `finalizeSettlement()` — settlement log updated with real outcomes,
+    /// `cancellationSettledAt` written, `run.status = .cancelled`.
+    func cancelRun(runID: UUID) async {
         guard let orchestrator = activeOrchestrators[runID] else { return }
 
-        let run = orchestrator.run
-
-        // Use the settlement-based coordinator for truthful cancellation.
+        // Phase 1: Synchronous settlement — agents cancelled, preliminary log written.
         let coordinator = RunCancellationCoordinator(
-            run: run,
+            run: orchestrator.run,
             orchestrator: orchestrator,
             modelContext: modelContext
         )
+        coordinator.beginSettlement()
 
-        // Remove from active orchestrators and clean up approvals immediately
-        // (the coordinator handles the terminal transition asynchronously).
+        // Collect session cleanup data before removing orchestrator reference.
+        let sessionIDs = coordinator.pendingSessionIDs
+        let executor = orchestrator.executor
+
+        // Remove from active orchestrators and clean up approvals.
         activeOrchestrators.removeValue(forKey: runID)
         pendingApprovals = pendingApprovals.filter { $0.value.runID != runID }
 
-        Task { @MainActor in
-            await coordinator.settle()
-
-            // P005-OPS: Fire notification for cancellation completion.
-            self.notificationService.notifyRunCancelled(run: run)
-            self.refreshDockBadge()
+        // Async session close — bounded per-session timeouts, outcomes recorded.
+        let outcomes: [RunCancellationCoordinator.SessionCloseOutcome]
+        if !sessionIDs.isEmpty {
+            outcomes = await RunCancellationCoordinator.closeGooseSessionsWithOutcomes(
+                sessionIDs: sessionIDs,
+                executor: executor
+            )
+        } else {
+            outcomes = []
         }
+
+        // Phase 2: Finalize settlement with truthful session close outcomes.
+        coordinator.finalizeSettlement(sessionOutcomes: outcomes)
     }
 
     // MARK: - Query

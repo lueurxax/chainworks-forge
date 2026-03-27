@@ -24,6 +24,7 @@ struct ContentView: View {
         case ideaArchive = "idea_archive"
         case workflowMap = "workflow_map"
         case gooseAssistant = "goose_assistant"
+        case releaseGate = "release_gate"
     }
 
     init() {
@@ -144,6 +145,8 @@ struct ContentView: View {
             UITestWorkflowMapSurface()
         case .gooseAssistant:
             UITestGooseAssistantSurface()
+        case .releaseGate:
+            UITestReleaseGateSurface()
         }
     }
 }

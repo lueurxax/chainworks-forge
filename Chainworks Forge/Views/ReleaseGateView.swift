@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import AppKit
 
 // MARK: - ReleaseGateView (Proposal 007 — §10.3)
 
@@ -16,6 +17,12 @@ struct ReleaseGateView: View {
     private var deliveryConfig: DeliveryConfiguration? {
         guard let data = run.deliveryConfigurationJSON else { return nil }
         return try? JSONDecoder().decode(DeliveryConfiguration.self, from: data)
+    }
+
+    private var allArtifacts: [Artifact] {
+        run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .flatMap(\.artifacts)
     }
 
     var body: some View {
@@ -83,6 +90,7 @@ struct ReleaseGateView: View {
         }
         .padding()
         .frame(minWidth: 500, minHeight: 400)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("release-gate-view")
     }
 
@@ -128,10 +136,6 @@ struct ReleaseGateView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Review Summary", systemImage: "checklist")
                     .font(.headline)
-
-                let allArtifacts = run.stageExecutions
-                    .flatMap(\.agentExecutions)
-                    .flatMap(\.artifacts)
 
                 reviewRow("Audit Report", artifactName: "audit_report", in: allArtifacts)
                 reviewRow("Security Report", artifactName: "security_report", in: allArtifacts)
@@ -184,11 +188,18 @@ struct ReleaseGateView: View {
                         }
                     }
                     if let worktree = run.worktreeRoot {
-                        LabeledContent("Worktree") {
-                            Text(worktree)
-                                .font(.caption)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                        VStack(alignment: .leading, spacing: 6) {
+                            LabeledContent("Worktree") {
+                                Text(worktree)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Button("Open Worktree in Finder") {
+                                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: worktree)
+                            }
+                            .buttonStyle(.link)
+                            .accessibilityIdentifier("release-gate-open-worktree")
                         }
                     }
                 }
@@ -267,10 +278,6 @@ struct ReleaseGateView: View {
                 Label("Decision Context", systemImage: "doc.text.magnifyingglass")
                     .font(.headline)
 
-                let allArtifacts = run.stageExecutions
-                    .flatMap(\.agentExecutions)
-                    .flatMap(\.artifacts)
-
                 let contextArtifacts: [(name: String, label: String, icon: String)] = [
                     ("approved_proposal", "Open Proposal", "doc.text"),
                     ("changed_files_manifest", "Open Diff Summary", "doc.text.magnifyingglass"),
@@ -283,26 +290,38 @@ struct ReleaseGateView: View {
                 ]
 
                 ForEach(contextArtifacts, id: \.name) { item in
-                    let exists = allArtifacts.contains { $0.name == item.name }
-                    HStack {
-                        Label(item.label, systemImage: item.icon)
-                            .foregroundStyle(exists ? .primary : .secondary)
-                        Spacer()
-                        if exists {
-                            Image(systemName: "chevron.right")
-                                .font(.caption2)
+                    if let artifact = artifact(named: item.name) {
+                        Button {
+                            openArtifact(artifact)
+                        } label: {
+                            HStack {
+                                Label(item.label, systemImage: item.icon)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .font(.callout)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("release-gate-open-\(item.name)")
+                    } else {
+                        HStack {
+                            Label(item.label, systemImage: item.icon)
                                 .foregroundStyle(.secondary)
-                        } else {
+                            Spacer()
                             Text("—")
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
                         }
+                        .font(.callout)
                     }
-                    .font(.callout)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("release-gate-decision-context")
     }
 
     @ViewBuilder
@@ -332,6 +351,16 @@ struct ReleaseGateView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+    }
+
+    private func artifact(named name: String) -> Artifact? {
+        allArtifacts.last(where: { $0.name == name })
+    }
+
+    private func openArtifact(_ artifact: Artifact) {
+        let url = URL(fileURLWithPath: artifact.filePath)
+        guard FileManager.default.fileExists(atPath: artifact.filePath) else { return }
+        NSWorkspace.shared.open(url)
     }
 }
 

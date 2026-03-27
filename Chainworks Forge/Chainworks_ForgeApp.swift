@@ -50,6 +50,11 @@ struct Chainworks_ForgeApp: App {
             StewardRecommendation.self,
             StewardExperiment.self,
             StewardDecision.self,
+            // Proposal 008: MVP Benchmark and Sign-Off
+            BenchmarkCohort.self,
+            BenchmarkExecutionRecord.self,
+            BenchmarkPair.self,
+            MVPSignOffDecisionSnapshot.self,
         ])
         let modelConfiguration = ModelConfiguration(
             schema: schema,
@@ -283,6 +288,7 @@ struct AppBootstrapView: View {
         Self.seedIdeaIfRequested(modelContext: modelContext)
         Self.seedWaitingApprovalRunIfRequested(modelContext: modelContext, catalog: catalog)
         Self.seedWorkflowMapRunIfRequested(modelContext: modelContext)
+        Self.seedReleaseGateRunIfRequested(modelContext: modelContext)
 
         if !isUnitTestHost {
             let compiler = RunPlanCompiler(modelContext: modelContext)
@@ -364,6 +370,13 @@ struct AppBootstrapView: View {
                             .environment(gooseServerManager)
                     case .gooseAssistant:
                         UITestGooseAssistantSurface()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                            .environment(gooseServerManager)
+                    case .releaseGate:
+                        UITestReleaseGateSurface()
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
@@ -764,6 +777,147 @@ struct AppBootstrapView: View {
         }
 
         PreviewSupport.seedWorkflowMapPreviewData(context: modelContext)
+    }
+
+    @MainActor
+    private static func seedReleaseGateRunIfRequested(modelContext: ModelContext) {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] == "release_gate" else {
+            return
+        }
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let existingRuns = (try? modelContext.fetch(descriptor)) ?? []
+        if existingRuns.contains(where: { $0.status == .waitingApproval && $0.deliveryConfigurationJSON != nil }) {
+            return
+        }
+
+        do {
+            let workspace = try makeSeedWorkspace(runID: UUID(), prefix: "UITestReleaseGate")
+            let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
+            try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+
+            let idea = Idea(title: "Release Gate Proof", body: "Seeded repo-backed release gate proof.")
+            modelContext.insert(idea)
+
+            let run = Run(
+                id: workspace.runID,
+                workflowID: "full_mvp_live",
+                workflowTitle: "Full MVP Live",
+                workflowSnapshotHash: "seeded-workflow",
+                catalogSnapshotHash: "seeded-catalog",
+                workflowSourcePath: resolvedExamplePath("examples/workflows/full-mvp-live.yaml"),
+                catalogSourcePath: resolvedExamplePath("examples/agents/agents.yaml"),
+                workflowSnapshotJSON: Data(),
+                catalogSnapshotJSON: Data(),
+                workspaceRoot: workspace.workspaceRoot.path,
+                artifactRoot: workspace.artifactRoot.path,
+                planCompilerVersion: 1
+            )
+            run.idea = idea
+            run.status = .waitingApproval
+            run.worktreeRoot = worktreeRoot.path
+            run.baseRevision = "seededbase"
+            run.repoIdentifier = "Chainworks Forge"
+            run.repoRoot = FileManager.default.currentDirectoryPath
+            run.baseBranch = "main"
+            run.targetBranch = "dogfood/full-mvp"
+            run.releaseTargetID = "sandbox_local"
+            run.releaseMode = "sandbox"
+            run.totalCostCents = 4200
+
+            let config = DeliveryConfiguration(
+                profileID: "chainworks_forge_self",
+                profileLabel: "Chainworks Forge (Self)",
+                sampleProfileID: nil,
+                repoIdentifier: "Chainworks Forge",
+                repoRoot: FileManager.default.currentDirectoryPath,
+                baseBranch: "main",
+                worktreeBasePath: worktreeRoot.deletingLastPathComponent().path,
+                targetBranch: "dogfood/full-mvp",
+                releaseTargetID: "sandbox_local",
+                releaseTargetLabel: "Local Sandbox",
+                releaseMode: .sandbox
+            )
+            run.deliveryConfigurationJSON = try JSONEncoder().encode(config)
+            modelContext.insert(run)
+
+            let releaseStage = StageExecution(
+                stageID: "state_11_manual_release",
+                label: "Manual release gate",
+                startedAt: Date().addingTimeInterval(-90),
+                status: .waitingApproval,
+                iteration: 1,
+                attemptNumber: 1
+            )
+            releaseStage.run = run
+            modelContext.insert(releaseStage)
+
+            let releaseExecution = AgentExecution(
+                agentID: "lead_orchestrator",
+                agentTitle: "Lead / Orchestrator",
+                taskName: "prepare_release_gate",
+                startedAt: Date().addingTimeInterval(-100),
+                status: .completed,
+                provider: "claude_code",
+                effort: "high"
+            )
+            releaseExecution.completedAt = Date().addingTimeInterval(-95)
+            releaseExecution.stageExecution = releaseStage
+            modelContext.insert(releaseExecution)
+
+            let artifactManager = ArtifactManager(modelContext: modelContext)
+            _ = try artifactManager.persistOutputs(
+                outputs: [
+                    "approved_proposal": Data("""
+                    {"title":"Seeded proposal","decision":"approved"}
+                    """.utf8),
+                    "changed_files_manifest": Data("Chainworks Forge/App.swift\nChainworks Forge/Views/ReleaseGateView.swift\n".utf8),
+                    "docs_delta": Data("{\"summary\":\"Docs updated\"}".utf8),
+                    "implementation_review_summary": Data("{\"decision\":\"implemented\"}".utf8),
+                    "security_report": Data("{\"status\":\"pass\"}".utf8),
+                    "audit_report": Data("{\"status\":\"pass\"}".utf8),
+                    "prepush_review_report": Data("{\"status\":\"pass\"}".utf8),
+                    "delivery_receipt": Data("{\"status\":\"ready\",\"target\":\"sandbox_local\"}".utf8)
+                ],
+                agent: ResolvedAgent(
+                    id: "lead_orchestrator",
+                    title: "Lead / Orchestrator",
+                    mode: "orchestration",
+                    provider: "claude_code",
+                    model: "default",
+                    effort: "high",
+                    maxTurns: 12,
+                    temperature: 0,
+                    permissionProfile: "ORCH",
+                    skillRef: "orchestrator_core",
+                    skillRole: nil,
+                    prompt: "Seeded release gate data",
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    inputs: [],
+                    outputs: ["approved_proposal", "changed_files_manifest", "docs_delta", "implementation_review_summary", "security_report", "audit_report", "prepush_review_report", "delivery_receipt"]
+                ),
+                agentExecution: releaseExecution,
+                workspace: workspace,
+                stageID: releaseStage.stageID,
+                iteration: releaseStage.iteration,
+                attemptNumber: releaseStage.attemptNumber,
+                catalog: nil
+            )
+
+            let approval = Approval(
+                stageID: releaseStage.stageID,
+                requestedAt: Date().addingTimeInterval(-60),
+                decision: .requested
+            )
+            approval.run = run
+            modelContext.insert(approval)
+
+            try modelContext.save()
+        } catch {
+            print("Failed to seed release gate run: \(error.localizedDescription)")
+        }
     }
 
     private static func makeSeedWorkspace(runID: UUID, prefix: String) throws -> RunWorkspace {

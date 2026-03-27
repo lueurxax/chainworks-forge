@@ -186,6 +186,12 @@ struct RunComparisonView: View {
                                     Text(bindingSummary(bindingA))
                                         .font(.caption2.monospaced())
                                         .foregroundStyle(.blue)
+                                    // Proposal 011 (REQ-010): Cross-family warning for run A.
+                                    if bindingA?.hasCrossFamilyMismatch == true {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.yellow)
+                                            .help("Cross-family binding mismatch")
+                                    }
                                 }
                                 HStack(spacing: 4) {
                                     Text("B:")
@@ -194,6 +200,12 @@ struct RunComparisonView: View {
                                     Text(bindingSummary(bindingB))
                                         .font(.caption2.monospaced())
                                         .foregroundStyle(.purple)
+                                    // Proposal 011 (REQ-010): Cross-family warning for run B.
+                                    if bindingB?.hasCrossFamilyMismatch == true {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.yellow)
+                                            .help("Cross-family binding mismatch")
+                                    }
                                 }
                             }
                         }
@@ -208,6 +220,10 @@ struct RunComparisonView: View {
         var parts = [binding.provider]
         if let model = binding.model { parts.append(model) }
         parts.append(binding.effort)
+        // Proposal 011 (REQ-009): Show provenance source from frozen data.
+        if let source = binding.provenanceSource {
+            parts.append("[\(source)]")
+        }
         return parts.joined(separator: " / ")
     }
 

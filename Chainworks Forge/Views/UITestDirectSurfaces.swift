@@ -143,3 +143,32 @@ struct UITestGooseAssistantSurface: View {
         .accessibilityIdentifier("ui-test-goose-assistant-surface")
     }
 }
+
+struct UITestReleaseGateSurface: View {
+    @Environment(\.modelContext) private var modelContext
+
+    private var targetRun: Run? {
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let runs = (try? modelContext.fetch(descriptor)) ?? []
+        return runs.first(where: { $0.status == .waitingApproval && $0.deliveryConfigurationJSON != nil }) ?? runs.first
+    }
+
+    var body: some View {
+        Group {
+            if let targetRun {
+                ReleaseGateView(
+                    run: targetRun,
+                    onApprove: {},
+                    onReject: {}
+                )
+            } else {
+                ContentUnavailableView(
+                    "Release gate unavailable",
+                    systemImage: "shippingbox",
+                    description: Text("The UI test release gate surface requires a seeded delivery run.")
+                )
+            }
+        }
+        .accessibilityIdentifier("ui-test-release-gate-surface")
+    }
+}

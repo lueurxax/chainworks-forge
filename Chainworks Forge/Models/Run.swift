@@ -44,6 +44,9 @@ import SwiftData
     var providerBindingSnapshotJSON: Data?
     var startOptionsJSON: Data?
 
+    // Proposal 011 (REQ-009): Frozen binding provenance per agent, keyed by agent ID.
+    var bindingProvenanceJSON: Data?
+
     // Proposal 011 (REQ-007): Frozen idea workspace root path at run creation time.
     // Set once during startRun, not mutated afterward.
     var frozenWorkspaceRootPath: String?
@@ -160,6 +163,37 @@ struct CancellationSettlementEntry: Codable, Sendable {
     let sessionCloseAttempted: Bool
     let sessionCloseSucceeded: Bool?     // nil if no session was open
     let settledAt: Date
+}
+
+// MARK: - FrozenBindingProvenance (Proposal 011 — REQ-009)
+
+/// How the resolved model was determined for a single agent binding.
+/// Frozen at run start, never reconstructed from mutable current settings.
+enum BindingProvenanceSource: String, Codable, Sendable {
+    case backendProfileDefault = "backend_profile"
+    case configuredProviderDefault = "configured_provider"
+    case runOverride = "run_override"
+    case unverifiable = "unverifiable"
+}
+
+/// Per-agent frozen provenance snapshot persisted in `Run.bindingProvenanceJSON`.
+struct FrozenBindingProvenance: Codable, Sendable {
+    /// The source that determined the resolved model.
+    let source: BindingProvenanceSource
+    /// The backend profile ID from the agent catalog.
+    let backendProfileID: String
+    /// The backend profile's declared model (may be "default" or explicit).
+    let backendProfileModel: String
+    /// The configured provider ID selected at run start (if any).
+    let configuredProviderID: UUID?
+    /// The configured provider's default model at the time of run start.
+    let configuredProviderDefaultModel: String?
+    /// The explicit run-start override model (if any).
+    let runOverrideModel: String?
+    /// The final resolved model actually sent to Goose.
+    let resolvedModel: String
+    /// The final resolved provider family.
+    let resolvedProviderFamily: String
 }
 
 enum DriftDecision: String, Codable {

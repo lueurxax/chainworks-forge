@@ -6,7 +6,7 @@ import Foundation
 /// without relying on hidden cwd state.
 struct SourceContextBuilder: Sendable {
 
-    struct SourceContext: Sendable {
+    struct SourceContext: Codable, Sendable {
         let worktreeRoot: String
         let repoRoot: String
         let baseBranch: String

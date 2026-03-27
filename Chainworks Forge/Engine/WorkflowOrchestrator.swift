@@ -246,6 +246,7 @@ final class WorkflowOrchestrator {
             if state.type == .end {
                 run.status = .completed
                 run.completedAt = Date()
+                persistDeliveryReceiptIfNeeded(finalStateID: state.id)
                 persistFinalFeatureReportIfNeeded(finalStateID: state.id)
                 isRunning = false
                 onComplete?(true)
@@ -289,6 +290,7 @@ final class WorkflowOrchestrator {
                 if state.transitions.isEmpty {
                     run.status = .completed
                     run.completedAt = Date()
+                    persistDeliveryReceiptIfNeeded(finalStateID: state.id)
                     isRunning = false
                     onComplete?(true)
                     return
@@ -459,7 +461,16 @@ final class WorkflowOrchestrator {
         registerLiveExecution(agentExec, for: agent.id)
 
         // Gather input artifacts
-        let inputData = gatherInputs(for: task)
+        let inputData: [String: Data]
+        do {
+            inputData = try await gatherExecutionInputs(for: task, agent: agent)
+        } catch {
+            agentExec.status = .failed
+            agentExec.completedAt = Date()
+            agentExec.logSnippet = "Source context preparation failed: \(error.localizedDescription)"
+            unregisterLiveExecution(agentExec, for: agent.id)
+            return false
+        }
         agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(inputData.keys).sorted())
         agentExec.inputBindingsJSON = buildInputBindings(for: task)
         agentExec.resolvedBackendProfileID = agent.backendProfileID
@@ -647,6 +658,22 @@ final class WorkflowOrchestrator {
                 return true
             } catch {
                 // REQ-011: Persist any partial receipts and propagate failure
+                let result = ReleaseOpsCoordinator.ReleaseResult(
+                    gitManifest: nil,
+                    gitReceipt: nil,
+                    bundleManifest: nil,
+                    uploadReceipt: nil,
+                    succeeded: false,
+                    failureStage: "commit_and_push",
+                    failureReason: error.localizedDescription
+                )
+                persistDeliveryReceipt(
+                    finalStateID: state.id,
+                    provider: agent.provider,
+                    model: agent.model,
+                    effort: agent.effort,
+                    releaseResult: result
+                )
                 agentExec.status = .failed
                 agentExec.completedAt = Date()
                 agentExec.logSnippet = "GitReleaseService failed: \(error.localizedDescription)"
@@ -668,10 +695,16 @@ final class WorkflowOrchestrator {
 
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
+            guard let gitReceipt = try? decoder.decode(GitReleaseService.GitPushReceipt.self, from: receiptData),
+                  let releaseManifest = try? decoder.decode(GitReleaseService.ReleaseManifest.self, from: manifestData) else {
+                agentExec.status = .failed
+                agentExec.completedAt = Date()
+                agentExec.logSnippet = "ConnectPublishService received invalid release inputs."
+                stageExec.status = .failed
+                unregisterLiveExecution(agentExec, for: agent.id)
+                return false
+            }
             do {
-                let gitReceipt = try decoder.decode(GitReleaseService.GitPushReceipt.self, from: receiptData)
-                let releaseManifest = try decoder.decode(GitReleaseService.ReleaseManifest.self, from: manifestData)
-
                 let publishService = ConnectPublishService()
                 let (bundle, uploadReceipt) = try await publishService.buildArchiveAndUpload(
                     worktreeRoot: worktreeRoot,
@@ -704,6 +737,23 @@ final class WorkflowOrchestrator {
                     producedArtifactNames.insert(artifact.name)
                 }
 
+                let result = ReleaseOpsCoordinator.ReleaseResult(
+                    gitManifest: releaseManifest,
+                    gitReceipt: gitReceipt,
+                    bundleManifest: bundle,
+                    uploadReceipt: uploadReceipt,
+                    succeeded: true,
+                    failureStage: nil,
+                    failureReason: nil
+                )
+                persistDeliveryReceipt(
+                    finalStateID: state.id,
+                    provider: agent.provider,
+                    model: agent.model,
+                    effort: agent.effort,
+                    releaseResult: result
+                )
+
                 agentExec.status = .completed
                 agentExec.completedAt = Date()
                 agentExec.logSnippet = "ConnectPublishService: bundle \(bundle.bundleVersion) uploaded to \(uploadReceipt.destination)"
@@ -712,6 +762,22 @@ final class WorkflowOrchestrator {
             } catch {
                 // REQ-011: Persist partial receipts (git_push_receipt already persisted by prior agent)
                 // and propagate failure so run becomes .blocked via existing failure handling
+                let result = ReleaseOpsCoordinator.ReleaseResult(
+                    gitManifest: releaseManifest,
+                    gitReceipt: gitReceipt,
+                    bundleManifest: nil,
+                    uploadReceipt: nil,
+                    succeeded: false,
+                    failureStage: "build_archive_and_push",
+                    failureReason: error.localizedDescription
+                )
+                persistDeliveryReceipt(
+                    finalStateID: state.id,
+                    provider: agent.provider,
+                    model: agent.model,
+                    effort: agent.effort,
+                    releaseResult: result
+                )
                 agentExec.status = .failed
                 agentExec.completedAt = Date()
                 agentExec.logSnippet = "ConnectPublishService failed: \(error.localizedDescription)"
@@ -763,7 +829,32 @@ final class WorkflowOrchestrator {
         // Execute all in parallel
         let results = await withTaskGroup(of: (Int, AgentResult?).self) { group in
             for (index, pair) in taskAgentPairs.enumerated() {
-                let gatheredInputs = gatherInputs(for: pair.task)
+                let gatheredInputs: [String: Data]
+                do {
+                    gatheredInputs = try await gatherExecutionInputs(for: pair.task, agent: pair.agent)
+                } catch {
+                    pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList([])
+                    pair.agentExec.inputBindingsJSON = buildInputBindings(for: pair.task)
+                    group.addTask {
+                        (
+                            index,
+                            AgentResult(
+                                outputs: [:],
+                                logSnippet: nil,
+                                costCents: nil,
+                                succeeded: false,
+                                errorMessage: "Source context preparation failed: \(error.localizedDescription)",
+                                sessionID: nil,
+                                durationSeconds: 0,
+                                providerReceipt: nil,
+                                resolvedModel: nil,
+                                configuredProviderID: nil,
+                                adapterVersion: nil
+                            )
+                        )
+                    }
+                    continue
+                }
                 let task = pair.task
                 let agent = pair.agent
                 let execContext = ExecutionContext(
@@ -997,6 +1088,46 @@ final class WorkflowOrchestrator {
                 }
             }
         }
+        return inputs
+    }
+
+    private func gatherExecutionInputs(
+        for task: AgentTask,
+        agent: ResolvedAgent
+    ) async throws -> [String: Data] {
+        var inputs = gatherInputs(for: task)
+
+        guard let config = deliveryConfig,
+              let worktreeRoot = workspace.worktreeRoot else {
+            return inputs
+        }
+
+        let sourceContext = try await SourceContextBuilder.build(
+            worktreeRoot: worktreeRoot,
+            repoRoot: config.repoRoot,
+            baseBranch: config.baseBranch,
+            baseRevision: run.baseRevision,
+            targetBranch: config.targetBranch
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        if let data = try? encoder.encode(sourceContext) {
+            inputs["source_context"] = data
+        }
+
+        if !sourceContext.diffSummary.isEmpty,
+           let data = sourceContext.diffSummary.data(using: .utf8) {
+            inputs["source_diff_summary"] = data
+        }
+
+        if (agent.worktreeWriteEnabled || plan.requiresProjectAccess),
+           !sourceContext.changedFilesManifest.isEmpty,
+           let data = sourceContext.changedFilesManifest.joined(separator: "\n").data(using: .utf8) {
+            inputs["source_changed_files_manifest"] = data
+        }
+
         return inputs
     }
 
@@ -1262,14 +1393,17 @@ final class WorkflowOrchestrator {
         switch action {
         case "pause_and_require_human":
             run.status = .blocked
+            persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
             isPaused = true
         case "fail_run":
             run.status = .failed
             run.completedAt = Date()
+            persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
         default:
             run.status = .blocked
+            persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
         }
 
@@ -1486,5 +1620,165 @@ final class WorkflowOrchestrator {
             "total_cost": totalCostUSD,
             "cost_currency": "USD"
         ]
+    }
+
+    private func persistDeliveryReceiptIfNeeded(finalStateID: String) {
+        guard producedArtifactNames.contains("delivery_receipt") == false else { return }
+        guard let releaseResult = currentReleaseResultSummary() else { return }
+
+        let provider = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .last?.provider ?? "system"
+        let model = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .last?.resolvedModel
+        let effort = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .last?.effort
+
+        persistDeliveryReceipt(
+            finalStateID: finalStateID,
+            provider: provider,
+            model: model,
+            effort: effort,
+            releaseResult: releaseResult
+        )
+    }
+
+    private func persistDeliveryReceipt(
+        finalStateID: String,
+        provider: String,
+        model: String?,
+        effort: String?,
+        releaseResult: ReleaseOpsCoordinator.ReleaseResult
+    ) {
+        guard producedArtifactNames.contains("delivery_receipt") == false else { return }
+        guard let deliveryConfigurationJSON = run.deliveryConfigurationJSON,
+              let deliveryConfig = try? JSONDecoder().decode(DeliveryConfiguration.self, from: deliveryConfigurationJSON),
+              let worktreeRoot = run.worktreeRoot else {
+            return
+        }
+
+        let receipt = DeliveryReceiptBuilder.buildReceipt(
+            runID: run.id,
+            workflowID: run.workflowID,
+            ideaTitle: run.idea?.title ?? "Unknown",
+            deliveryConfig: deliveryConfig,
+            worktreeRoot: worktreeRoot,
+            baseRevision: run.baseRevision,
+            releaseResult: releaseResult,
+            implementationReviewStatus: currentImplementationReviewStatus()
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(receipt) else { return }
+
+        if let artifact = try? artifactManager.persistSystemArtifact(
+            name: "delivery_receipt",
+            data: data,
+            contractID: "delivery_receipt",
+            format: .json,
+            workspace: workspace,
+            stageID: finalStateID,
+            agentID: "system_delivery",
+            provider: provider,
+            model: model,
+            effort: effort,
+            attemptNumber: 1
+        ) {
+            producedArtifactNames.insert(artifact.name)
+            if let fields = tryExtractScalarFields(from: data) {
+                artifactFields[artifact.name] = fields
+            }
+        }
+    }
+
+    private func currentReleaseResultSummary() -> ReleaseOpsCoordinator.ReleaseResult? {
+        let artifacts = (try? artifactManager.artifacts(forRunID: run.id)) ?? []
+
+        let gitManifest: GitReleaseService.ReleaseManifest? = decodeArtifact(
+            named: "release_manifest",
+            from: artifacts
+        )
+        let gitReceipt: GitReleaseService.GitPushReceipt? = decodeArtifact(
+            named: "git_push_receipt",
+            from: artifacts
+        )
+        let bundleManifest: ConnectPublishService.ReleaseBundleManifest? = decodeArtifact(
+            named: "release_bundle_manifest",
+            from: artifacts
+        )
+        let uploadReceipt: ConnectPublishService.ConnectUploadReceipt? = decodeArtifact(
+            named: "connect_upload_receipt",
+            from: artifacts
+        )
+
+        let releaseAgents = run.stageExecutions
+            .flatMap(\.agentExecutions)
+            .filter { $0.agentID == "commit_and_push_to_github" || $0.agentID == "build_archive_and_push_connect" }
+        guard !releaseAgents.isEmpty else { return nil }
+
+        let succeeded = uploadReceipt != nil
+        let failureStage: String? = {
+            if succeeded { return nil }
+            if gitManifest == nil || gitReceipt == nil { return "commit_and_push" }
+            return "build_archive_and_push"
+        }()
+        let failureReason: String? = {
+            guard !succeeded else { return nil }
+            return releaseAgents.last(where: { $0.status == .failed })?.logSnippet
+        }()
+
+        return ReleaseOpsCoordinator.ReleaseResult(
+            gitManifest: gitManifest,
+            gitReceipt: gitReceipt,
+            bundleManifest: bundleManifest,
+            uploadReceipt: uploadReceipt,
+            succeeded: succeeded,
+            failureStage: failureStage,
+            failureReason: failureReason
+        )
+    }
+
+    private func currentImplementationReviewStatus() -> String? {
+        let artifacts = (try? artifactManager.artifacts(forRunID: run.id)) ?? []
+        if let artifact = artifacts.last(where: { $0.name == "implementation_review_summary" }),
+           let data = try? artifactManager.readArtifact(artifact, workspace: workspace),
+           let fields = tryExtractScalarFields(from: data) {
+            if case .string(let decision)? = fields["decision"] {
+                return decision
+            }
+            if case .string(let status)? = fields["status"] {
+                return status
+            }
+            if case .bool(let pass)? = fields["pass"] {
+                return pass ? "pass" : "fail"
+            }
+        }
+
+        if let fields = artifactFields["implementation_review_summary"] {
+            if case .string(let decision)? = fields["decision"] {
+                return decision
+            }
+            if case .string(let status)? = fields["status"] {
+                return status
+            }
+            if case .bool(let pass)? = fields["pass"] {
+                return pass ? "pass" : "fail"
+            }
+        }
+        return producedArtifactNames.contains("implementation_review_summary") ? "available" : nil
+    }
+
+    private func decodeArtifact<T: Decodable>(named name: String, from artifacts: [Artifact]) -> T? {
+        guard let artifact = artifacts.last(where: { $0.name == name }),
+              let data = try? artifactManager.readArtifact(artifact, workspace: workspace) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(T.self, from: data)
     }
 }

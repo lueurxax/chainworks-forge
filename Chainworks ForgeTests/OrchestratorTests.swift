@@ -23,11 +23,12 @@ struct OrchestratorTests {
 
     // MARK: - Helpers
 
-    private func makeWorkspace() -> RunWorkspace {
+    private func makeWorkspace(worktreeRoot: URL? = nil) -> RunWorkspace {
         let runID = UUID()
         let workspaceRoot = tempDir.appendingPathComponent(runID.uuidString, isDirectory: true)
         let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
-        return RunWorkspace(runID: runID, workspaceRoot: workspaceRoot, artifactRoot: artifactRoot, worktreeRoot: nil)
+        try? FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+        return RunWorkspace(runID: runID, workspaceRoot: workspaceRoot, artifactRoot: artifactRoot, worktreeRoot: worktreeRoot)
     }
 
     private func makeRun(workspace: RunWorkspace) -> Run {
@@ -69,6 +70,22 @@ struct OrchestratorTests {
         )
     }
 
+    private func makeDeliveryConfig(repoRoot: String, targetBranch: String = "dogfood/test") -> DeliveryConfiguration {
+        DeliveryConfiguration(
+            profileID: "dogfood",
+            profileLabel: "Dogfood",
+            sampleProfileID: nil,
+            repoIdentifier: "local/repo",
+            repoRoot: repoRoot,
+            baseBranch: "main",
+            worktreeBasePath: tempDir.appendingPathComponent("worktrees").path,
+            targetBranch: targetBranch,
+            releaseTargetID: "sandbox_local",
+            releaseTargetLabel: "Sandbox",
+            releaseMode: .sandbox
+        )
+    }
+
     private struct StaticResultExecutor: AgentExecutor {
         let result: AgentResult
 
@@ -79,6 +96,65 @@ struct OrchestratorTests {
         ) async throws -> AgentResult {
             result
         }
+    }
+
+    private actor CapturedContextBox {
+        private(set) var artifactNames: [String] = []
+
+        func store(_ names: [String]) {
+            artifactNames = names
+        }
+    }
+
+    private struct CapturingExecutor: AgentExecutor {
+        let box: CapturedContextBox
+
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            await box.store(Array(context.inputArtifacts.keys).sorted())
+            return AgentResult(
+                outputs: ["output_1": Data("ok".utf8)],
+                logSnippet: "captured",
+                costCents: nil,
+                succeeded: true,
+                errorMessage: nil,
+                sessionID: nil,
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: agent.model,
+                configuredProviderID: nil,
+                adapterVersion: nil
+            )
+        }
+    }
+
+    private func runGit(_ arguments: [String], in directory: URL) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        process.currentDirectoryURL = directory
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if process.terminationStatus != 0 {
+            throw NSError(
+                domain: "OrchestratorTests.git",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: error]
+            )
+        }
+        return output
     }
 
     private func makeReviewCatalog() -> AgentCatalog {
@@ -1063,5 +1139,496 @@ struct OrchestratorTests {
         #expect(run.stageExecutions.first?.agentExecutions.first?.status == .failed)
         #expect(run.stageExecutions.first?.agentExecutions.first?.logSnippet?.contains("not valid JSON") == true)
         #expect(run.stageExecutions.first?.agentExecutions.first?.artifacts.isEmpty ?? true)
+    }
+
+    @Test("Repo-backed execution injects source context into agent inputs")
+    func repoBackedExecutionInjectsSourceContextIntoInputs() async throws {
+        let repoRoot = tempDir.appendingPathComponent("repo-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+
+        try "struct App {}\n".write(
+            to: repoRoot.appendingPathComponent("App.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        _ = try runGit(["init", "-b", "main"], in: repoRoot)
+        _ = try runGit(["config", "user.email", "tests@example.com"], in: repoRoot)
+        _ = try runGit(["config", "user.name", "Chainworks Tests"], in: repoRoot)
+        _ = try runGit(["add", "App.swift"], in: repoRoot)
+        _ = try runGit(["commit", "-m", "Initial commit"], in: repoRoot)
+
+        try "struct App { let version = 2 }\n".write(
+            to: repoRoot.appendingPathComponent("App.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let workspace = makeWorkspace(worktreeRoot: repoRoot)
+        let run = makeRun(workspace: workspace)
+        let config = DeliveryConfiguration(
+            profileID: "dogfood",
+            profileLabel: "Dogfood",
+            sampleProfileID: nil,
+            repoIdentifier: "local/repo",
+            repoRoot: repoRoot.path,
+            baseBranch: "main",
+            worktreeBasePath: tempDir.appendingPathComponent("worktrees").path,
+            targetBranch: "feature/test",
+            releaseTargetID: "sandbox_local",
+            releaseTargetLabel: "Sandbox",
+            releaseMode: .sandbox
+        )
+        run.deliveryConfigurationJSON = try JSONEncoder().encode(config)
+        run.worktreeRoot = repoRoot.path
+        run.baseRevision = try runGit(["rev-parse", "HEAD"], in: repoRoot).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "tool_use",
+            provider: "claude_code",
+            model: "default",
+            effort: "high",
+            maxTurns: 12,
+            temperature: 0,
+            permissionProfile: "write",
+            skillRef: "implementation_core",
+            skillRole: nil,
+            prompt: "Implement the change.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["output_1"],
+            worktreeWriteEnabled: true
+        )
+
+        let plan = RunPlan(
+            workflowID: "delivery",
+            workflowTitle: "Delivery",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Implementation",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "implement", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "Done",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            requiresProjectAccess: true,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let box = CapturedContextBox()
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: CapturingExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let artifactNames = await box.artifactNames
+        #expect(artifactNames.contains("source_context"))
+        #expect(artifactNames.contains("source_diff_summary"))
+        #expect(artifactNames.contains("source_changed_files_manifest"))
+        #expect(run.status == .completed)
+    }
+
+    @Test("Delivery receipt is emitted from real release artifacts on terminal delivery run")
+    func deliveryReceiptEmittedFromReleaseArtifacts() async throws {
+        let repoRoot = tempDir.appendingPathComponent("delivery-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+
+        let workspace = makeWorkspace(worktreeRoot: repoRoot)
+        let run = makeRun(workspace: workspace)
+        run.deliveryConfigurationJSON = try JSONEncoder().encode(makeDeliveryConfig(repoRoot: repoRoot.path))
+        run.worktreeRoot = repoRoot.path
+        run.baseRevision = "abc123def456"
+
+        let releaseStage = StageExecution(
+            stageID: "state_11_manual_release",
+            label: "Manual release gate",
+            startedAt: Date().addingTimeInterval(-120),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        releaseStage.completedAt = Date().addingTimeInterval(-60)
+        releaseStage.run = run
+        context.insert(releaseStage)
+
+        let gitExecution = AgentExecution(
+            agentID: "commit_and_push_to_github",
+            agentTitle: "Commit and Push",
+            taskName: "commit_and_push",
+            startedAt: Date().addingTimeInterval(-100),
+            status: .completed,
+            provider: "system",
+            effort: "high"
+        )
+        gitExecution.completedAt = Date().addingTimeInterval(-90)
+        gitExecution.stageExecution = releaseStage
+        context.insert(gitExecution)
+
+        let connectExecution = AgentExecution(
+            agentID: "build_archive_and_push_connect",
+            agentTitle: "Build and Distribute",
+            taskName: "build_and_distribute",
+            startedAt: Date().addingTimeInterval(-80),
+            status: .completed,
+            provider: "system",
+            effort: "high"
+        )
+        connectExecution.completedAt = Date().addingTimeInterval(-70)
+        connectExecution.stageExecution = releaseStage
+        context.insert(connectExecution)
+
+        let artifactManager = ArtifactManager(modelContext: context)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let gitAgent = makeAgent(
+            id: "commit_and_push_to_github",
+            outputs: ["release_manifest", "git_push_receipt"]
+        )
+        let connectAgent = makeAgent(
+            id: "build_archive_and_push_connect",
+            outputs: ["release_bundle_manifest", "connect_upload_receipt"]
+        )
+        let reviewAgent = makeAgent(
+            id: "implementation_reviewer",
+            outputs: ["implementation_review_summary"]
+        )
+
+        let gitManifest = GitReleaseService.ReleaseManifest(
+            commitSHA: "abc123def456",
+            branch: "dogfood/test",
+            remote: "origin",
+            commitMessage: "[local/repo] Apply approved_proposal via Chainworks Forge",
+            filesChanged: 3,
+            insertions: 42,
+            deletions: 5,
+            timestamp: Date()
+        )
+        let gitReceipt = GitReleaseService.GitPushReceipt(
+            commitSHA: "abc123def456",
+            remote: "origin",
+            branch: "dogfood/test",
+            status: "success",
+            failureReason: nil,
+            timestamp: Date()
+        )
+        let bundleManifest = ConnectPublishService.ReleaseBundleManifest(
+            bundleIdentifier: "com.chainworks.forge.sandbox",
+            bundleVersion: "1.0.0",
+            buildNumber: "abc123de",
+            archivePath: repoRoot.appendingPathComponent(".build").path,
+            checksumSHA256: "deadbeef",
+            sizeBytes: 1024,
+            timestamp: Date()
+        )
+        let uploadReceipt = ConnectPublishService.ConnectUploadReceipt(
+            artifactID: UUID().uuidString,
+            destination: "sandbox://sandbox_local",
+            releaseTargetID: "sandbox_local",
+            releaseMode: "sandbox",
+            status: "success",
+            failureReason: nil,
+            timestamp: Date()
+        )
+
+        _ = try artifactManager.persistOutputs(
+            outputs: [
+                "release_manifest": try encoder.encode(gitManifest),
+                "git_push_receipt": try encoder.encode(gitReceipt)
+            ],
+            agent: gitAgent,
+            agentExecution: gitExecution,
+            workspace: workspace,
+            stageID: releaseStage.stageID,
+            iteration: releaseStage.iteration,
+            attemptNumber: releaseStage.attemptNumber,
+            catalog: nil
+        )
+        _ = try artifactManager.persistOutputs(
+            outputs: [
+                "release_bundle_manifest": try encoder.encode(bundleManifest),
+                "connect_upload_receipt": try encoder.encode(uploadReceipt)
+            ],
+            agent: connectAgent,
+            agentExecution: connectExecution,
+            workspace: workspace,
+            stageID: releaseStage.stageID,
+            iteration: releaseStage.iteration,
+            attemptNumber: releaseStage.attemptNumber,
+            catalog: nil
+        )
+
+        let reviewExecution = AgentExecution(
+            agentID: "implementation_reviewer",
+            agentTitle: "Implementation Reviewer",
+            taskName: "review",
+            startedAt: Date().addingTimeInterval(-85),
+            status: .completed,
+            provider: "system",
+            effort: "high"
+        )
+        reviewExecution.completedAt = Date().addingTimeInterval(-75)
+        reviewExecution.stageExecution = releaseStage
+        context.insert(reviewExecution)
+        _ = try artifactManager.persistOutputs(
+            outputs: [
+                "implementation_review_summary": Data("""
+                {"decision":"implemented","pass":true}
+                """.utf8)
+            ],
+            agent: reviewAgent,
+            agentExecution: reviewExecution,
+            workspace: workspace,
+            stageID: releaseStage.stageID,
+            iteration: releaseStage.iteration,
+            attemptNumber: releaseStage.attemptNumber,
+            catalog: nil
+        )
+
+        let endState = ExecutableState(
+            id: "state_12_workflow_complete",
+            label: "Workflow complete",
+            type: .end,
+            ownerAgentID: "lead_orchestrator",
+            runBlock: nil,
+            runAfterApproval: nil,
+            transitions: [],
+            approvalRequired: false,
+            approvalPolicy: nil,
+            loop: nil
+        )
+        let plan = RunPlan(
+            workflowID: "full_mvp_live",
+            workflowTitle: "Full MVP Live",
+            states: ["state_12_workflow_complete": endState],
+            initialStateID: "state_12_workflow_complete",
+            agentBindings: [:],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SimulatedAgentExecutor(),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let artifacts = try artifactManager.artifacts(forRunID: run.id)
+        let receiptArtifact = try #require(artifacts.last(where: { $0.name == "delivery_receipt" }))
+        let receiptData = try artifactManager.readArtifact(receiptArtifact, workspace: workspace)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(DeliveryReceiptBuilder.DeliveryReceipt.self, from: receiptData)
+
+        #expect(run.status == .completed)
+        #expect(receipt.releaseResult?.succeeded == true)
+        #expect(receipt.releaseResult?.commitSHA == "abc123def456")
+        #expect(receipt.implementationReviewStatus == "implemented")
+    }
+
+    @Test("Delivery receipt is emitted for partial delivery failure")
+    func deliveryReceiptEmittedForPartialFailure() async throws {
+        let repoRoot = tempDir.appendingPathComponent("delivery-failed-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+
+        let workspace = makeWorkspace(worktreeRoot: repoRoot)
+        let run = makeRun(workspace: workspace)
+        run.deliveryConfigurationJSON = try JSONEncoder().encode(makeDeliveryConfig(repoRoot: repoRoot.path))
+        run.worktreeRoot = repoRoot.path
+        run.baseRevision = "fff111222"
+
+        let releaseStage = StageExecution(
+            stageID: "state_11_manual_release",
+            label: "Manual release gate",
+            startedAt: Date().addingTimeInterval(-120),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        releaseStage.completedAt = Date().addingTimeInterval(-60)
+        releaseStage.run = run
+        context.insert(releaseStage)
+
+        let gitExecution = AgentExecution(
+            agentID: "commit_and_push_to_github",
+            agentTitle: "Commit and Push",
+            taskName: "commit_and_push",
+            startedAt: Date().addingTimeInterval(-100),
+            status: .completed,
+            provider: "system",
+            effort: "high"
+        )
+        gitExecution.completedAt = Date().addingTimeInterval(-90)
+        gitExecution.stageExecution = releaseStage
+        context.insert(gitExecution)
+
+        let connectExecution = AgentExecution(
+            agentID: "build_archive_and_push_connect",
+            agentTitle: "Build and Distribute",
+            taskName: "build_and_distribute",
+            startedAt: Date().addingTimeInterval(-80),
+            status: .failed,
+            provider: "system",
+            effort: "high"
+        )
+        connectExecution.completedAt = Date().addingTimeInterval(-70)
+        connectExecution.logSnippet = "ConnectPublishService failed: Upload failed"
+        connectExecution.stageExecution = releaseStage
+        context.insert(connectExecution)
+
+        let artifactManager = ArtifactManager(modelContext: context)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let gitAgent = makeAgent(
+            id: "commit_and_push_to_github",
+            outputs: ["release_manifest", "git_push_receipt"]
+        )
+        let gitManifest = GitReleaseService.ReleaseManifest(
+            commitSHA: "fff111222",
+            branch: "dogfood/test",
+            remote: "origin",
+            commitMessage: "[local/repo] Apply approved_proposal via Chainworks Forge",
+            filesChanged: 1,
+            insertions: 10,
+            deletions: 2,
+            timestamp: Date()
+        )
+        let gitReceipt = GitReleaseService.GitPushReceipt(
+            commitSHA: "fff111222",
+            remote: "origin",
+            branch: "dogfood/test",
+            status: "success",
+            failureReason: nil,
+            timestamp: Date()
+        )
+        _ = try artifactManager.persistOutputs(
+            outputs: [
+                "release_manifest": try encoder.encode(gitManifest),
+                "git_push_receipt": try encoder.encode(gitReceipt)
+            ],
+            agent: gitAgent,
+            agentExecution: gitExecution,
+            workspace: workspace,
+            stageID: releaseStage.stageID,
+            iteration: releaseStage.iteration,
+            attemptNumber: releaseStage.attemptNumber,
+            catalog: nil
+        )
+
+        let failingState = ExecutableState(
+            id: "state_11_manual_release",
+            label: "Manual release gate",
+            type: .start,
+            ownerAgentID: "build_archive_and_push_connect",
+            runBlock: ExecutableRunBlock(phases: [
+                .sequential([AgentTask(agent: "failing_agent", task: "fail", inputs: nil, outputs: nil)])
+            ]),
+            runAfterApproval: nil,
+            transitions: [],
+            approvalRequired: false,
+            approvalPolicy: nil,
+            loop: nil
+        )
+        let plan = RunPlan(
+            workflowID: "full_mvp_live",
+            workflowTitle: "Full MVP Live",
+            states: ["state_11_manual_release": failingState],
+            initialStateID: "state_11_manual_release",
+            agentBindings: ["failing_agent": makeAgent(id: "failing_agent")],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: FailurePolicy(
+                onError: "pause_and_require_human",
+                onLoopBudgetExhausted: "pause_and_require_human",
+                preserveArtifacts: true
+            ),
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let failingResult = AgentResult(
+            outputs: [:],
+            logSnippet: "failed",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "failure",
+            sessionID: nil,
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: nil,
+            configuredProviderID: nil,
+            adapterVersion: nil
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: failingResult),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let artifacts = try artifactManager.artifacts(forRunID: run.id)
+        let receiptArtifact = try #require(artifacts.last(where: { $0.name == "delivery_receipt" }))
+        let receiptData = try artifactManager.readArtifact(receiptArtifact, workspace: workspace)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(DeliveryReceiptBuilder.DeliveryReceipt.self, from: receiptData)
+
+        #expect(run.status == .blocked)
+        #expect(receipt.releaseResult?.succeeded == false)
+        #expect(receipt.releaseResult?.failureStage == "build_archive_and_push")
+        #expect(receipt.releaseResult?.commitSHA == "fff111222")
     }
 }

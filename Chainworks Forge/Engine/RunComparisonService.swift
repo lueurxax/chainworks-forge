@@ -112,17 +112,39 @@ struct RunComparisonService {
     }
 
     private func extractBindings(from run: Run) -> [RunComparison.AgentBinding] {
+        // Proposal 011 (REQ-008): Read from frozen binding snapshot first.
+        let frozenBindings: [String: ResolvedProviderBinding]
+        if let data = run.providerBindingSnapshotJSON,
+           let decoded = try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data) {
+            frozenBindings = decoded
+        } else {
+            frozenBindings = [:]
+        }
+
+        // Proposal 011 (REQ-009): Read frozen provenance.
+        let frozenProvenances: [String: FrozenBindingProvenance]
+        if let data = run.bindingProvenanceJSON,
+           let decoded = try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data) {
+            frozenProvenances = decoded
+        } else {
+            frozenProvenances = [:]
+        }
+
         let allAgents = run.stageExecutions.flatMap { $0.agentExecutions }
         var seen = Set<String>()
         var bindings: [RunComparison.AgentBinding] = []
         for agent in allAgents {
             guard !seen.contains(agent.agentID) else { continue }
             seen.insert(agent.agentID)
+            let frozenModel = frozenBindings[agent.agentID]?.model
+            let provenanceSource = frozenProvenances[agent.agentID]?.source.rawValue
             bindings.append(RunComparison.AgentBinding(
                 agentID: agent.agentID,
                 provider: agent.provider,
-                model: agent.resolvedModel ?? agent.resolvedBackendProfileID,
-                effort: agent.effort
+                model: frozenModel ?? agent.resolvedModel ?? agent.resolvedBackendProfileID,
+                effort: agent.effort,
+                provenanceSource: provenanceSource,
+                providerFamily: frozenBindings[agent.agentID]?.providerFamily
             ))
         }
         return bindings
@@ -240,6 +262,29 @@ struct RunComparison: Identifiable {
         let provider: String
         let model: String?
         let effort: String
+        /// Proposal 011 (REQ-009): Provenance source from frozen data.
+        let provenanceSource: String?
+        /// Proposal 011 (REQ-010): Provider family for cross-family mismatch detection.
+        let providerFamily: String?
+
+        /// Heuristic cross-family mismatch check, consistent with `ResolvedProviderBinding.hasCrossFamilyMismatch`.
+        var hasCrossFamilyMismatch: Bool {
+            guard let model, let providerFamily else { return false }
+            let lowerModel = model.lowercased()
+            let lowerFamily = providerFamily.lowercased()
+            let familyModelPrefixes: [(String, [String])] = [
+                ("claude", ["claude", "anthropic"]),
+                ("openai", ["gpt", "o1", "o3", "chatgpt"]),
+                ("gemini", ["gemini", "palm"]),
+            ]
+            for (familyKey, prefixes) in familyModelPrefixes {
+                let modelBelongsToFamily = prefixes.contains(where: { lowerModel.hasPrefix($0) })
+                if modelBelongsToFamily && !lowerFamily.contains(familyKey) {
+                    return true
+                }
+            }
+            return false
+        }
     }
 
     struct StageDelta: Identifiable {

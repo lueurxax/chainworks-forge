@@ -142,12 +142,18 @@ final class RunReportBuilder {
             )
         }
 
+        // Proposal 011 (REQ-008): Read model truth from frozen binding snapshot first.
+        let frozenBindings = decodeFrozenBindings(from: run)
+        let frozenProvenances = decodeFrozenProvenances(from: run)
+
         // Agents used
         let agentsUsed: [RunReportPayload.AgentEntry] = allAgents.map { agent in
-            RunReportPayload.AgentEntry(
+            let frozenModel = frozenBindings[agent.agentID]?.model
+            let provenanceLabel = frozenProvenances[agent.agentID].map { " (\($0.source.rawValue))" } ?? ""
+            return RunReportPayload.AgentEntry(
                 agentID: agent.agentID,
                 provider: agent.provider,
-                model: agent.resolvedModel ?? agent.resolvedBackendProfileID,
+                model: (frozenModel ?? agent.resolvedModel ?? agent.resolvedBackendProfileID ?? "unknown") + provenanceLabel,
                 effort: agent.effort,
                 costCents: agent.costCents,
                 duration: agentDuration(agent),
@@ -396,6 +402,18 @@ final class RunReportBuilder {
     private func agentDuration(_ agent: AgentExecution) -> Double {
         let end = agent.completedAt ?? Date()
         return end.timeIntervalSince(agent.startedAt)
+    }
+
+    // Proposal 011 (REQ-008): Decode frozen bindings from Run snapshot.
+    private func decodeFrozenBindings(from run: Run) -> [String: ResolvedProviderBinding] {
+        guard let data = run.providerBindingSnapshotJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)) ?? [:]
+    }
+
+    // Proposal 011 (REQ-009): Decode frozen provenances from Run snapshot.
+    private func decodeFrozenProvenances(from run: Run) -> [String: FrozenBindingProvenance] {
+        guard let data = run.bindingProvenanceJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data)) ?? [:]
     }
 
     private func formattedDuration(_ seconds: Double) -> String {

@@ -1,12 +1,12 @@
 import SwiftUI
 
-// MARK: - P005-OPS §7.4: Recovery Sheet
+// MARK: - P005-OPS §7.4 + Proposal 008 §7.2: Recovery Sheet
 
 /// Surfaces blocked/failed run recovery with:
 /// - reason, most recent stage, trust/provenance summary,
-/// - suggested next safe action, list of allowed actions.
+/// - suggested next safe action, list of allowed actions,
+/// - Proposal 008 additions: preserved receipts, stage history, evidence-pack status.
 /// Only exposes actions allowed for the current run type.
-/// No repo-write, release, or publish recovery (§7.3).
 struct RecoverySheet: View {
     let run: Run
     @Environment(\.modelContext) private var modelContext
@@ -15,6 +15,9 @@ struct RecoverySheet: View {
     @State private var recoveryContext: RecoveryContext?
     @State private var isExecuting = false
     @State private var errorMessage: String?
+    // Proposal 008 (§7.2): Show stage history and preserved receipts
+    @State private var showStageHistory = false
+    @State private var showPreservedReceipts = false
 
     var body: some View {
         NavigationStack {
@@ -72,6 +75,56 @@ struct RecoverySheet: View {
                                     }
                                     .buttonStyle(.bordered)
                                     .disabled(isExecuting)
+                                }
+                            }
+                        }
+                    }
+
+                    // Proposal 008 (§7.2): Stage history disclosure
+                    DisclosureGroup("Stage History", isExpanded: $showStageHistory) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(run.stageExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { stage in
+                                HStack {
+                                    Image(systemName: stageStatusIcon(stage.status))
+                                        .foregroundStyle(stageStatusColor(stage.status))
+                                        .frame(width: 20)
+                                    Text(stage.label)
+                                        .font(.caption)
+                                    Spacer()
+                                    Text(stage.status.rawValue)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    if stage.attemptNumber > 1 {
+                                        Text("(attempt \(stage.attemptNumber))")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Proposal 008 (§7.2): Preserved receipts disclosure
+                    let receiptArtifacts = run.stageExecutions
+                        .flatMap(\.agentExecutions)
+                        .flatMap(\.artifacts)
+                        .filter { $0.name.contains("receipt") || $0.contractID == "provider_receipt" || $0.contractID == "delivery_receipt" }
+                    if !receiptArtifacts.isEmpty {
+                        DisclosureGroup("Preserved Receipts (\(receiptArtifacts.count))", isExpanded: $showPreservedReceipts) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(receiptArtifacts) { receipt in
+                                    HStack {
+                                        Image(systemName: "doc.text.fill")
+                                            .foregroundStyle(.blue)
+                                            .frame(width: 20)
+                                        VStack(alignment: .leading) {
+                                            Text(receipt.name)
+                                                .font(.caption)
+                                            Text(receipt.createdAt.formatted())
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -182,5 +235,31 @@ struct RecoverySheet: View {
         }
 
         isExecuting = false
+    }
+
+    // MARK: - Proposal 008 (§7.2): Stage Status Helpers
+
+    private func stageStatusIcon(_ status: StageStatus) -> String {
+        switch status {
+        case .completed: return "checkmark.circle.fill"
+        case .failed: return "xmark.circle.fill"
+        case .running: return "play.circle.fill"
+        case .waitingApproval: return "pause.circle.fill"
+        case .blocked: return "exclamationmark.triangle.fill"
+        case .skipped: return "forward.fill"
+        case .pending, .ready: return "circle"
+        }
+    }
+
+    private func stageStatusColor(_ status: StageStatus) -> Color {
+        switch status {
+        case .completed: return .green
+        case .failed: return .red
+        case .running: return .blue
+        case .waitingApproval: return .orange
+        case .blocked: return .red
+        case .skipped: return .gray
+        case .pending, .ready: return .secondary
+        }
     }
 }

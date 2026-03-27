@@ -18,6 +18,8 @@ struct RunsHomeView: View {
     @State private var showComparisonPicker = false
     @State private var comparisonTargetRun: Run?
     @State private var showReportView = false
+    // Proposal 008 (§7.1–7.2): Blocked run recovery deep-link
+    @State private var showBlockedRecovery = false
 
     var body: some View {
         NavigationSplitView {
@@ -127,6 +129,7 @@ struct RunsHomeView: View {
                     onRecover: { showRecoverySheet = true },
                     onCompare: { showComparisonPicker = true },
                     onViewReport: { showReportView = true },
+                    onBlockedRecovery: { showBlockedRecovery = true },
                     compatibilityChecker: compatibilityChecker
                 )
             } else {
@@ -162,6 +165,20 @@ struct RunsHomeView: View {
                         .toolbar {
                             ToolbarItem(placement: .cancellationAction) {
                                 Button("Done") { showReportView = false }
+                            }
+                        }
+                }
+                .frame(minWidth: 600, minHeight: 500)
+            }
+        }
+        // Proposal 008 (§7.2): Blocked run recovery deep-link surface
+        .sheet(isPresented: $showBlockedRecovery) {
+            if let run = selectedRun {
+                NavigationStack {
+                    BlockedRunRecoveryView(run: run)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { showBlockedRecovery = false }
                             }
                         }
                 }
@@ -472,6 +489,8 @@ struct RunDetailPanel: View {
     let onRecover: () -> Void
     let onCompare: () -> Void
     let onViewReport: () -> Void
+    // Proposal 008 (§7.2): Blocked run recovery deep-link
+    var onBlockedRecovery: (() -> Void)?
     let compatibilityChecker: CompatibilityChecker
 
     @State private var evidenceExportMessage: String?
@@ -541,6 +560,14 @@ struct RunDetailPanel: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.orange)
+
+                        // Proposal 008 (§7.2): Detailed blocked-run recovery surface
+                        if let onBlockedRecovery {
+                            Button("Detailed Recovery", systemImage: "wrench.and.screwdriver") {
+                                onBlockedRecovery()
+                            }
+                            .buttonStyle(.bordered)
+                        }
                     }
 
                     if compatibilityChecker.hasCompatibleTargets(for: run) {
