@@ -1,0 +1,18 @@
+{
+  "icon_master_html": "/Users/user/Documents/Chainworks Forge/docs/brand/render/chainworks-forge-app-icon.html",
+  "icon_master_png": "/Users/user/Documents/Chainworks Forge/docs/brand/render/chainworks-forge-app-icon.png",
+  "horizontal_logo_html": "/Users/user/Documents/Chainworks Forge/docs/brand/render/chainworks-forge-logo-horizontal.html",
+  "horizontal_logo_png": "/Users/user/Documents/Chainworks Forge/docs/brand/render/chainworks-forge-logo-horizontal.png",
+  "readme_hero_html": "/Users/user/Documents/Chainworks Forge/docs/brand/render/chainworks-forge-readme-hero.html",
+  "readme_hero_png": "/Users/user/Documents/Chainworks Forge/docs/brand/render/chainworks-forge-readme-hero.png",
+  "app_icon_set": "/Users/user/Documents/Chainworks Forge/Chainworks Forge/Assets.xcassets/AppIcon.appiconset",
+  "icon_sizes": [
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024
+  ]
+}

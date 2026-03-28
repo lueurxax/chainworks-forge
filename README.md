@@ -1,8 +1,22 @@
 # Chainworks Forge
 
+<p align="center">
+  <img src="docs/brand/render/chainworks-forge-readme-hero.png" alt="Chainworks Forge brand hero" width="920" />
+</p>
+
 Chainworks Forge is the macOS SwiftUI app project for **Chainworks**: a local control plane for agent-driven engineering work.
 
 The product thesis is simple: the system should move an idea through proposal, review, implementation, audit, and release using explicit workflows, specialized agents, durable artifacts, and hard approval gates. The primary object is not a chat session. It is a **Run**.
+
+## Brand Assets
+
+- Original designer sheet: [Chainworks Forge/Assets.xcassets/image.png](Chainworks%20Forge/Assets.xcassets/image.png)
+- Extracted app icon master: [docs/brand/original-cuts/app-icon-master.png](docs/brand/original-cuts/app-icon-master.png)
+- Extracted horizontal logo: [docs/brand/original-cuts/horizontal-logo-clean.png](docs/brand/original-cuts/horizontal-logo-clean.png)
+- Extracted README hero: [docs/brand/original-cuts/readme-hero-top-panel.png](docs/brand/original-cuts/readme-hero-top-panel.png)
+- Vector reconstruction sources: [docs/brand/chainworks-forge-app-icon.svg](docs/brand/chainworks-forge-app-icon.svg), [docs/brand/chainworks-forge-logo-horizontal.svg](docs/brand/chainworks-forge-logo-horizontal.svg), [docs/brand/chainworks-forge-readme-hero.svg](docs/brand/chainworks-forge-readme-hero.svg)
+- Rendered assets: [docs/brand/render](docs/brand/render)
+- macOS icon set: [Chainworks Forge/Assets.xcassets/AppIcon.appiconset](Chainworks%20Forge/Assets.xcassets/AppIcon.appiconset)
 
 ## Architecture Sketch
 

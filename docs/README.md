@@ -70,6 +70,9 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 ## Proposals (active, not yet implemented)
 
 - [proposals/008-mvp-hardening-and-sign-off.md](proposals/008-mvp-hardening-and-sign-off.md) — MVP validation, boundary freeze, recovery UX, launch gate
+- [proposals/014-design-system-adoption-and-brand-application.md](proposals/014-design-system-adoption-and-brand-application.md) — adopt Design Kit v1 across the app shell and operator surfaces
+- [proposals/012-ui-quality-audit-and-visual-polish.md](proposals/012-ui-quality-audit-and-visual-polish.md) — operator-surface visual consistency, density, and polish
+- [proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md](proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md) — stage-output contract alignment, retry truth, failed-stage evidence, and recovery hardening
 
 ## Evidence
 

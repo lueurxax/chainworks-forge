@@ -1,0 +1,37 @@
+<svg width="1600" height="900" viewBox="0 0 1600 900" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(312 172) rotate(49.6) scale(1044 1218)">
+      <stop stop-color="#24344B"/>
+      <stop offset="0.47" stop-color="#0E1623"/>
+      <stop offset="1" stop-color="#04080D"/>
+    </radialGradient>
+    <linearGradient id="orbit" x1="192" y1="514" x2="764" y2="251" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E7EDF4"/>
+      <stop offset="0.5" stop-color="#A3AFC0"/>
+      <stop offset="1" stop-color="#627083"/>
+    </linearGradient>
+    <g id="bird">
+      <path d="M0 44C27 24 58 13 91 13C112 13 136 18 162 31C183 12 203 3 220 3C207 19 198 34 193 49C218 58 236 74 247 97C228 89 207 82 183 78C165 108 136 127 95 133C72 136 49 135 27 130C52 118 71 103 84 86C57 86 29 72 0 44Z" fill="#FAFBFD"/>
+      <path d="M167 34C184 18 202 7 220 3C209 18 201 33 196 47C184 43 175 39 167 34Z" fill="#F59A2B"/>
+      <path d="M17 53C43 34 71 24 102 24C122 24 145 29 170 41C155 62 144 76 138 83C110 77 86 76 67 80C49 73 32 64 17 53Z" fill="#243244"/>
+      <path d="M86 86C125 61 158 42 186 28C176 50 171 67 170 79C148 96 123 111 95 123C68 127 45 127 26 122C52 114 72 102 86 86Z" fill="#EEF3FA"/>
+    </g>
+  </defs>
+  <rect width="1600" height="900" fill="url(#glow)"/>
+  <path d="M137 523C208 406 333 306 510 223C655 155 792 116 919 105" stroke="url(#orbit)" stroke-width="12" stroke-linecap="round"/>
+  <path d="M124 568C258 651 435 684 654 669" stroke="#C5D0DE" stroke-opacity="0.08" stroke-width="6" stroke-linecap="round"/>
+
+  <g transform="translate(209 409) rotate(-10) scale(1.08)">
+    <use href="#bird"/>
+  </g>
+  <g transform="translate(394 292) rotate(-7) scale(0.95)">
+    <use href="#bird"/>
+  </g>
+  <g transform="translate(576 184) rotate(-4) scale(0.82)">
+    <use href="#bird"/>
+  </g>
+
+  <text x="886" y="392" fill="#F8FAFC" font-family="SF Pro Display, Avenir Next, Helvetica Neue, Arial, sans-serif" font-size="120" font-weight="650" letter-spacing="5">CHAINWORKS</text>
+  <text x="1099" y="488" fill="#E5EAF2" font-family="SF Pro Display, Avenir Next, Helvetica Neue, Arial, sans-serif" font-size="72" font-weight="500" letter-spacing="18">FORGE</text>
+  <text x="889" y="586" fill="#9FB0C4" font-family="SF Pro Text, Avenir Next, Helvetica Neue, Arial, sans-serif" font-size="32" font-weight="500" letter-spacing="1">Local control plane for agent-driven engineering work.</text>
+</svg>

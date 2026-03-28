@@ -1188,8 +1188,21 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let ideas = IdeasScreen(app: app)
         let startRun = StartRunScreen(app: app)
 
+        // Ensure the Ideas owner path is reachable, then wait for the seeded idea to
+        // appear in the list. On remote approved hosts the NavigationSplitView list
+        // can lag behind the root-view signals by several seconds.
+        let ideasRoot = anyElement(app, identifier: "ideas-root-view")
+        let ideasArchiveButton = app.buttons["ideas-open-archive"].firstMatch
+        let seededIdeaRow = ideas.findRow(ideaTitle)
+        if !(ideasRoot.waitForExistence(timeout: 10)
+             || ideasArchiveButton.waitForExistence(timeout: 10)
+             || seededIdeaRow.waitForExistence(timeout: 10)) {
+            _ = screen.selectTab("Ideas", timeout: 10)
+        }
         XCTAssertTrue(
-            ensureIdeasOwnerPath(app, screen: screen),
+            ideasRoot.waitForExistence(timeout: 15)
+                || ideasArchiveButton.waitForExistence(timeout: 15)
+                || seededIdeaRow.waitForExistence(timeout: 15),
             "Ideas owner path must be reachable for canonical full product checkpoint"
         )
 
@@ -1272,8 +1285,18 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let ideas = IdeasScreen(app: app)
         let startRun = StartRunScreen(app: app)
 
+        let ideasRoot = anyElement(app, identifier: "ideas-root-view")
+        let ideasArchiveButton = app.buttons["ideas-open-archive"].firstMatch
+        let seededIdeaRow = ideas.findRow(ideaTitle)
+        if !(ideasRoot.waitForExistence(timeout: 10)
+             || ideasArchiveButton.waitForExistence(timeout: 10)
+             || seededIdeaRow.waitForExistence(timeout: 10)) {
+            _ = screen.selectTab("Ideas", timeout: 10)
+        }
         XCTAssertTrue(
-            ensureIdeasOwnerPath(app, screen: screen),
+            ideasRoot.waitForExistence(timeout: 15)
+                || ideasArchiveButton.waitForExistence(timeout: 15)
+                || seededIdeaRow.waitForExistence(timeout: 15),
             "Ideas owner path must be reachable for canonical non-happy-path checkpoint"
         )
         XCTAssertTrue(
