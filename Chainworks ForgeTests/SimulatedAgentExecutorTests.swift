@@ -97,7 +97,7 @@ struct SimulatedAgentExecutorTests {
         let executor = SimulatedAgentExecutor()
         let agent = makeAgent(
             id: "reviewer",
-            outputs: ["review"],
+            outputs: ["proposal_review_po"],
             outputContract: "proposal_review_v1"
         )
         let result = try await executor.execute(
@@ -108,11 +108,51 @@ struct SimulatedAgentExecutorTests {
         #expect(result.succeeded)
 
         // Verify JSON is valid and has required fields
-        let data = result.outputs["review"]!
+        let data = result.outputs["proposal_review_po"]!
         let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         #expect(json["agent_id"] != nil)
         #expect(json["score"] != nil)
         #expect(json["verdict"] != nil)
+    }
+
+    @Test("Explicit output contract only applies to matching output")
+    func explicitOutputContractOnlyAppliesToMatchingOutput() {
+        let agent = makeAgent(
+            id: "code_writer",
+            outputs: ["implementation_progress", "implementation_self_assessment"],
+            outputContract: "implementation_self_assessment_v1"
+        )
+
+        let contractOutput = OutputContractResolver.contractID(
+            for: "implementation_self_assessment",
+            agent: agent,
+            catalog: nil
+        )
+        let progressOutput = OutputContractResolver.contractID(
+            for: "implementation_progress",
+            agent: agent,
+            catalog: nil
+        )
+
+        #expect(contractOutput == "implementation_self_assessment_v1")
+        #expect(progressOutput == nil)
+    }
+
+    @Test("Known aliased outputs still resolve structured contracts")
+    func knownAliasedOutputsStillResolveStructuredContracts() {
+        let agent = makeAgent(
+            id: "prepush_code_reviewer",
+            outputs: ["prepush_review_report"],
+            outputContract: "prepush_review_v1"
+        )
+
+        let contractID = OutputContractResolver.contractID(
+            for: "prepush_review_report",
+            agent: agent,
+            catalog: nil
+        )
+
+        #expect(contractID == "prepush_review_v1")
     }
 
     // MARK: - Failure Injection

@@ -1,4 +1,5 @@
 import Foundation
+import SwiftData
 
 // MARK: - EvidencePackBuilder (Proposal 007 — §12.2)
 
@@ -65,9 +66,7 @@ final class EvidencePackBuilder {
         let artifactsDir = packDir.appendingPathComponent("artifacts", isDirectory: true)
         try fm.createDirectory(at: artifactsDir, withIntermediateDirectories: true)
 
-        let allArtifacts = run.stageExecutions
-            .flatMap(\.agentExecutions)
-            .flatMap(\.artifacts)
+        let allArtifacts = persistedArtifacts(for: run)
 
         for artifact in allArtifacts {
             let sourcePath = artifact.filePath
@@ -144,7 +143,7 @@ final class EvidencePackBuilder {
                         "agentTitle": agent.agentTitle,
                         "taskName": agent.taskName,
                         "status": agent.status.rawValue,
-                        "provider": agent.provider ?? "unknown",
+                        "provider": agent.provider,
                         "costCents": agent.costCents ?? 0,
                         "repoRevisionBefore": agent.repoRevisionBefore ?? "none",
                         "repoRevisionAfter": agent.repoRevisionAfter ?? "none"
@@ -184,5 +183,25 @@ final class EvidencePackBuilder {
             itemCount: itemCount,
             timestamp: Date()
         )
+    }
+
+    private static func persistedArtifacts(for run: Run) -> [Artifact] {
+        if let modelContext = run.modelContext {
+            let descriptor = FetchDescriptor<Artifact>(
+                sortBy: [SortDescriptor(\.createdAt)]
+            )
+            if let fetched = try? modelContext.fetch(descriptor) {
+                return fetched.filter { $0.runID == run.id }
+            }
+        }
+
+        return run.stageExecutions
+            .sorted { $0.startedAt < $1.startedAt }
+            .flatMap { stage in
+                stage.agentExecutions
+                    .sorted { $0.startedAt < $1.startedAt }
+                    .flatMap(\.artifacts)
+            }
+            .sorted { $0.createdAt < $1.createdAt }
     }
 }

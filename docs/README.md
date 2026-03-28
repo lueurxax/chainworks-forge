@@ -23,20 +23,26 @@ Repository documentation for Chainworks Forge.
 9. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
 10. [reference/operator-experience.md](reference/operator-experience.md) — operator shell baseline
 11. [reference/provider-platform.md](reference/provider-platform.md) — provider/settings baseline
-12. [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — archive and restore baseline
-13. [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Goose-backed provider remediation path
-14. [reference/live-workflow-map.md](reference/live-workflow-map.md) — run-detail topology baseline
-15. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
-16. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
-17. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
-18. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
-19. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+12. [reference/run-control.md](reference/run-control.md) — stop/cancel truth and settlement
+13. [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — idea-owned workspace and frozen run contract
+14. [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — frozen provider/model provenance truth
+15. [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — archive and restore baseline
+16. [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Goose-backed provider remediation path
+17. [reference/live-workflow-map.md](reference/live-workflow-map.md) — run-detail topology baseline
+18. [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — repo-backed worktree, implementation loop, manual release, evidence export
+19. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
+20. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
+21. [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure, mock lanes, tags, and plans
+22. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
+23. [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — how agents should run preview, XCUITest, and app-launched proof paths
+24. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
+25. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
 
 ## Status
 
 - Owner: single-engineer working repo
-- Last updated: 2026-03-26
-- State: active — foundation, execution engine, live Goose transport, and Steward V1 implemented
+- Last updated: 2026-03-28
+- State: active — foundation, execution engine, live Goose transport, full MVP delivery slice, and Steward V1 implemented
 
 ## Reference (implemented)
 
@@ -46,24 +52,29 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 - [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
 - [reference/operator-experience.md](reference/operator-experience.md) — Stable operator shell baseline and contracts
 - [reference/provider-platform.md](reference/provider-platform.md) — Stable multi-provider/settings/diagnostics baseline
+- [reference/run-control.md](reference/run-control.md) — Stable stop/cancel and cancellation-settlement contract
+- [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Stable idea-owned workspace and frozen run project contract
+- [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Stable provider/model truth and provenance contract
 - [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — Stable archive/restore lifecycle for ideas
 - [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Stable Goose-backed provider verification/remediation flow
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Stable workflow topology and agent-activity surface
+- [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Stable repo-backed delivery slice: worktrees, implementation loop, manual release, evidence export
 - [reference/forge-steward.md](reference/forge-steward.md) — V1 observer: metrics, anomaly detection, cohorting, triggers
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 - [reference/domain-model.md](reference/domain-model.md) — SwiftData models and persistence
 - [reference/architecture-decisions.md](reference/architecture-decisions.md) — AD log
+- [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Stable Swift Testing suite structure and migration baseline
 - [reference/test-gates.md](reference/test-gates.md) — layered fast/UI/proposal/full gates
+- [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — Stable agent-facing UI execution rules and fallback proof paths
 
 ## Proposals (active, not yet implemented)
 
-- [proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md) — worktrees, implementation loop, release, dogfooding
 - [proposals/008-mvp-hardening-and-sign-off.md](proposals/008-mvp-hardening-and-sign-off.md) — MVP validation, boundary freeze, recovery UX, launch gate
-- [proposals/011-run-control-working-directory-and-provider-binding-truth.md](proposals/011-run-control-working-directory-and-provider-binding-truth.md) — stop/cancel truth, idea working directory, resolved provider/model truth
 
 ## Evidence
 
 - [evidence/goose-server-transport-verification.md](evidence/goose-server-transport-verification.md) -- Goose server transport verification record
+- [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
 - [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON
 
 ## Research

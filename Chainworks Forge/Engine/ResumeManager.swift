@@ -88,15 +88,22 @@ final class ResumeManager {
         // Check 3: Drift detection — compare current source hashes with frozen hashes
         let driftResult = detectDrift(run: run)
         if let driftReason = driftResult {
-            // If the run was in a state with side effects, require user decision
-            if hasSideEffectStages(run: run, plan: plan) {
+            // Proposal 008 (§6.3): Runs interrupted at an approval gate must restore
+            // the visible approval context even when workflow sources have drifted.
+            // The operator can reject from the restored gate if content is stale.
+            // Drift is surfaced as informational detail, not as a resume blocker.
+            if run.status == .waitingApproval {
+                run.driftDetails = driftReason
+                // Fall through to resume — approval gate will be restored with drift notice
+            } else if hasSideEffectStages(run: run, plan: plan) {
                 return .needsDecision(
                     run,
                     reason: "Drift detected and run has executed side-effect stages: \(driftReason)"
                 )
+            } else {
+                // Drift without side effects — still needs decision
+                return .needsDecision(run, reason: driftReason)
             }
-            // Drift without side effects — still needs decision
-            return .needsDecision(run, reason: driftReason)
         }
 
         // Check 4: Side-effect stage detection (e.g., git push, release)

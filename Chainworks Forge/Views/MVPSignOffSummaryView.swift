@@ -96,7 +96,7 @@ struct MVPSignOffSummaryView: View {
                         Image(systemName: decisionIcon)
                             .font(.system(size: 48))
                             .foregroundStyle(decisionColor)
-                        Text(snapshot.decision == .go ? "GO" : "HOLD")
+                        Text(snapshot!.decision == .go ? "GO" : "HOLD")
                             .font(.system(size: 36, weight: .heavy, design: .rounded))
                             .foregroundStyle(decisionColor)
                         Text("MVP Sign-Off Decision")
@@ -113,15 +113,15 @@ struct MVPSignOffSummaryView: View {
 
                 // Summary stats
                 HStack(spacing: 0) {
-                    statCell(label: "Pairs", value: "\(snapshot.pairCount)")
+                    statCell(label: "Pairs", value: "\(snapshot!.pairCount)")
                     Divider().frame(height: 36)
-                    statCell(label: "Happy Path", value: "\(snapshot.happyPathCount)")
+                    statCell(label: "Happy Path", value: "\(snapshot!.happyPathCount)")
                     Divider().frame(height: 36)
-                    statCell(label: "Recovered", value: "\(snapshot.recoveredCount)")
+                    statCell(label: "Recovered", value: "\(snapshot!.recoveredCount)")
                     Divider().frame(height: 36)
                     statCell(
                         label: "Failing Gates",
-                        value: "\(snapshot.failingGateReasons.count)"
+                        value: "\(snapshot!.failingGateReasons.count)"
                     )
                 }
             }
@@ -219,7 +219,7 @@ struct MVPSignOffSummaryView: View {
                     HStack {
                         Image(systemName: "info.circle")
                             .foregroundStyle(.secondary)
-                        Text("Cohort data not available (ID: \(snapshot.cohortID.uuidString.prefix(8)))")
+                        Text("Cohort data not available (ID: \(snapshot!.cohortID.uuidString.prefix(8)))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -349,17 +349,17 @@ struct MVPSignOffSummaryView: View {
                 timingRow(
                     label: "Proposal Approval",
                     icon: "doc.text.fill",
-                    seconds: snapshot.medianProposalApprovalSeconds
+                    seconds: snapshot!.medianProposalApprovalSeconds
                 )
                 timingRow(
                     label: "Implementation Approval",
                     icon: "hammer.fill",
-                    seconds: snapshot.medianImplementationApprovalSeconds
+                    seconds: snapshot!.medianImplementationApprovalSeconds
                 )
                 timingRow(
                     label: "Release Decision",
                     icon: "shippingbox.fill",
-                    seconds: snapshot.medianReleaseDecisionSeconds
+                    seconds: snapshot!.medianReleaseDecisionSeconds
                 )
 
                 Divider()
@@ -374,7 +374,7 @@ struct MVPSignOffSummaryView: View {
                             .font(.caption.bold())
                     }
                     .frame(width: 180, alignment: .leading)
-                    Text(formatOptionalDuration(snapshot.medianManualOrchestrationSeconds))
+                    Text(formatOptionalDuration(snapshot!.medianManualOrchestrationSeconds))
                         .font(.caption.monospaced().bold())
                         .foregroundStyle(.orange)
                         .frame(width: 100, alignment: .trailing)
@@ -389,7 +389,7 @@ struct MVPSignOffSummaryView: View {
                             .font(.caption.bold())
                     }
                     .frame(width: 180, alignment: .leading)
-                    Text(formatOptionalDuration(snapshot.medianAppOrchestrationSeconds))
+                    Text(formatOptionalDuration(snapshot!.medianAppOrchestrationSeconds))
                         .font(.caption.monospaced().bold())
                         .foregroundStyle(.blue)
                         .frame(width: 100, alignment: .trailing)
@@ -462,7 +462,7 @@ struct MVPSignOffSummaryView: View {
                             Text("Median Manual")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            Text(formatOptionalDuration(snapshot.medianManualOrchestrationSeconds))
+                            Text(formatOptionalDuration(snapshot!.medianManualOrchestrationSeconds))
                                 .font(.headline.monospaced())
                                 .foregroundStyle(.orange)
                         }
@@ -474,7 +474,7 @@ struct MVPSignOffSummaryView: View {
                             Text("Median App")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            Text(formatOptionalDuration(snapshot.medianAppOrchestrationSeconds))
+                            Text(formatOptionalDuration(snapshot!.medianAppOrchestrationSeconds))
                                 .font(.headline.monospaced())
                                 .foregroundStyle(.blue)
                         }
@@ -486,7 +486,7 @@ struct MVPSignOffSummaryView: View {
                             Text("Improvement")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            if let improvement = snapshot.medianImprovementPercent {
+                            if let improvement = snapshot!.medianImprovementPercent {
                                 Text(String(format: "%+.1f%%", improvement))
                                     .font(.headline.monospaced().bold())
                                     .foregroundStyle(improvement >= 0 ? .green : .red)
@@ -517,7 +517,7 @@ struct MVPSignOffSummaryView: View {
                         .foregroundStyle(.red)
                 }
 
-                ForEach(Array(snapshot.failingGateReasons.enumerated()), id: \.offset) { index, reason in
+                ForEach(Array(snapshot!.failingGateReasons.enumerated()), id: \.offset) { index, reason in
                     HStack(alignment: .top, spacing: 8) {
                         Text("\(index + 1).")
                             .font(.caption.monospaced().bold())
@@ -531,7 +531,7 @@ struct MVPSignOffSummaryView: View {
                 }
             }
         } label: {
-            Label("Failing Gates (\(snapshot.failingGateReasons.count))", systemImage: "xmark.shield.fill")
+            Label("Failing Gates (\(snapshot!.failingGateReasons.count))", systemImage: "xmark.shield.fill")
                 .foregroundStyle(.red)
         }
     }
@@ -543,30 +543,30 @@ struct MVPSignOffSummaryView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 16) {
                     LabeledContent("Evaluator Version") {
-                        Text(snapshot.evaluatorVersion)
+                        Text(snapshot!.evaluatorVersion)
                             .font(.caption.monospaced())
                     }
                     LabeledContent("Evaluated At") {
-                        Text(snapshot.evaluatedAt.formatted(.dateTime))
+                        Text(snapshot!.evaluatedAt.formatted(.dateTime))
                             .font(.caption)
                     }
                 }
 
                 HStack(spacing: 16) {
                     LabeledContent("Payload Checksum") {
-                        Text(snapshot.payloadChecksum)
+                        Text(snapshot!.payloadChecksum)
                             .font(.caption.monospaced())
                             .textSelection(.enabled)
                             .lineLimit(1)
                     }
                     LabeledContent("Snapshot ID") {
-                        Text(snapshot.id.uuidString.prefix(8))
+                        Text(snapshot!.id.uuidString.prefix(8))
                             .font(.caption.monospaced())
                     }
                 }
 
                 LabeledContent("Cohort ID") {
-                    Text(snapshot.cohortID.uuidString)
+                    Text(snapshot!.cohortID.uuidString)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
                         .lineLimit(1)
@@ -645,62 +645,29 @@ struct MVPSignOffSummaryView: View {
 
     // MARK: - Export
 
+    /// Proposal 008 (REQ-008): Export replayable sign-off packet using the dedicated builder.
     private func exportSignOffPacket() {
         isExporting = true
         exportMessage = nil
+
+        guard let snapshot, let cohort else {
+            exportMessage = "Cannot export: missing snapshot or cohort data."
+            isExporting = false
+            return
+        }
 
         let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
 
         do {
-            let packetDir = desktopURL
-                .appendingPathComponent(
-                    "signoff-packet-\(snapshot.id.uuidString.prefix(8))",
-                    isDirectory: true
-                )
-            try FileManager.default.createDirectory(at: packetDir, withIntermediateDirectories: true)
-
-            // Decision metadata
-            let metadata: [String: Any] = [
-                "snapshotID": snapshot.id.uuidString,
-                "cohortID": snapshot.cohortID.uuidString,
-                "evaluatorVersion": snapshot.evaluatorVersion,
-                "evaluatedAt": ISO8601DateFormatter().string(from: snapshot.evaluatedAt),
-                "decision": snapshot.decision.rawValue,
-                "payloadChecksum": snapshot.payloadChecksum,
-                "pairCount": snapshot.pairCount,
-                "happyPathCount": snapshot.happyPathCount,
-                "recoveredCount": snapshot.recoveredCount,
-                "medianManualOrchestrationSeconds": snapshot.medianManualOrchestrationSeconds ?? 0,
-                "medianAppOrchestrationSeconds": snapshot.medianAppOrchestrationSeconds ?? 0,
-                "medianImprovementPercent": snapshot.medianImprovementPercent ?? 0,
-                "medianProposalApprovalSeconds": snapshot.medianProposalApprovalSeconds ?? 0,
-                "medianImplementationApprovalSeconds": snapshot.medianImplementationApprovalSeconds ?? 0,
-                "medianReleaseDecisionSeconds": snapshot.medianReleaseDecisionSeconds ?? 0,
-                "failingGateReasons": snapshot.failingGateReasons
-            ] as [String: Any]
-
-            let metaData = try JSONSerialization.data(
-                withJSONObject: metadata,
-                options: [.prettyPrinted, .sortedKeys]
+            let builder = SignOffEvidencePackBuilder(modelContext: modelContext)
+            let packet = try builder.buildCohortPacket(cohort: cohort, snapshot: snapshot)
+            let exportDir = desktopURL.appendingPathComponent(
+                "signoff-packet-\(snapshot.id.uuidString.prefix(8))",
+                isDirectory: true
             )
-            try metaData.write(to: packetDir.appendingPathComponent("signoff-decision.json"))
-
-            // Full decision payload
-            try snapshot.decisionPayloadJSON.write(
-                to: packetDir.appendingPathComponent("decision-payload.json")
-            )
-
-            // Failing gate reasons (separate file for easy review)
-            if !snapshot.failingGateReasons.isEmpty {
-                let gateData = try JSONSerialization.data(
-                    withJSONObject: snapshot.failingGateReasons,
-                    options: [.prettyPrinted]
-                )
-                try gateData.write(to: packetDir.appendingPathComponent("failing-gates.json"))
-            }
-
-            exportMessage = "Sign-off packet exported to Desktop."
+            try builder.exportToFile(packet: packet, destinationURL: exportDir)
+            exportMessage = "Sign-off packet exported to Desktop via SignOffEvidencePackBuilder."
         } catch {
             exportMessage = "Export failed: \(error.localizedDescription)"
         }
@@ -711,11 +678,11 @@ struct MVPSignOffSummaryView: View {
     // MARK: - Computed Properties
 
     private var decisionIcon: String {
-        snapshot.decision == .go ? "checkmark.seal.fill" : "hand.raised.fill"
+        snapshot!.decision == .go ? "checkmark.seal.fill" : "hand.raised.fill"
     }
 
     private var decisionColor: Color {
-        snapshot.decision == .go ? .green : .red
+        snapshot!.decision == .go ? .green : .red
     }
 
     private var cohortStatusColor: Color {

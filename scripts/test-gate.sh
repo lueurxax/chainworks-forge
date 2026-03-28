@@ -7,6 +7,11 @@ SCHEME_NAME="Chainworks Forge"
 DESTINATION="platform=macOS"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 TEST_PLANS_DIR="$ROOT_DIR/TestPlans"
+UNSIGNED_BUILD_ARGS=(
+  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_REQUIRED=NO
+  CODE_SIGN_IDENTITY=
+)
 
 FAST_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
@@ -31,6 +36,8 @@ PROPOSAL_006_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testPilotReadinessRefreshSurface"
 )
 
+DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
+
 log() {
   printf '==> %s\n' "$*"
 }
@@ -44,8 +51,56 @@ latest_crash_log() {
   ls -1t "$HOME/Library/Logs/DiagnosticReports"/Chainworks\ Forge-*.ips 2>/dev/null | head -1 || true
 }
 
+normalize_host() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+approved_remote_ui_hosts() {
+  if [[ -n "${CHAINWORKS_REMOTE_UI_TEST_HOSTS:-}" ]]; then
+    IFS=',' read -r -a hosts <<<"$CHAINWORKS_REMOTE_UI_TEST_HOSTS"
+    printf '%s\n' "${hosts[@]}"
+  else
+    printf '%s\n' "${DEFAULT_REMOTE_UI_TEST_HOSTS[@]}"
+  fi
+}
+
+observed_host_names() {
+  {
+    hostname 2>/dev/null || true
+    scutil --get LocalHostName 2>/dev/null || true
+    scutil --get ComputerName 2>/dev/null || true
+  } | while IFS= read -r host; do
+    host="$(normalize_host "$host")"
+    [[ -n "$host" ]] && printf '%s\n' "$host"
+  done | awk '!seen[$0]++'
+}
+
+require_remote_ui_host() {
+  local approved observed host
+  mapfile -t approved < <(approved_remote_ui_hosts | while IFS= read -r host; do normalize_host "$host"; done | awk '!seen[$0]++')
+  mapfile -t observed < <(observed_host_names)
+
+  for host in "${observed[@]}"; do
+    local allowed
+    for allowed in "${approved[@]}"; do
+      if [[ "$host" == "$allowed" ]]; then
+        return 0
+      fi
+    done
+  done
+
+  printf 'error: UI tests are remote-only and may not run on this host.\n' >&2
+  printf 'approved remote hosts: %s\n' "${approved[*]}" >&2
+  printf 'observed host names: %s\n' "${observed[*]}" >&2
+  exit 3
+}
+
 check_idle_environment() {
-  local pattern='xcodebuild|xctest|XCTest|debugserver|Chainworks Forge.app/Contents/MacOS/Chainworks Forge'
+  local mode="${1:-strict}"
+  local pattern='xcodebuild|xctest|XCTest|debugserver'
+  if [[ "$mode" == "strict" ]]; then
+    pattern+='|Chainworks Forge.app/Contents/MacOS/Chainworks Forge'
+  fi
   local matches
   matches="$(
     {
@@ -78,6 +133,7 @@ for file in root.rglob("*.swift"):
     if file.name in exempt:
         continue
     content = file.read_text(encoding="utf-8")
+    has_exemption_marker = "// RunRepository-exempt" in content
     content = block_comments.sub("", content)
     sanitized_lines = []
     for line in content.splitlines():
@@ -90,7 +146,7 @@ for file in root.rglob("*.swift"):
         pattern.search(sanitized)
         and "RunStatus" not in sanitized
         and "RunRepositoryError" not in sanitized
-        and "// RunRepository-exempt" not in sanitized
+        and not has_exemption_marker
     ):
         violations.append(str(file.relative_to(root.parent)))
 
@@ -211,6 +267,7 @@ run_build() {
     -scheme "$SCHEME_NAME" \
     -destination "$DESTINATION" \
     -derivedDataPath "$derived_data" \
+    "${UNSIGNED_BUILD_ARGS[@]}" \
     build
 }
 
@@ -255,10 +312,20 @@ run_targeted_tests() {
     -resultBundlePath "$result_bundle"
   )
 
+  local includes_ui=0
+
   local test_id
   for test_id in "$@"; do
     cmd+=("-only-testing:$test_id")
+    if [[ "$test_id" == Chainworks\ ForgeUITests/* ]]; then
+      includes_ui=1
+    fi
   done
+
+  if [[ $includes_ui -eq 0 ]]; then
+    cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
+    cmd+=("-skip-testing:Chainworks ForgeUITests")
+  fi
 
   log "Test gate: $gate_name"
   "${cmd[@]}"
@@ -326,7 +393,7 @@ case "$GATE" in
     guard_plan_tag_sync
     ;;
   build)
-    check_idle_environment
+    check_idle_environment allow_app
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else
@@ -336,7 +403,7 @@ case "$GATE" in
     run_build "build"
     ;;
   fast)
-    check_idle_environment
+    check_idle_environment allow_app
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else
@@ -351,7 +418,8 @@ case "$GATE" in
     fi
     ;;
   ui-smoke)
-    check_idle_environment
+    check_idle_environment strict
+    require_remote_ui_host
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else
@@ -360,7 +428,8 @@ case "$GATE" in
     run_targeted_tests "ui-smoke" "${UI_SMOKE_TESTS[@]}"
     ;;
   proposal-006|p006)
-    check_idle_environment
+    check_idle_environment strict
+    require_remote_ui_host
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else
@@ -374,7 +443,8 @@ case "$GATE" in
     fi
     ;;
   full)
-    check_idle_environment
+    check_idle_environment strict
+    require_remote_ui_host
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else

@@ -36,7 +36,8 @@ enum RunStartOverrideResolver {
                 outputContract: agent.outputContract,
                 requiresHumanApproval: agent.requiresHumanApproval,
                 inputs: agent.inputs,
-                outputs: agent.outputs
+                outputs: agent.outputs,
+                worktreeWriteEnabled: agent.worktreeWriteEnabled
             ))
         })
 

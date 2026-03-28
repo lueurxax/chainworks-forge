@@ -1376,4 +1376,65 @@ struct ProviderPlatformTests {
         #expect(contents.contains { $0.hasSuffix("artifact-index.json") })
         #expect(contents.contains { $0.hasSuffix("artifacts/proposal.md") })
     }
+
+    @Test("Provider draft resets generated model when switching from Codex to Claude")
+    mutating func providerDraftResetsGeneratedModelWhenSwitchingFamilies() {
+        var draft = ProviderDraft()
+        let configuration = AppConfiguration.seededDefault()
+
+        draft.applyFamilyDefaults(.codex, configuration: configuration)
+        #expect(draft.displayName == "Codex Goose")
+        #expect(draft.defaultModel == "gpt-5-codex")
+
+        draft.applyFamilyDefaults(.claude, configuration: configuration)
+
+        #expect(draft.family == .claude)
+        #expect(draft.displayName == "Claude Goose")
+        #expect(draft.defaultModel == "claude-sonnet-4")
+    }
+
+    @Test("Provider draft normalizes cross-family model before save")
+    mutating func providerDraftNormalizesCrossFamilyModelBeforeSave() {
+        var draft = ProviderDraft()
+        draft.family = .claude
+        draft.displayName = "Claude Goose"
+        draft.transport = .gooseServer
+        draft.defaultModel = "gpt-5-codex"
+
+        draft.normalizeForSave()
+        let provider = draft.makeProvider()
+
+        #expect(provider.family == .claude)
+        #expect(provider.defaultModel == "claude-sonnet-4")
+    }
+
+    @Test("Provider settings store sanitizes stale cross-family provider defaults")
+    mutating func providerSettingsStoreSanitizesStaleCrossFamilyDefaults() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let staleClaude = ConfiguredProvider(
+            family: .claude,
+            displayName: "Codex Goose",
+            transport: .gooseServer,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .none,
+            defaultModel: "gpt-5-codex"
+        )
+
+        let store = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [staleClaude],
+                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: staleClaude.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+
+        let sanitized = try #require(store.settings.configuredProviders.first)
+        #expect(sanitized.family == .claude)
+        #expect(sanitized.defaultModel == "claude-sonnet-4")
+        #expect(sanitized.displayName == "Claude Goose")
+    }
 }

@@ -159,6 +159,12 @@ enum ProviderAdapterSupport {
     }
 
     static func probeGooseServerStatus(at baseURL: URL) async -> GooseServerReachability {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] != nil,
+           (baseURL.host == "fixture.local" || baseURL.absoluteString.contains("fixture.local")) {
+            return .reachable(statusCode: 200)
+        }
+
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.timeoutIntervalForRequest = 5
         sessionConfiguration.timeoutIntervalForResource = 10

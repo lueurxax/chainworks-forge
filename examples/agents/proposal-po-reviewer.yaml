@@ -8,7 +8,7 @@ agent:
   backend:
     runtime: goose
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: high
 
   skill:

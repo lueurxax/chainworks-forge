@@ -86,11 +86,16 @@ struct AppConfiguration: Codable, Equatable, Sendable {
 
     static func defaultRepositoryRoot() -> URL {
         let fileManager = FileManager.default
-        let candidates = [
-            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true),
-            URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-                .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
+        var candidates = [
+            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
         ]
+
+        if allowsDocumentsFallbackForCurrentProcess {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                    .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
+            )
+        }
 
         if let repoRoot = candidates.first(where: {
             fileManager.fileExists(atPath: $0.appendingPathComponent("examples/agents/agents.yaml").path)
@@ -105,8 +110,13 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         let fileManager = FileManager.default
 
         if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
-            return fileManager.temporaryDirectory
+            let base = fileManager.temporaryDirectory
                 .appendingPathComponent("ChainworksForgeSupport", isDirectory: true)
+            if let sessionID = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_SESSION_ID"],
+               !sessionID.isEmpty {
+                return base.appendingPathComponent(sessionID, isDirectory: true)
+            }
+            return base
         }
 
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -124,6 +134,13 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         return candidates.first {
             FileManager.default.isExecutableFile(atPath: $0)
         }
+    }
+
+    static var allowsDocumentsFallbackForCurrentProcess: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["CHAINWORKS_IN_MEMORY_STORE"] != "1"
+            && environment["CHAINWORKS_UI_TEST_SESSION_ID"] == nil
+            && environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] == nil
     }
 }
 

@@ -87,6 +87,64 @@ struct FullMVPWorkflowTests {
         #expect(foundLeadFirst, "lead_orchestrator (worktree provisioning) must run before code_writer")
     }
 
+    @Test("Run start overrides preserve worktree write capability for repo-backed agents")
+    func runStartOverridesPreserveWorktreeWriteCapability() {
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            backendProfileID: "codex_builder_high",
+            provider: "codex",
+            model: "gpt-5-codex",
+            effort: "high",
+            maxTurns: 20,
+            temperature: 0.2,
+            permissionProfile: "CODE_WRITE",
+            skillRef: "code_writer_core",
+            skillRole: nil,
+            prompt: "Implement the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["approved_proposal"],
+            outputs: ["changed_files_manifest"],
+            worktreeWriteEnabled: true
+        )
+        let plan = RunPlan(
+            workflowID: "full_mvp_live",
+            workflowTitle: "Full MVP Live",
+            states: [:],
+            initialStateID: "state_1_idea_received",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            requiresProjectAccess: true,
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+        let binding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_builder_high",
+            configuredProviderID: UUID(),
+            providerFamily: "claude",
+            providerIdentifier: "claude_code",
+            model: "claude-sonnet-4",
+            effort: "high",
+            transport: "goose_server",
+            adapterVersion: "v1"
+        )
+
+        let adjusted = RunStartOverrideResolver.applying(
+            bindings: ["code_writer": binding],
+            to: plan
+        )
+
+        #expect(adjusted.agentBindings["code_writer"]?.worktreeWriteEnabled == true)
+    }
+
     // MARK: - §13.1 Workflow: Implementation loop stops when seemingly_complete
 
     @Test("Implementation continued loop transitions on seemingly_complete")
@@ -414,7 +472,7 @@ extension ReleaseMode: CaseIterable {
 // MARK: - Integration Tests (§13.2)
 
 @MainActor
-@Suite("Full MVP Delivery — Integration")
+@Suite("Full MVP Delivery — Integration", .serialized)
 struct FullMVPIntegrationTests {
     let container: ModelContainer
     let context: ModelContext
@@ -435,6 +493,42 @@ struct FullMVPIntegrationTests {
         compiler = RunPlanCompiler(modelContext: context)
     }
 
+    private func makeDogfoodRepository() throws -> URL {
+        struct GitTestError: Error {
+            let message: String
+        }
+        let repoRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FullMVPDogfood-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+        try Data("dogfood baseline\n".utf8).write(to: repoRoot.appendingPathComponent("README.md"))
+
+        func runGit(_ arguments: [String]) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = arguments
+            process.currentDirectoryURL = repoRoot
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                let errorOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                    ?? String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                    ?? "git failed"
+                throw GitTestError(message: "git \(arguments.joined(separator: " ")) failed: \(errorOutput)")
+            }
+        }
+
+        try runGit(["init", "-b", "main"])
+        try runGit(["config", "user.name", "Chainworks Forge Tests"])
+        try runGit(["config", "user.email", "chainworks-forge-tests@local"])
+        try runGit(["add", "."])
+        try runGit(["commit", "-m", "Dogfood baseline"])
+        return repoRoot
+    }
+
     // MARK: - testFullMVPLiveRunCompiles
 
     @Test("Full MVP live run can be created with delivery configuration")
@@ -446,14 +540,6 @@ struct FullMVPIntegrationTests {
         let idea = Idea(title: "Test Full MVP", body: "End-to-end test of the full MVP delivery slice.")
         context.insert(idea)
 
-        let (run, workspace) = try compiler.createRun(
-            for: idea,
-            plan: plan,
-            workflowSourcePath: "test/full-mvp-live.yaml",
-            catalogSourcePath: "test/agents.yaml"
-        )
-
-        // Freeze delivery configuration
         let deliveryConfig = DeliveryConfiguration(
             profileID: "test_profile",
             profileLabel: "Test Repo",
@@ -467,10 +553,30 @@ struct FullMVPIntegrationTests {
             releaseTargetLabel: "Test Sandbox",
             releaseMode: .sandbox
         )
-        run.deliveryConfigurationJSON = try JSONEncoder().encode(deliveryConfig)
+
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "test/full-mvp-live.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: Data("{\"proposal_writer\":{\"providerFamily\":\"claude_code\"}}".utf8),
+                bindingProvenanceJSON: Data("{\"proposal_writer\":{\"source\":\"backend_profile\"}}".utf8),
+                startOptionsJSON: Data("{}".utf8),
+                frozenWorkspaceRootPath: "/tmp/test-repo",
+                deliveryConfiguration: deliveryConfig,
+                deliveryPreflightJSON: Data("{\"passed\":true}".utf8)
+            )
+        )
 
         #expect(run.workflowID == "full_mvp_live")
         #expect(run.deliveryConfigurationJSON != nil)
+        #expect(run.providerBindingSnapshotJSON != nil)
+        #expect(run.bindingProvenanceJSON != nil)
+        #expect(run.startOptionsJSON != nil)
+        #expect(run.frozenWorkspaceRootPath == "/tmp/test-repo")
+        #expect(run.deliveryPreflightJSON != nil)
+        #expect(run.repoRoot == "/tmp/test-repo")
 
         // Verify frozen config can be decoded
         let decoded = try JSONDecoder().decode(
@@ -496,21 +602,6 @@ struct FullMVPIntegrationTests {
         let idea = Idea(title: "Resume Test", body: "Test resume with worktree context.")
         context.insert(idea)
 
-        let (run, _) = try compiler.createRun(
-            for: idea,
-            plan: plan,
-            workflowSourcePath: "test/full-mvp-live.yaml",
-            catalogSourcePath: "test/agents.yaml"
-        )
-
-        // Simulate worktree being provisioned
-        run.worktreeRoot = "/tmp/worktrees/cw-resume-test-abc123"
-        run.baseRevision = "abc123def456"
-        run.repoIdentifier = "test-repo"
-        run.repoRoot = "/tmp/test-repo"
-        run.baseBranch = "main"
-        run.targetBranch = "dogfood/resume-test"
-
         let deliveryConfig = DeliveryConfiguration(
             profileID: nil, profileLabel: nil, sampleProfileID: nil,
             repoIdentifier: "test-repo",
@@ -522,7 +613,29 @@ struct FullMVPIntegrationTests {
             releaseTargetLabel: "Test Sandbox",
             releaseMode: .sandbox
         )
-        run.deliveryConfigurationJSON = try JSONEncoder().encode(deliveryConfig)
+
+        let (run, _) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "test/full-mvp-live.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: nil,
+                bindingProvenanceJSON: nil,
+                startOptionsJSON: nil,
+                frozenWorkspaceRootPath: "/tmp/test-repo",
+                deliveryConfiguration: deliveryConfig,
+                deliveryPreflightJSON: nil
+            )
+        )
+
+        // Simulate worktree being provisioned
+        run.worktreeRoot = "/tmp/worktrees/cw-resume-test-abc123"
+        run.baseRevision = "abc123def456"
+        run.repoIdentifier = "test-repo"
+        run.repoRoot = "/tmp/test-repo"
+        run.baseBranch = "main"
+        run.targetBranch = "dogfood/resume-test"
 
         // Verify ResumeManager can reconstruct delivery context from Run
         #expect(run.worktreeRoot == "/tmp/worktrees/cw-resume-test-abc123")
@@ -667,6 +780,409 @@ struct FullMVPIntegrationTests {
         #expect(config.baseBranch == "main")
         #expect(config.releaseMode == .sandbox)
         #expect(config.profileID == "chainworks_forge_self")
+    }
+
+    private func desktopExportDirectory() -> URL {
+        FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+    }
+
+    private func assertEvidencePack(
+        at exportPath: URL,
+        expectedFiles: [String]
+    ) {
+        for relativePath in expectedFiles {
+            let url = exportPath.appendingPathComponent(relativePath)
+            #expect(
+                FileManager.default.fileExists(atPath: url.path),
+                Comment(rawValue: "Expected exported evidence artifact at \(url.path)")
+            )
+        }
+    }
+
+    @Test("Repo-backed fixture happy path completes through manual release")
+    func repoBackedFixtureHappyPathCompletes() async throws {
+        let workflow = try loadTestFullMVPLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let repoRoot = try makeDogfoodRepository()
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let idea = Idea(title: "Dogfood Happy Path", body: "Repo-backed full MVP proof.")
+        context.insert(idea)
+
+        let deliveryConfig = DeliveryConfiguration(
+            profileID: "chainworks_forge_self",
+            profileLabel: "Chainworks Forge (Self)",
+            sampleProfileID: "chainworks_forge_self",
+            repoIdentifier: repoRoot.lastPathComponent,
+            repoRoot: repoRoot.path,
+            baseBranch: "main",
+            worktreeBasePath: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FullMVPDogfoodWorktrees-\(UUID().uuidString)", isDirectory: true).path,
+            targetBranch: "dogfood/test",
+            releaseTargetID: "sandbox_test",
+            releaseTargetLabel: "Sandbox",
+            releaseMode: .sandbox
+        )
+
+        setenv("CHAINWORKS_DELIVERY_PROOF_MODE", "happy_path", 1)
+        defer { unsetenv("CHAINWORKS_DELIVERY_PROOF_MODE") }
+
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "test/full-mvp-live.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: nil,
+                bindingProvenanceJSON: nil,
+                startOptionsJSON: nil,
+                frozenWorkspaceRootPath: repoRoot.path,
+                deliveryConfiguration: deliveryConfig,
+                deliveryPreflightJSON: Data("{\"passed\":true}".utf8)
+            )
+        )
+
+        let executor = GooseAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: executor,
+            modelContext: context,
+            catalog: catalog
+        )
+
+        var approvals: [ApprovalRequest] = []
+        orchestrator.onApprovalRequest = { request in
+            approvals.append(request)
+        }
+
+        await orchestrator.start()
+
+        await awaitCondition("Repo-backed full MVP fixture should reach a terminal state", timeout: 30.0) {
+            if !approvals.isEmpty {
+                let pending = approvals
+                approvals.removeAll()
+                for request in pending {
+                    orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "Fixture auto-approve")
+                }
+            }
+            return run.status == .completed || run.status == .blocked || run.status == .failed
+        }
+
+        let stages = run.stageExecutions.map { "\($0.stageID)=\($0.status.rawValue)" }.joined(separator: ", ")
+        let agentLogs = run.stageExecutions
+            .flatMap { $0.agentExecutions }
+            .map { "\($0.agentID)=\($0.status.rawValue):\($0.logSnippet ?? "-")" }
+            .joined(separator: " | ")
+        let artifactManager = ArtifactManager(modelContext: context)
+        let artifacts = try artifactManager.artifacts(forRunID: run.id)
+        let artifactNames = artifacts.map(\.name).sorted().joined(separator: ", ")
+        let reviewSummaryDebug: String
+        let transitionDebug: String
+        let transitionFieldDebug: String
+        let transitionContext: TransitionEvaluator.EvaluationContext
+        func debugScalarFields(from data: Data) -> [String: AnyCodableValue] {
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return [:]
+            }
+            var result: [String: AnyCodableValue] = [:]
+            for (key, value) in object {
+                if let number = value as? NSNumber {
+                    if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                        result[key] = .bool(number.boolValue)
+                    } else if floor(number.doubleValue) == number.doubleValue {
+                        result[key] = .int(number.intValue)
+                    } else {
+                        result[key] = .double(number.doubleValue)
+                    }
+                } else if let boolVal = value as? Bool {
+                    result[key] = .bool(boolVal)
+                } else if let stringVal = value as? String {
+                    result[key] = .string(stringVal)
+                }
+            }
+            return result
+        }
+        var debugArtifactFields: [String: [String: AnyCodableValue]] = [:]
+        for artifact in artifacts where artifact.format == .json {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: artifact.filePath)) else { continue }
+            debugArtifactFields[artifact.name] = debugScalarFields(from: data)
+        }
+        transitionContext = TransitionEvaluator.EvaluationContext(
+            producedArtifactNames: Set(artifacts.map(\.name)),
+            approvalGranted: false,
+            variables: plan.variables,
+            artifactFields: debugArtifactFields
+        )
+        transitionFieldDebug = "proposal_review_summary=\(String(describing: debugArtifactFields["proposal_review_summary"])) target=\(String(describing: plan.variables["proposal_score_target"]))"
+        if let state4 = plan.states["state_4_proposal_reviewed"] {
+            transitionDebug = state4.transitions
+                .map { "\($0.to)=\(TransitionEvaluator.evaluate($0.condition, context: transitionContext))" }
+                .joined(separator: ", ")
+        } else {
+            transitionDebug = "missing-state-4"
+        }
+        if let reviewArtifact = artifacts.first(where: { $0.name == "proposal_review_summary" }),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: reviewArtifact.filePath)),
+           let text = String(data: data, encoding: .utf8) {
+            reviewSummaryDebug = text
+        } else {
+            reviewSummaryDebug = "missing"
+        }
+
+        #expect(
+            run.status == RunStatus.completed,
+            Comment(rawValue: "Expected completed, got \(run.status.rawValue). stages=\(stages) agents=\(agentLogs) artifacts=\(artifactNames) proposalReviewSummary=\(reviewSummaryDebug) transitions=\(transitionDebug) transitionFields=\(transitionFieldDebug)")
+        )
+
+        #expect(artifacts.contains(where: { $0.name == "delivery_receipt" }))
+        #expect(artifacts.contains(where: { $0.name == "git_push_receipt" }))
+        #expect(artifacts.contains(where: { $0.name == "connect_upload_receipt" }))
+        #expect(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("README.md").path))
+
+        let exportedPack = try EvidencePackBuilder.export(
+            run: run,
+            workspace: workspace,
+            exportDirectory: desktopExportDirectory()
+        )
+        assertEvidencePack(
+            at: exportedPack.exportPath,
+            expectedFiles: [
+                "run-metadata.json",
+                "delivery-configuration.json",
+                "delivery-preflight.json",
+                "stage-summary.json",
+                "agent-execution-detail.json",
+                "deliverables/release-manifest.json",
+                "deliverables/git-push-receipt.json",
+                "deliverables/connect-upload-receipt.json",
+                "deliverables/delivery-receipt.json",
+                "screenshot-checklist.md"
+            ]
+        )
+    }
+
+    @Test("Repo-backed fixture non-happy path exports evidence with preserved partial receipts")
+    func repoBackedFixtureNonHappyPathExportsEvidence() async throws {
+        let workflow = try loadTestFullMVPLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let repoRoot = try makeDogfoodRepository()
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let idea = Idea(title: "Dogfood Non-Happy Path", body: "Repo-backed blocked delivery proof.")
+        context.insert(idea)
+
+        let deliveryConfig = DeliveryConfiguration(
+            profileID: "chainworks_forge_self",
+            profileLabel: "Chainworks Forge (Self)",
+            sampleProfileID: "chainworks_forge_self",
+            repoIdentifier: repoRoot.lastPathComponent,
+            repoRoot: repoRoot.path,
+            baseBranch: "main",
+            worktreeBasePath: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FullMVPDogfoodBlockedWorktrees-\(UUID().uuidString)", isDirectory: true).path,
+            targetBranch: "dogfood/test",
+            releaseTargetID: "sandbox_test",
+            releaseTargetLabel: "Sandbox",
+            releaseMode: .sandbox
+        )
+
+        setenv("CHAINWORKS_DELIVERY_PROOF_MODE", "non_happy_path", 1)
+        defer { unsetenv("CHAINWORKS_DELIVERY_PROOF_MODE") }
+
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "test/full-mvp-live.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: nil,
+                bindingProvenanceJSON: nil,
+                startOptionsJSON: nil,
+                frozenWorkspaceRootPath: repoRoot.path,
+                deliveryConfiguration: deliveryConfig,
+                deliveryPreflightJSON: Data("{\"passed\":true}".utf8)
+            )
+        )
+
+        let executor = GooseAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: executor,
+            modelContext: context,
+            catalog: catalog
+        )
+
+        var approvals: [ApprovalRequest] = []
+        orchestrator.onApprovalRequest = { request in
+            approvals.append(request)
+        }
+
+        await orchestrator.start()
+
+        await awaitCondition("Repo-backed full MVP fixture non-happy path should reach a terminal state", timeout: 30.0) {
+            if !approvals.isEmpty {
+                let pending = approvals
+                approvals.removeAll()
+                for request in pending {
+                    orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "Fixture auto-approve")
+                }
+            }
+            return run.status == .completed || run.status == .blocked || run.status == .failed
+        }
+
+        let artifactManager = ArtifactManager(modelContext: context)
+        let artifacts = try artifactManager.artifacts(forRunID: run.id)
+
+        #expect(
+            run.status == RunStatus.blocked,
+            Comment(rawValue: "Expected blocked non-happy-path run, got \(run.status.rawValue)")
+        )
+        #expect(artifacts.contains(where: { $0.name == "delivery_receipt" }))
+        #expect(artifacts.contains(where: { $0.name == "git_push_receipt" }))
+        #expect(!artifacts.contains(where: { $0.name == "connect_upload_receipt" }))
+
+        let exportedPack = try EvidencePackBuilder.export(
+            run: run,
+            workspace: workspace,
+            exportDirectory: desktopExportDirectory()
+        )
+        assertEvidencePack(
+            at: exportedPack.exportPath,
+            expectedFiles: [
+                "run-metadata.json",
+                "delivery-configuration.json",
+                "delivery-preflight.json",
+                "stage-summary.json",
+                "agent-execution-detail.json",
+                "deliverables/release-manifest.json",
+                "deliverables/git-push-receipt.json",
+                "deliverables/delivery-receipt.json",
+                "screenshot-checklist.md"
+            ]
+        )
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: exportedPack.exportPath
+                    .appendingPathComponent("deliverables/connect-upload-receipt.json")
+                    .path
+            )
+        )
+    }
+
+    @Test("Repo-backed fixture implementation review refine loop re-enters review and completes")
+    func repoBackedFixtureImplementationReviewRefineLoopCompletes() async throws {
+        let workflow = try loadTestFullMVPLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let repoRoot = try makeDogfoodRepository()
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let idea = Idea(title: "Dogfood Refine Loop", body: "Repo-backed runtime proof for implementation review re-entry.")
+        context.insert(idea)
+
+        let deliveryConfig = DeliveryConfiguration(
+            profileID: "chainworks_forge_self",
+            profileLabel: "Chainworks Forge (Self)",
+            sampleProfileID: "chainworks_forge_self",
+            repoIdentifier: repoRoot.lastPathComponent,
+            repoRoot: repoRoot.path,
+            baseBranch: "main",
+            worktreeBasePath: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FullMVPDogfoodRefineWorktrees-\(UUID().uuidString)", isDirectory: true).path,
+            targetBranch: "dogfood/refine-loop",
+            releaseTargetID: "sandbox_test",
+            releaseTargetLabel: "Sandbox",
+            releaseMode: .sandbox
+        )
+
+        setenv("CHAINWORKS_DELIVERY_PROOF_MODE", "happy_path", 1)
+        defer { unsetenv("CHAINWORKS_DELIVERY_PROOF_MODE") }
+
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "test/full-mvp-live.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: nil,
+                bindingProvenanceJSON: nil,
+                startOptionsJSON: nil,
+                frozenWorkspaceRootPath: repoRoot.path,
+                deliveryConfiguration: deliveryConfig,
+                deliveryPreflightJSON: Data("{\"passed\":true}".utf8)
+            )
+        )
+
+        let executor = GooseAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPRefineThenSuccess))
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: executor,
+            modelContext: context,
+            catalog: catalog
+        )
+
+        var approvals: [ApprovalRequest] = []
+        orchestrator.onApprovalRequest = { request in
+            approvals.append(request)
+        }
+
+        await orchestrator.start()
+
+        await awaitCondition("Repo-backed refine-loop fixture should reach completion after review re-entry", timeout: 30.0) {
+            if !approvals.isEmpty {
+                let pending = approvals
+                approvals.removeAll()
+                for request in pending {
+                    orchestrator.resolveApproval(stageID: request.stageID, granted: true, comment: "Fixture auto-approve")
+                }
+            }
+            return run.status == .completed || run.status == .blocked || run.status == .failed
+        }
+
+        let artifactManager = ArtifactManager(modelContext: context)
+        let artifacts = try artifactManager.artifacts(forRunID: run.id)
+
+        func decodeStatus(from artifact: Artifact) throws -> String {
+            let data = try Data(contentsOf: URL(fileURLWithPath: artifact.filePath))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: data) as? [String: Any],
+                "Expected JSON object artifact at \(artifact.filePath)"
+            )
+            return try #require(object["status"] as? String, "Expected `status` field in \(artifact.filePath)")
+        }
+
+        let implementationReviewStages = run.stageExecutions.filter { $0.stageID == "state_9_implementation_reviewed" }
+        let refinementStages = run.stageExecutions.filter { $0.stageID == "state_10_implementation_refined" }
+        let auditReports = artifacts
+            .filter { $0.name == "audit_report" }
+            .sorted { $0.createdAt < $1.createdAt }
+        let reviewSummaries = artifacts
+            .filter { $0.name == "implementation_review_summary" }
+            .sorted { $0.createdAt < $1.createdAt }
+
+        #expect(run.status == .completed, "Refine-loop fixture should eventually complete")
+        #expect(implementationReviewStages.count == 2, "Implementation review must execute twice")
+        #expect(refinementStages.count == 1, "Refinement stage must execute once before returning to review")
+        #expect(run.loopCounters["implementation_revision_count"] == 1)
+        #expect(auditReports.count == 2, "Expected pre- and post-refinement audit reports")
+        #expect(reviewSummaries.count == 2, "Expected pre- and post-refinement review summaries")
+        #expect(try decodeStatus(from: auditReports[0]) == "Needs Work")
+        #expect(try decodeStatus(from: auditReports[1]) == "Implemented")
+        #expect(try decodeStatus(from: reviewSummaries[0]) == "Needs Work")
+        #expect(try decodeStatus(from: reviewSummaries[1]) == "Implemented")
+        #expect(artifacts.contains(where: { $0.name == "delivery_receipt" }))
     }
 
     // MARK: - testSourceContextBuilder

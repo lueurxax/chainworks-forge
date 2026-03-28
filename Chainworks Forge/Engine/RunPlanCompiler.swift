@@ -76,7 +76,8 @@ final class RunPlanCompiler {
         for idea: Idea,
         plan: RunPlan,
         workflowSourcePath: String,
-        catalogSourcePath: String
+        catalogSourcePath: String,
+        startSnapshot: RunStartSnapshot = .empty
     ) throws -> (Run, RunWorkspace) {
         // Step 8: Generate run identity
         let runID = UUID()
@@ -91,7 +92,8 @@ final class RunPlanCompiler {
             plan: plan,
             workspace: workspace,
             workflowSourcePath: workflowSourcePath,
-            catalogSourcePath: catalogSourcePath
+            catalogSourcePath: catalogSourcePath,
+            startSnapshot: startSnapshot
         )
 
         return (run, workspace)
@@ -327,12 +329,12 @@ final class RunPlanCompiler {
     // MARK: - Private: Workspace Provisioning
 
     private func provisionWorkspace(runID: UUID) throws -> RunWorkspace {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first!
-        let workspaceRoot = appSupport
-            .appendingPathComponent("Chainworks Forge", isDirectory: true)
-            .appendingPathComponent("runs", isDirectory: true)
+        let configuredBasePath = ProcessInfo.processInfo.environment["CHAINWORKS_RUN_STORAGE_BASE_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let runsBase = configuredBasePath?.isEmpty == false
+            ? URL(fileURLWithPath: configuredBasePath!, isDirectory: true)
+            : AppConfiguration.defaultSupportRoot().appendingPathComponent("runs", isDirectory: true)
+        let workspaceRoot = runsBase
             .appendingPathComponent(runID.uuidString, isDirectory: true)
         let artifactRoot = workspaceRoot
             .appendingPathComponent("artifacts", isDirectory: true)

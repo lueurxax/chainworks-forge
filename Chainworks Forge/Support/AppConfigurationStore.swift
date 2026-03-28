@@ -4,6 +4,7 @@ import Observation
 @Observable
 final class AppConfigurationStore {
     private let fileURL: URL
+    private let loadedPersistedConfiguration: Bool
     @MainActor private(set) var configuration: AppConfiguration
 
     @MainActor
@@ -12,16 +13,18 @@ final class AppConfigurationStore {
         self.fileURL = resolvedURL
 
         if let initialConfiguration {
+            self.loadedPersistedConfiguration = true
             self.configuration = initialConfiguration
             try? persist()
             return
         }
 
         if let loaded = try? Self.load(from: resolvedURL) {
+            self.loadedPersistedConfiguration = true
             self.configuration = loaded
         } else {
+            self.loadedPersistedConfiguration = false
             self.configuration = AppConfiguration.seededDefault()
-            try? persist()
         }
     }
 
@@ -48,7 +51,7 @@ final class AppConfigurationStore {
 
     @MainActor
     func hasPersistedConfiguration() -> Bool {
-        FileManager.default.fileExists(atPath: fileURL.path)
+        loadedPersistedConfiguration
     }
 
     private func persist() throws {

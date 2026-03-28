@@ -162,6 +162,7 @@ final class WorkflowOrchestrator {
 
     /// Resolve an approval (called from UI or ExecutionService).
     func resolveApproval(stageID: String, granted: Bool, comment: String? = nil) {
+        RuntimeDiagnostics.log("resolveApproval stageID=\(stageID) granted=\(granted)")
         // Find or create the Approval record
         let approval = run.approvals.first { $0.stageID == stageID && $0.decision == .requested }
         if let approval {
@@ -196,13 +197,18 @@ final class WorkflowOrchestrator {
 
     /// Resume execution after an approval is granted.
     private func resumeAfterApproval(stageID: String) async {
-        guard let state = plan.states[stageID] else { return }
+        guard let state = plan.states[stageID] else {
+            RuntimeDiagnostics.log("resumeAfterApproval missingState stageID=\(stageID)")
+            return
+        }
+        RuntimeDiagnostics.log("resumeAfterApproval begin stageID=\(stageID)")
 
         // Execute run_after_approval block if present
         if let runAfterApproval = state.runAfterApproval {
             if let stageExec = run.stageExecutions.first(where: { $0.stageID == stageID }) {
                 let success = await executeRunBlock(runAfterApproval, state: state, stageExec: stageExec)
                 if !success {
+                    RuntimeDiagnostics.log("resumeAfterApproval runAfterApprovalFailed stageID=\(stageID)")
                     handleFailure(state: state)
                     return
                 }
@@ -221,12 +227,14 @@ final class WorkflowOrchestrator {
             transitions: state.transitions,
             context: context
         ) else {
+            RuntimeDiagnostics.log("resumeAfterApproval noTransition stageID=\(stageID)")
             run.status = .blocked
             isRunning = false
             onComplete?(false)
             return
         }
 
+        RuntimeDiagnostics.log("resumeAfterApproval transition stageID=\(stageID) to=\(transition.to)")
         currentStateID = transition.to
         await executeStateMachine()
     }
@@ -244,6 +252,7 @@ final class WorkflowOrchestrator {
 
             // Check for end state
             if state.type == .end {
+                RuntimeDiagnostics.log("executeStateMachine reachedEnd stateID=\(state.id)")
                 run.status = .completed
                 run.completedAt = Date()
                 persistDeliveryReceiptIfNeeded(finalStateID: state.id)
@@ -288,6 +297,7 @@ final class WorkflowOrchestrator {
                 }
                 // Dead end — mark complete if no transitions defined
                 if state.transitions.isEmpty {
+                    RuntimeDiagnostics.log("executeStateMachine deadEndComplete stateID=\(state.id)")
                     run.status = .completed
                     run.completedAt = Date()
                     persistDeliveryReceiptIfNeeded(finalStateID: state.id)
@@ -296,6 +306,7 @@ final class WorkflowOrchestrator {
                     return
                 }
                 // Otherwise, stalled
+                RuntimeDiagnostics.log("executeStateMachine blockedNoTransition stateID=\(state.id) artifacts=\(producedArtifactNames.sorted())")
                 run.status = .blocked
                 isRunning = false
                 onComplete?(false)
@@ -303,6 +314,7 @@ final class WorkflowOrchestrator {
             }
 
             // Move to next state
+            RuntimeDiagnostics.log("executeStateMachine transition from=\(state.id) to=\(transition.to)")
             currentStateID = transition.to
         }
     }
@@ -319,6 +331,7 @@ final class WorkflowOrchestrator {
 
     /// Execute a single state: run block, then check approval.
     private func executeState(_ state: ExecutableState) async -> StateResult {
+        RuntimeDiagnostics.log("executeState begin stateID=\(state.id)")
         // Create StageExecution lazily (ARCH-027)
         let iteration = currentIteration(for: state.id)
         let stageExec = StageExecution(
@@ -335,6 +348,7 @@ final class WorkflowOrchestrator {
         do {
             try await provisionWorktreeIfNeeded(for: state)
         } catch {
+            RuntimeDiagnostics.log("executeState worktreeProvisioningFailed stateID=\(state.id) error=\(error.localizedDescription)")
             stageExec.status = .failed
             stageExec.completedAt = Date()
             stageExec.label = "\(state.label) — worktree provisioning failed: \(error.localizedDescription)"
@@ -345,6 +359,7 @@ final class WorkflowOrchestrator {
         if let runBlock = state.runBlock {
             let blockSuccess = await executeRunBlock(runBlock, state: state, stageExec: stageExec)
             if !blockSuccess {
+                RuntimeDiagnostics.log("executeState runBlockFailed stateID=\(state.id)")
                 stageExec.status = .failed
                 stageExec.completedAt = Date()
                 return .failed
@@ -374,6 +389,7 @@ final class WorkflowOrchestrator {
                 approvalPolicy: state.approvalPolicy
             )
             onApprovalRequest?(request)
+            RuntimeDiagnostics.log("executeState waitingApproval stateID=\(state.id) policy=\(state.approvalPolicy ?? "nil")")
             return .paused // Will resume when approval is resolved
         }
 
@@ -381,6 +397,7 @@ final class WorkflowOrchestrator {
         if let runAfterApproval = state.runAfterApproval {
             let afterSuccess = await executeRunBlock(runAfterApproval, state: state, stageExec: stageExec)
             if !afterSuccess {
+                RuntimeDiagnostics.log("executeState runAfterApprovalFailed stateID=\(state.id)")
                 stageExec.status = .failed
                 stageExec.completedAt = Date()
                 return .failed
@@ -407,6 +424,7 @@ final class WorkflowOrchestrator {
 
         stageExec.status = .completed
         stageExec.completedAt = Date()
+        RuntimeDiagnostics.log("executeState completed stateID=\(state.id)")
         return .succeeded
     }
 
@@ -477,7 +495,8 @@ final class WorkflowOrchestrator {
 
         // Build execution context
         let execContext = ExecutionContext(
-            workspace: workspace,
+            workspace: currentWorkspace,
+            projectRoot: preferredProjectRoot,
             stageID: state.id,
             iteration: currentIteration(for: state.id),
             attemptNumber: 1,
@@ -542,7 +561,7 @@ final class WorkflowOrchestrator {
                     outputs: result.outputs,
                     agent: agent,
                     agentExecution: agentExec,
-                    workspace: workspace,
+                    workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: 1,
@@ -602,7 +621,8 @@ final class WorkflowOrchestrator {
         deliveryConfig: DeliveryConfiguration,
         inputData: [String: Data]
     ) async -> Bool {
-        guard let worktreeRoot = workspace.worktreeRoot else {
+        guard let worktreeRoot = currentWorkspace.worktreeRoot else {
+            RuntimeDiagnostics.log("executeReleaseAgentTask missingWorktree agentID=\(agent.id) stateID=\(state.id)")
             agentExec.status = .failed
             agentExec.completedAt = Date()
             agentExec.logSnippet = "Release agent requires a provisioned worktree but none is available."
@@ -622,6 +642,7 @@ final class WorkflowOrchestrator {
         if agent.id == "commit_and_push_to_github" {
             let gitService = GitReleaseService()
             do {
+                RuntimeDiagnostics.log("executeReleaseAgentTask begin agentID=\(agent.id) branch=\(deliveryConfig.targetBranch) worktree=\(worktreeRoot.path)")
                 let (manifest, receipt) = try await gitService.commitAndPush(
                     worktreeRoot: worktreeRoot,
                     targetBranch: deliveryConfig.targetBranch,
@@ -641,7 +662,7 @@ final class WorkflowOrchestrator {
                     outputs: outputs,
                     agent: agent,
                     agentExecution: agentExec,
-                    workspace: workspace,
+                    workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: 1,
@@ -654,9 +675,11 @@ final class WorkflowOrchestrator {
                 agentExec.status = .completed
                 agentExec.completedAt = Date()
                 agentExec.logSnippet = "GitReleaseService: commit \(manifest.commitSHA.prefix(8)) pushed to \(manifest.branch)"
+                RuntimeDiagnostics.log("executeReleaseAgentTask success agentID=\(agent.id) branch=\(manifest.branch)")
                 unregisterLiveExecution(agentExec, for: agent.id)
                 return true
             } catch {
+                RuntimeDiagnostics.log("executeReleaseAgentTask failure agentID=\(agent.id) error=\(error.localizedDescription)")
                 // REQ-011: Persist any partial receipts and propagate failure
                 let result = ReleaseOpsCoordinator.ReleaseResult(
                     gitManifest: nil,
@@ -705,6 +728,7 @@ final class WorkflowOrchestrator {
                 return false
             }
             do {
+                RuntimeDiagnostics.log("executeReleaseAgentTask begin agentID=\(agent.id) target=\(deliveryConfig.releaseTargetID) mode=\(deliveryConfig.releaseMode.rawValue)")
                 let publishService = ConnectPublishService()
                 let (bundle, uploadReceipt) = try await publishService.buildArchiveAndUpload(
                     worktreeRoot: worktreeRoot,
@@ -727,7 +751,7 @@ final class WorkflowOrchestrator {
                     outputs: outputs,
                     agent: agent,
                     agentExecution: agentExec,
-                    workspace: workspace,
+                    workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: 1,
@@ -757,9 +781,11 @@ final class WorkflowOrchestrator {
                 agentExec.status = .completed
                 agentExec.completedAt = Date()
                 agentExec.logSnippet = "ConnectPublishService: bundle \(bundle.bundleVersion) uploaded to \(uploadReceipt.destination)"
+                RuntimeDiagnostics.log("executeReleaseAgentTask success agentID=\(agent.id) destination=\(uploadReceipt.destination)")
                 unregisterLiveExecution(agentExec, for: agent.id)
                 return true
             } catch {
+                RuntimeDiagnostics.log("executeReleaseAgentTask failure agentID=\(agent.id) error=\(error.localizedDescription)")
                 // REQ-011: Persist partial receipts (git_push_receipt already persisted by prior agent)
                 // and propagate failure so run becomes .blocked via existing failure handling
                 let result = ReleaseOpsCoordinator.ReleaseResult(
@@ -858,7 +884,8 @@ final class WorkflowOrchestrator {
                 let task = pair.task
                 let agent = pair.agent
                 let execContext = ExecutionContext(
-                    workspace: workspace,
+                    workspace: currentWorkspace,
+                    projectRoot: preferredProjectRoot,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: 1,
@@ -935,7 +962,7 @@ final class WorkflowOrchestrator {
                     outputs: result.outputs,
                     agent: agent,
                     agentExecution: agentExec,
-                    workspace: workspace,
+                    workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: 1,
@@ -1000,6 +1027,7 @@ final class WorkflowOrchestrator {
             repoIdentifier: config.repoIdentifier,
             repoRoot: config.repoRoot,
             baseBranch: config.baseBranch,
+            targetBranch: config.targetBranch,
             worktreeBasePath: config.worktreeBasePath,
             ideaSlug: ideaSlug,
             runShortID: runShortID
@@ -1008,6 +1036,7 @@ final class WorkflowOrchestrator {
         // Persist provisioning result on the Run
         run.worktreeRoot = result.worktreeRoot.path
         run.baseRevision = result.baseRevision
+        RuntimeDiagnostics.log("worktreeProvisioned stateID=\(state.id) branch=\(result.branchName) root=\(result.worktreeRoot.path)")
     }
 
     // MARK: - Helpers
@@ -1016,6 +1045,29 @@ final class WorkflowOrchestrator {
         guard !run.isDeleted, run.modelContext != nil else { return 1 }
         let existing = run.stageExecutions.filter { $0.stageID == stageID }
         return existing.count + 1
+    }
+
+    private var currentWorkspace: RunWorkspace {
+        RunWorkspace(
+            runID: workspace.runID,
+            workspaceRoot: workspace.workspaceRoot,
+            artifactRoot: workspace.artifactRoot,
+            worktreeRoot: run.worktreeRoot.flatMap { URL(fileURLWithPath: $0) }
+        )
+    }
+
+    private var preferredProjectRoot: URL? {
+        if let frozenPath = run.frozenWorkspaceRootPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !frozenPath.isEmpty {
+            return URL(fileURLWithPath: frozenPath, isDirectory: true)
+        }
+
+        if let config = deliveryConfig {
+            return URL(fileURLWithPath: config.repoRoot, isDirectory: true)
+        }
+
+        return nil
     }
 
     private func isApprovalGranted(for stageID: String) -> Bool {
@@ -1098,7 +1150,7 @@ final class WorkflowOrchestrator {
         var inputs = gatherInputs(for: task)
 
         guard let config = deliveryConfig,
-              let worktreeRoot = workspace.worktreeRoot else {
+              let worktreeRoot = currentWorkspace.worktreeRoot else {
             return inputs
         }
 
@@ -1371,7 +1423,15 @@ final class WorkflowOrchestrator {
     private func scalarFields(from json: [String: Any]) -> [String: AnyCodableValue] {
         var fields: [String: AnyCodableValue] = [:]
         for (key, value) in json {
-            if let boolVal = value as? Bool {
+            if let number = value as? NSNumber {
+                if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                    fields[key] = .bool(number.boolValue)
+                } else if floor(number.doubleValue) == number.doubleValue {
+                    fields[key] = .int(number.intValue)
+                } else {
+                    fields[key] = .double(number.doubleValue)
+                }
+            } else if let boolVal = value as? Bool {
                 fields[key] = .bool(boolVal)
             } else if let intVal = value as? Int {
                 fields[key] = .int(intVal)
@@ -1389,6 +1449,7 @@ final class WorkflowOrchestrator {
     private func handleFailure(state: ExecutableState) {
         let policy = plan.failurePolicy
         let action = policy?.onError ?? "pause_and_require_human"
+        RuntimeDiagnostics.log("handleFailure stateID=\(state.id) action=\(action)")
 
         switch action {
         case "pause_and_require_human":
@@ -1396,15 +1457,18 @@ final class WorkflowOrchestrator {
             persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
             isPaused = true
+            RuntimeDiagnostics.log("handleFailure blocked stateID=\(state.id)")
         case "fail_run":
             run.status = .failed
             run.completedAt = Date()
             persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
+            RuntimeDiagnostics.log("handleFailure failed stateID=\(state.id)")
         default:
             run.status = .blocked
             persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
+            RuntimeDiagnostics.log("handleFailure blockedDefault stateID=\(state.id)")
         }
 
         onComplete?(false)

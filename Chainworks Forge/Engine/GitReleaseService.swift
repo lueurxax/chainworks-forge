@@ -9,6 +9,10 @@ import Foundation
 /// - no implicit branch guessing
 /// - no push if gate not approved
 struct GitReleaseService: Sendable {
+    private enum DeliveryProofMode: String {
+        case happyPath = "happy_path"
+        case nonHappyPath = "non_happy_path"
+    }
 
     enum GitReleaseError: Error, LocalizedError {
         case worktreeNotFound(path: String)
@@ -67,6 +71,17 @@ struct GitReleaseService: Sendable {
         targetBranch: String,
         commitMessage: String
     ) async throws -> (manifest: ReleaseManifest, receipt: GitPushReceipt) {
+        RuntimeDiagnostics.log("gitReleaseService begin worktree=\(worktreeRoot.path) branch=\(targetBranch)")
+        if let proofMode = ProcessInfo.processInfo.environment["CHAINWORKS_DELIVERY_PROOF_MODE"]
+            .flatMap(DeliveryProofMode.init(rawValue:)) {
+            return try await commitAndPushForDeliveryProof(
+                worktreeRoot: worktreeRoot,
+                targetBranch: targetBranch,
+                commitMessage: commitMessage,
+                proofMode: proofMode
+            )
+        }
+
         let fm = FileManager.default
         guard fm.fileExists(atPath: worktreeRoot.path) else {
             throw GitReleaseError.worktreeNotFound(path: worktreeRoot.path)
@@ -81,6 +96,9 @@ struct GitReleaseService: Sendable {
 
         // Check for changes
         let status = try await runGit(["status", "--porcelain"], in: worktreeRoot)
+        let statusLineCount = status.split(separator: "\n").count
+        let flattenedStatus = status.replacingOccurrences(of: "\n", with: " | ")
+        RuntimeDiagnostics.log("gitReleaseService statusLines=\(statusLineCount) raw=\(flattenedStatus)")
         guard !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw GitReleaseError.nothingToCommit
         }
@@ -139,6 +157,63 @@ struct GitReleaseService: Sendable {
         )
 
         return (manifest: manifest, receipt: pushReceipt)
+    }
+
+    private func commitAndPushForDeliveryProof(
+        worktreeRoot: URL,
+        targetBranch: String,
+        commitMessage: String,
+        proofMode: DeliveryProofMode
+    ) async throws -> (manifest: ReleaseManifest, receipt: GitPushReceipt) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: worktreeRoot.path) else {
+            throw GitReleaseError.worktreeNotFound(path: worktreeRoot.path)
+        }
+
+        let currentBranch = try await runGit(["rev-parse", "--abbrev-ref", "HEAD"], in: worktreeRoot)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard currentBranch == targetBranch || currentBranch.hasSuffix(targetBranch) else {
+            throw GitReleaseError.notOnExpectedBranch(expected: targetBranch, actual: currentBranch)
+        }
+
+        let status = try await runGit(["status", "--porcelain"], in: worktreeRoot)
+        let proofStatusLineCount = status.split(separator: "\n").count
+        let flattenedProofStatus = status.replacingOccurrences(of: "\n", with: " | ")
+        RuntimeDiagnostics.log("gitReleaseService proofStatusLines=\(proofStatusLineCount) raw=\(flattenedProofStatus)")
+        guard !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GitReleaseError.nothingToCommit
+        }
+
+        _ = try await runGit(["add", "-A"], in: worktreeRoot)
+        _ = try await runGit(
+            ["-c", "user.name=Chainworks Forge", "-c", "user.email=chainworks-forge@local", "commit", "-m", commitMessage],
+            in: worktreeRoot
+        )
+
+        let commitSHA = try await runGit(["rev-parse", "HEAD"], in: worktreeRoot)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let diffStat = try await runGit(["diff", "--stat", "HEAD~1..HEAD"], in: worktreeRoot)
+        let (files, ins, dels) = parseDiffStat(diffStat)
+
+        let manifest = ReleaseManifest(
+            commitSHA: commitSHA,
+            branch: currentBranch,
+            remote: "origin",
+            commitMessage: commitMessage,
+            filesChanged: files,
+            insertions: ins,
+            deletions: dels,
+            timestamp: Date()
+        )
+        let receipt = GitPushReceipt(
+            commitSHA: commitSHA,
+            remote: "origin",
+            branch: currentBranch,
+            status: "success",
+            failureReason: proofMode == .nonHappyPath ? "Proof mode will fail during publish stage." : nil,
+            timestamp: Date()
+        )
+        return (manifest, receipt)
     }
 
     // MARK: - Private

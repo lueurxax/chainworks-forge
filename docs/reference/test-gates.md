@@ -2,6 +2,10 @@
 
 Chainworks Forge uses layered test gates instead of one default `xcodebuild test` loop for every change.
 
+This document is operational: it describes which gate to run and why. Structural details of the migrated Swift Testing suite live in [test-suite-architecture.md](test-suite-architecture.md).
+Agent-specific UI execution rules, including remote-host and app-launched proof guidance, live in [agent-ui-test-execution.md](agent-ui-test-execution.md).
+For remote macOS UI/app proof, the canonical SSH target is `test@SMacBook.local`.
+
 The purpose is simple:
 
 - keep the fast inner loop fast
@@ -19,9 +23,20 @@ Use the repository gate runner:
 
 The runner does three things before every gate:
 
-- refuses to start if `xcodebuild`, `xctest`, `debugserver`, or `Chainworks Forge.app` are already running
+- refuses to start if build/test tooling is already running
+- for `ui-smoke`, `proposal-006`, and `full`, also refuses to start if `Chainworks Forge.app` is already running on the host
 - prints the latest known `Chainworks Forge-*.ips` crash log path
 - reports a newly created crash log path when a gate fails
+
+The runner is also the canonical proving path for agents. Direct `xcodebuild -testPlan ...` invocations are allowed for diagnostics, but they are not the default evidence path because current Swift Testing toolchains can still yield green `0`-test outcomes for raw plan execution.
+
+For Codex and Claude Code, gate execution should normally happen through:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh <gate>"
+```
+
+Do not omit the `test@` user when writing prompts, docs, or runbooks for remote UI work.
 
 ## Gate Layers
 
@@ -87,6 +102,11 @@ Command:
 ./scripts/test-gate.sh fast
 ```
 
+Important:
+
+- this is the proving path for the fast lane
+- do not substitute it with raw `xcodebuild -testPlan FastGate test` and assume the result is equivalent
+
 ### `ui-smoke`
 
 Focused operator-shell UI smoke gate.
@@ -103,10 +123,21 @@ Use when:
 
 - changing navigation, shell layout, approvals, start-run flow, or progress UI
 
+Host policy:
+
+- remote-only
+- the gate runner refuses to execute this gate outside the approved UI host list
+
 Command:
 
 ```bash
 ./scripts/test-gate.sh ui-smoke
+```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"
 ```
 
 ### `proposal-006`
@@ -124,11 +155,25 @@ Use when:
 
 - changing provider-platform implementation or sign-off evidence
 
+Host policy:
+
+- remote-only because this gate includes UI tests
+
 Command:
 
 ```bash
 ./scripts/test-gate.sh proposal-006
 ```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-006"
+```
+
+Important:
+
+- the repository supports `ProviderGate.xctestplan` as metadata, but the canonical agent path still runs targeted tests by default
 
 ### `full`
 
@@ -145,10 +190,22 @@ Use when:
 - preparing proposal sign-off
 - validating the repository baseline before merge or release work
 
+Important:
+
+- `full` is still a repository-baseline gate, not a substitute for proposal-specific app-launched dogfood proof
+- for repo-backed delivery sign-off, agents may need both `full` and the app-launched evidence flow described in [agent-ui-test-execution.md](agent-ui-test-execution.md)
+- because `full` includes the UI target, the gate runner also treats it as remote-only
+
 Command:
 
 ```bash
 ./scripts/test-gate.sh full
+```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"
 ```
 
 ## Recommended Usage
@@ -162,19 +219,19 @@ Command:
 ### UI-heavy work
 
 ```bash
-./scripts/test-gate.sh ui-smoke
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"
 ```
 
 ### Provider-platform work
 
 ```bash
-./scripts/test-gate.sh proposal-006
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-006"
 ```
 
 ### Before sign-off
 
 ```bash
-./scripts/test-gate.sh full
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"
 ```
 
 ## Why This Exists
@@ -187,3 +244,10 @@ The repository has a real mix of:
 - broad baseline tests that catch unrelated crashes outside the active proposal
 
 Running them all on every edit burns time and makes failures harder to interpret. These gates make the cost and purpose of each layer explicit.
+
+## Related Docs
+
+- [test-suite-architecture.md](test-suite-architecture.md)
+- [agent-ui-test-execution.md](agent-ui-test-execution.md)
+- [provider-platform.md](provider-platform.md)
+- [operator-experience.md](operator-experience.md)

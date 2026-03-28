@@ -6,6 +6,31 @@ import Foundation
 
 @Suite("WorktreeProvisioner")
 struct WorktreeProvisionerTests {
+    private struct GitTestError: Error {
+        let message: String
+    }
+
+    private func runGit(_ arguments: [String], in directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        process.currentDirectoryURL = directory
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let output = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                ?? String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                ?? "git failed"
+            throw GitTestError(message: "git \(arguments.joined(separator: " ")) failed: \(output)")
+        }
+    }
 
     @Test("Provisioner rejects nonexistent repo root")
     func rejectsNonexistentRepo() async {
@@ -16,6 +41,7 @@ struct WorktreeProvisionerTests {
                 repoIdentifier: "test-repo",
                 repoRoot: "/nonexistent/repo/path",
                 baseBranch: "main",
+                targetBranch: "dogfood/test",
                 worktreeBasePath: "/tmp/worktrees",
                 ideaSlug: "test-idea",
                 runShortID: "abc123"
@@ -43,11 +69,77 @@ struct WorktreeProvisionerTests {
                 repoIdentifier: "test-repo",
                 repoRoot: "/nonexistent/repo", // Will fail at repo check before reaching worktree check
                 baseBranch: "main",
+                targetBranch: "dogfood/test",
                 worktreeBasePath: tempDir.path,
                 ideaSlug: "test",
                 runShortID: "abc123"
             )
         }
+    }
+
+    @Test("Provisioner accepts local repo root basename when origin remote is absent")
+    func acceptsRepoBasenameWhenOriginMissing() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorktreeProvisionerNoOrigin-\(UUID().uuidString)")
+        let repoRoot = tempDir.appendingPathComponent("Chainworks Forge Self", isDirectory: true)
+        let worktreeBase = tempDir.appendingPathComponent("worktrees", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+        try Data("dogfood".utf8).write(to: repoRoot.appendingPathComponent("README.md"))
+        try runGit(["init", "-b", "main"], in: repoRoot)
+        try runGit(["config", "user.name", "Chainworks Forge Tests"], in: repoRoot)
+        try runGit(["config", "user.email", "chainworks-forge-tests@local"], in: repoRoot)
+        try runGit(["add", "."], in: repoRoot)
+        try runGit(["commit", "-m", "Initial dogfood baseline"], in: repoRoot)
+
+        let provisioner = WorktreeProvisioner()
+        let result = try await provisioner.provision(
+            repoIdentifier: repoRoot.lastPathComponent,
+            repoRoot: repoRoot.path,
+            baseBranch: "main",
+            targetBranch: "dogfood/test",
+            worktreeBasePath: worktreeBase.path,
+            ideaSlug: "self dogfood",
+            runShortID: "abc123"
+        )
+
+        #expect(FileManager.default.fileExists(atPath: result.worktreeRoot.path))
+        #expect(result.branchName == "dogfood/test")
+        #expect(!result.baseRevision.isEmpty)
+    }
+
+    @Test("Provisioner accepts canonicalized identity when configured value differs from git remote style")
+    func acceptsCanonicalizedIdentityAcrossFormats() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorktreeProvisionerCanonicalIdentity-\(UUID().uuidString)")
+        let repoRoot = tempDir.appendingPathComponent("Chainworks Forge", isDirectory: true)
+        let worktreeBase = tempDir.appendingPathComponent("worktrees", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+        try Data("dogfood".utf8).write(to: repoRoot.appendingPathComponent("README.md"))
+        try runGit(["init", "-b", "main"], in: repoRoot)
+        try runGit(["config", "user.name", "Chainworks Forge Tests"], in: repoRoot)
+        try runGit(["config", "user.email", "chainworks-forge-tests@local"], in: repoRoot)
+        try runGit(["add", "."], in: repoRoot)
+        try runGit(["commit", "-m", "Initial dogfood baseline"], in: repoRoot)
+        try runGit(["remote", "add", "origin", "git@github.com:example/chainworks-forge.git"], in: repoRoot)
+
+        let provisioner = WorktreeProvisioner()
+        let result = try await provisioner.provision(
+            repoIdentifier: "Chainworks Forge",
+            repoRoot: repoRoot.path,
+            baseBranch: "main",
+            targetBranch: "dogfood/test",
+            worktreeBasePath: worktreeBase.path,
+            ideaSlug: "self dogfood",
+            runShortID: "canon01"
+        )
+
+        #expect(FileManager.default.fileExists(atPath: result.worktreeRoot.path))
+        #expect(result.branchName == "dogfood/test")
+        #expect(!result.baseRevision.isEmpty)
     }
 
     @Test("Worktree creates unique path per run — different runShortIDs produce different paths")

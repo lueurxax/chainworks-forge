@@ -161,20 +161,31 @@ private struct RootHostView: View {
             #if os(macOS)
             UIAutomationDiagnostics.log("rootHost.task.begin windows=\(NSApp.windows.count)")
             NSApp.setActivationPolicy(.regular)
-            for attempt in 0..<20 {
+            for attempt in 0..<3 {
                 if attempt > 0 {
-                    try? await Task.sleep(for: .milliseconds(150))
+                    try? await Task.sleep(for: .milliseconds(200))
                 }
-                await MainActor.run {
+
+                let shouldContinue = await MainActor.run { () -> Bool in
                     NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
                     NSApp.activate(ignoringOtherApps: true)
+
+                    var shouldRetry = true
                     for window in NSApp.windows {
                         window.collectionBehavior.remove(.transient)
                         window.makeKeyAndOrderFront(nil)
-                        window.orderFrontRegardless()
                     }
+
+                    if NSApp.windows.contains(where: { $0.isVisible }) {
+                        shouldRetry = false
+                    }
+
+                    return shouldRetry
                 }
                 UIAutomationDiagnostics.log("rootHost.task.activation attempt=\(attempt) windows=\(NSApp.windows.count)")
+                if !shouldContinue {
+                    break
+                }
             }
             UIAutomationDiagnostics.log("rootHost.task.end windows=\(NSApp.windows.count)")
             #endif
@@ -215,6 +226,7 @@ struct AppBootstrapView: View {
     @State private var providerRegistry: ProviderRegistry?
     @State private var gooseServerManager: GooseServerManager?
     @State private var showFirstRunWizard = false
+    @State private var dogfoodHarnessStarted = false
     private let forcedUISurface = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
         .flatMap(ContentView.UISurface.init(rawValue:))
 
@@ -249,6 +261,8 @@ struct AppBootstrapView: View {
         let isTestHost = environment["XCTestConfigurationFilePath"] != nil
         let isUIAutomationHost = environment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
         let isUnitTestHost = isTestHost && !isUIAutomationHost
+        let disableEagerUITestBootstrap = isUIAutomationHost && environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1"
+        let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled
 
         let appConfigurationStore = AppConfigurationStore()
         let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
@@ -266,7 +280,7 @@ struct AppBootstrapView: View {
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
-        if !isUnitTestHost {
+        if !isUnitTestHost && !disableEagerUITestBootstrap && !isProposal007DogfoodHarness {
             await gooseServerManager.bootstrap()
         }
         let liveRuntimeConfiguration = isUnitTestHost
@@ -298,7 +312,7 @@ struct AppBootstrapView: View {
             service.checkForConfigChange()
         }
 
-        if !isUnitTestHost {
+        if !isUnitTestHost && !disableEagerUITestBootstrap {
             Task { @MainActor in
                 await providerRegistry.refreshHealth()
             }
@@ -309,6 +323,30 @@ struct AppBootstrapView: View {
             providerSettings: providerSettingsStore.settings
         ) {
             showFirstRunWizard = true
+        }
+
+        if isProposal007DogfoodHarness,
+           dogfoodHarnessStarted == false {
+            dogfoodHarnessStarted = true
+            Task { @MainActor in
+                let harness = Proposal007DogfoodHarness(
+                    modelContext: modelContext,
+                    executionService: service,
+                    appConfiguration: resolvedConfiguration,
+                    providerRegistry: providerRegistry
+                )
+
+                do {
+                    let result = try await harness.runFromEnvironment()
+                    print("Proposal 007 dogfood harness completed: \(result.exportPath)")
+                } catch {
+                    print("Proposal 007 dogfood harness failed: \(error.localizedDescription)")
+                }
+
+                #if os(macOS)
+                NSApp.terminate(nil)
+                #endif
+            }
         }
         UIAutomationDiagnostics.log("bootstrapService.end showFirstRunWizard=\(showFirstRunWizard)")
     }
@@ -408,12 +446,16 @@ struct AppBootstrapView: View {
     }
 
     private static func loadBundledCatalog(appConfiguration: AppConfiguration) -> AgentCatalog? {
-        let candidates: [URL?] = [
+        var candidates: [URL?] = [
             URL(fileURLWithPath: appConfiguration.agentCatalogSourcePath),
-            Bundle.main.url(forResource: "agents", withExtension: "yaml"),
-            URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml")
+            Bundle.main.url(forResource: "agents", withExtension: "yaml")
         ]
+        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml")
+            )
+        }
         for case let url? in candidates {
             if let catalog = try? YAMLParser.loadAgentCatalog(from: url) {
                 return catalog
@@ -427,7 +469,9 @@ struct AppBootstrapView: View {
         providerSettings: ProviderSettings
     ) -> Bool {
         let environment = ProcessInfo.processInfo.environment
-        if environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] != nil || environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+        if environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] != nil
+            || environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
+            || Proposal007DogfoodHarness.isEnabled {
             return false
         }
 
@@ -443,11 +487,15 @@ struct AppBootstrapView: View {
     }
 
     private static func loadBundledWorkflow(named resourceName: String, repoRelativePath: String) -> WorkflowDefinition? {
-        let candidates: [URL?] = [
-            Bundle.main.url(forResource: resourceName, withExtension: "yaml"),
-            URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Documents/Chainworks Forge/\(repoRelativePath)")
+        var candidates: [URL?] = [
+            Bundle.main.url(forResource: resourceName, withExtension: "yaml")
         ]
+        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Documents/Chainworks Forge/\(repoRelativePath)")
+            )
+        }
         for case let url? in candidates {
             if let workflow = try? YAMLParser.loadWorkflow(from: url) {
                 return workflow
@@ -457,11 +505,15 @@ struct AppBootstrapView: View {
     }
 
     private static func loadStewardConfig() -> StewardConfig? {
-        let candidates: [URL?] = [
-            Bundle.main.url(forResource: "steward_config", withExtension: "yaml"),
-            URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Documents/Chainworks Forge/examples/steward/steward_config.yaml")
+        var candidates: [URL?] = [
+            Bundle.main.url(forResource: "steward_config", withExtension: "yaml")
         ]
+        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Documents/Chainworks Forge/examples/steward/steward_config.yaml")
+            )
+        }
         for case let url? in candidates {
             if let config = try? YAMLParser.loadStewardConfig(from: url) {
                 // REQ-003: Enforce validation at load time.
@@ -492,6 +544,22 @@ struct AppBootstrapView: View {
                 apiKey: nil,
                 override: override,
                 transportMode: .fixtureProposalLoopSuccess,
+                transportAPI: .bespoke
+            )
+        }
+        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "full_mvp_success" {
+            let override = LiveExecutionOverride(
+                enabled: true,
+                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
+                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
+                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
+            )
+
+            return LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://fixture.local")!,
+                apiKey: nil,
+                override: override,
+                transportMode: .fixtureFullMVPSuccess,
                 transportAPI: .bespoke
             )
         }
@@ -535,16 +603,24 @@ struct AppBootstrapView: View {
             return
         }
 
+        let seededWorkspaceRoot = environment["CHAINWORKS_UI_TEST_SEED_IDEA_WORKSPACE_ROOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
         let descriptor = FetchDescriptor<Idea>()
         let existingIdeas = (try? modelContext.fetch(descriptor)) ?? []
-        if existingIdeas.contains(where: { $0.title == title }) {
+        if let existingIdea = existingIdeas.first(where: { $0.title == title }) {
+            if let seededWorkspaceRoot, !seededWorkspaceRoot.isEmpty {
+                existingIdea.workspaceRootPath = seededWorkspaceRoot
+                try? modelContext.save()
+            }
             return
         }
 
         let idea = Idea(
             title: title,
             body: environment["CHAINWORKS_UI_TEST_SEED_IDEA_BODY"] ?? "Seeded UI test idea",
-            attachmentPath: nil
+            attachmentPath: nil,
+            workspaceRootPath: seededWorkspaceRoot?.isEmpty == false ? seededWorkspaceRoot : nil
         )
         modelContext.insert(idea)
         try? modelContext.save()
@@ -555,6 +631,7 @@ struct AppBootstrapView: View {
         modelContext: ModelContext,
         catalog: AgentCatalog?
     ) {
+        // RunRepository-exempt: seeded UI-test host data with manual stage/artifact shaping.
         let environment = ProcessInfo.processInfo.environment
         guard environment["CHAINWORKS_UI_TEST_SEED_WAITING_APPROVAL_RUN"] == "1",
               environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != "workflow_map",
@@ -818,7 +895,10 @@ struct AppBootstrapView: View {
             run.status = .waitingApproval
             run.worktreeRoot = worktreeRoot.path
             run.baseRevision = "seededbase"
-            run.repoIdentifier = "Chainworks Forge"
+            run.repoIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
+                configuredIdentifier: "Chainworks Forge",
+                repoRoot: FileManager.default.currentDirectoryPath
+            )
             run.repoRoot = FileManager.default.currentDirectoryPath
             run.baseBranch = "main"
             run.targetBranch = "dogfood/full-mvp"
@@ -929,10 +1009,15 @@ struct AppBootstrapView: View {
     }
 
     private static func resolvedExamplePath(_ relativePath: String) -> String {
-        let candidates = [
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(relativePath),
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/\(relativePath)")
+        var candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(relativePath)
         ]
+        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Documents/Chainworks Forge/\(relativePath)")
+            )
+        }
         return candidates.first(where: { FileManager.default.isReadableFile(atPath: $0.path) })?.path
             ?? candidates[0].path
     }

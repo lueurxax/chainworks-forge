@@ -7,7 +7,7 @@ import Foundation
 ///   - `always` (when: 'true')
 ///   - `artifactExists` (when: exists('name'))
 ///   - `approvalGranted` (when: approval.granted == true)
-///   - `expression`: artifact.field {==,>,>=} value/vars.X, `and`, `or`
+///   - `expression`: artifact.field {==,!=,<,<=,>,>=} value/vars.X, `and`, `or`
 ///   - vars.* substituted at RUNTIME from RunPlan.variables
 struct TransitionEvaluator {
 
@@ -60,6 +60,9 @@ struct TransitionEvaluator {
     ///   - `artifact.field == value`
     ///   - `artifact.field > value`
     ///   - `artifact.field >= value`
+    ///   - `artifact.field < value`
+    ///   - `artifact.field <= value`
+    ///   - `artifact.field != value`
     ///   - `vars.name == value`
     ///   - `expr and expr`
     ///   - `expr or expr`
@@ -161,22 +164,41 @@ struct TransitionEvaluator {
 
     private enum ComparisonOp {
         case equal       // ==
+        case notEqual    // !=
+        case lessThan    // <
+        case lessOrEqual // <=
         case greaterThan // >
         case greaterOrEqual // >=
     }
 
     private static func parseComparison(_ expr: String) -> Comparison? {
+        // Try <= before < and != before ==
+        if let range = expr.range(of: " <= ") {
+            let lhs = String(expr[expr.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let rhs = String(expr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            return Comparison(lhs: lhs, op: .lessOrEqual, rhs: rhs)
+        }
         // Try >= first (before >)
         if let range = expr.range(of: " >= ") {
             let lhs = String(expr[expr.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
             let rhs = String(expr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
             return Comparison(lhs: lhs, op: .greaterOrEqual, rhs: rhs)
         }
+        if let range = expr.range(of: " != ") {
+            let lhs = String(expr[expr.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let rhs = String(expr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            return Comparison(lhs: lhs, op: .notEqual, rhs: rhs)
+        }
         // Try ==
         if let range = expr.range(of: " == ") {
             let lhs = String(expr[expr.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
             let rhs = String(expr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
             return Comparison(lhs: lhs, op: .equal, rhs: rhs)
+        }
+        if let range = expr.range(of: " < ") {
+            let lhs = String(expr[expr.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let rhs = String(expr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            return Comparison(lhs: lhs, op: .lessThan, rhs: rhs)
         }
         // Try >
         if let range = expr.range(of: " > ") {
@@ -247,6 +269,13 @@ struct TransitionEvaluator {
         switch op {
         case .equal:
             return valuesEqual(lhs, rhs)
+        case .notEqual:
+            return !valuesEqual(lhs, rhs)
+        case .lessThan:
+            return compareNumeric(lhs, rhs) == .orderedAscending
+        case .lessOrEqual:
+            let cmp = compareNumeric(lhs, rhs)
+            return cmp == .orderedAscending || cmp == .orderedSame
         case .greaterThan:
             return compareNumeric(lhs, rhs) == .orderedDescending
         case .greaterOrEqual:

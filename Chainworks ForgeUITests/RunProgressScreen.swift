@@ -30,7 +30,48 @@ struct RunProgressScreen {
     }
 
     /// The Approve button in the run progress view.
-    var approveButton: XCUIElement { app.buttons["Approve"].firstMatch }
+    var approveButton: XCUIElement {
+        let identified = app.buttons["approval-approve-button"].firstMatch
+        return identified.exists ? identified : app.buttons["Approve"].firstMatch
+    }
+
+    @discardableResult
+    func revealApprovalButton(timeout: TimeInterval = 6) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        let button = approveButton
+        let window = app.windows.firstMatch
+        while Date() < deadline {
+            if button.exists && button.isHittable {
+                return true
+            }
+
+            let scrollView = app.scrollViews.firstMatch
+            let windowFrame = window.exists ? window.frame : .zero
+            let buttonFrame = button.exists ? button.frame : .zero
+
+            let shouldSwipeDown: Bool
+            if !windowFrame.isEmpty, !buttonFrame.isEmpty {
+                shouldSwipeDown = buttonFrame.maxY < windowFrame.minY + 80
+            } else {
+                shouldSwipeDown = false
+            }
+
+            if scrollView.exists {
+                if shouldSwipeDown {
+                    scrollView.swipeDown()
+                } else {
+                    scrollView.swipeUp()
+                }
+            } else if shouldSwipeDown {
+                app.swipeDown()
+            } else {
+                app.swipeUp()
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        }
+
+        return button.exists && button.isHittable
+    }
 
     /// Whether the run progress surface is visible in the current UI hierarchy.
     @discardableResult

@@ -272,14 +272,15 @@ struct RunComparison: Identifiable {
             guard let model, let providerFamily else { return false }
             let lowerModel = model.lowercased()
             let lowerFamily = providerFamily.lowercased()
-            let familyModelPrefixes: [(String, [String])] = [
-                ("claude", ["claude", "anthropic"]),
-                ("openai", ["gpt", "o1", "o3", "chatgpt"]),
-                ("gemini", ["gemini", "palm"]),
+            let familyModelPrefixes: [([String], [String])] = [
+                (["claude"], ["claude", "anthropic"]),
+                (["openai", "codex"], ["gpt", "o1", "o3", "chatgpt"]),
+                (["gemini"], ["gemini", "palm"]),
             ]
-            for (familyKey, prefixes) in familyModelPrefixes {
+            for (familyAliases, prefixes) in familyModelPrefixes {
                 let modelBelongsToFamily = prefixes.contains(where: { lowerModel.hasPrefix($0) })
-                if modelBelongsToFamily && !lowerFamily.contains(familyKey) {
+                let familyMatches = familyAliases.contains(where: { lowerFamily.contains($0) })
+                if modelBelongsToFamily && !familyMatches {
                     return true
                 }
             }

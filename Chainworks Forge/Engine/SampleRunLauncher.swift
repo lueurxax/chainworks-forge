@@ -33,6 +33,7 @@ struct SampleRunLauncher {
         let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
         let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: .empty)
         let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
+        let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: .empty)
 
         let idea = Idea(
             title: sampleIdeaTitle(),
@@ -45,10 +46,16 @@ struct SampleRunLauncher {
             for: idea,
             plan: adjustedPlan,
             workflowSourcePath: workflowURL.path,
-            catalogSourcePath: catalogURL.path
+            catalogSourcePath: catalogURL.path,
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
+                bindingProvenanceJSON: encodeProvenances(provenances),
+                startOptionsJSON: encodeStartOptions(.empty),
+                frozenWorkspaceRootPath: idea.workspaceRootPath,
+                deliveryConfiguration: nil,
+                deliveryPreflightJSON: nil
+            )
         )
-        run.providerBindingSnapshotJSON = encodeProviderBindings(providerBindings)
-        run.startOptionsJSON = encodeStartOptions(.empty)
         idea.status = .active
         try modelContext.save()
 
@@ -119,6 +126,12 @@ struct SampleRunLauncher {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try? encoder.encode(options)
+    }
+
+    private func encodeProvenances(_ provenances: [String: FrozenBindingProvenance]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(provenances)
     }
 
     private func sampleIdeaTitle() -> String {

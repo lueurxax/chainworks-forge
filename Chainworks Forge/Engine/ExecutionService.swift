@@ -15,6 +15,7 @@ enum GooseTransportAPI: String, Codable, Sendable {
 enum LiveTransportMode: Sendable {
     case network
     case fixtureProposalLoopSuccess
+    case fixtureFullMVPSuccess
 }
 
 struct LiveRuntimeConfiguration: Sendable {
@@ -43,6 +44,8 @@ struct LiveRuntimeConfiguration: Sendable {
                 return "Goose server (goosed)"
             }
         case .fixtureProposalLoopSuccess:
+            return "Fixture backend"
+        case .fixtureFullMVPSuccess:
             return "Fixture backend"
         }
     }
@@ -159,9 +162,15 @@ final class ExecutionService {
             self?.activeOrchestrators.removeValue(forKey: run.id)
             // Clean up any pending approvals for this run
             self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
+            self?.synchronizeIdeaStatus(for: run)
 
             // P005-OPS §6: Emit report on stable checkpoint
             self?.emitReportIfNeeded(for: run)
+
+            // Proposal 008 (REQ-006): Record app-driven benchmark execution if run is linked to a cohort.
+            if let modelContext = self?.modelContext {
+                self?.recordBenchmarkExecutionIfNeeded(run: run, modelContext: modelContext)
+            }
 
             // P005-OPS §10: Fire notifications
             self?.fireCompletionNotification(for: run)
@@ -173,6 +182,7 @@ final class ExecutionService {
         }
 
         activeOrchestrators[run.id] = orchestrator
+        synchronizeIdeaStatus(for: run)
 
         Task { @MainActor in
             await orchestrator.start()
@@ -217,7 +227,14 @@ final class ExecutionService {
                     orchestrator.onComplete = { [weak self] _ in
                         self?.activeOrchestrators.removeValue(forKey: run.id)
                         self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
+                        self?.synchronizeIdeaStatus(for: run)
                         self?.emitReportIfNeeded(for: run)
+
+                        // Proposal 008 (REQ-006): Record app-driven benchmark execution on resume path.
+                        if let modelContext = self?.modelContext {
+                            self?.recordBenchmarkExecutionIfNeeded(run: run, modelContext: modelContext)
+                        }
+
                         self?.fireCompletionNotification(for: run)
                     }
 
@@ -233,11 +250,13 @@ final class ExecutionService {
                     run.status = .blocked
                     run.driftDetectedAt = Date()
                     run.driftDetails = reason
+                    synchronizeIdeaStatus(for: run)
 
                 case .cannotResume(let run, let reason):
                     run.status = .failed
                     run.driftDetectedAt = Date()
                     run.driftDetails = reason
+                    synchronizeIdeaStatus(for: run)
                 }
             }
         } catch {
@@ -305,6 +324,7 @@ final class ExecutionService {
 
         // Phase 2: Finalize settlement with truthful session close outcomes.
         coordinator.finalizeSettlement(sessionOutcomes: outcomes)
+        synchronizeIdeaStatus(for: orchestrator.run)
     }
 
     // MARK: - Query
@@ -336,6 +356,12 @@ final class ExecutionService {
 
     var supportsLiveExecution: Bool {
         liveRuntimeConfiguration != nil
+    }
+
+    private func synchronizeIdeaStatus(for run: Run) {
+        guard let idea = run.idea else { return }
+        idea.synchronizePersistedStatusFromRuns()
+        try? modelContext.save()
     }
 
     var liveRuntimeReadiness: LiveRuntimeReadiness {
@@ -416,6 +442,8 @@ final class ExecutionService {
             }
         case .fixtureProposalLoopSuccess:
             transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
+        case .fixtureFullMVPSuccess:
+            transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
         }
 
         return GooseAgentExecutor(
@@ -516,6 +544,30 @@ final class ExecutionService {
             _ = try builder.emitReport(for: run)
         } catch {
             print("[P005-OPS] Report emission failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Proposal 008 (REQ-006): Benchmark Run Recording
+
+    /// If the completed run is linked to a benchmark cohort, record its execution
+    /// into the benchmark subsystem using `BenchmarkRunRecorder`.
+    private func recordBenchmarkExecutionIfNeeded(run: Run, modelContext: ModelContext) {
+        guard run.experimentCohortID != nil else { return }
+        guard [RunStatus.completed, .failed].contains(run.status) else { return }
+
+        // Find the benchmark pair linked to this run via cohort membership.
+        let pairDescriptor = FetchDescriptor<BenchmarkPair>()
+        guard let allPairs = try? modelContext.fetch(pairDescriptor) else { return }
+        guard let pair = allPairs.first(where: { pair in
+            pair.appDrivenRecord == nil && pair.cohort?.id == run.experimentCohortID
+        }) else { return }
+
+        let recorder = BenchmarkRunRecorder(modelContext: modelContext)
+        do {
+            try recorder.recordAppDrivenExecution(pair: pair, run: run)
+            print("[P008] Benchmark execution recorded for run \(run.id.uuidString.prefix(8))")
+        } catch {
+            print("[P008] Benchmark recording failed: \(error.localizedDescription)")
         }
     }
 

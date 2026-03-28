@@ -30,6 +30,17 @@ struct GooseProviderConnectionAssistantView: View {
                     Text("Goose Connection Assistant")
                         .font(.title3.bold())
                         .accessibilityIdentifier("goose-assistant-title")
+                    if let snapshot {
+                        LabeledContent("Provider", value: snapshot.providerDisplayName)
+                            .accessibilityIdentifier("goose-assistant-provider-name")
+                        LabeledContent("Family", value: snapshot.family.displayName)
+                            .accessibilityIdentifier("goose-assistant-provider-family")
+                    } else if let draftProvider {
+                        LabeledContent("Provider", value: draftProvider.displayName)
+                            .accessibilityIdentifier("goose-assistant-provider-name")
+                        LabeledContent("Family", value: draftProvider.family.displayName)
+                            .accessibilityIdentifier("goose-assistant-provider-family")
+                    }
                     LabeledContent("Origin", value: origin.displayName)
                     LabeledContent("State", value: journeyState.displayName)
                         .accessibilityIdentifier("goose-assistant-state")
@@ -38,7 +49,14 @@ struct GooseProviderConnectionAssistantView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                configurationSection
+                if snapshot == nil && draftProvider == nil {
+                    Section("Loading") {
+                        ProgressView("Loading provider journey…")
+                            .accessibilityIdentifier("goose-assistant-loading")
+                    }
+                } else {
+                    configurationSection
+                }
 
                 Section("Guided Verification") {
                     Text("Use this assistant to verify the Goose-backed path the live runtime actually depends on. The assistant owns verification; raw evidence stays in the evidence panel.")
@@ -102,12 +120,11 @@ struct GooseProviderConnectionAssistantView: View {
             }
             .navigationTitle("Goose Assistant")
             .accessibilityIdentifier("goose-connection-assistant-view")
-            .task {
-                if snapshot == nil {
-                    let provider = providerRegistry.configuredProvider(id: providerID)
-                    draftProvider = provider
-                    snapshot = probe.configuredSnapshot(for: providerID, origin: origin)
-                }
+            .frame(minWidth: 760, idealWidth: 840, minHeight: 680, idealHeight: 780)
+            .task(id: providerID) {
+                let provider = providerRegistry.configuredProvider(id: providerID)
+                draftProvider = provider
+                snapshot = probe.configuredSnapshot(for: providerID, origin: origin)
             }
         }
     }

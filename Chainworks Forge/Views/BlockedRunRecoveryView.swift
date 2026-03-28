@@ -565,7 +565,7 @@ struct BlockedRunRecoveryView: View {
             let hasRetryableStage = run.stageExecutions.contains { $0.status == .failed }
             recoveryPath = hasRetryableStage ? .retry : .clone
         case .blocked:
-            let hasRetryableStage = run.stageExecutions.contains { $0.status == .blocked }
+            let hasRetryableStage = run.stageExecutions.contains { $0.status == .blocked || $0.status == .failed }
             recoveryPath = hasRetryableStage ? .retry : .clone
         case .cancelled:
             recoveryPath = .cancel

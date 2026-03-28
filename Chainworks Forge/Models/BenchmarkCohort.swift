@@ -59,6 +59,7 @@ enum BenchmarkCohortStatus: String, Codable {
 struct CohortRepositoryProfile: Codable, Sendable {
     let repositoryID: String
     let profileName: String
+    let profileType: String
     let description: String
 }
 
@@ -66,4 +67,5 @@ struct CohortIdeaMember: Codable, Sendable {
     let ideaIdentifier: String
     let title: String
     let repositoryID: String
+    let repositoryProfileType: String
 }

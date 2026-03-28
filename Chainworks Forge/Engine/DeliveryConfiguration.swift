@@ -2,6 +2,54 @@ import Foundation
 
 // MARK: - DeliveryConfiguration (Proposal 007 — ARCH-067 through ARCH-075)
 
+enum RepositoryIdentityNormalizer {
+    static func canonicalIdentifier(configuredIdentifier: String?, repoRoot: String) -> String {
+        let raw = configuredIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let raw, !raw.isEmpty {
+            let canonical = canonicalIdentifier(from: raw)
+            if !canonical.isEmpty {
+                return canonical
+            }
+        }
+
+        let fallback = URL(fileURLWithPath: repoRoot).lastPathComponent
+        let canonical = canonicalIdentifier(from: fallback)
+        return canonical.isEmpty ? fallback : canonical
+    }
+
+    static func canonicalIdentifier(from rawValue: String) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let leaf = remoteLeafCandidate(from: trimmed)
+        var normalized = leaf.lowercased()
+        if normalized.hasSuffix(".git") {
+            normalized.removeLast(4)
+        }
+
+        normalized = normalized.replacingOccurrences(
+            of: #"[^a-z0-9]+"#,
+            with: "-",
+            options: .regularExpression
+        )
+        normalized = normalized.replacingOccurrences(
+            of: #"-{2,}"#,
+            with: "-",
+            options: .regularExpression
+        )
+        normalized = normalized.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return normalized
+    }
+
+    private static func remoteLeafCandidate(from rawValue: String) -> String {
+        let sanitized = rawValue.replacingOccurrences(of: ":", with: "/")
+        if let last = sanitized.split(separator: "/").last, !last.isEmpty {
+            return String(last)
+        }
+        return rawValue
+    }
+}
+
 /// Authoritative per-run delivery contract for repo-backed runs.
 /// Frozen at createRun() time, persisted on the Run.
 /// WorktreeProvisioner, RepoSafetyGuard, ReleaseOpsCoordinator, evidence export,
@@ -24,6 +72,35 @@ struct DeliveryConfiguration: Codable, Sendable {
     let releaseTargetID: String
     let releaseTargetLabel: String
     let releaseMode: ReleaseMode
+
+    init(
+        profileID: String?,
+        profileLabel: String?,
+        sampleProfileID: String?,
+        repoIdentifier: String,
+        repoRoot: String,
+        baseBranch: String,
+        worktreeBasePath: String,
+        targetBranch: String,
+        releaseTargetID: String,
+        releaseTargetLabel: String,
+        releaseMode: ReleaseMode
+    ) {
+        self.profileID = profileID
+        self.profileLabel = profileLabel
+        self.sampleProfileID = sampleProfileID
+        self.repoIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
+            configuredIdentifier: repoIdentifier,
+            repoRoot: repoRoot
+        )
+        self.repoRoot = repoRoot
+        self.baseBranch = baseBranch
+        self.worktreeBasePath = worktreeBasePath
+        self.targetBranch = targetBranch
+        self.releaseTargetID = releaseTargetID
+        self.releaseTargetLabel = releaseTargetLabel
+        self.releaseMode = releaseMode
+    }
 }
 
 // MARK: - ReleaseMode (Proposal 007 — ARCH-072)

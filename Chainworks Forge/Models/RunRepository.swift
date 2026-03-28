@@ -100,7 +100,8 @@ struct RunRepository {
         plan: RunPlan,
         workspace: RunWorkspace,
         workflowSourcePath: String,
-        catalogSourcePath: String
+        catalogSourcePath: String,
+        startSnapshot: RunStartSnapshot = .empty
     ) throws -> Run {
         let activeStatuses: [RunStatus] = [.pending, .ready, .running, .waitingApproval, .blocked]
         if let existing = idea.runs.first(where: { activeStatuses.contains($0.status) }) {
@@ -128,6 +129,11 @@ struct RunRepository {
         run.projectKey = Self.deriveProjectKey(from: idea)
         run.riskClass = .standard
         run.stack = "unknown"
+
+        // Proposal 008 (REQ-006): Link run to benchmark cohort if the idea has one.
+        run.experimentCohortID = idea.experimentCohortID
+
+        startSnapshot.apply(to: run)
 
         context.insert(run)
         return run

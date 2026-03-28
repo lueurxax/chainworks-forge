@@ -24,6 +24,9 @@ protocol AgentExecutor: Sendable {
 struct ExecutionContext: Sendable {
     /// The run's workspace (paths, isolation boundaries).
     let workspace: RunWorkspace
+    /// Preferred read-only project root for repo-backed runs before a writable worktree exists.
+    /// When present, agents should read source from here instead of from the ephemeral run workspace.
+    let projectRoot: URL?
     /// The current stage ID.
     let stageID: String
     /// The current iteration within this stage (for loop support).
@@ -38,6 +41,28 @@ struct ExecutionContext: Sendable {
     let ideaBody: String
     /// Resolved provider binding frozen at run start.
     let providerBinding: ResolvedProviderBinding?
+
+    init(
+        workspace: RunWorkspace,
+        projectRoot: URL? = nil,
+        stageID: String,
+        iteration: Int,
+        attemptNumber: Int,
+        inputArtifacts: [String: Data],
+        variables: [String: AnyCodableValue],
+        ideaBody: String,
+        providerBinding: ResolvedProviderBinding?
+    ) {
+        self.workspace = workspace
+        self.projectRoot = projectRoot
+        self.stageID = stageID
+        self.iteration = iteration
+        self.attemptNumber = attemptNumber
+        self.inputArtifacts = inputArtifacts
+        self.variables = variables
+        self.ideaBody = ideaBody
+        self.providerBinding = providerBinding
+    }
 }
 
 // MARK: - AgentResult
@@ -81,15 +106,13 @@ enum OutputContractResolver {
         agent: ResolvedAgent,
         catalog: AgentCatalog?
     ) -> String? {
-        if let explicit = agent.outputContract {
-            return explicit
-        }
-
         switch outputName {
         case "proposal_review_po", "proposal_review_ux", "proposal_review_ui", "proposal_review_architect":
             return "proposal_review_v1"
         case "proposal_review_summary":
             return "proposal_review_summary_v1"
+        case "prepush_review_report":
+            return "prepush_review_v1"
         case "final_feature_report":
             return "final_feature_report_v1"
         default:
@@ -104,6 +127,12 @@ enum OutputContractResolver {
         if catalog.contracts[versioned] != nil {
             return versioned
         }
+
+        if let explicit = agent.outputContract,
+           explicitContract(explicit, matches: outputName) {
+            return explicit
+        }
+
         return nil
     }
 
@@ -117,6 +146,15 @@ enum OutputContractResolver {
             return nil
         }
         return catalog.contracts[contractID]
+    }
+
+    private static func explicitContract(_ contractID: String, matches outputName: String) -> Bool {
+        guard let stem = contractID.range(of: #"_v\d+$"#, options: .regularExpression).map({
+            String(contractID[..<$0.lowerBound])
+        }) else {
+            return contractID == outputName
+        }
+        return stem == outputName
     }
 }
 

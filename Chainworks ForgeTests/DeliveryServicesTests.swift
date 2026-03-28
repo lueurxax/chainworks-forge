@@ -55,6 +55,29 @@ struct DeliveryServicesTests {
         #expect(config.targetBranch == "release/v1")
     }
 
+    @Test("DeliveryConfiguration canonicalizes repository identity across label and remote formats")
+    func deliveryConfigurationCanonicalizesRepoIdentity() {
+        let config = DeliveryConfiguration(
+            profileID: "chainworks_forge_self",
+            profileLabel: "Chainworks Forge (Self)",
+            sampleProfileID: nil,
+            repoIdentifier: "Chainworks Forge",
+            repoRoot: "/Users/test/Chainworks Forge",
+            baseBranch: "main",
+            worktreeBasePath: "/tmp/worktrees",
+            targetBranch: "dogfood/full-mvp",
+            releaseTargetID: "sandbox_local",
+            releaseTargetLabel: "Local Sandbox",
+            releaseMode: .sandbox
+        )
+
+        #expect(config.repoIdentifier == "chainworks-forge")
+        #expect(
+            RepositoryIdentityNormalizer.canonicalIdentifier(from: "git@github.com:example/chainworks-forge.git")
+                == config.repoIdentifier
+        )
+    }
+
     // MARK: - RepoSafetyGuard
 
     @Test("RepoSafetyGuard allows paths within workspace")

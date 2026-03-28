@@ -33,6 +33,28 @@ struct GooseSessionBridgeTests {
         )
     }
 
+    private func makeWriteAgent(id: String = "write_agent") -> ResolvedAgent {
+        ResolvedAgent(
+            id: id,
+            title: "Write Agent",
+            mode: "autonomous",
+            provider: "test_provider",
+            model: "test_model",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "read_write",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a write agent.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["input_artifact"],
+            outputs: ["output_artifact"],
+            worktreeWriteEnabled: true
+        )
+    }
+
     private func makeTask() -> AgentTask {
         AgentTask(agent: "test_agent", task: "test_task", inputs: ["input_artifact"], outputs: ["output_artifact"])
     }
@@ -139,7 +161,7 @@ struct GooseSessionBridgeTests {
 
         // System prompt should contain boundaries
         #expect(packet.systemPrompt.contains("Do not perform any git operations"))
-        #expect(packet.systemPrompt.contains("Do not modify files outside the workspace root"))
+        #expect(packet.systemPrompt.contains("Do not rely on implicit working directory"))
     }
 
     @Test("Packet can disable Xcode MCP via environment")
@@ -178,6 +200,7 @@ struct GooseSessionBridgeTests {
 
         let context = ExecutionContext(
             workspace: workspace,
+            projectRoot: URL(fileURLWithPath: "/tmp/project-root", isDirectory: true),
             stageID: "state_2",
             iteration: 1,
             attemptNumber: 1,
@@ -197,6 +220,9 @@ struct GooseSessionBridgeTests {
 
         // Context attachments should include workspace context
         #expect(packet.contextAttachments.contains { $0.name == "workspace_context" })
+        let workspaceContext = packet.contextAttachments.first { $0.name == "workspace_context" }
+        #expect(workspaceContext?.content?.contains("Project Root: /tmp/project-root") == true)
+        #expect(workspaceContext?.content?.contains("Ignore any unexpected server cwd drift") == true)
 
         // Context attachments should include input artifacts
         #expect(packet.contextAttachments.contains { $0.name == "input_artifact" })
@@ -278,6 +304,105 @@ struct GooseSessionBridgeTests {
         #expect(lastRequest?.executionPolicy?.gitOperationsAllowed == false)
         #expect(lastRequest?.executionPolicy?.releaseOperationsAllowed == false)
         #expect(lastRequest?.executionPolicy?.repoWritesAllowed == false)
+    }
+
+    @Test("Read-only repo-backed execution uses project root as working directory")
+    func sessionBridgeUsesProjectRootForReadOnlyRepoBackedExecution() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "bridge-project-root",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-project-root",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        )
+
+        let bridge = GooseSessionBridge(transport: transport)
+        let agent = makeAgent()
+        let task = makeTask()
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let projectRoot = URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true)
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: projectRoot,
+            stageID: "state_1",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: task,
+            context: context,
+            override: nil
+        )
+
+        let lastRequest = await transport.lastSessionRequest
+        #expect(lastRequest?.workingDirectory == projectRoot.path)
+        #expect(lastRequest?.executionPolicy?.workspaceMode == "read_only")
+    }
+
+    @Test("Writable execution prefers worktree root over project root")
+    func sessionBridgePrefersWorktreeRootForWritableExecution() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "bridge-worktree-root",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-worktree-root",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        )
+
+        let bridge = GooseSessionBridge(transport: transport)
+        let agent = makeWriteAgent()
+        let task = makeTask()
+        let workspace = makeWorkspace()
+        let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        let writableWorkspace = RunWorkspace(
+            runID: workspace.runID,
+            workspaceRoot: workspace.workspaceRoot,
+            artifactRoot: workspace.artifactRoot,
+            worktreeRoot: worktreeRoot
+        )
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: writableWorkspace,
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_7_implementation_started",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: task,
+            context: context,
+            override: nil
+        )
+
+        let lastRequest = await transport.lastSessionRequest
+        #expect(lastRequest?.workingDirectory == worktreeRoot.path)
+        #expect(lastRequest?.executionPolicy?.workspaceMode == "read_write")
     }
 
     // MARK: - LiveExecutionOverride Tests

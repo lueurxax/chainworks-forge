@@ -8,36 +8,121 @@
 import XCTest
 
 final class Chainworks_ForgeUITests: XCTestCase {
+    private static let defaultApprovedRemoteHosts = ["SMacBook.local", "SMacBook"]
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        try enforceRemoteOnlyUIHostPolicy()
+    }
 
     // MARK: - Test Helpers
+
+    private func enforceRemoteOnlyUIHostPolicy() throws {
+        let approvedHosts = Self.approvedRemoteHosts()
+        let observedHosts = Self.observedHostNames()
+        guard observedHosts.contains(where: { approvedHosts.contains($0) }) else {
+            let message = """
+            Chainworks Forge UI tests are remote-only and may not run on this host.
+            Approved remote hosts: \(approvedHosts.sorted().joined(separator: ", "))
+            Observed host names: \(observedHosts.sorted().joined(separator: ", "))
+            """
+            throw NSError(
+                domain: "ChainworksForge.UITestHostPolicy",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+    }
+
+    private static func approvedRemoteHosts() -> Set<String> {
+        let raw = ProcessInfo.processInfo.environment["CHAINWORKS_REMOTE_UI_TEST_HOSTS"]?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let source = (raw?.isEmpty == false ? raw! : defaultApprovedRemoteHosts)
+        return Set(source.map(normalizeHostName))
+    }
+
+    private static func observedHostNames() -> Set<String> {
+        var values = Set<String>()
+
+        let processHost = ProcessInfo.processInfo.hostName
+        if !processHost.isEmpty {
+            values.insert(normalizeHostName(processHost))
+        }
+
+        if let currentHostName = Host.current().name, !currentHostName.isEmpty {
+            values.insert(normalizeHostName(currentHostName))
+        }
+
+        if let localizedName = Host.current().localizedName, !localizedName.isEmpty {
+            values.insert(normalizeHostName(localizedName))
+        }
+
+        return values
+    }
+
+    private static func normalizeHostName(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
 
     private func makeApp(
         seededIdeaTitle: String? = nil,
         seededIdeaBody: String = "Seeded UI test idea",
+        seededIdeaWorkspaceRoot: String? = nil,
+        newIdeaPrefillTitle: String? = nil,
+        newIdeaPrefillBody: String? = nil,
         liveFixture: Bool = false,
+        liveFixtureMode: String? = nil,
+        deliveryProofMode: String? = nil,
         initialTab: String = "Ideas",
         seedWaitingApprovalRun: Bool = false,
-        directSurface: String? = nil
+        directSurface: String? = nil,
+        disableEagerBootstrap: Bool = false
     ) -> XCUIApplication {
         let app = XCUIApplication()
+        let resolvedRepoRoot = seededIdeaWorkspaceRoot ?? repoRootPath()
+        let workflowSourcePath = URL(fileURLWithPath: resolvedRepoRoot)
+            .appendingPathComponent("examples/workflows/workflow.yaml")
+            .path
+        let catalogSourcePath = URL(fileURLWithPath: resolvedRepoRoot)
+            .appendingPathComponent("examples/agents/agents.yaml")
+            .path
         // Prevent macOS scene restoration from opening stale windows that
         // overlap the test window and cause XCUITest to click hidden elements.
         app.launchArguments += ["-NSQuitAlwaysKeepsWindows", "NO"]
+        app.launchEnvironment["CHAINWORKS_UI_TEST_SESSION_ID"] = UUID().uuidString
         app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = "1"
         app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
         app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
+        app.launchEnvironment["CHAINWORKS_WORKFLOW_SOURCE_PATH"] = workflowSourcePath
+        app.launchEnvironment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"] = catalogSourcePath
         if let directSurface {
             app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
         }
         if let seededIdeaTitle {
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"] = seededIdeaTitle
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_BODY"] = seededIdeaBody
+            if let seededIdeaWorkspaceRoot {
+                app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_WORKSPACE_ROOT"] = seededIdeaWorkspaceRoot
+            }
         }
-        if liveFixture {
-            app.launchEnvironment["CHAINWORKS_GOOSE_FIXTURE_MODE"] = "proposal_loop_success"
+        if let newIdeaPrefillTitle {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_NEW_IDEA_TITLE"] = newIdeaPrefillTitle
+            app.launchEnvironment["CHAINWORKS_UI_TEST_NEW_IDEA_BODY"] = newIdeaPrefillBody ?? seededIdeaBody
+        }
+        let resolvedFixtureMode = liveFixtureMode ?? (liveFixture ? "proposal_loop_success" : nil)
+        if let resolvedFixtureMode {
+            app.launchEnvironment["CHAINWORKS_GOOSE_FIXTURE_MODE"] = resolvedFixtureMode
             app.launchEnvironment["CHAINWORKS_LIVE_PROVIDER"] = "claude_code"
             app.launchEnvironment["CHAINWORKS_LIVE_MODEL"] = "fixture-model"
             app.launchEnvironment["CHAINWORKS_LIVE_EFFORT"] = "high"
+        }
+        if disableEagerBootstrap {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] = "1"
+        }
+        if let deliveryProofMode {
+            app.launchEnvironment["CHAINWORKS_DELIVERY_PROOF_MODE"] = deliveryProofMode
         }
         if seedWaitingApprovalRun {
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_WAITING_APPROVAL_RUN"] = "1"
@@ -52,6 +137,19 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launch()
         app.activate()
         RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+    }
+
+    private func terminateIfRunning(_ app: XCUIApplication) {
+        guard app.state == .runningForeground || app.state == .runningBackground else { return }
+        app.activate()
+        app.terminate()
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if app.state == .notRunning || app.state == .unknown {
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
     }
 
     /// Takes an evidence screenshot. Silently skips if app has crashed/terminated.
@@ -77,11 +175,242 @@ final class Chainworks_ForgeUITests: XCTestCase {
             .firstMatch
     }
 
-    override func setUpWithError() throws {
-        continueAfterFailure = false
+    private func repoRootPath() -> String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .path
     }
 
-    override func tearDownWithError() throws {}
+    private func desktopEvidencePacks() -> [URL] {
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: desktop,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return contents
+            .filter { $0.lastPathComponent.hasPrefix("evidence-pack-") }
+            .sorted {
+                let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lhs > rhs
+            }
+    }
+
+    @discardableResult
+    private func waitForRunTerminalState(
+        _ app: XCUIApplication,
+        approvalsExpectedAtLeast: Int,
+        timeout: TimeInterval = 120
+    ) -> (terminal: String?, approvals: Int) {
+        var approvalCount = 0
+        let deadline = Date().addingTimeInterval(timeout)
+        let shell = AppScreen(app: app)
+        let inbox = ApprovalInboxScreen(app: app)
+        let progress = RunProgressScreen(app: app)
+        var lastFallbackNavigation = Date.distantPast
+        var lastApprovalAt = Date.distantPast
+
+        func terminalState() -> String? {
+            if let status = progress.currentRunStatus(),
+               ["completed", "blocked", "failed"].contains(status) {
+                return status
+            }
+
+            if anyElement(app, identifier: "run-status-completed").exists {
+                return "completed"
+            }
+            if anyElement(app, identifier: "run-status-blocked").exists {
+                return "blocked"
+            }
+            if anyElement(app, identifier: "run-status-failed").exists {
+                return "failed"
+            }
+            return nil
+        }
+
+        while Date() < deadline {
+            if let terminal = terminalState() {
+                return (terminal, approvalCount)
+            }
+
+            if Date().timeIntervalSince(lastApprovalAt) < 12 {
+                let completedEl = anyElement(app, identifier: "run-status-completed")
+                let blockedEl = anyElement(app, identifier: "run-status-blocked")
+                let failedEl = anyElement(app, identifier: "run-status-failed")
+                let inlineApproveButton = app.buttons["approval-approve-button"].firstMatch.exists
+                    ? app.buttons["approval-approve-button"].firstMatch
+                    : app.buttons["Approve"].firstMatch
+                let changePredicate = NSPredicate { _, _ in
+                    completedEl.exists
+                        || blockedEl.exists
+                        || failedEl.exists
+                        || (inlineApproveButton.exists && inlineApproveButton.isEnabled)
+                        || (inbox.approveButton.exists && inbox.approveButton.isEnabled)
+                }
+                let changeExpectation = XCTNSPredicateExpectation(predicate: changePredicate, object: nil)
+                _ = XCTWaiter().wait(for: [changeExpectation], timeout: 2)
+                continue
+            }
+
+            let inlineApproveButton = app.buttons["approval-approve-button"].firstMatch.exists
+                ? app.buttons["approval-approve-button"].firstMatch
+                : app.buttons["Approve"].firstMatch
+
+            if progress.revealApprovalButton(timeout: 4),
+               inlineApproveButton.exists,
+               inlineApproveButton.isEnabled,
+               inlineApproveButton.isHittable {
+                inlineApproveButton.click()
+                approvalCount += 1
+                lastApprovalAt = Date()
+                let transitionDeadline = Date().addingTimeInterval(10)
+                while Date() < transitionDeadline {
+                    if let terminal = terminalState() {
+                        return (terminal, approvalCount)
+                    }
+                    if !inlineApproveButton.exists || !inlineApproveButton.isEnabled {
+                        break
+                    }
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                }
+                continue
+            }
+
+            let progressSurfaceVisible = progress.isVisible(timeout: 1)
+            if !progressSurfaceVisible,
+               Date().timeIntervalSince(lastFallbackNavigation) > 8,
+               shell.selectTab("Approvals", timeout: 2),
+                      inbox.waitForRendered(timeout: 2),
+                      inbox.approveButton.exists,
+                      inbox.approveButton.isEnabled,
+                      inbox.approveButton.isHittable {
+                inbox.approveButton.click()
+                approvalCount += 1
+                lastApprovalAt = Date()
+                lastFallbackNavigation = Date()
+                let transitionDeadline = Date().addingTimeInterval(10)
+                while Date() < transitionDeadline {
+                    if let terminal = terminalState() {
+                        return (terminal, approvalCount)
+                    }
+                    if !inbox.approveButton.exists || !inbox.approveButton.isEnabled {
+                        break
+                    }
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                }
+                _ = shell.selectTab("Ideas", timeout: 2)
+                continue
+            }
+
+            if let terminal = terminalState() {
+                return (terminal, approvalCount)
+            }
+
+            let completedEl = anyElement(app, identifier: "run-status-completed")
+            let blockedEl = anyElement(app, identifier: "run-status-blocked")
+            let failedEl = anyElement(app, identifier: "run-status-failed")
+            let changePredicate = NSPredicate { _, _ in
+                completedEl.exists
+                    || blockedEl.exists
+                    || failedEl.exists
+                    || (inlineApproveButton.exists && inlineApproveButton.isEnabled)
+                    || (inbox.approveButton.exists && inbox.approveButton.isEnabled)
+            }
+            let changeExpectation = XCTNSPredicateExpectation(predicate: changePredicate, object: nil)
+            _ = XCTWaiter().wait(for: [changeExpectation], timeout: 3)
+        }
+
+        XCTAssertGreaterThanOrEqual(approvalCount, approvalsExpectedAtLeast)
+        return (nil, approvalCount)
+    }
+
+    private func exportEvidencePackFromRunsHome(
+        _ app: XCUIApplication,
+        ideaTitle: String
+    ) -> URL? {
+        let screen = AppScreen(app: app)
+        let openInRunsHomeButton = app.buttons["open-run-in-runs-home-button"].firstMatch
+        if openInRunsHomeButton.waitForExistence(timeout: 5), openInRunsHomeButton.isHittable {
+            openInRunsHomeButton.click()
+            let detailPanel = app.otherElements["run-detail-panel"].firstMatch
+            let exportButton = app.buttons["export-evidence-pack-button"].firstMatch
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                if detailPanel.exists && exportButton.exists {
+                    break
+                }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            }
+        } else if !screen.selectTab("Runs Home", timeout: 15) {
+            return nil
+        }
+
+        let exportButton = app.buttons["export-evidence-pack-button"].firstMatch
+        if !exportButton.exists {
+            let runTitle = app.staticTexts[ideaTitle].firstMatch
+            guard runTitle.waitForExistence(timeout: 15) else { return nil }
+            runTitle.click()
+        }
+
+        let before = Set(desktopEvidencePacks().map(\.path))
+        guard exportButton.waitForExistence(timeout: 10), exportButton.isEnabled else { return nil }
+        exportButton.click()
+
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            let current = desktopEvidencePacks()
+            if let latest = current.first, !before.contains(latest.path) {
+                return latest
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        return nil
+    }
+
+    private func assertEvidencePack(
+        _ packURL: URL,
+        expectedFiles: [String],
+        missingFilesAllowed: [String] = []
+    ) {
+        let fm = FileManager.default
+        for file in expectedFiles where !missingFilesAllowed.contains(file) {
+            XCTAssertTrue(
+                fm.fileExists(atPath: packURL.appendingPathComponent(file).path),
+                "Evidence pack must contain \(file)"
+            )
+        }
+    }
+
+    override func tearDownWithError() throws {
+        terminateIfRunning(XCUIApplication())
+    }
+
+    private func ensureIdeasOwnerPath(_ app: XCUIApplication, screen: AppScreen) -> Bool {
+        let signals = [
+            anyElement(app, identifier: "ideas-root-view"),
+            anyElement(app, identifier: "idea-list"),
+            anyElement(app, identifier: "ideas-new-idea"),
+            anyElement(app, identifier: "ideas-new-idea-inline"),
+            anyElement(app, identifier: "ideas-open-archive"),
+            anyElement(app, identifier: "ideas-summary-open-archive")
+        ]
+        if signals.contains(where: \.exists) {
+            return true
+        }
+
+        if screen.selectTab("Ideas", timeout: 10) {
+            return true
+        }
+
+        for signal in signals where signal.waitForExistence(timeout: 5) {
+            return true
+        }
+
+        return screen.waitForTabs(timeout: 10) && screen.selectTab("Ideas", timeout: 10)
+    }
 
     // MARK: - PROD-PA-001: Scaffold Walkthrough < 60 seconds
 
@@ -484,6 +813,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     func testReleaseGateSurfaceShowsDecisionContextActions() throws {
         let app = makeApp(directSurface: "release_gate")
+        defer { terminateIfRunning(app) }
         launchClean(app)
 
         let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-release_gate")
@@ -494,8 +824,10 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
         let releaseGate = anyElement(app, identifier: "release-gate-view")
         let decisionContext = anyElement(app, identifier: "release-gate-decision-context")
+        let seededReady = anyElement(app, identifier: "ui-test-release-gate-surface-ready")
         XCTAssertTrue(
             releaseGate.waitForExistence(timeout: 20)
+                || seededReady.waitForExistence(timeout: 20)
                 || decisionContext.waitForExistence(timeout: 20),
             "Release gate surface must render the manual release gate owner pane"
         )
@@ -839,106 +1171,152 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// Full product checkpoint: create idea -> start run -> approve 3 gates -> observe states -> inspect artifacts -> complete < 120s
     func testFullProductCheckpointCanonicalExecution() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
-        let app = makeApp()
+        let ideaTitle = "Canonical Checkpoint"
+        let repoRoot = repoRootPath()
+        let app = makeApp(
+            seededIdeaTitle: ideaTitle,
+            seededIdeaBody: "Canonical repo-backed happy-path proof",
+            seededIdeaWorkspaceRoot: repoRoot,
+            liveFixtureMode: "full_mvp_success",
+            deliveryProofMode: "happy_path",
+            disableEagerBootstrap: true
+        )
+        defer { terminateIfRunning(app) }
         launchClean(app)
 
         let screen = AppScreen(app: app)
         let ideas = IdeasScreen(app: app)
         let startRun = StartRunScreen(app: app)
 
-        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
-                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        XCTAssertTrue(
+            ensureIdeasOwnerPath(app, screen: screen),
+            "Ideas owner path must be reachable for canonical full product checkpoint"
+        )
 
-        // Step 1: Create an idea
-        try XCTSkipUnless(ideas.createIdea(title: "Canonical Checkpoint"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
+        // Step 1: Open the seeded repo-backed idea from the real UI
+        XCTAssertTrue(
+            ideas.openIdea(named: ideaTitle),
+            "Canonical full product checkpoint must be able to open the seeded repo-backed idea from the real UI"
+        )
+        XCTAssertTrue(
+            ideas.setProjectDirectory(repoRoot, for: ideaTitle),
+            "Canonical full product checkpoint must set the project directory through the real UI"
+        )
         screenshot(app, name: "PA012_01_IdeaCreated")
 
-        // Step 2: Open Start Run sheet and start
-        try XCTSkipUnless(ideas.openStartRunSheet(for: "Canonical Checkpoint"), "Sheet opened")
+        // Step 2: Open Start Run sheet, switch to full repo-backed live flow, and start
+        XCTAssertTrue(ideas.openStartRunSheet(for: ideaTitle), "Start Run sheet must open for canonical checkpoint")
+        XCTAssertTrue(startRun.selectLiveMode(), "Live mode must be selectable")
+        XCTAssertTrue(startRun.selectWorkflow("Full MVP (Live)"), "Full MVP live workflow must be selectable")
+        XCTAssertTrue(startRun.runDeliveryPreflightIfNeeded(), "Delivery preflight must succeed before start")
         let startRunBtn = startRun.startRunButton
-        guard startRunBtn.waitForExistence(timeout: 15), startRunBtn.isEnabled else {
-            startRun.dismiss()
-            try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
-            return
-        }
+        XCTAssertTrue(
+            startRun.waitForStartRunReady(timeout: 45),
+            "Start Run must become enabled after compile and preflight. Current state: \(startRun.startRunButtonStateDescription)"
+        )
+        XCTAssertTrue(startRunBtn.waitForExistence(timeout: 15) && startRunBtn.isEnabled)
         startRunBtn.click()
         screenshot(app, name: "PA012_02_RunStarted")
 
-        // Step 3: Monitor execution and approve gates
-        // The canonical workflow has 12 states and 3 approval gates.
-        // SimulatedAgentExecutor processes quickly (0.5s delay per agent).
-        var approvalCount = 0
-        var observedStates = Set<String>()
-        let executionDeadline = Date().addingTimeInterval(90) // leave 30s margin for 120s total
-
-        while Date() < executionDeadline {
-            // Collect observed status texts
-            for status in ["pending", "ready", "running", "waitingApproval", "completed", "failed"] {
-                if app.staticTexts[status].exists {
-                    observedStates.insert(status)
-                }
-            }
-
-            if observedStates.contains("completed") { break }
-
-            // Check for approval gate — look for inline Approve button in run progress
-            let approveButton = app.buttons["Approve"].firstMatch
-            if approveButton.exists && approveButton.isEnabled {
-                screenshot(app, name: "PA012_03_ApprovalGate_\(approvalCount + 1)")
-                approveButton.click()
-                approvalCount += 1
-
-                // Also check Approvals tab for approval gate view
-                if approvalCount == 1 {
-                    _ = screen.selectTab("Approvals")
-                    screenshot(app, name: "PA012_03b_ApprovalsTab")
-                    _ = screen.selectTab("Ideas")
-                    let ideaCell = app.staticTexts["Canonical Checkpoint"]
-                    if ideaCell.waitForExistence(timeout: 3) {
-                        ideaCell.click()
-                    }
-                }
-            }
-
-            // Wait for a meaningful state change instead of fixed-interval polling
-            let completedEl = app.staticTexts["completed"]
-            let approveEl = app.buttons["Approve"].firstMatch
-            let changePredicate = NSPredicate { _, _ in
-                completedEl.exists || (approveEl.exists && approveEl.isEnabled)
-            }
-            let changeExpectation = XCTNSPredicateExpectation(predicate: changePredicate, object: nil)
-            _ = XCTWaiter().wait(for: [changeExpectation], timeout: 2)
-        }
+        // Step 3: Monitor execution and approve all three gates
+        let terminal = waitForRunTerminalState(app, approvalsExpectedAtLeast: 3, timeout: 120)
+        XCTAssertEqual(terminal.terminal, "completed", "Repo-backed full checkpoint must complete")
+        XCTAssertGreaterThanOrEqual(terminal.approvals, 3, "All approval gates should be resolved")
 
         screenshot(app, name: "PA012_04_ExecutionDone")
 
-        XCTAssertTrue(observedStates.contains("completed"),
-                      "Run should reach completed state, observed: \(observedStates)")
-        XCTAssertGreaterThan(approvalCount, 0,
-                             "At least one approval gate should have been resolved")
-
-        // Step 4: Verify artifacts exist
-        let artifactsSection = app.staticTexts["Artifacts"]
-        let reportSection = app.staticTexts["Completed Feature Report"]
-        if artifactsSection.exists || reportSection.exists {
-            let artifactButtons = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] '·'"))
-            if artifactButtons.count > 0 {
-                artifactButtons.firstMatch.click()
-                screenshot(app, name: "PA012_05_ArtifactInspected")
-                app.typeKey(.escape, modifierFlags: [])
-            }
+        // Step 4: Export evidence pack from the completed run surface
+        let exportedPack = exportEvidencePackFromRunsHome(app, ideaTitle: ideaTitle)
+        XCTAssertNotNil(exportedPack, "Completed repo-backed run must export an evidence pack")
+        if let exportedPack {
+            assertEvidencePack(
+                exportedPack,
+                expectedFiles: [
+                    "delivery-configuration.json",
+                    "delivery-preflight.json",
+                    "run-metadata.json",
+                    "stage-summary.json",
+                    "agent-execution-detail.json",
+                    "deliverables/release-manifest.json",
+                    "deliverables/git-push-receipt.json",
+                    "deliverables/connect-upload-receipt.json",
+                    "deliverables/delivery-receipt.json",
+                    "screenshot-checklist.md"
+                ]
+            )
         }
-
-        // Step 5: Check stages were created
-        let stagesSection = app.staticTexts["Stages"]
-        if stagesSection.exists {
-            screenshot(app, name: "PA012_06_Stages")
-        }
+        screenshot(app, name: "PA012_05_EvidenceExported")
 
         screenshot(app, name: "PA012_07_Final")
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         XCTAssertLessThan(elapsed, 120.0,
                           "Full product checkpoint must complete in < 120s (\(String(format: "%.1f", elapsed))s)")
+    }
+
+    func testFullProductCheckpointCanonicalNonHappyPathExportsEvidence() throws {
+        let ideaTitle = "Canonical Checkpoint Failure"
+        let repoRoot = repoRootPath()
+        let app = makeApp(
+            seededIdeaTitle: ideaTitle,
+            seededIdeaBody: "Canonical repo-backed non-happy-path proof",
+            seededIdeaWorkspaceRoot: repoRoot,
+            liveFixtureMode: "full_mvp_success",
+            deliveryProofMode: "non_happy_path",
+            disableEagerBootstrap: true
+        )
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let screen = AppScreen(app: app)
+        let ideas = IdeasScreen(app: app)
+        let startRun = StartRunScreen(app: app)
+
+        XCTAssertTrue(
+            ensureIdeasOwnerPath(app, screen: screen),
+            "Ideas owner path must be reachable for canonical non-happy-path checkpoint"
+        )
+        XCTAssertTrue(
+            ideas.openIdea(named: ideaTitle),
+            "Canonical non-happy-path checkpoint must be able to open the seeded repo-backed idea from the real UI"
+        )
+        XCTAssertTrue(
+            ideas.setProjectDirectory(repoRoot, for: ideaTitle),
+            "Canonical non-happy-path checkpoint must set the project directory through the real UI"
+        )
+        XCTAssertTrue(ideas.openStartRunSheet(for: ideaTitle))
+        XCTAssertTrue(startRun.selectLiveMode())
+        XCTAssertTrue(startRun.selectWorkflow("Full MVP (Live)"))
+        XCTAssertTrue(startRun.runDeliveryPreflightIfNeeded())
+        XCTAssertTrue(startRun.waitForStartRunReady(timeout: 45))
+        startRun.startRunButton.click()
+
+        let terminal = waitForRunTerminalState(app, approvalsExpectedAtLeast: 3, timeout: 120)
+        XCTAssertEqual(terminal.terminal, "blocked", "Non-happy-path repo-backed run must block after release failure")
+        XCTAssertGreaterThanOrEqual(terminal.approvals, 3)
+
+        let exportedPack = exportEvidencePackFromRunsHome(app, ideaTitle: ideaTitle)
+        XCTAssertNotNil(exportedPack, "Blocked repo-backed run must still export an evidence pack")
+        if let exportedPack {
+            assertEvidencePack(
+                exportedPack,
+                expectedFiles: [
+                    "delivery-configuration.json",
+                    "delivery-preflight.json",
+                    "run-metadata.json",
+                    "stage-summary.json",
+                    "agent-execution-detail.json",
+                    "deliverables/release-manifest.json",
+                    "deliverables/git-push-receipt.json",
+                    "deliverables/delivery-receipt.json",
+                    "screenshot-checklist.md"
+                ]
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: exportedPack.appendingPathComponent("deliverables/connect-upload-receipt.json").path),
+                "Non-happy-path evidence pack must not contain a connect upload receipt"
+            )
+        }
+        screenshot(app, name: "PA012_NonHappyPath")
     }
 }

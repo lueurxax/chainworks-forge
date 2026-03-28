@@ -40,6 +40,11 @@ final class RecoveryCoordinator {
         case .blocked:
             if let blockedStage = lastBlockedStage(in: run) {
                 actions.append(.retryStage(stageID: blockedStage.stageID))
+            } else if let failedStage = lastFailedStage(in: run) {
+                if let failedAgent = lastFailedAgent(in: failedStage) {
+                    actions.append(.retryAgent(stageID: failedStage.stageID, agentID: failedAgent.agentID))
+                }
+                actions.append(.retryStage(stageID: failedStage.stageID))
             }
             actions.append(.cloneRunFrozenSnapshot)
             actions.append(.cloneRunCurrentConfig)
@@ -173,13 +178,15 @@ final class RecoveryCoordinator {
 
         // Rebuild plan from frozen snapshot
         let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: original)
+        settleSourceRunForCloneIfNeeded(original)
 
         let clone = try RunRepository(context: modelContext).createRunFromPlan(
             for: idea,
             plan: plan,
             workspace: workspace,
             workflowSourcePath: original.workflowSourcePath,
-            catalogSourcePath: original.catalogSourcePath
+            catalogSourcePath: original.catalogSourcePath,
+            startSnapshot: RunStartSnapshot.from(run: original)
         )
         clone.runtimeTrustLevel = original.runtimeTrustLevel
 
@@ -205,6 +212,7 @@ final class RecoveryCoordinator {
         }
 
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        settleSourceRunForCloneIfNeeded(original)
         let (clone, _) = try compiler.createRun(
             for: idea,
             plan: plan,
@@ -290,6 +298,21 @@ final class RecoveryCoordinator {
             .filter { $0.status == .waitingApproval }
             .sorted { $0.startedAt < $1.startedAt }
             .last
+    }
+
+    /// A recovery clone replaces the blocked source run as the active run for the idea.
+    /// The source run stays in durable history, but must no longer occupy the single-active-run slot.
+    private func settleSourceRunForCloneIfNeeded(_ run: Run) {
+        guard run.status == .blocked else { return }
+        run.status = .cancelled
+        run.completedAt = run.completedAt ?? Date()
+        if let details = run.driftDetails, !details.isEmpty {
+            if !details.localizedCaseInsensitiveContains("superseded by recovery clone") {
+                run.driftDetails = "\(details) Superseded by recovery clone."
+            }
+        } else {
+            run.driftDetails = "Superseded by recovery clone."
+        }
     }
 }
 

@@ -74,17 +74,29 @@ struct CompletedRunExportHub: View {
                 // FOOTER: Export actions
                 exportActionsSection
 
-                // Export feedback
+                // Export feedback with retry on failure (Proposal 008 REQ-012)
                 if let exportMessage {
-                    Text(exportMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .transition(.opacity)
+                    HStack {
+                        Text(exportMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if exportMessage.hasPrefix("Export failed") {
+                            Button("Retry") {
+                                exportEvidencePack()
+                            }
+                            .font(.caption)
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("export-retry-button")
+                        }
+                    }
+                    .transition(.opacity)
+                    .accessibilityIdentifier("completed-run-export-message")
                 }
             }
             .padding()
         }
         .navigationTitle("Export Hub")
+        .accessibilityIdentifier("completed-run-export-hub")
         .task {
             loadRunData()
         }
@@ -476,6 +488,7 @@ struct CompletedRunExportHub: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(isExporting || run.deliveryConfigurationJSON == nil)
+                    .accessibilityIdentifier("completed-run-export-evidence-pack")
                 }
 
                 Divider()
@@ -558,12 +571,33 @@ struct CompletedRunExportHub: View {
         loadSignOffSnapshot()
     }
 
+    /// Proposal 008 (REQ-015): Classify evidence-pack status using benchmark truth when available.
     private func classifyEvidencePackStatus() {
         let hasDeliveryConfig = run.deliveryConfigurationJSON != nil
         let hasReceipts = allArtifacts.contains {
             $0.name.localizedCaseInsensitiveContains("receipt")
         }
 
+        // Check for benchmark-side truth first (Proposal 008 REQ-015, REQ-020).
+        // Derive .exported strictly from persisted evidencePackExportedAt for benchmark-linked
+        // runs, not from receipt-presence heuristics. This keeps the operator-facing status
+        // in sync with the evaluator's Gate 6 truth.
+        if let cohortID = run.experimentCohortID {
+            let pairDescriptor = FetchDescriptor<BenchmarkPair>()
+            if let allPairs = try? modelContext.fetch(pairDescriptor),
+               let pair = allPairs.first(where: { $0.appDrivenRecord?.linkedRunID == run.id && $0.cohort?.id == cohortID }) {
+                // Run is linked to a benchmark pair — derive status from persisted export truth.
+                if let appRecord = pair.appDrivenRecord, appRecord.evidencePackExportedAt != nil {
+                    evidencePackStatus = .exported
+                    return
+                } else if pair.appDrivenRecord != nil {
+                    evidencePackStatus = .ready
+                    return
+                }
+            }
+        }
+
+        // Fallback to heuristic classification.
         if !hasDeliveryConfig {
             evidencePackStatus = .missing
         } else if run.status == .completed && hasReceipts {
@@ -611,11 +645,28 @@ struct CompletedRunExportHub: View {
             )
             exportMessage = "Exported \(pack.itemCount) items to Desktop."
             evidencePackStatus = .exported
+            // Proposal 008 (REQ-020): Mark the linked benchmark record as exported
+            // so the GO/HOLD gate can verify complete exported review packets.
+            markBenchmarkRecordExported()
         } catch {
             exportMessage = "Export failed: \(error.localizedDescription)"
         }
 
         isExporting = false
+    }
+
+    /// Proposal 008 (REQ-020): Stamp the benchmark execution record with the export timestamp
+    /// so the evaluator's Gate 6 can verify complete exported review packets.
+    private func markBenchmarkRecordExported() {
+        guard let cohortID = run.experimentCohortID else { return }
+        let pairDescriptor = FetchDescriptor<BenchmarkPair>()
+        guard let allPairs = try? modelContext.fetch(pairDescriptor),
+              let pair = allPairs.first(where: {
+                  $0.appDrivenRecord?.linkedRunID == run.id && $0.cohort?.id == cohortID
+              }),
+              let appRecord = pair.appDrivenRecord else { return }
+        appRecord.evidencePackExportedAt = Date()
+        try? modelContext.save()
     }
 
     private func exportSignOffPacket() {

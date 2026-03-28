@@ -67,9 +67,8 @@ struct DeliveryPreflightService: Sendable {
             detail: baseBranchExists ? nil : "Branch '\(config.baseBranch)' not found"
         ))
 
-        // Check 4: Worktree base path is writable
-        let worktreeBaseWritable = FileManager.default.isWritableFile(atPath: config.worktreeBasePath)
-            || FileManager.default.isWritableFile(atPath: URL(fileURLWithPath: config.worktreeBasePath).deletingLastPathComponent().path)
+        // Check 4: Worktree base path is creatable/writable
+        let worktreeBaseWritable = checkDirectoryCreatable(at: config.worktreeBasePath)
         checks.append(PreflightCheck(
             id: "worktree_writable",
             label: "Worktree base path is writable",
@@ -115,6 +114,21 @@ struct DeliveryPreflightService: Sendable {
             try process.run()
             process.waitUntilExit()
             return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func checkDirectoryCreatable(at path: String) -> Bool {
+        let fileManager = FileManager.default
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        let probeURL = url.appendingPathComponent(".cw-write-probe-\(UUID().uuidString)")
+
+        do {
+            try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+            try Data("ok".utf8).write(to: probeURL, options: .atomic)
+            try? fileManager.removeItem(at: probeURL)
+            return true
         } catch {
             return false
         }

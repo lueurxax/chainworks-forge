@@ -20,6 +20,8 @@ This document records that implemented baseline as a reference contract.
 Related stable doc:
 
 - [goose-provider-remediation.md](goose-provider-remediation.md)
+- [provider-binding-truth.md](provider-binding-truth.md)
+- [project-workspace-contract.md](project-workspace-contract.md)
 
 ## Supported MVP provider families
 

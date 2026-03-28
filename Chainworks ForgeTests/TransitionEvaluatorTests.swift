@@ -165,7 +165,9 @@ struct TransitionEvaluatorTests {
 
     @Test("artifact field comparison", arguments: [
         ArtifactFieldCase(label: "int score >= 80", artifactName: "review_report", fieldName: "score", fieldValue: .int(85), expression: "review_report.score >= 80", expected: true),
-        ArtifactFieldCase(label: "string status == pass", artifactName: "review_report", fieldName: "status", fieldValue: .string("pass"), expression: "review_report.status == 'pass'", expected: true)
+        ArtifactFieldCase(label: "string status == pass", artifactName: "review_report", fieldName: "status", fieldValue: .string("pass"), expression: "review_report.status == 'pass'", expected: true),
+        ArtifactFieldCase(label: "double score <= target", artifactName: "proposal_review_summary", fieldName: "aggregate_score", fieldValue: .double(9.0), expression: "proposal_review_summary.aggregate_score <= 9.1", expected: true),
+        ArtifactFieldCase(label: "string status != implemented", artifactName: "audit_report", fieldName: "status", fieldValue: .string("Needs Work"), expression: "audit_report.status != 'Implemented'", expected: true)
     ])
     func artifactFieldComparison(testCase: ArtifactFieldCase) {
         let ctx = makeContext(

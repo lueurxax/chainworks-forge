@@ -185,6 +185,15 @@ struct RunsHomeView: View {
                 .frame(minWidth: 600, minHeight: 500)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { notification in
+            guard
+                let runIDString = notification.userInfo?["runID"] as? String,
+                let runID = UUID(uuidString: runIDString)
+            else { return }
+            if let run = allRuns.first(where: { $0.id == runID }) {
+                selectedRun = run
+            }
+        }
     }
 
     // MARK: - Grouped Runs (§5.2)
@@ -468,17 +477,57 @@ struct ParentIdeaArchiveBadge: View {
 
     private var statusText: String {
         guard let idea else { return "Unavailable" }
-        return idea.isArchived ? "Archived" : "Active"
+        return idea.lifecycleStatusLabel
     }
 
     private var statusIcon: String {
         guard let idea else { return "questionmark.circle" }
-        return idea.isArchived ? "archivebox.fill" : "lightbulb.fill"
+        if idea.isArchived { return "archivebox.fill" }
+        if let latestRun = idea.latestRun {
+            switch latestRun.presentationStatus {
+            case .pending, .ready:
+                return "clock.fill"
+            case .running:
+                return "play.circle.fill"
+            case .waitingApproval:
+                return "checkmark.seal.fill"
+            case .blocked:
+                return "pause.circle.fill"
+            case .completed:
+                return "checkmark.circle.fill"
+            case .failed:
+                return "xmark.circle.fill"
+            case .cancelled:
+                return "stop.circle.fill"
+            case .cancelling:
+                return "hourglass"
+            }
+        }
+        return "lightbulb.fill"
     }
 
     private var statusColor: Color {
         guard let idea else { return .secondary }
-        return idea.isArchived ? .secondary : .green
+        if idea.isArchived { return .secondary }
+        if let latestRun = idea.latestRun {
+            switch latestRun.presentationStatus {
+            case .pending, .ready:
+                return .gray
+            case .running:
+                return .green
+            case .waitingApproval, .cancelling:
+                return .orange
+            case .blocked:
+                return .yellow
+            case .completed:
+                return .mint
+            case .failed:
+                return .red
+            case .cancelled:
+                return .gray
+            }
+        }
+        return .green
     }
 }
 
@@ -493,6 +542,7 @@ struct RunDetailPanel: View {
     var onBlockedRecovery: (() -> Void)?
     let compatibilityChecker: CompatibilityChecker
 
+    @Environment(\.modelContext) private var modelContext
     @State private var evidenceExportMessage: String?
 
     var body: some View {
@@ -605,6 +655,7 @@ struct RunDetailPanel: View {
             .padding()
         }
         .navigationTitle("Run Details")
+        .accessibilityIdentifier("run-detail-panel")
     }
 
     private func exportEvidencePack() {
@@ -621,9 +672,24 @@ struct RunDetailPanel: View {
         do {
             let pack = try EvidencePackBuilder.export(run: run, workspace: workspace, exportDirectory: desktopURL)
             evidenceExportMessage = "Exported \(pack.itemCount) items to Desktop."
+            // Proposal 008 (REQ-020): Mark linked benchmark record as exported.
+            markBenchmarkRecordExported()
         } catch {
             evidenceExportMessage = "Export failed: \(error.localizedDescription)"
         }
+    }
+
+    /// Proposal 008 (REQ-020): Stamp the benchmark execution record with the export timestamp.
+    private func markBenchmarkRecordExported() {
+        guard let cohortID = run.experimentCohortID else { return }
+        let pairDescriptor = FetchDescriptor<BenchmarkPair>()
+        guard let allPairs = try? modelContext.fetch(pairDescriptor),
+              let pair = allPairs.first(where: {
+                  $0.appDrivenRecord?.linkedRunID == run.id && $0.cohort?.id == cohortID
+              }),
+              let appRecord = pair.appDrivenRecord else { return }
+        appRecord.evidencePackExportedAt = Date()
+        try? modelContext.save()
     }
 
     private var statusColor: Color {

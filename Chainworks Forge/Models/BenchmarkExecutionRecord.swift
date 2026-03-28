@@ -12,6 +12,7 @@ import SwiftData
     var timeToFinalReleaseDecisionSeconds: Double?
     var totalOrchestrationTimeSeconds: Double?
     var terminalOutcome: BenchmarkExecutionOutcome
+    var evidencePackExportedAt: Date?
 
     private(set) var artifactLinksJSON: Data
     var notesJSON: Data?

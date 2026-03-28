@@ -353,6 +353,7 @@ struct ProviderSettingsView: View {
     }
 
     private func saveDraft() {
+        draft.normalizeForSave()
         let provider = draft.makeProvider()
         providerSettingsStore.upsert(provider: provider)
         if draft.authMode != .none, !secret.isEmpty {
@@ -487,13 +488,20 @@ struct ProviderDraft {
             }
             return "\(family.displayName) \(transport.displayName)"
         }()
+        let normalizedDefaultModel: String? = {
+            guard !defaultModel.isEmpty else { return nil }
+            guard ProviderDefaults.model(defaultModel, isCompatibleWith: family) else {
+                return ProviderDefaults.defaultModel(for: family)
+            }
+            return defaultModel
+        }()
         return ConfiguredProvider(
             family: family,
             displayName: displayName.isEmpty ? fallbackName : displayName,
             transport: transport,
             endpoint: endpoint.isEmpty ? nil : endpoint,
             authMode: authMode,
-            defaultModel: defaultModel.isEmpty ? nil : defaultModel,
+            defaultModel: normalizedDefaultModel,
             capabilities: .default(for: family)
         )
     }
@@ -501,6 +509,7 @@ struct ProviderDraft {
     mutating func applyFamilyDefaults(_ family: ProviderFamily, configuration: AppConfiguration) {
         let previousFamily = self.family
         let previousGeneratedName = generatedDisplayName(for: previousFamily, transport: transport)
+        let previousDefaultModel = defaultModel
         let resolvedTransport: ProviderTransport
         switch family {
         case .codex, .claude:
@@ -517,13 +526,11 @@ struct ProviderDraft {
 
         transport = resolvedTransport
 
-        switch family {
-        case .codex:
-            if defaultModel.isEmpty { defaultModel = "gpt-5-codex" }
-        case .claude:
-            if defaultModel.isEmpty { defaultModel = "claude-sonnet-4" }
-        case .gemini:
-            if defaultModel.isEmpty { defaultModel = "gemini-2.5-pro" }
+        let previousFamilyDefault = ProviderDefaults.defaultModel(for: previousFamily)
+        if previousDefaultModel.isEmpty
+            || previousDefaultModel == previousFamilyDefault
+            || !ProviderDefaults.model(previousDefaultModel, isCompatibleWith: family) {
+            defaultModel = ProviderDefaults.defaultModel(for: family)
         }
 
         if transport == .gooseServer {
@@ -537,9 +544,12 @@ struct ProviderDraft {
     }
 
     private func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {
-        if family.gooseFirstPreferred && transport == .gooseServer {
-            return "\(family.displayName) Goose"
+        ProviderDefaults.generatedDisplayName(for: family, transport: transport)
+    }
+
+    mutating func normalizeForSave() {
+        if !defaultModel.isEmpty, !ProviderDefaults.model(defaultModel, isCompatibleWith: family) {
+            defaultModel = ProviderDefaults.defaultModel(for: family)
         }
-        return "\(family.displayName) \(transport.displayName)"
     }
 }

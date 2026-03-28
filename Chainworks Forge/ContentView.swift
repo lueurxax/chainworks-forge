@@ -1,6 +1,11 @@
 import SwiftUI
 import SwiftData
 
+extension Notification.Name {
+    static let chainworksSelectTab = Notification.Name("chainworks.selectTab")
+    static let chainworksOpenRunInRunsHome = Notification.Name("chainworks.openRunInRunsHome")
+}
+
 struct ContentView: View {
     @Environment(ExecutionService.self) private var executionService
     @State private var selectedTab: Tab = .ideas
@@ -43,13 +48,17 @@ struct ContentView: View {
             return bundled
         }
 
-        let candidates = [
+        var candidates = [
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(repoRelativePath),
-            URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Documents/Chainworks Forge")
                 .appendingPathComponent(repoRelativePath)
         ]
+        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Documents/Chainworks Forge")
+                    .appendingPathComponent(repoRelativePath)
+            )
+        }
 
         return candidates.first { FileManager.default.isReadableFile(atPath: $0.path) }
     }
@@ -125,6 +134,16 @@ struct ContentView: View {
             guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
             // UI tests need a deterministic landing tab even when macOS restores prior scene state.
             selectedTab = forcedInitialTab
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab)) { notification in
+            guard
+                let rawValue = notification.userInfo?["tab"] as? String,
+                let tab = Tab(rawValue: rawValue)
+            else { return }
+            selectedTab = tab
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in
+            selectedTab = .runsHome
         }
         // Approval badge on Ideas tab when approvals are pending
         .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)

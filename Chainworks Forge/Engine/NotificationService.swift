@@ -10,6 +10,7 @@ import AppKit
 @MainActor
 @Observable
 final class NotificationService {
+    private static let processEnvironment = ProcessInfo.processInfo.environment
 
     private(set) var pendingAttentionCount: Int = 0
     private(set) var isMenuBarEnabled: Bool = false
@@ -22,6 +23,7 @@ final class NotificationService {
     // MARK: - Setup
 
     func requestAuthorization() async {
+        guard !Self.notificationsSuppressedForCurrentProcess else { return }
         let center = UNUserNotificationCenter.current()
         do {
             let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
@@ -121,6 +123,7 @@ final class NotificationService {
     // MARK: - Helpers
 
     private func scheduleNotification(id: String, content: UNNotificationContent) {
+        guard !Self.notificationsSuppressedForCurrentProcess else { return }
         // Guard: skip scheduling in unit-test contexts where notification center may not be available
         guard NSApp != nil else { return }
         let request = UNNotificationRequest(
@@ -140,5 +143,10 @@ final class NotificationService {
         if let app = NSApp {
             app.dockTile.badgeLabel = "\(pendingAttentionCount)"
         }
+    }
+
+    private static var notificationsSuppressedForCurrentProcess: Bool {
+        processEnvironment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
+            || processEnvironment.keys.contains(where: { $0.hasPrefix("CHAINWORKS_UI_TEST") })
     }
 }

@@ -9,6 +9,10 @@ import Foundation
 /// - explicit target only
 /// - checksum recorded always
 struct ConnectPublishService: Sendable {
+    private enum DeliveryProofMode: String {
+        case happyPath = "happy_path"
+        case nonHappyPath = "non_happy_path"
+    }
 
     enum PublishError: Error, LocalizedError {
         case buildFailed(output: String)
@@ -71,6 +75,19 @@ struct ConnectPublishService: Sendable {
         releaseTargetID: String,
         releaseMode: ReleaseMode
     ) async throws -> (bundle: ReleaseBundleManifest, receipt: ConnectUploadReceipt) {
+        RuntimeDiagnostics.log("connectPublishService begin worktree=\(worktreeRoot.path) target=\(releaseTargetID) mode=\(releaseMode.rawValue)")
+        if let proofMode = ProcessInfo.processInfo.environment["CHAINWORKS_DELIVERY_PROOF_MODE"]
+            .flatMap(DeliveryProofMode.init(rawValue:)) {
+            return try await buildArchiveAndUploadForDeliveryProof(
+                worktreeRoot: worktreeRoot,
+                gitPushReceipt: gitPushReceipt,
+                releaseManifest: releaseManifest,
+                releaseTargetID: releaseTargetID,
+                releaseMode: releaseMode,
+                proofMode: proofMode
+            )
+        }
+
         guard gitPushReceipt.status == "success" else {
             throw PublishError.missingGitPushReceipt
         }
@@ -132,6 +149,48 @@ struct ConnectPublishService: Sendable {
         )
 
         return (bundle: bundleManifest, receipt: uploadReceipt)
+    }
+
+    private func buildArchiveAndUploadForDeliveryProof(
+        worktreeRoot: URL,
+        gitPushReceipt: GitReleaseService.GitPushReceipt,
+        releaseManifest: GitReleaseService.ReleaseManifest,
+        releaseTargetID: String,
+        releaseMode: ReleaseMode,
+        proofMode: DeliveryProofMode
+    ) async throws -> (bundle: ReleaseBundleManifest, receipt: ConnectUploadReceipt) {
+        RuntimeDiagnostics.log("connectPublishService proof begin worktree=\(worktreeRoot.path) target=\(releaseTargetID) mode=\(releaseMode.rawValue) proof=\(proofMode.rawValue)")
+        guard gitPushReceipt.status == "success" else {
+            throw PublishError.missingGitPushReceipt
+        }
+
+        if proofMode == .nonHappyPath {
+            throw PublishError.uploadFailed(output: "Forced dogfood proof failure during publish stage")
+        }
+
+        let checksumInput = "\(releaseManifest.commitSHA):\(releaseManifest.filesChanged):\(releaseManifest.insertions):\(releaseManifest.deletions)"
+        let checksum = computeSHA256(checksumInput)
+        let worktreeSize = directorySize(at: worktreeRoot)
+
+        let bundleManifest = ReleaseBundleManifest(
+            bundleIdentifier: "com.chainworks.forge.\(releaseMode.rawValue)",
+            bundleVersion: "1.0.0",
+            buildNumber: String(releaseManifest.commitSHA.prefix(8)),
+            archivePath: nil,
+            checksumSHA256: checksum,
+            sizeBytes: worktreeSize,
+            timestamp: Date()
+        )
+        let uploadReceipt = ConnectUploadReceipt(
+            artifactID: UUID().uuidString,
+            destination: "\(releaseMode.rawValue)://\(releaseTargetID)",
+            releaseTargetID: releaseTargetID,
+            releaseMode: releaseMode.rawValue,
+            status: "success",
+            failureReason: nil,
+            timestamp: Date()
+        )
+        return (bundleManifest, uploadReceipt)
     }
 
     // MARK: - Private Helpers

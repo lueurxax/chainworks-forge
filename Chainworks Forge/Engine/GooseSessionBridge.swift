@@ -46,11 +46,14 @@ final class GooseSessionBridge: Sendable {
         }
 
         // Step 3: Create isolated session
-        // REQ-005: Use worktree as working directory with write access for write-enabled agents
+        // REQ-005: Use worktree as working directory with write access for write-enabled agents.
+        // For read-only repo-backed stages, prefer the frozen project root over the ephemeral
+        // run workspace so proposal/review agents inspect the actual target repository.
         let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
+        let readOnlyRoot = context.projectRoot?.path ?? context.workspace.workspaceRoot.path
         let workingDirectory = useWorktree
             ? context.workspace.worktreeRoot!.path
-            : context.workspace.workspaceRoot.path
+            : readOnlyRoot
 
         let sessionRequest = GooseSessionRequest(
             systemPrompt: packet.systemPrompt,
@@ -122,11 +125,14 @@ final class GooseSessionBridge: Sendable {
         var attachments: [GooseContextAttachment] = []
 
         // Workspace context attachment
+        let projectRootDescription = context.projectRoot?.path ?? "not provided"
         let worktreeRootDescription = context.workspace.worktreeRoot?.path ?? "not provisioned"
         let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
         let boundaryNote = useWorktree
             ? "IMPORTANT: This agent has write access to the worktree root. All file operations must use explicit absolute paths within the worktree root."
-            : "IMPORTANT: No implicit working directory is allowed. All file operations must use explicit absolute paths within the workspace root."
+            : context.projectRoot != nil
+                ? "IMPORTANT: Treat the project root as the only source tree. Ignore any unexpected server cwd drift and use explicit absolute paths within the project root for reads, while writing outputs only into the artifact root."
+                : "IMPORTANT: No implicit working directory is allowed. All file operations must use explicit absolute paths within the workspace root."
         attachments.append(GooseContextAttachment(
             type: "text",
             name: "workspace_context",
@@ -136,6 +142,7 @@ final class GooseSessionBridge: Sendable {
             Iteration: \(context.iteration)
             Attempt: \(context.attemptNumber)
             Workspace Root: \(context.workspace.workspaceRoot.path)
+            Project Root: \(projectRootDescription)
             Artifact Root: \(context.workspace.artifactRoot.path)
             Worktree Root: \(worktreeRootDescription)
             \(boundaryNote)
@@ -205,8 +212,10 @@ final class GooseSessionBridge: Sendable {
         parts.append("## Boundaries")
         parts.append("- You must write output files to the artifact output directory provided.")
         parts.append("- Do not perform any git operations.")
-        parts.append("- Do not modify files outside the workspace root.")
-        parts.append("- Do not rely on implicit working directory — use explicit paths.")
+        parts.append("- Do not rely on implicit working directory — use explicit absolute paths from the workspace context.")
+        parts.append("- For read-only repo-backed stages, read source only from the Project Root provided in workspace_context.")
+        parts.append("- If a writable worktree is provided, do not modify files outside that worktree root.")
+        parts.append("- If the server cwd appears inconsistent with workspace_context, trust workspace_context and continue with explicit paths only.")
         if ProcessInfo.processInfo.environment["CHAINWORKS_DISABLE_XCODE_MCP"] == "1" {
             parts.append("- Do not call xcode_mcp or any IDE/editor MCP tools.")
             parts.append("- In tests, respond directly and complete the task without MCP tool discovery.")

@@ -5,16 +5,16 @@
 | Date | 2026-03-26 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [007-full-mvp-delivery-slice](007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md), [008-mvp-hardening-and-sign-off](008-mvp-hardening-and-sign-off.md) |
-| Scope | UI/UX visual quality, consistency, and polish across all 30 SwiftUI view files |
-| Goal | Elevate the Chainworks Forge UI from functional prototype to production-quality macOS citizen by fixing truncation, information density, visual consistency, and establishing a lightweight design system. |
+| Depends on | [007-full-mvp-delivery-slice](007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md), [008-mvp-hardening-and-sign-off](008-mvp-hardening-and-sign-off.md), [idea-lifecycle](../reference/idea-lifecycle.md), [live-workflow-map](../reference/live-workflow-map.md) |
+| Scope | UI/UX visual quality, consistency, and polish across the current operator-facing macOS surfaces listed in Appendix A |
+| Goal | Elevate the Chainworks Forge UI from functional prototype to production-quality macOS citizen by fixing truncation, information density, visual consistency, and trust-bearing non-happy-path feedback while introducing a bounded lightweight design-system slice. |
 
 ---
 
 ## 1. Context
 
-The current UI was built incrementally across Proposals 002 through 011.
-Each proposal correctly prioritised runtime behaviour and correctness over visual polish.
+The current UI was built incrementally across the MVP delivery and hardening slices.
+Runtime behaviour and correctness were correctly prioritised ahead of visual polish, while some UI baseline truth has since moved into stable reference documents such as `idea-lifecycle.md` and `live-workflow-map.md`.
 The result is a **functionally complete but visually inconsistent** interface that has accumulated multiple categories of UI debt:
 
 - Severe text truncation in sidebars making content unreadable.
@@ -23,15 +23,39 @@ The result is a **functionally complete but visually inconsistent** interface th
 - No formal design system — colors, fonts, spacing are all ad-hoc.
 - Missing empty-state experiences and visual feedback cues.
 
-This proposal catalogues every issue found during a systematic Xcode Preview audit of all 12 previewable surfaces and code review of all 30 view files, then prescribes a structured remediation plan.
+This revision is intentionally rebaselined against current `HEAD`.
+It no longer treats stale repo-wide counts as the source of truth.
+Instead, Appendix A defines the audited operator surfaces that drive this proposal, and the open backlog below excludes items already addressed since the earlier audit snapshot.
 
 ### 1.1 Audit Methodology
 
 All issues were identified via:
 
-1. **Xcode Preview rendering** of all 12 `#Preview` definitions at their declared frame sizes.
-2. **Code review** of all 30 SwiftUI view files in `Views/`, plus `ContentView.swift` and `Chainworks_ForgeApp.swift`.
-3. **Cross-view consistency analysis** comparing badge styles, color usage, font scales, and layout patterns.
+1. **Xcode Preview rendering** of the current preview-backed operator surfaces listed in Appendix A.
+2. **Code review** of the current operator-facing SwiftUI view files in `Views/`, plus `ContentView.swift` and `Chainworks_ForgeApp.swift`, without treating a raw file count as the source of truth.
+3. **Cross-view consistency analysis** comparing badge styles, color usage, font scales, layout patterns, and async feedback treatment.
+4. **Reference-baseline cross-check** against current stable docs where surface behaviour is already codified outside proposal-number lineage.
+
+### 1.2 Baseline Authorities
+
+This proposal depends on four baseline authorities:
+
+1. `007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md` for the delivered MVP operator shell and delivery workflow foundations.
+2. `008-mvp-hardening-and-sign-off.md` for MVP hardening expectations and sign-off posture.
+3. `docs/reference/idea-lifecycle.md` for current idea/archive lifecycle truth used by `IdeaListView` and related archive surfaces.
+4. `docs/reference/live-workflow-map.md` for current workflow-map topology and agent-state presentation truth.
+
+Where older proposal snapshots and current stable references diverge, **current `HEAD` plus the stable reference docs win**.
+
+### 1.3 Rebaseline Outcomes
+
+The earlier audit snapshot contained items that are no longer safe to carry as open work:
+
+- The earlier `30 view files / 12 previews` inventory claim is retired; Appendix A is now the audited-surface source of truth for this proposal revision.
+- `C-02` is removed from the active backlog because `IdeaListView` already uses the wider sidebar width at current `HEAD`.
+- `L-02` is removed from the active backlog because the idea detail empty state already uses `ContentUnavailableView`.
+- `L-11` is reclassified as a preview ergonomics note, not a production defect in `DeliveryPreflightReportView`.
+- `L-09` is narrowed from "no keyboard shortcuts exist" to "coverage is incomplete on key operator flows."
 
 ---
 
@@ -51,16 +75,6 @@ All issues were identified via:
 3. Use `.lineLimit(1)` with `.truncationMode(.tail)` on the title and show full title in the detail panel.
 
 **Affected file:** `Views/RunsHomeView.swift` (lines 23–121, 261–329)
-
----
-
-#### C-02: IdeaListView sidebar — narrow column truncates titles
-
-**Observed:** IdeaListView explicitly sets `.navigationSplitViewColumnWidth(min: 200, ideal: 250)` which is too narrow for idea titles + lifecycle badges + attachment/run indicators.
-
-**Fix:** Increase to `min: 260, ideal: 320`. Match the pattern used by `ArchivedIdeasView` (which correctly uses `min: 260, ideal: 320`).
-
-**Affected file:** `Views/IdeaListView.swift` (line 80)
 
 ---
 
@@ -145,12 +159,12 @@ struct StatusCapsule: View {
 
     enum Size {
         case small   // caption2, px:6/py:2
-        case regular // caption, px:8/py:3
+        case regular // caption2, px:8/py:3
     }
 
     var body: some View {
         Text(text)
-            .font(size == .small ? .caption2.bold() : .caption.bold())
+            .font(.caption2.bold())
             .padding(.horizontal, size == .small ? 6 : 8)
             .padding(.vertical, size == .small ? 2 : 3)
             .background(color.opacity(0.15), in: Capsule())
@@ -158,6 +172,9 @@ struct StatusCapsule: View {
     }
 }
 ```
+
+Shared status affordances must not rely on color alone.
+Badges, chips, and status cards must preserve a textual/icon cue and remain legible under Differentiate Without Color Alone, Increase Contrast, and Reduce Transparency.
 
 **Affected files:** `RunsHomeView.swift`, `ReleaseGateView.swift`, `WorkflowMapView.swift`, `DeliveryPreflightReportView.swift`, `IdeaListView.swift`
 
@@ -194,7 +211,7 @@ enum DesignTokens {
 }
 ```
 
-**Affected files:** All 30 view files.
+**Affected files:** Phase 3 first adopters only in the initial pass: `RunsHomeView.swift`, `WorkflowMapView.swift`, `ReleaseGateView.swift`, `DeliveryPreflightReportView.swift`, and `IdeaListView.swift`. Expansion to the rest of the app is deferred until the adopter slice passes verification.
 
 ---
 
@@ -216,6 +233,9 @@ enum DesignTokens {
 | Supporting | `.caption` | Secondary/descriptive text |
 | Micro | `.caption2` | Timestamps, metadata, badge text |
 
+Apply the scale first to the Phase 3 adopter slice and to any surface touched in Phases 1-2.
+Repo-wide migration is explicitly deferred until the adopter slice is stable.
+
 ---
 
 #### M-04: Foreground banner animation direction mismatch
@@ -235,7 +255,7 @@ enum DesignTokens {
 **Observed:** All `ContentUnavailableView` instances use system SF Symbols:
 - "Select a Run" → `sidebar.left`
 - "No Runs" → `tray`
-- "Select an idea" → plain text without icon
+- "Select an idea" → `lightbulb`
 - "Select an archived idea" → `archivebox`
 - "No Pending Approvals" → `checkmark.seal`
 
@@ -247,23 +267,6 @@ These are generic and create a flat, utilitarian feel.
 3. Consider adding subtle hint text with specific call-to-action: "Create your first run" with a button vs. just "No Runs".
 
 **Affected files:** `RunsHomeView.swift`, `IdeaListView.swift`, `ArchivedIdeasView.swift`, `ApprovalGateView.swift`
-
----
-
-#### L-02: Ideas detail pane shows plain text "Select an idea"
-
-**Observed:** When no idea is selected, the detail pane shows `Text("Select an idea").foregroundStyle(.secondary)` (IdeaListView line 103–104). This is not a `ContentUnavailableView` like other screens, creating inconsistency.
-
-**Fix:** Replace with:
-```swift
-ContentUnavailableView(
-    "Select an idea",
-    systemImage: "lightbulb",
-    description: Text("Choose an idea from the sidebar to view details and launch runs.")
-)
-```
-
-**Affected file:** `Views/IdeaListView.swift` (lines 102–105)
 
 ---
 
@@ -348,11 +351,15 @@ Form {
 
 ---
 
-#### L-09: No keyboard shortcuts for primary actions
+#### L-09: Keyboard shortcut coverage is incomplete on key operator flows
 
-**Observed:** No views declare `.keyboardShortcut()` on primary action buttons. The approval buttons, recovery actions, and run start actions could benefit from keyboard shortcuts for power users.
+**Observed:** Current code already includes keyboard shortcuts such as new-idea creation and standard cancel actions, so the issue is no longer "none exist." The remaining gap is inconsistent coverage on high-value approval, release, recovery, and first-run confirmation flows.
 
-**Fix:** Add `.keyboardShortcut(.return, modifiers: .command)` to primary confirmation buttons and `.keyboardShortcut(.escape)` to cancel/dismiss buttons.
+**Fix:**
+1. Preserve existing shortcuts and do not conflict with system-defined macOS shortcuts.
+2. Add shortcuts only to the highest-value confirmation and dismissal flows.
+3. Modal confirm/dismiss surfaces must remain fully operable for keyboard-only users, including `Escape` for dismissal where appropriate.
+4. Document ownership per surface so approval, release, recovery, and wizard flows converge on one convention set.
 
 **Affected files:** `ApprovalGateView.swift`, `ReleaseGateView.swift`, `FirstRunSetupWizard.swift`, `RecoverySheet.swift`
 
@@ -362,19 +369,9 @@ Form {
 
 **Observed:** In `RunDetailPanel`, the contextual action buttons (Recover, Compare, View Report, Export Evidence Pack) appear at the very bottom of a `ScrollView`. When the stage list is long, these actions are below the fold.
 
-**Fix:** Move action buttons into the toolbar or a floating footer outside the ScrollView, ensuring they're always visible.
+**Fix:** Move important action buttons into the toolbar or a sticky footer outside the `ScrollView`, ensuring they stay above the fold while rare or advanced controls remain in disclosure or secondary destinations.
 
 **Affected file:** `Views/RunsHomeView.swift` (lines 536–570)
-
----
-
-#### L-11: DeliveryPreflightReportView rendered at minimum size
-
-**Observed:** The Delivery Preflight Report preview renders at only 520px wide with no explicit height. The view itself is compact and well-designed, but when used as a sheet or inline panel, it should have a minimum frame for comfortable reading.
-
-**Fix:** Add `.frame(minWidth: 480, minHeight: 300)` when presented in sheets.
-
-**Affected file:** `Views/DeliveryPreflightReportView.swift`
 
 ---
 
@@ -382,21 +379,56 @@ Form {
 
 **Observed:** Multiple views trigger async operations (provider diagnostics refresh, preflight checks, sample run launch, Goose verification) but show no visual loading indicator during the operation. The `isProbing` state in GooseAssistant disables buttons but shows no spinner.
 
-**Fix:** Add `ProgressView()` inline or as an overlay during async operations:
-```swift
-if isProbing {
-    ProgressView("Verifying Goose connection...")
-        .padding()
-}
-```
+**Fix:**
+1. `ProviderSettingsView`: inline progress row inside the affected provider card, disabled action copy, and an inline retry affordance on failure.
+2. `PilotReadinessView`: section-local progress plus a top summary banner that distinguishes loading, degraded, and failed readiness checks.
+3. `GooseProviderConnectionAssistantView`: step-local spinner and status copy inside the Journey section, not only disabled buttons.
+4. `FirstRunSetupWizard`: blocking footer progress for "Save and Launch Sample Run" with explicit success/failure copy and preserved form state on failure.
+5. Recoverable loading and error states stay inline/local to the initiating surface; alerts are reserved for destructive, irreversible, or explicit acknowledgement flows.
 
 **Affected files:** `PilotReadinessView.swift`, `ProviderSettingsView.swift`, `GooseProviderConnectionAssistantView.swift`, `FirstRunSetupWizard.swift`
 
 ---
 
-## 3. Design System Foundation
+## 3. State and Feedback Contract
 
-### 3.1 Proposed File Structure
+Proposal 012 is not only a happy-path readability pass.
+For every touched operator surface, the implementation must either define the non-happy-path treatment below or explicitly defer it.
+
+### 3.1 Surface State Matrix
+
+| Surface | Validation | Backend / Offline / Auth | Retry / Recovery | Cancellation / Rollback |
+|---|---|---|---|---|
+| `IdeaListView` / `NewIdeaSheetView` | Invalid title or attachment input must show inline field messaging and block save until valid. | Create/archive failures use inline banner copy; auth-expiry handling stays owned by the provider platform and is only surfaced here if already raised upstream. | Failed create/archive actions keep local draft state and offer retry without data loss. | Cancel closes the sheet without partial persistence; archive/restore remains reversible through the existing archive flow. |
+| `ProviderSettingsView` | Invalid provider settings must be called out inline in the affected form section. | Distinguish misconfiguration, backend failure, offline/degraded transport, and auth-expiry/reconnect-required states instead of collapsing them into generic warnings. | Every diagnostics/probe action needs a local retry or refresh action on the same card. | Cancelling a refresh/probe must leave existing saved configuration intact. |
+| `PilotReadinessView` | Validation failures from required configuration must appear in the summary banner and the owning section. | Readiness must differentiate blocking backend failure, degraded/offline checks, and auth-required reconnect states. | Failed checks must expose rerun/retry affordances without forcing navigation away from the surface. | Dismissing readiness UI never rolls back configuration; it only ends the current review pass. |
+| `FirstRunSetupWizard` | Section-level validation summary plus inline field errors; launch stays disabled while invalid. | Save/launch failures must differentiate local validation, backend/probe failure, offline transport, and auth-expiry during provider verification. | Operators can rerun verification and relaunch without re-entering already valid sections. | Cancelling the wizard exits without creating a run; rollback of partially persisted settings is out of scope and must not be implied. |
+| `GooseProviderConnectionAssistantView` | Invalid/manual inputs must show local guidance before probing starts. | Probe results must distinguish unreachable server, degraded transport, auth/reconnect, and unexpected backend errors. | Journey states need explicit retry/reprobe affordances with preserved context. | Cancelling or dismissing the assistant must not mutate provider state. |
+| `WorkflowMapView` / `ReleaseGateView` / `DeliveryPreflightReportView` | Not form-driven; validation rules are represented as artifact availability and check-result semantics. | Distinguish "not yet produced", "fetch failed", "backend unavailable", and "requires re-auth" where artifacts depend on remote data. | Allow reload/recheck from the same surface where data is fetched. | Release cancellation/rollback remains a workflow concern outside this proposal; this proposal owns only the display semantics and dismissal behaviour. |
+| `RunsHomeView` / `RunDetailPanel` | Not form-driven. | Stale or failed refresh states must not look identical to a legitimate empty list. | Refresh/recover actions must remain visible even when long detail content pushes the fold. | Destructive recovery actions keep their existing explicit confirmation boundaries. |
+
+### 3.2 Async Feedback by Surface
+
+| Surface | Loading Treatment | Success Feedback | Failure Feedback |
+|---|---|---|---|
+| `ProviderSettingsView` | Inline spinner inside the affected provider card; disable only the relevant actions. | Short health/status refresh copy in the same card. | Inline error block with retry action and preserved diagnostics context. |
+| `PilotReadinessView` | Section-local progress plus top summary banner. | Updated readiness verdict and refreshed completion count. | Banner-level failure/degraded summary plus section-local explanation. |
+| `GooseProviderConnectionAssistantView` | Journey-local spinner and in-progress copy on the verification step. | Advance the journey state with explicit connected/verified language. | Retryable guidance card that preserves the previous probe context. |
+| `FirstRunSetupWizard` | Footer-level blocking progress during save/launch; section content remains readable. | Clear launch confirmation and next-step guidance. | Non-destructive error summary plus section-local indicators for what must be fixed or retried. |
+
+### 3.3 Deferred State Ownership
+
+The following remain outside Proposal 012 and must not be invented locally:
+
+- Global account/session recovery flows beyond the surface-level presentation of an upstream auth-expiry state.
+- Engine-level rollback semantics for release or run-control operations.
+- New persistence, caching, or transport contracts.
+
+---
+
+## 4. Design System Foundation
+
+### 4.1 Proposed File Structure
 
 ```
 Support/
@@ -406,7 +438,7 @@ Support/
 └── PreviewSupport.swift      // (existing)
 ```
 
-### 3.2 Spacing Tokens
+### 4.2 Spacing Tokens
 
 | Token | Value | Usage |
 |---|---|---|
@@ -416,7 +448,7 @@ Support/
 | `large` | 16pt | Between GroupBoxes/sections |
 | `section` | 20pt | Between major content blocks |
 
-### 3.3 Corner Radius Tokens
+### 4.3 Corner Radius Tokens
 
 | Token | Value | Usage |
 |---|---|---|
@@ -427,51 +459,80 @@ Support/
 
 ---
 
-## 4. Implementation Plan
+### 4.4 First-Adopter Slice and Migration Guardrails
 
-### Phase 1: Critical Fixes (estimated: 1 day)
-- [ ] C-01: Fix RunsHomeView sidebar width and row density
-- [ ] C-02: Fix IdeaListView sidebar width
-- [ ] M-04: Fix banner animation direction
-- [ ] L-02: Fix Ideas detail pane empty state
+The initial design-system rollout is intentionally bounded.
+Phase 3 is limited to the surfaces already carrying live visual inconsistency risk:
 
-### Phase 2: Design System Extraction (estimated: 1 day)
-- [ ] M-01: Extract `StatusCapsule` component
-- [ ] M-02: Create `DesignTokens` with semantic colors
-- [ ] M-03: Apply consistent typography scale
-- [ ] Migrate all views to use shared components
+- `RunsHomeView` status, provenance, and archive badges
+- `WorkflowMapView` status badges
+- `ReleaseGateView` status and artifact-semantics badges
+- `DeliveryPreflightReportView` status badges
+- `IdeaListView` summary-strip chips if they are touched by the readability pass
 
-### Phase 3: Visual Hierarchy Improvements (estimated: 2 days)
-- [ ] H-01: Restructure ProviderSettingsView
-- [ ] H-02: Add hero status to PilotReadinessView
-- [ ] H-03: Add step progression to FirstRunSetupWizard
-- [ ] H-04: Simplify RunsHomeRow for sidebar density
+Guardrails for the first pass:
 
-### Phase 4: Polish and Experience (estimated: 1–2 days)
-- [ ] L-01: Enhance empty states
-- [ ] L-03: Redesign IdeaListView summary strip
-- [ ] L-04: Add journey visualization to GooseAssistant
-- [ ] L-05: Make WorkflowMap topology cards interactive
-- [ ] L-06: Fix ReleaseGate review status semantics
-- [ ] L-07: Convert New Idea sheet to Form
-- [ ] L-09: Add keyboard shortcuts
-- [ ] L-10: Float RunDetailPanel actions
-- [ ] L-12: Add loading states for async operations
+1. No business-logic changes and no navigation changes are allowed inside the shared primitive extraction.
+2. Existing `accessibilityIdentifier` values and keyboard behaviors must remain stable.
+3. New shared primitives (`StatusCapsule`, `DesignTokens`, typography helpers) may be adopted only on the surfaces above in the first pass.
+4. Badges, chips, and status cards in the adopter slice must continue to differentiate state without color alone and preserve non-text contrast under Increase Contrast and Reduce Transparency.
+5. Expansion to the rest of the app is allowed only after the adopter slice passes previews, min-window checks, VoiceOver labels/traits, focus order, and non-text contrast verification without regressions.
+
+macOS command-placement rule for all phases:
+
+- Keep high-value commands above the fold or in a toolbar/sticky footer.
+- Move rare advanced controls into `DisclosureGroup` sections or secondary destinations instead of leaving them in the primary reading path.
 
 ---
 
-## 5. Verification Criteria
+## 5. Implementation Plan
+
+### Phase 1: Current-HEAD Readability Fixes (estimated: 1 day)
+- [ ] C-01: Fix RunsHomeView sidebar width and row density
+- [ ] M-04: Fix banner animation direction
+- [ ] L-03: Redesign IdeaListView summary strip
+- [ ] L-06: Fix ReleaseGate review status semantics
+- [ ] L-10: Move RunDetailPanel actions out of the fold
+
+### Phase 2: Operator State and Feedback Contracts (estimated: 1–2 days)
+- [ ] H-01: Restructure ProviderSettingsView and define per-state hierarchy
+- [ ] H-02: Add hero status to PilotReadinessView with degraded/error semantics
+- [ ] H-03: Add step progression and validation summary to FirstRunSetupWizard
+- [ ] L-04: Add journey visualization and probing feedback to GooseAssistant
+- [ ] L-09: Complete keyboard shortcut coverage on primary operator flows
+- [ ] L-12: Implement the per-surface loading, success, and failure treatments defined in Section 3
+
+### Phase 3: First-Adopter Shared Primitives (estimated: 1 day)
+- [ ] M-01: Extract `StatusCapsule` for the bounded adopter slice
+- [ ] M-02: Create `DesignTokens` with semantic colors and spacing for the bounded adopter slice
+- [ ] M-03: Apply the agreed typography scale to the bounded adopter slice
+- [ ] Expand beyond the adopter slice only if Phase 3 guardrails pass unchanged-behaviour checks
+
+### Phase 4: Secondary Polish (estimated: 1 day)
+- [ ] L-01: Enhance empty states
+- [ ] L-05: Make WorkflowMap topology cards interactive
+- [ ] L-07: Convert New Idea sheet to Form
+- [ ] H-04: Simplify RunsHomeRow for long-term sidebar density cleanup
+- [ ] L-08: Reassess tab grouping only after the higher-priority operator flows are stable
+
+---
+
+## 6. Verification Criteria
 
 Each fix must be verified via:
 
-1. **Xcode Preview rendering** at the declared preview frame size — no truncation, no overflow.
-2. **Minimum window size test** — resize to 1024×768 and verify all content remains usable.
-3. **Cross-view consistency** — badges, colors, and fonts must match the design tokens after migration.
-4. **Accessibility audit** — VoiceOver must read status information, not just visual cues.
+1. **Xcode Preview rendering** for every preview-backed surface named in Appendix A at the declared preview frame size — no truncation, no overflow.
+2. **Minimum window size test** — resize to 1024×768 and verify all surfaces in Appendix A that declare `Min-window` proof ownership remain usable.
+3. **State contract verification** — validation, backend failure, offline/degraded, auth-required, retry, and cancellation semantics must either match Section 3 or be explicitly deferred.
+4. **Cross-view consistency** — badges, colors, and fonts must match the bounded design tokens after migration.
+5. **Keyboard and interaction verification** — `ApprovalGateView`, `ReleaseGateView`, `FirstRunSetupWizard`, and `RecoverySheet` must expose the intended primary confirm/dismiss bindings without colliding with system-defined shortcuts, modal dismiss flows must work keyboard-only including `Escape` where appropriate, and `RunDetailPanel` high-value actions must remain discoverable without scrolling the full detail body.
+6. **Accessibility settings audit** — on the bounded adopter slice, verify Differentiate Without Color Alone, Increase Contrast, and Reduce Transparency behavior for badges, chips, and status cards, including non-text contrast and focus visibility.
+7. **Accessibility audit** — VoiceOver must read status information, labels, and traits correctly rather than relying only on visual cues.
+8. **Implementation evidence handoff** — after code lands, runtime screenshots and live interaction proof move to the follow-up implementation evidence review rather than staying implicit here.
 
 ---
 
-## 6. Out of Scope
+## 7. Out of Scope
 
 - Custom illustrations or branded iconography (post-MVP).
 - Light mode support (needs separate design pass).
@@ -481,33 +542,43 @@ Each fix must be verified via:
 
 ---
 
-## 7. Risk Assessment
+## 8. Risk Assessment
 
 | Risk | Mitigation |
 |---|---|
-| Design system extraction causes regression | Phase 2 changes are purely visual — no business logic changes. Each file migrated independently. |
+| Design system extraction causes regression | Shared primitives are limited to the Phase 3 adopter slice first; no repo-wide migration occurs until the adopter slice passes unchanged-behaviour verification. |
 | Sidebar width changes break existing layouts | Test with preview seeds at min/ideal/max widths. |
 | Wizard step progression changes break UI tests | Maintain existing `accessibilityIdentifier` values on all elements. |
-| Time overrun on polish items | Phase 4 items are independently shippable; any subset improves quality. |
+| Time overrun on polish items | Phase 1 and 2 target live operator-facing issues first; Phase 4 remains independently shippable follow-on polish. |
+| Non-happy-path states drift between surfaces | Section 3 defines per-surface state ownership and must be treated as an implementation gate, not a suggestion. |
 
 ---
 
-## Appendix A: Full Screenshot Audit Reference
+## Appendix A: Current Audited Surface Reference
 
-| Screen | Preview Name | Key Issues |
-|---|---|---|
-| ContentView (tab shell) | `Content Shell — Seeded` | 7 tabs, banner overlap |
-| RunsHomeView | `Runs Home — Mixed States` | C-01, H-04 (truncation, row density) |
-| IdeaListView | `Ideas — Operator List` | C-02, L-02, L-03 (narrow sidebar, plain empty state, dense strip) |
-| ProviderSettingsView | `Provider Settings — Configured` | H-01 (information overload) |
-| PilotReadinessView | `Pilot Readiness — Seeded` | H-02 (wall of text) |
-| FirstRunSetupWizard | `First Run Setup — Seeded` | H-03 (no step progression) |
-| ArchivedIdeasView | `Archived Ideas — Seeded` | L-01 (generic empty state) |
-| DeliveryPreflightReportView | `Delivery Preflight — All Passing` | L-11 (minimum frame) |
-| GooseProviderConnectionAssistantView | `Goose Assistant` | L-04 (no journey visualization) |
-| ReleaseGateView | `Release Gate — Sandbox` | L-06 (Missing vs Not Yet Produced) |
-| RunStartOverridesView | `Override List — 8 agents` | Adequate — no critical issues |
-| WorkflowMapView | `Workflow Map — Proposal Loop` | L-05 (static topology cards) |
+Appendix A is the authoritative audited-surface list for this proposal revision.
+It replaces the earlier stale repo-wide count claim.
+Subordinate sheets and panels are listed separately whenever they carry their own proof obligation.
+
+| Surface | Proof Owner | Proof Asset / Check | Key Open Issues |
+|---|---|---|---|
+| `ContentView` tab shell | Preview | `Content Shell — Seeded` | L-08 shell grouping discussion, M-04 banner ownership |
+| `RunsHomeView` sidebar/list | Preview + Min-window | `Runs Home — Mixed States`; 1024×768 resize | C-01, H-04 (truncation, row density) |
+| `RunDetailPanel` | Interaction checklist + Min-window | 1024×768 resize plus detail-action visibility check in the parent runs surface | L-10 action discoverability below the fold |
+| `IdeaListView` | Preview + Min-window | `Ideas — Operator List` | L-03 dense summary strip; top-level idea flow remains in scope |
+| `NewIdeaSheetView` | Preview | `New Idea Sheet — Empty`, `New Idea Sheet — Ready` | L-07 raw `VStack` form treatment |
+| `ProviderSettingsView` | Preview | `Provider Settings — Configured` | H-01 information overload, L-12 inline async feedback |
+| `PilotReadinessView` | Preview | `Pilot Readiness — Seeded` | H-02 wall of text, L-12 summary/loading semantics |
+| `FirstRunSetupWizard` | Preview + Interaction checklist | `First Run Setup — Seeded` plus keyboard binding check | H-03 step progression, L-09 shortcut ownership, L-12 launch feedback |
+| `ArchivedIdeasView` | Preview | `Archived Ideas — Seeded` | L-01 generic empty-state treatment |
+| `DeliveryPreflightReportView` positive state | Preview | `Delivery Preflight — All Passing` | Shared badge/token alignment on happy-path report rendering |
+| `DeliveryPreflightReportView` negative state | Preview | `Delivery Preflight — Issues Found` | Negative-state readability and status semantics |
+| `GooseProviderConnectionAssistantView` | Preview | `Goose Assistant` | L-04 journey visualization, L-12 probing feedback |
+| `ApprovalGateView` | Interaction checklist | Confirm/dismiss binding check plus approval action discoverability | L-09 shortcut ownership for approval decisions |
+| `ReleaseGateView` | Preview + Interaction checklist | `Release Gate — Sandbox` plus keyboard binding check | L-06 missing-vs-not-yet-produced semantics, L-09 shortcut ownership |
+| `RecoverySheet` | Interaction checklist | Confirm/dismiss binding check plus recovery-action discoverability | L-09 shortcut ownership for recovery flows |
+| `RunStartOverridesView` | Preview | `Override List — 8 agents` | Adequate — no critical issues |
+| `WorkflowMapView` | Preview | `Workflow Map — Proposal Loop` | L-05 static topology cards |
 
 ---
 

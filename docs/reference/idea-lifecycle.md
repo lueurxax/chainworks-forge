@@ -20,7 +20,7 @@ This reference covers:
 - operator entry points in the `Ideas` flow.
 
 It does not define stopping active work before archive.
-That boundary belongs to [../proposals/011-run-control-working-directory-and-provider-binding-truth.md](../proposals/011-run-control-working-directory-and-provider-binding-truth.md).
+That boundary belongs to [run-control.md](run-control.md).
 
 ## Core rule
 

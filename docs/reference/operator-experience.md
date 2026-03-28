@@ -17,6 +17,8 @@ Related stable docs:
 
 - [idea-lifecycle.md](idea-lifecycle.md)
 - [live-workflow-map.md](live-workflow-map.md)
+- [run-control.md](run-control.md)
+- [provider-binding-truth.md](provider-binding-truth.md)
 
 ## Scope
 

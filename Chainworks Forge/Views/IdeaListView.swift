@@ -1,15 +1,15 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 struct IdeaListView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
     @Query(sort: \Idea.createdAt, order: .reverse) private var ideas: [Idea]
-    @State private var newTitle = ""
-    @State private var newBody = ""
-    @State private var newAttachmentPath = ""
+    @State private var newIdeaDraft = NewIdeaDraft()
     @State private var showNewIdeaSheet = false
     @State private var showArchivedIdeas = false
+    @State private var selectedIdeaID: UUID?
 
     private var activeIdeas: [Idea] {
         ideas.filter { !$0.isArchived }
@@ -19,11 +19,34 @@ struct IdeaListView: View {
         ideas.filter(\.isArchived)
     }
 
+    private var selectedIdea: Idea? {
+        guard let selectedIdeaID else { return nil }
+        return ideas.first(where: { $0.id == selectedIdeaID })
+    }
+
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
                 // Summary strip (UI-001)
                 summaryStrip
+
+                HStack(spacing: 12) {
+                    Button(action: presentNewIdeaSheet) {
+                        Label("New Idea", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("ideas-new-idea-inline")
+
+                    Button(action: { showArchivedIdeas = true }) {
+                        Label("Archive", systemImage: "archivebox")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("ideas-open-archive-inline")
+
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
 
                 Group {
                     if activeIdeas.isEmpty {
@@ -33,11 +56,9 @@ struct IdeaListView: View {
                             description: Text(archivedIdeas.isEmpty ? "Create your first idea to get started." : "Open the archive lane to restore an idea or create a new one.")
                         )
                     } else {
-                        List {
+                        List(selection: $selectedIdeaID) {
                             ForEach(activeIdeas) { idea in
-                                NavigationLink {
-                                    IdeaDetailView(idea: idea)
-                                } label: {
+                                NavigationLink(value: idea.id) {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(idea.title).font(.headline)
                                         HStack(spacing: 8) {
@@ -47,13 +68,12 @@ struct IdeaListView: View {
                                                     .font(.caption2)
                                                     .foregroundStyle(.secondary)
                                             }
-                                            if idea.attachmentPath != nil {
-                                                Image(systemName: "paperclip")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
+                                            if let attachPath = idea.attachmentPath {
+                                                // Proposal 008 (REQ-009): Color-code attachment indicator by validation status.
+                                                AttachmentStatusIcon(path: attachPath)
                                             }
                                             // Show active run indicator
-                                            if idea.runs.contains(where: { [.running, .waitingApproval, .pending, .ready].contains($0.status) }) {
+                                            if idea.runs.contains(where: { [.running, .waitingApproval, .pending, .ready, .blocked].contains($0.status) }) {
                                                 Image(systemName: "play.circle.fill")
                                                     .font(.caption2)
                                                     .foregroundStyle(.green)
@@ -61,6 +81,7 @@ struct IdeaListView: View {
                                         }
                                     }
                                 }
+                                .tag(idea.id)
                                 .contextMenu {
                                     ideaArchiveMenu(for: idea)
                                 }
@@ -77,7 +98,7 @@ struct IdeaListView: View {
                     approvalBar
                 }
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 250)
+            .navigationSplitViewColumnWidth(min: 260, ideal: 320)
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button(action: { showArchivedIdeas = true }) {
@@ -86,13 +107,26 @@ struct IdeaListView: View {
                     .accessibilityIdentifier("ideas-open-archive")
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    Button(action: { showNewIdeaSheet = true }) {
+                    Button(action: presentNewIdeaSheet) {
                         Label("New Idea", systemImage: "plus")
                     }
+                    .keyboardShortcut("n", modifiers: [.command])
+                    .accessibilityIdentifier("ideas-new-idea")
                 }
             }
             .sheet(isPresented: $showNewIdeaSheet) {
-                newIdeaSheet
+                NewIdeaSheetView(
+                    draft: $newIdeaDraft,
+                    onBrowseAttachment: browseAttachment,
+                    onCancel: {
+                        resetForm()
+                        showNewIdeaSheet = false
+                    },
+                    onSave: {
+                        createIdea()
+                        showNewIdeaSheet = false
+                    }
+                )
             }
             .sheet(isPresented: $showArchivedIdeas) {
                 ArchivedIdeasView()
@@ -100,8 +134,32 @@ struct IdeaListView: View {
             }
             .accessibilityIdentifier("ideas-root-view")
         } detail: {
-            Text("Select an idea")
-                .foregroundStyle(.secondary)
+            if let selectedIdea {
+                IdeaDetailView(idea: selectedIdea)
+            } else {
+                ContentUnavailableView(
+                    "Select an Idea",
+                    systemImage: "lightbulb",
+                    description: Text("Choose an idea from the list or create a new one to configure its project directory and start a run.")
+                )
+            }
+        }
+        .navigationDestination(for: UUID.self) { ideaID in
+            if let idea = ideas.first(where: { $0.id == ideaID }) {
+                IdeaDetailView(idea: idea)
+            }
+        }
+        .onChange(of: activeIdeas.map(\.id)) { _, activeIDs in
+            if let selectedIdeaID, !activeIDs.contains(selectedIdeaID) {
+                self.selectedIdeaID = activeIDs.first
+            } else if self.selectedIdeaID == nil {
+                self.selectedIdeaID = activeIDs.first
+            }
+        }
+        .task {
+            if selectedIdeaID == nil {
+                selectedIdeaID = activeIdeas.first?.id
+            }
         }
     }
 
@@ -165,55 +223,38 @@ struct IdeaListView: View {
         .background(Color.orange.opacity(0.1))
     }
 
-    // MARK: - New Idea Sheet
-
-    private var newIdeaSheet: some View {
-        VStack(spacing: 16) {
-            Text("New Idea").font(.headline)
-            TextField("Title", text: $newTitle)
-                .textFieldStyle(.roundedBorder)
-            TextEditor(text: $newBody)
-                .frame(minHeight: 100)
-                .border(Color.secondary.opacity(0.3))
-            HStack {
-                TextField("Attachment path (optional)", text: $newAttachmentPath)
-                    .textFieldStyle(.roundedBorder)
-                Button("Browse...") { browseAttachment() }
-            }
-            HStack {
-                Button("Cancel") {
-                    resetForm()
-                    showNewIdeaSheet = false
-                }
-                Spacer()
-                Button("Save Idea") {
-                    createIdea()
-                    showNewIdeaSheet = false
-                }
-                .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty)
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding()
-        .frame(minWidth: 400, minHeight: 300)
-    }
-
     private func createIdea() {
-        let trimmedPath = newAttachmentPath.trimmingCharacters(in: .whitespaces)
+        let trimmedPath = newIdeaDraft.attachmentPath.trimmingCharacters(in: .whitespaces)
         let idea = Idea(
-            title: newTitle.trimmingCharacters(in: .whitespaces),
-            body: newBody.trimmingCharacters(in: .whitespaces),
+            title: newIdeaDraft.title.trimmingCharacters(in: .whitespaces),
+            body: newIdeaDraft.body.trimmingCharacters(in: .whitespaces),
             attachmentPath: trimmedPath.isEmpty ? nil : trimmedPath
         )
         modelContext.insert(idea)
         try? modelContext.save()
+        selectedIdeaID = idea.id
         resetForm()
     }
 
+    private func presentNewIdeaSheet() {
+        prefillNewIdeaDraftFromUITestEnvironmentIfNeeded()
+        showNewIdeaSheet = true
+    }
+
+    private func prefillNewIdeaDraftFromUITestEnvironmentIfNeeded() {
+        let environment = ProcessInfo.processInfo.environment
+        if let title = environment["CHAINWORKS_UI_TEST_NEW_IDEA_TITLE"],
+           newIdeaDraft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            newIdeaDraft.title = title
+        }
+        if let body = environment["CHAINWORKS_UI_TEST_NEW_IDEA_BODY"],
+           newIdeaDraft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            newIdeaDraft.body = body
+        }
+    }
+
     private func resetForm() {
-        newTitle = ""
-        newBody = ""
-        newAttachmentPath = ""
+        newIdeaDraft = NewIdeaDraft()
     }
 
     private func deleteIdeas(offsets: IndexSet) {
@@ -224,10 +265,7 @@ struct IdeaListView: View {
     }
 
     private func statusLabel(for idea: Idea) -> String {
-        if idea.isArchived {
-            return "Archived"
-        }
-        return idea.status.rawValue.capitalized
+        idea.lifecycleStatusLabel
     }
 
     @MainActor
@@ -257,9 +295,115 @@ struct IdeaListView: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
-            newAttachmentPath = url.path
+            newIdeaDraft.attachmentPath = url.path
         }
         #endif
+    }
+}
+
+struct NewIdeaDraft: Equatable {
+    var title: String = ""
+    var body: String = ""
+    var attachmentPath: String = ""
+
+    var trimmedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var canSave: Bool {
+        !trimmedTitle.isEmpty
+    }
+}
+
+struct NewIdeaSheetView: View {
+    @Binding var draft: NewIdeaDraft
+    let onBrowseAttachment: () -> Void
+    let onCancel: () -> Void
+    let onSave: () -> Void
+    private let environment = ProcessInfo.processInfo.environment
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("New Idea")
+                    .font(.title3.weight(.semibold))
+                Text("Capture the idea first. Project directory and run configuration come after the idea exists.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                TextField("Title", text: $draft.title)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("new-idea-title-field")
+                    .onPasteCommand(of: [UTType.plainText]) { providers in
+                        guard let provider = providers.first else { return }
+                        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                            let resolvedText: String?
+                            switch item {
+                            case let data as Data:
+                                resolvedText = String(data: data, encoding: .utf8)
+                            case let string as String:
+                                resolvedText = string
+                            case let string as NSString:
+                                resolvedText = string as String
+                            default:
+                                resolvedText = nil
+                            }
+                            guard let resolvedText else { return }
+                            Task { @MainActor in
+                                draft.title = resolvedText
+                            }
+                        }
+                    }
+
+                TextEditor(text: $draft.body)
+                    .frame(minHeight: 120)
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(Color.secondary.opacity(0.25))
+                    )
+                    .accessibilityIdentifier("new-idea-body-field")
+
+                HStack(spacing: 10) {
+                    TextField("Attachment path (optional)", text: $draft.attachmentPath)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("new-idea-attachment-field")
+                    Button("Browse...", action: onBrowseAttachment)
+                        .accessibilityIdentifier("new-idea-browse-button")
+                }
+            }
+
+            HStack {
+                Button("Cancel", action: onCancel)
+                    .accessibilityIdentifier("new-idea-cancel-button")
+                Spacer()
+                Button("Save Idea", action: onSave)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!draft.canSave)
+                    .accessibilityIdentifier("new-idea-save-button")
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 460, minHeight: 340)
+        .accessibilityIdentifier("new-idea-sheet")
+        .task {
+            prefillFromUITestEnvironmentIfNeeded()
+        }
+    }
+
+    @MainActor
+    private func prefillFromUITestEnvironmentIfNeeded() {
+        guard let title = environment["CHAINWORKS_UI_TEST_NEW_IDEA_TITLE"],
+              draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        draft.title = title
+        if let body = environment["CHAINWORKS_UI_TEST_NEW_IDEA_BODY"],
+           draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft.body = body
+        }
     }
 }
 
@@ -280,6 +424,16 @@ struct IdeaDetailView: View {
         idea.runs.contains { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
     }
 
+    private var displayedRun: Run? {
+        guard let activeRun else { return nil }
+        switch activeRun.presentationStatus {
+        case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
+            return activeRun
+        case .completed, .failed, .cancelled:
+            return nil
+        }
+    }
+
     private var latestActiveRun: Run? {
         idea.runs
             .filter { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
@@ -287,21 +441,63 @@ struct IdeaDetailView: View {
             .first
     }
 
+    private var startRunActionTitle: String {
+        idea.latestRunIsTerminal ? "Start Another Run" : "Start New Run"
+    }
+
+    private var startRunHelperText: String? {
+        if idea.isArchived {
+            return "Restore the idea before starting a new run."
+        }
+        if hasActiveRun {
+            return "An active run already exists for this idea."
+        }
+        guard let latestRun = idea.latestRun else { return nil }
+        switch latestRun.presentationStatus {
+        case .cancelled:
+            return "Latest run was cancelled. Start another run or archive the idea."
+        case .completed:
+            return "Latest run completed. Start another run or archive the idea."
+        case .failed:
+            return "Latest run failed. Review artifacts, then start another run or archive the idea."
+        default:
+            return nil
+        }
+    }
+
     var body: some View {
         Group {
-            if let activeRun {
+            if let activeRun = displayedRun {
                 WorkflowRunProgressView(run: activeRun)
             } else {
                 Form {
                     Section("Idea") {
                         LabeledContent("Title", value: idea.title)
-                        LabeledContent("Status", value: idea.status.rawValue.capitalized)
+                        LabeledContent("Status", value: idea.lifecycleStatusLabel)
                         LabeledContent("Created", value: idea.createdAt, format: .dateTime)
                         if let archivedAt = idea.archivedAt {
                             LabeledContent("Archived", value: archivedAt, format: .dateTime)
                         }
                         if let path = idea.attachmentPath {
-                            LabeledContent("Attachment", value: path)
+                            HStack {
+                                Text("Attachment")
+                                Spacer()
+                                Text(path)
+                                    .foregroundStyle(.secondary)
+                                // Proposal 008 (REQ-009): Surface attachment validation state.
+                                let validationStatus = MVPBoundaryPolicy.validateAttachment(path: path)
+                                Text(validationStatus.rawValue)
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(
+                                        validationStatus == .referenceOnly
+                                            ? Color.green.opacity(0.15)
+                                            : Color.red.opacity(0.15)
+                                    )
+                                    .foregroundStyle(validationStatus == .referenceOnly ? .green : .red)
+                                    .clipShape(Capsule())
+                            }
                         }
                     }
 
@@ -316,18 +512,16 @@ struct IdeaDetailView: View {
                             TextField("Workspace root path", text: $editingWorkspacePath)
                                 .textFieldStyle(.roundedBorder)
                                 .accessibilityIdentifier("idea-workspace-root-path-field")
+                            Button("Save Path") {
+                                saveWorkspaceRoot()
+                            }
+                            .disabled(editingWorkspacePath.trimmingCharacters(in: .whitespaces) == (idea.workspaceRootPath ?? ""))
+                            .accessibilityIdentifier("idea-workspace-root-save")
                             Button("Browse...") {
                                 browseWorkspaceRoot()
                             }
                             .accessibilityIdentifier("idea-workspace-root-browse")
                         }
-                        Button("Save Path") {
-                            let trimmed = editingWorkspacePath.trimmingCharacters(in: .whitespaces)
-                            idea.workspaceRootPath = trimmed.isEmpty ? nil : trimmed
-                            try? modelContext.save()
-                        }
-                        .disabled(editingWorkspacePath.trimmingCharacters(in: .whitespaces) == (idea.workspaceRootPath ?? ""))
-                        .accessibilityIdentifier("idea-workspace-root-save")
 
                         if let path = idea.workspaceRootPath, !path.isEmpty {
                             let isValid = isValidDirectory(path)
@@ -392,18 +586,14 @@ struct IdeaDetailView: View {
                         Button {
                             showStartRunSheet = true
                         } label: {
-                            Label("Start New Run", systemImage: "play.fill")
+                            Label(startRunActionTitle, systemImage: "play.fill")
                         }
                         .disabled(hasActiveRun || idea.isArchived)
                         .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("start-new-run-button")
 
-                        if idea.isArchived {
-                            Text("Restore the idea before starting a new run.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        } else if hasActiveRun {
-                            Text("An active run already exists for this idea.")
+                        if let startRunHelperText {
+                            Text(startRunHelperText)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -550,6 +740,12 @@ struct IdeaDetailView: View {
             editingWorkspacePath = url.path
         }
         #endif
+    }
+
+    private func saveWorkspaceRoot() {
+        let trimmed = editingWorkspacePath.trimmingCharacters(in: .whitespaces)
+        idea.workspaceRootPath = trimmed.isEmpty ? nil : trimmed
+        try? modelContext.save()
     }
 
     private func isValidDirectory(_ path: String) -> Bool {
@@ -705,6 +901,52 @@ struct WorkflowStartRunSheet: View {
         WorkflowPreset.allCases.filter { $0.mode == selectedMode }
     }
 
+    @ViewBuilder
+    private var workflowSelectionControl: some View {
+        if availableWorkflows.count <= 1 {
+            LabeledContent("Workflow", value: workflowSelection.wrappedValue.title)
+                .accessibilityIdentifier("workflow-preset-single")
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Workflow")
+                    .font(.subheadline.weight(.medium))
+                ForEach(availableWorkflows) { workflow in
+                    Button {
+                        workflowSelection.wrappedValue = workflow
+                    } label: {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(workflow.title)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                Text(workflow.relativePath)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Image(systemName: workflowSelection.wrappedValue == workflow ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(workflowSelection.wrappedValue == workflow ? .blue : .secondary)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(workflowSelection.wrappedValue == workflow ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(workflow.title)
+                    .accessibilityValue(workflowSelection.wrappedValue == workflow ? "selected" : "not selected")
+                    .accessibilityIdentifier("workflow-preset-button-\(workflow.id)")
+                }
+            }
+            .accessibilityIdentifier("workflow-preset-list")
+            .accessibilityValue(workflowSelection.wrappedValue.id)
+        }
+    }
+
     private var selectedWorkflowURL: URL? {
         workflowURLs[selectedWorkflow]
     }
@@ -727,8 +969,51 @@ struct WorkflowStartRunSheet: View {
         executionService.supportsLiveExecution ? ExecutionMode.allCases : [.simulated]
     }
 
+    @ViewBuilder
+    private var executionModeSelectionControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Execution Mode")
+                .font(.subheadline.weight(.medium))
+            ForEach(availableModes) { mode in
+                Button {
+                    selectedMode = mode
+                } label: {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(mode.title)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(.primary)
+                            Text(mode == .live ? "Uses configured Goose-backed execution." : "Uses the canonical local executor.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: selectedMode == mode ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selectedMode == mode ? .blue : .secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(selectedMode == mode ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(mode.title)
+                .accessibilityValue(selectedMode == mode ? "selected" : "not selected")
+                .accessibilityIdentifier("execution-mode-\(mode.id)-button")
+            }
+        }
+        .accessibilityIdentifier("execution-mode-list")
+    }
+
     private var liveModeConfigured: Bool {
         executionService.supportsLiveExecution
+    }
+
+    private var shouldDefaultToDeliveryFlow: Bool {
+        liveModeConfigured && !(idea.workspaceRootPath?.trimmingCharacters(in: .whitespaces).isEmpty ?? true)
     }
 
     private var liveModeRequiresConfiguration: Bool {
@@ -745,6 +1030,65 @@ struct WorkflowStartRunSheet: View {
 
     private var warnRequiresConfirmation: Bool {
         preflightReport?.status == .warn && !requiresCleanPreflight
+    }
+
+    private var normalizedWorkspaceRoot: String? {
+        idea.workspaceRootPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    private var effectiveDeliveryRepoRoot: String? {
+        normalizedWorkspaceRoot ?? deliveryRepoRoot.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    private var effectiveDeliveryWorktreeBasePath: String {
+        if let explicit = deliveryWorktreeBasePath.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            return explicit
+        }
+        if let configured = appConfigurationStore.configuration.worktreeBasePath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            return configured
+        }
+        return AppConfiguration.defaultSupportRoot()
+            .appendingPathComponent("worktrees", isDirectory: true)
+            .path
+    }
+
+    private var effectiveDeliveryTargetBranch: String {
+        deliveryTargetBranch.isEmpty
+            ? "dogfood/\(idea.title.lowercased().replacingOccurrences(of: " ", with: "-"))-\(UUID().uuidString.prefix(8))"
+            : deliveryTargetBranch
+    }
+
+    private var startRunBlockingReasons: [String] {
+        var reasons: [String] = []
+        if compiledPlan == nil { reasons.append("compile_pending") }
+        if isStarting { reasons.append("starting") }
+        if compileState == .compiling { reasons.append("compiling") }
+        if liveModeRequiresConfiguration { reasons.append("live_runtime_unconfigured") }
+        if preflightBlocksStart { reasons.append("preflight_failed") }
+        if preflightReport?.status == .warn && requiresCleanPreflight { reasons.append("preflight_requires_clean") }
+        if warnRequiresConfirmation && allowWarnStart == false { reasons.append("warning_confirmation_required") }
+        if deliveryPreflightBlocksStart { reasons.append("delivery_preflight_blocked") }
+        return reasons
+    }
+
+    private var startRunButtonAccessibilityValue: String {
+        if startRunBlockingReasons.isEmpty {
+            return "enabled"
+        }
+        var components = ["blocked:\(startRunBlockingReasons.joined(separator: ","))"]
+        if let preflightReport, let firstBlockingIssue = preflightReport.blockingIssues.first {
+            components.append("preflight_issue=\(firstBlockingIssue)")
+        } else if let preflightReport, let firstWarning = preflightReport.warnings.first {
+            components.append("preflight_warning=\(firstWarning)")
+        }
+        if let deliveryPreflightResult, !deliveryPreflightResult.passed {
+            let failedIDs = deliveryPreflightResult.failedChecks.map(\.id).joined(separator: ",")
+            components.append("delivery_checks=\(failedIDs)")
+        }
+        if selectedWorkflow == .fullMVPLive {
+            components.append("delivery_repo_root=\(effectiveDeliveryRepoRoot ?? "nil")")
+        }
+        return components.joined(separator: " | ")
     }
 
     var body: some View {
@@ -786,26 +1130,11 @@ struct WorkflowStartRunSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            GroupBox("Run Mode") {
+                    GroupBox("Run Mode") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Picker("Execution Mode", selection: $selectedMode) {
-                        ForEach(availableModes) { mode in
-                            Text(mode.title)
-                                .accessibilityIdentifier("execution-mode-\(mode.id)")
-                                .tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .accessibilityIdentifier("execution-mode-picker")
+                    executionModeSelectionControl
 
-                    Picker("Workflow", selection: workflowSelection) {
-                        ForEach(availableWorkflows) { workflow in
-                            Text(workflow.title)
-                                .accessibilityIdentifier("workflow-preset-\(workflow.id)")
-                                .tag(workflow)
-                        }
-                    }
-                    .accessibilityIdentifier("workflow-preset-picker")
+                    workflowSelectionControl
 
                     if !liveModeConfigured {
                         VStack(alignment: .leading, spacing: 6) {
@@ -980,11 +1309,11 @@ struct WorkflowStartRunSheet: View {
                         }
 
                         // Summary block
-                        if !deliveryRepoRoot.isEmpty {
+                        if let effectiveRepoRoot = effectiveDeliveryRepoRoot {
                             Divider()
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("Workflow: Full MVP Live")
-                                Text("Repo: \(URL(fileURLWithPath: deliveryRepoRoot).lastPathComponent) → \(deliveryRepoRoot)")
+                                Text("Repo: \(URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent) → \(effectiveRepoRoot)")
                                 Text("Branch: \(deliveryBaseBranch) → \(deliveryTargetBranch.isEmpty ? "auto" : deliveryTargetBranch)")
                                 Text("Release target: \(deliveryReleaseMode.rawValue.capitalized) (\(deliveryReleaseTargetID))")
                                 Text("Safety: dedicated worktree, manual release gate, deterministic services")
@@ -1083,6 +1412,7 @@ struct WorkflowStartRunSheet: View {
                             Toggle("Allow start with warnings", isOn: $allowWarnStart)
                                 .toggleStyle(.checkbox)
                                 .font(.caption)
+                                .accessibilityIdentifier("allow-start-with-warnings-toggle")
                         } else if preflightReport.status == .warn && requiresCleanPreflight {
                             Label("Run start is blocked until preflight is clean in current settings.", systemImage: "lock.fill")
                                 .font(.caption)
@@ -1123,30 +1453,33 @@ struct WorkflowStartRunSheet: View {
                     compile()
                 }
                 .disabled(compileState == .compiling)
+                .accessibilityIdentifier("workflow-compile-button")
 
                 Button("Start Run") {
                     startRun()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(
-                    compiledPlan == nil
-                    || isStarting
-                    || compileState == .compiling
-                    || liveModeRequiresConfiguration
-                    || preflightBlocksStart
-                    || (preflightReport?.status == .warn && requiresCleanPreflight)
-                    || (warnRequiresConfirmation && allowWarnStart == false)
-                    || deliveryPreflightBlocksStart
-                )
+                .disabled(!startRunBlockingReasons.isEmpty)
                 .accessibilityIdentifier("workflow-start-run-confirm-button")
+                .accessibilityValue(startRunButtonAccessibilityValue)
             }
         }
         .padding(20)
         .frame(minWidth: 520, minHeight: 480)
         .task {
             resolveURLs()
-            selectedMode = availableModes.contains(selectedMode) ? selectedMode : .simulated
-            selectedWorkflow = availableWorkflows.first ?? .canonicalRelease
+            selectedMode = shouldDefaultToDeliveryFlow ? .live : (availableModes.contains(selectedMode) ? selectedMode : .simulated)
+            if shouldDefaultToDeliveryFlow {
+                selectedWorkflow = .fullMVPLive
+            } else {
+                selectedWorkflow = availableWorkflows.first ?? .canonicalRelease
+            }
+            if deliveryRepoRoot.isEmpty, let workspaceRoot = normalizedWorkspaceRoot {
+                deliveryRepoRoot = workspaceRoot
+            }
+            if deliveryWorktreeBasePath.isEmpty {
+                deliveryWorktreeBasePath = effectiveDeliveryWorktreeBasePath
+            }
             compile()
         }
         .onChange(of: selectedMode) { _, newMode in
@@ -1177,6 +1510,7 @@ struct WorkflowStartRunSheet: View {
     }
 
     private func resolveURLs() {
+        let configuredWorkflowRepositoryRoot = repositoryRoot(derivedFromWorkflowPath: appConfigurationStore.configuration.workflowSourcePath)
         workflowURLs = Dictionary(uniqueKeysWithValues: WorkflowPreset.allCases.compactMap { preset in
             let bundleURL = preset.bundleResourceName.flatMap { Bundle.main.url(forResource: $0, withExtension: "yaml") }
             let configuredWorkflowURL: URL? = {
@@ -1184,28 +1518,40 @@ struct WorkflowStartRunSheet: View {
                 case .canonicalRelease:
                     return URL(fileURLWithPath: appConfigurationStore.configuration.workflowSourcePath)
                 case .proposalLoopLive:
-                    return nil
+                    return configuredWorkflowRepositoryRoot?.appendingPathComponent(preset.relativePath)
                 case .fullMVPLive:
-                    return nil
+                    return configuredWorkflowRepositoryRoot?.appendingPathComponent(preset.relativePath)
                 }
             }()
-            guard let url = resolveExistingFile(at: [
+            var candidates: [URL?] = [
                 configuredWorkflowURL,
-                URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(preset.relativePath),
-                URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/\(preset.relativePath)"),
-                bundleURL
-            ]) else {
+                URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(preset.relativePath)
+            ]
+            if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+                candidates.append(
+                    URL(fileURLWithPath: NSHomeDirectory())
+                        .appendingPathComponent("Documents/Chainworks Forge/\(preset.relativePath)")
+                )
+            }
+            candidates.append(bundleURL)
+            guard let url = resolveExistingFile(at: candidates) else {
                 return nil
             }
             return (preset, url)
         })
 
-        catalogURL = resolveExistingFile(at: [
+        var catalogCandidates: [URL?] = [
             URL(fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("examples/agents/agents.yaml"),
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml"),
-            Bundle.main.url(forResource: "agents", withExtension: "yaml")
-        ])
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("examples/agents/agents.yaml")
+        ]
+        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
+            catalogCandidates.append(
+                URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml")
+            )
+        }
+        catalogCandidates.append(Bundle.main.url(forResource: "agents", withExtension: "yaml"))
+        catalogURL = resolveExistingFile(at: catalogCandidates)
     }
 
     private func resolveExistingFile(at candidates: [URL?]) -> URL? {
@@ -1213,6 +1559,20 @@ struct WorkflowStartRunSheet: View {
             return url
         }
         return nil
+    }
+
+    private func repositoryRoot(derivedFromWorkflowPath path: String) -> URL? {
+        let workflowURL = URL(fileURLWithPath: path)
+        let components = Array(workflowURL.pathComponents.suffix(3))
+        guard components.count == 3,
+              components[0] == "examples",
+              components[1] == "workflows" else {
+            return nil
+        }
+        return workflowURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 
     private func compile() {
@@ -1271,68 +1631,19 @@ struct WorkflowStartRunSheet: View {
             let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
             let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions)
             let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
+            let startSnapshot = try buildRunStartSnapshot(
+                resolver: resolver,
+                adjustedPlan: adjustedPlan,
+                providerBindings: providerBindings
+            )
             let compiler = RunPlanCompiler(modelContext: modelContext)
             let (run, workspace) = try compiler.createRun(
                 for: idea,
                 plan: adjustedPlan,
                 workflowSourcePath: workflowURL.path,
-                catalogSourcePath: catalogURL.path
+                catalogSourcePath: catalogURL.path,
+                startSnapshot: startSnapshot
             )
-            run.providerBindingSnapshotJSON = encodeProviderBindings(providerBindings)
-            run.startOptionsJSON = encodeStartOptions(startOptions)
-
-            // Proposal 011 (REQ-009): Freeze binding provenance per agent at run start.
-            let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
-            run.bindingProvenanceJSON = encodeProvenances(provenances)
-
-            // Proposal 011 (REQ-007): Freeze idea workspace root path into the Run record.
-            run.frozenWorkspaceRootPath = idea.workspaceRootPath
-
-            // Proposal 007 §6.4: Freeze DeliveryConfiguration for fullMVPLive preset.
-            // Proposal 011 (REQ-007): No ambient cwd fallback — use frozen workspace or explicit config.
-            // The editable form is a draft; the started run stores the frozen validated snapshot.
-            if selectedWorkflow == .fullMVPLive {
-                let effectiveRepoRoot = idea.workspaceRootPath
-                    ?? run.frozenWorkspaceRootPath
-                    ?? (deliveryRepoRoot.isEmpty ? nil : deliveryRepoRoot)
-                guard let effectiveRepoRoot else {
-                    compileState = .error("Delivery workflow requires a project directory. Set the workspace root on the idea or provide a delivery repo root.")
-                    isStarting = false
-                    return
-                }
-                let effectiveTargetBranch = deliveryTargetBranch.isEmpty
-                    ? "release/\(run.id.uuidString.prefix(8))"
-                    : deliveryTargetBranch
-                let effectiveWorktreeBase = deliveryWorktreeBasePath.isEmpty
-                    ? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-                        .appendingPathComponent("Chainworks Forge/worktrees").path
-                    : deliveryWorktreeBasePath
-                let deliveryConfig = DeliveryConfiguration(
-                    profileID: "dogfood_self",
-                    profileLabel: "Self (Dogfood)",
-                    sampleProfileID: nil,
-                    repoIdentifier: URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent,
-                    repoRoot: effectiveRepoRoot,
-                    baseBranch: deliveryBaseBranch,
-                    worktreeBasePath: effectiveWorktreeBase,
-                    targetBranch: effectiveTargetBranch,
-                    releaseTargetID: deliveryReleaseTargetID,
-                    releaseTargetLabel: deliveryReleaseMode == .sandbox ? "Sandbox" : "Staging",
-                    releaseMode: deliveryReleaseMode
-                )
-                run.deliveryConfigurationJSON = try? JSONEncoder().encode(deliveryConfig)
-                // Proposal 007 §6.4: Populate run mirror fields from frozen delivery configuration
-                run.repoIdentifier = deliveryConfig.repoIdentifier
-                run.repoRoot = deliveryConfig.repoRoot
-                run.baseBranch = deliveryConfig.baseBranch
-                run.targetBranch = effectiveTargetBranch
-                run.releaseTargetID = deliveryConfig.releaseTargetID
-                run.releaseMode = deliveryConfig.releaseMode.rawValue
-                // Persist preflight snapshot alongside delivery config
-                if let preflightResult = deliveryPreflightResult {
-                    run.deliveryPreflightJSON = try? JSONEncoder().encode(preflightResult)
-                }
-            }
 
             let preparedRun = PreparedRunStart(run: run, plan: adjustedPlan, workspace: workspace)
             onRunPrepared?(preparedRun)
@@ -1368,16 +1679,7 @@ struct WorkflowStartRunSheet: View {
     // MARK: - Delivery Preflight (Proposal 007 §9.6)
 
     private func runDeliveryPreflight() async {
-        let effectiveRepoRoot = idea.workspaceRootPath
-            ?? (deliveryRepoRoot.isEmpty ? nil : deliveryRepoRoot)
-            ?? "(no project directory set)"
-        let effectiveTargetBranch = deliveryTargetBranch.isEmpty
-            ? "dogfood/full-mvp"
-            : deliveryTargetBranch
-        let effectiveWorktreeBase = deliveryWorktreeBasePath.isEmpty
-            ? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-                .appendingPathComponent("Chainworks Forge/worktrees").path
-            : deliveryWorktreeBasePath
+        let effectiveRepoRoot = effectiveDeliveryRepoRoot ?? "(no project directory set)"
 
         let draft = DeliveryConfiguration(
             profileID: nil,
@@ -1386,8 +1688,8 @@ struct WorkflowStartRunSheet: View {
             repoIdentifier: URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent,
             repoRoot: effectiveRepoRoot,
             baseBranch: deliveryBaseBranch,
-            worktreeBasePath: effectiveWorktreeBase,
-            targetBranch: effectiveTargetBranch,
+            worktreeBasePath: effectiveDeliveryWorktreeBasePath,
+            targetBranch: effectiveDeliveryTargetBranch,
             releaseTargetID: deliveryReleaseTargetID,
             releaseTargetLabel: deliveryReleaseMode == .sandbox ? "Sandbox" : "Staging",
             releaseMode: deliveryReleaseMode
@@ -1420,6 +1722,48 @@ struct WorkflowStartRunSheet: View {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try? encoder.encode(options)
+    }
+
+    private func buildRunStartSnapshot(
+        resolver: BackendProfileResolverV2,
+        adjustedPlan: RunPlan,
+        providerBindings: [String: ResolvedProviderBinding]
+    ) throws -> RunStartSnapshot {
+        let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
+
+        let deliveryConfig: DeliveryConfiguration?
+        let deliveryPreflightJSON: Data?
+        if selectedWorkflow == .fullMVPLive {
+            guard let effectiveRepoRoot = effectiveDeliveryRepoRoot else {
+                throw WorkflowStartSnapshotError.missingDeliveryProjectDirectory
+            }
+            deliveryConfig = DeliveryConfiguration(
+                profileID: "chainworks_forge_self",
+                profileLabel: "Chainworks Forge (Self)",
+                sampleProfileID: "chainworks_forge_self",
+                repoIdentifier: URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent,
+                repoRoot: effectiveRepoRoot,
+                baseBranch: deliveryBaseBranch,
+                worktreeBasePath: effectiveDeliveryWorktreeBasePath,
+                targetBranch: effectiveDeliveryTargetBranch,
+                releaseTargetID: deliveryReleaseTargetID,
+                releaseTargetLabel: deliveryReleaseMode == .sandbox ? "Sandbox" : "Staging",
+                releaseMode: deliveryReleaseMode
+            )
+            deliveryPreflightJSON = deliveryPreflightResult.flatMap { try? JSONEncoder().encode($0) }
+        } else {
+            deliveryConfig = nil
+            deliveryPreflightJSON = nil
+        }
+
+        return RunStartSnapshot(
+            providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
+            bindingProvenanceJSON: encodeProvenances(provenances),
+            startOptionsJSON: encodeStartOptions(startOptions),
+            frozenWorkspaceRootPath: normalizedWorkspaceRoot,
+            deliveryConfiguration: deliveryConfig,
+            deliveryPreflightJSON: deliveryPreflightJSON
+        )
     }
 
     private func preflightIcon(_ status: PreflightStatus) -> String {
@@ -1550,7 +1894,7 @@ struct WorkflowRunProgressView: View {
         case .running, .pending, .ready:
             return "Watch live progress and inspect artifacts as they arrive."
         case .cancelled:
-            return "Run was cancelled."
+            return "Run was cancelled. Return to the idea to start another run or archive it."
         case .cancelling:
             return "Cancellation in progress. Waiting for agents to settle."
         }
@@ -1567,11 +1911,7 @@ struct WorkflowRunProgressView: View {
                 LabeledContent("Total Cost", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
             }
 
-            Section("Workflow Map") {
-                WorkflowMapView(run: run)
-            }
-
-                Section("Current Phase") {
+            Section("Current Phase") {
                 LabeledContent("Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
                 LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
                 LabeledContent("Latest Event", value: latestMeaningfulEvent?.event.detail ?? "Waiting for the next execution event")
@@ -1579,6 +1919,127 @@ struct WorkflowRunProgressView: View {
                     LabeledContent("Session ID", value: sessionID)
                 }
                 LabeledContent("Next Action", value: nextActionText)
+                if run.presentationStatus == .completed || run.presentationStatus == .blocked || run.presentationStatus == .failed || run.presentationStatus == .cancelled {
+                    Button("Open in Runs Home") {
+                        NotificationCenter.default.post(
+                            name: .chainworksOpenRunInRunsHome,
+                            object: nil,
+                            userInfo: ["runID": run.id.uuidString]
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("open-run-in-runs-home-button")
+                }
+            }
+
+            if let pendingApprovalRequest {
+                // Proposal 007 §11.1: Show ReleaseGateView when approvalPolicy is manual_release
+                if run.deliveryConfigurationJSON != nil,
+                   pendingApprovalRequest.approvalPolicy == "manual_release" {
+                    Section("Release Gate") {
+                        ReleaseGateView(
+                            run: run,
+                            onApprove: {
+                                executionService.resolveApproval(
+                                    approvalID: pendingApprovalRequest.id,
+                                    granted: true,
+                                    comment: blankToNil(approvalComment)
+                                )
+                                approvalComment = ""
+                            },
+                            onReject: {
+                                executionService.resolveApproval(
+                                    approvalID: pendingApprovalRequest.id,
+                                    granted: false,
+                                    comment: blankToNil(approvalComment)
+                                )
+                                approvalComment = ""
+                            }
+                        )
+                    }
+                } else {
+                    Section("Approval Gate") {
+                        Text("Run is waiting at \(pendingApprovalRequest.stageLabel).")
+                            .font(.subheadline)
+                        LabeledContent("Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+                        TextField("Comment", text: $approvalComment, axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                        HStack {
+                            Button("Reject", role: .destructive) {
+                                executionService.resolveApproval(
+                                    approvalID: pendingApprovalRequest.id,
+                                    granted: false,
+                                    comment: blankToNil(approvalComment)
+                                )
+                                approvalComment = ""
+                            }
+                            .accessibilityIdentifier("approval-reject-button")
+                            Spacer()
+                            Button("Approve") {
+                                executionService.resolveApproval(
+                                    approvalID: pendingApprovalRequest.id,
+                                    granted: true,
+                                    comment: blankToNil(approvalComment)
+                                )
+                                approvalComment = ""
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("approval-approve-button")
+                        }
+                        if !approvalContextArtifacts.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Decision Context")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                ForEach(approvalContextArtifacts) { artifact in
+                                    Button {
+                                        selectedArtifact = artifact
+                                    } label: {
+                                        HStack {
+                                            Text(artifact.name)
+                                            Spacer()
+                                            Text(artifact.format.rawValue)
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("Open \(artifact.name)")
+                                    .accessibilityElement(children: .combine)
+                                    .accessibilityIdentifier("artifact-button-\(artifact.name)")
+                                }
+                            }
+                        }
+                        if !latestDebugArtifacts.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Receipts & Traces")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                ForEach(latestDebugArtifacts) { artifact in
+                                    Button {
+                                        selectedArtifact = artifact
+                                    } label: {
+                                        HStack {
+                                            Text(artifact.name)
+                                            Spacer()
+                                            Text(artifact.format.rawValue)
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("Open \(artifact.name)")
+                                    .accessibilityElement(children: .combine)
+                                    .accessibilityIdentifier("artifact-button-\(artifact.name)")
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // MARK: Delivery Progress (Proposal 007 §10.2)
@@ -1709,114 +2170,6 @@ struct WorkflowRunProgressView: View {
                     }
                 }
                 .accessibilityIdentifier("worktree-repo-section")
-            }
-
-            if let pendingApprovalRequest {
-                // Proposal 007 §11.1: Show ReleaseGateView when approvalPolicy is manual_release
-                if run.deliveryConfigurationJSON != nil,
-                   pendingApprovalRequest.approvalPolicy == "manual_release" {
-                    Section("Release Gate") {
-                        ReleaseGateView(
-                            run: run,
-                            onApprove: {
-                                executionService.resolveApproval(
-                                    approvalID: pendingApprovalRequest.id,
-                                    granted: true,
-                                    comment: blankToNil(approvalComment)
-                                )
-                                approvalComment = ""
-                            },
-                            onReject: {
-                                executionService.resolveApproval(
-                                    approvalID: pendingApprovalRequest.id,
-                                    granted: false,
-                                    comment: blankToNil(approvalComment)
-                                )
-                                approvalComment = ""
-                            }
-                        )
-                    }
-                } else {
-                Section("Approval Gate") {
-                    Text("Run is waiting at \(pendingApprovalRequest.stageLabel).")
-                        .font(.subheadline)
-                    LabeledContent("Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
-                    if !approvalContextArtifacts.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Decision Context")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            ForEach(approvalContextArtifacts) { artifact in
-                                Button {
-                                    selectedArtifact = artifact
-                                } label: {
-                                    HStack {
-                                        Text(artifact.name)
-                                        Spacer()
-                                        Text(artifact.format.rawValue)
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Open \(artifact.name)")
-                                .accessibilityElement(children: .combine)
-                                .accessibilityIdentifier("artifact-button-\(artifact.name)")
-                            }
-                        }
-                    }
-                    if !latestDebugArtifacts.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Receipts & Traces")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            ForEach(latestDebugArtifacts) { artifact in
-                                Button {
-                                    selectedArtifact = artifact
-                                } label: {
-                                    HStack {
-                                        Text(artifact.name)
-                                        Spacer()
-                                        Text(artifact.format.rawValue)
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Open \(artifact.name)")
-                                .accessibilityElement(children: .combine)
-                                .accessibilityIdentifier("artifact-button-\(artifact.name)")
-                            }
-                        }
-                    }
-                    TextField("Comment", text: $approvalComment, axis: .vertical)
-                        .textFieldStyle(.roundedBorder)
-                HStack {
-                        Button("Reject", role: .destructive) {
-                            executionService.resolveApproval(
-                                approvalID: pendingApprovalRequest.id,
-                                granted: false,
-                                comment: blankToNil(approvalComment)
-                            )
-                            approvalComment = ""
-                        }
-                        Spacer()
-                        Button("Approve") {
-                            executionService.resolveApproval(
-                                approvalID: pendingApprovalRequest.id,
-                                granted: true,
-                                comment: blankToNil(approvalComment)
-                            )
-                            approvalComment = ""
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-                } // end else (generic approval gate)
             }
 
             Section("Stages") {
@@ -2104,6 +2457,25 @@ struct WorkflowStageDetailView: View {
     }
 }
 
+// MARK: - Proposal 008 (REQ-009): Attachment Validation Status Icon
+
+/// Displays a color-coded icon indicating attachment validation state.
+/// `reference_only` = paperclip (secondary), `rejected` = warning triangle (red).
+struct AttachmentStatusIcon: View {
+    let path: String
+
+    private var status: MVPBoundaryPolicy.AttachmentStatus {
+        MVPBoundaryPolicy.validateAttachment(path: path)
+    }
+
+    var body: some View {
+        let isValid = status == .referenceOnly
+        Image(systemName: isValid ? "paperclip" : "exclamationmark.triangle")
+            .font(.caption2)
+            .foregroundColor(isValid ? Color.secondary : Color.red)
+    }
+}
+
 // MARK: - WorkflowArtifactInspectorView
 
 struct WorkflowArtifactInspectorView: View {
@@ -2197,6 +2569,23 @@ struct WorkflowArtifactInspectorView: View {
         }
     }
 }
+
+private enum WorkflowStartSnapshotError: LocalizedError {
+    case missingDeliveryProjectDirectory
+
+    var errorDescription: String? {
+        switch self {
+        case .missingDeliveryProjectDirectory:
+            return "Delivery workflow requires a project directory. Set the workspace root on the idea or provide a delivery repo root."
+        }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
 #endif
 
 #Preview("Ideas — Operator List") {
@@ -2228,4 +2617,30 @@ struct WorkflowArtifactInspectorView: View {
         .environment(providerSettingsStore)
         .environment(providerRegistry)
         .frame(width: 560, height: 860)
+}
+
+#Preview("New Idea Sheet — Empty") {
+    NewIdeaSheetView(
+        draft: .constant(NewIdeaDraft()),
+        onBrowseAttachment: {},
+        onCancel: {},
+        onSave: {}
+    )
+    .frame(width: 520, height: 380)
+}
+
+#Preview("New Idea Sheet — Ready") {
+    NewIdeaSheetView(
+        draft: .constant(
+            NewIdeaDraft(
+                title: "Canonical delivery dogfood",
+                body: "Use the real repo-backed flow to validate the delivery path end to end.",
+                attachmentPath: "/Users/user/Documents/Chainworks Forge/docs/reference/provider-platform.md"
+            )
+        ),
+        onBrowseAttachment: {},
+        onCancel: {},
+        onSave: {}
+    )
+    .frame(width: 520, height: 380)
 }

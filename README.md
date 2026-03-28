@@ -103,9 +103,14 @@ For the current MVP slice, the system is intended to support:
 - [Live provider execution slice](docs/reference/live-provider-execution-slice.md)
 - [Operator experience baseline](docs/reference/operator-experience.md)
 - [Provider platform baseline](docs/reference/provider-platform.md)
+- [Run control baseline](docs/reference/run-control.md)
+- [Project workspace contract](docs/reference/project-workspace-contract.md)
+- [Provider binding truth](docs/reference/provider-binding-truth.md)
 - [Idea lifecycle baseline](docs/reference/idea-lifecycle.md)
 - [Goose provider remediation baseline](docs/reference/goose-provider-remediation.md)
 - [Live workflow map baseline](docs/reference/live-workflow-map.md)
+- [Test suite architecture](docs/reference/test-suite-architecture.md)
+- [Agent UI test execution](docs/reference/agent-ui-test-execution.md)
 - [Proposal 002: Workflow execution engine](docs/proposals/002-workflow-execution-engine.md)
 - [Proposal 003: Forge Steward](docs/proposals/003-forge-steward-sdlc-health-and-adaptation.md)
 
@@ -191,13 +196,13 @@ Proposal-specific gate:
 UI smoke gate:
 
 ```bash
-./scripts/test-gate.sh ui-smoke
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"
 ```
 
 Full sign-off gate:
 
 ```bash
-./scripts/test-gate.sh full
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"
 ```
 
 Run the live fixture slice locally:
@@ -213,3 +218,4 @@ open "Chainworks Forge.xcodeproj"
 Test gate reference:
 
 - [docs/reference/test-gates.md](docs/reference/test-gates.md)
+- [docs/reference/agent-ui-test-execution.md](docs/reference/agent-ui-test-execution.md)

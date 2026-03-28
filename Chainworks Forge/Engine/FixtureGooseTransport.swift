@@ -6,11 +6,14 @@ import Foundation
 final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     enum Scenario {
         case proposalLoopSuccess
+        case fullMVPSuccess
+        case fullMVPRefineThenSuccess
     }
 
     private let scenario: Scenario
     private let stateQueue = DispatchQueue(label: "FixtureGooseTransport.state")
     private var sessionRequests: [String: GooseSessionRequest] = [:]
+    private var taskInvocationCounts: [String: Int] = [:]
 
     nonisolated init(scenario: Scenario = .proposalLoopSuccess) {
         self.scenario = scenario
@@ -67,6 +70,10 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         switch scenario {
         case .proposalLoopSuccess:
             return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
+        case .fullMVPSuccess:
+            return fullMVPSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
+        case .fullMVPRefineThenSuccess:
+            return fullMVPSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
         }
     }
 
@@ -79,17 +86,19 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         let agentID = request?.metadata?["agent_id"] ?? "unknown_agent"
         let outputDirectory = parseOutputDirectory(from: prompt.content)
         let outputNames = parseOutputNames(from: prompt.content)
+        let invocation = nextInvocation(for: taskName)
 
         if let outputDirectory {
             writeFixtureOutputs(
                 for: taskName,
                 agentID: agentID,
                 outputNames: outputNames,
-                outputDirectory: outputDirectory
+                outputDirectory: outputDirectory,
+                invocation: invocation
             )
         }
 
-        let finalOutput = makeFinalOutput(taskName: taskName, agentID: agentID)
+        let finalOutput = makeFinalOutput(taskName: taskName, agentID: agentID, invocation: invocation)
 
         return [
             .sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#),
@@ -97,6 +106,45 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
             .toolCallStarted(toolName: "read_workspace", raw: "{}"),
             .toolCallFinished(toolName: "read_workspace", raw: "{}"),
             .textChunk(text: "Fixture backend executing \(taskName)..."),
+            .finalOutput(content: finalOutput),
+            .sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#)
+        ]
+    }
+
+    private func fullMVPSuccessEvents(
+        sessionID: String,
+        prompt: GoosePromptRequest,
+        request: GooseSessionRequest?
+    ) -> [GooseStreamEvent] {
+        let taskName = parseTaskName(from: prompt.content)
+        let agentID = request?.metadata?["agent_id"] ?? "unknown_agent"
+        let outputDirectory = parseOutputDirectory(from: prompt.content)
+        let outputNames = parseOutputNames(from: prompt.content)
+        let invocation = nextInvocation(for: taskName)
+
+        if let outputDirectory {
+            writeFixtureOutputs(
+                for: taskName,
+                agentID: agentID,
+                outputNames: outputNames,
+                outputDirectory: outputDirectory,
+                invocation: invocation
+            )
+        }
+
+        if shouldWriteToWorktree(taskName: taskName, request: request),
+           let workingDirectory = request?.workingDirectory {
+            writeFixtureWorktreeChange(taskName: taskName, workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true))
+        }
+
+        let finalOutput = makeFinalOutput(taskName: taskName, agentID: agentID, invocation: invocation)
+
+        return [
+            .sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#),
+            .promptSubmitted(raw: #"{"task":"\#(taskName)","request_id":"fixture-request-\#(sessionID)"}"#),
+            .toolCallStarted(toolName: "inspect_repo_context", raw: "{}"),
+            .toolCallFinished(toolName: "inspect_repo_context", raw: "{}"),
+            .textChunk(text: "Fixture backend executing \(taskName) for full_mvp_live..."),
             .finalOutput(content: finalOutput),
             .sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#)
         ]
@@ -146,7 +194,8 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         for taskName: String,
         agentID: String,
         outputNames: [String],
-        outputDirectory: URL
+        outputDirectory: URL,
+        invocation: Int
     ) {
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 
@@ -154,18 +203,194 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
             let content = makeOutputContent(
                 taskName: taskName,
                 agentID: agentID,
-                outputName: outputName
+                outputName: outputName,
+                invocation: invocation
             )
             let url = outputDirectory.appendingPathComponent(outputName)
             try? content.data(using: .utf8)?.write(to: url)
         }
     }
 
-    private func makeFinalOutput(taskName: String, agentID: String) -> String {
-        makeOutputContent(taskName: taskName, agentID: agentID, outputName: "final_output")
+    private func makeFinalOutput(taskName: String, agentID: String, invocation: Int) -> String {
+        makeOutputContent(taskName: taskName, agentID: agentID, outputName: "final_output", invocation: invocation)
     }
 
-    private func makeOutputContent(taskName: String, agentID: String, outputName: String) -> String {
+    private func makeOutputContent(taskName: String, agentID: String, outputName: String, invocation: Int) -> String {
+        switch outputName {
+        case "proposal_review_po":
+            return reviewerJSON(agentID: agentID, role: "product_owner", score: 9.4)
+        case "proposal_review_ux":
+            return reviewerJSON(agentID: agentID, role: "ux", score: 9.2)
+        case "proposal_review_ui":
+            return reviewerJSON(agentID: agentID, role: "ui", score: 9.1)
+        case "proposal_review_architect":
+            return reviewerJSON(agentID: agentID, role: "architect", score: 9.3)
+        case "proposal_review_summary":
+            return """
+            {
+              "pass": true,
+              "average_score": 9.25,
+              "aggregate_score": 9.25,
+              "min_individual_score": 9.1,
+              "blocker_count": 0,
+              "summary": "Proposal clears the review threshold.",
+              "required_changes": [],
+              "recurring_themes": ["Scope is clear", "Safety boundary is explicit"],
+              "decision": "proceed"
+            }
+            """
+        case "implementation_self_assessment":
+            return """
+            {
+              "seemingly_complete": true,
+              "remaining_tasks": [],
+              "known_risks": [],
+              "tests_run": true,
+              "docs_impacted": ["README.md"]
+            }
+            """
+        case "tests_result":
+            return """
+            {
+              "green": true,
+              "passed": 12,
+              "failed": 0,
+              "summary": "Fixture repo-backed tests are green."
+            }
+            """
+        case "security_report":
+            return """
+            {
+              "status": "pass",
+              "critical": 0,
+              "high": 0,
+              "medium": 0,
+              "low": 0,
+              "findings": [],
+              "required_fixes": []
+            }
+            """
+        case "docs_report":
+            return """
+            {
+              "status": "pass",
+              "changed_docs": ["README.md"],
+              "missing_docs": [],
+              "followups": []
+            }
+            """
+        case "docs_delta":
+            return """
+            # Docs Delta
+
+            Updated documentation to match the implementation changes.
+            """
+        case "audit_report":
+            if case .fullMVPRefineThenSuccess = scenario,
+               taskName == "audit_implementation_against_proposal",
+               invocation == 1 {
+                return """
+                {
+                  "status": "Needs Work",
+                  "matches_proposal": false,
+                  "missing_items": [],
+                  "extra_items": [],
+                  "defects": ["Refine implementation once more before release."],
+                  "required_fixes": ["Apply follow-up implementation pass"]
+                }
+                """
+            }
+            return """
+            {
+              "status": "Implemented",
+              "matches_proposal": true,
+              "missing_items": [],
+              "extra_items": [],
+              "defects": [],
+              "required_fixes": []
+            }
+            """
+        case "implementation_review_summary":
+            if case .fullMVPRefineThenSuccess = scenario,
+               taskName == "aggregate_implementation_reviews",
+               invocation == 1 {
+                return """
+                {
+                  "status": "Needs Work",
+                  "open_blockers": 1,
+                  "must_fix": ["Apply follow-up implementation pass"],
+                  "recommended_next_step": "refine_implementation"
+                }
+                """
+            }
+            return """
+            {
+              "status": "Implemented",
+              "open_blockers": 0,
+              "must_fix": [],
+              "recommended_next_step": "proceed_to_release"
+            }
+            """
+        case "prepush_review_report":
+            return """
+            {
+              "status": "pass",
+              "major_concerns": [],
+              "cleanup_items": [],
+              "test_coverage_notes": "Fixture proof covers the repo-backed happy path.",
+              "release_note": "Ready for manual release."
+            }
+            """
+        case "release_manifest":
+            return """
+            {
+              "commit_sha": "fixture-commit-sha",
+              "branch": "chainworks/cw-fixture-release",
+              "remote": "origin",
+              "commit_message": "Fixture delivery commit",
+              "files_changed": 1,
+              "insertions": 12,
+              "deletions": 0,
+              "timestamp": "\(ISO8601DateFormatter().string(from: Date()))"
+            }
+            """
+        case "git_push_receipt":
+            return """
+            {
+              "status": "success",
+              "branch": "chainworks/cw-fixture-release",
+              "commit_sha": "fixture-commit-sha",
+              "remote": "origin"
+            }
+            """
+        case "release_bundle_manifest":
+            return """
+            {
+              "status": "success",
+              "bundle_path": "Build/Fixture/ChainworksForge.xcarchive",
+              "distribution_target": "sandbox",
+              "timestamp": "\(ISO8601DateFormatter().string(from: Date()))"
+            }
+            """
+        case "connect_upload_receipt":
+            return """
+            {
+              "status": "success",
+              "artifact_id": "fixture-upload-artifact",
+              "channel": "sandbox"
+            }
+            """
+        case "changed_files_manifest":
+            return """
+            {
+              "files": ["CHAINWORKS_DOGFOOD_PROOF.txt"],
+              "summary": "Fixture implementation touched one worktree-scoped file."
+            }
+            """
+        default:
+            break
+        }
+
         switch taskName {
         case "normalize_idea_and_prepare_proposal_brief":
             return """
@@ -221,6 +446,35 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
             Agent: \(agentID)
             Output: \(outputName)
             """
+        }
+    }
+
+    private func shouldWriteToWorktree(taskName: String, request: GooseSessionRequest?) -> Bool {
+        guard request?.executionPolicy?.repoWritesAllowed == true else { return false }
+        return taskName == "initial_implementation"
+            || taskName == "continue_implementation"
+            || taskName == "refine_implementation"
+    }
+
+    private func nextInvocation(for taskName: String) -> Int {
+        stateQueue.sync {
+            let next = (taskInvocationCounts[taskName] ?? 0) + 1
+            taskInvocationCounts[taskName] = next
+            return next
+        }
+    }
+
+    private func writeFixtureWorktreeChange(taskName: String, workingDirectory: URL) {
+        let proofFile = workingDirectory.appendingPathComponent("CHAINWORKS_DOGFOOD_PROOF.txt")
+        let line = "\(taskName) @ \(ISO8601DateFormatter().string(from: Date()))\n"
+        if FileManager.default.fileExists(atPath: proofFile.path) {
+            if let handle = try? FileHandle(forWritingTo: proofFile) {
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: Data(line.utf8))
+                try? handle.close()
+            }
+        } else {
+            try? Data(line.utf8).write(to: proofFile)
         }
     }
 

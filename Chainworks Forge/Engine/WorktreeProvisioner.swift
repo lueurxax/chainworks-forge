@@ -47,6 +47,11 @@ struct WorktreeProvisioner: Sendable {
         let branchName: String
     }
 
+    private struct RepositoryIdentity: Sendable {
+        let value: String
+        let source: String
+    }
+
     /// Provision a dedicated writable worktree for a repo-backed run.
     ///
     /// Steps per §7.4:
@@ -60,10 +65,12 @@ struct WorktreeProvisioner: Sendable {
         repoIdentifier: String,
         repoRoot: String,
         baseBranch: String,
+        targetBranch: String,
         worktreeBasePath: String,
         ideaSlug: String,
         runShortID: String
     ) async throws -> ProvisioningResult {
+        RuntimeDiagnostics.log("worktreeProvisioner begin repoRoot=\(repoRoot) baseBranch=\(baseBranch) targetBranch=\(targetBranch) worktreeBase=\(worktreeBasePath)")
         let fm = FileManager.default
         let repoURL = URL(fileURLWithPath: repoRoot)
 
@@ -72,11 +79,20 @@ struct WorktreeProvisioner: Sendable {
             throw ProvisioningError.repoRootNotFound(path: repoRoot)
         }
 
-        // Verify repo identity via git remote
-        let remoteOutput = try await runGit(["remote", "get-url", "origin"], in: repoURL)
-        let actualIdentifier = remoteOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard actualIdentifier.contains(repoIdentifier) || repoIdentifier == actualIdentifier else {
-            throw ProvisioningError.repoIdentityMismatch(expected: repoIdentifier, actual: actualIdentifier)
+        let repositoryIdentity = try await resolveRepositoryIdentity(
+            repoIdentifier: repoIdentifier,
+            repoURL: repoURL
+        )
+        let expectedIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
+            configuredIdentifier: repoIdentifier,
+            repoRoot: repoRoot
+        )
+        let actualIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
+            configuredIdentifier: repositoryIdentity.value,
+            repoRoot: repoRoot
+        )
+        guard expectedIdentifier == actualIdentifier else {
+            throw ProvisioningError.repoIdentityMismatch(expected: expectedIdentifier, actual: actualIdentifier)
         }
 
         // Step 2: Verify base branch exists
@@ -115,12 +131,18 @@ struct WorktreeProvisioner: Sendable {
         // Create worktree base directory if needed
         try fm.createDirectory(at: worktreeBase, withIntermediateDirectories: true)
 
-        // Create dedicated branch for this worktree
-        let branchName = "chainworks/\(worktreeDirName)"
+        // The frozen target branch is the release branch truth for the run.
+        // Provision the worktree directly on that branch instead of inventing
+        // a second runtime-only branch name that later release services reject.
+        let branchName = targetBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "chainworks/\(worktreeDirName)"
+            : targetBranch
         _ = try await runGit(
             ["worktree", "add", "-b", branchName, worktreeRoot.path, baseBranch],
             in: repoURL
         )
+
+        RuntimeDiagnostics.log("worktreeProvisioner success branch=\(branchName) worktreeRoot=\(worktreeRoot.path)")
 
         return ProvisioningResult(
             worktreeRoot: worktreeRoot,
@@ -162,5 +184,24 @@ struct WorktreeProvisioner: Sendable {
         }
 
         return output
+    }
+
+    private func resolveRepositoryIdentity(
+        repoIdentifier: String,
+        repoURL: URL
+    ) async throws -> RepositoryIdentity {
+        if let remoteOutput = try? await runGit(["remote", "get-url", "origin"], in: repoURL) {
+            let value = remoteOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty {
+                return RepositoryIdentity(value: value, source: "origin")
+            }
+        }
+
+        let repoBasename = repoURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !repoBasename.isEmpty {
+            return RepositoryIdentity(value: repoBasename, source: "repo_root")
+        }
+
+        throw ProvisioningError.repoIdentityMismatch(expected: repoIdentifier, actual: "")
     }
 }

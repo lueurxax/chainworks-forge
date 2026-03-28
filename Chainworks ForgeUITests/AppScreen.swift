@@ -22,11 +22,45 @@ struct AppScreen {
         app.windows.firstMatch
     }
 
+    private func tabIdentifier(for label: String) -> String? {
+        switch label {
+        case "Runs Home":
+            return "tab-runs-home"
+        case "Ideas":
+            return "tab-ideas"
+        case "Approvals":
+            return "tab-approvals"
+        case "Agent Catalog":
+            return "tab-agent-catalog"
+        case "Workflow Inspector":
+            return "tab-workflow-inspector"
+        case "Pilot Readiness":
+            return "tab-pilot-readiness"
+        case "Settings":
+            return "tab-provider-settings"
+        default:
+            return nil
+        }
+    }
+
     private func tabCandidates(_ label: String) -> [XCUIElement] {
         let win = primaryWindow
         let beginsWith = NSPredicate(format: "label BEGINSWITH %@", label)
+        let identifierPredicate = tabIdentifier(for: label).map { NSPredicate(format: "identifier == %@", $0) }
+        let identifierMatches: [XCUIElement]
+        if let identifierPredicate {
+            identifierMatches = [
+                win.descendants(matching: .radioButton).matching(identifierPredicate).firstMatch,
+                win.descendants(matching: .tab).matching(identifierPredicate).firstMatch,
+                win.descendants(matching: .button).matching(identifierPredicate).firstMatch,
+                win.descendants(matching: .staticText).matching(identifierPredicate).firstMatch,
+                app.descendants(matching: .any).matching(identifierPredicate).firstMatch
+            ]
+        } else {
+            identifierMatches = []
+        }
 
-        return [
+        return identifierMatches + [
             win.radioButtons[label].firstMatch,
             win.tabs[label].firstMatch,
             win.buttons[label].firstMatch,
@@ -49,6 +83,15 @@ struct AppScreen {
 
     private func compactNavigationToggleCandidates() -> [XCUIElement] {
         let win = primaryWindow
+        guard win.exists else {
+            return [
+                app.buttons.matching(
+                    NSPredicate(
+                        format: "label CONTAINS[c] 'sidebar' OR label CONTAINS[c] 'navigation' OR identifier CONTAINS[c] 'sidebar' OR identifier CONTAINS[c] 'navigation'"
+                    )
+                ).firstMatch
+            ]
+        }
         let navPredicate = NSPredicate(
             format: "label CONTAINS[c] 'sidebar' OR label CONTAINS[c] 'navigation' OR identifier CONTAINS[c] 'sidebar' OR identifier CONTAINS[c] 'navigation'"
         )
@@ -100,10 +143,12 @@ struct AppScreen {
         case "Runs Home":
             return app.otherElements["runs-home-list"].exists
         case "Ideas":
-            return app.otherElements["ideas-root-view"].exists
-                || app.otherElements["idea-list"].exists
-                || app.buttons["ideas-open-archive"].exists
-                || app.buttons["ideas-summary-open-archive"].exists
+            return app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-root-view")).firstMatch.exists
+                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "idea-list")).firstMatch.exists
+                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-open-archive")).firstMatch.exists
+                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-summary-open-archive")).firstMatch.exists
+                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-new-idea")).firstMatch.exists
+                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-new-idea-inline")).firstMatch.exists
         case "Approvals":
             return app.otherElements["approval-inbox-view"].exists
                 || app.otherElements["approval-inbox-empty-state"].exists

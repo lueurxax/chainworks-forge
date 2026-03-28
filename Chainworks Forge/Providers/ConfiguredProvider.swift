@@ -34,6 +34,43 @@ struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+enum ProviderDefaults {
+    static func defaultModel(for family: ProviderFamily) -> String {
+        switch family {
+        case .codex:
+            return "gpt-5-codex"
+        case .claude:
+            return "claude-sonnet-4"
+        case .gemini:
+            return "gemini-2.5-pro"
+        }
+    }
+
+    static func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {
+        if family.gooseFirstPreferred && transport == .gooseServer {
+            return "\(family.displayName) Goose"
+        }
+        return "\(family.displayName) \(transport.displayName)"
+    }
+
+    static func model(_ model: String, isCompatibleWith family: ProviderFamily) -> Bool {
+        let lower = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return true }
+
+        let expectedPrefixes: [String]
+        switch family {
+        case .codex:
+            expectedPrefixes = ["gpt", "o1", "o3", "chatgpt"]
+        case .claude:
+            expectedPrefixes = ["claude", "anthropic"]
+        case .gemini:
+            expectedPrefixes = ["gemini", "palm"]
+        }
+
+        return expectedPrefixes.contains { lower.hasPrefix($0) }
+    }
+}
+
 enum ProviderFamily: String, Codable, CaseIterable, Sendable {
     case codex
     case claude

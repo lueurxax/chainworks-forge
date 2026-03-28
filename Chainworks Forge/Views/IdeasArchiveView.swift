@@ -14,6 +14,26 @@ struct IdeaLifecycleBadge: View {
 
     private var backgroundColor: Color {
         if idea.isArchived { return .secondary }
+        if let latestRun = idea.latestRun {
+            switch latestRun.presentationStatus {
+            case .pending:
+                return idea.status == .draft ? .blue : .gray
+            case .ready:
+                return .gray
+            case .running:
+                return .green
+            case .waitingApproval, .cancelling:
+                return .orange
+            case .blocked:
+                return .yellow
+            case .completed:
+                return .mint
+            case .failed:
+                return .red
+            case .cancelled:
+                return .gray
+            }
+        }
         switch idea.status {
         case .draft:
             return .blue

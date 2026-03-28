@@ -82,6 +82,7 @@ struct MVPSignOffEvaluator {
     /// 3. At least one happy-path and one recovered non-happy-path evidence pack
     /// 4. No benchmark run requires raw-log archaeology
     /// 5. Evidence packs exportable for all sign-off runs
+    /// 6. Complete exported review packets exist for all app-driven records (REQ-020)
     func checkGateRequirements(pairs: [BenchmarkPair]) -> [String] {
         var reasons: [String] = []
 
@@ -149,6 +150,19 @@ struct MVPSignOffEvaluator {
                 reasons.append(
                     "Pair \(pair.id.uuidString.prefix(8)): app-driven record has no linked run ID " +
                     "(evidence pack not exportable)"
+                )
+            }
+        }
+
+        // Gate 6: Complete exported review packets required for all app-driven records (REQ-020)
+        // The proposal demands "no complete exported review packet, no pass."
+        // This gate ensures each app-driven benchmark run has actually been exported,
+        // not merely that export is theoretically possible (which Gate 5 covers).
+        for pair in completePairs {
+            if let appRecord = pair.appDrivenRecord, appRecord.evidencePackExportedAt == nil {
+                reasons.append(
+                    "Pair \(pair.id.uuidString.prefix(8)): app-driven record has no exported evidence pack " +
+                    "(complete exported review packet required before GO)"
                 )
             }
         }

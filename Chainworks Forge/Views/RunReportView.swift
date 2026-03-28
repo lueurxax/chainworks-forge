@@ -16,6 +16,12 @@ struct RunReportView: View {
     @State private var reportArtifacts: [Artifact] = []
     @State private var summaryContent: String?
     @State private var selectedReportContent: String?
+    // Proposal 008 (REQ-012): Loading/timeout/retry states for report surfaces.
+    @State private var isLoadingReport = true
+    @State private var loadError: String?
+    @State private var isTimedOut = false
+    /// Proposal 008 (PERF-080): SLO measurement for report opens.
+    private let sloProbe = OutputRetrievalSLOProbe()
 
     enum ReportTab: String, CaseIterable {
         case latestSummary = "Latest Summary"
@@ -77,6 +83,7 @@ struct RunReportView: View {
             }
         }
         .navigationTitle("Run Report")
+        .accessibilityIdentifier("run-report-view")
         .task {
             loadReportData()
         }
@@ -134,7 +141,33 @@ struct RunReportView: View {
 
     @ViewBuilder
     private var latestSummaryContent: some View {
-        if let content = summaryContent {
+        if isLoadingReport {
+            ProgressView("Loading report...")
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding()
+        } else if isTimedOut {
+            // Proposal 008 (REQ-012): Explicit timeout state with retry action.
+            ContentUnavailableView {
+                Label("Report Timed Out", systemImage: "clock.badge.exclamationmark")
+            } description: {
+                Text("Loading exceeded the \(String(format: "%.0f", OutputRetrievalSLOProbe.p95TargetSeconds))s SLO target. The report may still be generating.")
+            } actions: {
+                Button("Retry") { retryLoadReport() }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("report-retry-button")
+            }
+        } else if let error = loadError {
+            // Proposal 008 (REQ-012): Explicit error state with retry action.
+            ContentUnavailableView {
+                Label("Load Error", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Retry") { retryLoadReport() }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("report-retry-button")
+            }
+        } else if let content = summaryContent {
             Text(content)
                 .font(.body.monospaced())
                 .textSelection(.enabled)
@@ -182,6 +215,12 @@ struct RunReportView: View {
     // MARK: - Data Loading
 
     private func loadReportData() {
+        isLoadingReport = true
+        loadError = nil
+        isTimedOut = false
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+
         // Load immutable report artifacts
         let runID = run.id
         let descriptor = FetchDescriptor<Artifact>(
@@ -192,7 +231,7 @@ struct RunReportView: View {
         )
         reportArtifacts = (try? modelContext.fetch(descriptor)) ?? []
 
-        // Load latest summary
+        // Proposal 008 (PERF-080): Measure summary retrieval latency via SLO probe.
         if let summaryID = run.latestSummaryArtifactID {
             let summaryDescriptor = FetchDescriptor<Artifact>(
                 predicate: #Predicate<Artifact> { artifact in
@@ -200,13 +239,43 @@ struct RunReportView: View {
                 }
             )
             if let summaryArtifact = try? modelContext.fetch(summaryDescriptor).first {
-                summaryContent = try? String(contentsOfFile: summaryArtifact.filePath, encoding: .utf8)
+                do {
+                    summaryContent = try sloProbe.measure(
+                        artifactName: summaryArtifact.name,
+                        runID: run.id
+                    ) {
+                        try String(contentsOfFile: summaryArtifact.filePath, encoding: .utf8)
+                    }
+                } catch {
+                    loadError = "Failed to load summary: \(error.localizedDescription)"
+                }
             }
         }
+
+        // Proposal 008 (REQ-012): Detect timeout when retrieval exceeds SLO target.
+        let elapsed = CFAbsoluteTimeGetCurrent() - loadStart
+        if elapsed > OutputRetrievalSLOProbe.p95TargetSeconds && summaryContent == nil && loadError == nil {
+            isTimedOut = true
+        }
+
+        isLoadingReport = false
+    }
+
+    /// Proposal 008 (REQ-012): Retry report retrieval after error or timeout.
+    private func retryLoadReport() {
+        summaryContent = nil
+        selectedReportContent = nil
+        loadReportData()
     }
 
     private func loadReportContent(_ artifact: Artifact) {
-        selectedReportContent = try? String(contentsOfFile: artifact.filePath, encoding: .utf8)
+        // Proposal 008 (PERF-080): Measure report retrieval latency.
+        selectedReportContent = try? sloProbe.measure(
+            artifactName: artifact.name,
+            runID: run.id
+        ) {
+            try String(contentsOfFile: artifact.filePath, encoding: .utf8)
+        }
     }
 }
 

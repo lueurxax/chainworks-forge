@@ -4,186 +4,165 @@
 |---|---|
 | Proposal | `docs/proposals/012-ui-quality-audit-and-visual-polish.md` |
 | Repository Root | `.` |
-| Git SHA | `63f5270` |
-| Reviewed At | `2026-03-26T23:31:00+0200` |
-| Review Mode | `full-review` |
+| Git SHA | `fa31abc` |
+| Reviewed At | `2026-03-28T15:48:47+0200` |
+| Review Mode | `proposal-readiness` |
 | Product Overlay | `omitted` |
-| Overall Status | `Evidence Gap Review` |
-| Readiness | `Red` |
+| Overall Status | `Full Review` |
+| Readiness | `Green` |
 | Confidence | `High` |
-| Evidence Completeness | `Partial` |
+| Evidence Completeness | `Complete` |
 
-## 0. Review Mode and Evidence Summary
+## 0. Review Mode and Proposal Evidence Summary
 
-- Mode used: `full-review`
-- Evidence completeness: `Partial`
-- Documents / repo inputs reviewed:
+- Mode used: `proposal-readiness`
+- Evidence completeness: `Complete`
+- Proposal / docs reviewed:
   - `docs/proposals/012-ui-quality-audit-and-visual-polish.md`
-  - current `Views/` SwiftUI surfaces cited by the proposal
-- Freshness check:
-  - the proposal was read against current `HEAD`
-  - no prior written Proposal 012 review existed in `docs/reviews/`
-  - current-round build and targeted UI evidence were attempted fresh
-- Build/run attempts used in this round:
-  - fresh `xcodebuild -project 'Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -derivedDataPath /tmp/p012-build-dd -resultBundlePath /tmp/p012-build.xcresult build` passed
-  - fresh targeted UI slice attempted at [`/tmp/p012-ui.xcresult`](/tmp/p012-ui.xcresult), but the runner failed before product proof with `Timed out while enabling automation mode`
-- Screenshots / attachments in scope:
-  - no authoritative current-round UI screenshots were produced because the macOS UI runner failed to initialize
+  - pre-refresh review artifact at `docs/reviews/012-ui-quality-audit-and-visual-polish-review.md`
+  - pre-refresh evidence pack at `docs/reviews/012-ui-quality-audit-and-visual-polish-evidence-pack.md`
+  - `docs/reference/idea-lifecycle.md`
+  - `docs/reference/live-workflow-map.md`
+- Reusable baseline used: `none`
+- Baseline reused: `no`
+- Baseline refreshed: `no`
+- Baseline freshness: `Missing`
+- Proposal-specific integration context: `none`
+- Targeted context refresh performed: `current code-path mapping only`
+- External research used: `None`
+- Research pack: `n/a`
+- Sources reused: `n/a`
+- Sources refreshed: `n/a`
+- Time-sensitive external guidance: `n/a`
 - Code areas inspected:
-  - `ContentView`
-  - `RunsHomeView`
-  - `IdeaListView`
-  - `ProviderSettingsView`
-  - `PilotReadinessView`
-  - `FirstRunSetupWizard`
-  - `ArchivedIdeasView` / `IdeasArchiveView`
-  - `GooseProviderConnectionAssistantView`
-  - `ReleaseGateView`
-  - `WorkflowMapView`
-  - `DeliveryPreflightReportView`
+  - `ContentView.swift`
+  - `Views/RunsHomeView.swift`
+  - `Views/IdeaListView.swift`
+  - `Views/ProviderSettingsView.swift`
+  - `Views/PilotReadinessView.swift`
+  - `Views/FirstRunSetupWizard.swift`
+  - `Views/GooseProviderConnectionAssistantView.swift`
+  - `Views/WorkflowMapView.swift`
+  - `Views/ReleaseGateView.swift`
+  - `Views/ForegroundBannerView.swift`
+  - `Views/DeliveryPreflightReportView.swift`
+  - `Views/ApprovalGateView.swift`
+  - `Views/RecoverySheet.swift`
+  - `Views/ArchivedIdeasView.swift`
+  - `Views/RunStartOverridesView.swift`
+- Current repo contradictions found:
+  - none material in this revision
+  - the three previous blockers are now closed in proposal text: audited-surface ownership, keyboard/interaction verification, and `StatusCapsule` contract alignment
+- Runtime evidence used: `None`
+- Provenance of key evidence:
+  - proposal text
+  - stable reference docs
+  - current SwiftUI source and preview declarations
+- Remaining assumptions:
+  - proposal readiness can be judged from proposal/docs/code evidence without build/run proof
+  - missing repo-level baseline does not block this round because current code mapping was sufficient
+- Remaining blockers:
+  - none
 
 ## 1. Executive Summary
 
-- Overall readiness: `Red`
+- Overall readiness: `Green`
 - Confidence: `High`
-- Remaining blockers to handoff:
-  1. the dependency table understates the real baseline: the proposal audits and intends to polish surfaces delivered by Proposals 006, 010, and 011, but the draft still claims dependency only on 007 and 008
-  2. the audit methodology and scope counts are stale and internally inconsistent, so the proposal currently overclaims review coverage
-  3. at least one catalogued issue (`L-11`) is already closed on the correct presentation layer and is assigned to the wrong owner file
-- Top risks:
-  1. implementation can waste time polishing already-closed issues instead of the remaining live defects
-  2. future readers can mistake the current issue catalogue for a complete, current-state audit when its inventory is already out of date
-  3. proposal sequencing can break if 012 is read as runnable before the surfaces from 006/010/011 are guaranteed
+- Proposal completeness signal: `Strong`
+- Top strengths:
+  1. Appendix A now lists the subordinate surfaces and proof owners that were previously outside the authoritative audit boundary.
+  2. Verification criteria now explicitly cover keyboard/interaction ownership on the operator flows that needed it.
+  3. The shared `StatusCapsule` contract is now internally consistent between the main spec and Appendix B.
+- Residual note:
+  1. The repo still has no reusable `.review-baselines/current-system-baseline.md`, so this round relied on direct code mapping instead of baseline reuse.
 
-Verdict: Proposal 012 has a useful direction, but the current draft is not yet trustworthy as a complete UI audit artifact. The current round also lacks fresh product screenshots because the targeted macOS UI runner failed before automation mode initialized.
+Proposal 012 is now ready for implementation handoff as a proposal artifact. The prior P0/P1 issues are closed in the current draft: Appendix A matches the real touched-surface set, Section 6 now proves the keyboard and below-the-fold interaction work explicitly, and the shared badge primitive is no longer internally contradictory. This round stays proposal-first: no build/run/simulator proof was required or used.
 
-## 2. Discipline Scorecard
+## 2. Proposal Scope and Completeness
+
+- In scope:
+  - visual polish across the operator-facing macOS shell and the audited surfaces listed in Appendix A
+  - readability, hierarchy, badge/token consistency, empty/loading feedback, and a bounded design-system slice
+  - non-happy-path presentation semantics for the touched surfaces
+- Out of scope:
+  - business-logic changes
+  - light mode support
+  - localization readiness
+  - iOS/iPadOS adaptation
+  - motion work beyond the banner fix
+  - runtime/Xcode validation in this review round
+- Deferred intentionally:
+  - product KPI overlay
+  - external research
+  - engine-level rollback semantics and session-recovery ownership
+- Most important baseline refreshes performed:
+  - none; `.review-baselines/current-system-baseline.md` is absent in the current repo
+- Most important contradictions with current repo:
+  - none material after the current proposal revision
+- Most important missing or partial states:
+  - none material at proposal-readiness level; Section 3, Section 6, and Appendix A now cover the active surfaces and proof obligations well enough for handoff
+
+## 3. External Research Summary
+
+Not used in this round.
+
+## 4. Discipline Scorecard
 
 | Discipline | Readiness | Confidence | Evidence Completeness | Critical | High | Medium | Low |
 |---|---|---|---|---:|---:|---:|---:|
-| UI | Red | High | Partial | 0 | 1 | 1 | 0 |
-| UX | Yellow | Medium | Partial | 0 | 0 | 1 | 0 |
-| iOS Architecture | Red | High | Partial | 0 | 1 | 0 | 0 |
+| UI | Green | High | Complete | 0 | 0 | 0 | 0 |
+| UX | Green | High | Complete | 0 | 0 | 0 | 0 |
+| iOS Architecture | Green | Medium | Complete | 0 | 0 | 0 | 0 |
 
-## 3. Findings by Discipline
+## 5. Findings by Discipline
 
-### UI
+### 5.1 UI Findings
 
-#### Finding UI-01 — Audit inventory is stale and internally inconsistent
+No material UI blocker remains in the current draft. The previously open audited-surface boundary gap is closed: Appendix A now enumerates subordinate surfaces and assigns proof ownership to them, and the `StatusCapsule` contract is consistent between the main `M-01` example and Appendix B.
 
-- Severity: `High`
-- Confidence: `High`
-- Location: `docs/proposals/012-ui-quality-audit-and-visual-polish.md:26-33`
-- Why it matters:
-  - the proposal claims a systematic preview audit of `all 12 previewable surfaces` and `all 30 view files in Views/`
-  - current `HEAD` does not match that inventory
-  - repo search in this round found `14` named `#Preview("...")` definitions, `15` total `#Preview` blocks, and `28` Swift files under `Views/`
-  - line `33` also contradicts line `9`: it says `30` files in `Views/`, plus `ContentView.swift` and `Chainworks_ForgeApp.swift`, which would imply `32` total review targets rather than `30`
-- Recommendation:
-  - rebaseline the audit inventory against current `HEAD`
-  - either list the exact preview set audited or remove the completeness claim
-  - make the scope counts internally consistent before treating the issue catalogue as authoritative
+### 5.2 UX Findings
 
-#### Finding UI-02 — `L-11` is already closed on the presentation layer and points at the wrong owner
+No material UX blocker remains in the current draft. The verification section now explicitly names the keyboard/interaction-heavy surfaces and the expected proof obligations for confirm/dismiss bindings and below-the-fold action discoverability.
 
-- Severity: `Medium`
-- Confidence: `High`
-- Location: `docs/proposals/012-ui-quality-audit-and-visual-polish.md:371-377`
-- Why it matters:
-  - `L-11` says `DeliveryPreflightReportView` needs a minimum sheet frame and assigns the work to `Views/DeliveryPreflightReportView.swift`
-  - current code already applies minimum sheet frames where the report is presented:
-    - [IdeaListView.swift](/Users/user/Documents/Chainworks Forge/Chainworks Forge/Views/IdeaListView.swift#L997) -> `.frame(minWidth: 480, minHeight: 360)`
-    - [PilotReadinessView.swift](/Users/user/Documents/Chainworks Forge/Chainworks Forge/Views/PilotReadinessView.swift#L248) -> `.frame(minWidth: 520, minHeight: 420)`
-    - [FirstRunSetupWizard.swift](/Users/user/Documents/Chainworks Forge/Chainworks Forge/Views/FirstRunSetupWizard.swift#L224) -> `.frame(minWidth: 520, minHeight: 420)`
-  - that means the issue is either already fixed or belongs to preview sizing, not to the report view itself
-- Recommendation:
-  - remove `L-11` from the open backlog, or rewrite it as a preview-sizing / presentation-consistency note owned by the presentation sites
+### 5.3 iOS Architecture Findings
 
-### UX
+No material iOS-architecture blocker was found in this round. Dependency framing, bounded shared-primitive rollout, and state-ownership boundaries remain coherent enough for proposal-readiness.
 
-No separate live UX text blocker beyond the stale issue-catalog ownership above surfaced in this round.
+## 6. Cross-Discipline Conflicts and Decisions
 
-Evidence-level note:
+No open cross-discipline conflict remains after this revision. The current proposal now aligns:
 
-- the targeted macOS UI rerun did not reach runtime assertions because the runner failed to initialize automation mode, so fresh visual proof for the proposed polish areas is still missing
+- Appendix A with the actual touched-surface set
+- Section 6 with the interaction-heavy Phase 2 commitments
+- `M-01` with Appendix B for the shared badge primitive
 
-### Architecture
+## 7. Prioritized Action Backlog
 
-#### Finding ARCH-01 — Dependency baseline is understated for the audited surfaces
+No blocking proposal changes remain before implementation handoff.
 
-- Severity: `High`
-- Confidence: `High`
-- Location: `docs/proposals/012-ui-quality-audit-and-visual-polish.md:8-10`
-- Why it matters:
-  - the proposal says it depends only on `007` and `008`
-  - the actual issue catalogue and remediation plan materially rely on surfaces introduced later in the stack, including:
-    - `ProviderSettingsView`, `PilotReadinessView`, `FirstRunSetupWizard` from the provider/settings path
-    - `ArchivedIdeasView`, `GooseProviderConnectionAssistantView`, `WorkflowMapView` from the operator-clarity path
-    - current `Ideas -> Start Run` and runtime shells shaped by Proposal 011
-  - if 012 is sequenced or read literally from its dependency table, a large part of the audited UI would not exist yet
-- Recommendation:
-  - either expand the dependency table to reflect the real baseline, or narrow the proposal to the subset of shells guaranteed by 007/008
+Optional follow-on outside Proposal 012:
 
-## 4. Cross-Discipline Conflicts and Decisions
+- create `.review-baselines/current-system-baseline.md` via `$integration-context-baseline` so future proposal rounds can reuse host-system mapping instead of rebuilding it from source
 
-- Conflict: the draft presents itself as a complete UI audit, but the current repo evidence shows both stale inventory and already-closed issue entries.
-  Tradeoff: treat the catalogue as mostly good enough versus require a precise rebaseline before implementation.
-  Decision: require rebaseline. Proposal 012 is itself an audit artifact, so stale completeness claims materially weaken the document.
-  Owner: proposal author
+## 8. Validation and Measurement Plan
 
-- Conflict: current-round build health is green, but current-round visual proof is incomplete because the macOS UI runner failed before automation mode initialized.
-  Tradeoff: infer visual proof from code alone versus keep the review partial.
-  Decision: keep the round partial and explicit about the missing screenshots / attachments.
-  Owner: review process / environment
-
-## 5. Prioritized Action Backlog
-
-| Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source |
-|---|---|---|---|---|---|---|---|
-| P1 | Fix the dependency table so it matches the real audited baseline or narrow the proposal scope to 007/008-owned shells only | Architecture | Proposal author | Immediate | none | dependency table no longer understates required surfaces | ARCH-01 |
-| P1 | Rebaseline the audit methodology and appendix counts against current `HEAD` | UI | Proposal author | Immediate | none | preview/file counts and completeness wording are accurate | UI-01 |
-| P2 | Remove or rewrite `L-11` so it no longer tracks an already-closed presentation concern as an open view-level defect | UI / UX | Proposal author | Immediate | none | `L-11` no longer points at the wrong owner or a closed issue | UI-02 |
-| P2 | Rerun the targeted macOS UI slice once automation mode is stable so the evidence pack includes current-round attachments | UI | Review owner | Next rereview | environment stable | current-round xcresult contains product proof instead of runner-init failure | Evidence gap only |
-
-## 6. Validation and Measurement Plan
-
-| Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Hold Criteria |
+| Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Audit inventory truth | whether the proposal accurately enumerates the surfaces it audited | preview count and file count match repo search | do not claim completeness without enumerating the audited set | next rereview | hold if counts are still stale |
-| Issue catalogue freshness | whether open issues still correspond to current live UI problems | removed stale items such as `L-11` | do not preserve already-fixed issues just because they existed in an earlier pass | next rereview | hold if closed issues remain in the backlog |
-| Sequencing truth | whether dependencies match the actual UI baseline required by the proposal | dependency table includes the true prerequisite proposals or narrowed scope | do not allow proposal order to imply missing surfaces exist | next rereview | hold if dependency table still understates the baseline |
-| Visual proof | whether targeted macOS UI evidence produces current-round attachments | UI runner reaches automation mode and runs the targeted slice | do not substitute code inspection for missing screenshot proof when testing is available | next rereview | hold if runner init still fails |
+| Proposal-to-implementation traceability | whether Appendix A proof owners and Section 6 checks survive implementation unchanged | every touched surface still maps cleanly to a proof owner during implementation review | do not silently drop subordinate surfaces or interaction checks | first implementation evidence review after code lands | hold if implementation narrows proof coverage relative to the proposal |
+| State/feedback contract conformance | whether touched surfaces implement the Section 3 semantics or explicitly defer them | validation, degraded/offline, retry, and cancellation semantics stay tied to the named surfaces | do not invent engine/session semantics that Proposal 012 explicitly leaves out of scope | first implementation evidence review after code lands | hold if surface-level semantics drift from Section 3 without explicit deferral |
+| Bounded design-system rollout | whether Phase 3 stays inside the adopter slice and preserves behaviour | shared primitives appear only on the named adopter surfaces first | no business-logic or navigation drift during token/capsule extraction | Phase 3 implementation review | hold if primitive rollout expands beyond the adopter slice before verification passes |
 
-## 7. Evidence Gaps and Open Questions
+## 9. Evidence Gaps and Open Questions
 
 ### Evidence Gaps
 
-- `GAP-01`: no current-round authoritative screenshots / attachments were produced because the macOS UI runner failed to initialize for automation mode
-- `GAP-02`: because the proposal itself is an audit document, the stale inventory weakens confidence in uncited or borderline issue entries beyond the ones explicitly rechecked in this round
+- `GAP-01`: `.review-baselines/current-system-baseline.md` is absent, so this round relied on direct code mapping instead of reusable host-system baseline intake.
+- `GAP-02`: Proposal-readiness mode intentionally did not run previews or simulator proofs; this round only verified that the declared preview/test surfaces exist in source and that the proposal’s scope matches them.
 
 ### Open Questions
 
-- Are there more already-closed catalogue items beyond `L-11` that should be culled once the inventory is rebaselined against current `HEAD`?
+No blocking open question remains for the proposal artifact itself.
 
-## Evidence Gap Review Fallback
+## 10. Evidence Gap Review Fallback
 
-- What was attempted:
-  - reread Proposal 012 end-to-end against current `HEAD`
-  - reran fresh build proof
-  - attempted a fresh targeted macOS UI slice for provider settings, wizard, Goose assistant, pilot readiness, archive, workflow map, and run-start/run-progress surfaces
-  - spot-checked the concrete files named in the issue catalogue
-- What is missing:
-  - current-round product screenshots / attachments
-  - a fully trustworthy, up-to-date issue inventory inside the proposal itself
-- Blockers:
-  - the UI runner failed with `Timed out while enabling automation mode`
-  - the draft still contains stale / mis-scoped audit claims
-- Confidence: `High`
-- What can still be said with partial confidence:
-  - current `HEAD` build health is green
-  - the dependency table is understated
-  - the audit inventory is stale
-  - `L-11` is already addressed at the presentation layer
-- What evidence is required to finish the full review:
-  - corrected proposal scope / inventory
-  - a fresh successful targeted macOS UI rerun with attachments
+Not used in this round. Proposal/doc/code evidence was sufficient for a full proposal-readiness review.

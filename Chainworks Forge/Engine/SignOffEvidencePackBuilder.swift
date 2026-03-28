@@ -39,7 +39,8 @@ struct SignOffEvidencePackBuilder {
             SignOffPacket.CohortMember(
                 ideaIdentifier: member.ideaIdentifier,
                 title: member.title,
-                repositoryID: member.repositoryID
+                repositoryID: member.repositoryID,
+                repositoryProfileType: member.repositoryProfileType
             )
         }
 
@@ -131,6 +132,7 @@ struct SignOffEvidencePackBuilder {
             timeToImplementationApprovalSeconds: record.timeToImplementationApprovalSeconds,
             timeToFinalReleaseDecisionSeconds: record.timeToFinalReleaseDecisionSeconds,
             terminalOutcome: record.terminalOutcome.rawValue,
+            evidencePackExportedAt: record.evidencePackExportedAt,
             artifactLinks: record.artifactLinks.map { link in
                 SignOffPacket.ArtifactLinkSnapshot(
                     artifactID: link.artifactID,
@@ -219,6 +221,7 @@ struct SignOffPacket: Codable, Sendable {
         let ideaIdentifier: String
         let title: String
         let repositoryID: String
+        let repositoryProfileType: String
     }
 
     struct PairRecord: Codable, Sendable {
@@ -241,6 +244,7 @@ struct SignOffPacket: Codable, Sendable {
         let timeToImplementationApprovalSeconds: Double?
         let timeToFinalReleaseDecisionSeconds: Double?
         let terminalOutcome: String
+        let evidencePackExportedAt: Date?
         let artifactLinks: [ArtifactLinkSnapshot]
         let notes: [String]?
     }
