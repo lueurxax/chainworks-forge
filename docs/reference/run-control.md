@@ -31,7 +31,7 @@ This reference covers:
 - persisted cancellation evidence,
 - terminal-history rules for cancelled runs.
 
-It does not define repo-backed release approval or delivery execution. That boundary remains in [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md).
+It does not define repo-backed release approval or delivery execution. That boundary remains in [full-mvp-delivery.md](full-mvp-delivery.md).
 
 ## Core rule
 

@@ -22,6 +22,12 @@ struct AppScreen {
         app.windows.firstMatch
     }
 
+    private func identifiedAny(_ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", identifier))
+            .firstMatch
+    }
+
     private func tabIdentifier(for label: String) -> String? {
         switch label {
         case "Runs Home":
@@ -61,6 +67,8 @@ struct AppScreen {
         }
 
         return identifierMatches + [
+            win.descendants(matching: .scrollView).matching(beginsWith).firstMatch,
+            win.descendants(matching: .outline).matching(beginsWith).firstMatch,
             win.radioButtons[label].firstMatch,
             win.tabs[label].firstMatch,
             win.buttons[label].firstMatch,
@@ -141,30 +149,57 @@ struct AppScreen {
     private func expectedRootVisible(for label: String) -> Bool {
         switch label {
         case "Runs Home":
-            return app.otherElements["runs-home-list"].exists
+            return identifiedAny("runs-home-list").exists
         case "Ideas":
-            return app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-root-view")).firstMatch.exists
-                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "idea-list")).firstMatch.exists
-                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-open-archive")).firstMatch.exists
-                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-summary-open-archive")).firstMatch.exists
-                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-new-idea")).firstMatch.exists
-                || app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-new-idea-inline")).firstMatch.exists
+            return identifiedAny("ideas-root-view").exists
+                || identifiedAny("idea-list").exists
+                || identifiedAny("ideas-open-archive").exists
+                || identifiedAny("ideas-summary-open-archive").exists
+                || identifiedAny("ideas-new-idea").exists
+                || identifiedAny("ideas-new-idea-inline").exists
         case "Approvals":
-            return app.otherElements["approval-inbox-view"].exists
-                || app.otherElements["approval-inbox-empty-state"].exists
+            return identifiedAny("approval-inbox-view").exists
+                || identifiedAny("approval-inbox-empty-state").exists
+                || identifiedAny("approval-gate-view").exists
                 || app.buttons["approval-approve-button"].exists
         case "Agent Catalog":
-            return app.otherElements["agent-catalog-count"].exists
+            return identifiedAny("agent-catalog-count").exists
         case "Workflow Inspector":
-            return app.otherElements["workflow-state-count"].exists
+            return identifiedAny("workflow-state-count").exists
         case "Pilot Readiness":
-            return app.otherElements["pilot-readiness-view"].exists
-                || app.otherElements["pilot-readiness-title"].exists
+            return identifiedAny("pilot-readiness-view").exists
+                || identifiedAny("pilot-readiness-title").exists
         case "Settings":
-            return app.otherElements["provider-settings-view"].exists
-                || app.otherElements["provider-settings-title"].exists
+            return identifiedAny("provider-settings-view").exists
+                || identifiedAny("provider-settings-title").exists
         default:
             return false
+        }
+    }
+
+    private func clickRepresentative(for target: XCUIElement, label: String) {
+        let identifier = tabIdentifier(for: label)
+        let queries: [XCUIElement] = [
+            target.descendants(matching: .radioButton).matching(NSPredicate(format: "label BEGINSWITH %@", label)).firstMatch,
+            target.descendants(matching: .button).matching(NSPredicate(format: "label BEGINSWITH %@", label)).firstMatch,
+            target.descendants(matching: .staticText).matching(NSPredicate(format: "label BEGINSWITH %@", label)).firstMatch,
+            target.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH %@", label)).firstMatch
+        ] + (identifier.map { id in
+            [
+                target.descendants(matching: .radioButton).matching(NSPredicate(format: "identifier == %@", id)).firstMatch,
+                target.descendants(matching: .button).matching(NSPredicate(format: "identifier == %@", id)).firstMatch,
+                target.descendants(matching: .staticText).matching(NSPredicate(format: "identifier == %@", id)).firstMatch,
+                target.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", id)).firstMatch
+            ]
+        } ?? [])
+
+        if let child = queries.first(where: { $0.exists && $0.isHittable }) {
+            child.click()
+            return
+        }
+
+        if target.isHittable || target.isEnabled {
+            target.click()
         }
     }
 
@@ -206,7 +241,7 @@ struct AppScreen {
         guard target.waitForExistence(timeout: timeout) else { return false }
 
         if isTabSelected(label) { return true }
-        if target.isEnabled || target.isHittable { target.click() }
+        clickRepresentative(for: target, label: label)
 
         if expectedRootVisible(for: label) {
             return true
@@ -224,7 +259,7 @@ struct AppScreen {
 
         // Single retry — badge-modified accessibility labels may need a second click
         _ = revealCompactNavigationIfNeeded()
-        if target.isEnabled || target.isHittable { target.click() }
+        clickRepresentative(for: target, label: label)
         return isTabSelected(label) || expectedRootVisible(for: label)
     }
 

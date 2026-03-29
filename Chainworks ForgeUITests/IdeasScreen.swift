@@ -167,7 +167,15 @@ struct IdeasScreen {
             app.textFields["idea-workspace-root-path-field"].firstMatch,
             app.buttons["start-new-run-button"].firstMatch,
             app.buttons["archive-idea-button"].firstMatch,
-            app.buttons["stop-run-button"].firstMatch
+            app.buttons["stop-run-button"].firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "run-progress-view"))
+                .firstMatch,
+            app.descendants(matching: .staticText)
+                .matching(NSPredicate(format: "identifier BEGINSWITH %@", "run-status-"))
+                .firstMatch,
+            app.buttons["approval-approve-button"].firstMatch,
+            app.buttons["approval-reject-button"].firstMatch
         ]
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {

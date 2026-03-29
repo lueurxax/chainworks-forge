@@ -286,4 +286,4 @@ It does not define:
 - git/release side-effect execution,
 - delivery-specific recovery.
 
-Those remain the responsibility of [007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md).
+Those remain the responsibility of [full-mvp-delivery.md](full-mvp-delivery.md).

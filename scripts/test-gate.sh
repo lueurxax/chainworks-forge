@@ -24,6 +24,7 @@ FAST_TESTS=(
 UI_SMOKE_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testApprovalInboxReachable"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testApprovalGateViewSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testCompletedRunExportHubSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testStartRunSheetUI"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testLiveRuntimeUnavailableShowsRecoveryGuidance"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
@@ -75,10 +76,59 @@ observed_host_names() {
   done | awk '!seen[$0]++'
 }
 
+default_codesign_keychain() {
+  local test_keychain="$HOME/Library/Keychains/test.keychain-db"
+  local login_keychain="$HOME/Library/Keychains/login.keychain-db"
+  if [[ -n "${CHAINWORKS_CODESIGN_KEYCHAIN:-}" ]]; then
+    printf '%s\n' "$CHAINWORKS_CODESIGN_KEYCHAIN"
+  elif [[ -f "$test_keychain" ]]; then
+    printf '%s\n' "$test_keychain"
+  else
+    printf '%s\n' "$login_keychain"
+  fi
+}
+
+prepare_codesign_keychain() {
+  local keychain password
+  keychain="$(default_codesign_keychain)"
+  password="${CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD:-}"
+
+  [[ -f "$keychain" ]] || return 0
+
+  security list-keychains -d user -s "$keychain" >/dev/null
+  security default-keychain -d user -s "$keychain" >/dev/null
+
+  if security show-keychain-info "$keychain" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -z "$password" ]]; then
+    die "codesign keychain is locked: $keychain. Set CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD for remote UI gates."
+  fi
+
+  log "Unlocking codesign keychain: $keychain"
+  security unlock-keychain -p "$password" "$keychain"
+  security set-keychain-settings -lut 21600 "$keychain"
+  security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+}
+
 require_remote_ui_host() {
   local approved observed host
-  mapfile -t approved < <(approved_remote_ui_hosts | while IFS= read -r host; do normalize_host "$host"; done | awk '!seen[$0]++')
-  mapfile -t observed < <(observed_host_names)
+  approved=()
+  while IFS= read -r host; do
+    approved+=("$host")
+  done < <(
+    approved_remote_ui_hosts \
+      | while IFS= read -r host; do
+          printf '%s\n' "$(normalize_host "$host")"
+        done \
+      | awk '!seen[$0]++'
+  )
+
+  observed=()
+  while IFS= read -r host; do
+    observed+=("$host")
+  done < <(observed_host_names)
 
   for host in "${observed[@]}"; do
     local allowed
@@ -90,8 +140,8 @@ require_remote_ui_host() {
   done
 
   printf 'error: UI tests are remote-only and may not run on this host.\n' >&2
-  printf 'approved remote hosts: %s\n' "${approved[*]}" >&2
-  printf 'observed host names: %s\n' "${observed[*]}" >&2
+  printf 'approved remote hosts: %s\n' "$(IFS=', '; printf '%s' "${approved[*]}")" >&2
+  printf 'observed host names: %s\n' "$(IFS=', '; printf '%s' "${observed[*]}")" >&2
   exit 3
 }
 
@@ -106,7 +156,7 @@ check_idle_environment() {
     {
       ps -axo pid=,command= \
         | grep -E "$pattern" \
-        | grep -v -E 'grep -E|pgrep -fal|scripts/test-gate.sh'
+        | grep -v -E 'grep -E|egrep |pgrep -fal|ps -axo pid=,command=|ps aux \| egrep|scripts/test-gate.sh'
     } || true
   )"
   if [[ -n "$matches" ]]; then
@@ -420,6 +470,7 @@ case "$GATE" in
   ui-smoke)
     check_idle_environment strict
     require_remote_ui_host
+    prepare_codesign_keychain
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else
@@ -430,6 +481,7 @@ case "$GATE" in
   proposal-006|p006)
     check_idle_environment strict
     require_remote_ui_host
+    prepare_codesign_keychain
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else
@@ -445,6 +497,7 @@ case "$GATE" in
   full)
     check_idle_environment strict
     require_remote_ui_host
+    prepare_codesign_keychain
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
     else

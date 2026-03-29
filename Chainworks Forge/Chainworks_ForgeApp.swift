@@ -420,6 +420,13 @@ struct AppBootstrapView: View {
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
                             .environment(gooseServerManager)
+                    case .completedExportHub:
+                        UITestCompletedExportHubSurface()
+                            .environment(service)
+                            .environment(appConfigurationStore)
+                            .environment(providerSettingsStore)
+                            .environment(providerRegistry)
+                            .environment(gooseServerManager)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

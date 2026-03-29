@@ -6,7 +6,7 @@
 - Documents / repo inputs reviewed:
   - `/Users/user/Documents/Chainworks Forge/docs/ps/chainworks-forge-mvp.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/provider-platform.md`
-  - `/Users/user/Documents/Chainworks Forge/docs/proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/reference/full-mvp-delivery.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/runtime-contract.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reviews/post-007-mvp-readiness-evidence-pack.md`
 - External sources reviewed:

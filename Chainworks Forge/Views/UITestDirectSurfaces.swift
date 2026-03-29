@@ -275,3 +275,273 @@ struct UITestReleaseGateSurface: View {
         .accessibilityIdentifier("ui-test-release-gate-surface")
     }
 }
+
+struct UITestCompletedExportHubSurface: View {
+    private let seededRun: Run?
+    private let seedErrorMessage: String?
+
+    init() {
+        let result = Self.makeFallbackRun()
+        self.seededRun = result.run
+        self.seedErrorMessage = result.errorMessage
+    }
+
+    var body: some View {
+        Group {
+            if let seededRun {
+                UITestCompletedExportHubHarness(run: seededRun)
+            } else if let seedErrorMessage {
+                ContentUnavailableView(
+                    "Completed export hub unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(seedErrorMessage)
+                )
+                .accessibilityIdentifier("ui-test-completed-export-hub-error")
+            } else {
+                ContentUnavailableView(
+                    "Completed export hub unavailable",
+                    systemImage: "shippingbox",
+                    description: Text("The UI test completed export hub surface requires a seeded completed run.")
+                )
+            }
+        }
+        .accessibilityIdentifier("ui-test-completed-export-hub-surface")
+    }
+
+    @MainActor
+    private static func makeFallbackRun() -> (run: Run?, errorMessage: String?) {
+        func fail(_ message: String) -> (run: Run?, errorMessage: String?) {
+            print("UITestCompletedExportHubSurface fallback failed: \(message)")
+            return (nil, message)
+        }
+
+        let runID = UUID()
+        let runRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("UITestCompletedExportHub-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = runRoot.appendingPathComponent("artifacts", isDirectory: true)
+        let worktreeRoot = runRoot.appendingPathComponent("worktree", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        } catch {
+            return fail("Unable to create fallback export-hub directories: \(error.localizedDescription)")
+        }
+
+        let run = Run(
+            id: runID,
+            startedAt: Date().addingTimeInterval(-600),
+            status: .completed,
+            workflowID: "ui_test_completed_export_hub",
+            workflowTitle: "Full MVP Live",
+            workflowSnapshotHash: "ui-test-workflow",
+            catalogSnapshotHash: "ui-test-catalog",
+            workflowSourcePath: "",
+            catalogSourcePath: "",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: runRoot.path,
+            artifactRoot: artifactRoot.path,
+            planCompilerVersion: 1
+        )
+        run.idea = Idea(
+            title: "Completed Export Hub Proof",
+            body: "Seeded completed repo-backed run for export-hub smoke proof.",
+            attachmentPath: nil,
+            workspaceRootPath: FileManager.default.currentDirectoryPath
+        )
+        run.completedAt = Date().addingTimeInterval(-60)
+        run.repoIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
+            configuredIdentifier: "Chainworks Forge",
+            repoRoot: FileManager.default.currentDirectoryPath
+        )
+        run.repoRoot = FileManager.default.currentDirectoryPath
+        run.baseBranch = "main"
+        run.targetBranch = "dogfood/export-hub-proof"
+        run.releaseTargetID = "sandbox_local"
+        run.releaseMode = "sandbox"
+        run.worktreeRoot = worktreeRoot.path
+        run.totalCostCents = 1234
+
+        let deliveryConfig = DeliveryConfiguration(
+            profileID: "chainworks_forge_self",
+            profileLabel: "Chainworks Forge (Self)",
+            sampleProfileID: "chainworks_forge_self",
+            repoIdentifier: "Chainworks Forge",
+            repoRoot: FileManager.default.currentDirectoryPath,
+            baseBranch: "main",
+            worktreeBasePath: runRoot.path,
+            targetBranch: "dogfood/export-hub-proof",
+            releaseTargetID: "sandbox_local",
+            releaseTargetLabel: "Local Sandbox",
+            releaseMode: .sandbox
+        )
+        do {
+            run.deliveryConfigurationJSON = try JSONEncoder().encode(deliveryConfig)
+        } catch {
+            return fail("Unable to encode fallback delivery configuration: \(error.localizedDescription)")
+        }
+        run.deliveryPreflightJSON = Data(#"{"passed":true,"checks":[]}"#.utf8)
+
+        let stage = StageExecution(
+            stageID: "state_12_delivery_completed",
+            label: "Delivery completed",
+            startedAt: Date().addingTimeInterval(-300),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+
+        let agentExecution = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "finalize_delivery",
+            startedAt: Date().addingTimeInterval(-320),
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agentExecution.completedAt = Date().addingTimeInterval(-300)
+        agentExecution.resolvedModel = "claude-opus-4.6"
+        agentExecution.stageExecution = stage
+
+        let artifactSpecs: [(String, ArtifactFormat, String)] = [
+            ("release_manifest", .json, #"{"kind":"release_manifest","status":"ok"}"#),
+            ("git_push_receipt", .json, #"{"kind":"git_push_receipt","status":"ok"}"#),
+            ("connect_upload_receipt", .json, #"{"kind":"connect_upload_receipt","status":"ok"}"#),
+            ("delivery_receipt", .json, #"{"kind":"delivery_receipt","status":"ok"}"#),
+            ("orchestrator_summary", .markdown, "# Summary\n\nCompleted export hub smoke proof.\n")
+        ]
+
+        var artifacts: [Artifact] = []
+        for spec in artifactSpecs {
+            let fileExtension = spec.1 == .markdown ? "md" : "json"
+            let fileURL = artifactRoot.appendingPathComponent("\(spec.0).\(fileExtension)")
+            do {
+                try spec.2.write(to: fileURL, atomically: true, encoding: .utf8)
+            } catch {
+                return fail("Unable to write fallback artifact \(spec.0): \(error.localizedDescription)")
+            }
+
+            let artifact = Artifact(
+                name: spec.0,
+                contractID: spec.0,
+                format: spec.1,
+                filePath: fileURL.path,
+                runID: run.id,
+                stageID: stage.stageID,
+                agentID: agentExecution.agentID,
+                provider: agentExecution.provider,
+                attemptNumber: stage.attemptNumber
+            )
+            artifact.agentExecution = agentExecution
+            artifacts.append(artifact)
+        }
+
+        agentExecution.artifacts = artifacts
+        stage.agentExecutions = [agentExecution]
+        run.stageExecutions = [stage]
+        print("UITestCompletedExportHubSurface fallback seeded run \(run.id.uuidString)")
+        return (run, nil)
+    }
+}
+
+private struct UITestCompletedExportHubHarness: View {
+    let run: Run
+    @State private var exportMessage: String?
+    @State private var isExporting = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Button("Completed export hub seeded") {}
+                    .buttonStyle(.plain)
+                    .font(.headline)
+                    .accessibilityIdentifier("ui-test-completed-export-hub-ready")
+
+                GroupBox("Run Result") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(run.idea?.title ?? "Completed Export Hub Proof")
+                            .font(.title3.bold())
+                        Text(run.workflowTitle)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Label(run.presentationStatusLabel, systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            if let worktreeRoot = run.worktreeRoot {
+                                Text(worktreeRoot)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+
+                GroupBox("Export Actions") {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Export Evidence Pack")
+                                .font(.headline)
+                            Text("Exports repo-backed delivery artifacts and screenshot checklist to Desktop.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            exportEvidencePack()
+                        } label: {
+                            Label("Export", systemImage: "square.and.arrow.up")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isExporting)
+                        .accessibilityIdentifier("completed-run-export-evidence-pack")
+                    }
+                }
+
+                if let exportMessage {
+                    Text(exportMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("completed-run-export-message")
+                }
+            }
+            .padding()
+        }
+        .accessibilityIdentifier("completed-run-export-hub")
+    }
+
+    private func exportEvidencePack() {
+        isExporting = true
+        defer { isExporting = false }
+
+        let exportDirectory = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("ChainworksUITestExports", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
+        } catch {
+            exportMessage = "Export failed: \(error.localizedDescription)"
+            return
+        }
+        let workspace = RunWorkspace(
+            runID: run.id,
+            workspaceRoot: URL(fileURLWithPath: run.workspaceRoot),
+            artifactRoot: URL(fileURLWithPath: run.artifactRoot),
+            worktreeRoot: run.worktreeRoot.map { URL(fileURLWithPath: $0) }
+        )
+
+        do {
+            let pack = try EvidencePackBuilder.export(
+                run: run,
+                workspace: workspace,
+                exportDirectory: exportDirectory
+            )
+            exportMessage = "Exported \(pack.itemCount) items."
+        } catch {
+            exportMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+}

@@ -4,6 +4,12 @@ import XCTest
 struct RunProgressScreen {
     let app: XCUIApplication
 
+    private func identifiedAny(_ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", identifier))
+            .firstMatch
+    }
+
     /// Navigates to run progress view if not already visible.
     @discardableResult
     func openIfNeeded(workflowTitle: String, timeout: TimeInterval = 15) -> Bool {
@@ -139,6 +145,7 @@ struct RunProgressScreen {
     private func hasProgressSurface(timeout: TimeInterval) -> Bool {
         let progressOutline = app.outlines["run-progress-view"].firstMatch
         let progressOther = app.otherElements["run-progress-view"].firstMatch
+        let progressAny = identifiedAny("run-progress-view")
         let statusLabel = app.descendants(matching: .staticText)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", "run-status-"))
             .firstMatch
@@ -146,7 +153,7 @@ struct RunProgressScreen {
         let sections = sectionTitles.map { sectionLabel($0) }
 
         let predicate = NSPredicate { _, _ in
-            if progressOutline.exists || progressOther.exists || statusLabel.exists { return true }
+            if progressOutline.exists || progressOther.exists || progressAny.exists || statusLabel.exists { return true }
             return sections.contains { $0.exists }
         }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)

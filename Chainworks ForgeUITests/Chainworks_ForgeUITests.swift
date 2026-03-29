@@ -97,6 +97,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
         app.launchEnvironment["CHAINWORKS_WORKFLOW_SOURCE_PATH"] = workflowSourcePath
         app.launchEnvironment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"] = catalogSourcePath
+        app.launchEnvironment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"] = uiTestExportDirectory().path
         if let directSurface {
             app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
         }
@@ -183,8 +184,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     }
 
     private func desktopEvidencePacks() -> [URL] {
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
+        let desktop = uiTestExportDirectory()
         let contents = (try? FileManager.default.contentsOfDirectory(
             at: desktop,
             includingPropertiesForKeys: [.contentModificationDateKey],
@@ -197,6 +197,11 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 return lhs > rhs
             }
+    }
+
+    private func uiTestExportDirectory() -> URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("ChainworksUITestExports", isDirectory: true)
     }
 
     @discardableResult
@@ -842,6 +847,54 @@ final class Chainworks_ForgeUITests: XCTestCase {
         )
 
         screenshot(app, name: "P007_ReleaseGate")
+    }
+
+    func testCompletedRunExportHubSurface() throws {
+        let app = makeApp(directSurface: "completed_export_hub")
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-completed_export_hub")
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "Completed export hub direct surface must finish bootstrap"
+        )
+
+        let seededReady = anyElement(app, identifier: "ui-test-completed-export-hub-ready")
+        let exportHub = anyElement(app, identifier: "completed-run-export-hub")
+        let exportButton = app.buttons["completed-run-export-evidence-pack"].firstMatch
+        XCTAssertTrue(
+            seededReady.waitForExistence(timeout: 20)
+                || exportHub.waitForExistence(timeout: 20),
+            "Completed export hub surface must render the export owner pane"
+        )
+        XCTAssertTrue(
+            exportButton.waitForExistence(timeout: 10) && exportButton.isEnabled,
+            "Completed export hub must expose an enabled evidence-pack export action"
+        )
+        screenshot(app, name: "REQ016_ExportHub_Ready")
+
+        let before = Set(desktopEvidencePacks().map(\.path))
+        exportButton.click()
+
+        let exportMessage = anyElement(app, identifier: "completed-run-export-message")
+        let deadline = Date().addingTimeInterval(20)
+        var exportedPack: URL?
+        while Date() < deadline {
+            let current = desktopEvidencePacks()
+            if let latest = current.first, !before.contains(latest.path) {
+                exportedPack = latest
+                break
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+
+        XCTAssertNotNil(exportedPack, "Completed export hub must write a new evidence pack to Desktop")
+        XCTAssertTrue(
+            exportMessage.waitForExistence(timeout: 5),
+            "Completed export hub must surface export feedback after a successful export"
+        )
+        screenshot(app, name: "REQ016_ExportHub_Exported")
     }
 
     // MARK: - REQ-011: Start Run Sheet UI

@@ -6,19 +6,20 @@ import shutil
 ROOT = Path(__file__).resolve().parents[1]
 BRAND = ROOT / "docs" / "brand"
 OUT = BRAND / "render"
+APP_ICON_SOURCE = ROOT / "Chainworks Forge" / "Assets.xcassets" / "chainworks_app_icon_clean.svg"
 
 SVG_SPECS = [
-    ("chainworks-forge-app-icon.svg", "chainworks-forge-app-icon.html", 1024, 1024),
-    ("chainworks-forge-logo-horizontal.svg", "chainworks-forge-logo-horizontal.html", 1600, 560),
-    ("chainworks-forge-readme-hero.svg", "chainworks-forge-readme-hero.html", 1600, 900),
+    (APP_ICON_SOURCE, "chainworks-forge-app-icon.html", 1024, 1024),
+    (BRAND / "chainworks-forge-logo-horizontal.svg", "chainworks-forge-logo-horizontal.html", 1600, 560),
+    (BRAND / "chainworks-forge-readme-hero.svg", "chainworks-forge-readme-hero.html", 1600, 900),
 ]
 
 APP_ICON_SET = ROOT / "Chainworks Forge" / "Assets.xcassets" / "AppIcon.appiconset"
 ICON_SIZES = [16, 32, 64, 128, 256, 512, 1024]
 
 
-def write_html(svg_name: str, html_name: str, width: int, height: int) -> None:
-    svg = (BRAND / svg_name).read_text(encoding="utf-8")
+def write_html(svg_path: Path, html_name: str, width: int, height: int) -> None:
+    svg = svg_path.read_text(encoding="utf-8")
     html = f"""<!doctype html>
 <html>
 <head>
@@ -53,8 +54,8 @@ svg {{
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    for svg_name, html_name, width, height in SVG_SPECS:
-        write_html(svg_name, html_name, width, height)
+    for svg_path, html_name, width, height in SVG_SPECS:
+        write_html(svg_path, html_name, width, height)
 
     contents = {
         "images": [],
@@ -76,6 +77,7 @@ def main() -> None:
     manifest = {
         "icon_master_html": str(OUT / "chainworks-forge-app-icon.html"),
         "icon_master_png": str(OUT / "chainworks-forge-app-icon.png"),
+        "icon_master_source_svg": str(APP_ICON_SOURCE),
         "horizontal_logo_html": str(OUT / "chainworks-forge-logo-horizontal.html"),
         "horizontal_logo_png": str(OUT / "chainworks-forge-logo-horizontal.png"),
         "readme_hero_html": str(OUT / "chainworks-forge-readme-hero.html"),

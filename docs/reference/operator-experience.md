@@ -33,7 +33,7 @@ This reference covers the read-only and repo-agnostic operator layer:
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does not define repo-backed write/release recovery. That boundary belongs to [007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md).
+It does not define repo-backed write/release recovery. That boundary belongs to [full-mvp-delivery.md](full-mvp-delivery.md).
 
 ## Runs Home
 

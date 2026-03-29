@@ -1,6 +1,6 @@
 # Full MVP Delivery Proof
 
-Current implementation and proof status for the repo-backed full MVP delivery slice that was previously tracked through Proposal 007 reviews and implementation audits.
+Current implementation and proof status for the repo-backed full MVP delivery slice that was previously tracked through Proposal 007.
 
 ## Status
 
@@ -10,7 +10,7 @@ Current implementation and proof status for the repo-backed full MVP delivery sl
 | Source contract | [../reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md) |
 | Current implementation status | Implemented |
 | Current readiness | Ready with Risks |
-| Primary evidence owner | local repo docs and accepted dogfood artifacts |
+| Primary evidence owner | local repo docs and accepted current-head dogfood artifacts |
 | Last consolidated audit | `R10` on `2026-03-28` |
 
 ## What is considered proven
@@ -30,10 +30,9 @@ The proof set now supports these claims:
 The current proof story is built from:
 
 - the stable runtime/reference docs for adjacent baselines,
-- the final review pass at [../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-review.md](../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-review.md),
-- the final evidence pack summary at [../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-evidence-pack.md](../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-evidence-pack.md),
-- the final implementation audit at [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R10.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R10.md),
-- the earlier implementation audits `R1` through `R9`, which document the path from proposal to implemented slice.
+- accepted current-head repo-backed happy-path and non-happy-path dogfood artifacts,
+- green approved-host gate results required for that delivery slice,
+- the consolidated evidence interpretation captured in this document and in [mvp-sign-off-proof.md](mvp-sign-off-proof.md).
 
 ## Current interpretation
 
@@ -57,26 +56,10 @@ The final audit accepts repo-backed happy-path and non-happy-path dogfood proof 
 That caution does not reopen the delivery contract itself.
 It only narrows how broadly the latest proof should be generalized without rerunning the same checks locally.
 
-## Historical artifact index
+## Historical note
 
-### Final consolidation
-
-- [../reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md) — stable contract
-- [../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-review.md](../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-review.md) — last full review before final implementation sign-off
-- [../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-evidence-pack.md](../reviews/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding-evidence-pack.md) — evidence-pack summary for that review
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R10.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R10.md) — final implementation audit
-
-### Audit trail
-
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R1.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R1.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R2.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R2.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R3.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R3.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R4.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R4.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R5.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R5.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R6.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R6.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R7.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R7.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R8.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R8.md)
-- [../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R9.md](../proposals/007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding_IMPLEMENTATION_AUDIT_R9.md)
+Proposal 007's raw proposal/review/audit package was a transitional implementation trail.
+This document now replaces it as the stable proof narrative for the delivery slice.
 
 ## Usage guidance
 
@@ -84,4 +67,4 @@ Use:
 
 - [../reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md) for the stable delivery contract,
 - this document for implementation/proof status,
-- the raw review and audit artifacts only when you need the detailed historical trail.
+- [mvp-sign-off-proof.md](mvp-sign-off-proof.md) when you need the wider MVP sign-off proof story that consumes this slice.

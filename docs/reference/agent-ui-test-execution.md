@@ -529,11 +529,11 @@ Required for repo-backed delivery work:
 - terminal state truth that matches the scenario
 - happy-path and non-happy-path proof when the proposal requires both
 
-For Proposal 007 specifically, direct-surface smoke tests are useful but insufficient on their own.
+For the stable full-MVP-delivery slice, direct-surface smoke tests are useful but insufficient on their own.
 
-## Proposal 007 Acceptance Evidence
+## Full MVP Delivery Acceptance Evidence
 
-For `007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding`, agents should collect all of the following:
+For the implemented [full-mvp-delivery.md](full-mvp-delivery.md) slice, agents should collect all of the following:
 
 - one happy-path app-launched repo-backed run
 - one non-happy-path app-launched repo-backed run

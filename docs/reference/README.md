@@ -26,6 +26,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 - [goose-provider-remediation.md](goose-provider-remediation.md) — Goose-first Codex/Claude remediation path, assistant, handshake probe, evidence panel
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
 - [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, evidence export
+- [mvp-sign-off.md](mvp-sign-off.md) — benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
 
 ## Test Strategy
 

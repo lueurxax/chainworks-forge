@@ -5,7 +5,7 @@
 | Date | 2026-03-26 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [007-full-mvp-delivery-slice](007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md), [008-mvp-hardening-and-sign-off](008-mvp-hardening-and-sign-off.md), [idea-lifecycle](../reference/idea-lifecycle.md), [live-workflow-map](../reference/live-workflow-map.md) |
+| Depends on | [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md), [reference/mvp-sign-off.md](../reference/mvp-sign-off.md), [idea-lifecycle](../reference/idea-lifecycle.md), [live-workflow-map](../reference/live-workflow-map.md) |
 | Scope | UI/UX visual quality, consistency, and polish across the current operator-facing macOS surfaces listed in Appendix A |
 | Goal | Elevate the Chainworks Forge UI from functional prototype to production-quality macOS citizen by fixing truncation, information density, visual consistency, and trust-bearing non-happy-path feedback while introducing a bounded lightweight design-system slice. |
 
@@ -40,8 +40,8 @@ All issues were identified via:
 
 This proposal depends on four baseline authorities:
 
-1. `007-full-mvp-delivery-slice-worktrees-implementation-loop-manual-release-and-dogfooding.md` for the delivered MVP operator shell and delivery workflow foundations.
-2. `008-mvp-hardening-and-sign-off.md` for MVP hardening expectations and sign-off posture.
+1. `docs/reference/full-mvp-delivery.md` for the delivered MVP operator shell and repo-backed delivery workflow foundations.
+2. `docs/reference/mvp-sign-off.md` for MVP hardening expectations and sign-off posture.
 3. `docs/reference/idea-lifecycle.md` for current idea/archive lifecycle truth used by `IdeaListView` and related archive surfaces.
 4. `docs/reference/live-workflow-map.md` for current workflow-map topology and agent-state presentation truth.
 

@@ -53,7 +53,7 @@ private struct WorkflowMapSummaryStrip: View {
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
             GridRow {
-                WorkflowMapStatChip(label: "Run", value: projection.runStatus.rawValue.capitalized, systemImage: "chart.flow")
+                WorkflowMapStatChip(label: "Run", value: projection.runStatus.rawValue.capitalized, systemImage: "chart.bar")
                 WorkflowMapStatChip(label: "Stage", value: projection.currentStageLabel ?? "Not started", systemImage: "square.stack.3d.up")
                 WorkflowMapStatChip(label: "Communications", value: "\(projection.communicationCount)", systemImage: "arrow.left.arrow.right")
                 WorkflowMapStatChip(label: "Live events", value: "\(projection.liveEventCount)", systemImage: "dot.radiowaves.left.and.right")
@@ -366,9 +366,9 @@ private struct WorkflowMapHandoffLedger: View {
         case .sequence:
             return "arrow.right"
         case .fanout:
-            return "arrow.up.forward.and.arrow.down.forward"
+            return "arrow.up.right"
         case .join:
-            return "arrow.down.left.and.arrow.up.right"
+            return "arrow.down.right"
         case .transition:
             return "arrow.turn.up.right"
         case .loop:

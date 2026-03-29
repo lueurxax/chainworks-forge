@@ -78,13 +78,17 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - delivery configuration freezing
   - release gate UI
   - evidence/export paths
+- MVP sign-off layer:
+  - persisted benchmark/sign-off state
+  - completed-run export hub
+  - replayable `GO/HOLD` decision snapshots
+  - approved-host current-head proof gates
 - layered test gates for fast runtime validation, remote UI smoke, and full sign-off
 
 ## What Is Still Active
 
 This repo is still under active product and hardening work. Current active areas are mostly about:
 
-- MVP hardening and final sign-off flow
 - output-contract alignment, retry truth, and failure-evidence hardening
 - design-system adoption and UI polish
 
@@ -172,6 +176,7 @@ Implemented-system references:
 - [`docs/reference/operator-experience.md`](docs/reference/operator-experience.md)
 - [`docs/reference/provider-platform.md`](docs/reference/provider-platform.md)
 - [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
+- [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
 
 Examples:

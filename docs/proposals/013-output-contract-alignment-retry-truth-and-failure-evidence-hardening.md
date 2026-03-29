@@ -5,7 +5,7 @@
 | Date | 2026-03-28 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [reference/runtime-contract.md](../reference/runtime-contract.md), [reference/workflow-execution-engine.md](../reference/workflow-execution-engine.md), [reference/operator-experience.md](../reference/operator-experience.md), [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md), [008-mvp-hardening-and-sign-off.md](008-mvp-hardening-and-sign-off.md) |
+| Depends on | [reference/runtime-contract.md](../reference/runtime-contract.md), [reference/workflow-execution-engine.md](../reference/workflow-execution-engine.md), [reference/operator-experience.md](../reference/operator-experience.md), [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md), [reference/mvp-sign-off.md](../reference/mvp-sign-off.md) |
 | Scope | Stage-output contracts, failed-stage persistence, retry semantics, blocked-run recovery extensions, and bounded proposal-output resilience |
 | Goal | Eliminate the class of runtime failures where agents produce useful work but the run still blocks because output contracts, persistence ordering, retry bookkeeping, and recovery UX disagree about what happened. |
 

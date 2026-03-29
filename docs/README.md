@@ -30,19 +30,20 @@ Repository documentation for Chainworks Forge.
 16. [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Goose-backed provider remediation path
 17. [reference/live-workflow-map.md](reference/live-workflow-map.md) — run-detail topology baseline
 18. [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — repo-backed worktree, implementation loop, manual release, evidence export
-19. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
-20. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
-21. [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure, mock lanes, tags, and plans
-22. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
-23. [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — how agents should run preview, XCUITest, and app-launched proof paths
-24. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
-25. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+19. [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — benchmark, launch gate, export hub, and current-head sign-off rules
+20. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
+21. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
+22. [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure, mock lanes, tags, and plans
+23. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
+24. [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — how agents should run preview, XCUITest, and app-launched proof paths
+25. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
+26. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
 
 ## Status
 
 - Owner: single-engineer working repo
 - Last updated: 2026-03-28
-- State: active — foundation, execution engine, live Goose transport, full MVP delivery slice, and Steward V1 implemented
+- State: active — foundation, execution engine, live Goose transport, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
 
 ## Reference (implemented)
 
@@ -59,6 +60,7 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 - [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Stable Goose-backed provider verification/remediation flow
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Stable workflow topology and agent-activity surface
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Stable repo-backed delivery slice: worktrees, implementation loop, manual release, evidence export
+- [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — Stable benchmark, recovery/export, and launch-gate sign-off contract
 - [reference/forge-steward.md](reference/forge-steward.md) — V1 observer: metrics, anomaly detection, cohorting, triggers
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 - [reference/domain-model.md](reference/domain-model.md) — SwiftData models and persistence
@@ -69,7 +71,6 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 ## Proposals (active, not yet implemented)
 
-- [proposals/008-mvp-hardening-and-sign-off.md](proposals/008-mvp-hardening-and-sign-off.md) — MVP validation, boundary freeze, recovery UX, launch gate
 - [proposals/014-design-system-adoption-and-brand-application.md](proposals/014-design-system-adoption-and-brand-application.md) — adopt Design Kit v1 across the app shell and operator surfaces
 - [proposals/012-ui-quality-audit-and-visual-polish.md](proposals/012-ui-quality-audit-and-visual-polish.md) — operator-surface visual consistency, density, and polish
 - [proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md](proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md) — stage-output contract alignment, retry truth, failed-stage evidence, and recovery hardening
@@ -78,6 +79,7 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 - [evidence/goose-server-transport-verification.md](evidence/goose-server-transport-verification.md) -- Goose server transport verification record
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
+- [evidence/mvp-sign-off-proof.md](evidence/mvp-sign-off-proof.md) -- consolidated implementation/proof status for MVP hardening and sign-off
 - [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON
 
 ## Research
