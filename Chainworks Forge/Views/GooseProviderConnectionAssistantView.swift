@@ -26,10 +26,15 @@ struct GooseProviderConnectionAssistantView: View {
     var body: some View {
         NavigationStack {
             List {
+                // Proposal 012 (L-04): Journey visualization with 3-step progress
                 Section("Journey") {
                     Text("Goose Connection Assistant")
-                        .font(.title3.bold())
+                        .font(.title2.bold())
                         .accessibilityIdentifier("goose-assistant-title")
+
+                    // 3-step progress indicator: Configure → Verify → Connected
+                    journeyProgressIndicator
+
                     if let snapshot {
                         LabeledContent("Provider", value: snapshot.providerDisplayName)
                             .accessibilityIdentifier("goose-assistant-provider-name")
@@ -42,10 +47,29 @@ struct GooseProviderConnectionAssistantView: View {
                             .accessibilityIdentifier("goose-assistant-provider-family")
                     }
                     LabeledContent("Origin", value: origin.displayName)
-                    LabeledContent("State", value: journeyState.displayName)
-                        .accessibilityIdentifier("goose-assistant-state")
+
+                    // Proposal 012 (L-12): Journey state with spinner during probing
+                    HStack {
+                        Text("State")
+                        Spacer()
+                        if isProbing {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Verifying…")
+                                .font(DesignTokens.Typography.supporting)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            StatusCapsule(
+                                text: journeyState.displayName,
+                                color: journeyStateColor,
+                                icon: journeyStateIcon,
+                                size: .small
+                            )
+                        }
+                    }
+                    .accessibilityIdentifier("goose-assistant-state")
                     Text(origin.canonicalReturnPath)
-                        .font(.caption)
+                        .font(DesignTokens.Typography.supporting)
                         .foregroundStyle(.secondary)
                 }
 
@@ -219,6 +243,67 @@ struct GooseProviderConnectionAssistantView: View {
             draftProvider = refreshedProvider
         }
         snapshot = await probe.probe(providerID: providerID, origin: origin)
+    }
+
+    // MARK: - Proposal 012 (L-04): Journey Progress Indicator
+
+    private var journeyProgressIndicator: some View {
+        HStack(spacing: 0) {
+            journeyStep(title: "Configure", icon: "gearshape", isComplete: draftProvider != nil, isActive: journeyState == .configuredUnverified)
+            journeyConnector(isComplete: draftProvider != nil)
+            journeyStep(title: "Verify", icon: "checkmark.shield", isComplete: journeyState == .verified || journeyState == .probing, isActive: journeyState == .probing)
+            journeyConnector(isComplete: journeyState == .verified)
+            journeyStep(title: "Connected", icon: "link.circle.fill", isComplete: journeyState == .verified, isActive: false)
+        }
+        .padding(.vertical, DesignTokens.Spacing.small)
+    }
+
+    private func journeyStep(title: String, icon: String, isComplete: Bool, isActive: Bool) -> some View {
+        VStack(spacing: DesignTokens.Spacing.compact) {
+            ZStack {
+                Circle()
+                    .fill(isComplete ? DesignTokens.Status.success.opacity(0.15) : isActive ? DesignTokens.Action.primary.opacity(0.15) : Color.secondary.opacity(0.1))
+                    .frame(width: 32, height: 32)
+                if isActive && !isComplete {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: isComplete ? "checkmark" : icon)
+                        .font(.caption.bold())
+                        .foregroundStyle(isComplete ? DesignTokens.Status.success : isActive ? DesignTokens.Action.primary : .secondary)
+                }
+            }
+            Text(title)
+                .font(DesignTokens.Typography.micro)
+                .foregroundStyle(isComplete || isActive ? .primary : .secondary)
+        }
+    }
+
+    private func journeyConnector(isComplete: Bool) -> some View {
+        Rectangle()
+            .fill(isComplete ? DesignTokens.Status.success : Color.secondary.opacity(0.3))
+            .frame(height: 2)
+            .frame(maxWidth: 40)
+    }
+
+    private var journeyStateColor: Color {
+        switch journeyState {
+        case .configuredUnverified: return DesignTokens.Status.neutral
+        case .probing: return DesignTokens.Status.running
+        case .verified: return DesignTokens.Status.success
+        case .degraded: return DesignTokens.Status.warning
+        case .failing: return DesignTokens.Status.error
+        }
+    }
+
+    private var journeyStateIcon: String {
+        switch journeyState {
+        case .configuredUnverified: return "circle.dashed"
+        case .probing: return "arrow.clockwise"
+        case .verified: return "checkmark.circle.fill"
+        case .degraded: return "exclamationmark.triangle"
+        case .failing: return "xmark.circle"
+        }
     }
 }
 

@@ -43,10 +43,11 @@ struct ArchivedIdeasView: View {
                 }
             }
         } detail: {
-            ContentUnavailableView(
-                "Select an archived idea",
+            // Proposal 012 (L-01): Enhanced empty state
+            StyledEmptyState(
+                title: "Select an archived idea",
                 systemImage: "archivebox",
-                description: Text("Review archived ideas and restore them when they become relevant again.")
+                description: "Review archived ideas and restore them when they become relevant again."
             )
         }
         .frame(minWidth: 920, minHeight: 640)

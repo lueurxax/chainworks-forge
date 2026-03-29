@@ -3,13 +3,13 @@
 ## 0. Review Target and Local Context Consumed
 
 - Target proposal: `docs/proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md`
-- Proposal hash at research time: `c0fc6d7f9cac165a751ea7de7df0507a`
+- Proposal hash at research time: `c733a958b8ae65363bdd559fc1110a5d`
 - Local evidence pack used to derive research scope: `docs/reviews/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening-evidence-pack.md`
 - Local seams already established before browsing:
   - `DOC-02`, `DOC-03`, `DOC-05`: current repo truth is still immutable stage-attempt artifact storage
   - `DATA-02`, `DATA-03`, `DATA-04`: validation/persistence and retry lineage seams are already mapped
   - `INT-03`, `REAL-01`: Proposal 013 now defines a disjoint same-stage agent-retry namespace
-- This research pack does not reopen local architecture review. It only tests whether authoritative external patterns strengthen, narrow, or contradict the current draft.
+- This 2026-03-29 refresh does not reopen local architecture review. It rechecks whether the now-updated draft still matches the same authoritative external patterns and whether the prior recommended deltas have been adopted cleanly.
 
 ## 1. Research Questions Derived from Local Evidence
 
@@ -23,10 +23,10 @@
 
 | Source ID | Source | Type | Why It Was Chosen | Freshness / Scope Note |
 |---|---|---|---|---|
-| `SRC-01` | [GitHub Docs: Re-running workflows and jobs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs) | official product docs | Clear, current reference for rerun semantics, same-source reruns, and preserved attempt history UI. | Stable operational docs; low freshness risk. |
-| `SRC-02` | [Temporal Docs](https://docs.temporal.io/) | official product docs | Establishes Temporal as a durable execution system with persisted workflow state and replay semantics. | High-level source; useful for framing, not exact retry-policy wording. |
-| `SRC-03` | [Temporal workshop PDF: Crafting an error handling strategy](https://learn.temporal.io/assets/files/crafting-an-error-handling-strategy-dotnet-replay2025-e633cef41481baac8b25a636533c4d37.pdf) | official educational material | Concrete reference for persisted failure history, retry attempts, and non-retryable/manual-intervention guidance. | Official but lower authority than core reference docs. Recheck before borrowing exact terminology. |
-| `SRC-04` | [Great Expectations 0.18: Validation Result Store](https://docs.greatexpectations.io/docs/0.18/reference/learn/terms/validation_result_store/) | official product docs | Strong pattern for persisting validation results and associated metadata as a first-class store, separate from raw data flow. | Versioned legacy docs; use for pattern guidance, not current API naming. |
+| `SRC-01` | [GitHub Docs: Re-running workflows and jobs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs) | official product docs | Clear, current reference for rerun semantics, same-source reruns, and preserved attempt history UI. | Refreshed 2026-03-29; stable operational docs; low freshness risk. |
+| `SRC-02` | [Temporal Docs](https://docs.temporal.io/) | official product docs | Establishes Temporal as a durable execution system with persisted workflow state and replay semantics. | Refreshed 2026-03-29; high-level source; useful for framing, not exact retry-policy wording. |
+| `SRC-03` | [Temporal workshop PDF: Crafting an error handling strategy](https://learn.temporal.io/assets/files/crafting-an-error-handling-strategy-dotnet-replay2025-e633cef41481baac8b25a636533c4d37.pdf) | official educational material | Concrete reference for persisted failure history, retry attempts, and non-retryable/manual-intervention guidance. | Refreshed 2026-03-29; official but lower authority than core reference docs. Recheck before borrowing exact terminology. |
+| `SRC-04` | [Great Expectations 0.18: Validation Result Store](https://docs.greatexpectations.io/docs/0.18/reference/learn/terms/validation_result_store/) | official product docs | Strong pattern for persisting validation results and associated metadata as a first-class store, separate from raw data flow. | Refreshed 2026-03-29; versioned legacy docs; use for pattern guidance, not current API naming. |
 
 ## 3. Findings by Theme
 
@@ -45,6 +45,7 @@ Inference for Chainworks:
 - The new Proposal 013 direction is consistent with stronger host-system practice: same logical work should keep its original frozen source context while later attempts append history instead of mutating it.
 - The proposal’s `agent-retry-{agentAttemptNumber}` namespace and lineage metadata are the right shape.
 - The highest-value extra clarification is not a new architecture layer; it is a sharper statement that same-run `Retry Failed Agent` reuses the same frozen logical snapshot and leaves prior agent-attempt evidence inspectable even after a later successful retry.
+- Current status in draft: adopted. The current proposal now states same frozen logical snapshot reuse, requires persisted snapshot linkage, and adds explicit inspectability proof expectations.
 
 Why this matters locally:
 
@@ -65,6 +66,7 @@ Inference for Chainworks:
 - Proposal 013 is strongest when `ValidationFailureRecord` and the failed-stage evidence packet are treated as canonical persisted evidence, not just transient validation diagnostics or summary flags.
 - Recovery UI, reports, and exports should reference that canonical persisted failure object or packet directly.
 - A report summary alone is not enough; the durable failure record should be the inspectable source of truth behind the summary.
+- Current status in draft: adopted. The current proposal now says `ValidationFailureRecord` or the failed-stage packet is the canonical persisted reference target for recovery UI, immutable reports, and exports.
 
 Why this matters locally:
 
@@ -85,6 +87,7 @@ Inference for Chainworks:
 - Output-contract and validation mismatches should default to operator-mediated recovery, not blind auto-retry.
 - Narrow retry can still be the preferred recovery action, but it should happen after an operator-visible explanation or an explicit policy decision, because the failure class usually reflects prompt/schema/content mismatch rather than flaky transport.
 - Proposal 013 does not need to ban all automatic retries forever, but its default truth should classify these failures as non-transient unless policy explicitly says otherwise.
+- Current status in draft: adopted. The current proposal now states that output-contract mismatch and post-generation validation failure are non-auto-retryable by default unless explicit recovery or policy override applies.
 
 Why this matters locally:
 
@@ -100,7 +103,7 @@ Why this matters locally:
 | `APP-04` | Mirror external UI attempt-history controls literally | `SRC-01` | `Reject` | Chainworks should borrow the truth model, not the exact GitHub attempt-switcher UX. Existing recovery/report owners are already correct. |
 | `APP-05` | Reuse Great Expectations terminology and store taxonomy verbatim | `SRC-04` | `Watch` | The pattern is useful, but the cited docs are legacy-versioned; adopt the concept, not the names, without a later freshness recheck. |
 
-## 5. Proposal Deltas / Recommended Updates
+## 5. Proposal Delta Status
 
 ### `DELTA-01` Adopt
 
@@ -120,6 +123,10 @@ Why:
 
 - This is the highest-signal lesson from `SRC-01` plus `SRC-03`, and it makes Proposal 013’s lineage claim more testable.
 
+Status in current draft:
+
+- adopted in `Sections 5.2`, `5.4`, `10.2`, and `10.3`
+
 ### `DELTA-02` Adopt
 
 Target areas:
@@ -136,6 +143,10 @@ Recommended update:
 Why:
 
 - `SRC-04` strongly supports durable validation-result storage as a first-class operator-visible object rather than only a derived summary.
+
+Status in current draft:
+
+- adopted in `Section 6.3`
 
 ### `DELTA-03` Adapt
 
@@ -154,13 +165,17 @@ Why:
 
 - `SRC-03` supports manual-intervention treatment for persistent failure classes, and this fits Proposal 013’s operator-trust goal.
 
+Status in current draft:
+
+- adopted in `Sections 5.4` and `7.2`
+
 ## 6. Freshness Risks / Recheck Triggers
 
 - `SRC-04` is official but versioned legacy documentation. Recheck current Great Expectations docs before borrowing any class names, store names, or config-shape terminology.
 - `SRC-03` is official Temporal educational material, not the primary reference spec. Recheck Temporal reference docs if Chainworks later imports exact retry terminology or policy names.
 - Re-run external research if Proposal 013 later grows from retry/evidence hardening into a broader workflow-history or operator-analytics redesign.
+- No new external contradiction surfaced in the 2026-03-29 refresh.
 
 ## 7. Remaining Open Questions
 
-- Does Chainworks need an explicit persisted frozen-input reference at agent-retry scope so reports can prove “same logical snapshot” without inference?
-- Should there be a bounded allowlist of contract-failure cases that may auto-retry safely, or is operator-mediated recovery the only acceptable default for Proposal 013?
+- None proposal-blocking after the 2026-03-29 refresh. Remaining questions are implementation-audit level, not research-blocking.

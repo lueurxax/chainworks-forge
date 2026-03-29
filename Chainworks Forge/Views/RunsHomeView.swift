@@ -113,15 +113,18 @@ struct RunsHomeView: View {
                 }
 
                 if allRuns.isEmpty {
-                    ContentUnavailableView(
-                        "No Runs",
+                    // Proposal 012 (L-01): Enhanced empty state
+                    StyledEmptyState(
+                        title: "No Runs",
                         systemImage: "tray",
-                        description: Text("Start a run from the Ideas tab to see it here.")
+                        description: "Start a run from the Ideas tab to see it here."
                     )
                 }
             }
             .navigationTitle("Runs Home")
             .accessibilityIdentifier("runs-home-list")
+            // Proposal 012 (C-01): Widen sidebar to accommodate run row content
+            .navigationSplitViewColumnWidth(min: 280, ideal: 340)
         } detail: {
             if let run = selectedRun {
                 RunDetailPanel(
@@ -133,10 +136,11 @@ struct RunsHomeView: View {
                     compatibilityChecker: compatibilityChecker
                 )
             } else {
-                ContentUnavailableView(
-                    "Select a Run",
+                // Proposal 012 (L-01): Enhanced empty state
+                StyledEmptyState(
+                    title: "Select a Run",
                     systemImage: "sidebar.left",
-                    description: Text("Choose a run from the sidebar to view details.")
+                    description: "Choose a run from the sidebar to view details."
                 )
             }
         }
@@ -285,52 +289,41 @@ struct RunsHomeRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        // Proposal 012 (C-01 / H-04): Compact 2-line sidebar row.
+        // Full details (parent idea badge, provenance, cost, last progress) live in RunDetailPanel.
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+            // Line 1: Title + attention icon
             HStack {
                 Text(run.idea?.title ?? "Unknown Idea")
-                    .font(.headline)
+                    .font(DesignTokens.Typography.cardTitle)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Spacer()
                 Image(systemName: attentionLevel.icon)
+                    .font(DesignTokens.Typography.supporting)
                     .foregroundStyle(attentionLevel.color)
             }
 
-            HStack(spacing: 8) {
-                Text(run.workflowTitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Divider().frame(height: 12)
-                Text(run.presentationStatusLabel)
-                    .font(.caption)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(statusColor.opacity(0.15))
-                    .foregroundStyle(statusColor)
-                    .clipShape(Capsule())
+            // Line 2: Status capsule + elapsed time
+            HStack(spacing: DesignTokens.Spacing.small) {
+                StatusCapsule(
+                    text: run.presentationStatusLabel,
+                    color: statusColor,
+                    size: .small
+                )
                 if let stageLabel = currentStageLabel {
                     Text(stageLabel)
-                        .font(.caption)
+                        .font(DesignTokens.Typography.micro)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-            }
-            ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
-
-            HStack(spacing: 12) {
-                Label(elapsedTimeString, systemImage: "clock")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if let cost = run.totalCostCents {
-                    Label("\(cost)c", systemImage: "dollarsign.circle")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Label(lastProgressString, systemImage: "arrow.clockwise")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                 Spacer()
-                RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
+                Text(elapsedTimeString)
+                    .font(DesignTokens.Typography.micro)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, DesignTokens.Spacing.compact)
         .accessibilityIdentifier("run-row-\(run.id.uuidString)")
         // §5.4: Contextual row actions — only executable actions appear
         .contextMenu {
@@ -356,16 +349,17 @@ struct RunsHomeRow: View {
 
     // MARK: - Computed
 
+    // Proposal 012 (M-02): Semantic status colors
     private var statusColor: Color {
         switch run.presentationStatus {
-        case .completed: return .green
-        case .failed: return .red
-        case .blocked: return .red
-        case .waitingApproval: return .orange
-        case .running: return .blue
-        case .cancelled: return .gray
-        case .cancelling: return .orange
-        case .pending, .ready: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .blocked: return DesignTokens.Status.error
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .running: return DesignTokens.Status.running
+        case .cancelled: return DesignTokens.Status.cancelled
+        case .cancelling: return DesignTokens.Status.warning
+        case .pending, .ready: return DesignTokens.Status.neutral
         }
     }
 
@@ -403,21 +397,17 @@ struct RunsHomeRow: View {
 
 // MARK: - Runtime Provenance Badge (§5.3)
 
+// Proposal 012 (M-01): Migrated to StatusCapsule pattern with DesignTokens
 struct RuntimeProvenanceBadge: View {
     let trustLevel: String?
 
     var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: badgeIcon)
-                .font(.caption2)
-            Text(badgeLabel)
-                .font(.caption2)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(badgeColor.opacity(0.12))
-        .foregroundStyle(badgeColor)
-        .clipShape(Capsule())
+        StatusCapsule(
+            text: badgeLabel,
+            color: badgeColor,
+            icon: badgeIcon,
+            size: .small
+        )
     }
 
     private var badgeLabel: String {
@@ -440,10 +430,10 @@ struct RuntimeProvenanceBadge: View {
 
     private var badgeColor: Color {
         switch trustLevel {
-        case "fixture_verified": return .green
-        case "server_verified": return .green
-        case "server_unverified": return .orange
-        default: return .secondary
+        case "fixture_verified": return DesignTokens.Status.success
+        case "server_verified": return DesignTokens.Status.success
+        case "server_unverified": return DesignTokens.Status.warning
+        default: return DesignTokens.Status.neutral
         }
     }
 }
@@ -466,7 +456,7 @@ struct ParentIdeaArchiveBadge: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background(statusColor.opacity(0.14), in: Capsule())
+        .background(statusColor.opacity(DesignTokens.badgeBackgroundOpacity), in: Capsule())
         .foregroundStyle(statusColor)
         .accessibilityIdentifier("parent-idea-archive-\(sanitizedTitle)")
     }
@@ -546,116 +536,128 @@ struct RunDetailPanel: View {
     @State private var evidenceExportMessage: String?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(run.idea?.title ?? "Unknown Idea")
-                        .font(.title)
-                    Text(run.workflowTitle)
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        Text(run.presentationStatusLabel)
-                            .font(.headline)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(statusColor.opacity(0.15))
-                            .foregroundStyle(statusColor)
-                            .clipShape(Capsule())
-                        RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
-                    }
-                    ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
-                }
-
-                Divider()
-
-                LabeledContent("Started", value: run.startedAt.formatted())
-                if let completed = run.completedAt {
-                    LabeledContent("Completed", value: completed.formatted())
-                }
-                LabeledContent("Elapsed", value: elapsedTimeString)
-                if let cost = run.totalCostCents {
-                    LabeledContent("Total Cost", value: "\(cost) cents")
-                }
-
-                Divider()
-
-                Text("Stages")
-                    .font(.headline)
-                ForEach(run.stageExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { stage in
-                    HStack {
-                        Image(systemName: stageIcon(stage.status))
-                            .foregroundStyle(stageColor(stage.status))
-                        Text(stage.label)
-                        Spacer()
-                        Text(stage.status.rawValue)
-                            .font(.caption)
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.large) {
+                    VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+                        Text(run.idea?.title ?? "Unknown Idea")
+                            .font(.title2.bold())
+                        Text(run.workflowTitle)
+                            .font(.title3)
                             .foregroundStyle(.secondary)
-                    }
-                }
-
-                Divider()
-
-                Text("Workflow Map")
-                    .font(.headline)
-                WorkflowMapView(run: run)
-
-                Divider()
-
-                // §5.4: Contextual actions — only executable actions
-                HStack(spacing: 12) {
-                    if run.status == .blocked || run.status == .failed {
-                        Button("Recover", systemImage: "arrow.counterclockwise") {
-                            onRecover()
+                        HStack {
+                            StatusCapsule(
+                                text: run.presentationStatusLabel,
+                                color: statusColor,
+                                size: .regular
+                            )
+                            RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.orange)
+                        ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
+                    }
 
-                        // Proposal 008 (§7.2): Detailed blocked-run recovery surface
-                        if let onBlockedRecovery {
-                            Button("Detailed Recovery", systemImage: "wrench.and.screwdriver") {
-                                onBlockedRecovery()
+                    Divider()
+
+                    LabeledContent("Started", value: run.startedAt.formatted())
+                    if let completed = run.completedAt {
+                        LabeledContent("Completed", value: completed.formatted())
+                    }
+                    LabeledContent("Elapsed", value: elapsedTimeString)
+                    if let cost = run.totalCostCents {
+                        LabeledContent("Total Cost", value: "\(cost) cents")
+                    }
+
+                    Divider()
+
+                    Text("Stages")
+                        .font(DesignTokens.Typography.sectionHeader)
+                    ForEach(run.stageExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { stage in
+                        HStack {
+                            Image(systemName: stageIcon(stage.status))
+                                .foregroundStyle(stageColor(stage.status))
+                            Text(stage.label)
+                            Spacer()
+                            Text(stage.status.rawValue)
+                                .font(DesignTokens.Typography.supporting)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    Text("Workflow Map")
+                        .font(DesignTokens.Typography.sectionHeader)
+                    WorkflowMapView(run: run)
+                }
+                .padding()
+            }
+
+            // Proposal 012 (L-10): Sticky action footer — always visible above the fold
+            if hasAnyAction {
+                Divider()
+                VStack(spacing: DesignTokens.Spacing.small) {
+                    HStack(spacing: DesignTokens.Spacing.medium) {
+                        if run.status == .blocked || run.status == .failed {
+                            Button("Recover", systemImage: "arrow.counterclockwise") {
+                                onRecover()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(DesignTokens.Action.caution)
+
+                            // Proposal 008 (§7.2): Detailed blocked-run recovery surface
+                            if let onBlockedRecovery {
+                                Button("Detailed Recovery", systemImage: "wrench.and.screwdriver") {
+                                    onBlockedRecovery()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+
+                        if compatibilityChecker.hasCompatibleTargets(for: run) {
+                            Button("Compare", systemImage: "arrow.left.arrow.right") {
+                                onCompare()
                             }
                             .buttonStyle(.bordered)
                         }
+
+                        if run.latestImmutableReportArtifactID != nil {
+                            Button("View Report", systemImage: "doc.text") {
+                                onViewReport()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        // Gap 2 (Proposal 007): Export Evidence Pack for completed delivery runs
+                        if (run.status == .completed || run.status == .failed),
+                           run.deliveryConfigurationJSON != nil {
+                            Button("Export Evidence Pack", systemImage: "shippingbox") {
+                                exportEvidencePack()
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("export-evidence-pack-button")
+                        }
                     }
 
-                    if compatibilityChecker.hasCompatibleTargets(for: run) {
-                        Button("Compare", systemImage: "arrow.left.arrow.right") {
-                            onCompare()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    if run.latestImmutableReportArtifactID != nil {
-                        Button("View Report", systemImage: "doc.text") {
-                            onViewReport()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    // Gap 2 (Proposal 007): Export Evidence Pack for completed delivery runs
-                    if (run.status == .completed || run.status == .failed),
-                       run.deliveryConfigurationJSON != nil {
-                        Button("Export Evidence Pack", systemImage: "shippingbox") {
-                            exportEvidencePack()
-                        }
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("export-evidence-pack-button")
+                    if let evidenceExportMessage {
+                        Text(evidenceExportMessage)
+                            .font(DesignTokens.Typography.supporting)
+                            .foregroundStyle(.secondary)
+                            .transition(.opacity)
                     }
                 }
-
-                if let evidenceExportMessage {
-                    Text(evidenceExportMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .transition(.opacity)
-                }
+                .padding()
+                .background(.bar)
             }
-            .padding()
         }
         .navigationTitle("Run Details")
         .accessibilityIdentifier("run-detail-panel")
+    }
+
+    private var hasAnyAction: Bool {
+        run.status == .blocked || run.status == .failed
+            || compatibilityChecker.hasCompatibleTargets(for: run)
+            || run.latestImmutableReportArtifactID != nil
+            || (run.deliveryConfigurationJSON != nil && (run.status == .completed || run.status == .failed))
     }
 
     private func exportEvidencePack() {
@@ -692,15 +694,16 @@ struct RunDetailPanel: View {
         try? modelContext.save()
     }
 
+    // Proposal 012 (M-02): Semantic status colors
     private var statusColor: Color {
         switch run.presentationStatus {
-        case .completed: return .green
-        case .failed, .blocked: return .red
-        case .waitingApproval: return .orange
-        case .running: return .blue
-        case .cancelling: return .orange
-        case .cancelled: return .gray
-        default: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed, .blocked: return DesignTokens.Status.error
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .running: return DesignTokens.Status.running
+        case .cancelling: return DesignTokens.Status.warning
+        case .cancelled: return DesignTokens.Status.cancelled
+        default: return DesignTokens.Status.neutral
         }
     }
 

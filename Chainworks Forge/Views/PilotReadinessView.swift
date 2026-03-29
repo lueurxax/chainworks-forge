@@ -16,6 +16,7 @@ struct PilotReadinessView: View {
     @State private var showWizard = false
     @State private var showPreflightReport = false
     @State private var selectedAssistantProviderID: UUID?
+    @State private var isRefreshing = false
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
     var body: some View {
@@ -28,21 +29,25 @@ struct PilotReadinessView: View {
                             .accessibilityIdentifier("pilot-readiness-surface-ready")
                     }
                 }
+
+                // Proposal 012 (H-02): Hero status banner
                 Section {
-                    Text("Pilot Readiness")
-                        .font(.title3.bold())
-                        .accessibilityIdentifier("pilot-readiness-title")
+                    readinessHeroBanner
                 }
-                Section("Configuration") {
-                    LabeledContent("Source", value: appConfigurationStore.configuration.activeConfigurationSource.displayName)
-                    LabeledContent("Workflow", value: appConfigurationStore.configuration.workflowSourcePath)
-                    LabeledContent("Catalog", value: appConfigurationStore.configuration.agentCatalogSourcePath)
-                    LabeledContent("Run Storage", value: appConfigurationStore.configuration.runStorageBasePath)
-                    if let gooseBaseURL = appConfigurationStore.configuration.gooseServerBaseURL {
-                        LabeledContent("Goose Base URL", value: gooseBaseURL.absoluteString)
-                    }
-                    if let worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath {
-                        LabeledContent("Worktree Base", value: worktreeBasePath)
+
+                // Proposal 012 (H-02): Configuration paths in collapsible DisclosureGroup
+                Section {
+                    DisclosureGroup("Configuration Paths") {
+                        LabeledContent("Source", value: appConfigurationStore.configuration.activeConfigurationSource.displayName)
+                        LabeledContent("Workflow", value: appConfigurationStore.configuration.workflowSourcePath)
+                        LabeledContent("Catalog", value: appConfigurationStore.configuration.agentCatalogSourcePath)
+                        LabeledContent("Run Storage", value: appConfigurationStore.configuration.runStorageBasePath)
+                        if let gooseBaseURL = appConfigurationStore.configuration.gooseServerBaseURL {
+                            LabeledContent("Goose Base URL", value: gooseBaseURL.absoluteString)
+                        }
+                        if let worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath {
+                            LabeledContent("Worktree Base", value: worktreeBasePath)
+                        }
                     }
                 }
 
@@ -289,7 +294,10 @@ struct PilotReadinessView: View {
         }
     }
 
+    // Proposal 012 (L-12): Refresh with loading state
     private func refreshReadiness() async {
+        isRefreshing = true
+        defer { isRefreshing = false }
         await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
         let preflight = PreflightService(
             appConfigurationStore: appConfigurationStore,
@@ -342,11 +350,84 @@ struct PilotReadinessView: View {
     private func statusColor(_ status: PreflightCheckStatus) -> Color {
         switch status {
         case .pass:
-            return .green
+            return DesignTokens.Status.success
         case .warn:
-            return .orange
+            return DesignTokens.Status.warning
         case .fail:
-            return .red
+            return DesignTokens.Status.error
+        }
+    }
+
+    // MARK: - Proposal 012 (H-02): Hero Readiness Banner
+
+    @ViewBuilder
+    private var readinessHeroBanner: some View {
+        if isRefreshing {
+            HStack(spacing: DesignTokens.Spacing.medium) {
+                ProgressView()
+                    .controlSize(.regular)
+                VStack(alignment: .leading) {
+                    Text("Checking Readiness…")
+                        .font(.title3.bold())
+                    Text("Running diagnostics and preflight checks.")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, DesignTokens.Spacing.small)
+        } else if let report = readinessReport {
+            let passCount = report.checks.filter { $0.status == .pass }.count
+            let totalCount = report.checks.count
+            let hasBlockers = !report.blockingIssues.isEmpty
+            let hasWarnings = !report.warnings.isEmpty
+
+            HStack(spacing: DesignTokens.Spacing.medium) {
+                Image(systemName: hasBlockers ? "xmark.circle.fill" : hasWarnings ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .font(.system(size: 36))
+                    .foregroundStyle(hasBlockers ? DesignTokens.Status.error : hasWarnings ? DesignTokens.Status.warning : DesignTokens.Status.success)
+                    .symbolRenderingMode(.multicolor)
+
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+                    Text(hasBlockers ? "\(report.blockingIssues.count) Issue(s) Found" : hasWarnings ? "Ready with Warnings" : "System Ready")
+                        .font(.title3.bold())
+                    Text("\(passCount)/\(totalCount) checks pass")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                // Progress ring
+                ZStack {
+                    Circle()
+                        .stroke(Color.secondary.opacity(0.2), lineWidth: 4)
+                    Circle()
+                        .trim(from: 0, to: totalCount > 0 ? CGFloat(passCount) / CGFloat(totalCount) : 0)
+                        .stroke(
+                            hasBlockers ? DesignTokens.Status.error : hasWarnings ? DesignTokens.Status.warning : DesignTokens.Status.success,
+                            style: StrokeStyle(lineWidth: 4, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                    Text("\(passCount)/\(totalCount)")
+                        .font(DesignTokens.Typography.micro.bold())
+                }
+                .frame(width: 44, height: 44)
+            }
+            .padding(.vertical, DesignTokens.Spacing.small)
+            .accessibilityIdentifier("pilot-readiness-title")
+        } else {
+            HStack(spacing: DesignTokens.Spacing.medium) {
+                Image(systemName: "questionmark.circle")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading) {
+                    Text("Pilot Readiness")
+                        .font(.title3.bold())
+                        .accessibilityIdentifier("pilot-readiness-title")
+                    Text("Refresh to check system readiness.")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, DesignTokens.Spacing.small)
         }
     }
 }

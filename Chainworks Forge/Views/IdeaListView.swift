@@ -50,11 +50,15 @@ struct IdeaListView: View {
 
                 Group {
                     if activeIdeas.isEmpty {
-                        ContentUnavailableView(
-                            archivedIdeas.isEmpty ? "No ideas yet" : "No active ideas",
+                        // Proposal 012 (L-01): Enhanced empty state with action
+                        StyledEmptyState(
+                            title: archivedIdeas.isEmpty ? "No ideas yet" : "No active ideas",
                             systemImage: "lightbulb",
-                            description: Text(archivedIdeas.isEmpty ? "Create your first idea to get started." : "Open the archive lane to restore an idea or create a new one.")
-                        )
+                            description: archivedIdeas.isEmpty ? "Create your first idea to get started." : "Open the archive lane to restore an idea or create a new one.",
+                            actionTitle: "New Idea"
+                        ) {
+                            presentNewIdeaSheet()
+                        }
                     } else {
                         List(selection: $selectedIdeaID) {
                             ForEach(activeIdeas) { idea in
@@ -137,10 +141,11 @@ struct IdeaListView: View {
             if let selectedIdea {
                 IdeaDetailView(idea: selectedIdea)
             } else {
-                ContentUnavailableView(
-                    "Select an Idea",
+                // Proposal 012 (L-01): Enhanced empty state
+                StyledEmptyState(
+                    title: "Select an Idea",
                     systemImage: "lightbulb",
-                    description: Text("Choose an idea from the list or create a new one to configure its project directory and start a run.")
+                    description: "Choose an idea from the list or create a new one to configure its project directory and start a run."
                 )
             }
         }
@@ -165,47 +170,93 @@ struct IdeaListView: View {
 
     // MARK: - Summary Strip
 
+    // Proposal 012 (L-03): Redesigned summary strip with pill chips and two-row layout.
     private var summaryStrip: some View {
         let draftCount = activeIdeas.filter { $0.status == .draft }.count
         let activeCount = activeIdeas.filter { $0.status == .active }.count
 
-        return HStack {
-            Image(systemName: "lightbulb.fill")
-                .foregroundStyle(.blue)
-            Text("\(activeIdeas.count) ideas \u{00B7} \(draftCount) drafts \u{00B7} \(activeCount) active")
-            if !archivedIdeas.isEmpty {
-                Button {
-                    showArchivedIdeas = true
-                } label: {
-                    Label("\(archivedIdeas.count) archived", systemImage: "archivebox")
-                        .foregroundStyle(.secondary)
+        return VStack(spacing: DesignTokens.Spacing.compact) {
+            // Row 1: Idea count chips
+            HStack(spacing: DesignTokens.Spacing.small) {
+                summaryChip(
+                    label: "\(activeIdeas.count) ideas",
+                    icon: "lightbulb.fill",
+                    color: .blue
+                )
+                summaryChip(
+                    label: "\(draftCount) drafts",
+                    icon: "pencil",
+                    color: .secondary
+                )
+                summaryChip(
+                    label: "\(activeCount) active",
+                    icon: "bolt.fill",
+                    color: DesignTokens.Status.success
+                )
+                if !archivedIdeas.isEmpty {
+                    Button {
+                        showArchivedIdeas = true
+                    } label: {
+                        summaryChip(
+                            label: "\(archivedIdeas.count) archived",
+                            icon: "archivebox",
+                            color: .secondary
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("ideas-summary-open-archive")
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("ideas-summary-open-archive")
+                Spacer()
             }
-            Spacer()
-            if executionService.hasActiveRuns {
-                Label("\(executionService.activeOrchestrators.count) running", systemImage: "bolt.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-            }
-            switch executionService.liveRuntimeReadiness {
-            case .ready(_, let source):
-                Label("Live ready (\(source))", systemImage: "bolt.horizontal.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
+
+            // Row 2: Runtime status
+            HStack(spacing: DesignTokens.Spacing.small) {
+                if executionService.hasActiveRuns {
+                    StatusCapsule(
+                        text: "\(executionService.activeOrchestrators.count) running",
+                        color: DesignTokens.Status.success,
+                        icon: "play.circle.fill",
+                        size: .small
+                    )
+                }
+                switch executionService.liveRuntimeReadiness {
+                case .ready(_, let source):
+                    StatusCapsule(
+                        text: "Live ready (\(source))",
+                        color: DesignTokens.Status.success,
+                        icon: "bolt.horizontal.circle.fill",
+                        size: .small
+                    )
                     .accessibilityIdentifier("live-runtime-ready")
-            case .unavailable:
-                Label("Live unavailable", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                case .unavailable:
+                    StatusCapsule(
+                        text: "Live unavailable",
+                        color: DesignTokens.Status.warning,
+                        icon: "exclamationmark.triangle.fill",
+                        size: .small
+                    )
                     .accessibilityIdentifier("live-runtime-unavailable")
+                }
+                Spacer()
             }
         }
-        .font(.caption)
         .padding(.horizontal)
-        .padding(.vertical, 6)
-        .background(Color.blue.opacity(0.08))
+        .padding(.vertical, DesignTokens.Spacing.small)
+        .background(Color.blue.opacity(0.06))
+    }
+
+    /// Pill-shaped chip for the summary strip.
+    private func summaryChip(label: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(DesignTokens.Typography.micro)
+            Text(label)
+                .font(DesignTokens.Typography.micro.weight(.medium))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(color.opacity(DesignTokens.badgeBackgroundOpacity), in: Capsule())
+        .foregroundStyle(color)
     }
 
     // MARK: - Approval Bar
@@ -322,70 +373,70 @@ struct NewIdeaSheetView: View {
     let onSave: () -> Void
     private let environment = ProcessInfo.processInfo.environment
 
+    // Proposal 012 (L-07): Converted to Form for macOS consistency
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("New Idea")
-                    .font(.title3.weight(.semibold))
-                Text("Capture the idea first. Project directory and run configuration come after the idea exists.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
+        NavigationStack {
+            Form {
+                Section {
+                    Text("Capture the idea first. Project directory and run configuration come after the idea exists.")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(.secondary)
+                }
 
-            VStack(alignment: .leading, spacing: 12) {
-                TextField("Title", text: $draft.title)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityIdentifier("new-idea-title-field")
-                    .onPasteCommand(of: [UTType.plainText]) { providers in
-                        guard let provider = providers.first else { return }
-                        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                            let resolvedText: String?
-                            switch item {
-                            case let data as Data:
-                                resolvedText = String(data: data, encoding: .utf8)
-                            case let string as String:
-                                resolvedText = string
-                            case let string as NSString:
-                                resolvedText = string as String
-                            default:
-                                resolvedText = nil
-                            }
-                            guard let resolvedText else { return }
-                            Task { @MainActor in
-                                draft.title = resolvedText
+                Section("Details") {
+                    TextField("Title", text: $draft.title)
+                        .accessibilityIdentifier("new-idea-title-field")
+                        .onPasteCommand(of: [UTType.plainText]) { providers in
+                            guard let provider = providers.first else { return }
+                            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                                let resolvedText: String?
+                                switch item {
+                                case let data as Data:
+                                    resolvedText = String(data: data, encoding: .utf8)
+                                case let string as String:
+                                    resolvedText = string
+                                case let string as NSString:
+                                    resolvedText = string as String
+                                default:
+                                    resolvedText = nil
+                                }
+                                guard let resolvedText else { return }
+                                Task { @MainActor in
+                                    draft.title = resolvedText
+                                }
                             }
                         }
+
+                    TextEditor(text: $draft.body)
+                        .frame(minHeight: 100)
+                        .accessibilityIdentifier("new-idea-body-field")
+                }
+
+                Section("Attachment") {
+                    HStack(spacing: DesignTokens.Spacing.small) {
+                        TextField("Path (optional)", text: $draft.attachmentPath)
+                            .accessibilityIdentifier("new-idea-attachment-field")
+                        Button("Browse...", action: onBrowseAttachment)
+                            .accessibilityIdentifier("new-idea-browse-button")
                     }
-
-                TextEditor(text: $draft.body)
-                    .frame(minHeight: 120)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(Color.secondary.opacity(0.25))
-                    )
-                    .accessibilityIdentifier("new-idea-body-field")
-
-                HStack(spacing: 10) {
-                    TextField("Attachment path (optional)", text: $draft.attachmentPath)
-                        .textFieldStyle(.roundedBorder)
-                        .accessibilityIdentifier("new-idea-attachment-field")
-                    Button("Browse...", action: onBrowseAttachment)
-                        .accessibilityIdentifier("new-idea-browse-button")
                 }
             }
-
-            HStack {
-                Button("Cancel", action: onCancel)
-                    .accessibilityIdentifier("new-idea-cancel-button")
-                Spacer()
-                Button("Save Idea", action: onSave)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!draft.canSave)
-                    .accessibilityIdentifier("new-idea-save-button")
+            .navigationTitle("New Idea")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                        .keyboardShortcut(.escape, modifiers: [])
+                        .accessibilityIdentifier("new-idea-cancel-button")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save Idea", action: onSave)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!draft.canSave)
+                        .keyboardShortcut(.return, modifiers: [.command])
+                        .accessibilityIdentifier("new-idea-save-button")
+                }
             }
         }
-        .padding(20)
         .frame(minWidth: 460, minHeight: 340)
         .accessibilityIdentifier("new-idea-sheet")
         .task {

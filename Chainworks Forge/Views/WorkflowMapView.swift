@@ -120,8 +120,11 @@ private struct WorkflowMapTopologyView: View {
     }
 }
 
+// Proposal 012 (L-05): Interactive stage cards with hover + popover
 private struct WorkflowMapStageCard: View {
     let stage: WorkflowMapStageProjection
+    @State private var isHovered = false
+    @State private var showPopover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -203,39 +206,67 @@ private struct WorkflowMapStageCard: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(stage.isCurrent ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: stage.isCurrent ? 2 : 1)
+                .stroke(stage.isCurrent ? Color.accentColor : isHovered ? Color.accentColor.opacity(0.5) : Color.secondary.opacity(0.18), lineWidth: stage.isCurrent ? 2 : isHovered ? 1.5 : 1)
         )
+        // Proposal 012 (L-05): Hover effect and tap popover
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) { isHovered = hovering }
+        }
+        .scaleEffect(isHovered ? 1.02 : 1.0)
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+        .onTapGesture { showPopover = true }
+        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                Text(stage.label)
+                    .font(DesignTokens.Typography.sectionHeader)
+                Divider()
+                LabeledContent("Owner", value: stage.ownerAgentTitle)
+                LabeledContent("Status", value: stage.status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+                LabeledContent("Iteration", value: "\(stage.iteration)")
+                if stage.approvalRequired {
+                    Label("Approval required", systemImage: "checkmark.seal")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(DesignTokens.Status.warning)
+                }
+                LabeledContent("Communications", value: "\(stage.communicationCount)")
+                LabeledContent("Agent Occurrences", value: "\(stage.occurrences.count)")
+                if !stage.transitions.isEmpty {
+                    Text("Transitions: \(stage.transitions.map(\.toLabel).joined(separator: ", "))")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding()
+            .frame(minWidth: 280)
+        }
     }
 }
 
+// Proposal 012 (M-01): Migrated to StatusCapsule
 private struct WorkflowMapStatusBadge: View {
     let status: WorkflowMapStageState
 
     var body: some View {
-        Text(status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
-            .font(.caption2.bold())
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(statusColor.opacity(0.15), in: Capsule())
-            .foregroundStyle(statusColor)
+        StatusCapsule(
+            text: status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
+            color: statusColor
+        )
     }
 
     private var statusColor: Color {
         switch status {
         case .notStarted, .pending, .ready:
-            return .secondary
+            return DesignTokens.Status.neutral
         case .running:
-            return .blue
+            return DesignTokens.Status.running
         case .waitingApproval:
-            return .orange
-        case .blocked:
-            return .red
+            return DesignTokens.Status.warning
+        case .blocked, .failed:
+            return DesignTokens.Status.error
         case .completed:
-            return .green
-        case .failed:
-            return .red
+            return DesignTokens.Status.success
         case .skipped:
-            return .secondary
+            return DesignTokens.Status.cancelled
         }
     }
 }

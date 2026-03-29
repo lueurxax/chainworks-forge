@@ -12,6 +12,7 @@ struct ContentView: View {
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
 
+    // Proposal 012 (L-08): Reduced from 7 to 6 tabs by merging Pilot Readiness into Configuration
     enum Tab: String, CaseIterable {
         case runsHome = "Runs Home"
         case ideas = "Ideas"

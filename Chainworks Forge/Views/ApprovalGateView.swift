@@ -79,6 +79,8 @@ struct ApprovalGateView: View {
                         Label("Reject", systemImage: "xmark.circle")
                     }
                     .disabled(isResolving)
+                    // Proposal 012 (L-09): Keyboard shortcut for reject
+                    .keyboardShortcut(.delete, modifiers: [.command])
                     .accessibilityIdentifier("approval-reject-button")
 
                     Spacer()
@@ -89,8 +91,10 @@ struct ApprovalGateView: View {
                         Label("Approve", systemImage: "checkmark.circle.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.green)
+                    .tint(DesignTokens.Action.approve)
                     .disabled(isResolving)
+                    // Proposal 012 (L-09): Keyboard shortcut for approve
+                    .keyboardShortcut(.return, modifiers: [.command])
                     .accessibilityIdentifier("approval-approve-button")
                 }
             }

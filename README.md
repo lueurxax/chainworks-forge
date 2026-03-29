@@ -4,232 +4,182 @@
   <img src="docs/brand/render/chainworks-forge-readme-hero.png" alt="Chainworks Forge brand hero" width="920" />
 </p>
 
-Chainworks Forge is the macOS SwiftUI app project for **Chainworks**: a local control plane for agent-driven engineering work.
+Chainworks Forge is a macOS SwiftUI control plane for agent-driven engineering workflows.
 
-The product thesis is simple: the system should move an idea through proposal, review, implementation, audit, and release using explicit workflows, specialized agents, durable artifacts, and hard approval gates. The primary object is not a chat session. It is a **Run**.
+It is built around one idea: the primary object is not a chat thread. It is a **Run**.
+A run takes one idea, compiles a frozen workflow snapshot, routes work through specialized agents, pauses at explicit approval gates, stores durable artifacts, and leaves behind a truthful report of what happened.
 
-## Brand Assets
+## What The App Does
 
-- Original designer sheet: [Chainworks Forge/Assets.xcassets/image.png](Chainworks%20Forge/Assets.xcassets/image.png)
-- Extracted app icon master: [docs/brand/original-cuts/app-icon-master.png](docs/brand/original-cuts/app-icon-master.png)
-- Extracted horizontal logo: [docs/brand/original-cuts/horizontal-logo-clean.png](docs/brand/original-cuts/horizontal-logo-clean.png)
-- Extracted README hero: [docs/brand/original-cuts/readme-hero-top-panel.png](docs/brand/original-cuts/readme-hero-top-panel.png)
-- Vector reconstruction sources: [docs/brand/chainworks-forge-app-icon.svg](docs/brand/chainworks-forge-app-icon.svg), [docs/brand/chainworks-forge-logo-horizontal.svg](docs/brand/chainworks-forge-logo-horizontal.svg), [docs/brand/chainworks-forge-readme-hero.svg](docs/brand/chainworks-forge-readme-hero.svg)
-- Rendered assets: [docs/brand/render](docs/brand/render)
-- macOS icon set: [Chainworks Forge/Assets.xcassets/AppIcon.appiconset](Chainworks%20Forge/Assets.xcassets/AppIcon.appiconset)
+- captures ideas as units of engineering work
+- executes YAML-defined workflows instead of hardcoded chat flows
+- binds specialized agents to providers, models, permissions, and output contracts
+- preserves run state, stage history, approvals, and artifact metadata in SwiftData
+- stores generated artifacts on disk instead of hiding execution inside chat history
+- supports recovery, comparison, reporting, and approval-driven continuation
+- keeps repo-backed delivery and release work behind explicit gates
 
-## Architecture Sketch
+In practice, Chainworks Forge sits between ad hoc AI chats and heavyweight orchestration systems: local-first, inspectable, and built for one engineer running governed multi-agent workflows from a desktop app.
 
-```text
-SwiftUI macOS app
-  -> Ideas / Agent Catalog / Workflow Inspector
-  -> YAML parser + validator + compact normalizer
-  -> RunPlan compiler + transition evaluator
-  -> Execution service + workflow orchestrator + resume manager
-  -> SwiftData models + RunRepository
-  -> Artifact manager + disk-backed storage
-  -> Steward deterministic analysis services
-  -> Approval + artifact-backed run history
-```
+## Core Concepts
 
-## What This Repository Contains
+| Concept | Meaning |
+|---|---|
+| `Idea` | A user-entered piece of work, optionally tied to files or a workspace. |
+| `Workflow` | A YAML-defined execution graph with stages, approvals, transitions, and agent references. |
+| `Run` | One execution instance of a workflow for one idea. This is the main operational object in the system. |
+| `RunPlanSnapshot` | The frozen workflow, catalog, provider binding, and path snapshot compiled at run start. |
+| `Agent` | A specialized worker with explicit role, provider binding, tool access, and output contract. |
+| `Artifact` | Durable output such as a proposal, review report, diff, transcript, receipt, or run report. |
+| `Approval gate` | A workflow-defined pause where the engineer must explicitly continue. |
 
-This repository currently combines:
+## Current Product Shape
 
-- a native SwiftUI macOS client with implemented foundation and core runtime slices
-- MVP, proposal, review, and reference documents
-- architecture research for orchestration and workspace isolation
-- canonical YAML examples for agent catalogs, workflows, and steward config
-- unit/UI tests plus CI configuration
+Today the app exposes these top-level operator surfaces:
 
-## Product Model
+- `Runs Home` for active, blocked, running, and completed runs
+- `Ideas` for starting and managing work
+- `Approvals` for pending human decisions
+- `Agent Catalog` for inspecting the resolved agent catalog
+- `Workflow Inspector` for YAML workflow inspection and validation
+- `Pilot Readiness` for readiness and sign-off support
+- `Settings` for provider configuration, diagnostics, and remediation
 
-Chainworks is designed around:
+The current MVP provider set is:
 
-- **Ideas** entered as text in the app, optionally with a referenced file
-- **Runs** as the main execution object
-- **Workflows** defined in YAML
-- **Specialized agents** with explicit roles, permissions, and provider bindings
-- **Artifacts** instead of free-form chat history
-- **Approval gates** before sensitive transitions
-
-For the current MVP slice, the system is intended to support:
-
-- one active run per idea
-- SwiftData as the durable local store
-- Codex, Claude Code, and Gemini as the MVP provider set
-- automatic run resume on app launch
-- three human checkpoints:
-  - after the first proposal
-  - before implementation
-  - before push / distribution
+- `Codex`
+- `Claude Code`
+- `Gemini`
 
 ## Implemented Today
 
-- SwiftUI desktop shell with `Ideas`, `Agent Catalog`, and `Workflow Inspector` tabs
-- SwiftData domain models for ideas, runs, stages, agents, approvals, artifacts, and Steward records
-- YAML DSL parsing, validation, compact workflow normalization, and provenance hashing
-- run compilation/runtime core:
+The repository is no longer a scaffold. It already contains the core control-plane and runtime slices:
+
+- SwiftUI macOS app shell with operator-facing tabs and recovery/report surfaces
+- SwiftData models for ideas, runs, stages, approvals, artifacts, benchmark/sign-off state, and provider state
+- YAML parsing, validation, normalization, and frozen provenance snapshotting
+- run compilation and execution services:
   - `RunPlanCompiler`
   - `TransitionEvaluator`
   - `ExecutionService`
   - `WorkflowOrchestrator`
   - `ResumeManager`
-- artifact handling:
+- artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`
-  - output-contract-aware artifact formatting
-- live execution slice:
-  - per-run live vs simulated executor selection
-  - Goose event bridging into run progress and live timeline state
-  - deterministic fixture-backed `proposal_loop_live` transport for local proof and tests
-  - runtime readiness gating for live mode in the app
-- deterministic Steward services:
-  - metrics collection
-  - cohort classification
-  - anomaly detection
-  - run dossier building
-- unit tests, UI tests, and CI workflow
+  - report/export surfaces
+- provider platform slices:
+  - provider settings
+  - pilot readiness
+  - Goose-backed diagnostics and remediation
+  - frozen provider/model provenance truth
+- repo-backed delivery slice:
+  - worktree provisioning
+  - delivery configuration freezing
+  - release gate UI
+  - evidence/export paths
+- layered test gates for fast runtime validation, remote UI smoke, and full sign-off
 
-## Planned Next
+## What Is Still Active
 
-- harden the live app-level proof path so the fixture-backed proposal loop is fully stable in UI automation
-- extend provider-backed execution beyond the current first live slice
-- deepen `Start Run` / run progress / stage detail / artifact inspection UI
-- approval inbox and approval decision surfaces in the app
-- richer run and artifact browsing for implemented Proposal 002 flows
-- Steward report and recommendation UI for Proposal 003 flows
+This repo is still under active product and hardening work. Current active areas are mostly about:
 
-## Not In MVP
+- MVP hardening and final sign-off flow
+- output-contract alignment, retry truth, and failure-evidence hardening
+- design-system adoption and UI polish
 
-- provider families beyond Codex, Claude Code, and Gemini
-- parallel write-capable agents in one worktree
-- distributed workers
-- cloud sync
-- shared multi-user orchestration
-
-## Canonical Documents
-
-- [Product vision](docs/research/chainworks_core_idea.md)
-- [MVP scope](docs/ps/chainworks-forge-mvp.md)
-- [Architecture research](docs/research/goose_swiftui_agent_architecture_research.md)
-- [Foundation/runtime reference](docs/reference/README.md)
-- [Live provider execution slice](docs/reference/live-provider-execution-slice.md)
-- [Operator experience baseline](docs/reference/operator-experience.md)
-- [Provider platform baseline](docs/reference/provider-platform.md)
-- [Run control baseline](docs/reference/run-control.md)
-- [Project workspace contract](docs/reference/project-workspace-contract.md)
-- [Provider binding truth](docs/reference/provider-binding-truth.md)
-- [Idea lifecycle baseline](docs/reference/idea-lifecycle.md)
-- [Goose provider remediation baseline](docs/reference/goose-provider-remediation.md)
-- [Live workflow map baseline](docs/reference/live-workflow-map.md)
-- [Test suite architecture](docs/reference/test-suite-architecture.md)
-- [Agent UI test execution](docs/reference/agent-ui-test-execution.md)
-- [Proposal 002: Workflow execution engine](docs/proposals/002-workflow-execution-engine.md)
-- [Proposal 003: Forge Steward](docs/proposals/003-forge-steward-sdlc-health-and-adaptation.md)
-
-## Canonical YAML Examples
-
-- [Full agent catalog](examples/agents/agents.yaml)
-- [Full workflow example](examples/workflows/workflow.yaml)
-- [Compact agent example](examples/agents/proposal-po-reviewer.yaml)
-- [Compact workflow example](examples/workflows/proposal-to-release.yaml)
+The best source of truth for that work is the docs index and the active proposals, not this README.
 
 ## Repository Layout
 
 ```text
 Chainworks Forge/
   Chainworks Forge.xcodeproj/   Xcode project
-  Chainworks Forge/             SwiftUI application sources
+  Chainworks Forge/             SwiftUI app sources
     DSL/                        YAML parsing, validation, normalization
-    Engine/                     Compiler, orchestration, execution, Steward services
-    Models/                     SwiftData persistence models
-    Views/                      Current desktop UI surfaces
-  Chainworks ForgeTests/        Unit tests
-  Chainworks ForgeUITests/      UI tests
-  docs/                         Product docs, proposals, reviews, reference
-  examples/                     Agent, workflow, and steward YAML examples
-  .github/                      CI workflow
+    Engine/                     Compiler, orchestration, execution, recovery, export
+    Models/                     SwiftData models and repositories
+    Views/                      Operator UI surfaces
+    Support/                    Policies, design tokens, app configuration
+  Chainworks ForgeTests/        Unit and integration tests
+  Chainworks ForgeUITests/      macOS UI tests
+  TestPlans/                    Xcode test-plan metadata
+  docs/                         reference docs, proposals, research, evidence
+  examples/                     agent catalogs and workflow examples
+  scripts/                      operational helpers, including test gates
 ```
 
-## Current Status
+## Getting Started
 
-The repository is no longer just a template scaffold. The domain model, YAML DSL, run compilation/orchestration core, and the first live execution slice are implemented. The app can now resolve live workflows per run, gate live launch on runtime readiness, and stream provider events into run state. The biggest remaining gap is full UI hardening around that live slice: the desktop app is closer to an operator console, but the end-to-end UX still needs deeper polish and more stable automation coverage.
-
-At this stage, the repository is primarily validating:
-
-- the product shape
-- the workflow model
-- the agent catalog structure
-- immutable run compilation and orchestration contracts
-- the approval and artifact model
-- the first live provider execution path through `proposal_loop_live`
-- deterministic Steward analysis boundaries
-- the local macOS control-plane direction
-
-The current runtime direction assumes:
-
-- local-first control plane in SwiftUI
-- YAML-defined workflows and agent catalogs
-- SwiftData metadata plus disk-backed artifacts
-- provider adapters and workspace-isolation boundaries
-- deterministic side-effect boundaries for git/release/publish operations
-- workflow topology resolved through agent catalog references and backend profiles
-
-## Development
-
-Requirements:
+### Requirements
 
 - macOS
-- Xcode 26.3 or newer
+- Xcode `26.3` or newer
 
-Open in Xcode:
+### Open The Project
 
 ```bash
 open "Chainworks Forge.xcodeproj"
 ```
 
-Build:
+### Build
 
 ```bash
-xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
+./scripts/test-gate.sh build
 ```
 
-Run tests:
+### Default Engineering Gate
 
 ```bash
 ./scripts/test-gate.sh fast
 ```
 
-Proposal-specific gate:
+The repository uses layered test gates. The canonical proving path is the gate runner, not raw `xcodebuild -testPlan ...` commands.
+
+## Test Gates
+
+List available gates:
 
 ```bash
-./scripts/test-gate.sh proposal-006
+./scripts/test-gate.sh list
 ```
 
-UI smoke gate:
+Most common gates:
 
-```bash
-ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"
-```
+- `./scripts/test-gate.sh build` — compile-only sanity check
+- `./scripts/test-gate.sh fast` — default inner-loop runtime/unit gate
+- `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"` — remote-only UI smoke gate
+- `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"` — remote-only full sign-off gate
 
-Full sign-off gate:
+Important:
 
-```bash
-ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"
-```
+- UI tests are remote-only by repo policy
+- the remote UI host path is documented in [`docs/reference/agent-ui-test-execution.md`](docs/reference/agent-ui-test-execution.md)
+- gate behavior and intended usage are documented in [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
 
-Run the live fixture slice locally:
+## Key Docs
 
-```bash
-CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success \
-CHAINWORKS_LIVE_PROVIDER=claude_code \
-CHAINWORKS_LIVE_MODEL=fixture-model \
-CHAINWORKS_LIVE_EFFORT=high \
-open "Chainworks Forge.xcodeproj"
-```
+Start here:
 
-Test gate reference:
+- [`docs/README.md`](docs/README.md) — documentation index and reading order
+- [`docs/ps/chainworks-forge-mvp.md`](docs/ps/chainworks-forge-mvp.md) — MVP scope and requirements
+- [`docs/research/chainworks_core_idea.md`](docs/research/chainworks_core_idea.md) — product vision and positioning
 
-- [docs/reference/test-gates.md](docs/reference/test-gates.md)
-- [docs/reference/agent-ui-test-execution.md](docs/reference/agent-ui-test-execution.md)
+Implemented-system references:
+
+- [`docs/reference/workflow-execution-engine.md`](docs/reference/workflow-execution-engine.md)
+- [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
+- [`docs/reference/operator-experience.md`](docs/reference/operator-experience.md)
+- [`docs/reference/provider-platform.md`](docs/reference/provider-platform.md)
+- [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
+- [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
+
+Examples:
+
+- [`examples/agents/agents.yaml`](examples/agents/agents.yaml)
+- [`examples/workflows/workflow.yaml`](examples/workflows/workflow.yaml)
+- [`examples/workflows/proposal-to-release.yaml`](examples/workflows/proposal-to-release.yaml)
+
+## Brand Assets
+
+Brand sources and rendered assets live under [`docs/brand`](docs/brand). The app icon set used by the macOS target lives under [`Chainworks Forge/Assets.xcassets/AppIcon.appiconset`](Chainworks%20Forge/Assets.xcassets/AppIcon.appiconset).

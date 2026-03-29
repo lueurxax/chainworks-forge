@@ -19,6 +19,10 @@ struct ProviderSettingsView: View {
     @State private var gooseTroubleshootingByProviderID: [UUID: ProviderTroubleshootingReport] = [:]
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
+    @State private var showAddProviderSheet = false
+    @State private var isRefreshing = false
+    @State private var refreshError: String?
+
     var body: some View {
         NavigationStack {
             List {
@@ -31,10 +35,10 @@ struct ProviderSettingsView: View {
                 }
                 Section {
                     Text("Provider Settings")
-                        .font(.title3.bold())
+                        .font(.title2.bold())
                         .accessibilityIdentifier("provider-settings-title")
                     Text("Use Goose-backed setup first for Codex and Claude. Treat raw paths and storage as advanced configuration, not the primary setup journey.")
-                        .font(.caption)
+                        .font(DesignTokens.Typography.supporting)
                         .foregroundStyle(.secondary)
                     Button("Open First Run Wizard") {
                         showWizard = true
@@ -42,22 +46,40 @@ struct ProviderSettingsView: View {
                     .accessibilityIdentifier("provider-settings-open-wizard")
                 }
                 managedGooseServerSection
-                providerSection
+                configuredProvidersSection
+                // Proposal 012 (H-01): Transfer moved inline as secondary section
                 transferSection
-                configurationSection
+                // Proposal 012 (H-01): Advanced config behind DisclosureGroup
+                advancedConfigurationSection
             }
             .navigationTitle("Provider Settings")
             .accessibilityIdentifier("provider-settings-view")
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button("Refresh Diagnostics") {
-                        Task { await refreshDiagnostics() }
+                    // Proposal 012 (H-01): Add Provider moved to toolbar +
+                    Button {
+                        showAddProviderSheet = true
+                    } label: {
+                        Label("Add Provider", systemImage: "plus")
                     }
+                    .accessibilityIdentifier("provider-settings-add-provider-toolbar")
+                    Button {
+                        Task {
+                            isRefreshing = true
+                            refreshError = nil
+                            await refreshDiagnostics()
+                            isRefreshing = false
+                        }
+                    } label: {
+                        if isRefreshing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(isRefreshing)
                     .accessibilityIdentifier("provider-settings-refresh-health")
-                    Button("Export Settings") {
-                        exportSettings()
-                    }
-                    .accessibilityIdentifier("provider-settings-toolbar-export")
                     Button("First Run Wizard") {
                         showWizard = true
                     }
@@ -90,11 +112,86 @@ struct ProviderSettingsView: View {
                         .environment(gooseServerManager)
                 }
             }
+            // Proposal 012 (H-01): Add Provider sheet
+            .sheet(isPresented: $showAddProviderSheet) {
+                addProviderSheet
+            }
         }
     }
 
-    private var configurationSection: some View {
-        Section("Advanced Configuration") {
+    // MARK: - Add Provider Sheet (H-01)
+    @ViewBuilder
+    private var addProviderSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Provider Family") {
+                    Picker("Family", selection: $draft.family) {
+                        ForEach(ProviderFamily.allCases, id: \.self) { family in
+                            Text(family.displayName).tag(family)
+                        }
+                    }
+                    .accessibilityIdentifier("provider-settings-family-picker")
+                    .onChange(of: draft.family) { _, newFamily in
+                        draft.applyFamilyDefaults(newFamily, configuration: appConfigurationStore.configuration)
+                    }
+                }
+
+                Section("Transport & Auth") {
+                    Picker("Transport", selection: $draft.transport) {
+                        ForEach(ProviderTransport.allCases, id: \.self) { transport in
+                            Text(transport.displayName).tag(transport)
+                        }
+                    }
+                    .accessibilityIdentifier("provider-settings-transport-picker")
+                    Text(draft.transport == .gooseServer
+                         ? "Goose Server uses the same runtime path as live runs."
+                         : "Choose the transport that matches how the provider is actually reached.")
+                        .font(DesignTokens.Typography.micro)
+                        .foregroundStyle(.secondary)
+
+                    Picker("Auth", selection: $draft.authMode) {
+                        ForEach(ProviderAuthMode.allCases, id: \.self) { authMode in
+                            Text(authMode.rawValue).tag(authMode)
+                        }
+                    }
+                    .accessibilityIdentifier("provider-settings-auth-picker")
+                }
+
+                Section("Details") {
+                    TextField("Display Name", text: $draft.displayName)
+                        .accessibilityIdentifier("provider-settings-display-name")
+                    TextField("Default Model", text: $draft.defaultModel)
+                        .accessibilityIdentifier("provider-settings-default-model")
+                    TextField(draft.transport == .gooseServer ? "Goose Endpoint (required)" : "Endpoint (optional)", text: $draft.endpoint)
+                        .accessibilityIdentifier("provider-settings-endpoint")
+                    if draft.authMode != .none {
+                        SecureField("Secret", text: $secret)
+                            .accessibilityIdentifier("provider-settings-secret")
+                    }
+                }
+            }
+            .navigationTitle("Add Provider")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showAddProviderSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        saveDraft()
+                        showAddProviderSheet = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("provider-settings-save-provider")
+                }
+            }
+        }
+        .frame(minWidth: 480, minHeight: 400)
+    }
+
+    // Proposal 012 (H-01): Advanced Configuration behind DisclosureGroup
+    private var advancedConfigurationSection: some View {
+        Section {
+            DisclosureGroup("Advanced Configuration") {
             TextField("Run Storage Base Path", text: Binding(
                 get: { appConfigurationStore.configuration.runStorageBasePath },
                 set: { newValue in
@@ -164,134 +261,116 @@ struct ProviderSettingsView: View {
                 }
             ))
             .accessibilityIdentifier("provider-settings-require-clean-preflight")
+            }
         }
     }
 
-    private var providerSection: some View {
+    // Proposal 012 (H-01): Configured providers with GroupBox boundaries
+    private var configuredProvidersSection: some View {
         Section("Configured Providers") {
             if providerSettingsStore.settings.configuredProviders.isEmpty {
-                Text("No providers configured yet")
+                Text("No providers configured yet. Use the + button to add one.")
                     .foregroundStyle(.secondary)
             }
 
-            ForEach(providerSettingsStore.settings.configuredProviders) { provider in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(provider.displayName)
-                            .font(.headline)
-                        Spacer()
-                        Text(provider.family.displayName)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Text("\(provider.transport.displayName) · \(provider.defaultModel ?? "default model not set")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Text(capabilitySummary(for: provider.capabilities))
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-
-                    if provider.family.gooseFirstPreferred && provider.transport != .gooseServer {
-                        Text("Goose-first setup is preferred for this family")
-                            .font(.caption2)
-                            .foregroundStyle(.blue)
-                    }
-
-                    if let snapshot = providerRegistry.healthSnapshot(for: provider.id) {
-                        Label(snapshot.summary, systemImage: healthIcon(snapshot.status))
-                            .font(.caption2)
-                            .foregroundStyle(color(for: snapshot.status))
-                        if !snapshot.blockingIssues.isEmpty {
-                            Text(snapshot.blockingIssues.joined(separator: " • "))
-                                .font(.caption2)
-                                .foregroundStyle(.red)
-                        }
-                        Text("Checked \(snapshot.checkedAt.formatted(date: .omitted, time: .shortened))")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    if let models = availableModelsByProviderID[provider.id], !models.isEmpty {
-                        Text("Models: \(models.joined(separator: ", "))")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if let report = gooseTroubleshootingByProviderID[provider.id] {
-                        ProviderTroubleshootingPanel(report: report)
-                    }
-
-                    if provider.family.gooseFirstPreferred {
-                        Button("Open Goose Assistant") {
-                            selectedAssistantProviderID = provider.id
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityIdentifier("provider-settings-open-assistant-\(provider.family.rawValue)")
-                    }
-
-                    HStack {
-                        Button("Prefer") {
-                            providerSettingsStore.setPreferredProvider(id: provider.id, for: provider.family)
-                        }
-                        Button("Remove", role: .destructive) {
-                            providerSettingsStore.removeProvider(id: provider.id)
+            // Proposal 012 (L-12): Inline refresh error
+            if let refreshError {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(DesignTokens.Status.warning)
+                    Text(refreshError)
+                        .font(DesignTokens.Typography.supporting)
+                    Spacer()
+                    Button("Retry") {
+                        Task {
+                            self.refreshError = nil
+                            isRefreshing = true
+                            await refreshDiagnostics()
+                            isRefreshing = false
                         }
                     }
                     .buttonStyle(.borderless)
                 }
-                .padding(.vertical, 4)
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Add Provider")
-                    .font(.subheadline.bold())
+            ForEach(providerSettingsStore.settings.configuredProviders) { provider in
+                // Proposal 012 (H-01): Each provider in a GroupBox
+                GroupBox {
+                    VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                        HStack {
+                            Text(provider.displayName)
+                                .font(DesignTokens.Typography.cardTitle)
+                            Spacer()
+                            StatusCapsule(
+                                text: provider.family.displayName,
+                                color: .blue,
+                                size: .small
+                            )
+                        }
 
-                Picker("Family", selection: $draft.family) {
-                    ForEach(ProviderFamily.allCases, id: \.self) { family in
-                        Text(family.displayName).tag(family)
+                        Text("\(provider.transport.displayName) · \(provider.defaultModel ?? "default model not set")")
+                            .font(DesignTokens.Typography.supporting)
+                            .foregroundStyle(.secondary)
+
+                        Text(capabilitySummary(for: provider.capabilities))
+                            .font(DesignTokens.Typography.micro)
+                            .foregroundStyle(.tertiary)
+
+                        if provider.family.gooseFirstPreferred && provider.transport != .gooseServer {
+                            Label("Goose-first setup is preferred for this family", systemImage: "info.circle")
+                                .font(DesignTokens.Typography.micro)
+                                .foregroundStyle(.blue)
+                        }
+
+                        // Proposal 012 (L-12): Inline health with distinct states
+                        if let snapshot = providerRegistry.healthSnapshot(for: provider.id) {
+                            Divider()
+                            Label(snapshot.summary, systemImage: healthIcon(snapshot.status))
+                                .font(DesignTokens.Typography.micro)
+                                .foregroundStyle(color(for: snapshot.status))
+                            if !snapshot.blockingIssues.isEmpty {
+                                Text(snapshot.blockingIssues.joined(separator: " • "))
+                                    .font(DesignTokens.Typography.micro)
+                                    .foregroundStyle(DesignTokens.Status.error)
+                            }
+                            Text("Checked \(snapshot.checkedAt.formatted(date: .omitted, time: .shortened))")
+                                .font(DesignTokens.Typography.micro)
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        if let models = availableModelsByProviderID[provider.id], !models.isEmpty {
+                            Text("Models: \(models.joined(separator: ", "))")
+                                .font(DesignTokens.Typography.micro)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let report = gooseTroubleshootingByProviderID[provider.id] {
+                            ProviderTroubleshootingPanel(report: report)
+                        }
+
+                        Divider()
+
+                        HStack(spacing: DesignTokens.Spacing.medium) {
+                            if provider.family.gooseFirstPreferred {
+                                Button("Open Goose Assistant") {
+                                    selectedAssistantProviderID = provider.id
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityIdentifier("provider-settings-open-assistant-\(provider.family.rawValue)")
+                            }
+                            Button("Prefer") {
+                                providerSettingsStore.setPreferredProvider(id: provider.id, for: provider.family)
+                            }
+                            .buttonStyle(.borderless)
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                providerSettingsStore.removeProvider(id: provider.id)
+                            }
+                            .buttonStyle(.borderless)
+                        }
                     }
                 }
-                .accessibilityIdentifier("provider-settings-family-picker")
-                .onChange(of: draft.family) { _, newFamily in
-                    draft.applyFamilyDefaults(newFamily, configuration: appConfigurationStore.configuration)
-                }
-
-                Picker("Transport", selection: $draft.transport) {
-                    ForEach(ProviderTransport.allCases, id: \.self) { transport in
-                        Text(transport.displayName).tag(transport)
-                    }
-                }
-                .accessibilityIdentifier("provider-settings-transport-picker")
-                Text(draft.transport == .gooseServer
-                     ? "Goose Server uses the same runtime path as live runs. Use it for Codex and Claude Code first."
-                     : "Choose the transport that matches how the provider is actually reached.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
-                Picker("Auth", selection: $draft.authMode) {
-                    ForEach(ProviderAuthMode.allCases, id: \.self) { authMode in
-                        Text(authMode.rawValue).tag(authMode)
-                    }
-                }
-                .accessibilityIdentifier("provider-settings-auth-picker")
-
-                TextField("Display Name", text: $draft.displayName)
-                    .accessibilityIdentifier("provider-settings-display-name")
-                TextField("Default Model", text: $draft.defaultModel)
-                    .accessibilityIdentifier("provider-settings-default-model")
-                TextField(draft.transport == .gooseServer ? "Goose Endpoint (required)" : "Endpoint (optional)", text: $draft.endpoint)
-                    .accessibilityIdentifier("provider-settings-endpoint")
-                if draft.authMode != .none {
-                    SecureField("Secret", text: $secret)
-                        .accessibilityIdentifier("provider-settings-secret")
-                }
-
-                Button("Save Provider") {
-                    saveDraft()
-                }
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("provider-settings-save-provider")
+                .padding(.vertical, DesignTokens.Spacing.compact)
             }
         }
         .onAppear {

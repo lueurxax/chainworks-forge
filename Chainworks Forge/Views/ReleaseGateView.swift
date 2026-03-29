@@ -74,6 +74,8 @@ struct ReleaseGateView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                // Proposal 012 (L-09): Keyboard shortcut for reject
+                .keyboardShortcut(.delete, modifiers: [.command])
                 .accessibilityIdentifier("release-gate-reject-button")
 
                 Button {
@@ -83,7 +85,9 @@ struct ReleaseGateView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.orange)
+                .tint(DesignTokens.Action.caution)
+                // Proposal 012 (L-09): Keyboard shortcut for approve
+                .keyboardShortcut(.return, modifiers: [.command])
                 .accessibilityIdentifier("release-gate-approve-button")
             }
             .controlSize(.large)
@@ -98,13 +102,11 @@ struct ReleaseGateView: View {
 
     @ViewBuilder
     private var statusBadge: some View {
-        Text("Awaiting Approval")
-            .font(.caption.bold())
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(.orange.opacity(0.15))
-            .foregroundStyle(.orange)
-            .clipShape(Capsule())
+        StatusCapsule(
+            text: "Awaiting Approval",
+            color: DesignTokens.Status.warning,
+            icon: "checkmark.seal"
+        )
     }
 
     @ViewBuilder
@@ -147,17 +149,36 @@ struct ReleaseGateView: View {
         }
     }
 
+    // Proposal 012 (L-06): Three-state review row semantics.
+    // - "Available" (green) — artifact exists
+    // - "Not yet produced" (neutral/secondary) — expected during in-progress runs
+    // - "Missing" (warning/orange) — expected artifact was not generated in a terminal run
     @ViewBuilder
     private func reviewRow(_ label: String, artifactName: String, in artifacts: [Artifact]) -> some View {
         let exists = artifacts.contains { $0.name == artifactName }
+        let isTerminal = run.status == .completed || run.status == .failed || run.status == .cancelled
         HStack {
-            Image(systemName: exists ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(exists ? .green : .secondary)
+            if exists {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(DesignTokens.Status.success)
+            } else if isTerminal {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(DesignTokens.Status.warning)
+            } else {
+                Image(systemName: "circle.dashed")
+                    .foregroundStyle(DesignTokens.Status.neutral)
+            }
             Text(label)
             Spacer()
-            Text(exists ? "Available" : "Missing")
-                .font(.caption)
-                .foregroundStyle(exists ? .green : .orange)
+            if exists {
+                StatusCapsule(text: "Available", color: DesignTokens.Status.success, size: .small)
+            } else if isTerminal {
+                StatusCapsule(text: "Missing", color: DesignTokens.Status.warning, size: .small)
+            } else {
+                Text("Not yet produced")
+                    .font(DesignTokens.Typography.supporting)
+                    .foregroundStyle(DesignTokens.Status.neutral)
+            }
         }
     }
 

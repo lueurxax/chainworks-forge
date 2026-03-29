@@ -148,6 +148,8 @@ struct RecoverySheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        // Proposal 012 (L-09): Escape to dismiss recovery sheet
+                        .keyboardShortcut(.escape, modifiers: [])
                 }
             }
         }

@@ -8,20 +8,19 @@ struct DeliveryPreflightReportView: View {
     let result: DeliveryPreflightService.PreflightResult
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
             HStack {
                 Image(systemName: result.passed ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
-                    .foregroundStyle(result.passed ? .green : .orange)
+                    .foregroundStyle(result.passed ? DesignTokens.Status.success : DesignTokens.Status.warning)
                 Text("Delivery Preflight")
-                    .font(.headline)
+                    .font(DesignTokens.Typography.sectionHeader)
                 Spacer()
-                Text(result.passed ? "Ready" : "Issues Found")
-                    .font(.caption.bold())
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(result.passed ? Color.green.opacity(0.15) : Color.orange.opacity(0.15))
-                    .foregroundStyle(result.passed ? .green : .orange)
-                    .clipShape(Capsule())
+                // Proposal 012 (M-01): Migrated to StatusCapsule
+                StatusCapsule(
+                    text: result.passed ? "Ready" : "Issues Found",
+                    color: result.passed ? DesignTokens.Status.success : DesignTokens.Status.warning,
+                    icon: result.passed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                )
             }
 
             ForEach(result.checks, id: \.id) { check in

@@ -21,11 +21,49 @@ struct FirstRunSetupWizard: View {
     @State private var transferMessage: String?
     @State private var showPreflightReport = false
     @State private var selectedAssistantProviderID: UUID?
+    @State private var isLaunching = false
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
+
+    // Proposal 012 (H-03): Wizard steps
+    enum WizardStep: Int, CaseIterable {
+        case workspace = 0
+        case providers = 1
+        case verification = 2
+        case launch = 3
+
+        var title: String {
+            switch self {
+            case .workspace: return "Workspace"
+            case .providers: return "Providers"
+            case .verification: return "Verification"
+            case .launch: return "Launch"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .workspace: return "folder"
+            case .providers: return "server.rack"
+            case .verification: return "checkmark.shield"
+            case .launch: return "play.circle"
+            }
+        }
+    }
+
+    @State private var currentStep: WizardStep = .workspace
 
     var body: some View {
         NavigationStack {
-            Form {
+            VStack(spacing: 0) {
+                // Proposal 012 (H-03): Step indicator strip
+                wizardStepIndicator
+                    .padding(.vertical, DesignTokens.Spacing.medium)
+                    .padding(.horizontal)
+                    .background(.bar)
+
+                Divider()
+
+                Form {
                 if showsUITestReadyMarker {
                     Section {
                         Button("First Run Setup Ready") {}
@@ -36,6 +74,8 @@ struct FirstRunSetupWizard: View {
                             .accessibilityIdentifier("first-run-setup-wizard")
                     }
                 }
+
+                // Show sections based on current step (all visible but highlighted)
                 Section("Workspace & YAML") {
                     TextField("Run Storage Base Path", text: $runStorageBasePath)
                         .accessibilityIdentifier("first-run-run-storage-path")
@@ -176,28 +216,42 @@ struct FirstRunSetupWizard: View {
 
                 Section("Sample Run Path") {
                     Text("Creates a sample idea and launches the current safe workflow path with frozen provider bindings.")
-                        .font(.caption)
+                        .font(DesignTokens.Typography.supporting)
                         .foregroundStyle(.secondary)
 
-                    Button("Save and Launch Sample Run") {
+                    // Proposal 012 (L-12): Footer-level blocking progress during save/launch
+                    Button {
                         Task { await saveAndLaunchSampleRun() }
+                    } label: {
+                        HStack {
+                            if isLaunching {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Launching…")
+                            } else {
+                                Label("Save and Launch Sample Run", systemImage: "play.circle.fill")
+                            }
+                        }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(providerSettingsStore.settings.configuredProviders.isEmpty)
+                    .disabled(providerSettingsStore.settings.configuredProviders.isEmpty || isLaunching)
                     .accessibilityIdentifier("first-run-launch-sample-run")
 
                     if let wizardMessage {
                         Text(wizardMessage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(DesignTokens.Typography.supporting)
+                            .foregroundStyle(wizardMessage.contains("started") ? DesignTokens.Status.success : DesignTokens.Status.error)
                             .accessibilityIdentifier("first-run-message")
                     }
                 }
-            }
+                } // end Form
+            } // end VStack
             .navigationTitle("First Run Setup")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { isPresented = false }
+                        // Proposal 012 (L-09): Escape to dismiss wizard
+                        .keyboardShortcut(.escape, modifiers: [])
                         .accessibilityIdentifier("first-run-close")
                 }
                 ToolbarItem(placement: .confirmationAction) {
@@ -210,6 +264,8 @@ struct FirstRunSetupWizard: View {
                         isPresented = false
                     }
                     .buttonStyle(.borderedProminent)
+                    // Proposal 012 (L-09): ⌘S to save wizard configuration
+                    .keyboardShortcut("s", modifiers: [.command])
                     .accessibilityIdentifier("first-run-save")
                 }
             }
@@ -290,7 +346,11 @@ struct FirstRunSetupWizard: View {
         )
     }
 
+    // Proposal 012 (L-12): Save and launch with loading + error state
     private func saveAndLaunchSampleRun() async {
+        isLaunching = true
+        defer { isLaunching = false }
+        wizardMessage = nil
         persistConfiguration()
         await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
         await refreshPreflight()
@@ -309,6 +369,52 @@ struct FirstRunSetupWizard: View {
         } catch {
             wizardMessage = error.localizedDescription
         }
+    }
+
+    // Proposal 012 (H-03): Step indicator strip
+    private var wizardStepIndicator: some View {
+        HStack(spacing: 0) {
+            ForEach(WizardStep.allCases, id: \.rawValue) { step in
+                HStack(spacing: DesignTokens.Spacing.compact) {
+                    Image(systemName: stepCompleted(step) ? "checkmark.circle.fill" : step.icon)
+                        .font(.caption)
+                        .foregroundStyle(stepColor(step))
+                    Text(step.title)
+                        .font(currentStep == step ? DesignTokens.Typography.cardTitle : DesignTokens.Typography.supporting)
+                        .foregroundStyle(currentStep == step ? .primary : .secondary)
+                }
+                .padding(.horizontal, DesignTokens.Spacing.small)
+                .padding(.vertical, DesignTokens.Spacing.compact)
+                .background(currentStep == step ? Color.accentColor.opacity(0.1) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                .onTapGesture { currentStep = step }
+
+                if step.rawValue < WizardStep.allCases.count - 1 {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 2)
+                }
+            }
+        }
+    }
+
+    private func stepCompleted(_ step: WizardStep) -> Bool {
+        switch step {
+        case .workspace:
+            return !runStorageBasePath.isEmpty && !workflowSourcePath.isEmpty && !agentCatalogSourcePath.isEmpty
+        case .providers:
+            return !providerSettingsStore.settings.configuredProviders.isEmpty
+        case .verification:
+            return latestPreflight?.status == .pass || latestPreflight?.status == .warn
+        case .launch:
+            return wizardMessage?.contains("started") ?? false
+        }
+    }
+
+    private func stepColor(_ step: WizardStep) -> Color {
+        if stepCompleted(step) { return DesignTokens.Status.success }
+        if currentStep == step { return DesignTokens.Action.primary }
+        return .secondary
     }
 
     private func exportSettings() {

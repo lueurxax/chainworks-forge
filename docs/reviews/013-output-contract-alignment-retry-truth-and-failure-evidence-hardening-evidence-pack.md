@@ -140,6 +140,7 @@
 
 ## O. Research Triggers / External Questions
 
+- 2026-03-29 refresh note: no new research triggers were added. The same bounded `RQ-01` through `RQ-03` set remains sufficient and was rechecked against refreshed official sources.
 - `RQ-01` Host-system integration risk: do authoritative workflow systems preserve previous attempt history/evidence when rerunning failed work from the same logical snapshot, and what can Proposal 013 borrow here without violating current repo truth?
 - `RQ-02` Unresolved tradeoff: should validation failure evidence be persisted as a first-class result object distinct from metrics or summary state, and how should operator-facing links/references be derived from that object?
 - `RQ-03` Unresolved tradeoff: should output-contract / validation mismatches be treated more like permanent or operator-actionable failures than transient auto-retry cases?

@@ -63,7 +63,9 @@ struct ForegroundBannerView: View {
             .buttonStyle(.plain)
             .padding(.horizontal, 12)
             .padding(.top, 4)
-            .transition(.move(edge: .top).combined(with: .opacity))
+            // Proposal 012 (M-04): Banner is positioned at .bottom via overlay alignment,
+            // so the transition must slide from the bottom edge, not the top.
+            .transition(.move(edge: .bottom).combined(with: .opacity))
             .accessibilityIdentifier("foreground-attention-banner")
         }
     }
