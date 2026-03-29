@@ -471,6 +471,210 @@ struct OrchestratorTests {
         }
     }
 
+    @Test("Orchestrator persists canonical execution truth on successful agent execution")
+    func persistsCanonicalExecutionTruthOnSuccess() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = makeAgent(id: "agent_1")
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "agent_1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "agent_1", task: "do_work", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "agent_1",
+                    runBlock: nil, runAfterApproval: nil, transitions: [],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["agent_1": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: FailurePolicy(onError: "fail_run", onLoopBudgetExhausted: "fail_run", preserveArtifacts: true),
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let result = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "done",
+            costCents: 5,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "runtime-session-1",
+            durationSeconds: 0.1,
+            providerReceipt: ProviderExecutionReceipt(
+                providerFamily: "goose_openai",
+                configuredProviderID: nil,
+                model: "gpt-5.4",
+                effort: "high",
+                transport: "http_sse",
+                inputTokens: 10,
+                outputTokens: 20,
+                billedUnits: nil,
+                costCents: 5,
+                wallClockSeconds: 0.1,
+                rawReceiptJSON: nil
+            ),
+            resolvedModel: "configured-model",
+            configuredProviderID: nil,
+            adapterVersion: "adapter-v2",
+            canonicalOutcome: .completed,
+            transportErrorKind: nil,
+            providerStopReason: "end_turn",
+            outputPresence: .durableOutput,
+            runtimeProvider: "runtime-provider",
+            runtimeModel: "runtime-model",
+            outcomeEnvelope: OutcomeEnvelope(
+                canonicalOutcome: .completed,
+                transportErrorKind: nil,
+                providerStopReason: "end_turn",
+                outputPresence: .durableOutput,
+                rawErrorMessage: nil,
+                rawFinishEvent: #"{"stop_reason":"end_turn"}"#
+            )
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let agentExec = try #require(run.stageExecutions.first?.agentExecutions.first)
+        #expect(agentExec.status == .completed)
+        #expect(agentExec.canonicalOutcome == .completed)
+        #expect(agentExec.outputPresence == .durableOutput)
+        #expect(agentExec.providerStopReason == "end_turn")
+        #expect(agentExec.runtimeProvider == "runtime-provider")
+        #expect(agentExec.runtimeModel == "runtime-model")
+        #expect(agentExec.settledAt != nil)
+        #expect(agentExec.providerSessionID == "runtime-session-1")
+
+        let envelopeData = try #require(agentExec.outcomeEnvelopeJSON)
+        let envelope = try JSONDecoder().decode(OutcomeEnvelope.self, from: envelopeData)
+        #expect(envelope.canonicalOutcome == .completed)
+        #expect(envelope.providerStopReason == "end_turn")
+        #expect(envelope.outputPresence == .durableOutput)
+        #expect(envelope.rawFinishEvent == #"{"stop_reason":"end_turn"}"#)
+    }
+
+    @Test("Validation failure overrides provisional completed outcome with failed-after-output-validation")
+    func validationFailureOverridesCompletedOutcome() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: ["claude_code"]
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: [:],
+            contracts: [
+                "output_1_v1": ArtifactContract(format: "json", requiredFields: ["score"])
+            ],
+            backendProfiles: [:],
+            permissionProfiles: [:],
+            agents: []
+        )
+
+        let agent = makeAgent(id: "agent_1", outputs: ["output_1"])
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "agent_1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "agent_1", task: "produce", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["agent_1": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: FailurePolicy(onError: "fail_run", onLoopBudgetExhausted: "fail_run", preserveArtifacts: true),
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let result = AgentResult(
+            outputs: ["output_1": Data("not valid json".utf8)],
+            logSnippet: "produced invalid payload",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0.1,
+            providerReceipt: nil,
+            resolvedModel: "fixture-model",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            transportErrorKind: nil,
+            providerStopReason: "end_turn",
+            outputPresence: .durableOutput,
+            runtimeProvider: "claude-code",
+            runtimeModel: "fixture-model"
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context,
+            catalog: catalog
+        )
+
+        await orchestrator.start()
+
+        let agentExec = try #require(run.stageExecutions.first?.agentExecutions.first)
+        #expect(run.status == .failed)
+        #expect(agentExec.status == .failed)
+        #expect(agentExec.canonicalOutcome == .failedAfterOutputValidation)
+        #expect(agentExec.outputPresence == .durableOutput)
+        #expect(agentExec.settledAt != nil)
+
+        let envelopeData = try #require(agentExec.outcomeEnvelopeJSON)
+        let envelope = try JSONDecoder().decode(OutcomeEnvelope.self, from: envelopeData)
+        #expect(envelope.canonicalOutcome == .failedAfterOutputValidation)
+    }
+
     @Test("Completed run persists final feature report")
     func completedRunPersistsFinalFeatureReport() async throws {
         let workspace = makeWorkspace()
@@ -1134,11 +1338,14 @@ struct OrchestratorTests {
 
         await orchestrator.start()
 
-        #expect(run.status == .failed)
-        #expect(run.stageExecutions.count == 1)
-        #expect(run.stageExecutions.first?.agentExecutions.first?.status == .failed)
-        #expect(run.stageExecutions.first?.agentExecutions.first?.logSnippet?.contains("not valid JSON") == true)
-        #expect(run.stageExecutions.first?.agentExecutions.first?.artifacts.isEmpty ?? true)
+        // Proposal 013 §4.3: structured_with_human_companion mode now accepts markdown reviews.
+        // Non-JSON review output ("not valid json") is treated as human companion text and PASSES validation.
+        // The run completes successfully because the human companion is accepted.
+        #expect(run.status == .completed)
+        let agentExec = run.stageExecutions.first?.agentExecutions.first
+        #expect(agentExec?.status == .completed)
+        // Raw outputs are persisted as artifacts
+        #expect(agentExec?.artifacts.isEmpty == false)
     }
 
     @Test("Repo-backed execution injects source context into agent inputs")

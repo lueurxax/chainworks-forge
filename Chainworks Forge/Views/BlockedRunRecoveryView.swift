@@ -19,6 +19,9 @@ struct BlockedRunRecoveryView: View {
     @State private var receiptArtifacts: [Artifact] = []
     @State private var diffArtifacts: [Artifact] = []
     @State private var testArtifacts: [Artifact] = []
+    // Proposal 013: Evidence-aware recovery
+    @State private var evidencePacket: FailedStageEvidencePacket?
+    @State private var showEvidencePanel = false
 
     // MARK: - Recovery Path Classification
 
@@ -94,7 +97,24 @@ struct BlockedRunRecoveryView: View {
         .navigationTitle("Run Recovery")
         .task {
             loadArtifactContext()
+            loadEvidencePacket()
             classifyRecoveryPath()
+        }
+        .sheet(isPresented: $showEvidencePanel) {
+            if let packet = evidencePacket {
+                NavigationStack {
+                    ScrollView {
+                        FailedStageEvidencePanel(evidencePacket: packet)
+                    }
+                    .navigationTitle("Failure Evidence")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close") { showEvidencePanel = false }
+                        }
+                    }
+                }
+                .frame(minWidth: 500, minHeight: 400)
+            }
         }
     }
 
@@ -150,6 +170,17 @@ struct BlockedRunRecoveryView: View {
                 HStack(spacing: 8) {
                     RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
                     ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
+                    // Proposal 013: Evidence panel button
+                    if evidencePacket != nil {
+                        Button {
+                            showEvidencePanel = true
+                        } label: {
+                            Label("Failure Evidence", systemImage: "doc.text.magnifyingglass")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
                 }
             }
         } label: {
@@ -526,6 +557,12 @@ struct BlockedRunRecoveryView: View {
     }
 
     // MARK: - Data Loading
+
+    // Proposal 013: Load and present evidence packet
+    private func loadEvidencePacket() {
+        let coordinator = RecoveryCoordinator(modelContext: modelContext)
+        evidencePacket = coordinator.buildEvidencePacket(for: run)
+    }
 
     private func loadArtifactContext() {
         let runID = run.id

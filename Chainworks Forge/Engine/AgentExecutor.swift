@@ -92,6 +92,60 @@ struct AgentResult: Sendable {
     let configuredProviderID: UUID?
     /// Adapter version used to execute.
     let adapterVersion: String?
+    /// Canonical terminal outcome for this attempt.
+    let canonicalOutcome: AgentCanonicalOutcome?
+    /// Normalized transport failure class, if any.
+    let transportErrorKind: TransportErrorKind?
+    /// Normalized provider/app stop reason, if any.
+    let providerStopReason: String?
+    /// Whether durable output existed before settlement.
+    let outputPresence: OutputPresence
+    /// Actual runtime provider identity when known.
+    let runtimeProvider: String?
+    /// Actual runtime model identity when known.
+    let runtimeModel: String?
+    /// Supporting diagnostic envelope for later readers.
+    let outcomeEnvelope: OutcomeEnvelope?
+
+    init(
+        outputs: [String: Data],
+        logSnippet: String?,
+        costCents: Int64?,
+        succeeded: Bool,
+        errorMessage: String?,
+        sessionID: String?,
+        durationSeconds: Double,
+        providerReceipt: ProviderExecutionReceipt?,
+        resolvedModel: String?,
+        configuredProviderID: UUID?,
+        adapterVersion: String?,
+        canonicalOutcome: AgentCanonicalOutcome? = nil,
+        transportErrorKind: TransportErrorKind? = nil,
+        providerStopReason: String? = nil,
+        outputPresence: OutputPresence = .none,
+        runtimeProvider: String? = nil,
+        runtimeModel: String? = nil,
+        outcomeEnvelope: OutcomeEnvelope? = nil
+    ) {
+        self.outputs = outputs
+        self.logSnippet = logSnippet
+        self.costCents = costCents
+        self.succeeded = succeeded
+        self.errorMessage = errorMessage
+        self.sessionID = sessionID
+        self.durationSeconds = durationSeconds
+        self.providerReceipt = providerReceipt
+        self.resolvedModel = resolvedModel
+        self.configuredProviderID = configuredProviderID
+        self.adapterVersion = adapterVersion
+        self.canonicalOutcome = canonicalOutcome
+        self.transportErrorKind = transportErrorKind
+        self.providerStopReason = providerStopReason
+        self.outputPresence = outputPresence
+        self.runtimeProvider = runtimeProvider
+        self.runtimeModel = runtimeModel
+        self.outcomeEnvelope = outcomeEnvelope
+    }
 }
 
 // MARK: - Output Contract Resolution

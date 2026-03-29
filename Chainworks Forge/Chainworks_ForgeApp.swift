@@ -30,12 +30,97 @@ private enum UIAutomationDiagnostics {
     }
 }
 
+private struct UITestWindowSize {
+    let width: CGFloat
+    let height: CGFloat
+
+    static let `default` = UITestWindowSize(width: 1200, height: 800)
+
+    static var requested: UITestWindowSize? {
+        guard let rawValue = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_WINDOW_SIZE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !rawValue.isEmpty
+        else { return nil }
+
+        let normalized = rawValue.lowercased().replacingOccurrences(of: "×", with: "x")
+        let parts = normalized.split(separator: "x", maxSplits: 1).map(String.init)
+        guard
+            parts.count == 2,
+            let width = Double(parts[0]),
+            let height = Double(parts[1]),
+            width > 0,
+            height > 0
+        else {
+            return nil
+        }
+
+        return UITestWindowSize(width: width, height: height)
+    }
+
+    var accessibilityIdentifier: String {
+        "ui-test-window-size-\(Int(width))x\(Int(height))"
+    }
+}
+
+struct UITestAccessibilitySettings: Equatable {
+    let differentiateWithoutColor: Bool
+    let increaseContrast: Bool
+    let reduceTransparency: Bool
+
+    static let none = UITestAccessibilitySettings(
+        differentiateWithoutColor: false,
+        increaseContrast: false,
+        reduceTransparency: false
+    )
+
+    static var requested: UITestAccessibilitySettings? {
+        let environment = ProcessInfo.processInfo.environment
+        let settings = UITestAccessibilitySettings(
+            differentiateWithoutColor: environment["CHAINWORKS_UI_TEST_DIFFERENTIATE_WITHOUT_COLOR"] == "1",
+            increaseContrast: environment["CHAINWORKS_UI_TEST_INCREASE_CONTRAST"] == "1",
+            reduceTransparency: environment["CHAINWORKS_UI_TEST_REDUCE_TRANSPARENCY"] == "1"
+        )
+        return settings.hasOverrides ? settings : nil
+    }
+
+    var hasOverrides: Bool {
+        differentiateWithoutColor || increaseContrast || reduceTransparency
+    }
+
+    var activeIdentifiers: [String] {
+        var identifiers: [String] = []
+        if differentiateWithoutColor {
+            identifiers.append("ui-test-accessibility-differentiate-without-color")
+        }
+        if increaseContrast {
+            identifiers.append("ui-test-accessibility-increase-contrast")
+        }
+        if reduceTransparency {
+            identifiers.append("ui-test-accessibility-reduce-transparency")
+        }
+        return identifiers
+    }
+}
+
+private struct UITestAccessibilitySettingsKey: EnvironmentKey {
+    static let defaultValue: UITestAccessibilitySettings = .none
+}
+
+extension EnvironmentValues {
+    var uiTestAccessibilitySettings: UITestAccessibilitySettings {
+        get { self[UITestAccessibilitySettingsKey.self] }
+        set { self[UITestAccessibilitySettingsKey.self] = newValue }
+    }
+}
+
 @main
 struct Chainworks_ForgeApp: App {
     static let processEnvironment = ProcessInfo.processInfo.environment
     static let isTestHost = processEnvironment["XCTestConfigurationFilePath"] != nil
     static let isUIAutomationHost = processEnvironment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
     static let isUnitTestHost = isTestHost && !isUIAutomationHost
+    fileprivate static let uiWindowSize = UITestWindowSize.requested ?? .default
+    fileprivate static let uiAccessibilitySettings = UITestAccessibilitySettings.requested
     static let sharedModelContainer: ModelContainer = {
         let environment = ProcessInfo.processInfo.environment
         let schema = Schema([
@@ -90,7 +175,7 @@ struct Chainworks_ForgeApp: App {
             RootHostView()
         }
         .modelContainer(Self.sharedModelContainer)
-        .defaultSize(width: 1200, height: 800)
+        .defaultSize(width: Self.uiWindowSize.width, height: Self.uiWindowSize.height)
     }
 
 }
@@ -124,7 +209,7 @@ final class AutomationFallbackAppDelegate: NSObject, NSApplicationDelegate {
             let window = NSWindow(contentViewController: hostingController)
             window.title = "Chainworks Forge"
             window.identifier = NSUserInterfaceItemIdentifier("chainworks-fallback-window")
-            window.setContentSize(NSSize(width: 1200, height: 800))
+            window.setContentSize(NSSize(width: Chainworks_ForgeApp.uiWindowSize.width, height: Chainworks_ForgeApp.uiWindowSize.height))
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.center()
             window.makeKeyAndOrderFront(nil)
@@ -360,96 +445,147 @@ struct AppBootstrapView: View {
         gooseServerManager: GooseServerManager
     ) -> some View {
         if let forcedUISurface {
-            VStack(spacing: 0) {
-                Button("UI Test Surface: \(forcedUISurface.rawValue)") {}
-                    .buttonStyle(.plain)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .accessibilityIdentifier("ui-test-direct-surface-ready-\(forcedUISurface.rawValue)")
+            withRequestedWindowSizeMarker {
+                VStack(spacing: 0) {
+                    Text("UI Test Surface: \(forcedUISurface.rawValue)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .accessibilityIdentifier("ui-test-direct-surface-ready-\(forcedUISurface.rawValue)")
 
-                Group {
-                    switch forcedUISurface {
-                    case .providerSettings:
-                        ProviderSettingsView()
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .pilotReadiness:
-                        PilotReadinessView()
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .firstRunSetup:
-                        FirstRunSetupWizard(isPresented: .constant(true))
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .ideaArchive:
-                        UITestIdeaArchiveSurface()
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .workflowMap:
-                        UITestWorkflowMapSurface()
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .gooseAssistant:
-                        UITestGooseAssistantSurface()
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .releaseGate:
-                        UITestReleaseGateSurface()
-                            .environment(service)
-                            .environment(appConfigurationStore)
-                            .environment(providerSettingsStore)
-                            .environment(providerRegistry)
-                            .environment(gooseServerManager)
-                    case .completedExportHub:
-                        UITestCompletedExportHubSurface()
+                    if let requestedWindowSize = UITestWindowSize.requested {
+                        Text("Window \(Int(requestedWindowSize.width))×\(Int(requestedWindowSize.height))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 4)
+                            .accessibilityIdentifier(requestedWindowSize.accessibilityIdentifier)
+                    }
+
+                    Group {
+                        switch forcedUISurface {
+                        case .providerSettings:
+                            ProviderSettingsView()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .pilotReadiness:
+                            PilotReadinessView()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .firstRunSetup:
+                            FirstRunSetupWizard(isPresented: .constant(true))
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .ideaArchive:
+                            UITestIdeaArchiveSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .workflowMap:
+                            UITestWorkflowMapSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .gooseAssistant:
+                            UITestGooseAssistantSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .releaseGate:
+                            UITestReleaseGateSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .deliveryPreflightReport:
+                            UITestDeliveryPreflightReportSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .completedExportHub:
+                            UITestCompletedExportHubSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .accessibilityAudit:
+                            UITestAccessibilityAuditSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(minWidth: 960, minHeight: 720)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("ui-test-direct-surface-container-\(forcedUISurface.rawValue)")
+        } else {
+            withRequestedWindowSizeMarker {
+                ContentView()
+                    .environment(service)
+                    .environment(appConfigurationStore)
+                    .environment(providerSettingsStore)
+                    .environment(providerRegistry)
+                    .environment(gooseServerManager)
+                    .sheet(isPresented: $showFirstRunWizard) {
+                        FirstRunSetupWizard(isPresented: $showFirstRunWizard)
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
                             .environment(gooseServerManager)
                     }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(minWidth: 960, minHeight: 720)
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("ui-test-direct-surface-container-\(forcedUISurface.rawValue)")
-        } else {
-            ContentView()
-                .environment(service)
-                .environment(appConfigurationStore)
-                .environment(providerSettingsStore)
-                .environment(providerRegistry)
-                .environment(gooseServerManager)
-                .sheet(isPresented: $showFirstRunWizard) {
-                    FirstRunSetupWizard(isPresented: $showFirstRunWizard)
-                        .environment(service)
-                        .environment(appConfigurationStore)
-                        .environment(providerSettingsStore)
-                        .environment(providerRegistry)
-                        .environment(gooseServerManager)
-                }
         }
+    }
+
+    @ViewBuilder
+    private func withRequestedWindowSizeMarker<Content: View>(
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        content()
+            .environment(\.uiTestAccessibilitySettings, Chainworks_ForgeApp.uiAccessibilitySettings ?? .none)
+            .overlay(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: 1) {
+                    if let requestedWindowSize = UITestWindowSize.requested {
+                        Color.clear
+                            .frame(width: 1, height: 1)
+                            .accessibilityIdentifier(requestedWindowSize.accessibilityIdentifier)
+                    }
+
+                    if let requestedSettings = Chainworks_ForgeApp.uiAccessibilitySettings {
+                        ForEach(requestedSettings.activeIdentifiers, id: \.self) { identifier in
+                            Color.clear
+                                .frame(width: 1, height: 1)
+                                .accessibilityIdentifier(identifier)
+                        }
+                    }
+                }
+            }
     }
 
     private static func loadBundledCatalog(appConfiguration: AppConfiguration) -> AgentCatalog? {

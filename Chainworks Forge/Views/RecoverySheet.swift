@@ -18,6 +18,9 @@ struct RecoverySheet: View {
     // Proposal 008 (§7.2): Show stage history and preserved receipts
     @State private var showStageHistory = false
     @State private var showPreservedReceipts = false
+    // Proposal 013 (§7.3): Failed stage evidence panel
+    @State private var showEvidencePanel = false
+    @State private var evidencePacket: FailedStageEvidencePacket?
 
     var body: some View {
         NavigationStack {
@@ -35,6 +38,33 @@ struct RecoverySheet: View {
 
                     GroupBox("Runtime Trust") {
                         RuntimeProvenanceBadge(trustLevel: context.trustSummary)
+                    }
+
+                    // Proposal 013 (§7.3): Evidence summary
+                    if let evidenceSummary = context.evidenceSummary {
+                        GroupBox("Evidence") {
+                            HStack {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                    .foregroundStyle(.orange)
+                                VStack(alignment: .leading) {
+                                    Text(evidenceSummary)
+                                        .font(.caption)
+                                    if let failureClass = context.failureClass {
+                                        Text("Failure: \(failureClass.replacingOccurrences(of: "_", with: " "))")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                if evidencePacket != nil {
+                                    Button("Details") {
+                                        showEvidencePanel = true
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                }
+                            }
+                        }
                     }
 
                     Divider()
@@ -68,7 +98,14 @@ struct RecoverySheet: View {
                                 HStack {
                                     Image(systemName: action.systemImage)
                                         .frame(width: 24)
-                                    Text(action.label)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(action.label)
+                                            .font(.callout)
+                                        // Proposal 013 §7.2: Action explanation text
+                                        Text(recoveryActionExplanation(action))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                     Spacer()
                                     Button("Execute") {
                                         executeAction(action)
@@ -157,6 +194,24 @@ struct RecoverySheet: View {
         .task {
             let coordinator = RecoveryCoordinator(modelContext: modelContext)
             recoveryContext = coordinator.recoveryContext(for: run)
+            // Proposal 013: Build evidence packet for the evidence panel
+            evidencePacket = coordinator.buildEvidencePacket(for: run)
+        }
+        .sheet(isPresented: $showEvidencePanel) {
+            if let packet = evidencePacket {
+                NavigationStack {
+                    ScrollView {
+                        FailedStageEvidencePanel(evidencePacket: packet)
+                    }
+                    .navigationTitle("Failure Evidence")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close") { showEvidencePanel = false }
+                        }
+                    }
+                }
+                .frame(minWidth: 500, minHeight: 400)
+            }
         }
     }
 
@@ -240,6 +295,22 @@ struct RecoverySheet: View {
     }
 
     // MARK: - Proposal 008 (§7.2): Stage Status Helpers
+
+    // Proposal 013 §7.2: Action explanation with reuse/re-execution/same-run-vs-clone semantics
+    private func recoveryActionExplanation(_ action: RecoveryAction) -> String {
+        switch action {
+        case .retryAgent(_, let agentID):
+            return "Retries only agent '\(agentID)' in the same run. Successful sibling outputs are reused."
+        case .retryStage(let stageID):
+            return "Re-executes the entire '\(stageID)' stage in the same run. All agents re-run."
+        case .resumeFromApprovalGate:
+            return "Resumes from the approval gate in the same run. No re-execution."
+        case .cloneRunFrozenSnapshot:
+            return "Creates a new run using the frozen snapshot. This run becomes terminal history."
+        case .cloneRunCurrentConfig:
+            return "Creates a new run with the latest config. This run becomes terminal history."
+        }
+    }
 
     private func stageStatusIcon(_ status: StageStatus) -> String {
         switch status {

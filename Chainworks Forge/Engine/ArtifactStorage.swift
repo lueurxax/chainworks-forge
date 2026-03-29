@@ -19,12 +19,20 @@ struct ArtifactStorage: Sendable {
         agentID: String,
         attemptNumber: Int,
         artifactRoot: URL,
-        workspaceRoot: URL
+        workspaceRoot: URL,
+        agentAttemptNumber: Int? = nil
     ) throws -> ArtifactStorageResult {
-        let directory = artifactRoot
+        // Proposal 013 §5.4: Agent-retry artifacts use disjoint namespace
+        // Primary:     {artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}
+        // Agent retry: {artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/agent-retry-{agentAttemptNumber}/{name}
+        var directory = artifactRoot
             .appendingPathComponent("\(stageID).\(iteration)", isDirectory: true)
             .appendingPathComponent(agentID, isDirectory: true)
             .appendingPathComponent("\(attemptNumber)", isDirectory: true)
+
+        if let agentAttempt = agentAttemptNumber, agentAttempt > 1 {
+            directory = directory.appendingPathComponent("agent-retry-\(agentAttempt)", isDirectory: true)
+        }
 
         let filePath = directory.appendingPathComponent(name)
 

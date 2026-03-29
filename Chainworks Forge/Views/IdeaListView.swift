@@ -149,11 +149,6 @@ struct IdeaListView: View {
                 )
             }
         }
-        .navigationDestination(for: UUID.self) { ideaID in
-            if let idea = ideas.first(where: { $0.id == ideaID }) {
-                IdeaDetailView(idea: idea)
-            }
-        }
         .onChange(of: activeIdeas.map(\.id)) { _, activeIDs in
             if let selectedIdeaID, !activeIDs.contains(selectedIdeaID) {
                 self.selectedIdeaID = activeIDs.first
@@ -181,17 +176,20 @@ struct IdeaListView: View {
                 summaryChip(
                     label: "\(activeIdeas.count) ideas",
                     icon: "lightbulb.fill",
-                    color: .blue
+                    color: .blue,
+                    accessibilityIdentifier: "ideas-summary-chip-total"
                 )
                 summaryChip(
                     label: "\(draftCount) drafts",
                     icon: "pencil",
-                    color: .secondary
+                    color: .secondary,
+                    accessibilityIdentifier: "ideas-summary-chip-drafts"
                 )
                 summaryChip(
                     label: "\(activeCount) active",
                     icon: "bolt.fill",
-                    color: DesignTokens.Status.success
+                    color: DesignTokens.Status.success,
+                    accessibilityIdentifier: "ideas-summary-chip-active"
                 )
                 if !archivedIdeas.isEmpty {
                     Button {
@@ -200,7 +198,8 @@ struct IdeaListView: View {
                         summaryChip(
                             label: "\(archivedIdeas.count) archived",
                             icon: "archivebox",
-                            color: .secondary
+                            color: .secondary,
+                            accessibilityIdentifier: "ideas-summary-chip-archived"
                         )
                     }
                     .buttonStyle(.plain)
@@ -246,17 +245,14 @@ struct IdeaListView: View {
     }
 
     /// Pill-shaped chip for the summary strip.
-    private func summaryChip(label: String, icon: String, color: Color) -> some View {
-        HStack(spacing: 3) {
-            Image(systemName: icon)
-                .font(DesignTokens.Typography.micro)
-            Text(label)
-                .font(DesignTokens.Typography.micro.weight(.medium))
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(color.opacity(DesignTokens.badgeBackgroundOpacity), in: Capsule())
-        .foregroundStyle(color)
+    private func summaryChip(label: String, icon: String, color: Color, accessibilityIdentifier: String) -> some View {
+        StatusCapsule(
+            text: label,
+            color: color,
+            icon: icon,
+            size: .small,
+            accessibilityIdentifier: accessibilityIdentifier
+        )
     }
 
     // MARK: - Approval Bar

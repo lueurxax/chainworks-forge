@@ -35,7 +35,8 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> AgentResult {
-        let expectedOutputs = OutputContractResolver.expectedOutputs(for: task, agent: agent)
+        // Proposal 013: V2 resolver — catalog-driven contract resolution
+        let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
         // Record execution
         _lock.lock()

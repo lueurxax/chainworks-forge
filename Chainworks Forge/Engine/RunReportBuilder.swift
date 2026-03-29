@@ -127,12 +127,13 @@ final class RunReportBuilder {
     // MARK: - Report Payload Construction (§6.4)
 
     func buildReportPayload(for run: Run, version: Int) -> RunReportPayload {
-        let stages = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
-        let allAgents = stages.flatMap { $0.agentExecutions }
+        let historicalStages = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
+        let canonicalStages = canonicalStages(from: historicalStages)
+        let allAgents = canonicalStages.flatMap { canonicalAgents(for: $0) }
         let approvals = run.approvals.sorted { $0.requestedAt < $1.requestedAt }
 
-        // Stage timeline
-        let stageTimeline: [RunReportPayload.StageEntry] = stages.map { stage in
+        // Stage timeline (canonical lineage only)
+        let stageTimeline: [RunReportPayload.StageEntry] = canonicalStages.map { stage in
             RunReportPayload.StageEntry(
                 label: stage.label,
                 status: stage.status.rawValue,
@@ -173,16 +174,18 @@ final class RunReportBuilder {
         }
 
         // Execution summary
-        let completedStages = stages.filter { $0.status == .completed }.count
-        let skippedStages = stages.filter { $0.status == .skipped }.count
-        let failedStages = stages.filter { $0.status == .failed }.count
+        let completedStages = canonicalStages.filter { $0.status == .completed }.count
+        let skippedStages = canonicalStages.filter { $0.status == .skipped }.count
+        let failedStages = canonicalStages.filter { $0.status == .failed }.count
         let loopsEntered = run.loopCounters.values.reduce(0, +)
         let approvalsRequested = approvals.count
         let approvalsGranted = approvals.filter { $0.decision == .granted }.count
         let approvalsRejected = approvals.filter { $0.decision == .rejected }.count
 
-        // Key artifacts (pinned first, then report-worthy)
-        let allArtifacts = allAgents.flatMap { $0.artifacts }
+        // Key artifacts (canonical lineage only; pinned first, then report-worthy)
+        let allArtifacts = allAgents
+            .flatMap(\.artifacts)
+            .sorted { $0.createdAt < $1.createdAt }
         let pinnedArtifacts = allArtifacts.filter { $0.isPinned }
         let reportArtifacts = allArtifacts.filter { !$0.isPinned && $0.reportKind == nil }
 
@@ -197,37 +200,35 @@ final class RunReportBuilder {
         }
 
         // §6.5: Retry/recovery narrative
-        let retriesPerformed = stages.reduce(0) { $0 + max(0, $1.attemptNumber - 1) }
-        let recoveryActionsTaken: [String] = allAgents
+        let retriesPerformed = historicalStages.reduce(0) { $0 + max(0, $1.attemptNumber - 1) }
+        let recoveryActionsTaken: [String] = historicalStages
+            .flatMap(\.agentExecutions)
             .compactMap { $0.retryReason }
 
-        // §6.5: Compute retry path and resume path from current run state
-        let retryPath: String? = {
-            if run.status == .failed || run.status == .blocked {
-                if let failedStage = stages.last(where: { $0.status == .failed }) {
-                    if let failedAgent = failedStage.agentExecutions.first(where: { $0.status == .failed }) {
-                        return "Retry agent '\(failedAgent.agentID)' in stage '\(failedStage.label)'"
-                    }
-                    return "Retry stage '\(failedStage.label)'"
-                }
-                if let blockedStage = stages.last(where: { $0.status == .blocked }) {
-                    return "Retry stage '\(blockedStage.label)'"
-                }
-            }
-            return nil
-        }()
+        let failureEvidenceSummaries: [RunReportPayload.FailureEvidenceSummary] = historicalStages.compactMap { stage in
+            guard let packet = failureEvidencePacket(for: stage, run: run) else { return nil }
+            return RunReportPayload.FailureEvidenceSummary(
+                stageID: packet.stageID,
+                stageLabel: packet.stageLabel,
+                failureClass: packet.failureClass.rawValue,
+                failureSummary: packet.failureSummary,
+                rawOutputsExist: packet.rawOutputsExist,
+                receiptExists: packet.receiptExists,
+                transcriptExists: packet.transcriptExists
+            )
+        }
 
-        let resumePath: String? = {
-            if run.status == .waitingApproval {
-                if let gateStage = stages.last(where: { $0.status == .waitingApproval }) {
-                    return "Resume from approval gate '\(gateStage.label)'"
-                }
-            }
-            if run.status == .failed || run.status == .blocked {
-                return "Clone run (frozen snapshot or current config)"
-            }
-            return nil
-        }()
+        let currentRecoveryStage = historicalStages.last {
+            $0.status == .failed || $0.status == .blocked || $0.status == .waitingApproval
+        }
+        let currentRecoverySnapshot = currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
+        let blockedReason = currentRecoveryStage.flatMap { failureEvidencePacket(for: $0, run: run)?.failureSummary } ?? run.driftDetails
+        let retryPath = retryPathDescription(from: currentRecoverySnapshot)
+        let resumePath = resumePathDescription(
+            run: run,
+            waitingApprovalStage: historicalStages.last(where: { $0.status == .waitingApproval }),
+            snapshot: currentRecoverySnapshot
+        )
 
         return RunReportPayload(
             ideaTitle: run.idea?.title ?? "Unknown",
@@ -254,13 +255,183 @@ final class RunReportBuilder {
             agentsUsed: agentsUsed,
             approvalEntries: approvalEntries,
             keyArtifacts: keyArtifactEntries,
-            blockedReason: run.driftDetails,
+            blockedReason: blockedReason,
             retryPath: retryPath,
             resumePath: resumePath,
             driftDecision: run.driftDecision?.rawValue,
             retriesPerformed: retriesPerformed,
-            recoveryActionsTaken: recoveryActionsTaken
+            recoveryActionsTaken: recoveryActionsTaken,
+            failureEvidenceSummaries: failureEvidenceSummaries
         )
+    }
+
+    private func canonicalStages(from historicalStages: [StageExecution]) -> [StageExecution] {
+        let grouped = Dictionary(grouping: historicalStages) { stage in
+            "\(stage.stageID)::\(stage.iteration)"
+        }
+
+        return grouped.values.compactMap { stages in
+            stages.max { lhs, rhs in
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                if lhs.startedAt != rhs.startedAt {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+        }
+        .sorted { $0.startedAt < $1.startedAt }
+    }
+
+    private func canonicalAgents(for stage: StageExecution) -> [AgentExecution] {
+        let grouped = Dictionary(grouping: stage.agentExecutions, by: \.agentID)
+
+        return grouped.values.compactMap { agents in
+            agents.max { lhs, rhs in
+                let lhsAttempt = lhs.agentAttemptNumber ?? 1
+                let rhsAttempt = rhs.agentAttemptNumber ?? 1
+                if lhsAttempt != rhsAttempt {
+                    return lhsAttempt < rhsAttempt
+                }
+                if lhs.startedAt != rhs.startedAt {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+        }
+        .sorted { $0.startedAt < $1.startedAt }
+    }
+
+    private func failureEvidencePacket(for stage: StageExecution, run: Run) -> FailedStageEvidencePacket? {
+        if let packetData = stage.evidencePacketJSON,
+           let packet = try? JSONDecoder().decode(FailedStageEvidencePacket.self, from: packetData) {
+            return packet
+        }
+
+        let validationFailure = validationFailureRecord(for: stage)
+        let outputEnvelopes = stage.agentExecutions.flatMap { decodeOutputEnvelopes(from: $0) }
+        let recoverySnapshot = recoverySnapshot(for: run, stage: stage)
+        let failedAgent = failedAgent(for: stage)
+
+        let hasFailureTruth = stage.status == .failed
+            || stage.status == .blocked
+            || validationFailure != nil
+            || !outputEnvelopes.isEmpty
+            || failedAgent != nil
+        guard hasFailureTruth else { return nil }
+
+        return FailedStageEvidenceBuilder.buildEvidencePacket(
+            stageExecution: stage,
+            failedAgent: failedAgent,
+            validationFailure: validationFailure,
+            outputEnvelopes: outputEnvelopes,
+            recoverySnapshot: recoverySnapshot
+        )
+    }
+
+    private func recoverySnapshot(for run: Run, stage: StageExecution) -> RecoveryActionSnapshot? {
+        if let data = stage.recoverySnapshotJSON,
+           let snapshot = try? JSONDecoder().decode(RecoveryActionSnapshot.self, from: data) {
+            return snapshot
+        }
+
+        if let packetData = stage.evidencePacketJSON,
+           let packet = try? JSONDecoder().decode(FailedStageEvidencePacket.self, from: packetData),
+           let snapshot = packet.recoverySnapshot {
+            return snapshot
+        }
+
+        guard stage.status == .failed || stage.status == .blocked else { return nil }
+        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
+        return retryCoordinator.narrowestRecoveryAction(
+            for: run,
+            failedStage: stage,
+            failedAgent: failedAgent(for: stage),
+            validationFailure: validationFailureRecord(for: stage)
+        )
+    }
+
+    private func validationFailureRecord(for stage: StageExecution) -> ValidationFailureRecord? {
+        if let data = stage.validationFailureJSON,
+           let record = try? JSONDecoder().decode(ValidationFailureRecord.self, from: data) {
+            return record
+        }
+
+        for agent in stage.agentExecutions.sorted(by: { $0.startedAt < $1.startedAt }).reversed() {
+            if let data = agent.validationFailureJSON,
+               let record = try? JSONDecoder().decode(ValidationFailureRecord.self, from: data) {
+                return record
+            }
+        }
+
+        return nil
+    }
+
+    private func decodeOutputEnvelopes(from agent: AgentExecution) -> [StructuredOutputEnvelope] {
+        guard let data = agent.outputEnvelopesJSON else { return [] }
+        return (try? JSONDecoder().decode([StructuredOutputEnvelope].self, from: data)) ?? []
+    }
+
+    private func failedAgent(for stage: StageExecution) -> AgentExecution? {
+        stage.agentExecutions
+            .filter { $0.status == .failed }
+            .sorted { lhs, rhs in
+                if lhs.startedAt != rhs.startedAt {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                let lhsAttempt = lhs.agentAttemptNumber ?? 1
+                let rhsAttempt = rhs.agentAttemptNumber ?? 1
+                return lhsAttempt < rhsAttempt
+            }
+            .last
+    }
+
+    private func retryPathDescription(from snapshot: RecoveryActionSnapshot?) -> String? {
+        guard let snapshot else { return nil }
+        let retryAction = snapshot.availableActions.first {
+            $0.action == .retryFailedAgent || $0.action == .retryFailedStage
+        } ?? snapshot.recommendedAction
+
+        guard let action = retryAction else { return nil }
+        switch action.action {
+        case .retryFailedAgent:
+            guard let agentID = action.agentID, let stageID = action.stageID else { return nil }
+            return "Retry agent '\(agentID)' in stage '\(stageID)'"
+        case .retryFailedStage:
+            guard let stageID = action.stageID else { return nil }
+            return "Retry stage '\(stageID)'"
+        default:
+            return nil
+        }
+    }
+
+    private func resumePathDescription(
+        run: Run,
+        waitingApprovalStage: StageExecution?,
+        snapshot: RecoveryActionSnapshot?
+    ) -> String? {
+        if run.status == .waitingApproval, let gateStage = waitingApprovalStage {
+            return "Resume from approval gate '\(gateStage.label)'"
+        }
+
+        guard run.status == .failed || run.status == .blocked else { return nil }
+        guard let snapshot else {
+            return "Clone run (frozen snapshot or current config)"
+        }
+
+        if let recommended = snapshot.recommendedAction, recommended.action == .operatorInspection {
+            return "Inspect failure evidence first; same-run retry remains available before clone-run."
+        }
+
+        let hasSameRunRecovery = snapshot.availableActions.contains { detail in
+            detail.action == .retryFailedAgent || detail.action == .retryFailedStage
+        }
+        if hasSameRunRecovery {
+            return "Use same-run recovery from the canonical recovery snapshot; clone run is fallback only."
+        }
+
+        return "Clone run (frozen snapshot or current config)"
     }
 
     // MARK: - Rendering
@@ -341,8 +512,20 @@ final class RunReportBuilder {
                 lines.append("  - \(action)")
             }
         }
+        // Proposal 013: Failure evidence summaries
+        if !payload.failureEvidenceSummaries.isEmpty {
+            lines.append("## 9. Failure Evidence (Proposal 013)")
+            for evidence in payload.failureEvidenceSummaries {
+                lines.append("- **\(evidence.stageLabel)** (\(evidence.stageID))")
+                lines.append("  - Failure class: \(evidence.failureClass)")
+                lines.append("  - Summary: \(evidence.failureSummary)")
+                lines.append("  - Raw output: \(evidence.rawOutputsExist ? "present" : "missing")")
+                lines.append("  - Receipt: \(evidence.receiptExists ? "present" : "missing")")
+                lines.append("  - Transcript: \(evidence.transcriptExists ? "present" : "missing")")
+            }
+        }
         lines.append("")
-        lines.append("## 9. Outcome")
+        lines.append("## 10. Outcome")
         lines.append("- \(payload.runStatus)")
         lines.append("")
         return lines.joined(separator: "\n")
@@ -488,6 +671,19 @@ struct RunReportPayload: Codable, Sendable {
     // §6.5: Retry/recovery narrative
     let retriesPerformed: Int
     let recoveryActionsTaken: [String]
+
+    // Proposal 013: Failure evidence from canonical packet
+    let failureEvidenceSummaries: [FailureEvidenceSummary]
+
+    struct FailureEvidenceSummary: Codable, Sendable {
+        let stageID: String
+        let stageLabel: String
+        let failureClass: String
+        let failureSummary: String
+        let rawOutputsExist: Bool
+        let receiptExists: Bool
+        let transcriptExists: Bool
+    }
 
     struct StageEntry: Codable, Sendable {
         let label: String

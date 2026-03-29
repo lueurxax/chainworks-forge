@@ -25,6 +25,11 @@ import SwiftData
     var reportVersion: Int?
     var supersedesArtifactID: UUID?
 
+    // Proposal 013 — Layer N: Agent-Retry Lineage (§5.4)
+    var agentAttemptNumber: Int?               // Agent-level attempt number (for agent-only retries)
+    var supersedesAgentArtifactID: UUID?       // Which agent artifact this supersedes
+    var artifactLineageKind: String?           // "stage_attempt_primary" | "agent_retry_delta" | "reused_sibling_reference"
+
     @Relationship(inverse: \AgentExecution.artifacts)
     var agentExecution: AgentExecution?
 

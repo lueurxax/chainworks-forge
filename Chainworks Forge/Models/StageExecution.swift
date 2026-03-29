@@ -10,6 +10,20 @@ import SwiftData
     var status: StageStatus
     var iteration: Int
     var attemptNumber: Int
+    var lineageID: String?
+    var settlementKind: StageSettlementKind?
+    var settledAt: Date?
+    var activeOwnerToken: String?
+
+    // Proposal 013 — Layer N: Retry and Attempt Truth (§5.3)
+    var retryMode: String?               // RetryMode.rawValue: "agent_retry" | "stage_retry" | "fresh_execution"
+    var triggerReason: String?            // Why this attempt was created
+    var supersedesAttemptNumber: Int?     // Which attempt this supersedes (stage retry)
+
+    // Proposal 013 — Layer O: Failed Stage Evidence
+    var validationFailureJSON: Data?     // Serialized ValidationFailureRecord
+    var evidencePacketJSON: Data?        // Serialized FailedStageEvidencePacket
+    var recoverySnapshotJSON: Data?      // Serialized RecoveryActionSnapshot
 
     @Relationship(inverse: \Run.stageExecutions)
     var run: Run?

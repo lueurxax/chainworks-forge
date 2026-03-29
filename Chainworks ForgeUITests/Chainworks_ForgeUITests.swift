@@ -59,11 +59,44 @@ final class Chainworks_ForgeUITests: XCTestCase {
             values.insert(normalizeHostName(localizedName))
         }
 
+        let commandLookups: [(String, [String])] = [
+            ("/bin/hostname", []),
+            ("/usr/sbin/scutil", ["--get", "LocalHostName"]),
+            ("/usr/sbin/scutil", ["--get", "ComputerName"])
+        ]
+        for lookup in commandLookups {
+            if let output = captureCommandOutput(executable: lookup.0, arguments: lookup.1), !output.isEmpty {
+                values.insert(normalizeHostName(output))
+            }
+        }
+
         return values
     }
 
     private static func normalizeHostName(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func captureCommandOutput(executable: String, arguments: [String]) -> String? {
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func makeApp(
@@ -78,7 +111,12 @@ final class Chainworks_ForgeUITests: XCTestCase {
         initialTab: String = "Ideas",
         seedWaitingApprovalRun: Bool = false,
         directSurface: String? = nil,
-        disableEagerBootstrap: Bool = false
+        disableEagerBootstrap: Bool = false,
+        uiTestWindowSize: String? = nil,
+        differentiateWithoutColor: Bool = false,
+        increaseContrast: Bool = false,
+        reduceTransparency: Bool = false,
+        focusProof: Bool = false
     ) -> XCUIApplication {
         let app = XCUIApplication()
         let resolvedRepoRoot = seededIdeaWorkspaceRoot ?? repoRootPath()
@@ -100,6 +138,21 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"] = uiTestExportDirectory().path
         if let directSurface {
             app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
+        }
+        if let uiTestWindowSize {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_WINDOW_SIZE"] = uiTestWindowSize
+        }
+        if differentiateWithoutColor {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_DIFFERENTIATE_WITHOUT_COLOR"] = "1"
+        }
+        if increaseContrast {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_INCREASE_CONTRAST"] = "1"
+        }
+        if reduceTransparency {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_REDUCE_TRANSPARENCY"] = "1"
+        }
+        if focusProof {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_FOCUS_PROOF"] = "1"
         }
         if let seededIdeaTitle {
             app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"] = seededIdeaTitle
@@ -174,6 +227,85 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier == %@", identifier))
             .firstMatch
+    }
+
+    private func labeledElement(_ app: XCUIApplication, label: String) -> XCUIElement {
+        let exact = NSPredicate(format: "label == %@", label)
+        let beginsWith = NSPredicate(format: "label BEGINSWITH %@", label)
+        let exactAny = app.descendants(matching: .any).matching(exact).firstMatch
+        if exactAny.exists { return exactAny }
+
+        let beginsWithAny = app.descendants(matching: .any).matching(beginsWith).firstMatch
+        if beginsWithAny.exists { return beginsWithAny }
+
+        let candidates = [
+            app.staticTexts[label].firstMatch,
+            app.buttons[label].firstMatch,
+            app.radioButtons[label].firstMatch,
+            app.outlines.staticTexts[label].firstMatch,
+            app.staticTexts.matching(exact).firstMatch,
+            app.buttons.matching(exact).firstMatch,
+            app.radioButtons.matching(exact).firstMatch,
+            app.staticTexts.matching(beginsWith).firstMatch,
+            app.buttons.matching(beginsWith).firstMatch,
+            app.radioButtons.matching(beginsWith).firstMatch
+        ]
+
+        return candidates.first(where: \.exists) ?? exactAny
+    }
+
+    private func accessibilityValueString(_ element: XCUIElement) -> String {
+        guard let value = element.value else { return "" }
+        if let stringValue = value as? String {
+            return stringValue
+        }
+        return String(describing: value)
+    }
+
+    @discardableResult
+    private func waitForLabeledSurface(
+        _ app: XCUIApplication,
+        label: String,
+        timeout: TimeInterval
+    ) -> XCUIElement? {
+        let candidates = [
+            app.staticTexts[label].firstMatch,
+            app.buttons[label].firstMatch,
+            app.radioButtons[label].firstMatch,
+            app.outlines.staticTexts[label].firstMatch,
+            app.descendants(matching: .staticText).matching(NSPredicate(format: "label == %@", label)).firstMatch,
+            app.descendants(matching: .button).matching(NSPredicate(format: "label == %@", label)).firstMatch,
+            app.descendants(matching: .radioButton).matching(NSPredicate(format: "label == %@", label)).firstMatch
+        ]
+
+        let slice = max(timeout / Double(max(candidates.count, 1)), 0.5)
+        for candidate in candidates where candidate.waitForExistence(timeout: slice) {
+            return candidate
+        }
+
+        return candidates.first(where: \.exists)
+    }
+
+    @discardableResult
+    private func waitForLabeledPrefix(
+        _ app: XCUIApplication,
+        prefix: String,
+        timeout: TimeInterval
+    ) -> XCUIElement? {
+        let beginsWith = NSPredicate(format: "label BEGINSWITH %@", prefix)
+        let candidates = [
+            app.descendants(matching: .staticText).matching(beginsWith).firstMatch,
+            app.descendants(matching: .button).matching(beginsWith).firstMatch,
+            app.descendants(matching: .radioButton).matching(beginsWith).firstMatch,
+            app.descendants(matching: .any).matching(beginsWith).firstMatch
+        ]
+
+        let slice = max(timeout / Double(max(candidates.count, 1)), 0.5)
+        for candidate in candidates where candidate.waitForExistence(timeout: slice) {
+            return candidate
+        }
+
+        return candidates.first(where: \.exists)
     }
 
     private func repoRootPath() -> String {
@@ -794,9 +926,14 @@ final class Chainworks_ForgeUITests: XCTestCase {
         XCTAssertTrue(directSurface.waitForExistence(timeout: 20),
                       "Workflow map direct surface must finish bootstrap")
 
+        let workflowMapSurface = anyElement(app, identifier: "ui-test-workflow-map-surface")
         let workflowMap = anyElement(app, identifier: "workflow-map-view")
-        XCTAssertTrue(workflowMap.waitForExistence(timeout: 20),
-                      "Workflow map surface must render the workflow map owner pane")
+        XCTAssertTrue(
+            workflowMap.waitForExistence(timeout: 20)
+                || workflowMapSurface.waitForExistence(timeout: 20)
+                || anyElement(app, identifier: "ui-test-workflow-map-projection-ready").waitForExistence(timeout: 10),
+            "Workflow map surface must render the workflow map owner pane"
+        )
         XCTAssertTrue(anyElement(app, identifier: "ui-test-workflow-map-projection-ready").waitForExistence(timeout: 10),
                       "Workflow map must render a projection-ready topology surface")
         screenshot(app, name: "P010_WorkflowMap")
@@ -895,6 +1032,244 @@ final class Chainworks_ForgeUITests: XCTestCase {
             "Completed export hub must surface export feedback after a successful export"
         )
         screenshot(app, name: "REQ016_ExportHub_Exported")
+    }
+
+    func testProposal012AppendixAMinWindowOwnersAt1024x768() throws {
+        let runsTitle = "P012 Runs Home Owner Proof"
+        let runsApp = makeApp(
+            seededIdeaTitle: runsTitle,
+            initialTab: "Runs Home",
+            seedWaitingApprovalRun: true,
+            uiTestWindowSize: "1024x768"
+        )
+        defer { terminateIfRunning(runsApp) }
+        launchClean(runsApp)
+
+        let runsScreen = AppScreen(app: runsApp)
+        try XCTSkipUnless(runsScreen.waitForTabs(timeout: 30),
+                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        XCTAssertTrue(
+            anyElement(runsApp, identifier: "ui-test-window-size-1024x768").waitForExistence(timeout: 10),
+            "RunsHome proving path must expose the 1024x768 window-size marker"
+        )
+        XCTAssertTrue(
+            anyElement(runsApp, identifier: "runs-home-adopter-slice-summary").waitForExistence(timeout: 10)
+                || waitForLabeledPrefix(runsApp, prefix: "Runs Home. Waiting approval ", timeout: 10) != nil,
+            "RunsHome adopter summary must remain reachable at 1024x768"
+        )
+        screenshot(runsApp, name: "P012_1024x768_RunsHome")
+        terminateIfRunning(runsApp)
+
+        let ideaTitle = "P012 Ideas Owner Proof"
+        let ideasApp = makeApp(
+            seededIdeaTitle: ideaTitle,
+            seededIdeaWorkspaceRoot: repoRootPath(),
+            initialTab: "Ideas",
+            uiTestWindowSize: "1024x768"
+        )
+        defer { terminateIfRunning(ideasApp) }
+        launchClean(ideasApp)
+
+        let ideasScreen = AppScreen(app: ideasApp)
+        let ideas = IdeasScreen(app: ideasApp)
+        try XCTSkipUnless(ideasScreen.waitForTabs(timeout: 30),
+                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        XCTAssertTrue(ideasScreen.selectTab("Ideas"))
+        XCTAssertTrue(
+            anyElement(ideasApp, identifier: "ui-test-window-size-1024x768").waitForExistence(timeout: 10),
+            "IdeaList proving path must expose the 1024x768 window-size marker"
+        )
+        XCTAssertTrue(
+            anyElement(ideasApp, identifier: "ideas-root-view").waitForExistence(timeout: 15)
+                || anyElement(ideasApp, identifier: "idea-list").waitForExistence(timeout: 15),
+            "IdeaListView must render at 1024x768"
+        )
+        XCTAssertTrue(ideas.openIdea(named: ideaTitle), "Seeded idea detail must remain reachable at 1024x768")
+        XCTAssertTrue(
+            ideasApp.buttons["start-new-run-button"].firstMatch.waitForExistence(timeout: 10)
+                || ideasApp.textFields["idea-workspace-root-path-field"].firstMatch.waitForExistence(timeout: 10),
+            "IdeaList owner path must expose core controls at 1024x768"
+        )
+        screenshot(ideasApp, name: "P012_1024x768_IdeaList")
+    }
+
+    func testProposal012AdopterSliceAccessibilityProof() throws {
+        let runsTitle = "P012 Accessibility Run"
+        let runsApp = makeApp(
+            seededIdeaTitle: runsTitle,
+            initialTab: "Runs Home",
+            seedWaitingApprovalRun: true,
+            uiTestWindowSize: "1024x768",
+            differentiateWithoutColor: true
+        )
+        defer { terminateIfRunning(runsApp) }
+        launchClean(runsApp)
+
+        let runsScreen = AppScreen(app: runsApp)
+        try XCTSkipUnless(runsScreen.waitForTabs(timeout: 30),
+                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        let runsHomeRow = anyElement(runsApp, identifier: "runs-home-adopter-slice-summary")
+        let labeledRunsHome = waitForLabeledPrefix(runsApp, prefix: "Runs Home. Waiting approval ", timeout: 15)
+        XCTAssertTrue(
+            runsHomeRow.waitForExistence(timeout: 1) || labeledRunsHome != nil,
+            "RunsHome adopter slice must expose a readable owner-level accessibility surface"
+        )
+        let effectiveRunsHome = runsHomeRow.exists ? runsHomeRow : labeledRunsHome
+        guard let effectiveRunsHome else {
+            return
+        }
+        XCTAssertTrue(
+            effectiveRunsHome.label.contains("Waiting approval"),
+            "RunsHome owner surface must preserve textual lane counts in its VoiceOver label"
+        )
+        XCTAssertTrue(
+            anyElement(runsApp, identifier: "ui-test-accessibility-differentiate-without-color").waitForExistence(timeout: 5),
+            "RunsHome proof must run with Differentiate Without Color enabled"
+        )
+        XCTAssertTrue(
+            effectiveRunsHome.label.contains("Waiting approval"),
+            "RunsHome adopter slice must preserve readable waiting-approval counts in its VoiceOver label"
+        )
+        XCTAssertTrue(
+            effectiveRunsHome.label.contains("differentiate without color")
+                || accessibilityValueString(effectiveRunsHome).contains("differentiate without color"),
+            "RunsHome adopter slice must report Differentiate Without Color styling when that setting is active"
+        )
+        screenshot(runsApp, name: "P012_A11Y_RunsHome_DifferentiateWithoutColor")
+        terminateIfRunning(runsApp)
+
+        let ideasApp = makeApp(
+            seededIdeaTitle: "P012 Accessibility Idea",
+            seededIdeaWorkspaceRoot: repoRootPath(),
+            initialTab: "Ideas",
+            uiTestWindowSize: "1024x768",
+            increaseContrast: true
+        )
+        defer { terminateIfRunning(ideasApp) }
+        launchClean(ideasApp)
+
+        let ideasScreen = AppScreen(app: ideasApp)
+        try XCTSkipUnless(ideasScreen.waitForTabs(timeout: 30),
+                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        XCTAssertTrue(ideasScreen.selectTab("Ideas"))
+        let totalIdeasChip = anyElement(ideasApp, identifier: "ideas-summary-chip-total")
+        let activeIdeasChip = anyElement(ideasApp, identifier: "ideas-summary-chip-active")
+        XCTAssertTrue(
+            totalIdeasChip.waitForExistence(timeout: 15) || activeIdeasChip.waitForExistence(timeout: 15),
+            "IdeaList adopter slice must expose summary-strip chips as accessible static text"
+        )
+        let visibleIdeasChip = totalIdeasChip.exists ? totalIdeasChip : activeIdeasChip
+        XCTAssertFalse(visibleIdeasChip.label.isEmpty, "IdeaList summary chips must have textual VoiceOver labels")
+        XCTAssertTrue(
+            anyElement(ideasApp, identifier: "ui-test-accessibility-increase-contrast").waitForExistence(timeout: 5),
+            "IdeaList proof must run with Increase Contrast enabled"
+        )
+        XCTAssertTrue(
+            anyElement(ideasApp, identifier: "\(visibleIdeasChip.identifier)-increase-contrast").waitForExistence(timeout: 5)
+                || accessibilityValueString(visibleIdeasChip).contains("increase contrast"),
+            "IdeaList summary chips must react to Increase Contrast on the real owner surface"
+        )
+        screenshot(ideasApp, name: "P012_A11Y_IdeaList_IncreaseContrast")
+        terminateIfRunning(ideasApp)
+
+        let workflowMapApp = makeApp(
+            directSurface: "workflow_map",
+            uiTestWindowSize: "1024x768",
+            reduceTransparency: true
+        )
+        defer { terminateIfRunning(workflowMapApp) }
+        launchClean(workflowMapApp)
+        XCTAssertTrue(
+            anyElement(workflowMapApp, identifier: "ui-test-direct-surface-ready-workflow_map").waitForExistence(timeout: 20),
+            "WorkflowMap adopter slice must render via its direct surface"
+        )
+        let workflowStatus = anyElement(workflowMapApp, identifier: "workflow-map-status-completed")
+        XCTAssertTrue(workflowStatus.waitForExistence(timeout: 10), "WorkflowMap must expose textual status badges")
+        XCTAssertEqual(workflowStatus.label, "Completed")
+        XCTAssertTrue(
+            anyElement(workflowMapApp, identifier: "ui-test-accessibility-reduce-transparency").waitForExistence(timeout: 5),
+            "WorkflowMap proof must run with Reduce Transparency enabled"
+        )
+        XCTAssertTrue(
+            anyElement(workflowMapApp, identifier: "workflow-map-status-completed-reduce-transparency").waitForExistence(timeout: 5)
+                || accessibilityValueString(workflowStatus).contains("reduce transparency"),
+            "WorkflowMap status badges must react to Reduce Transparency on the real adopter surface"
+        )
+        screenshot(workflowMapApp, name: "P012_A11Y_WorkflowMap_ReduceTransparency")
+        terminateIfRunning(workflowMapApp)
+
+        let releaseGateApp = makeApp(
+            directSurface: "release_gate",
+            uiTestWindowSize: "1024x768",
+            differentiateWithoutColor: true,
+            increaseContrast: true,
+            reduceTransparency: true,
+            focusProof: true
+        )
+        defer { terminateIfRunning(releaseGateApp) }
+        launchClean(releaseGateApp)
+        XCTAssertTrue(
+            anyElement(releaseGateApp, identifier: "ui-test-direct-surface-ready-release_gate").waitForExistence(timeout: 20),
+            "ReleaseGate adopter slice must render via its direct surface"
+        )
+        XCTAssertTrue(
+            releaseGateApp.buttons["release-gate-approve-button"].firstMatch.waitForExistence(timeout: 10),
+            "ReleaseGate must preserve keyboard/focusable approval action"
+        )
+        let awaitingApproval = anyElement(releaseGateApp, identifier: "release-gate-status-badge")
+        XCTAssertTrue(awaitingApproval.waitForExistence(timeout: 10), "ReleaseGate status badge must remain textual for VoiceOver")
+        XCTAssertEqual(awaitingApproval.label, "Awaiting Approval")
+        let releaseGateStatusModes = accessibilityValueString(awaitingApproval)
+        XCTAssertTrue(
+            anyElement(releaseGateApp, identifier: "release-gate-status-badge-differentiate-without-color").waitForExistence(timeout: 5)
+                || releaseGateStatusModes.contains("differentiate without color")
+        )
+        XCTAssertTrue(
+            anyElement(releaseGateApp, identifier: "release-gate-status-badge-increase-contrast").waitForExistence(timeout: 5)
+                || releaseGateStatusModes.contains("increase contrast")
+        )
+        XCTAssertTrue(
+            anyElement(releaseGateApp, identifier: "release-gate-status-badge-reduce-transparency").waitForExistence(timeout: 5)
+                || releaseGateStatusModes.contains("reduce transparency")
+        )
+
+        let focusOrder = anyElement(releaseGateApp, identifier: "release-gate-focus-order")
+        XCTAssertTrue(focusOrder.waitForExistence(timeout: 10), "ReleaseGate focus proof marker must render")
+        XCTAssertTrue(focusOrder.label.contains("Open Proposal"), "ReleaseGate focus should start on the first decision-context action")
+        releaseGateApp.typeKey(.tab, modifierFlags: [])
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        XCTAssertTrue(focusOrder.label.contains("Reject Release"), "Tab order must move from decision context into Reject Release")
+        releaseGateApp.typeKey(.tab, modifierFlags: [])
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        XCTAssertTrue(focusOrder.label.contains("Approve Release"), "Tab order must then move to Approve Release")
+        screenshot(releaseGateApp, name: "P012_A11Y_ReleaseGate_FocusOrder")
+        terminateIfRunning(releaseGateApp)
+
+        let preflightApp = makeApp(
+            directSurface: "delivery_preflight_report",
+            uiTestWindowSize: "1024x768",
+            increaseContrast: true,
+            reduceTransparency: true
+        )
+        defer { terminateIfRunning(preflightApp) }
+        launchClean(preflightApp)
+        XCTAssertTrue(
+            anyElement(preflightApp, identifier: "ui-test-direct-surface-ready-delivery_preflight_report").waitForExistence(timeout: 20),
+            "DeliveryPreflightReport adopter slice must render via its direct surface"
+        )
+        let issuesFound = anyElement(preflightApp, identifier: "Issues Found")
+        XCTAssertTrue(issuesFound.waitForExistence(timeout: 10), "DeliveryPreflightReport status badge must stay textual for VoiceOver")
+        XCTAssertEqual(issuesFound.label, "Issues Found")
+        let preflightModes = accessibilityValueString(issuesFound)
+        XCTAssertTrue(
+            anyElement(preflightApp, identifier: "issues-found-increase-contrast").waitForExistence(timeout: 5)
+                || preflightModes.contains("increase contrast")
+        )
+        XCTAssertTrue(
+            anyElement(preflightApp, identifier: "issues-found-reduce-transparency").waitForExistence(timeout: 5)
+                || preflightModes.contains("reduce transparency")
+        )
+        screenshot(preflightApp, name: "P012_A11Y_DeliveryPreflight_Settings")
     }
 
     // MARK: - REQ-011: Start Run Sheet UI

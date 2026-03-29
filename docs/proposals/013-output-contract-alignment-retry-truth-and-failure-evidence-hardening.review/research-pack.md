@@ -2,180 +2,167 @@
 
 ## 0. Review Target and Local Context Consumed
 
-- Target proposal: `docs/proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md`
-- Proposal hash at research time: `c733a958b8ae65363bdd559fc1110a5d`
-- Local evidence pack used to derive research scope: `docs/reviews/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening-evidence-pack.md`
-- Local seams already established before browsing:
-  - `DOC-02`, `DOC-03`, `DOC-05`: current repo truth is still immutable stage-attempt artifact storage
-  - `DATA-02`, `DATA-03`, `DATA-04`: validation/persistence and retry lineage seams are already mapped
-  - `INT-03`, `REAL-01`: Proposal 013 now defines a disjoint same-stage agent-retry namespace
-- This 2026-03-29 refresh does not reopen local architecture review. It rechecks whether the now-updated draft still matches the same authoritative external patterns and whether the prior recommended deltas have been adopted cleanly.
+- Proposal: `docs/proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md`
+- Research round: `refresh` on `2026-03-29`
+- Proposal hash: `e879a47b9d5e44d000bb8adf3e7c7cec62334ca1f14681ec66d7b3dfb0ce80e7`
+- Proposal evidence pack used: `docs/reviews/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening-evidence-pack.md`
+- Current-system baseline used: `.review-baselines/current-system-baseline.md`
+- Proposal-specific integration context used: none
+- Existing research pack reused: yes; prior question set reused, source set refreshed and strengthened toward primary docs
+- Adjacent docs consumed:
+  - `docs/reference/runtime-contract.md`
+  - `docs/reference/workflow-execution-engine.md`
+  - `docs/reference/operator-experience.md`
+  - `docs/reference/full-mvp-delivery.md`
+  - `docs/reference/mvp-sign-off.md`
+- Current code / module mapping consumed:
+  - `Chainworks Forge/Engine/AgentExecutor.swift`
+  - `Chainworks Forge/Engine/ArtifactManager.swift`
+  - `Chainworks Forge/Engine/ArtifactStorage.swift`
+  - `Chainworks Forge/Engine/GooseSessionBridge.swift`
+  - `Chainworks Forge/Engine/GooseTransport.swift`
+  - `Chainworks Forge/Engine/WorkflowOrchestrator.swift`
+  - `Chainworks Forge/Models/Artifact.swift`
+  - `Chainworks Forge/Models/AgentExecution.swift`
+  - `Chainworks Forge/Models/StageExecution.swift`
+  - `examples/agents/agents.yaml`
+  - `examples/workflows/workflow.yaml`
+- Local evidence IDs that triggered research:
+  - `REAL-07`: same-stage retry needs disjoint agent-attempt lineage
+  - `REAL-08`: failure evidence must survive validation failure and stage settlement
+  - `REAL-05`: `backend_profiles.*.structured_output` remains Tier `1` while live transport support is uneven
+  - `REAL-10`: Appendix `B` is now correctly tiered, so research can focus on the bounded Tier `1` slice
+  - `REAL-11`: top-level wording is slightly broader than the new tiered boundary
+- Notes on baseline freshness or local contradictions:
+  - repo-level baseline is fresh for topology and dependency-chain context
+  - targeted local seam refresh was still required for declarative coverage, retry lineage, and failure-evidence ordering
+  - no proposal-blocking contradiction surfaced between proposal, baseline, and current code
 
 ## 1. Research Questions Derived from Local Evidence
 
-| RQ ID | Question | Local Evidence IDs | Why Local Evidence Was Not Enough |
-|---|---|---|---|
-| `RQ-01` | Do authoritative workflow systems preserve previous attempt history and evidence when rerunning failed work from the same logical snapshot? | `DOC-02`, `DOC-03`, `DOC-05`, `DATA-03`, `DATA-04`, `INT-03` | Local evidence showed Proposal 013 is coherent internally, but not whether its immutable-history pattern matches stronger host-system practice. |
-| `RQ-02` | Should validation failure evidence be persisted as a first-class result object distinct from metrics or summary state? | `DOC-01`, `DATA-02`, `DATA-03`, `TEST-01` | Local evidence justified `ValidationFailureRecord`, but not whether external validation systems treat failure results as durable operator-facing records. |
-| `RQ-03` | Should output-contract and validation mismatches be treated more like permanent or operator-actionable failures than transient auto-retry cases? | `DOC-01`, `DATA-02`, `DATA-04`, `TEST-01` | Local draft prefers narrow recovery, but external guidance helps decide whether blind automatic retry is the wrong default for this failure class. |
+| Question ID | Derived From (`Proposal gap | Baseline constraint | Host-system integration risk | Unresolved tradeoff`) | Local Evidence IDs | Research Question | Why Local Evidence Is Not Enough | Priority |
+|---|---|---|---|---|---|
+| `RQ-01` | Host-system integration risk | `DOC-03`, `MAP-07`, `MAP-08`, `REAL-07` | Do stronger workflow systems preserve prior attempt history and evidence when rerunning failed work from the same logical snapshot? | Local evidence proves Proposal 013 is internally coherent, but external workflow history practice is useful to validate the same-snapshot retry model. | High |
+| `RQ-02` | Unresolved tradeoff | `DOC-04`, `MAP-07`, `REAL-08` | Should validation failure evidence be persisted as a first-class result object rather than only a summary state or derived metric? | Local evidence shows where persistence happens, but external validation-system practice helps justify what should remain canonical and durable. | High |
+| `RQ-03` | Unresolved tradeoff | `DOC-01`, `REAL-08` | Should output-contract and post-generation validation mismatch default to operator-mediated or non-auto-retryable handling rather than blind transient retry? | Local draft prefers narrow recovery, but external failure semantics help calibrate the right default classification. | Medium |
+| `RQ-04` | Proposal gap | `MAP-04`, `REAL-05`, `REAL-10` | For `backend_profiles.*.structured_output`, should unsupported schema/capability combinations fail closed before execution, and should post-generation validation still remain mandatory even when transport support exists? | Local evidence proves the current transport gap, but external provider docs are needed to avoid overclaiming what "structured output support" actually guarantees. | High |
 
 ## 2. Source Ledger
 
-| Source ID | Source | Type | Why It Was Chosen | Freshness / Scope Note |
-|---|---|---|---|---|
-| `SRC-01` | [GitHub Docs: Re-running workflows and jobs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs) | official product docs | Clear, current reference for rerun semantics, same-source reruns, and preserved attempt history UI. | Refreshed 2026-03-29; stable operational docs; low freshness risk. |
-| `SRC-02` | [Temporal Docs](https://docs.temporal.io/) | official product docs | Establishes Temporal as a durable execution system with persisted workflow state and replay semantics. | Refreshed 2026-03-29; high-level source; useful for framing, not exact retry-policy wording. |
-| `SRC-03` | [Temporal workshop PDF: Crafting an error handling strategy](https://learn.temporal.io/assets/files/crafting-an-error-handling-strategy-dotnet-replay2025-e633cef41481baac8b25a636533c4d37.pdf) | official educational material | Concrete reference for persisted failure history, retry attempts, and non-retryable/manual-intervention guidance. | Refreshed 2026-03-29; official but lower authority than core reference docs. Recheck before borrowing exact terminology. |
-| `SRC-04` | [Great Expectations 0.18: Validation Result Store](https://docs.greatexpectations.io/docs/0.18/reference/learn/terms/validation_result_store/) | official product docs | Strong pattern for persisting validation results and associated metadata as a first-class store, separate from raw data flow. | Refreshed 2026-03-29; versioned legacy docs; use for pattern guidance, not current API naming. |
+| Source ID | Title | Publisher / Authority | URL or Reference | Published Date | Last Updated Date | Accessed / Verified Date | Why This Source Matters | Temporal Volatility / Freshness Risk | Confidence |
+|---|---|---|---|---|---|---|---|---|---|
+| `SRC-01` | Re-running workflows and jobs | GitHub Docs | [https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs) | Not stated | Not stated | 2026-03-29 | Gives a current mainstream rerun model with preserved run history and same source revision semantics. | Low; product docs may evolve, but rerun semantics are usually stable. | High |
+| `SRC-02` | Event History | Temporal Platform Documentation | [https://docs.temporal.io/encyclopedia/event-history](https://docs.temporal.io/encyclopedia/event-history) | Not stated | Not stated | 2026-03-29 | Primary durable-execution reference for immutable event history, replay, and state reconstruction after failure. | Low; core platform concept. | High |
+| `SRC-03` | Temporal Failures reference | Temporal Platform Documentation | [https://docs.temporal.io/references/failures](https://docs.temporal.io/references/failures) | Not stated | Not stated | 2026-03-29 | Primary reference for retryable vs non-retryable failures, attempt tracking, and terminal failed-state semantics. | Medium; exact retry semantics can evolve across features, but the failure model is core reference material. | High |
+| `SRC-04` | Configure Validation Result Stores | Great Expectations OSS Docs 0.18.21 | [https://docs.greatexpectations.io/docs/0.18/oss/guides/setup/configuring_metadata_stores/configure_result_stores/](https://docs.greatexpectations.io/docs/0.18/oss/guides/setup/configuring_metadata_stores/configure_result_stores/) | Not stated | Not stated | 2026-03-29 | Shows a durable validation-result store pattern and explicitly warns that validation results can contain sensitive or regulated data. | Medium-High; official but legacy-versioned and no longer actively maintained. | Medium |
+| `SRC-05` | Structured model outputs | OpenAI API Docs | [https://developers.openai.com/api/docs/guides/structured-outputs](https://developers.openai.com/api/docs/guides/structured-outputs) | Not stated | Not stated | 2026-03-29 | Official guidance that structured outputs use explicit strict schema contracts, support only part of JSON Schema, and should be backed by evals. | Medium-High; provider docs evolve with models and schema support. | High |
+| `SRC-06` | Structured outputs | Google AI for Developers | [https://ai.google.dev/gemini-api/docs/structured-output](https://ai.google.dev/gemini-api/docs/structured-output) | Not stated | 2026-02-26 | 2026-03-29 | Official provider guidance that unsupported schema features may be ignored, large schemas may be rejected, and app-side validation remains necessary. | High; capability details change with model/platform releases. | High |
 
 ## 3. Findings by Theme
 
-### 3.1 Immutable retry lineage and same-snapshot reruns
+### Architecture / State / Concurrency / Offline / Sync Patterns
 
-Research question: `RQ-01`
+- Finding ID: `FIND-ARCH-01`
+  - Research question IDs: `RQ-01`
+  - Source IDs: `SRC-01`, `SRC-02`, `SRC-03`
+  - Source-backed finding:
+    - GitHub reruns keep the original source revision while preserving previous run attempts as inspectable history.
+    - Temporal models recovery through durable event history rather than overwriting prior truth.
+    - Temporal failure tracking also keeps attempt count and last-attempt failure details alongside retry semantics.
+  - Model inference / host-system note:
+    - Proposal 013 is aligned with stronger host-system practice when same-run `Retry Failed Agent` keeps the same frozen logical snapshot and appends inspectable lineage instead of mutating earlier attempt evidence.
+    - The existing proposal wording already adopts the core pattern correctly.
+  - Host-system surface touched: `StageRetryCoordinator`, `StageAttemptHistoryRecord`, `AgentAttemptHistoryRecord`, `ArtifactStorage`, regression proof sections
+  - Time-sensitive: `No`
+  - Confidence: `High`
 
-External signal:
+- Finding ID: `FIND-ARCH-02`
+  - Research question IDs: `RQ-04`
+  - Source IDs: `SRC-05`, `SRC-06`
+  - Source-backed finding:
+    - Structured-output providers do not expose a uniform guarantee surface. OpenAI documents explicit strict schema mode but also notes only part of JSON Schema is supported; Gemini says unsupported properties may be ignored and large schemas may be rejected.
+    - Gemini also says syntactically valid structured output still needs application-side validation before use.
+  - Model inference / host-system note:
+    - Proposal 013 should not define `StructuredOutputSchemaGate` as a simple boolean "provider supports structured output."
+    - The useful pattern is provider-aware preflight compatibility checking plus continued post-generation validation inside `WorkflowOrchestrator.validateStructuredOutputs(...)`.
+  - Host-system surface touched: `StructuredOutputSchemaGate`, `GooseSessionBridge`, `GooseTransport`, `WorkflowOrchestrator.validateStructuredOutputs(...)`, Appendix `B` Tier `1`
+  - Time-sensitive: `Yes`
+  - Confidence: `High`
 
-- `SRC-01` says reruns reuse the same original `GITHUB_SHA` and `GITHUB_REF`, while preserving prior run attempts as selectable history.
-- `SRC-03` shows failure details and retry attempts are recorded in durable event history rather than overwritten by later attempts.
-- `SRC-02` reinforces the broader durable-execution model: workflow progress and recovery are expected to survive faults without losing prior truth.
+### Testing Strategy
 
-Inference for Chainworks:
+- Finding ID: `FIND-TEST-01`
+  - Research question IDs: `RQ-04`
+  - Source IDs: `SRC-05`, `SRC-06`
+  - Source-backed finding:
+    - OpenAI explicitly recommends using evals to determine whether a schema works well for the use case.
+    - Gemini explicitly recommends final application-side validation even when the transport returns schema-shaped JSON.
+  - Model inference / host-system note:
+    - Proposal 013’s `10.1` proof should keep provider-subset and semantic-validation cases separate:
+      - preflight rejection when the active backend or schema subset is unsupported
+      - post-generation validation failure when transport accepted the request but the content still violates business or contract rules
+  - Host-system surface touched: `Section 10.1`, contract-validation tests, structured-output schema gate tests
+  - Time-sensitive: `Yes`
+  - Confidence: `High`
 
-- The new Proposal 013 direction is consistent with stronger host-system practice: same logical work should keep its original frozen source context while later attempts append history instead of mutating it.
-- The proposal’s `agent-retry-{agentAttemptNumber}` namespace and lineage metadata are the right shape.
-- The highest-value extra clarification is not a new architecture layer; it is a sharper statement that same-run `Retry Failed Agent` reuses the same frozen logical snapshot and leaves prior agent-attempt evidence inspectable even after a later successful retry.
-- Current status in draft: adopted. The current proposal now states same frozen logical snapshot reuse, requires persisted snapshot linkage, and adds explicit inspectability proof expectations.
+### Consumer-Finance Trust / Transparency / Recovery
 
-Why this matters locally:
+- Finding ID: `FIND-TRUST-01`
+  - Research question IDs: `RQ-02`
+  - Source IDs: `SRC-03`, `SRC-04`
+  - Source-backed finding:
+    - Great Expectations treats validation results as durable stored objects, not just ephemeral summary flags, and warns that those results can include sensitive or regulated data.
+    - Temporal failure records also preserve failure details as inspectable structured state rather than collapsing everything into a generic status summary.
+  - Model inference / host-system note:
+    - Proposal 013 is strongest when `ValidationFailureRecord` or the failed-stage evidence packet remains the canonical durable record, while report/export/recovery surfaces reference it by stable identifier and present redacted or summarized views by default.
+    - This is especially relevant for Chainworks because raw outputs, transcripts, and receipts may later include sensitive user or provider material.
+  - Host-system surface touched: `ValidationFailureRecord`, `FailedStageEvidencePanel`, `RunReportBuilder`, export surfaces
+  - Time-sensitive: `Yes`, because the source pattern is stable but the cited Great Expectations doc is legacy-versioned
+  - Confidence: `Medium`
 
-- This reinforces `Section 5.4` and makes `Sections 10.2`, `10.3`, and `11` easier to verify against real runtime evidence.
-
-### 3.2 Validation failure evidence should be a first-class persisted result
-
-Research question: `RQ-02`
-
-External signal:
-
-- `SRC-04` describes a dedicated Validation Result Store that persists validation results and associated metadata automatically.
-- `SRC-04` also distinguishes stored validation results from evaluation-parameter and metric usage; metrics may be derived from validation results, but they are not the same object.
-- The same source says stored validation results exist for review and rendering into operator-facing Data Docs.
-
-Inference for Chainworks:
-
-- Proposal 013 is strongest when `ValidationFailureRecord` and the failed-stage evidence packet are treated as canonical persisted evidence, not just transient validation diagnostics or summary flags.
-- Recovery UI, reports, and exports should reference that canonical persisted failure object or packet directly.
-- A report summary alone is not enough; the durable failure record should be the inspectable source of truth behind the summary.
-- Current status in draft: adopted. The current proposal now says `ValidationFailureRecord` or the failed-stage packet is the canonical persisted reference target for recovery UI, immutable reports, and exports.
-
-Why this matters locally:
-
-- This strengthens `Sections 6.2`, `6.3`, and `7.3` and supports the motivating requirement that validation failure must not make downstream evidence disappear.
-
-### 3.3 Contract mismatch is closer to a permanent or operator-actionable failure than a transient retry
-
-Research question: `RQ-03`
-
-External signal:
-
-- `SRC-03` explicitly distinguishes permanent failures from transient ones and recommends marking permanent failures non-retryable so they can be fixed manually.
-- `SRC-03` also shows that retry history should still preserve failure details even when the failure is considered non-retryable.
-- `SRC-04` implicitly supports this separation: a failed validation still yields a durable validation result, not an absence of result.
-
-Inference for Chainworks:
-
-- Output-contract and validation mismatches should default to operator-mediated recovery, not blind auto-retry.
-- Narrow retry can still be the preferred recovery action, but it should happen after an operator-visible explanation or an explicit policy decision, because the failure class usually reflects prompt/schema/content mismatch rather than flaky transport.
-- Proposal 013 does not need to ban all automatic retries forever, but its default truth should classify these failures as non-transient unless policy explicitly says otherwise.
-- Current status in draft: adopted. The current proposal now states that output-contract mismatch and post-generation validation failure are non-auto-retryable by default unless explicit recovery or policy override applies.
-
-Why this matters locally:
-
-- This sharpens recovery-policy language in `Sections 5`, `6`, and `7` and reduces the chance that a later implementation quietly reclassifies contract failures as generic transient noise.
+- Finding ID: `FIND-TRUST-02`
+  - Research question IDs: `RQ-03`
+  - Source IDs: `SRC-03`, `SRC-04`
+  - Source-backed finding:
+    - Temporal distinguishes retryable from non-retryable failures and treats non-retryable failures as terminal until explicit intervention.
+    - Durable validation-result systems preserve the failed result rather than acting as if no meaningful output exists.
+  - Model inference / host-system note:
+    - Proposal 013’s default of treating output-contract mismatch and post-generation validation failure as non-auto-retryable is externally well grounded.
+    - Chainworks should keep narrow retry available, but as an explicit recovery action or policy override after the operator can inspect the evidence.
+  - Host-system surface touched: `RunRecoveryPolicy`, `RecoveryActionSnapshot`, `RecoverySheet`, `BlockedRunRecoveryView`
+  - Time-sensitive: `No`
+  - Confidence: `High`
 
 ## 4. Host-System Applicability Matrix
 
-| Applicability ID | External Pattern | Source IDs | Classification | Chainworks Fit |
-|---|---|---|---|---|
-| `APP-01` | Preserve prior attempts while rerunning from the same logical source snapshot | `SRC-01`, `SRC-02`, `SRC-03` | `Adopt` | Directly supports Proposal 013’s immutable lineage model and same-run retry semantics. |
-| `APP-02` | Persist validation outcomes as first-class reviewable records, not just metrics or summaries | `SRC-04` | `Adopt` | Directly strengthens `ValidationFailureRecord` plus failed-stage evidence packet design. |
-| `APP-03` | Treat schema/contract mismatch closer to non-retryable/manual-intervention than to blind transient retry | `SRC-03`, `SRC-04` | `Adapt` | Good default for Chainworks, but should remain policy-shaped because some contract failures may become safely retryable after explicit prompt/contract repair. |
-| `APP-04` | Mirror external UI attempt-history controls literally | `SRC-01` | `Reject` | Chainworks should borrow the truth model, not the exact GitHub attempt-switcher UX. Existing recovery/report owners are already correct. |
-| `APP-05` | Reuse Great Expectations terminology and store taxonomy verbatim | `SRC-04` | `Watch` | The pattern is useful, but the cited docs are legacy-versioned; adopt the concept, not the names, without a later freshness recheck. |
+| Insight ID | Source IDs | Classification (`Adopt | Adapt | Watch | Reject`) | Proposal Area Affected | Host-System Surface Touched | Why It Applies or Does Not Apply | Concrete Recommended Change |
+|---|---|---|---|---|---|---|
+| `APP-01` | `SRC-01`, `SRC-02`, `SRC-03` | `Adopt` | `Sections 5.2`, `5.4`, `10.2`, `10.3`, `11` | retry lineage, stage/agent attempt history, artifact storage | External systems preserve prior attempts while keeping the same logical work context. This matches the motivating failure class directly. | Keep the current same-snapshot lineage model and verify inspectability of prior attempt artifacts in implementation proof. |
+| `APP-02` | `SRC-03`, `SRC-04` | `Adopt` | `Sections 6.2`, `6.3`, `7.3`, `11.7` | validation-failure storage, report/export/reference truth | Durable validation or failure records are more trustworthy than summary-only status. This maps directly onto Proposal 013’s operator-trust goal. | Keep `ValidationFailureRecord` or failed-stage packet as canonical persisted evidence and reference it directly from recovery/report/export surfaces. |
+| `APP-03` | `SRC-03`, `SRC-04` | `Adapt` | `Sections 5.4`, `7.2`, `11` | recovery policy and retry defaults | The permanent-vs-transient distinction is useful, but Chainworks still needs explicit operator-driven retry as a recovery action for some content failures. | Keep non-auto-retryable-by-default semantics, but allow explicit narrow retry or policy override after evidence inspection. |
+| `APP-04` | `SRC-05`, `SRC-06` | `Adopt` | `Section 4.2.2`, Layer `Q`, `10.1`, `11.9`, Appendix `B` Tier `1` | `StructuredOutputSchemaGate`, transport bridge, post-generation validation | Provider docs show schema support is partial and non-uniform. Silent no-op or partial ignore is possible if the app does not gate capability per backend/schema combination. | Define `StructuredOutputSchemaGate` as provider-aware preflight compatibility plus continued post-generation validation, not as a generic yes/no flag. |
+| `APP-05` | `SRC-04` | `Adapt` | `Sections 6.3`, `7.3`, export/report decisions | failure evidence panel, reports, exports | Durable validation results are useful, but the cited source warns they may contain sensitive or regulated data. Chainworks should not equate canonical storage with broad inline display. | Add a note that reports/exports reference canonical failure evidence by ID and default to redacted summaries unless explicit full-detail inspection is requested. |
+| `APP-06` | `SRC-01`, `SRC-04` | `Reject` | recovery UX wording only | operator shell and failure UI | The truth model is reusable, but GitHub run-history UI and Great Expectations store taxonomy are not direct UX templates for Chainworks. | Borrow semantics, not literal controls or terminology. |
 
-## 5. Proposal Delta Status
+## 5. Proposal Deltas / Recommended Updates
 
-### `DELTA-01` Adopt
-
-Target areas:
-
-- `Section 5.4`
-- `Section 10.2`
-- `Section 10.3`
-- `Section 11`
-
-Recommended update:
-
-- Add one explicit sentence that same-run `Retry Failed Agent` reuses the same frozen logical snapshot as the failed attempt.
-- Add one proof expectation that earlier agent-attempt artifacts, receipts, and transcripts remain inspectable after a later retry succeeds.
-
-Why:
-
-- This is the highest-signal lesson from `SRC-01` plus `SRC-03`, and it makes Proposal 013’s lineage claim more testable.
-
-Status in current draft:
-
-- adopted in `Sections 5.2`, `5.4`, `10.2`, and `10.3`
-
-### `DELTA-02` Adopt
-
-Target areas:
-
-- `Section 6.2`
-- `Section 6.3`
-- `Section 7.3`
-
-Recommended update:
-
-- Make the `ValidationFailureRecord` or failed-stage evidence packet the canonical reference target for recovery UI, report rendering, and export surfaces.
-- State explicitly that summary fields may derive from that object, but may not replace it as the durable source of truth.
-
-Why:
-
-- `SRC-04` strongly supports durable validation-result storage as a first-class operator-visible object rather than only a derived summary.
-
-Status in current draft:
-
-- adopted in `Section 6.3`
-
-### `DELTA-03` Adapt
-
-Target areas:
-
-- `Section 5.2`
-- `Section 7.2`
-- `Section 11`
-
-Recommended update:
-
-- Add a default policy statement that output-contract mismatch and post-generation validation failure are non-auto-retryable by default.
-- Narrow retry remains allowed, but as an explicit recovery action or policy override, not as silent blind retry.
-
-Why:
-
-- `SRC-03` supports manual-intervention treatment for persistent failure classes, and this fits Proposal 013’s operator-trust goal.
-
-Status in current draft:
-
-- adopted in `Sections 5.4` and `7.2`
+| Delta ID | Proposal Section / Decision | Recommended Update | Why It Helps | Supporting Source IDs | Supporting Local Evidence IDs | Priority |
+|---|---|---|---|---|---|---|
+| `DELTA-01` | `Sections 5.2`, `5.4`, `10.2`, `10.3`, `11` | No new wording change required. Keep the current same-snapshot retry lineage language and verify it in implementation proof exactly as written. | External rerun/history systems still support the current immutable-lineage direction. | `SRC-01`, `SRC-02`, `SRC-03` | `REAL-07` | Low |
+| `DELTA-02` | `Sections 5.4`, `7.2`, `11` | No new wording change required. Keep non-auto-retryable-by-default handling for contract mismatch and post-generation validation failure. | External failure semantics still support explicit operator-mediated recovery for this failure class. | `SRC-03`, `SRC-04` | `REAL-08` | Low |
+| `DELTA-03` | `Section 4.2.2`, Layer `Q`, `10.1`, `11.9`, Appendix `B` Tier `1` | Add one explicit sentence that `StructuredOutputSchemaGate` is provider-aware: unsupported backend/schema subset combinations must fail in preflight, and successful transport-level structured output does not remove the need for post-generation contract validation. | Prevents Proposal 013 from overclaiming what provider-level structured-output support guarantees and keeps Tier `1` honest. | `SRC-05`, `SRC-06` | `MAP-04`, `REAL-05`, `REAL-10` | Medium |
+| `DELTA-04` | `Sections 6.3`, `7.3`, export/report guidance | Add one explicit rule that canonical failure evidence may contain sensitive data, so reports and exports should reference the canonical record and default to summarized or redacted presentation. | Makes the failure-evidence hardening safer for consumer-finance workflows without changing the core proposal scope. | `SRC-04` | `REAL-08` | Medium |
 
 ## 6. Freshness Risks / Recheck Triggers
 
-- `SRC-04` is official but versioned legacy documentation. Recheck current Great Expectations docs before borrowing any class names, store names, or config-shape terminology.
-- `SRC-03` is official Temporal educational material, not the primary reference spec. Recheck Temporal reference docs if Chainworks later imports exact retry terminology or policy names.
-- Re-run external research if Proposal 013 later grows from retry/evidence hardening into a broader workflow-history or operator-analytics redesign.
-- No new external contradiction surfaced in the 2026-03-29 refresh.
+| Trigger ID | Claim / Recommendation | Why It Is Time-Sensitive | What Must Be Rechecked | Recheck Trigger / Window | Source IDs |
+|---|---|---|---|---|---|
+| `FRESH-01` | Provider-aware structured-output gate should fail unsupported combinations before execution | Provider schema support evolves quickly and can differ by model family | OpenAI and Gemini structured-output docs, plus active backend capabilities in the repo | Recheck before implementation and again if provider families or model bindings change | `SRC-05`, `SRC-06` |
+| `FRESH-02` | App-side semantic validation remains mandatory even when provider transport accepts structured output | Providers may change what they validate server-side versus what they leave to clients | Structured-output docs and any new transport-layer guarantees | Recheck before implementing `StructuredOutputSchemaGate` and validation tests | `SRC-05`, `SRC-06` |
+| `FRESH-03` | Great Expectations-style validation-result storage is a useful pattern, but not a naming contract | The cited GX docs are legacy-versioned and explicitly no longer actively maintained | Whether the team wants terminology, storage taxonomy, or only the durability pattern | Recheck only if later proposals borrow exact class/store names | `SRC-04` |
+| `FRESH-04` | Same-snapshot retry lineage and canonical failure evidence remain the right external framing for Proposal 013 | Low volatility, but future scope expansion could change applicability | Whether Proposal 013 remains a bounded retry/evidence hardening slice rather than a broader history/analytics redesign | Recheck if Appendix `B` or reporting scope expands materially | `SRC-01`, `SRC-02`, `SRC-03`, `SRC-04` |
 
 ## 7. Remaining Open Questions
 
-- None proposal-blocking after the 2026-03-29 refresh. Remaining questions are implementation-audit level, not research-blocking.
+- `QUESTION-01`: Should Proposal 013 make the redacted-summary-versus-full-evidence display rule explicit now, or leave that as an implementation-detail decision inside the later audit?
+- `QUESTION-02`: Does the repo eventually need a provider capability matrix artifact for `structured_output` support, so Appendix `B` does not become the long-term home for backend-specific schema compatibility rules?

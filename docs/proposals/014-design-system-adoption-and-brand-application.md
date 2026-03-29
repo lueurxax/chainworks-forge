@@ -5,7 +5,7 @@
 | Date | 2026-03-28 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [reference/chainworks_forge_design_kit_v1.md](../reference/chainworks_forge_design_kit_v1.md), [012-ui-quality-audit-and-visual-polish.md](012-ui-quality-audit-and-visual-polish.md), [reference/operator-experience.md](../reference/operator-experience.md), [reference/live-workflow-map.md](../reference/live-workflow-map.md), [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md) |
+| Depends on | [reference/chainworks_forge_design_kit_v1.md](../reference/chainworks_forge_design_kit_v1.md), [reference/ui-quality-and-polish.md](../reference/ui-quality-and-polish.md), [reference/operator-experience.md](../reference/operator-experience.md), [reference/live-workflow-map.md](../reference/live-workflow-map.md), [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md) |
 | Scope | Brand-token adoption, shared UI primitives, icon/logo application, and surface-by-surface migration of the current macOS app toward the approved Chainworks Forge design system |
 | Goal | Bring the shipped app into visual, typographic, and interaction alignment with the Design Kit v1 so Chainworks Forge reads as a coherent orchestration tool with a distinctive brand rather than a collection of functional SwiftUI screens. |
 
@@ -14,7 +14,7 @@
 ## 1. Context
 
 The app now has enough runtime maturity that visual inconsistency is no longer a side issue.
-There is already a UI-quality proposal in [012-ui-quality-audit-and-visual-polish.md](012-ui-quality-audit-and-visual-polish.md), and a stable full-delivery runtime baseline in [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md).
+There is already a stable UI-quality baseline in [reference/ui-quality-and-polish.md](../reference/ui-quality-and-polish.md), and a stable full-delivery runtime baseline in [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md).
 What was missing until now was one explicit visual authority for the brand and the UI language.
 
 [chainworks_forge_design_kit_v1.md](../reference/chainworks_forge_design_kit_v1.md) now provides that authority:
@@ -37,9 +37,9 @@ The repo will keep accumulating:
 
 Proposal 014 is the bounded implementation slice that turns the design kit into real app behavior.
 
-### 1.1 Relationship to Proposal 012
+### 1.1 Relationship to the UI quality baseline
 
-Proposal 012 remains the audit and readability baseline.
+The implemented UI-quality baseline remains the audit and readability authority.
 It already defines:
 
 - the audited surface inventory,
@@ -54,10 +54,10 @@ It builds on it and answers a different question:
 
 Rule of thumb:
 
-- Proposal 012 owns **readability, information hierarchy, and UI debt closure**.
+- The UI quality baseline owns **readability, information hierarchy, and UI debt closure**.
 - Proposal 014 owns **brand-system adoption, design tokens, icon/logo application, and surface migration into the design kit**.
 
-When both proposals touch the same surface, Proposal 012 remains authoritative for interaction and state truth, while Proposal 014 remains authoritative for visual language.
+When both slices touch the same surface, the UI quality baseline remains authoritative for interaction and state truth, while Proposal 014 remains authoritative for visual language.
 
 ### 1.2 What this proposal is not
 
@@ -250,7 +250,7 @@ Rules:
 
 ## 6. Surface rollout plan
 
-Proposal 014 uses the audited-surface inventory from Proposal 012 rather than inventing a new scope list.
+Proposal 014 uses the audited-surface inventory from [reference/ui-quality-and-polish.md](../reference/ui-quality-and-polish.md) rather than inventing a new scope list.
 
 ### 6.1 Phase 1: Foundation and shell
 
@@ -359,7 +359,7 @@ Rules:
 
 ## 8. Accessibility and trust constraints
 
-Proposal 014 must preserve the accessibility and operator-trust rules already established by Proposal 012.
+Proposal 014 must preserve the accessibility and operator-trust rules already established by the UI quality baseline.
 
 Required constraints:
 
@@ -413,7 +413,7 @@ Proposal 014 is a visual-system rollout, not permission to hide or reframe criti
 
 Each migrated phase must be verified through:
 
-1. **Preview proof** for the migrated surfaces listed in Proposal 012 Appendix A.
+1. **Preview proof** for the migrated surfaces listed in the UI quality baseline.
 2. **Min-window proof** at `1024x768` for every migrated surface that declares min-window ownership.
 3. **Cross-view consistency proof** that badges, spacing, panel styling, and typography now come from shared primitives rather than local ad-hoc styling.
 4. **Brand application proof** that the logo/icon/accent usage follows the design-kit restraint rules.
@@ -438,11 +438,11 @@ Each migrated phase must be verified through:
 
 | Risk | Mitigation |
 |---|---|
-| Design-kit rollout turns into broad UI churn | Phase-based surface migration using the audited-surface list from Proposal 012 |
+| Design-kit rollout turns into broad UI churn | Phase-based surface migration using the audited-surface list from the UI quality baseline |
 | Branding competes with workflow clarity | Brand accents are bounded; runtime hierarchy and status semantics remain primary |
 | Custom iconography hurts small-size readability | Keep small operational icons monochrome-first and allow SF Symbols where branded icons are weaker |
 | Token extraction causes behavior regressions | No business-logic changes inside token/primitives work; verification includes unchanged interaction proof |
-| Dense setup and provider screens become prettier but less usable | Above-the-fold command rule and Proposal 012 interaction constraints remain binding |
+| Dense setup and provider screens become prettier but less usable | Above-the-fold command rule and UI quality interaction constraints remain binding |
 
 ---
 
@@ -461,7 +461,7 @@ Proposal 014 is complete only when all of the following are true:
 
 ## 14. Final recommendation
 
-Approve Proposal 014 as the bounded design-system rollout plan that follows Proposal 012.
+Approve Proposal 014 as the bounded design-system rollout plan that follows the implemented UI quality baseline.
 
-Proposal 012 identifies what is visually and structurally wrong.
+The UI quality baseline identifies what is visually and structurally wrong.
 Proposal 014 defines how the app should actually look and how to migrate it there without turning visual work into uncontrolled product churn.

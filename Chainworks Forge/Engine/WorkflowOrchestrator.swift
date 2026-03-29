@@ -257,6 +257,7 @@ final class WorkflowOrchestrator {
                 run.completedAt = Date()
                 persistDeliveryReceiptIfNeeded(finalStateID: state.id)
                 persistFinalFeatureReportIfNeeded(finalStateID: state.id)
+                persistDeclarativeCoverageIfNeeded(finalStateID: state.id)
                 isRunning = false
                 onComplete?(true)
                 return
@@ -486,6 +487,17 @@ final class WorkflowOrchestrator {
             agentExec.status = .failed
             agentExec.completedAt = Date()
             agentExec.logSnippet = "Source context preparation failed: \(error.localizedDescription)"
+            applyTerminalExecutionTruth(
+                to: agentExec,
+                canonicalOutcome: .failedBeforeOutput,
+                transportErrorKind: .unknown,
+                providerStopReason: nil,
+                outputPresence: .none,
+                runtimeProvider: nil,
+                runtimeModel: nil,
+                rawErrorMessage: error.localizedDescription,
+                rawFinishEvent: nil
+            )
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
@@ -493,13 +505,13 @@ final class WorkflowOrchestrator {
         agentExec.inputBindingsJSON = buildInputBindings(for: task)
         agentExec.resolvedBackendProfileID = agent.backendProfileID
 
-        // Build execution context
+        // Build execution context — Proposal 013: use actual stage attempt number
         let execContext = ExecutionContext(
             workspace: currentWorkspace,
             projectRoot: preferredProjectRoot,
             stageID: state.id,
             iteration: currentIteration(for: state.id),
-            attemptNumber: 1,
+            attemptNumber: stageExec.attemptNumber,
             inputArtifacts: inputData,
             variables: runtimeVariables,
             ideaBody: run.idea?.body ?? "",
@@ -528,6 +540,23 @@ final class WorkflowOrchestrator {
             agentExec.status = .failed
             agentExec.completedAt = Date()
             agentExec.logSnippet = "Error: \(error.localizedDescription)"
+            applyTerminalExecutionTruth(
+                to: agentExec,
+                canonicalOutcome: .failedBeforeOutput,
+                transportErrorKind: .unknown,
+                providerStopReason: nil,
+                outputPresence: .none,
+                runtimeProvider: nil,
+                runtimeModel: nil,
+                rawErrorMessage: error.localizedDescription,
+                rawFinishEvent: nil
+            )
+            persistStageFailureEvidence(
+                stageExec: stageExec,
+                failedAgentExec: agentExec,
+                validationFailure: nil,
+                additionalEnvelopes: []
+            )
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
@@ -543,6 +572,7 @@ final class WorkflowOrchestrator {
             existing: agentExec.logSnippet,
             result: result.logSnippet
         )
+        applyExecutionTruth(from: result, to: agentExec)
         // Record sessionID from the executor (§6.1)
         if let sessionID = result.sessionID {
             agentExec.providerSessionID = sessionID
@@ -550,22 +580,93 @@ final class WorkflowOrchestrator {
         }
 
         if result.succeeded {
-            // Persist outputs via ArtifactManager (ARCH-030: sole disk writer)
+            // Proposal 013 §6.2: Ordered persistence — raw outputs first, then validation, then settlement.
             do {
-                let validatedFields = try validateStructuredOutputs(
-                    result.outputs,
-                    for: task,
-                    agent: agent
-                )
-                let artifacts = try artifactManager.persistOutputs(
-                    outputs: result.outputs,
+                // Step 1: Persist raw outputs BEFORE validation (§6.2 Rule 2)
+                let (artifacts, rawEnvelopes) = try ArtifactPersistenceOrderingPolicy.persistRawOutputs(
+                    result: result,
                     agent: agent,
                     agentExecution: agentExec,
                     workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
-                    attemptNumber: 1,
+                    attemptNumber: stageExec.attemptNumber,
+                    artifactManager: artifactManager,
                     catalog: catalog
+                )
+                capturePersistedExecutionEvidence(from: artifacts, for: agentExec)
+
+                // Step 2: Validate structured outputs AFTER raw persistence (§6.2 Rule 3)
+                var envelopes = rawEnvelopes
+                let validationResults = ArtifactPersistenceOrderingPolicy.validatePersistedOutputs(
+                    outputs: result.outputs,
+                    agent: agent,
+                    catalog: catalog,
+                    envelopes: &envelopes
+                )
+
+                // Persist output envelopes as evidence
+                agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
+
+                // Step 3: Check for validation failures
+                let failedResults = validationResults.values.filter { $0.status == OutputValidationStatus.failed }
+                if !failedResults.isEmpty {
+                    // Build and persist validation failure record (§6.2 Rule 4)
+                    let failureRecord = ArtifactPersistenceOrderingPolicy.buildFailureRecord(
+                        validationResults: validationResults,
+                        agent: agent,
+                        stageID: state.id,
+                        runID: run.id,
+                        rawOutputExists: true,
+                        receiptExists: agentExec.providerReceiptJSON != nil,
+                        transcriptExists: hasPersistedTranscriptEvidence(for: agentExec),
+                        catalog: catalog
+                    )
+
+                    if let failureRecord {
+                        agentExec.validationFailureJSON = try? JSONEncoder().encode(failureRecord)
+                        _ = try ArtifactPersistenceOrderingPolicy.persistFailureEvidence(
+                            failureRecord: failureRecord,
+                            workspace: currentWorkspace,
+                            stageID: state.id,
+                            agentID: agent.id,
+                            attemptNumber: stageExec.attemptNumber,
+                            artifactManager: artifactManager
+                        )
+                    }
+
+                    // Raw outputs are preserved even though validation failed
+                    agentExec.status = .failed
+                    applyTerminalExecutionTruth(
+                        to: agentExec,
+                        canonicalOutcome: .failedAfterOutputValidation,
+                        transportErrorKind: agentExec.transportErrorKind,
+                        providerStopReason: agentExec.providerStopReason,
+                        outputPresence: .durableOutput,
+                        runtimeProvider: agentExec.runtimeProvider,
+                        runtimeModel: agentExec.runtimeModel,
+                        rawErrorMessage: failedResults.compactMap(\.validationError).joined(separator: "; "),
+                        rawFinishEvent: nil
+                    )
+                    let validationMessages = failedResults.compactMap { $0.validationError }
+                    agentExec.logSnippet = "Output contract validation failed: \(validationMessages.joined(separator: "; "))"
+
+                    persistStageFailureEvidence(
+                        stageExec: stageExec,
+                        failedAgentExec: agentExec,
+                        validationFailure: failureRecord,
+                        additionalEnvelopes: envelopes
+                    )
+
+                    unregisterLiveExecution(agentExec, for: agent.id)
+                    return false
+                }
+
+                // Validation passed — extract fields for transition evaluation
+                let validatedFields = try validateStructuredOutputs(
+                    result.outputs,
+                    for: task,
+                    agent: agent
                 )
 
                 // Update tracking for transition evaluation
@@ -591,9 +692,30 @@ final class WorkflowOrchestrator {
                     run.totalCostCents = (run.totalCostCents ?? 0) + cost
                 }
                 agentExec.status = .completed
+                // Proposal 013 §8.2: Record compaction outcome truth
+                updateCompactionOutcome(agentExec: agentExec, succeeded: true)
             } catch {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Output validation or persistence error: \(error.localizedDescription)"
+                applyTerminalExecutionTruth(
+                    to: agentExec,
+                    canonicalOutcome: result.outputPresence == .durableOutput ? .failedAfterOutputValidation : .failedBeforeOutput,
+                    transportErrorKind: result.transportErrorKind,
+                    providerStopReason: result.providerStopReason,
+                    outputPresence: result.outputPresence,
+                    runtimeProvider: agentExec.runtimeProvider,
+                    runtimeModel: agentExec.runtimeModel,
+                    rawErrorMessage: error.localizedDescription,
+                    rawFinishEvent: result.outcomeEnvelope?.rawFinishEvent
+                )
+                persistStageFailureEvidence(
+                    stageExec: stageExec,
+                    failedAgentExec: agentExec,
+                    validationFailure: nil,
+                    additionalEnvelopes: []
+                )
+                // Proposal 013 §8.2: Record compaction outcome truth
+                updateCompactionOutcome(agentExec: agentExec, succeeded: false)
                 unregisterLiveExecution(agentExec, for: agent.id)
                 return false
             }
@@ -601,11 +723,126 @@ final class WorkflowOrchestrator {
             unregisterLiveExecution(agentExec, for: agent.id)
             return true
         } else {
+            if !result.outputs.isEmpty {
+                do {
+                    let (artifacts, envelopes) = try ArtifactPersistenceOrderingPolicy.persistRawOutputs(
+                        result: result,
+                        agent: agent,
+                        agentExecution: agentExec,
+                        workspace: currentWorkspace,
+                        stageID: state.id,
+                        iteration: currentIteration(for: state.id),
+                        attemptNumber: stageExec.attemptNumber,
+                        artifactManager: artifactManager,
+                        catalog: catalog
+                    )
+                    capturePersistedExecutionEvidence(from: artifacts, for: agentExec)
+                    agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
+                    persistStageFailureEvidence(
+                        stageExec: stageExec,
+                        failedAgentExec: agentExec,
+                        validationFailure: nil,
+                        additionalEnvelopes: envelopes
+                    )
+                } catch {
+                    agentExec.logSnippet = mergedLogSnippet(
+                        existing: agentExec.logSnippet,
+                        result: "Raw failure outputs could not be persisted: \(error.localizedDescription)"
+                    )
+                }
+            } else {
+                persistStageFailureEvidence(
+                    stageExec: stageExec,
+                    failedAgentExec: agentExec,
+                    validationFailure: nil,
+                    additionalEnvelopes: []
+                )
+            }
             agentExec.status = .failed
             agentExec.logSnippet = result.errorMessage
+            // Proposal 013 §8.2: Record compaction outcome truth
+            updateCompactionOutcome(agentExec: agentExec, succeeded: false)
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
+    }
+
+    private func capturePersistedExecutionEvidence(from artifacts: [Artifact], for agentExec: AgentExecution) {
+        for artifact in artifacts where artifact.name.hasSuffix("_transcript.md") {
+            agentExec.transcriptArtifactPath = artifact.filePath
+            agentExec.transcriptPath = artifact.filePath
+        }
+    }
+
+    private func hasPersistedTranscriptEvidence(for agentExec: AgentExecution) -> Bool {
+        agentExec.transcriptPath != nil
+            || agentExec.transcriptArtifactPath != nil
+            || agentExec.artifacts.contains(where: { $0.name.hasSuffix("_transcript.md") })
+    }
+
+    private func decodeOutputEnvelopes(from agentExec: AgentExecution) -> [StructuredOutputEnvelope] {
+        guard let data = agentExec.outputEnvelopesJSON else { return [] }
+        return (try? JSONDecoder().decode([StructuredOutputEnvelope].self, from: data)) ?? []
+    }
+
+    private func mergedOutputEnvelopes(
+        for stageExec: StageExecution,
+        additionalEnvelopes: [StructuredOutputEnvelope]
+    ) -> [StructuredOutputEnvelope] {
+        let stageEnvelopes = stageExec.agentExecutions.flatMap { decodeOutputEnvelopes(from: $0) }
+        let all = stageEnvelopes + additionalEnvelopes
+        var seen: Set<String> = []
+        var merged: [StructuredOutputEnvelope] = []
+
+        for envelope in all {
+            let key = [
+                envelope.outputName,
+                envelope.agentID,
+                envelope.stageID,
+                envelope.rawPayloadChecksum ?? "no-checksum",
+                envelope.sessionID ?? "no-session"
+            ].joined(separator: "|")
+            if seen.insert(key).inserted {
+                merged.append(envelope)
+            }
+        }
+
+        return merged
+    }
+
+    private func persistStageFailureEvidence(
+        stageExec: StageExecution,
+        failedAgentExec: AgentExecution,
+        validationFailure: ValidationFailureRecord?,
+        additionalEnvelopes: [StructuredOutputEnvelope]
+    ) {
+        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
+        let recoverySnapshot = retryCoordinator.narrowestRecoveryAction(
+            for: run,
+            failedStage: stageExec,
+            failedAgent: failedAgentExec,
+            validationFailure: validationFailure
+        )
+        stageExec.recoverySnapshotJSON = try? JSONEncoder().encode(recoverySnapshot)
+
+        if let validationFailure {
+            if failedAgentExec.validationFailureJSON == nil {
+                failedAgentExec.validationFailureJSON = try? JSONEncoder().encode(validationFailure)
+            }
+            stageExec.validationFailureJSON = failedAgentExec.validationFailureJSON
+        }
+
+        let evidencePacket = FailedStageEvidenceBuilder.buildEvidencePacket(
+            stageExecution: stageExec,
+            failedAgent: failedAgentExec,
+            validationFailure: validationFailure,
+            outputEnvelopes: mergedOutputEnvelopes(
+                for: stageExec,
+                additionalEnvelopes: additionalEnvelopes
+            ),
+            recoverySnapshot: recoverySnapshot
+        )
+        stageExec.evidencePacketJSON = try? JSONEncoder().encode(evidencePacket)
     }
 
     // MARK: - Release Agent Execution (Proposal 007 REQ-008 / REQ-011)
@@ -665,7 +902,7 @@ final class WorkflowOrchestrator {
                     workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
-                    attemptNumber: 1,
+                    attemptNumber: stageExec.attemptNumber,
                     catalog: catalog
                 )
                 for artifact in artifacts {
@@ -883,12 +1120,13 @@ final class WorkflowOrchestrator {
                 }
                 let task = pair.task
                 let agent = pair.agent
+                // Proposal 013: use actual stage attempt number
                 let execContext = ExecutionContext(
                     workspace: currentWorkspace,
                     projectRoot: preferredProjectRoot,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
-                    attemptNumber: 1,
+                    attemptNumber: stageExec.attemptNumber,
                     inputArtifacts: gatheredInputs,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? "",
@@ -933,6 +1171,21 @@ final class WorkflowOrchestrator {
             guard let result = optResult, result.succeeded else {
                 agentExec.status = .failed
                 agentExec.logSnippet = optResult?.errorMessage ?? "Execution failed"
+                if let result = optResult {
+                    applyExecutionTruth(from: result, to: agentExec)
+                } else {
+                    applyTerminalExecutionTruth(
+                        to: agentExec,
+                        canonicalOutcome: .failedBeforeOutput,
+                        transportErrorKind: .unknown,
+                        providerStopReason: nil,
+                        outputPresence: .none,
+                        runtimeProvider: nil,
+                        runtimeModel: nil,
+                        rawErrorMessage: agentExec.logSnippet,
+                        rawFinishEvent: nil
+                    )
+                }
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
@@ -943,6 +1196,7 @@ final class WorkflowOrchestrator {
             agentExec.configuredProviderID = result.configuredProviderID
             agentExec.adapterVersion = result.adapterVersion
             agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
+            applyExecutionTruth(from: result, to: agentExec)
             if let sessionID = result.sessionID {
                 agentExec.providerSessionID = sessionID
                 agentExec.gooseSessionID = sessionID
@@ -958,6 +1212,7 @@ final class WorkflowOrchestrator {
                     for: pair.task,
                     agent: agent
                 )
+                // Proposal 013: use actual stage attempt number
                 let artifacts = try artifactManager.persistOutputs(
                     outputs: result.outputs,
                     agent: agent,
@@ -965,7 +1220,7 @@ final class WorkflowOrchestrator {
                     workspace: currentWorkspace,
                     stageID: state.id,
                     iteration: currentIteration(for: state.id),
-                    attemptNumber: 1,
+                    attemptNumber: stageExec.attemptNumber,
                     catalog: catalog
                 )
 
@@ -992,6 +1247,17 @@ final class WorkflowOrchestrator {
             } catch {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Output validation or persistence error: \(error.localizedDescription)"
+                applyTerminalExecutionTruth(
+                    to: agentExec,
+                    canonicalOutcome: result.outputPresence == .durableOutput ? .failedAfterOutputValidation : .failedBeforeOutput,
+                    transportErrorKind: result.transportErrorKind,
+                    providerStopReason: result.providerStopReason,
+                    outputPresence: result.outputPresence,
+                    runtimeProvider: agentExec.runtimeProvider,
+                    runtimeModel: agentExec.runtimeModel,
+                    rawErrorMessage: error.localizedDescription,
+                    rawFinishEvent: result.outcomeEnvelope?.rawFinishEvent
+                )
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
@@ -1221,9 +1487,10 @@ final class WorkflowOrchestrator {
     ) throws -> [String: [String: AnyCodableValue]] {
         var validated: [String: [String: AnyCodableValue]] = [:]
 
-        for outputName in OutputContractResolver.expectedOutputs(for: task, agent: agent) {
+        // Proposal 013: V2 resolver — catalog-driven, no hardcoded fallbacks
+        for outputName in OutputContractResolverV2.expectedOutputs(for: task, agent: agent) {
             guard let data = outputs[outputName] else { continue }
-            guard let contractID = OutputContractResolver.contractID(
+            guard let contractID = OutputContractResolverV2.resolveContractID(
                 for: outputName,
                 agent: agent,
                 catalog: catalog
@@ -1233,6 +1500,18 @@ final class WorkflowOrchestrator {
             contract.format == "json" else {
                 continue
             }
+
+            // Proposal 013 §4.3: Skip strict field validation for structured_with_human_companion
+            // contracts — the V2 validation has already accepted the output.
+            let schema = OutputContractResolverV2.resolveSchema(for: outputName, agent: agent, catalog: catalog)
+            if schema?.validationMode == .structuredWithHumanCompanion {
+                // Try JSON extraction for transition evaluation, but don't throw on failure
+                if let fields = tryExtractScalarFields(from: data) {
+                    validated[outputName] = fields
+                }
+                continue
+            }
+
             let json = try parseJSONObject(
                 data,
                 agentID: agent.id,
@@ -1576,6 +1855,8 @@ final class WorkflowOrchestrator {
             return String(trimmed.prefix(220))
         case .finalOutput:
             return "Final output received"
+        case .finish:
+            return event.detail
         case .error:
             return "Provider error: \(event.detail)"
         case .sessionClosed:
@@ -1602,6 +1883,69 @@ final class WorkflowOrchestrator {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try? encoder.encode(receipt)
+    }
+
+    private func encodeOutcomeEnvelope(_ envelope: OutcomeEnvelope?) -> Data? {
+        guard let envelope else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(envelope)
+    }
+
+    private func applyExecutionTruth(from result: AgentResult, to agentExec: AgentExecution) {
+        let canonicalOutcome = result.canonicalOutcome ?? (result.succeeded ? .completed : .failedBeforeOutput)
+        let runtimeProvider = result.runtimeProvider ?? result.providerReceipt?.providerFamily
+        let runtimeModel = result.runtimeModel ?? result.providerReceipt?.model ?? result.resolvedModel
+        let envelope = result.outcomeEnvelope ?? OutcomeEnvelope(
+            canonicalOutcome: canonicalOutcome,
+            transportErrorKind: result.transportErrorKind,
+            providerStopReason: result.providerStopReason,
+            outputPresence: result.outputPresence,
+            rawErrorMessage: result.errorMessage,
+            rawFinishEvent: nil
+        )
+
+        applyTerminalExecutionTruth(
+            to: agentExec,
+            canonicalOutcome: canonicalOutcome,
+            transportErrorKind: result.transportErrorKind,
+            providerStopReason: result.providerStopReason,
+            outputPresence: result.outputPresence,
+            runtimeProvider: runtimeProvider,
+            runtimeModel: runtimeModel,
+            envelope: envelope
+        )
+    }
+
+    private func applyTerminalExecutionTruth(
+        to agentExec: AgentExecution,
+        canonicalOutcome: AgentCanonicalOutcome,
+        transportErrorKind: TransportErrorKind?,
+        providerStopReason: String?,
+        outputPresence: OutputPresence,
+        runtimeProvider: String?,
+        runtimeModel: String?,
+        rawErrorMessage: String? = nil,
+        rawFinishEvent: String? = nil,
+        envelope: OutcomeEnvelope? = nil
+    ) {
+        agentExec.canonicalOutcome = canonicalOutcome
+        agentExec.transportErrorKind = transportErrorKind
+        agentExec.providerStopReason = providerStopReason
+        agentExec.outputPresence = outputPresence
+        agentExec.runtimeProvider = runtimeProvider
+        agentExec.runtimeModel = runtimeModel
+        agentExec.settledAt = agentExec.completedAt ?? Date()
+
+        let resolvedEnvelope = envelope ?? OutcomeEnvelope(
+            canonicalOutcome: canonicalOutcome,
+            transportErrorKind: transportErrorKind,
+            providerStopReason: providerStopReason,
+            outputPresence: outputPresence,
+            rawErrorMessage: rawErrorMessage,
+            rawFinishEvent: rawFinishEvent
+        )
+        agentExec.outcomeEnvelopeJSON = encodeOutcomeEnvelope(resolvedEnvelope)
     }
 
     private static func decodeProviderBindings(from data: Data?) -> [String: ResolvedProviderBinding] {
@@ -1663,6 +2007,38 @@ final class WorkflowOrchestrator {
             if let fields = tryExtractScalarFields(from: data) {
                 artifactFields[artifact.name] = fields
             }
+        }
+    }
+
+    // Proposal 013 §8.2: Update compaction outcome truth on agent execution
+    private func updateCompactionOutcome(agentExec: AgentExecution, succeeded: Bool) {
+        guard let data = agentExec.compactionMetadataJSON,
+              var metadata = try? JSONDecoder().decode(CompactionMetadata.self, from: data) else {
+            return
+        }
+        metadata.stageOutcome = succeeded ? .succeededWithCompaction : .failedDespiteCompaction
+        agentExec.compactionMetadataJSON = try? JSONEncoder().encode(metadata)
+    }
+
+    // Proposal 013 Layer Q: Emit declarative coverage snapshot at run terminal state
+    private func persistDeclarativeCoverageIfNeeded(finalStateID: String) {
+        guard producedArtifactNames.contains("declarative_coverage_report") == false else { return }
+        let report = DeclarativeCoverageReport()
+        guard let data = try? JSONEncoder().encode(report) else { return }
+        if let artifact = try? artifactManager.persistSystemArtifact(
+            name: "declarative_coverage_report",
+            data: data,
+            contractID: "declarative_coverage_v1",
+            format: .json,
+            workspace: workspace,
+            stageID: finalStateID,
+            agentID: "system_reporter",
+            provider: "system",
+            model: nil,
+            effort: nil,
+            attemptNumber: 1
+        ) {
+            producedArtifactNames.insert(artifact.name)
         }
     }
 

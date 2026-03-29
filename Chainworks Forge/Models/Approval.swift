@@ -9,6 +9,8 @@ import SwiftData
     var decision: ApprovalDecision
     var comment: String?
     var expiresAt: Date?
+    var lineageID: String?
+    var repairedAt: Date?
 
     @Relationship(inverse: \Run.approvals)
     var run: Run?

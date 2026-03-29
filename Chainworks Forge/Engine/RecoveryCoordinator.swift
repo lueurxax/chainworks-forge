@@ -64,6 +64,7 @@ final class RecoveryCoordinator {
     // MARK: - Execute Recovery
 
     /// Execute a retry agent action. Returns the updated run and emits a new report version.
+    /// Proposal 013: Uses StageRetryCoordinator for proper attempt lineage (§5.2 Rule 1).
     func retryAgent(run: Run, stageID: String, agentID: String) throws -> Run {
         guard run.status == .failed || run.status == .blocked else {
             throw RecoveryError.invalidStateForAction(current: run.status.rawValue, action: "retryAgent")
@@ -80,20 +81,19 @@ final class RecoveryCoordinator {
             throw RecoveryError.agentNotFound(agentID)
         }
 
-        // Reset agent for retry
-        agent.status = .pending
-        agent.completedAt = nil
-        agent.costCents = nil
-        agent.logSnippet = nil
-        agent.retryReason = "manual_retry_via_recovery"
+        // Proposal 013 §5.2: Use StageRetryCoordinator for proper lineage
+        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
+        _ = try retryCoordinator.retryFailedAgent(run: run, stage: stage, failedAgent: agent)
 
-        // Reset stage status
-        stage.status = .ready
-        stage.completedAt = nil
-        stage.attemptNumber += 1
-
-        // Reset run status
-        run.status = .ready
+        // Build and persist recovery snapshot
+        let validationFailure = decodeValidationFailure(from: agent)
+        let snapshot = retryCoordinator.narrowestRecoveryAction(
+            for: run,
+            failedStage: stage,
+            failedAgent: agent,
+            validationFailure: validationFailure
+        )
+        stage.recoverySnapshotJSON = try? JSONEncoder().encode(snapshot)
 
         // Emit recovery report
         _ = try reportBuilder.emitReport(for: run)
@@ -103,6 +103,7 @@ final class RecoveryCoordinator {
     }
 
     /// Execute a retry stage action.
+    /// Proposal 013: Uses StageRetryCoordinator for proper attempt lineage (§5.2 Rule 2).
     func retryStage(run: Run, stageID: String) throws -> Run {
         guard run.status == .failed || run.status == .blocked else {
             throw RecoveryError.invalidStateForAction(current: run.status.rawValue, action: "retryStage")
@@ -115,22 +116,9 @@ final class RecoveryCoordinator {
             throw RecoveryError.stageNotFound(stageID)
         }
 
-        // Reset all agents in the stage
-        for agent in stage.agentExecutions {
-            agent.status = .pending
-            agent.completedAt = nil
-            agent.costCents = nil
-            agent.logSnippet = nil
-            agent.retryReason = "stage_retry_via_recovery"
-        }
-
-        // Reset stage
-        stage.status = .ready
-        stage.completedAt = nil
-        stage.attemptNumber += 1
-
-        // Reset run status
-        run.status = .ready
+        // Proposal 013 §5.2: Use StageRetryCoordinator for proper lineage
+        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
+        _ = try retryCoordinator.retryFailedStage(run: run, stage: stage)
 
         // Emit recovery report
         _ = try reportBuilder.emitReport(for: run)
@@ -228,15 +216,23 @@ final class RecoveryCoordinator {
         return clone
     }
 
-    // MARK: - Recovery Context (§7.4)
+    // MARK: - Recovery Context (§7.4) — Proposal 013: Evidence-aware
 
     /// Build a recovery context for the recovery sheet UI.
+    /// Proposal 013: Now includes evidence summary and failure class information.
     func recoveryContext(for run: Run) -> RecoveryContext {
         let reason: String
         let mostRecentStage: String
         let trustSummary: String
 
-        if let details = run.driftDetails {
+        // Proposal 013: Try to get failure reason from validation evidence first
+        let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run)
+        let failedAgent = failedStage.flatMap { lastFailedAgent(in: $0) }
+        let validationFailure = failedAgent.flatMap { decodeValidationFailure(from: $0) }
+
+        if let vf = validationFailure {
+            reason = "\(vf.failureClass.rawValue.replacingOccurrences(of: "_", with: " ").capitalized): \(vf.failureSummary)"
+        } else if let details = run.driftDetails {
             reason = details
         } else if run.status == .failed {
             reason = "Run failed during execution"
@@ -252,14 +248,57 @@ final class RecoveryCoordinator {
         trustSummary = run.runtimeTrustLevel ?? "unknown"
 
         let actions = availableActions(for: run)
-        let suggestedAction = actions.first
+
+        // Proposal 013 UX-001: For contract mismatch, suggest operator inspection first
+        // instead of blind retry. Use narrowestRecoveryAction for evidence-backed suggestion.
+        let suggestedAction: RecoveryAction?
+        if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
+            // Operator-mediated: don't suggest retry first for contract mismatch
+            // Instead, the evidence panel should be inspected before retrying
+            suggestedAction = nil
+        } else {
+            suggestedAction = actions.first
+        }
+
+        // Proposal 013: Build evidence summary
+        let evidenceSummary: String?
+        if let vf = validationFailure {
+            var parts: [String] = []
+            if vf.rawOutputExists { parts.append("raw output present") }
+            if vf.receiptExists { parts.append("receipt present") }
+            if vf.transcriptExists { parts.append("transcript present") }
+            evidenceSummary = parts.isEmpty ? nil : parts.joined(separator: ", ")
+        } else {
+            evidenceSummary = nil
+        }
 
         return RecoveryContext(
             reason: reason,
             mostRecentStage: mostRecentStage,
             trustSummary: trustSummary,
             suggestedAction: suggestedAction,
-            allowedActions: actions
+            allowedActions: actions,
+            evidenceSummary: evidenceSummary,
+            failureClass: validationFailure?.failureClass.rawValue
+        )
+    }
+
+    // MARK: - Proposal 013: Evidence Packet Building
+
+    /// Build a failed-stage evidence packet for the evidence panel.
+    func buildEvidencePacket(for run: Run) -> FailedStageEvidencePacket? {
+        guard let stage = lastFailedStage(in: run) ?? lastBlockedStage(in: run) else { return nil }
+        let failedAgent = lastFailedAgent(in: stage)
+        let validationFailure = failedAgent.flatMap { decodeValidationFailure(from: $0) }
+        let envelopes = failedAgent.flatMap { decodeOutputEnvelopes(from: $0) } ?? []
+        let recoverySnapshot = decodeRecoverySnapshot(from: stage)
+
+        return FailedStageEvidenceBuilder.buildEvidencePacket(
+            stageExecution: stage,
+            failedAgent: failedAgent,
+            validationFailure: validationFailure,
+            outputEnvelopes: envelopes,
+            recoverySnapshot: recoverySnapshot
         )
     }
 
@@ -298,6 +337,23 @@ final class RecoveryCoordinator {
             .filter { $0.status == .waitingApproval }
             .sorted { $0.startedAt < $1.startedAt }
             .last
+    }
+
+    // MARK: - Proposal 013: Decode Helpers
+
+    private func decodeValidationFailure(from agent: AgentExecution) -> ValidationFailureRecord? {
+        guard let data = agent.validationFailureJSON else { return nil }
+        return try? JSONDecoder().decode(ValidationFailureRecord.self, from: data)
+    }
+
+    private func decodeOutputEnvelopes(from agent: AgentExecution) -> [StructuredOutputEnvelope]? {
+        guard let data = agent.outputEnvelopesJSON else { return nil }
+        return try? JSONDecoder().decode([StructuredOutputEnvelope].self, from: data)
+    }
+
+    private func decodeRecoverySnapshot(from stage: StageExecution) -> RecoveryActionSnapshot? {
+        guard let data = stage.recoverySnapshotJSON else { return nil }
+        return try? JSONDecoder().decode(RecoveryActionSnapshot.self, from: data)
     }
 
     /// A recovery clone replaces the blocked source run as the active run for the idea.
@@ -362,6 +418,28 @@ struct RecoveryContext {
     let trustSummary: String
     let suggestedAction: RecoveryAction?
     let allowedActions: [RecoveryAction]
+
+    // Proposal 013: Evidence-aware recovery context
+    let evidenceSummary: String?
+    let failureClass: String?
+
+    init(
+        reason: String,
+        mostRecentStage: String,
+        trustSummary: String,
+        suggestedAction: RecoveryAction?,
+        allowedActions: [RecoveryAction],
+        evidenceSummary: String? = nil,
+        failureClass: String? = nil
+    ) {
+        self.reason = reason
+        self.mostRecentStage = mostRecentStage
+        self.trustSummary = trustSummary
+        self.suggestedAction = suggestedAction
+        self.allowedActions = allowedActions
+        self.evidenceSummary = evidenceSummary
+        self.failureClass = failureClass
+    }
 }
 
 enum RecoveryError: Error, LocalizedError {

@@ -90,7 +90,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
 This repo is still under active product and hardening work. Current active areas are mostly about:
 
 - output-contract alignment, retry truth, and failure-evidence hardening
-- design-system adoption and UI polish
+- broader design-system adoption and brand application
 
 The best source of truth for that work is the docs index and the active proposals, not this README.
 
@@ -175,6 +175,7 @@ Implemented-system references:
 - [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
 - [`docs/reference/operator-experience.md`](docs/reference/operator-experience.md)
 - [`docs/reference/provider-platform.md`](docs/reference/provider-platform.md)
+- [`docs/reference/ui-quality-and-polish.md`](docs/reference/ui-quality-and-polish.md)
 - [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
 - [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)

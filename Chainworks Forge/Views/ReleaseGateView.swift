@@ -10,9 +10,25 @@ import AppKit
 /// security/audit/docs summary, target branch, release destination.
 /// Quick actions: open proposal, open diff, approve, reject.
 struct ReleaseGateView: View {
+    fileprivate enum FocusTarget: String {
+        case openProposal
+        case rejectRelease
+        case approveRelease
+
+        var label: String {
+            switch self {
+            case .openProposal: return "Open Proposal"
+            case .rejectRelease: return "Reject Release"
+            case .approveRelease: return "Approve Release"
+            }
+        }
+    }
+
     let run: Run
     let onApprove: () -> Void
     let onReject: () -> Void
+
+    @FocusState private var focusedTarget: FocusTarget?
 
     private var deliveryConfig: DeliveryConfiguration? {
         guard let data = run.deliveryConfigurationJSON else { return nil }
@@ -23,6 +39,14 @@ struct ReleaseGateView: View {
         run.stageExecutions
             .flatMap(\.agentExecutions)
             .flatMap(\.artifacts)
+    }
+
+    private var focusProofEnabled: Bool {
+        ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_FOCUS_PROOF"] == "1"
+    }
+
+    private var initialFocusTarget: FocusTarget {
+        artifact(named: "approved_proposal") != nil ? .openProposal : .rejectRelease
     }
 
     var body: some View {
@@ -77,6 +101,8 @@ struct ReleaseGateView: View {
                 // Proposal 012 (L-09): Keyboard shortcut for reject
                 .keyboardShortcut(.delete, modifiers: [.command])
                 .accessibilityIdentifier("release-gate-reject-button")
+                .focusable(focusProofEnabled)
+                .focused($focusedTarget, equals: .rejectRelease)
 
                 Button {
                     onApprove()
@@ -89,6 +115,8 @@ struct ReleaseGateView: View {
                 // Proposal 012 (L-09): Keyboard shortcut for approve
                 .keyboardShortcut(.return, modifiers: [.command])
                 .accessibilityIdentifier("release-gate-approve-button")
+                .focusable(focusProofEnabled)
+                .focused($focusedTarget, equals: .approveRelease)
             }
             .controlSize(.large)
         }
@@ -96,16 +124,33 @@ struct ReleaseGateView: View {
         .frame(minWidth: 500, minHeight: 400)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("release-gate-view")
+        .overlay(alignment: .topLeading) {
+            if focusProofEnabled {
+                Text("Focused: \(focusedTarget?.label ?? "None")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                    .padding(.leading, 2)
+                    .accessibilityIdentifier("release-gate-focus-order")
+            }
+        }
+        .task(id: focusProofEnabled) {
+            guard focusProofEnabled else { return }
+            await MainActor.run {
+                focusedTarget = initialFocusTarget
+            }
+        }
     }
 
-    // MARK: - Sections
+// MARK: - Sections
 
     @ViewBuilder
     private var statusBadge: some View {
         StatusCapsule(
             text: "Awaiting Approval",
             color: DesignTokens.Status.warning,
-            icon: "checkmark.seal"
+            icon: "checkmark.seal",
+            accessibilityIdentifier: "release-gate-status-badge"
         )
     }
 
@@ -312,20 +357,39 @@ struct ReleaseGateView: View {
 
                 ForEach(contextArtifacts, id: \.name) { item in
                     if let artifact = artifact(named: item.name) {
-                        Button {
-                            openArtifact(artifact)
-                        } label: {
-                            HStack {
-                                Label(item.label, systemImage: item.icon)
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                        if focusProofEnabled && item.name == "approved_proposal" {
+                            Button {
+                                openArtifact(artifact)
+                            } label: {
+                                HStack {
+                                    Label(item.label, systemImage: item.icon)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .font(.callout)
                             }
-                            .font(.callout)
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("release-gate-open-\(item.name)")
+                            .focusable()
+                            .focused($focusedTarget, equals: .openProposal)
+                        } else {
+                            Button {
+                                openArtifact(artifact)
+                            } label: {
+                                HStack {
+                                    Label(item.label, systemImage: item.icon)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .font(.callout)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("release-gate-open-\(item.name)")
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("release-gate-open-\(item.name)")
                     } else {
                         HStack {
                             Label(item.label, systemImage: item.icon)

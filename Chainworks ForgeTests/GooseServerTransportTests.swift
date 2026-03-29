@@ -512,6 +512,7 @@ struct GooseServerTransportTests {
             case .promptSubmitted: return "promptSubmitted"
             case .textChunk: return "textChunk"
             case .finalOutput: return "finalOutput"
+            case .finish: return "finish"
             case .sessionClosed: return "sessionClosed"
             case .toolCallStarted: return "toolCallStarted"
             case .toolCallFinished: return "toolCallFinished"

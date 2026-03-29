@@ -9,6 +9,7 @@ import SwiftData
 struct RunsHomeView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
 
     @Query(sort: \Run.startedAt, order: .reverse)
     private var allRuns: [Run]
@@ -22,10 +23,40 @@ struct RunsHomeView: View {
     @State private var showBlockedRecovery = false
 
     var body: some View {
-        NavigationSplitView {
-            List(selection: $selectedRun) {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+            HStack(alignment: .firstTextBaseline, spacing: DesignTokens.Spacing.small) {
+                Text("Runs Home")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("runs-home-owner-ready")
+
+                Spacer(minLength: DesignTokens.Spacing.small)
+
+                Text(runsHomeAccessibilitySummary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+                    .accessibilityLabel(runsHomeAccessibilityLabel)
+                    .accessibilityValue(runsHomeAccessibilityValue)
+                    .accessibilityAddTraits(.isStaticText)
+                    .accessibilityIdentifier("runs-home-adopter-slice-summary-text")
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(runsHomeAccessibilityLabel)
+            .accessibilityValue(runsHomeAccessibilityValue)
+            .accessibilityIdentifier("runs-home-adopter-slice-summary")
+            .padding(.horizontal, DesignTokens.Spacing.section)
+            .padding(.top, DesignTokens.Spacing.compact)
+
+            NavigationSplitView {
+                List(selection: $selectedRun) {
                 // §5.2: Waiting Approval
                 if !waitingApprovalRuns.isEmpty {
+                    Text("Waiting Approval")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("runs-home-section-waiting-approval")
+
                     Section {
                         ForEach(waitingApprovalRuns) { run in
                             RunsHomeRow(
@@ -121,27 +152,28 @@ struct RunsHomeView: View {
                     )
                 }
             }
-            .navigationTitle("Runs Home")
-            .accessibilityIdentifier("runs-home-list")
-            // Proposal 012 (C-01): Widen sidebar to accommodate run row content
-            .navigationSplitViewColumnWidth(min: 280, ideal: 340)
-        } detail: {
-            if let run = selectedRun {
-                RunDetailPanel(
-                    run: run,
-                    onRecover: { showRecoverySheet = true },
-                    onCompare: { showComparisonPicker = true },
-                    onViewReport: { showReportView = true },
-                    onBlockedRecovery: { showBlockedRecovery = true },
-                    compatibilityChecker: compatibilityChecker
-                )
-            } else {
-                // Proposal 012 (L-01): Enhanced empty state
-                StyledEmptyState(
-                    title: "Select a Run",
-                    systemImage: "sidebar.left",
-                    description: "Choose a run from the sidebar to view details."
-                )
+                .navigationTitle("Runs Home")
+                .accessibilityIdentifier("runs-home-list")
+                // Proposal 012 (C-01): Widen sidebar to accommodate run row content
+                .navigationSplitViewColumnWidth(min: 280, ideal: 340)
+            } detail: {
+                if let run = selectedRun {
+                    RunDetailPanel(
+                        run: run,
+                        onRecover: { showRecoverySheet = true },
+                        onCompare: { showComparisonPicker = true },
+                        onViewReport: { showReportView = true },
+                        onBlockedRecovery: { showBlockedRecovery = true },
+                        compatibilityChecker: compatibilityChecker
+                    )
+                } else {
+                    // Proposal 012 (L-01): Enhanced empty state
+                    StyledEmptyState(
+                        title: "Select a Run",
+                        systemImage: "sidebar.left",
+                        description: "Choose a run from the sidebar to view details."
+                    )
+                }
             }
         }
         .sheet(isPresented: $showRecoverySheet) {
@@ -189,6 +221,10 @@ struct RunsHomeView: View {
                 .frame(minWidth: 600, minHeight: 500)
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(runsHomeAccessibilityLabel)
+        .accessibilityValue(runsHomeAccessibilityValue)
+        .accessibilityIdentifier("runs-home-owner-view")
         .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { notification in
             guard
                 let runIDString = notification.userInfo?["runID"] as? String,
@@ -216,6 +252,33 @@ struct RunsHomeView: View {
 
     private var recentlyCompletedRuns: [Run] {
         allRuns.filter { $0.status == .completed || $0.status == .failed || $0.status == .cancelled }
+    }
+
+    private var runsHomeAccessibilitySummary: String {
+        "Waiting approval \(waitingApprovalRuns.count), blocked \(blockedRuns.count), recent completed \(recentlyCompletedRuns.count)"
+    }
+
+    private var runsHomeAccessibilityLabel: String {
+        "Runs Home. \(runsHomeAccessibilitySummary). Accessibility display settings: \(runsHomeAccessibilityValue)"
+    }
+
+    private var runsHomeAccessibilityValue: String {
+        var modes: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            modes.append("differentiate without color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            modes.append("increase contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            modes.append("reduce transparency")
+        }
+        let modeSummary = modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
+        if let featuredRun = waitingApprovalRuns.first ?? blockedRuns.first ?? runningRuns.first ?? recentlyCompletedRuns.first {
+            let featuredTitle = featuredRun.idea?.title ?? "Unknown Idea"
+            return "\(modeSummary). Featured run: \(featuredTitle), \(featuredRun.presentationStatusLabel)."
+        }
+        return modeSummary
     }
 
     // MARK: - Compatibility (§8.1)
@@ -255,6 +318,8 @@ struct CompatibilityChecker {
 // MARK: - Run Row (§5.3)
 
 struct RunsHomeRow: View {
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
+
     let run: Run
     let attentionLevel: AttentionLevel
 
@@ -309,7 +374,8 @@ struct RunsHomeRow: View {
                 StatusCapsule(
                     text: run.presentationStatusLabel,
                     color: statusColor,
-                    size: .small
+                    size: .small,
+                    accessibilityIdentifier: "run-row-status-\(sanitizedRunTitle)"
                 )
                 if let stageLabel = currentStageLabel {
                     Text(stageLabel)
@@ -324,7 +390,10 @@ struct RunsHomeRow: View {
             }
         }
         .padding(.vertical, DesignTokens.Spacing.compact)
-        .accessibilityIdentifier("run-row-\(run.id.uuidString)")
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(rowAccessibilityLabel)
+        .accessibilityValue(rowStatusAccessibilityValue)
+        .accessibilityIdentifier("run-row-title-\(sanitizedRunTitle)")
         // §5.4: Contextual row actions — only executable actions appear
         .contextMenu {
             Button("Open", systemImage: "arrow.right.circle") { onOpen() }
@@ -366,6 +435,35 @@ struct RunsHomeRow: View {
     private var currentStageLabel: String? {
         guard let stageID = run.currentStageID else { return nil }
         return run.stageExecutions.first(where: { $0.stageID == stageID })?.label
+    }
+
+    private var sanitizedRunTitle: String {
+        (run.idea?.title ?? "unknown-idea")
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+    }
+
+    private var rowStatusAccessibilityValue: String {
+        var modes: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            modes.append("differentiate without color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            modes.append("increase contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            modes.append("reduce transparency")
+        }
+        return modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
+    }
+
+    private var rowAccessibilityLabel: String {
+        var parts = [run.idea?.title ?? "Unknown Idea", run.presentationStatusLabel]
+        if let currentStageLabel {
+            parts.append(currentStageLabel)
+        }
+        parts.append(elapsedTimeString)
+        return parts.joined(separator: ", ")
     }
 
     private var elapsedTimeString: String {
@@ -447,18 +545,13 @@ struct ParentIdeaArchiveBadge: View {
     let idea: Idea?
 
     var body: some View {
-        Label {
-            Text("\(title): \(statusText)")
-                .font(.caption2.weight(.semibold))
-        } icon: {
-            Image(systemName: statusIcon)
-                .font(.caption2)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(statusColor.opacity(DesignTokens.badgeBackgroundOpacity), in: Capsule())
-        .foregroundStyle(statusColor)
-        .accessibilityIdentifier("parent-idea-archive-\(sanitizedTitle)")
+        StatusCapsule(
+            text: "\(title): \(statusText)",
+            color: statusColor,
+            icon: statusIcon,
+            size: .small,
+            accessibilityIdentifier: "parent-idea-archive-\(sanitizedTitle)"
+        )
     }
 
     private var sanitizedTitle: String {

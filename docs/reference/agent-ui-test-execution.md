@@ -114,6 +114,7 @@ Use focused XCUITest for:
 Preferred entrypoints:
 
 - `./scripts/test-gate.sh ui-smoke`
+- `./scripts/test-gate.sh proposal-012`
 - targeted `xcodebuild test -only-testing:...` commands on a macOS host with working Xcode
 
 Execution rule:
@@ -130,6 +131,18 @@ Primary files:
 - [AppScreen.swift](../../Chainworks%20ForgeUITests/AppScreen.swift)
 
 Focused XCUITest is the correct layer for operator-shell reachability, not for proving a full repo-backed delivery contract.
+
+For the implemented UI quality slice, the canonical same-head proof path is:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-012"
+```
+
+That gate is where agents should collect:
+
+- bounded `1024×768` minimum-window screenshots
+- bounded accessibility proof for Differentiate Without Color, Increase Contrast, and Reduce Transparency
+- current-round runtime proof for secondary Appendix A surfaces such as Goose assistant, workflow map, and release gate
 
 ### 3. App-Launched Dogfood Proof
 

@@ -19,6 +19,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 - [goose-server-transport.md](goose-server-transport.md) — GooseServerTransport adapter: goosed API contract, SSE event mapping, session lifecycle, executor pipeline, proven real Goose connection
 - [operator-experience.md](operator-experience.md) — Stable operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
 - [provider-platform.md](provider-platform.md) — Stable provider/settings baseline: registry, adapters, settings, preflight, receipts, first-run and pilot surfaces
+- [ui-quality-and-polish.md](ui-quality-and-polish.md) — Stable UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, cancellation settlement, operator-visible cancelling/cancelled truth
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling
@@ -27,6 +28,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
 - [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, evidence export
 - [mvp-sign-off.md](mvp-sign-off.md) — benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
+- [current-system-baseline.md](current-system-baseline.md) — current-head subsystem map and reusable baseline for review and planning work
 
 ## Test Strategy
 

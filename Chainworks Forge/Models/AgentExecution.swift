@@ -37,6 +37,24 @@ import SwiftData
     var toolTracePath: String?
     var retryReason: String?
 
+    // Proposal 013 — Layer N: Agent Attempt Lineage (§5.3, §5.4)
+    var agentAttemptNumber: Int?              // Agent-level attempt within the same stage attempt
+    var supersedesAgentExecutionID: UUID?     // Which agent execution this supersedes
+    var reusedSiblingExecutionIDsJSON: Data?  // [UUID] — sibling executions reused for this retry
+
+    // Proposal 013 — Layer O: Validation Evidence
+    var validationFailureJSON: Data?          // Serialized ValidationFailureRecord for this agent
+    var outputEnvelopesJSON: Data?            // Serialized [StructuredOutputEnvelope]
+    var compactionMetadataJSON: Data?         // Serialized CompactionMetadata (if output was compacted)
+    var canonicalOutcome: AgentCanonicalOutcome?
+    var transportErrorKind: TransportErrorKind?
+    var providerStopReason: String?
+    var outputPresence: OutputPresence?
+    var settledAt: Date?
+    var runtimeProvider: String?
+    var runtimeModel: String?
+    var outcomeEnvelopeJSON: Data?
+
     // Proposal 007: Repo-backed execution tracking
     var repoRevisionBefore: String?
     var repoRevisionAfter: String?

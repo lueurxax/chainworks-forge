@@ -340,6 +340,7 @@ enum GooseStreamEvent: Sendable {
     case toolCallFinished(toolName: String, raw: String)
     case textChunk(text: String)
     case finalOutput(content: String)
+    case finish(reason: String, totalTokens: Int?, raw: String)
     case error(message: String)
     case sessionClosed(raw: String)
     case unknown(type: String, data: String)

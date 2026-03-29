@@ -156,7 +156,49 @@ final class EvidencePackBuilder {
             itemCount += 1
         }
 
-        // 8. Screenshot checklist template
+        // 8. Proposal 013: Failed-stage evidence packets + compaction truth
+        let failureEvidenceDir = packDir.appendingPathComponent("failure-evidence", isDirectory: true)
+        try fm.createDirectory(at: failureEvidenceDir, withIntermediateDirectories: true)
+
+        for stage in run.stageExecutions where stage.evidencePacketJSON != nil {
+            if let packetData = stage.evidencePacketJSON {
+                let fileName = "evidence-\(stage.stageID)-attempt\(stage.attemptNumber).json"
+                try packetData.write(to: failureEvidenceDir.appendingPathComponent(fileName))
+                itemCount += 1
+            }
+        }
+
+        // Export validation failure records from failed agents
+        for stage in run.stageExecutions {
+            for agent in stage.agentExecutions where agent.validationFailureJSON != nil {
+                if let failureData = agent.validationFailureJSON {
+                    let fileName = "validation-failure-\(agent.agentID).json"
+                    try failureData.write(to: failureEvidenceDir.appendingPathComponent(fileName))
+                    itemCount += 1
+                }
+            }
+        }
+
+        // Export compaction metadata from agents that were compacted
+        for stage in run.stageExecutions {
+            for agent in stage.agentExecutions where agent.compactionMetadataJSON != nil {
+                if let compactionData = agent.compactionMetadataJSON {
+                    let fileName = "compaction-\(agent.agentID).json"
+                    try compactionData.write(to: failureEvidenceDir.appendingPathComponent(fileName))
+                    itemCount += 1
+                }
+            }
+        }
+
+        // Export declarative coverage report if present
+        if let coverageArtifact = allArtifacts.last(where: { $0.name == "declarative_coverage_report" }),
+           fm.fileExists(atPath: coverageArtifact.filePath) {
+            let destPath = deliverablesDir.appendingPathComponent("declarative-coverage-report.json")
+            try? fm.copyItem(atPath: coverageArtifact.filePath, toPath: destPath.path)
+            itemCount += 1
+        }
+
+        // 9. Screenshot checklist template
         let checklist = """
         # Evidence Pack Screenshot Checklist
 

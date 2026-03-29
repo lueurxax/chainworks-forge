@@ -67,6 +67,34 @@ struct PreflightService {
                 status: errors.isEmpty ? .pass : .fail,
                 message: errors.isEmpty ? "Workflow and catalog parsed successfully" : errors.map(\.message).joined(separator: "; ")
             ))
+
+            // Proposal 013 Layer Q: Structured Output Schema Gate
+            // Ensures backend_profiles.*.structured_output reaches transport or triggers preflight failure.
+            let gateResults = StructuredOutputSchemaGate.validate(catalog: catalog)
+            let blockingGates = gateResults.filter { $0.isBlocking }
+            if blockingGates.isEmpty {
+                checks.append(PreflightCheck(
+                    category: "Contracts",
+                    title: "Structured Output Gate",
+                    status: .pass,
+                    message: "All structured_output declarations are supported by their transport"
+                ))
+            } else {
+                let msg = blockingGates.map { $0.explanation }.joined(separator: "; ")
+                checks.append(PreflightCheck(
+                    category: "Contracts",
+                    title: "Structured Output Gate",
+                    status: .fail,
+                    message: msg
+                ))
+                blockingIssues.append("Structured output gate: \(msg)")
+            }
+
+            let warningGates = gateResults.filter { !$0.isBlocking && !$0.transportSupportsStructured }
+            if !warningGates.isEmpty {
+                let warnMsg = warningGates.map { $0.explanation }.joined(separator: "; ")
+                warnings.append("Structured output: \(warnMsg)")
+            }
         } catch {
             checks.append(PreflightCheck(
                 category: "Catalog",

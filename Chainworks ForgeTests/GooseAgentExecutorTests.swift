@@ -240,6 +240,62 @@ struct GooseAgentExecutorTests {
         #expect(result.costCents != nil, "Should have a cost estimate")
     }
 
+    @MainActor
+    @Test("Neutral finish marker alone does not count as success")
+    func neutralFinishMarkerDoesNotCountAsSuccess() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(events: [
+            .sessionStarted(raw: "{}"),
+            .finish(reason: "stop", totalTokens: 42, raw: #"{"type":"Finish","reason":"stop"}"#),
+            .sessionClosed(raw: "{}")
+        ])
+
+        let executor = GooseAgentExecutor(transport: transport)
+        let agent = makeAgent(outputs: ["required_output.json"])
+        let task = makeTask()
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.errorMessage != nil)
+        #expect(result.canonicalOutcome == .failedBeforeOutput)
+        #expect(result.providerStopReason == "stop")
+    }
+
+    @MainActor
+    @Test("Limit exhaustion after output preserves artifacts and records canonical outcome")
+    func limitExhaustionAfterOutputPreservesArtifacts() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(events: [
+            .sessionStarted(raw: "{}"),
+            .textChunk(text: "partial draft"),
+            .finish(reason: "max_tokens", totalTokens: 128, raw: #"{"type":"Finish","reason":"max_tokens"}"#),
+            .sessionClosed(raw: "{}")
+        ])
+
+        let executor = GooseAgentExecutor(transport: transport)
+        let agent = makeAgent(outputs: ["proposal_current"])
+        let task = makeTask()
+        let context = makeContext()
+
+        let outputDir = context.workspace.artifactRoot
+            .appendingPathComponent("\(context.stageID).\(context.iteration)", isDirectory: true)
+            .appendingPathComponent(agent.id, isDirectory: true)
+            .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        try Data("# Partial Proposal".utf8).write(to: outputDir.appendingPathComponent("proposal_current"))
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.outputs["proposal_current"] != nil)
+        #expect(result.canonicalOutcome == .limitExhaustedAfterOutput)
+        #expect(result.outputPresence == .durableOutput)
+        #expect(result.providerStopReason == "max_tokens")
+        #expect(result.errorMessage?.contains("limit") == true || result.errorMessage?.contains("output") == true)
+    }
+
     /// testGooseExecutorSessionCreationFailure
     @MainActor
     @Test("Executor handles session creation failure gracefully")

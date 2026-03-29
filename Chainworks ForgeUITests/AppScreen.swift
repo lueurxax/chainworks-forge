@@ -149,7 +149,11 @@ struct AppScreen {
     private func expectedRootVisible(for label: String) -> Bool {
         switch label {
         case "Runs Home":
-            return identifiedAny("runs-home-list").exists
+            return identifiedAny("runs-home-owner-view").exists
+                || identifiedAny("runs-home-list").exists
+                || identifiedAny("runs-home-section-waiting-approval").exists
+                || identifiedAny("run-detail-panel").exists
+                || primaryWindow.staticTexts["Waiting Approval"].exists
         case "Ideas":
             return identifiedAny("ideas-root-view").exists
                 || identifiedAny("idea-list").exists

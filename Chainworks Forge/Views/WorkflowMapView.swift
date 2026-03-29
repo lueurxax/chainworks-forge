@@ -16,32 +16,31 @@ struct WorkflowMapView: View {
     }
 
     var body: some View {
-        Group {
-            if let projection {
-                VStack(alignment: .leading, spacing: 14) {
-                    WorkflowMapSummaryStrip(projection: projection)
-                        .accessibilityIdentifier("workflow-map-summary")
-                    WorkflowMapTopologyView(projection: projection)
-                        .accessibilityIdentifier("workflow-map-topology")
-                    WorkflowMapHandoffLedger(projection: projection)
-                        .accessibilityIdentifier("workflow-map-handoffs")
-                    WorkflowMapAgentPanels(projection: projection)
-                        .accessibilityIdentifier("workflow-map-agents")
-                    WorkflowMapLoopTelemetryView(projection: projection)
-                        .accessibilityIdentifier("workflow-map-loops")
-                    WorkflowMapTimelineView(projection: projection)
-                        .accessibilityIdentifier("workflow-map-timeline")
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ContentUnavailableView(
-                    "Workflow Map Unavailable",
-                    systemImage: "chart.xyaxis.line",
-                    description: Text("This run snapshot could not be rebuilt into a frozen workflow topology.")
-                )
+        if let projection {
+            VStack(alignment: .leading, spacing: 14) {
+                WorkflowMapSummaryStrip(projection: projection)
+                    .accessibilityIdentifier("workflow-map-summary")
+                WorkflowMapTopologyView(projection: projection)
+                    .accessibilityIdentifier("workflow-map-topology")
+                WorkflowMapHandoffLedger(projection: projection)
+                    .accessibilityIdentifier("workflow-map-handoffs")
+                WorkflowMapAgentPanels(projection: projection)
+                    .accessibilityIdentifier("workflow-map-agents")
+                WorkflowMapLoopTelemetryView(projection: projection)
+                    .accessibilityIdentifier("workflow-map-loops")
+                WorkflowMapTimelineView(projection: projection)
+                    .accessibilityIdentifier("workflow-map-timeline")
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("workflow-map-view")
+        } else {
+            ContentUnavailableView(
+                "Workflow Map Unavailable",
+                systemImage: "chart.xyaxis.line",
+                description: Text("This run snapshot could not be rebuilt into a frozen workflow topology.")
+            )
+            .accessibilityIdentifier("workflow-map-view")
         }
-        .accessibilityIdentifier("workflow-map-view")
     }
 }
 
@@ -249,7 +248,8 @@ private struct WorkflowMapStatusBadge: View {
     var body: some View {
         StatusCapsule(
             text: status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
-            color: statusColor
+            color: statusColor,
+            accessibilityIdentifier: "workflow-map-status-\(status.rawValue)"
         )
     }
 

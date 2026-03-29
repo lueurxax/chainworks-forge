@@ -60,7 +60,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         secretKey: String? = nil,
         provider: String? = nil,
         model: String? = nil,
-        requestTimeout: TimeInterval = 300
+        requestTimeout: TimeInterval = 900
     ) {
         self.baseURL = baseURL
         self.secretKey = secretKey
@@ -69,6 +69,10 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         self.requestTimeout = requestTimeout
 
         let config = URLSessionConfiguration.default
+        // Proposal 013: Increased from 300s to 900s to handle parallel agent execution
+        // where the Goose server processes sessions sequentially. With 4 parallel review
+        // agents each taking ~250s, sequential processing needs ~1000s total window.
+        // 900s request timeout + 1800s resource timeout provides adequate margin.
         config.timeoutIntervalForRequest = requestTimeout
         config.timeoutIntervalForResource = requestTimeout * 2
 
@@ -223,6 +227,12 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
 
                                         // Check for terminal events
                                         if case .finalOutput = event {
+                                            continuation.yield(event)
+                                            continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                                            continuation.finish()
+                                            return
+                                        }
+                                        if case .finish = event {
                                             continuation.yield(event)
                                             continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
                                             continuation.finish()

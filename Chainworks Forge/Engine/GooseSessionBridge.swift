@@ -108,7 +108,8 @@ final class GooseSessionBridge: Sendable {
         task: AgentTask,
         context: ExecutionContext
     ) -> ExecutionPacket {
-        let expectedOutputs = OutputContractResolver.expectedOutputs(for: task, agent: agent)
+        // Proposal 013: V2 resolver — catalog-driven contract resolution
+        let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
         // 1. System prompt
         let systemPrompt = buildSystemPrompt(agent: agent, expectedOutputs: expectedOutputs)

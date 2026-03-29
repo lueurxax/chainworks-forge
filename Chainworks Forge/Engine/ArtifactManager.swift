@@ -38,8 +38,12 @@ final class ArtifactManager {
     ) throws -> [Artifact] {
         var artifacts: [Artifact] = []
 
+        // Proposal 013 §5.4: Detect agent-retry lineage from execution metadata
+        let agentAttempt = agentExecution.agentAttemptNumber
+        let isAgentRetry = (agentAttempt ?? 1) > 1
+
         for (name, data) in outputs {
-            // Write to disk (nonisolated)
+            // Write to disk (nonisolated) — Proposal 013: pass agent retry namespace
             let storageResult = try ArtifactStorage.write(
                 data: data,
                 name: name,
@@ -48,7 +52,8 @@ final class ArtifactManager {
                 agentID: agent.id,
                 attemptNumber: attemptNumber,
                 artifactRoot: workspace.artifactRoot,
-                workspaceRoot: workspace.workspaceRoot
+                workspaceRoot: workspace.workspaceRoot,
+                agentAttemptNumber: isAgentRetry ? agentAttempt : nil
             )
 
             // Determine format from catalog contract, not hardcoded
@@ -57,7 +62,8 @@ final class ArtifactManager {
                 agent: agent,
                 catalog: catalog
             )
-            let contractID = OutputContractResolver.contractID(
+            // Proposal 013: Use V2 resolver — catalog-driven, no hardcoded fallbacks
+            let contractID = OutputContractResolverV2.resolveContractID(
                 for: name,
                 agent: agent,
                 catalog: catalog
@@ -80,6 +86,38 @@ final class ArtifactManager {
             artifact.model = agent.model
             artifact.effort = agent.effort
             artifact.agentExecution = agentExecution
+
+            // Proposal 013 §5.4: Write artifact lineage metadata
+            if isAgentRetry {
+                artifact.agentAttemptNumber = agentAttempt
+                artifact.artifactLineageKind = "agent_retry_delta"
+                // Resolve superseded artifact from the prior agent execution's artifacts
+                if let priorExecID = agentExecution.supersedesAgentExecutionID,
+                   let priorArtifact = agentExecution.stageExecution?.agentExecutions
+                    .first(where: { $0.id == priorExecID })?
+                    .artifacts.first(where: { $0.name == name }) {
+                    artifact.supersedesAgentArtifactID = priorArtifact.id
+                }
+            } else {
+                artifact.artifactLineageKind = "stage_attempt_primary"
+            }
+
+            // Proposal 013 §5.4: Write reused_sibling_reference for sibling outputs
+            if let siblingJSON = agentExecution.reusedSiblingExecutionIDsJSON,
+               let siblingIDs = try? JSONDecoder().decode([UUID].self, from: siblingJSON),
+               !siblingIDs.isEmpty {
+                // Mark sibling artifacts as referenced by this retry
+                for siblingID in siblingIDs {
+                    if let siblingExec = agentExecution.stageExecution?.agentExecutions
+                        .first(where: { $0.id == siblingID }) {
+                        for siblingArtifact in siblingExec.artifacts {
+                            if siblingArtifact.artifactLineageKind == nil {
+                                siblingArtifact.artifactLineageKind = "reused_sibling_reference"
+                            }
+                        }
+                    }
+                }
+            }
 
             modelContext.insert(artifact)
             artifacts.append(artifact)
@@ -181,11 +219,18 @@ final class ArtifactManager {
         agent: ResolvedAgent,
         catalog: AgentCatalog?
     ) -> ArtifactFormat {
-        let contract = OutputContractResolver.contract(
+        // Proposal 013: Use V2 resolver for format detection
+        let resolvedSchema = OutputContractResolverV2.resolveSchema(
             for: outputName,
             agent: agent,
             catalog: catalog
         )
+        let contract: ArtifactContract?
+        if let schema = resolvedSchema, let catalog {
+            contract = catalog.contracts[schema.contractID]
+        } else {
+            contract = nil
+        }
 
         if contract == nil,
            let hintedPath = catalog?.artifacts[outputName] {

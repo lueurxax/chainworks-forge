@@ -299,6 +299,8 @@ struct LiveGooseConnectionProofTests {
                 case .finalOutput(let content):
                     receivedFinalOutput = true
                     entry = EventLogEntry(index: eventIndex, type: "final_output", snippet: String(content.prefix(500)), receivedAtOffset: offset)
+                case .finish(let reason, _, _):
+                    entry = EventLogEntry(index: eventIndex, type: "finish", snippet: reason, receivedAtOffset: offset)
                 case .error(let message):
                     entry = EventLogEntry(index: eventIndex, type: "error", snippet: message, receivedAtOffset: offset)
                 case .sessionClosed(let raw):

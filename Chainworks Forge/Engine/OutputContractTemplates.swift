@@ -54,17 +54,19 @@ struct OutputContractTemplates {
         stageID: String,
         catalog: AgentCatalog? = nil
     ) -> (data: Data, format: ArtifactFormat) {
-        if let contractID = OutputContractResolver.contractID(
+        // Proposal 013: V2 resolver — catalog-driven contract resolution
+        if let contractID = OutputContractResolverV2.resolveContractID(
             for: outputName,
             agent: agent,
             catalog: catalog
         ) {
             let data = generate(contractID: contractID, agentID: agent.id, stageID: stageID).data
-            let format = OutputContractResolver.contract(
-                for: outputName,
-                agent: agent,
-                catalog: catalog
-            ).map { artifactFormat(from: $0.format) } ?? .report
+            let format: ArtifactFormat
+            if let schema = OutputContractResolverV2.resolveSchema(for: outputName, agent: agent, catalog: catalog) {
+                format = artifactFormat(from: schema.machineFormat.rawValue)
+            } else {
+                format = .report
+            }
             return (data, format)
         }
 

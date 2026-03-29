@@ -9,10 +9,13 @@ import SwiftUI
 /// conveyed by color alone. Legible under Increase Contrast
 /// and Reduce Transparency via `.foregroundStyle` + opaque text.
 struct StatusCapsule: View {
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
+
     let text: String
     let color: Color
     var icon: String?
     var size: Size = .regular
+    var accessibilityIdentifier: String?
 
     enum Size {
         /// caption2, px:6 / py:2 — compact inline badges
@@ -32,7 +35,20 @@ struct StatusCapsule: View {
         }
         .padding(.horizontal, size == .small ? 6 : 8)
         .padding(.vertical, size == .small ? 2 : 3)
-        .background(color.opacity(DesignTokens.badgeBackgroundOpacity), in: Capsule())
+        .background(backgroundFill, in: Capsule())
+        .overlay {
+            Capsule()
+                .strokeBorder(borderColor, lineWidth: borderLineWidth)
+        }
+        .overlay(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: 1) {
+                ForEach(activeAccessibilitySettingIdentifiers, id: \.self) { identifier in
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier(identifier)
+                }
+            }
+        }
         .foregroundStyle(color)
         // Proposal 012 (REQ-005): Explicit VoiceOver semantics —
         // combine icon + text into a single spoken element so status
@@ -40,6 +56,8 @@ struct StatusCapsule: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isStaticText)
         .accessibilityLabel(text)
+        .accessibilityValue(accessibilitySettingsDescription)
+        .accessibilityIdentifier(accessibilityIdentifier ?? text)
     }
 
     private var fontSize: Font {
@@ -47,6 +65,77 @@ struct StatusCapsule: View {
         case .small:  return .caption2
         case .regular: return .caption2.bold()
         }
+    }
+
+    private var isIncreasedContrast: Bool {
+        uiTestAccessibilitySettings.increaseContrast
+    }
+
+    private var backgroundFill: Color {
+        if reduceTransparency {
+            return color.opacity(isIncreasedContrast ? 0.34 : 0.28)
+        }
+        if isIncreasedContrast {
+            return color.opacity(0.24)
+        }
+        return color.opacity(DesignTokens.badgeBackgroundOpacity)
+    }
+
+    private var borderLineWidth: CGFloat {
+        if differentiateWithoutColor && isIncreasedContrast {
+            return 2
+        }
+        if differentiateWithoutColor || isIncreasedContrast || reduceTransparency {
+            return 1
+        }
+        return 0
+    }
+
+    private var borderColor: Color {
+        differentiateWithoutColor || isIncreasedContrast || reduceTransparency ? color : .clear
+    }
+
+    private var accessibilitySettingsDescription: String {
+        var activeModes: [String] = []
+        if differentiateWithoutColor {
+            activeModes.append("differentiate without color")
+        }
+        if isIncreasedContrast {
+            activeModes.append("increase contrast")
+        }
+        if reduceTransparency {
+            activeModes.append("reduce transparency")
+        }
+        return activeModes.isEmpty ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
+    }
+
+    private var activeAccessibilitySettingIdentifiers: [String] {
+        var identifiers: [String] = []
+        if differentiateWithoutColor {
+            identifiers.append("\(sanitizedIdentifier)-differentiate-without-color")
+        }
+        if isIncreasedContrast {
+            identifiers.append("\(sanitizedIdentifier)-increase-contrast")
+        }
+        if reduceTransparency {
+            identifiers.append("\(sanitizedIdentifier)-reduce-transparency")
+        }
+        return identifiers
+    }
+
+    private var sanitizedIdentifier: String {
+        (accessibilityIdentifier ?? text)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "/", with: "-")
+    }
+
+    private var differentiateWithoutColor: Bool {
+        uiTestAccessibilitySettings.differentiateWithoutColor
+    }
+
+    private var reduceTransparency: Bool {
+        uiTestAccessibilitySettings.reduceTransparency
     }
 }
 

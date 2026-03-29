@@ -115,21 +115,16 @@ enum GooseStreamEventMapper {
 
     // MARK: - Private: Finish Mapping
 
-    /// Map a `Finish` event → `.finalOutput` + accumulated text.
+    /// Map a `Finish` event into a terminal marker.
     private static func mapFinish(_ json: [String: Any]) -> GooseStreamEvent {
-        // The Finish event carries a `reason` and optional `token_state`.
-        // We map it to `.finalOutput` because it signals the end of agent response.
         let reason = json["reason"] as? String ?? "stop"
 
-        // Extract token usage if available
-        var tokenInfo = ""
+        var totalTokens: Int?
         if let tokenState = json["token_state"] as? [String: Any] {
-            if let totalTokens = tokenState["total_tokens"] as? Int {
-                tokenInfo = " (tokens: \(totalTokens))"
-            }
+            totalTokens = tokenState["total_tokens"] as? Int
         }
 
-        return .finalOutput(content: "Finish: \(reason)\(tokenInfo)")
+        return .finish(reason: reason, totalTokens: totalTokens, raw: serializeToJSON(json) ?? "{}")
     }
 
     // MARK: - Private: Tool Name Extraction

@@ -37,13 +37,55 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     // MARK: - AgentExecutor Protocol
 
+    /// Proposal 013: Maximum transport-level retry attempts for timeout errors.
+    private static let maxTransportRetries = 1
+
     func execute(
         task: AgentTask,
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> AgentResult {
+        // Proposal 013: Retry on transport timeout to handle sequential Goose processing
+        var lastResult: AgentResult?
+        for attempt in 0...Self.maxTransportRetries {
+            let result = try await executeAttempt(
+                task: task,
+                agent: agent,
+                context: context,
+                attemptIndex: attempt
+            )
+
+            // If succeeded or not a timeout error, return immediately
+            if result.succeeded || !isTimeoutError(result) {
+                return result
+            }
+
+            lastResult = result
+
+            // Only retry on timeout, and only once
+            if attempt < Self.maxTransportRetries {
+                // Brief pause before retry to let server recover
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        return lastResult!
+    }
+
+    /// Check if the result indicates a transport timeout.
+    private func isTimeoutError(_ result: AgentResult) -> Bool {
+        guard let error = result.errorMessage else { return false }
+        return error.contains("timed out") || error.contains("-1001") || error.contains("timeout")
+    }
+
+    private func executeAttempt(
+        task: AgentTask,
+        agent: ResolvedAgent,
+        context: ExecutionContext,
+        attemptIndex: Int
+    ) async throws -> AgentResult {
         let startedAt = Date()
-        let expectedOutputs = OutputContractResolver.expectedOutputs(for: task, agent: agent)
+        // Proposal 013: V2 resolver — catalog-driven contract resolution
+        let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
         // Step 1: Validate workspace (ARCH-025)
         try GooseSessionBridge.validateWorkspace(context.workspace)
@@ -60,7 +102,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         } catch {
             return AgentResult(
                 outputs: [:],
-                logSnippet: "Session creation failed: \(error.localizedDescription)",
+                logSnippet: "Session creation failed (attempt \(attemptIndex)): \(error.localizedDescription)",
                 costCents: nil,
                 succeeded: false,
                 errorMessage: "Session creation failed: \(error.localizedDescription)",
@@ -115,6 +157,18 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             }
 
             // Generate receipt even on stream failure
+            let outputPresence: OutputPresence = salvaged.contains { key, _ in
+                !key.hasSuffix("_receipt.json") && !key.hasSuffix("_transcript.md")
+            } ? .durableOutput : .none
+            let transportKind = classifyTransportErrorKind(error.localizedDescription)
+            let canonicalOutcome = classifyStreamFailureOutcome(
+                errorMessage: error.localizedDescription,
+                outputPresence: outputPresence
+            )
+            let failureMessage = failureMessage(
+                for: canonicalOutcome,
+                fallback: "Stream processing failed: \(error.localizedDescription)"
+            )
             let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
                 agentID: agent.id,
                 sessionID: sessionExecution.sessionID,
@@ -126,8 +180,8 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 events: eventBridge.eventLog,
                 toolCalls: eventBridge.toolCalls,
                 finalContent: nil,
-                succeeded: !salvaged.isEmpty,
-                errorMessage: "Stream processing failed: \(error.localizedDescription)",
+                succeeded: canonicalOutcome == .completed,
+                errorMessage: failureMessage,
                 provider: resolvedProvider,
                 model: resolvedModel,
                 effort: resolvedEffort
@@ -136,14 +190,12 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 salvaged[name] = data
             }
 
-            let salvagedOutputs = !salvaged.keys.contains(where: { !$0.hasSuffix("_receipt.json") && !$0.hasSuffix("_transcript.md") })
-
             return AgentResult(
                 outputs: salvaged,
                 logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts from disk. Error: \(error.localizedDescription)",
                 costCents: nil,
-                succeeded: !salvagedOutputs && !salvaged.isEmpty,
-                errorMessage: salvagedOutputs ? "Stream processing failed: \(error.localizedDescription)" : nil,
+                succeeded: canonicalOutcome == .completed,
+                errorMessage: failureMessage,
                 sessionID: sessionExecution.sessionID,
                 durationSeconds: completedAt.timeIntervalSince(startedAt),
                 providerReceipt: UsageReceiptNormalizer.makeReceipt(
@@ -158,7 +210,21 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 ),
                 resolvedModel: context.providerBinding?.model ?? resolvedModel,
                 configuredProviderID: context.providerBinding?.configuredProviderID,
-                adapterVersion: context.providerBinding?.adapterVersion
+                adapterVersion: context.providerBinding?.adapterVersion,
+                canonicalOutcome: canonicalOutcome,
+                transportErrorKind: transportKind,
+                providerStopReason: nil,
+                outputPresence: outputPresence,
+                runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
+                runtimeModel: context.providerBinding?.model ?? resolvedModel,
+                outcomeEnvelope: OutcomeEnvelope(
+                    canonicalOutcome: canonicalOutcome,
+                    transportErrorKind: transportKind,
+                    providerStopReason: nil,
+                    outputPresence: outputPresence,
+                    rawErrorMessage: error.localizedDescription,
+                    rawFinishEvent: nil
+                )
             )
         }
 
@@ -220,6 +286,17 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             }
         }
 
+        let outputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
+        let canonicalOutcome = classifyCompletedStreamOutcome(
+            outputPresence: outputPresence,
+            finishReason: streamResult.finishReason,
+            hadExplicitFinalOutput: streamResult.finalContent != nil
+        )
+        let failureMessage = canonicalOutcome == .completed ? nil : failureMessage(
+            for: canonicalOutcome,
+            fallback: "Execution did not produce final output"
+        )
+
         // Add receipt artifacts to outputs
         for (name, data) in receiptArtifacts {
             outputs[name] = data
@@ -251,7 +328,21 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 ),
                 resolvedModel: context.providerBinding?.model ?? resolvedModel,
                 configuredProviderID: context.providerBinding?.configuredProviderID,
-                adapterVersion: context.providerBinding?.adapterVersion
+                adapterVersion: context.providerBinding?.adapterVersion,
+                canonicalOutcome: canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome,
+                transportErrorKind: nil,
+                providerStopReason: streamResult.finishReason,
+                outputPresence: outputPresence,
+                runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
+                runtimeModel: context.providerBinding?.model ?? resolvedModel,
+                outcomeEnvelope: OutcomeEnvelope(
+                    canonicalOutcome: canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome,
+                    transportErrorKind: nil,
+                    providerStopReason: streamResult.finishReason,
+                    outputPresence: outputPresence,
+                    rawErrorMessage: "Required outputs missing: \(missingList)",
+                    rawFinishEvent: streamResult.finishRaw
+                )
             )
         }
 
@@ -268,8 +359,8 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             outputs: outputs,
             logSnippet: logSnippet,
             costCents: estimateCost(streamResult: streamResult),
-            succeeded: true,
-            errorMessage: nil,
+            succeeded: canonicalOutcome == .completed,
+            errorMessage: failureMessage,
             sessionID: sessionExecution.sessionID,
             durationSeconds: completedAt.timeIntervalSince(startedAt),
             providerReceipt: UsageReceiptNormalizer.makeReceipt(
@@ -284,7 +375,21 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             ),
             resolvedModel: context.providerBinding?.model ?? resolvedModel,
             configuredProviderID: context.providerBinding?.configuredProviderID,
-            adapterVersion: context.providerBinding?.adapterVersion
+            adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: canonicalOutcome,
+            transportErrorKind: nil,
+            providerStopReason: streamResult.finishReason,
+            outputPresence: outputPresence,
+            runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
+            runtimeModel: context.providerBinding?.model ?? resolvedModel,
+            outcomeEnvelope: OutcomeEnvelope(
+                canonicalOutcome: canonicalOutcome,
+                transportErrorKind: nil,
+                providerStopReason: streamResult.finishReason,
+                outputPresence: outputPresence,
+                rawErrorMessage: failureMessage,
+                rawFinishEvent: streamResult.finishRaw
+            )
         )
     }
 
@@ -310,5 +415,107 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         let estimatedTokens = inputChars / 4
         // Rough: $0.01 per 1000 tokens = 1 cent per 1000 tokens
         return max(1, Int64(estimatedTokens / 1000))
+    }
+
+    private func classifyTransportErrorKind(_ errorMessage: String) -> TransportErrorKind {
+        let lowercased = errorMessage.lowercased()
+        if lowercased.contains("timed out") || lowercased.contains("timeout") || lowercased.contains("-1001") {
+            return .timeout
+        }
+        if lowercased.contains("provider") {
+            return .provider
+        }
+        if lowercased.contains("stream") {
+            return .stream
+        }
+        return .unknown
+    }
+
+    private func classifyStreamFailureOutcome(
+        errorMessage: String,
+        outputPresence: OutputPresence
+    ) -> AgentCanonicalOutcome {
+        switch (classifyTransportErrorKind(errorMessage), outputPresence) {
+        case (.timeout, .durableOutput):
+            return .timedOutAfterOutput
+        case (.timeout, .none):
+            return .timedOutBeforeOutput
+        case (_, .durableOutput):
+            return .completedWithTransportError
+        case (_, .none):
+            return .failedBeforeOutput
+        }
+    }
+
+    private func classifyCompletedStreamOutcome(
+        outputPresence: OutputPresence,
+        finishReason: String?,
+        hadExplicitFinalOutput: Bool
+    ) -> AgentCanonicalOutcome {
+        guard let finishReason else {
+            return outputPresence == .durableOutput ? .completed : .failedBeforeOutput
+        }
+
+        if isLimitExhaustionReason(finishReason) {
+            return outputPresence == .durableOutput ? .limitExhaustedAfterOutput : .limitExhaustedBeforeOutput
+        }
+
+        if hadExplicitFinalOutput {
+            return .completed
+        }
+
+        if outputPresence == .durableOutput {
+            return .completed
+        }
+
+        if isNeutralFinishReason(finishReason) {
+            return .failedBeforeOutput
+        }
+
+        return .failedBeforeOutput
+    }
+
+    private func isLimitExhaustionReason(_ reason: String) -> Bool {
+        let normalized = reason.lowercased()
+        return normalized.contains("max_tokens")
+            || normalized.contains("max token")
+            || normalized.contains("rate_limit")
+            || normalized.contains("rate limit")
+            || normalized.contains("quota")
+            || normalized.contains("budget")
+            || normalized.contains("limit")
+    }
+
+    private func isNeutralFinishReason(_ reason: String) -> Bool {
+        let normalized = reason.lowercased()
+        return normalized == "stop" || normalized == "session_closed" || normalized == "session closed"
+    }
+
+    private func failureMessage(
+        for outcome: AgentCanonicalOutcome,
+        fallback: String
+    ) -> String {
+        switch outcome {
+        case .limitExhaustedBeforeOutput:
+            return "Provider or app limit exhausted before output was produced"
+        case .limitExhaustedAfterOutput:
+            return "Provider or app limit exhausted after output was produced"
+        case .timedOutBeforeOutput:
+            return "Execution timed out before output was produced"
+        case .timedOutAfterOutput:
+            return "Execution timed out after output was produced"
+        case .completedWithTransportError:
+            return "Execution produced durable output but transport errored afterward"
+        case .failedBeforeOutput:
+            return fallback
+        case .failedAfterOutputValidation:
+            return "Output validation failed after output was produced"
+        case .cancelledBeforeOutput:
+            return "Execution was cancelled before output was produced"
+        case .cancelledAfterOutput:
+            return "Execution was cancelled after output was produced"
+        case .completed:
+            return fallback
+        }
     }
 }

@@ -71,12 +71,12 @@ struct GooseStreamEventMapperTests {
         {"type":"Finish","reason":"stop","token_state":{"total_tokens":42}}
         """
         let event = GooseStreamEventMapper.map(json)
-        if case .finalOutput(let content) = event {
-            #expect(content.contains("Finish"))
-            #expect(content.contains("stop"))
-            #expect(content.contains("42"))
+        if case .finish(let reason, let totalTokens, let raw) = event {
+            #expect(reason == "stop")
+            #expect(totalTokens == 42)
+            #expect(raw.contains("\"type\":\"Finish\""))
         } else {
-            Issue.record("Expected .finalOutput, got \(String(describing: event))")
+            Issue.record("Expected .finish, got \(String(describing: event))")
         }
     }
 
@@ -86,10 +86,11 @@ struct GooseStreamEventMapperTests {
         {"type":"Finish","reason":"stop"}
         """
         let event = GooseStreamEventMapper.map(json)
-        if case .finalOutput(let content) = event {
-            #expect(content.contains("stop"))
+        if case .finish(let reason, let totalTokens, _) = event {
+            #expect(reason == "stop")
+            #expect(totalTokens == nil)
         } else {
-            Issue.record("Expected .finalOutput, got \(String(describing: event))")
+            Issue.record("Expected .finish, got \(String(describing: event))")
         }
     }
 

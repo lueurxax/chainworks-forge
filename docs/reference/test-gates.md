@@ -175,6 +175,44 @@ Important:
 
 - the repository supports `ProviderGate.xctestplan` as metadata, but the canonical agent path still runs targeted tests by default
 
+### `proposal-012`
+
+UI-quality proof gate for the implemented visual-polish and bounded accessibility slice.
+
+Scope:
+
+- runtime proof for `GooseProviderConnectionAssistantView`
+- runtime proof for `WorkflowMapView`
+- runtime proof for `ReleaseGateView`
+- explicit `1024×768` minimum-window proof
+- bounded accessibility proof for:
+  - Differentiate Without Color
+  - Increase Contrast
+  - Reduce Transparency
+  - accessibility tree / focus order
+
+Use when:
+
+- reproving the implemented UI quality slice on the current head
+- validating the bounded adopter slice and secondary runtime owner surfaces beyond preview/code evidence
+- collecting same-head screenshot-bearing proof for UI quality audits
+
+Host policy:
+
+- remote-only because this gate is UI automation
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-012
+```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-012"
+```
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
@@ -232,6 +270,12 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ```bash
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"
+```
+
+### UI quality proof
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-012"
 ```
 
 ## Why This Exists

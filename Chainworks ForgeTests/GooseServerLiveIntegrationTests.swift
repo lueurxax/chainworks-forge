@@ -134,6 +134,8 @@ struct GooseServerLiveIntegrationTests {
                 textChunks.append(text)
             case .finalOutput:
                 hasFinalOutput = true
+            case .finish:
+                break
             case .sessionClosed:
                 hasSessionClosed = true
             case .error(let message):

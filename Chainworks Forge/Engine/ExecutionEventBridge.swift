@@ -24,6 +24,8 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     /// Whether the execution completed with final output.
     private var _hasFinalOutput: Bool = false
+    private var _finishReason: String?
+    private var _finishRaw: String?
 
     // MARK: - Public Accessors
 
@@ -41,6 +43,14 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     var hasFinalOutput: Bool {
         withLock { _hasFinalOutput }
+    }
+
+    var finishReason: String? {
+        withLock { _finishReason }
+    }
+
+    var finishRaw: String? {
+        withLock { _finishRaw }
     }
 
     // MARK: - Event Processing
@@ -62,6 +72,11 @@ final class ExecutionEventBridge: @unchecked Sendable {
                 finalContent = content
                 withLock {
                     _hasFinalOutput = true
+                }
+            case .finish(let reason, _, let raw):
+                withLock {
+                    _finishReason = reason
+                    _finishRaw = raw
                 }
             case .textChunk(let text):
                 withLock {
@@ -94,7 +109,9 @@ final class ExecutionEventBridge: @unchecked Sendable {
             finalContent: finalContent,
             accumulatedText: accumulatedText,
             toolCalls: toolCalls,
-            succeeded: hasFinalOutput
+            succeeded: hasFinalOutput,
+            finishReason: finishReason,
+            finishRaw: finishRaw
         )
     }
 
@@ -140,6 +157,9 @@ final class ExecutionEventBridge: @unchecked Sendable {
             return ExecutionEvent(type: .textChunk, timestamp: timestamp, detail: String(text.prefix(200)))
         case .finalOutput:
             return ExecutionEvent(type: .finalOutput, timestamp: timestamp, detail: "Final output received")
+        case .finish(let reason, let totalTokens, _):
+            let suffix = totalTokens.map { " (\($0) tokens)" } ?? ""
+            return ExecutionEvent(type: .finish, timestamp: timestamp, detail: "Finish: \(reason)\(suffix)")
         case .error(let message):
             return ExecutionEvent(type: .error, timestamp: timestamp, detail: message)
         case .sessionClosed:
@@ -177,6 +197,8 @@ final class ExecutionEventBridge: @unchecked Sendable {
             _toolCalls = []
             _eventLog = []
             _hasFinalOutput = false
+            _finishReason = nil
+            _finishRaw = nil
         }
     }
 
@@ -222,6 +244,7 @@ struct ExecutionEvent: Sendable, Identifiable {
         case toolCallFinished = "tool_call_finished"
         case textChunk = "text_chunk"
         case finalOutput = "final_output"
+        case finish = "finish"
         case error = "error"
         case sessionClosed = "session_closed"
         case unknown = "unknown"
@@ -246,4 +269,6 @@ struct ExecutionStreamResult: Sendable {
     let accumulatedText: String
     let toolCalls: [ToolCallRecord]
     let succeeded: Bool
+    let finishReason: String?
+    let finishRaw: String?
 }

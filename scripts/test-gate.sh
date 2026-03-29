@@ -37,6 +37,14 @@ PROPOSAL_006_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testPilotReadinessRefreshSurface"
 )
 
+PROPOSAL_012_TESTS=(
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testGooseAssistantSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testWorkflowMapSurfaceShowsAfterRunStart"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testReleaseGateSurfaceShowsDecisionContextActions"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 
 log() {
@@ -98,12 +106,10 @@ prepare_codesign_keychain() {
   security list-keychains -d user -s "$keychain" >/dev/null
   security default-keychain -d user -s "$keychain" >/dev/null
 
-  if security show-keychain-info "$keychain" >/dev/null 2>&1; then
-    return 0
-  fi
-
   if [[ -z "$password" ]]; then
-    die "codesign keychain is locked: $keychain. Set CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD for remote UI gates."
+    security show-keychain-info "$keychain" >/dev/null 2>&1 || \
+      die "codesign keychain is locked: $keychain. Set CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD for remote UI gates."
+    return 0
   fi
 
   log "Unlocking codesign keychain: $keychain"
@@ -493,6 +499,17 @@ case "$GATE" in
     else
       run_targeted_tests "proposal-006" "${PROPOSAL_006_TESTS[@]}"
     fi
+    ;;
+  proposal-012|p012)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    run_targeted_tests "proposal-012" "${PROPOSAL_012_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict
