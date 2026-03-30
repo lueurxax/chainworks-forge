@@ -5,7 +5,7 @@ import Foundation
 /// First-class persisted record describing why output validation failed
 /// after agent execution completed. This is the canonical reference target
 /// for recovery UI, immutable run reports, and exported evidence.
-nonisolated struct ValidationFailureRecord: Codable, Sendable, Identifiable, Equatable {
+struct ValidationFailureRecord: Codable, Sendable, Identifiable, Equatable {
     let id: UUID
     let timestamp: Date
 
@@ -72,7 +72,7 @@ nonisolated struct ValidationFailureRecord: Codable, Sendable, Identifiable, Equ
 // MARK: - Failure Class (§1.1)
 
 /// Categorizes the type of validation failure.
-nonisolated enum ValidationFailureClass: String, Codable, Sendable, Equatable {
+enum ValidationFailureClass: String, Codable, Sendable, Equatable {
     /// Agent output does not match declared contract format.
     case outputContractMismatch = "output_contract_mismatch"
     /// Agent produced no output at all.
@@ -90,7 +90,7 @@ nonisolated enum ValidationFailureClass: String, Codable, Sendable, Equatable {
 // MARK: - Contract Validation Metadata
 
 /// Metadata about the contract used for validation.
-nonisolated struct ContractValidationMetadata: Codable, Sendable, Equatable {
+struct ContractValidationMetadata: Codable, Sendable, Equatable {
     let outputName: String
     let contractID: String
     let machineFormat: String
@@ -101,20 +101,20 @@ nonisolated struct ContractValidationMetadata: Codable, Sendable, Equatable {
 // MARK: - Recovery Recommendation
 
 /// Suggested recovery action derived from the validation failure.
-nonisolated struct RecoveryRecommendation: Codable, Sendable, Equatable {
+struct RecoveryRecommendation: Codable, Sendable, Equatable {
     let action: RecommendedAction
     let explanation: String
     let source: RecommendationSource
 }
 
-nonisolated enum RecommendedAction: String, Codable, Sendable, Equatable {
+enum RecommendedAction: String, Codable, Sendable, Equatable {
     case retryFailedAgent = "retry_failed_agent"
     case retryFailedStage = "retry_failed_stage"
     case cloneRun = "clone_run"
     case operatorInspection = "operator_inspection"
 }
 
-nonisolated enum RecommendationSource: String, Codable, Sendable, Equatable {
+enum RecommendationSource: String, Codable, Sendable, Equatable {
     case runtimePolicy = "runtime_policy"
     case operatorOverride = "operator_override"
 }

@@ -104,19 +104,3 @@ MVP provider boundary:
 
 - required now: `codex`, `claude_code`, `gemini`
 - post-MVP via provider adapter extension: additional backends beyond the MVP provider set
-
-## 8. Execution truth and recovery
-
-The frozen snapshot and coarse state machines are not enough on their own.
-
-Current implemented baseline also requires:
-
-- one canonical terminal outcome per `AgentExecution`,
-- one active owner per stage or approval lineage,
-- fail-closed startup repair for stale active rows,
-- first-class aggregate settlement truth,
-- and report/recovery readers that prefer canonical persisted truth over raw receipts.
-
-Authoritative contract:
-
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md)

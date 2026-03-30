@@ -167,10 +167,6 @@ struct ResolvedAgent: Sendable {
     let outputs: [String]
     /// Proposal 007 REQ-005: When true, the agent operates against the provisioned worktree with write access.
     let worktreeWriteEnabled: Bool
-    /// Declarative write strategy from AgentCatalog.worktree_policy.strategy.
-    let worktreeStrategy: String?
-    /// Declarative writable root/path from AgentCatalog.worktree_policy.path.
-    let worktreePath: String?
 
     init(
         id: String,
@@ -190,9 +186,7 @@ struct ResolvedAgent: Sendable {
         requiresHumanApproval: Bool,
         inputs: [String],
         outputs: [String],
-        worktreeWriteEnabled: Bool = false,
-        worktreeStrategy: String? = nil,
-        worktreePath: String? = nil
+        worktreeWriteEnabled: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -212,8 +206,6 @@ struct ResolvedAgent: Sendable {
         self.inputs = inputs
         self.outputs = outputs
         self.worktreeWriteEnabled = worktreeWriteEnabled
-        self.worktreeStrategy = worktreeStrategy
-        self.worktreePath = worktreePath
     }
 }
 

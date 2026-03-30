@@ -1,6 +1,6 @@
 # Execution Truth and Recovery Proof
 
-Current implementation and proof status for the execution-truth / settlement / recovery slice in the current Chainworks Forge baseline.
+Current implementation and proof status for the execution-truth and recovery slice consolidated from Proposal 016.
 
 ## Status
 
@@ -9,96 +9,66 @@ Current implementation and proof status for the execution-truth / settlement / r
 | Slice | Execution Truth and Recovery |
 | Source contract | [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) |
 | Current implementation status | Implemented |
-| Current readiness | Ready |
-| Primary evidence owner | current-head non-UI proof lane plus app-launched Proposal 016 harness |
-| Last consolidated audit | `R4` on `2026-03-30` |
+| Current readiness | Ready with Risks |
+| Primary evidence owner | current-head unit/runtime suites in `Chainworks ForgeTests` |
+| Last consolidated documentation refresh | `2026-03-30` |
 
 ## What is considered proven
 
-The accepted proof set now supports these claims:
+The accepted proof story for this slice supports these claims:
 
-- each agent attempt settles to one canonical terminal outcome, including truthful cancellation and limit exhaustion,
-- stage and approval create paths enforce one active lineage owner at a time,
-- startup repair collapses stale active records before new work begins,
-- aggregate settlement is persisted as first-class subordinate truth instead of being inferred from fan-out artifacts,
-- report and recovery surfaces show frozen-vs-runtime binding truth and downgrade weak runtime evidence to `unverifiable`,
-- legacy backfill is deterministic when possible and fail-closed when not,
-- app-level proof demonstrates repair, exhaustion, policy-stop narrowing, and truthful downgrade behavior on the current head.
+- neutral finish markers do not silently count as success,
+- provider/app limit exhaustion after output preserves durable output truth and records a canonical non-success outcome,
+- `WorkflowOrchestrator` persists canonical outcome, transport metadata, runtime provider/model, and outcome envelopes onto `AgentExecution`,
+- output validation after durable output settles as `failed_after_output_validation`,
+- interrupted approval flows restore operator-visible approval context instead of silently re-executing the stage,
+- recovery and report builders read stage-owned failure/recovery evidence instead of relying only on heuristic artifact scans.
 
-## Accepted current-head proof set
+## Accepted current-head proof owners
 
-The current proof story rests on three pillars:
+The strongest current-head proof owners are:
 
-1. green current-head non-UI proposal slice,
-2. green historical replay and legacy-backfill owners inside that same slice,
-3. green app-launched `Proposal016ExecutionTruthHarness` proof.
-
-### Current-head non-UI proof lane
-
-Accepted current-head lane:
-
-- `Proposal016Tests`
-- `ActiveExecutionUniquenessGuardTests`
-- `RuntimeBindingTruthSummaryTests`
-- `LegacyExecutionTruthBackfillTests`
-- `HistoricalRunReplayTests`
-- `RunCancellationCoordinatorTests`
+- `GooseAgentExecutorTests`
+- `OrchestratorTests`
 - `ResumeManagerTests`
 - `RecoveryCoordinatorTests`
-- `OrchestratorTests`
 - `Proposal013Tests`
 
-The latest accepted same-head slice passed `116` tests across `10` suites during audit `R4`.
+Important owner examples on the current tree:
 
-### App-level proof
-
-Accepted app-level proof comes from the `Proposal016ExecutionTruthHarness` autorun path and proves:
-
-- startup repair leaves one canonical active owner,
-- limit exhaustion preserves durable output truth,
-- provider policy-bound stops suppress default same-run retry,
-- legacy rows without canonical truth remain `unverifiable`,
-- standard report/recovery surfaces expose frozen-vs-runtime binding truth honestly.
+- `Neutral finish marker alone does not count as success`
+- `Limit exhaustion after output preserves artifacts and records canonical outcome`
+- `Orchestrator` coverage that persists `canonicalOutcome`, `providerStopReason`, `runtimeProvider`, `runtimeModel`, and `outcomeEnvelopeJSON`
+- approval-resume coverage in `ResumeManagerTests`
+- report/recovery synthesis coverage in `Proposal013Tests`
 
 ## Consolidation note
 
-The original Proposal 016 draft, review, evidence, research, and implementation-audit files were transitional implementation artifacts.
+The old Proposal 016 draft, review, evidence-pack, and proposal-local research files were implementation-trail artifacts.
 
-They have been removed after consolidation into:
+They have been superseded by:
 
 - [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md)
 - this proof document
 
-The stable reference/evidence pair above is now the only long-lived documentation surface for this slice.
-
-## Current interpretation
-
-Execution truth and recovery should now be treated as implemented baseline behavior, not an active proposal.
-
-The proposal lineage showed a clear progression:
-
-1. early rounds identified ambiguous transport outcome truth, stale lineage drift, and aggregate invisibility,
-2. mid rounds closed storage ownership, limit-exhaustion, cancellation, and startup-repair gaps,
-3. later rounds shifted from behavior gaps to proof-lane quality,
-4. the final consolidated audit marked the slice `Implemented` and `Ready`.
+This slice should now be treated as stable reference behavior, not as an active proposal dependency.
 
 ## Remaining caution
 
-The remaining caution is operational, not contractual:
+The remaining caution is about proof packaging rather than the contract itself:
 
-- the `proposal-016` wrapper gate refuses to start while unrelated test/app processes are already running on the host,
-- some proof artifacts are current-head snapshots and should be reproved on later heads instead of being inherited by assumption.
+- the current repository does not expose a dedicated `proposal-016` wrapper gate,
+- proof therefore lives in targeted runtime suites rather than one named top-level gate,
+- later heads should still be reproved instead of inheriting this documentation by assumption.
 
-That caution does not reopen the execution-truth contract.
-It only narrows how far one current-head proof bundle should be generalized without rerun.
+That caution does not reopen the slice.
+It only means the evidence story is suite-based rather than wrapper-gate-based.
 
 ## Recommended usage
 
 Use:
 
-- [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) for the stable runtime contract,
-- [../reference/runtime-contract.md](../reference/runtime-contract.md) for the adjacent frozen snapshot and artifact boundary,
-- [../reference/provider-binding-truth.md](../reference/provider-binding-truth.md) for the narrower binding-provenance contract,
-- [../reference/run-control.md](../reference/run-control.md) for the cancellation/control layer.
-
-Do not recreate proposal-local duplicates for this slice unless a future change genuinely needs a new delta proposal.
+- [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) for the stable contract,
+- [../reference/runtime-contract.md](../reference/runtime-contract.md) for adjacent snapshot and artifact rules,
+- [../reference/provider-binding-truth.md](../reference/provider-binding-truth.md) for binding provenance and downgrade semantics,
+- [../reference/run-control.md](../reference/run-control.md) for the cancellation-control layer.

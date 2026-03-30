@@ -26,6 +26,7 @@ Those remain owned by:
 - [operator-experience.md](operator-experience.md),
 - [provider-platform.md](provider-platform.md),
 - [live-workflow-map.md](live-workflow-map.md),
+- [design-system-and-brand-application.md](design-system-and-brand-application.md),
 - [full-mvp-delivery.md](full-mvp-delivery.md),
 - [mvp-sign-off.md](mvp-sign-off.md),
 - [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md).
@@ -198,6 +199,7 @@ Canonical runtime commands are documented in:
 Use:
 
 - [operator-experience.md](operator-experience.md) for the broader operator shell contract,
+- [design-system-and-brand-application.md](design-system-and-brand-application.md) for the implemented brand/token adoption layer,
 - [provider-platform.md](provider-platform.md) for provider/settings/readiness semantics,
 - [live-workflow-map.md](live-workflow-map.md) for topology truth in run detail,
 - [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) for brand-system authority,

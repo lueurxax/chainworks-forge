@@ -7,7 +7,7 @@ private func makeArchiveContext() throws -> ModelContext {
     let config = ModelConfiguration("ArchiveTests-\(UUID().uuidString)", isStoredInMemoryOnly: true)
     let container = try ModelContainer(
         for: Idea.self, Run.self, StageExecution.self,
-        AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self,
+        AgentExecution.self, Approval.self, Artifact.self,
         configurations: config
     )
     return ModelContext(container)

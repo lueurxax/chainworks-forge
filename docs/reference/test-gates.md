@@ -142,10 +142,11 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ### `proposal-006`
 
-Provider/setup UI sign-off gate for settings/diagnostics/readiness work.
+Provider-platform gate for settings/diagnostics/readiness work.
 
 Scope:
 
+- `ProviderPlatformTests`
 - `testProviderSettingsWizardFlowSurface`
 - `testProviderSettingsExportSurface`
 - `testPilotReadinessRefreshSurface`
@@ -172,9 +173,7 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 Important:
 
-- provider-platform unit/runtime truth remains anchored to the canonical `fast` gate
-- `proposal-006` is the bounded approved-host UI proof for provider/settings/readiness surfaces
-- the repository may still keep `ProviderGate.xctestplan` as diagnostic metadata, but it is not the required proof owner for this gate
+- the repository supports `ProviderGate.xctestplan` as metadata, but the canonical agent path still runs targeted tests by default
 
 ### `proposal-012`
 
@@ -214,40 +213,44 @@ Canonical remote form:
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-012"
 ```
 
-### `proposal-016`
+### `proposal-014`
 
-Execution-truth / settlement / recovery proof gate for the implemented Proposal 016 slice.
+Design-system and brand-application proof gate for the implemented Forge visual rollout.
 
 Scope:
 
-- `ActiveExecutionUniquenessGuardTests`
-- `Proposal016Tests`
-- `RuntimeBindingTruthSummaryTests`
-- `LegacyExecutionTruthBackfillTests`
-- `HistoricalRunReplayTests`
-- `Proposal013Tests`
-- `OrchestratorTests`
-- `RunCancellationCoordinatorTests`
-- `ResumeManagerTests`
-- `RecoveryCoordinatorTests`
-- app-launched `Proposal016ExecutionTruthHarness` proof
+- shell brand header visibility
+- foreground attention banner proof
+- approval / progress / recovery continuity on branded surfaces
+- provider/setup owner surfaces included in the bounded visual rollout
+- workflow map / release gate / min-window / adopter accessibility owners carried forward into the branded proof lane
 
 Use when:
 
-- reproving canonical execution-truth behavior on current head
-- validating startup repair, legacy backfill, aggregate settlement, or narrow recovery behavior
-- collecting current-head evidence for execution-truth / recovery audits
+- reproving the implemented design-system and brand-application slice on the current head
+- collecting approved-host same-head proof for shell/run/setup/recovery visual adoption
+- validating that the branded rollout still preserves accessibility and recovery owner execution
 
 Host policy:
 
-- same proof path is valid locally or on the approved remote host
-- the wrapper gate refuses to start if other test/app processes are already running
+- remote-only because this gate is UI automation
 
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-016
+./scripts/test-gate.sh proposal-014
 ```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-014"
+```
+
+Important:
+
+- the gate keeps its historical proposal label for reproducibility
+- the documentation source of truth for the slice is now [design-system-and-brand-application.md](design-system-and-brand-application.md), not the old proposal file
 
 ### `full`
 

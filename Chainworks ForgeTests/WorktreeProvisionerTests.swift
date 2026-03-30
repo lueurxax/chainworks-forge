@@ -4,7 +4,6 @@ import Foundation
 
 // MARK: - WorktreeProvisioner Tests (Proposal 007 §13.1)
 
-@MainActor
 @Suite("WorktreeProvisioner")
 struct WorktreeProvisionerTests {
     private struct GitTestError: Error {

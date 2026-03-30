@@ -7,13 +7,12 @@ import Foundation
 /// for every Appendix B row.
 struct DeclarativeCoverageReport: Codable, Sendable {
 
-    let reportVersion: Int
+    let reportVersion: Int = 1
     let generatedAt: Date
     let agentCatalogEntries: [CatalogCoverageEntry]
     let workflowEntries: [WorkflowCoverageEntry]
 
     init(generatedAt: Date = Date()) {
-        self.reportVersion = 1
         self.generatedAt = generatedAt
         self.agentCatalogEntries = Self.buildCatalogEntries()
         self.workflowEntries = Self.buildWorkflowEntries()

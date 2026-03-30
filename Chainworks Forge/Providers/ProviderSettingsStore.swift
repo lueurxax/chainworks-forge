@@ -77,11 +77,11 @@ final class ProviderSettingsStore {
         try data.write(to: fileURL, options: .atomic)
     }
 
-    private nonisolated static func load(from fileURL: URL) throws -> ProviderSettings {
+    private static func load(from fileURL: URL) throws -> ProviderSettings {
         try JSONDecoder().decode(ProviderSettings.self, from: Data(contentsOf: fileURL))
     }
 
-    private nonisolated static func sanitized(_ settings: ProviderSettings) -> ProviderSettings {
+    private static func sanitized(_ settings: ProviderSettings) -> ProviderSettings {
         ProviderSettings(
             configuredProviders: settings.configuredProviders.map(sanitized),
             preferredProviderIDsByFamily: settings.preferredProviderIDsByFamily,
@@ -90,7 +90,7 @@ final class ProviderSettingsStore {
         )
     }
 
-    private nonisolated static func sanitized(_ provider: ConfiguredProvider) -> ConfiguredProvider {
+    private static func sanitized(_ provider: ConfiguredProvider) -> ConfiguredProvider {
         var provider = provider
         if let defaultModel = provider.defaultModel,
            !ProviderDefaults.model(defaultModel, isCompatibleWith: provider.family) {
@@ -106,12 +106,12 @@ final class ProviderSettingsStore {
         return provider
     }
 
-    nonisolated static func defaultFileURL() -> URL {
+    static func defaultFileURL() -> URL {
         AppConfiguration.defaultSupportRoot()
             .appendingPathComponent("provider-settings.json")
     }
 
-    private nonisolated static func seededDefault() -> ProviderSettings {
+    private static func seededDefault() -> ProviderSettings {
         let environment = ProcessInfo.processInfo.environment
         let seedsInMemory = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
         let fixtureEndpoint = environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == nil ? nil : "http://fixture.local"

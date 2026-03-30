@@ -40,7 +40,7 @@ Proposal 017 addresses those two problems directly.
 
 ### 1.1 Why this needs a separate proposal
 
-Proposal 016 repairs execution truth, settlement truth, and resume idempotency.
+The implemented [execution-truth and recovery baseline](../reference/execution-truth-and-recovery.md) repairs execution truth, settlement truth, and resume idempotency.
 Proposal 013 repairs output-contract truth, failure evidence, and narrow recovery.
 
 Neither proposal makes one architectural promise that the host system still needs:

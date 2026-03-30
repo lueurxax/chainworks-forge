@@ -43,33 +43,29 @@ struct ForegroundBannerView: View {
 
     var body: some View {
         if totalAttention > 0 {
-            ZStack(alignment: .topLeading) {
-                Button(action: onTap) {
-                    HStack(spacing: ForgeSpacing.small) {
-                        Image(systemName: bannerIcon)
-                            .foregroundStyle(.white)
-                        Text(bannerText)
-                            .font(ForgeTypography.supporting.bold())
-                            .foregroundStyle(.white)
-                        Spacer()
-                        Text("View in Runs Home →")
-                            .font(ForgeTypography.micro)
-                            .foregroundStyle(.white.opacity(0.8))
-                    }
-                    .padding(.horizontal, ForgeSpacing.medium)
-                    .padding(.vertical, 6)
-                    .background(bannerColor.gradient)
-                    .clipShape(RoundedRectangle(cornerRadius: ForgeRadius.card))
+            Button(action: onTap) {
+                HStack(spacing: ForgeSpacing.small) {
+                    Image(systemName: bannerIcon)
+                        .foregroundStyle(.white)
+                    Text(bannerText)
+                        .font(ForgeTypography.supporting.bold())
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Text("View in Runs Home →")
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(.white.opacity(0.8))
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, ForgeSpacing.medium)
+                .padding(.vertical, 6)
+                .background(bannerColor.gradient)
+                .clipShape(RoundedRectangle(cornerRadius: ForgeRadius.card))
             }
+            .buttonStyle(.plain)
             .padding(.horizontal, ForgeSpacing.medium)
             .padding(.top, 4)
             // Proposal 012 (M-04): Banner is positioned at .bottom via overlay alignment,
             // so the transition must slide from the bottom edge, not the top.
             .transition(.move(edge: .bottom).combined(with: .opacity))
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Foreground attention banner. \(bannerText)")
             .accessibilityIdentifier("foreground-attention-banner")
         }
     }

@@ -1,5 +1,4 @@
 import SwiftUI
-import SwiftData
 
 // MARK: - P005-OPS §8: Run Comparison View
 

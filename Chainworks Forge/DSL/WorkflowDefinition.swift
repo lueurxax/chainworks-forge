@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Full Workflow Definition
 
-nonisolated struct WorkflowDefinition: Codable, Sendable {
+struct WorkflowDefinition: Codable, Sendable {
     let schemaVersion: Int
     let workflow: WorkflowMeta
     let variables: [String: AnyCodableValue]?
@@ -19,7 +19,7 @@ nonisolated struct WorkflowDefinition: Codable, Sendable {
     }
 }
 
-nonisolated struct WorkflowMeta: Codable, Sendable {
+struct WorkflowMeta: Codable, Sendable {
     let id: String
     let name: String
     let usesAgentCatalog: String?
@@ -36,7 +36,7 @@ nonisolated struct WorkflowMeta: Codable, Sendable {
     }
 }
 
-nonisolated struct WorkflowState: Codable, Sendable {
+struct WorkflowState: Codable, Sendable {
     let label: String
     let type: String?
     let owner: String
@@ -76,30 +76,30 @@ nonisolated struct WorkflowState: Codable, Sendable {
     }
 }
 
-nonisolated struct RunBlock: Codable, Sendable {
+struct RunBlock: Codable, Sendable {
     let sequence: [AgentTask]?
     let parallel: [AgentTask]?
     let then: [AgentTask]?
 }
 
-nonisolated struct AgentTask: Codable, Sendable {
+struct AgentTask: Codable, Sendable {
     let agent: String
     let task: String
     let inputs: [String]?
     let outputs: [String]?
 }
 
-nonisolated struct Transition: Codable, Sendable {
+struct Transition: Codable, Sendable {
     let to: String
     let when: String
 }
 
-nonisolated struct LoopConfig: Codable, Sendable {
+struct LoopConfig: Codable, Sendable {
     let counter: String
     let max: String
 }
 
-nonisolated struct FailurePolicy: Codable, Sendable {
+struct FailurePolicy: Codable, Sendable {
     let onError: String
     let onLoopBudgetExhausted: String
     let preserveArtifacts: Bool
@@ -111,7 +111,7 @@ nonisolated struct FailurePolicy: Codable, Sendable {
     }
 }
 
-nonisolated struct ExecutionConfig: Codable, Sendable {
+struct ExecutionConfig: Codable, Sendable {
     let singleActiveRunPerIdea: Bool
     let resumePolicy: String
     /// Proposal 011 (REQ-004): when true, the workflow requires a valid project directory.
@@ -141,16 +141,16 @@ nonisolated struct ExecutionConfig: Codable, Sendable {
     }
 }
 
-nonisolated struct IdeaInputConfig: Codable, Sendable {
+struct IdeaInputConfig: Codable, Sendable {
     let mode: String
 }
 
-nonisolated struct ScoringConfig: Codable, Sendable {
+struct ScoringConfig: Codable, Sendable {
     let proposal: ProposalScoring?
     let implementation: ImplementationScoring?
 }
 
-nonisolated struct ProposalScoring: Codable, Sendable {
+struct ProposalScoring: Codable, Sendable {
     let aggregateFormula: String?
     let passWhen: [String]?
 
@@ -160,7 +160,7 @@ nonisolated struct ProposalScoring: Codable, Sendable {
     }
 }
 
-nonisolated struct ImplementationScoring: Codable, Sendable {
+struct ImplementationScoring: Codable, Sendable {
     let implementedWhen: [String]?
 
     enum CodingKeys: String, CodingKey {
@@ -170,7 +170,7 @@ nonisolated struct ImplementationScoring: Codable, Sendable {
 
 // MARK: - Type-erased Codable value
 
-nonisolated enum AnyCodableValue: Codable, Sendable {
+enum AnyCodableValue: Codable, Sendable {
     case string(String)
     case int(Int)
     case double(Double)

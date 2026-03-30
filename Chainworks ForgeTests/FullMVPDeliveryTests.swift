@@ -20,7 +20,7 @@ struct FullMVPWorkflowTests {
     init() throws {
         let schema = Schema([
             Idea.self, Run.self, StageExecution.self,
-            AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self
+            AgentExecution.self, Approval.self, Artifact.self
         ])
         let config = ModelConfiguration(
             "FullMVPDeliveryTests-\(UUID().uuidString)",
@@ -317,7 +317,6 @@ struct FullMVPWorkflowTests {
 
 // MARK: - Release Ops Tests (§13.1)
 
-@MainActor
 @Suite("Full MVP Delivery — Release Ops")
 struct FullMVPReleaseOpsTests {
 
@@ -515,7 +514,7 @@ struct FullMVPIntegrationTests {
     init() throws {
         let schema = Schema([
             Idea.self, Run.self, StageExecution.self,
-            AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self
+            AgentExecution.self, Approval.self, Artifact.self
         ])
         let config = ModelConfiguration(
             "FullMVPIntegrationTests-\(UUID().uuidString)",

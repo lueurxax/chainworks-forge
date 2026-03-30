@@ -29,19 +29,22 @@ final class RecoveryCoordinator {
         switch run.status {
         case .failed:
             if let failedStage = lastFailedStage(in: run) {
-                actions.append(contentsOf: narrowRecoveryActions(for: run, stage: failedStage))
+                if let failedAgent = lastFailedAgent(in: failedStage) {
+                    actions.append(.retryAgent(stageID: failedStage.stageID, agentID: failedAgent.agentID))
+                }
+                actions.append(.retryStage(stageID: failedStage.stageID))
             }
             actions.append(.cloneRunFrozenSnapshot)
             actions.append(.cloneRunCurrentConfig)
 
         case .blocked:
-            if let resumableStage = resumableManualResumeStage(in: run) {
-                actions.append(.resumeRun(stageID: resumableStage.stageID))
-            }
             if let blockedStage = lastBlockedStage(in: run) {
-                actions.append(contentsOf: narrowRecoveryActions(for: run, stage: blockedStage))
+                actions.append(.retryStage(stageID: blockedStage.stageID))
             } else if let failedStage = lastFailedStage(in: run) {
-                actions.append(contentsOf: narrowRecoveryActions(for: run, stage: failedStage))
+                if let failedAgent = lastFailedAgent(in: failedStage) {
+                    actions.append(.retryAgent(stageID: failedStage.stageID, agentID: failedAgent.agentID))
+                }
+                actions.append(.retryStage(stageID: failedStage.stageID))
             }
             actions.append(.cloneRunFrozenSnapshot)
             actions.append(.cloneRunCurrentConfig)
@@ -55,7 +58,7 @@ final class RecoveryCoordinator {
             break
         }
 
-        return deduplicated(actions)
+        return actions
     }
 
     // MARK: - Execute Recovery
@@ -71,13 +74,10 @@ final class RecoveryCoordinator {
         }
 
         // Find the stage and agent
-        guard let stage = canonicalStage(in: run, stageID: stageID, matching: [.failed, .blocked]) else {
+        guard let stage = run.stageExecutions.first(where: { $0.stageID == stageID }) else {
             throw RecoveryError.stageNotFound(stageID)
         }
-        guard let agent = stage.agentExecutions
-            .filter({ $0.agentID == agentID })
-            .sorted(by: { $0.startedAt < $1.startedAt })
-            .last else {
+        guard let agent = stage.agentExecutions.first(where: { $0.agentID == agentID }) else {
             throw RecoveryError.agentNotFound(agentID)
         }
 
@@ -112,7 +112,7 @@ final class RecoveryCoordinator {
             throw RecoveryError.notProposalLoopRun
         }
 
-        guard let stage = canonicalStage(in: run, stageID: stageID, matching: [.failed, .blocked]) else {
+        guard let stage = run.stageExecutions.first(where: { $0.stageID == stageID }) else {
             throw RecoveryError.stageNotFound(stageID)
         }
 
@@ -121,58 +121,6 @@ final class RecoveryCoordinator {
         _ = try retryCoordinator.retryFailedStage(run: run, stage: stage)
 
         // Emit recovery report
-        _ = try reportBuilder.emitReport(for: run)
-
-        try modelContext.save()
-        return run
-    }
-
-    /// Execute an aggregate-step retry action.
-    /// Re-runs only the aggregate proposal-review step and reuses contract-valid reviewer outputs.
-    func retryAggregateStep(run: Run, stageID: String) throws -> Run {
-        guard run.status == .failed || run.status == .blocked else {
-            throw RecoveryError.invalidStateForAction(current: run.status.rawValue, action: "retryAggregateStep")
-        }
-        guard isProposalLoopReadOnly(run) else {
-            throw RecoveryError.notProposalLoopRun
-        }
-
-        guard let stage = canonicalStage(in: run, stageID: stageID, matching: [.failed, .blocked]) else {
-            throw RecoveryError.stageNotFound(stageID)
-        }
-        let aggregateRecord = aggregateSettlementRecord(for: stage)
-        let aggregateAgent = stage.agentExecutions
-            .filter(\.isAggregateProposalReviewStep)
-            .sorted { lhs, rhs in
-                if lhs.blocksForwardProgress != rhs.blocksForwardProgress {
-                    return !lhs.blocksForwardProgress && rhs.blocksForwardProgress
-                }
-                return lhs.startedAt < rhs.startedAt
-            }
-            .last
-        guard let aggregateAgent else {
-            throw RecoveryError.aggregateStepNotFound(stageID)
-        }
-
-        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
-        _ = try retryCoordinator.retryFailedAgent(
-            run: run,
-            stage: stage,
-            failedAgent: aggregateAgent,
-            allowNonBlockingRetry: aggregateRecord != nil && aggregateAgent.isAggregateProposalReviewStep
-        )
-
-        let validationFailure = decodeValidationFailure(from: aggregateAgent)
-            ?? aggregateRecord.flatMap(decodeValidationFailure(from:))
-        let snapshot = retryCoordinator.narrowestRecoveryAction(
-            for: run,
-            failedStage: stage,
-            failedAgent: aggregateAgent,
-            validationFailure: validationFailure,
-            aggregateFailure: aggregateRecord != nil
-        )
-        stage.recoverySnapshotJSON = try? JSONEncoder().encode(snapshot)
-
         _ = try reportBuilder.emitReport(for: run)
 
         try modelContext.save()
@@ -188,7 +136,7 @@ final class RecoveryCoordinator {
             throw RecoveryError.notProposalLoopRun
         }
 
-        guard let stage = canonicalStage(in: run, stageID: stageID, matching: [.waitingApproval]) else {
+        guard let stage = run.stageExecutions.first(where: { $0.stageID == stageID }) else {
             throw RecoveryError.stageNotFound(stageID)
         }
         guard stage.status == .waitingApproval else {
@@ -197,9 +145,6 @@ final class RecoveryCoordinator {
 
         // Re-arm the approval gate
         stage.status = .ready
-        stage.activeOwnerToken = UUID().uuidString
-        stage.settlementKind = nil
-        stage.settledAt = nil
         run.status = .ready
 
         // Emit recovery report
@@ -220,12 +165,13 @@ final class RecoveryCoordinator {
         }
 
         // Rebuild plan from frozen snapshot
-        let (plan, _) = try compiler.rebuildPlanFromSnapshot(run: original)
+        let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: original)
         settleSourceRunForCloneIfNeeded(original)
 
-        let (clone, _) = try compiler.createRun(
+        let clone = try RunRepository(context: modelContext).createRunFromPlan(
             for: idea,
             plan: plan,
+            workspace: workspace,
             workflowSourcePath: original.workflowSourcePath,
             catalogSourcePath: original.catalogSourcePath,
             startSnapshot: RunStartSnapshot.from(run: original)
@@ -278,14 +224,11 @@ final class RecoveryCoordinator {
         let reason: String
         let mostRecentStage: String
         let trustSummary: String
-        let bindingSummary: String?
 
         // Proposal 013: Try to get failure reason from validation evidence first
         let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run)
         let failedAgent = failedStage.flatMap { lastFailedAgent(in: $0) }
-        let aggregateRecord = failedStage.flatMap { aggregateSettlementRecord(for: $0) }
         let validationFailure = failedAgent.flatMap { decodeValidationFailure(from: $0) }
-            ?? aggregateRecord.flatMap(decodeValidationFailure(from:))
 
         if let vf = validationFailure {
             reason = "\(vf.failureClass.rawValue.replacingOccurrences(of: "_", with: " ").capitalized): \(vf.failureSummary)"
@@ -299,23 +242,19 @@ final class RecoveryCoordinator {
             reason = "Unknown"
         }
 
-        let sorted = canonicalStages(in: run)
+        let sorted = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
         mostRecentStage = sorted.last?.label ?? "None"
 
         trustSummary = run.runtimeTrustLevel ?? "unknown"
-        bindingSummary = RuntimeBindingTruthSummaryBuilder.summaryText(for: run)
 
         let actions = availableActions(for: run)
 
         // Proposal 013 UX-001: For contract mismatch, suggest operator inspection first
         // instead of blind retry. Use narrowestRecoveryAction for evidence-backed suggestion.
         let suggestedAction: RecoveryAction?
-        let operatorInspectionRequired = failedStage.map { requiresOperatorInspection(run: run, stage: $0) } ?? false
         if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
             // Operator-mediated: don't suggest retry first for contract mismatch
             // Instead, the evidence panel should be inspected before retrying
-            suggestedAction = nil
-        } else if operatorInspectionRequired {
             suggestedAction = nil
         } else {
             suggestedAction = actions.first
@@ -337,7 +276,6 @@ final class RecoveryCoordinator {
             reason: reason,
             mostRecentStage: mostRecentStage,
             trustSummary: trustSummary,
-            bindingSummary: bindingSummary,
             suggestedAction: suggestedAction,
             allowedActions: actions,
             evidenceSummary: evidenceSummary,
@@ -351,9 +289,7 @@ final class RecoveryCoordinator {
     func buildEvidencePacket(for run: Run) -> FailedStageEvidencePacket? {
         guard let stage = lastFailedStage(in: run) ?? lastBlockedStage(in: run) else { return nil }
         let failedAgent = lastFailedAgent(in: stage)
-        let aggregateRecord = aggregateSettlementRecord(for: stage)
         let validationFailure = failedAgent.flatMap { decodeValidationFailure(from: $0) }
-            ?? aggregateRecord.flatMap(decodeValidationFailure(from:))
         let envelopes = failedAgent.flatMap { decodeOutputEnvelopes(from: $0) } ?? []
         let recoverySnapshot = decodeRecoverySnapshot(from: stage)
 
@@ -376,14 +312,14 @@ final class RecoveryCoordinator {
     }
 
     private func lastFailedStage(in run: Run) -> StageExecution? {
-        canonicalStages(in: run)
+        run.stageExecutions
             .filter { $0.status == .failed }
             .sorted { $0.startedAt < $1.startedAt }
             .last
     }
 
     private func lastBlockedStage(in run: Run) -> StageExecution? {
-        canonicalStages(in: run)
+        run.stageExecutions
             .filter { $0.status == .blocked }
             .sorted { $0.startedAt < $1.startedAt }
             .last
@@ -391,163 +327,15 @@ final class RecoveryCoordinator {
 
     private func lastFailedAgent(in stage: StageExecution) -> AgentExecution? {
         stage.agentExecutions
-            .filter { $0.blocksForwardProgress }
+            .filter { $0.status == .failed }
             .sorted { $0.startedAt < $1.startedAt }
             .last
-    }
-
-    private func aggregateSettlementRecord(for stage: StageExecution) -> AggregateSettlementRecord? {
-        let descriptor = FetchDescriptor<AggregateSettlementRecord>()
-        let records = (try? modelContext.fetch(descriptor)) ?? []
-        return records
-            .filter { $0.stageExecutionID == stage.id }
-            .sorted { lhs, rhs in
-                let lhsSettledAt = lhs.settledAt ?? .distantPast
-                let rhsSettledAt = rhs.settledAt ?? .distantPast
-                if lhsSettledAt != rhsSettledAt {
-                    return lhsSettledAt < rhsSettledAt
-                }
-                return lhs.id.uuidString < rhs.id.uuidString
-            }
-            .last
-    }
-
-    private func requiresOperatorInspection(run: Run, stage: StageExecution) -> Bool {
-        let aggregateRecord = aggregateSettlementRecord(for: stage)
-        let failedAgent = lastFailedAgent(in: stage)
-        let validationFailure = failedAgent.flatMap(decodeValidationFailure(from:))
-            ?? aggregateRecord.flatMap(decodeValidationFailure(from:))
-        if let snapshot = decodeRecoverySnapshot(from: stage) {
-            return snapshot.recommendedAction?.action == .operatorInspection
-        }
-
-        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
-        let snapshot = retryCoordinator.narrowestRecoveryAction(
-            for: run,
-            failedStage: stage,
-            failedAgent: failedAgent,
-            validationFailure: validationFailure,
-            aggregateFailure: aggregateRecord != nil
-        )
-        return snapshot.recommendedAction?.action == .operatorInspection
-    }
-
-    private func hasAggregateExecution(in stage: StageExecution) -> Bool {
-        stage.agentExecutions.contains(where: \.isAggregateProposalReviewStep)
-    }
-
-    private func narrowRecoveryActions(for run: Run, stage: StageExecution) -> [RecoveryAction] {
-        let failedAgent = lastFailedAgent(in: stage)
-        let aggregateRecord = aggregateSettlementRecord(for: stage)
-        let validationFailure = failedAgent.flatMap(decodeValidationFailure(from:))
-            ?? aggregateRecord.flatMap(decodeValidationFailure(from:))
-
-        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
-        let snapshot = retryCoordinator.narrowestRecoveryAction(
-            for: run,
-            failedStage: stage,
-            failedAgent: failedAgent,
-            validationFailure: validationFailure,
-            aggregateFailure: aggregateRecord != nil
-        )
-
-        let requiresInspection = snapshot.recommendedAction?.action == .operatorInspection
-        let allowSameRunRetryDuringInspection = validationFailure?.failureClass == .outputContractMismatch
-
-        return snapshot.availableActions.compactMap { detail in
-            if requiresInspection && !allowSameRunRetryDuringInspection {
-                switch detail.action {
-                case .cloneRunFrozenSnapshot, .cloneRunCurrentConfig:
-                    break
-                default:
-                    return nil
-                }
-            }
-            return recoveryAction(from: detail)
-        }
-    }
-
-    private func recoveryAction(from detail: RecoveryActionDetail) -> RecoveryAction? {
-        switch detail.action {
-        case .retryFailedAgent:
-            guard let stageID = detail.stageID, let agentID = detail.agentID else { return nil }
-            return .retryAgent(stageID: stageID, agentID: agentID)
-        case .retryAggregateStep:
-            guard let stageID = detail.stageID else { return nil }
-            return .retryAggregateStep(stageID: stageID)
-        case .retryFailedStage:
-            guard let stageID = detail.stageID else { return nil }
-            return .retryStage(stageID: stageID)
-        case .cloneRunFrozenSnapshot:
-            return .cloneRunFrozenSnapshot
-        case .cloneRunCurrentConfig:
-            return .cloneRunCurrentConfig
-        case .operatorInspection:
-            return nil
-        }
-    }
-
-    private func deduplicated(_ actions: [RecoveryAction]) -> [RecoveryAction] {
-        var seen: Set<String> = []
-        var result: [RecoveryAction] = []
-        for action in actions {
-            if seen.insert(action.id).inserted {
-                result.append(action)
-            }
-        }
-        return result
     }
 
     private func lastApprovalGateStage(in run: Run) -> StageExecution? {
-        canonicalStages(in: run)
+        run.stageExecutions
             .filter { $0.status == .waitingApproval }
             .sorted { $0.startedAt < $1.startedAt }
-            .last
-    }
-
-    private func resumableManualResumeStage(in run: Run) -> StageExecution? {
-        guard run.status == .blocked,
-              let details = run.driftDetails?.lowercased(),
-              (details.contains("explicit operator resume")
-                || details.contains("explicit operator recovery")),
-              let currentStageID = run.currentStageID else {
-            return nil
-        }
-
-        return canonicalStages(in: run)
-            .filter { $0.stageID == currentStageID && ($0.status == .running || $0.status == .ready) }
-            .first(where: { stage in
-                stage.agentExecutions.contains(where: { $0.status == .pending || $0.status == .running })
-            })
-    }
-
-    private func canonicalStages(in run: Run) -> [StageExecution] {
-        let grouped = Dictionary(grouping: run.stageExecutions) { stage in
-            stage.lineageID ?? "\(stage.stageID)::\(stage.iteration)"
-        }
-
-        return grouped.values.compactMap { stages in
-            stages.max { lhs, rhs in
-                if lhs.attemptNumber != rhs.attemptNumber {
-                    return lhs.attemptNumber < rhs.attemptNumber
-                }
-                if lhs.startedAt != rhs.startedAt {
-                    return lhs.startedAt < rhs.startedAt
-                }
-                return lhs.id.uuidString < rhs.id.uuidString
-            }
-        }
-        .sorted { $0.startedAt < $1.startedAt }
-    }
-
-    private func canonicalStage(in run: Run, stageID: String, matching statuses: Set<StageStatus>) -> StageExecution? {
-        canonicalStages(in: run)
-            .filter { $0.stageID == stageID && statuses.contains($0.status) }
-            .sorted { lhs, rhs in
-                if lhs.iteration != rhs.iteration { return lhs.iteration < rhs.iteration }
-                if lhs.attemptNumber != rhs.attemptNumber { return lhs.attemptNumber < rhs.attemptNumber }
-                return lhs.startedAt < rhs.startedAt
-            }
             .last
     }
 
@@ -555,11 +343,6 @@ final class RecoveryCoordinator {
 
     private func decodeValidationFailure(from agent: AgentExecution) -> ValidationFailureRecord? {
         guard let data = agent.validationFailureJSON else { return nil }
-        return try? JSONDecoder().decode(ValidationFailureRecord.self, from: data)
-    }
-
-    private func decodeValidationFailure(from aggregateRecord: AggregateSettlementRecord) -> ValidationFailureRecord? {
-        guard let data = aggregateRecord.validationFailureJSON else { return nil }
         return try? JSONDecoder().decode(ValidationFailureRecord.self, from: data)
     }
 
@@ -592,9 +375,7 @@ final class RecoveryCoordinator {
 // MARK: - Recovery Types
 
 enum RecoveryAction: Identifiable, Equatable {
-    case resumeRun(stageID: String)
     case retryAgent(stageID: String, agentID: String)
-    case retryAggregateStep(stageID: String)
     case retryStage(stageID: String)
     case resumeFromApprovalGate(stageID: String)
     case cloneRunFrozenSnapshot
@@ -602,9 +383,7 @@ enum RecoveryAction: Identifiable, Equatable {
 
     var id: String {
         switch self {
-        case .resumeRun(let stageID): return "resumeRun_\(stageID)"
         case .retryAgent(let stageID, let agentID): return "retryAgent_\(stageID)_\(agentID)"
-        case .retryAggregateStep(let stageID): return "retryAggregate_\(stageID)"
         case .retryStage(let stageID): return "retryStage_\(stageID)"
         case .resumeFromApprovalGate(let stageID): return "resumeGate_\(stageID)"
         case .cloneRunFrozenSnapshot: return "cloneFrozen"
@@ -614,9 +393,7 @@ enum RecoveryAction: Identifiable, Equatable {
 
     var label: String {
         switch self {
-        case .resumeRun: return "Resume Run"
         case .retryAgent: return "Retry Agent"
-        case .retryAggregateStep: return "Retry Aggregate Step"
         case .retryStage: return "Retry Stage"
         case .resumeFromApprovalGate: return "Resume from Approval Gate"
         case .cloneRunFrozenSnapshot: return "Clone Run (Frozen Snapshot)"
@@ -626,9 +403,7 @@ enum RecoveryAction: Identifiable, Equatable {
 
     var systemImage: String {
         switch self {
-        case .resumeRun: return "play.circle.fill"
         case .retryAgent: return "arrow.clockwise"
-        case .retryAggregateStep: return "arrow.trianglehead.2.clockwise.rotate.90"
         case .retryStage: return "arrow.counterclockwise"
         case .resumeFromApprovalGate: return "play.fill"
         case .cloneRunFrozenSnapshot: return "doc.on.doc"
@@ -641,7 +416,6 @@ struct RecoveryContext {
     let reason: String
     let mostRecentStage: String
     let trustSummary: String
-    let bindingSummary: String?
     let suggestedAction: RecoveryAction?
     let allowedActions: [RecoveryAction]
 
@@ -653,7 +427,6 @@ struct RecoveryContext {
         reason: String,
         mostRecentStage: String,
         trustSummary: String,
-        bindingSummary: String? = nil,
         suggestedAction: RecoveryAction?,
         allowedActions: [RecoveryAction],
         evidenceSummary: String? = nil,
@@ -662,7 +435,6 @@ struct RecoveryContext {
         self.reason = reason
         self.mostRecentStage = mostRecentStage
         self.trustSummary = trustSummary
-        self.bindingSummary = bindingSummary
         self.suggestedAction = suggestedAction
         self.allowedActions = allowedActions
         self.evidenceSummary = evidenceSummary
@@ -675,7 +447,6 @@ enum RecoveryError: Error, LocalizedError {
     case notProposalLoopRun
     case stageNotFound(String)
     case agentNotFound(String)
-    case aggregateStepNotFound(String)
 
     var errorDescription: String? {
         switch self {
@@ -687,8 +458,6 @@ enum RecoveryError: Error, LocalizedError {
             return "Stage '\(id)' not found"
         case .agentNotFound(let id):
             return "Agent '\(id)' not found"
-        case .aggregateStepNotFound(let stageID):
-            return "Aggregate step not found in stage '\(stageID)'"
         }
     }
 }

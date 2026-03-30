@@ -19,43 +19,47 @@ Repository documentation for Chainworks Forge.
 5. [reference/architecture-decisions.md](reference/architecture-decisions.md) — AD log
 6. [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — execution engine
 7. [reference/runtime-contract.md](reference/runtime-contract.md) — runtime contracts
-8. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — live proposal loop
-9. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
-10. [reference/operator-experience.md](reference/operator-experience.md) — operator shell baseline
-11. [reference/provider-platform.md](reference/provider-platform.md) — provider/settings baseline
-12. [reference/run-control.md](reference/run-control.md) — stop/cancel truth and settlement
-13. [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — idea-owned workspace and frozen run contract
-14. [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — frozen provider/model provenance truth
-15. [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — archive and restore baseline
-16. [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Goose-backed provider remediation path
-17. [reference/live-workflow-map.md](reference/live-workflow-map.md) — run-detail topology baseline
-18. [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — implemented UI readability, accessibility, and bounded design-system hardening contract
-19. [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — repo-backed worktree, implementation loop, manual release, evidence export
-20. [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — benchmark, launch gate, export hub, and current-head sign-off rules
-21. [reference/current-system-baseline.md](reference/current-system-baseline.md) — current-head subsystem map and reusable review baseline
-22. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
-23. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
-24. [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure, mock lanes, tags, and plans
-25. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
-26. [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — how agents should run preview, XCUITest, and app-launched proof paths
-27. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
-28. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+8. [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — canonical outcomes, stage-owned recovery evidence, approval restore, and report/recovery read truth
+9. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — live proposal loop
+10. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
+11. [reference/operator-experience.md](reference/operator-experience.md) — operator shell baseline
+12. [reference/provider-platform.md](reference/provider-platform.md) — provider/settings baseline
+13. [reference/run-control.md](reference/run-control.md) — stop/cancel truth and settlement
+14. [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — idea-owned workspace and frozen run contract
+15. [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — frozen provider/model provenance truth
+16. [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — archive and restore baseline
+17. [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Goose-backed provider remediation path
+18. [reference/live-workflow-map.md](reference/live-workflow-map.md) — run-detail topology baseline
+19. [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — implemented UI readability, accessibility, and bounded design-system hardening contract
+20. [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — implemented Forge token lane, brand assets, and shell/run/setup/recovery adoption
+21. [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — repo-backed worktree, implementation loop, manual release, evidence export
+22. [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — benchmark, launch gate, export hub, and current-head sign-off rules
+23. [reference/current-system-baseline.md](reference/current-system-baseline.md) — current-head subsystem map and reusable review baseline
+24. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
+25. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
+26. [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure, mock lanes, tags, and plans
+27. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
+28. [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — how agents should run preview, XCUITest, and app-launched proof paths
+29. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
+30. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
 
 ## Status
 
 - Owner: single-engineer working repo
-- Last updated: 2026-03-29
-- State: active — foundation, execution engine, live Goose transport, UI quality slice, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
+- Last updated: 2026-03-30
+- State: active — foundation, execution engine, execution-truth baseline, live Goose transport, UI quality slice, design-system adoption slice, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
 
 ## Reference (implemented)
 
 See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
+- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Stable canonical outcome, recovery, and report/read-truth contract
 - [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
 - [reference/operator-experience.md](reference/operator-experience.md) — Stable operator shell baseline and contracts
 - [reference/provider-platform.md](reference/provider-platform.md) — Stable multi-provider/settings/diagnostics baseline
 - [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — Stable UI readability, accessibility, and bounded design-system hardening baseline
+- [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — Stable Forge token lane, brand assets, and bounded visual rollout
 - [reference/run-control.md](reference/run-control.md) — Stable stop/cancel and cancellation-settlement contract
 - [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Stable idea-owned workspace and frozen run project contract
 - [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Stable provider/model truth and provenance contract
@@ -75,13 +79,14 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 
 ## Proposals (active, not yet implemented)
 
-- [proposals/014-design-system-adoption-and-brand-application.md](proposals/014-design-system-adoption-and-brand-application.md) — adopt Design Kit v1 across the app shell and operator surfaces
 - [proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md](proposals/013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md) — stage-output contract alignment, retry truth, failed-stage evidence, and recovery hardening
 
 ## Evidence
 
 - [evidence/goose-server-transport-verification.md](evidence/goose-server-transport-verification.md) -- Goose server transport verification record
+- [evidence/execution-truth-and-recovery-proof.md](evidence/execution-truth-and-recovery-proof.md) -- consolidated implementation/proof status for the execution-truth and recovery slice
 - [evidence/ui-quality-and-polish-proof.md](evidence/ui-quality-and-polish-proof.md) -- consolidated implementation/proof status for the UI quality and visual polish slice
+- [evidence/design-system-and-brand-application-proof.md](evidence/design-system-and-brand-application-proof.md) -- consolidated implementation/proof status for the design-system and brand-application slice
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
 - [evidence/mvp-sign-off-proof.md](evidence/mvp-sign-off-proof.md) -- consolidated implementation/proof status for MVP hardening and sign-off
 - [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON

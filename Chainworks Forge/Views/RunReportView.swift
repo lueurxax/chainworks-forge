@@ -56,15 +56,6 @@ struct RunReportView: View {
             .padding(.vertical, 4)
             .background(trustColor.opacity(0.05))
 
-            if let bindingSummary = RuntimeBindingTruthSummaryBuilder.summaryText(for: run) {
-                Text(bindingSummary)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.horizontal)
-                    .padding(.bottom, 4)
-            }
-
             HStack {
                 ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
                 Spacer()

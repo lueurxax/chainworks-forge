@@ -39,9 +39,7 @@ enum ProposalReviewContractAdapter {
     }
 
     /// Resolve the contract schema for a proposal review output.
-    /// Returns the canonical review schema. Proposal review outputs are
-    /// machine-first JSON contracts; any human-readable companion must be
-    /// persisted separately and never replace the declared artifact.
+    /// Proposal-review outputs are strict JSON machine artifacts.
     static func resolveReviewSchema(for outputName: String, catalog: AgentCatalog?) -> OutputContractSchemaV2? {
         guard isReviewOutput(outputName) || isReviewSummary(outputName) else { return nil }
 
@@ -56,7 +54,8 @@ enum ProposalReviewContractAdapter {
         )
     }
 
-    /// Validate a proposal review output as strict machine JSON.
+    /// Validate a proposal review output.
+    /// Proposal-review outputs must be top-level JSON objects with all required fields.
     static func validateReviewOutput(
         outputName: String,
         data: Data,

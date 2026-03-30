@@ -231,17 +231,8 @@ struct RecoverySheet: View {
 
         do {
             switch action {
-            case .resumeRun(let stageID):
-                let compiler = RunPlanCompiler(modelContext: modelContext)
-                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
-                dismiss()
-
             case .retryAgent(let stageID, let agentID):
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
-                dismiss()
-
-            case .retryAggregateStep(let stageID):
-                _ = try coordinator.retryAggregateStep(run: run, stageID: stageID)
                 dismiss()
 
             case .retryStage(let stageID):
@@ -316,12 +307,8 @@ struct RecoverySheet: View {
     // Proposal 013 §7.2: Action explanation with reuse/re-execution/same-run-vs-clone semantics
     private func recoveryActionExplanation(_ action: RecoveryAction) -> String {
         switch action {
-        case .resumeRun(let stageID):
-            return "Resumes the interrupted '\(stageID)' stage in the same run using the persisted frozen snapshot."
         case .retryAgent(_, let agentID):
             return "Retries only agent '\(agentID)' in the same run. Successful sibling outputs are reused."
-        case .retryAggregateStep(let stageID):
-            return "Re-runs only the aggregate settlement step for '\(stageID)' without restarting upstream agents."
         case .retryStage(let stageID):
             return "Re-executes the entire '\(stageID)' stage in the same run. All agents re-run."
         case .resumeFromApprovalGate:
@@ -359,9 +346,8 @@ struct RecoverySheet: View {
 
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
-        case .resumeRun: return DesignTokens.Action.primary
         case .resumeFromApprovalGate: return DesignTokens.Action.approve
-        case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
+        case .retryAgent, .retryStage: return DesignTokens.Action.caution
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
         case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }

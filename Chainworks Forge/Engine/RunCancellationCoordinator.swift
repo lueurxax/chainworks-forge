@@ -66,31 +66,8 @@ final class RunCancellationCoordinator {
 
         for agentExec in activeAgentExecutions {
             let priorStatus = agentExec.status.rawValue
+            agentExec.status = .cancelled
             agentExec.completedAt = agentExec.completedAt ?? Date()
-
-            let outputPresence = ExecutionTruthSupport.derivedOutputPresence(for: agentExec)
-            let receipt = ExecutionTruthSupport.decodedReceipt(from: agentExec)
-            let canonicalOutcome: AgentCanonicalOutcome = outputPresence == .durableOutput
-                ? .cancelledAfterOutput
-                : .cancelledBeforeOutput
-            let runtimeProvider = agentExec.runtimeProvider
-                ?? receipt?.providerFamily
-                ?? agentExec.provider
-            let runtimeModel = agentExec.runtimeModel
-                ?? receipt?.model
-                ?? agentExec.resolvedModel
-
-            ExecutionTruthSupport.persistTerminalTruth(
-                for: agentExec,
-                canonicalOutcome: canonicalOutcome,
-                transportErrorKind: nil,
-                providerStopReason: "operator_cancelled",
-                outputPresence: outputPresence,
-                runtimeProvider: runtimeProvider,
-                runtimeModel: runtimeModel,
-                rawErrorMessage: "Cancellation requested by operator",
-                rawFinishEvent: nil
-            )
 
             // Collect session IDs for async cleanup.
             let hasSession = agentExec.gooseSessionID != nil && !(agentExec.gooseSessionID?.isEmpty ?? true)

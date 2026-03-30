@@ -20,9 +20,9 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
     var failingAgentIDs: Set<String> = []
 
     var executedTasks: [(agentID: String, task: String, stageID: String)] {
-        _lock.withLock {
-            _executedTasks
-        }
+        _lock.lock()
+        defer { _lock.unlock() }
+        return _executedTasks
     }
 
     init(simulatedDelay: TimeInterval = 0, catalog: AgentCatalog? = nil) {
@@ -39,9 +39,9 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
         // Record execution
-        _lock.withLock {
-            _executedTasks.append((agentID: agent.id, task: task.task, stageID: context.stageID))
-        }
+        _lock.lock()
+        _executedTasks.append((agentID: agent.id, task: task.task, stageID: context.stageID))
+        _lock.unlock()
 
         // Simulated delay
         if simulatedDelay > 0 {
@@ -123,9 +123,9 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     /// Reset tracking state (for test setup).
     func reset() {
-        _lock.withLock {
-            _executedTasks.removeAll()
-            failingAgentIDs.removeAll()
-        }
+        _lock.lock()
+        _executedTasks.removeAll()
+        failingAgentIDs.removeAll()
+        _lock.unlock()
     }
 }

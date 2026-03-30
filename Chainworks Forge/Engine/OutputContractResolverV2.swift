@@ -281,7 +281,7 @@ enum OutputContractResolverV2 {
 // MARK: - Output Validation Result
 
 /// Result of validating a single output against its contract.
-nonisolated struct OutputValidationResult: Codable, Sendable, Equatable {
+struct OutputValidationResult: Codable, Sendable, Equatable {
     let outputName: String
     let contractID: String?
     let status: OutputValidationStatus
@@ -290,7 +290,7 @@ nonisolated struct OutputValidationResult: Codable, Sendable, Equatable {
     let rawPayloadSize: Int
 }
 
-nonisolated enum OutputValidationStatus: String, Codable, Sendable, Equatable {
+enum OutputValidationStatus: String, Codable, Sendable, Equatable {
     case passed
     case failed
     case noContractDeclared

@@ -18,18 +18,15 @@ struct DeliveryPreflightReportView: View {
             HStack {
                 Image(systemName: result.passed ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
                     .foregroundStyle(result.passed ? DesignTokens.Status.success : DesignTokens.Status.warning)
-                ForgeSectionHeader(
-                    title: "Delivery Preflight",
-                    subtitle: "Repo-backed start checks stay operational first: release readiness, writable worktrees, and target configuration must remain explicit.",
-                    systemImage: nil,
-                    tint: result.passed ? DesignTokens.Status.success : DesignTokens.Status.warning
-                )
+                Text("Delivery Preflight")
+                    .font(DesignTokens.Typography.sectionHeader)
                 Spacer()
+                // Proposal 012 (M-01): Migrated to StatusCapsule
                 StatusCapsule(
                     text: statusText,
                     color: result.passed ? DesignTokens.Status.success : DesignTokens.Status.warning,
                     icon: result.passed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill",
-                    accessibilityIdentifier: "delivery-preflight-status"
+                    accessibilityIdentifier: statusText
                 )
                 statusAccessibilityProof
             }
@@ -37,7 +34,7 @@ struct DeliveryPreflightReportView: View {
             ForEach(result.checks, id: \.id) { check in
                 HStack(spacing: 8) {
                     Image(systemName: check.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundStyle(check.passed ? DesignTokens.Status.success : DesignTokens.Status.error)
+                        .foregroundStyle(check.passed ? .green : .red)
                         .font(.body)
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -45,8 +42,8 @@ struct DeliveryPreflightReportView: View {
                             .font(.body)
                         if let detail = check.detail {
                             Text(detail)
-                                .font(DesignTokens.Typography.supporting)
-                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                                 .lineLimit(2)
                         }
                     }
@@ -54,7 +51,6 @@ struct DeliveryPreflightReportView: View {
                     Spacer()
                 }
                 .padding(.vertical, 2)
-                .forgeInsetPanel(tone: check.passed ? .quiet : .critical)
             }
 
             if !result.passed {
@@ -62,29 +58,28 @@ struct DeliveryPreflightReportView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Failed Checks")
-                        .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     ForEach(result.failedChecks, id: \.id) { check in
                         HStack(spacing: 4) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.caption2)
-                                .foregroundStyle(DesignTokens.Status.warning)
+                                .foregroundStyle(.orange)
                             Text(check.label)
-                                .font(DesignTokens.Typography.supporting)
-                                .foregroundStyle(DesignTokens.Status.error)
+                                .font(.caption)
+                                .foregroundStyle(.red)
                             if let detail = check.detail {
                                 Text("— \(detail)")
-                                    .font(DesignTokens.Typography.supporting)
-                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             }
                         }
                     }
                 }
-                .forgeInsetPanel(tone: .warning)
             }
         }
-        .forgePanel(tone: result.passed ? .standard : .warning)
+        .padding()
         .accessibilityIdentifier("delivery-preflight-report-view")
     }
 

@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Agent Catalog (top-level)
 
-nonisolated struct AgentCatalog: Codable, Sendable {
+struct AgentCatalog: Codable, Sendable {
     let schemaVersion: Int
     let app: AppConfig
     let paths: [String: String]
@@ -21,7 +21,7 @@ nonisolated struct AgentCatalog: Codable, Sendable {
     }
 }
 
-nonisolated struct AppConfig: Codable, Sendable {
+struct AppConfig: Codable, Sendable {
     let name: String
     let runtime: String
     let transport: String
@@ -40,7 +40,7 @@ nonisolated struct AppConfig: Codable, Sendable {
     }
 }
 
-nonisolated struct AgentDefinition: Codable, Sendable, Identifiable {
+struct AgentDefinition: Codable, Sendable, Identifiable {
     let id: String
     let title: String
     let mode: String
@@ -70,7 +70,7 @@ nonisolated struct AgentDefinition: Codable, Sendable, Identifiable {
     }
 }
 
-nonisolated struct BackendProfile: Codable, Sendable {
+struct BackendProfile: Codable, Sendable {
     let provider: String
     let model: String
     let effort: String
@@ -85,7 +85,7 @@ nonisolated struct BackendProfile: Codable, Sendable {
     }
 }
 
-nonisolated struct PermissionProfile: Codable, Sendable {
+struct PermissionProfile: Codable, Sendable {
     let filesystem: FilesystemPermissions
     let git: GitPermissions
     let shell: ShellPermissions
@@ -93,7 +93,7 @@ nonisolated struct PermissionProfile: Codable, Sendable {
     let mcp: MCPPermissions
 }
 
-nonisolated struct ArtifactContract: Codable, Sendable {
+struct ArtifactContract: Codable, Sendable {
     let format: String
     let requiredFields: [String]
 
@@ -103,14 +103,14 @@ nonisolated struct ArtifactContract: Codable, Sendable {
     }
 }
 
-nonisolated struct SkillRef: Codable, Sendable {
+struct SkillRef: Codable, Sendable {
     let type: String
     let path: String?
     let name: String?
     let description: String?
 }
 
-nonisolated struct WorktreePolicy: Codable, Sendable {
+struct WorktreePolicy: Codable, Sendable {
     let strategy: String
     let path: String
     let baseBranch: String?
@@ -125,13 +125,13 @@ nonisolated struct WorktreePolicy: Codable, Sendable {
 
 // MARK: - Supporting Permission Types
 
-nonisolated struct FilesystemPermissions: Codable, Sendable {
+struct FilesystemPermissions: Codable, Sendable {
     let read: [String]?
     let write: [String]?
     let deny: [String]?
 }
 
-nonisolated struct GitPermissions: Codable, Sendable {
+struct GitPermissions: Codable, Sendable {
     let status: Bool?
     let diff: Bool?
     let checkout: Bool?
@@ -139,15 +139,15 @@ nonisolated struct GitPermissions: Codable, Sendable {
     let push: Bool?
 }
 
-nonisolated struct ShellPermissions: Codable, Sendable {
+struct ShellPermissions: Codable, Sendable {
     let allow: [String]?
     let deny: [String]?
 }
 
-nonisolated struct NetworkPermissions: Codable, Sendable {
+struct NetworkPermissions: Codable, Sendable {
     let allow: [String]?
 }
 
-nonisolated struct MCPPermissions: Codable, Sendable {
+struct MCPPermissions: Codable, Sendable {
     let allow: [String]?
 }

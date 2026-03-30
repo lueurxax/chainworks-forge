@@ -5,18 +5,16 @@ import SwiftData
 
 // MARK: - Helpers
 
-@MainActor
 private func makeContext() throws -> ModelContext {
     let config = ModelConfiguration("ForgeTests-\(UUID().uuidString)", isStoredInMemoryOnly: true)
     let container = try ModelContainer(
         for: Idea.self, Run.self, StageExecution.self,
-        AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self,
+        AgentExecution.self, Approval.self, Artifact.self,
         configurations: config
     )
     return ModelContext(container)
 }
 
-@MainActor
 private let dummyWorkflow = WorkflowDefinition(
     schemaVersion: 1,
     workflow: WorkflowMeta(
@@ -33,7 +31,6 @@ private let dummyWorkflow = WorkflowDefinition(
     ]
 )
 
-@MainActor
 private let dummyCatalog = AgentCatalog(
     schemaVersion: 1,
     app: AppConfig(
@@ -70,7 +67,6 @@ private final class _TestBundleMarker: NSObject {}
 
 // MARK: - Synthetic Builder Helpers
 
-@MainActor
 private func makeWorkflow(
     initialState: String = "s1",
     states: [String: WorkflowState] = ["s1": WorkflowState(label: "S1", type: "start", owner: "o", approval: nil, run: nil, runAfterApproval: nil, loop: nil, transitions: nil)],
@@ -90,7 +86,6 @@ private func makeWorkflow(
     )
 }
 
-@MainActor
 private func makeCatalog(
     paths: [String: String] = [:],
     artifacts: [String: String] = [:],
@@ -113,7 +108,6 @@ private func makeCatalog(
     )
 }
 
-@MainActor
 private func makeAgent(
     id: String = "test_agent",
     backendProfile: String = "bp1",
@@ -133,7 +127,6 @@ private func makeAgent(
     )
 }
 
-@MainActor
 private let dummyPermissionProfile = PermissionProfile(
     filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
     git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
@@ -142,16 +135,13 @@ private let dummyPermissionProfile = PermissionProfile(
     mcp: MCPPermissions(allow: nil)
 )
 
-@MainActor
 private let dummyBackendProfile = BackendProfile(
     provider: "claude_code", model: "opus", effort: "high",
     temperature: 0.0, maxTurns: 10, structuredOutput: "json"
 )
 
-@MainActor
 private let dummySkillRef = SkillRef(type: "builtin", path: nil, name: nil, description: nil)
 
-@MainActor
 private func makeCompact(stages: [CompactStage]) -> CompactWorkflowDefinition {
     CompactWorkflowDefinition(
         version: 1,
@@ -167,7 +157,6 @@ private func makeCompact(stages: [CompactStage]) -> CompactWorkflowDefinition {
 
 // MARK: - Model Tests
 
-@MainActor
 @Suite("Idea Model")
 struct IdeaTests {
     @Test func creation() throws {
@@ -547,7 +536,6 @@ struct RunTests {
 
 // MARK: - Parser Tests
 
-@MainActor
 @Suite("YAML Parser", .serialized)
 struct YAMLParserTests {
     @Test func parseAgentCatalog() throws {
@@ -764,7 +752,6 @@ struct YAMLParserTests {
 
 // MARK: - Validator Tests (Full Coverage)
 
-@MainActor
 @Suite("YAML Validator", .serialized)
 struct YAMLValidatorTests {
 
@@ -979,7 +966,6 @@ struct YAMLValidatorTests {
 
 // MARK: - Compact Validator Tests
 
-@MainActor
 @Suite("Compact Workflow Validator")
 struct CompactWorkflowValidatorTests {
 
@@ -1048,7 +1034,6 @@ struct CompactWorkflowValidatorTests {
 
 // MARK: - Hasher Tests
 
-@MainActor
 @Suite("Definition Hasher")
 struct DefinitionHasherTests {
     @Test func deterministic() throws {

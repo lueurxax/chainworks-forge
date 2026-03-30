@@ -12,7 +12,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 
 - [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, lineage settlement, startup repair, aggregate truth, and recovery/report read precedence
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, stage-owned recovery evidence, approval restore, runtime binding truth, and report/recovery read precedence
 
 ## Live Execution
 
@@ -20,6 +20,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 - [goose-server-transport.md](goose-server-transport.md) — GooseServerTransport adapter: goosed API contract, SSE event mapping, session lifecycle, executor pipeline, proven real Goose connection
 - [operator-experience.md](operator-experience.md) — Stable operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
 - [provider-platform.md](provider-platform.md) — Stable provider/settings baseline: registry, adapters, settings, preflight, receipts, first-run and pilot surfaces
+- [design-system-and-brand-application.md](design-system-and-brand-application.md) — Stable Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — Stable UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, cancellation settlement, operator-visible cancelling/cancelled truth
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
@@ -44,6 +45,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 ## Evidence
 
 - [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md) — consolidated implementation/proof story for the execution-truth and recovery slice
+- [../evidence/design-system-and-brand-application-proof.md](../evidence/design-system-and-brand-application-proof.md) — consolidated implementation/proof story for the design-system and brand-application slice
 
 ## Risk Analysis
 

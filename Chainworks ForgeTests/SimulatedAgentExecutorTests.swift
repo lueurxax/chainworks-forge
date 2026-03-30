@@ -2,13 +2,11 @@ import Testing
 import Foundation
 @testable import Chainworks_Forge
 
-@MainActor
 @Suite("SimulatedAgentExecutor")
 struct SimulatedAgentExecutorTests {
 
     // MARK: - Helpers
 
-    @MainActor
     private func makeAgent(
         id: String = "test_agent",
         outputs: [String] = ["test_output"],
@@ -24,7 +22,6 @@ struct SimulatedAgentExecutorTests {
         )
     }
 
-    @MainActor
     private func makeContext(stageID: String = "stage_1") -> ExecutionContext {
         ExecutionContext(
             workspace: RunWorkspace(
@@ -43,7 +40,6 @@ struct SimulatedAgentExecutorTests {
         )
     }
 
-    @MainActor
     private func makeTask(agent: String = "test_agent", task: String = "do_work") -> AgentTask {
         AgentTask(agent: agent, task: task, inputs: nil, outputs: nil)
     }
@@ -120,8 +116,7 @@ struct SimulatedAgentExecutorTests {
     }
 
     @Test("Explicit output contract only applies to matching output")
-    @MainActor
-    func explicitOutputContractOnlyAppliesToMatchingOutput() async {
+    func explicitOutputContractOnlyAppliesToMatchingOutput() {
         let agent = makeAgent(
             id: "code_writer",
             outputs: ["implementation_progress", "implementation_self_assessment"],
@@ -144,8 +139,7 @@ struct SimulatedAgentExecutorTests {
     }
 
     @Test("Known aliased outputs still resolve structured contracts")
-    @MainActor
-    func knownAliasedOutputsStillResolveStructuredContracts() async {
+    func knownAliasedOutputsStillResolveStructuredContracts() {
         let agent = makeAgent(
             id: "prepush_code_reviewer",
             outputs: ["prepush_review_report"],
@@ -196,10 +190,9 @@ struct SimulatedAgentExecutorTests {
             context: makeContext(stageID: "stage_2")
         )
 
-        let executedTasks = executor.executedTasks
-        #expect(executedTasks.count == 2)
-        #expect(executedTasks[0].task == "task_1")
-        #expect(executedTasks[1].stageID == "stage_2")
+        #expect(executor.executedTasks.count == 2)
+        #expect(executor.executedTasks[0].task == "task_1")
+        #expect(executor.executedTasks[1].stageID == "stage_2")
     }
 
     @Test("Reset")
@@ -210,17 +203,14 @@ struct SimulatedAgentExecutorTests {
         _ = try await executor.execute(task: makeTask(), agent: agent, context: makeContext())
 
         executor.reset()
-        let executedTasks = executor.executedTasks
-        let failingAgentIDs = executor.failingAgentIDs
-        #expect(executedTasks.isEmpty)
-        #expect(failingAgentIDs.isEmpty)
+        #expect(executor.executedTasks.isEmpty)
+        #expect(executor.failingAgentIDs.isEmpty)
     }
 
     // MARK: - OutputContractTemplates Coverage
 
     @Test("All contract templates produce valid JSON")
-    @MainActor
-    func allContractTemplatesProduceValidJSON() async throws {
+    func allContractTemplatesProduceValidJSON() throws {
         let contractIDs = [
             "proposal_review_v1",
             "proposal_review_summary_v1",
@@ -248,8 +238,7 @@ struct SimulatedAgentExecutorTests {
     }
 
     @Test("Unknown contract produces markdown")
-    @MainActor
-    func unknownContractProducesMarkdown() async {
+    func unknownContractProducesMarkdown() {
         let (data, format) = OutputContractTemplates.generate(
             contractID: "unknown_contract",
             agentID: "test",

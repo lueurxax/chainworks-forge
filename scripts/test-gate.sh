@@ -37,16 +37,6 @@ PROPOSAL_006_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testPilotReadinessRefreshSurface"
 )
 
-PROPOSAL_006_UNIT_TESTS=(
-  "Chainworks ForgeTests/ProviderPlatformTests"
-)
-
-PROPOSAL_006_UI_TESTS=(
-  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsWizardFlowSurface"
-  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsExportSurface"
-  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testPilotReadinessRefreshSurface"
-)
-
 PROPOSAL_012_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testGooseAssistantSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testWorkflowMapSurfaceShowsAfterRunStart"
@@ -69,19 +59,6 @@ PROPOSAL_014_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testReleaseGateSurfaceShowsDecisionContextActions"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
-)
-
-PROPOSAL_016_TESTS=(
-  "Chainworks ForgeTests/ActiveExecutionUniquenessGuardTests"
-  "Chainworks ForgeTests/Proposal016Tests"
-  "Chainworks ForgeTests/RuntimeBindingTruthSummaryTests"
-  "Chainworks ForgeTests/LegacyExecutionTruthBackfillTests"
-  "Chainworks ForgeTests/HistoricalRunReplayTests"
-  "Chainworks ForgeTests/Proposal013Tests"
-  "Chainworks ForgeTests/OrchestratorTests"
-  "Chainworks ForgeTests/RunCancellationCoordinatorTests"
-  "Chainworks ForgeTests/ResumeManagerTests"
-  "Chainworks ForgeTests/RecoveryCoordinatorTests"
 )
 
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
@@ -411,10 +388,12 @@ run_targeted_tests() {
 
   local cmd=(
     xcodebuild
+    test
     -project "$PROJECT_PATH"
     -scheme "$SCHEME_NAME"
     -destination "$DESTINATION"
     -derivedDataPath "$derived_data"
+    -resultBundlePath "$result_bundle"
   )
 
   local includes_ui=0
@@ -428,85 +407,13 @@ run_targeted_tests() {
   done
 
   if [[ $includes_ui -eq 0 ]]; then
-    cmd+=(test)
-    cmd+=(-resultBundlePath "$result_bundle")
     cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
     cmd+=("-skip-testing:Chainworks ForgeUITests")
-    log "Test gate: $gate_name"
-    "${cmd[@]}"
-    log "Result bundle: $result_bundle"
-    return
   fi
 
-  cmd+=(test)
-  cmd+=(-resultBundlePath "$result_bundle")
-  log "UI test gate: $gate_name"
+  log "Test gate: $gate_name"
   "${cmd[@]}"
   log "Result bundle: $result_bundle"
-}
-
-run_proposal_016_app_proof() {
-  local stamp derived_data app_bundle app_binary result_json app_log
-  stamp="$(make_stamp)"
-  derived_data="$TMP_BASE/proposal-016-app-${stamp}-DerivedData"
-  result_json="$TMP_BASE/proposal-016-app-${stamp}-result.json"
-  app_log="$TMP_BASE/proposal-016-app-${stamp}.log"
-  mkdir -p "$TMP_BASE"
-
-  log "Build gate: proposal-016 app proof"
-  xcodebuild \
-    -project "$PROJECT_PATH" \
-    -scheme "$SCHEME_NAME" \
-    -destination "$DESTINATION" \
-    -derivedDataPath "$derived_data" \
-    "${UNSIGNED_BUILD_ARGS[@]}" \
-    build >/dev/null
-
-  app_bundle="$derived_data/Build/Products/Debug/Chainworks Forge.app"
-  app_binary="$app_bundle/Contents/MacOS/Chainworks Forge"
-  [[ -x "$app_binary" ]] || die "proposal-016 app proof binary missing: $app_binary"
-
-  log "App-launched proof: proposal-016"
-  (
-    cd "$ROOT_DIR"
-    CHAINWORKS_P016_PROOF_AUTORUN=1 \
-    CHAINWORKS_IN_MEMORY_STORE=1 \
-    CHAINWORKS_P016_RESULT_PATH="$result_json" \
-    "$app_binary"
-  ) >"$app_log" 2>&1 &
-  local app_pid=$!
-
-  local waited=0
-  while [[ $waited -lt 90 ]]; do
-    if [[ -f "$result_json" ]]; then
-      break
-    fi
-    if ! kill -0 "$app_pid" 2>/dev/null; then
-      break
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-
-  wait "$app_pid" || true
-
-  [[ -f "$result_json" ]] || {
-    cat "$app_log" >&2 || true
-    die "proposal-016 app proof did not produce result json"
-  }
-
-  python3 - "$result_json" <<'PY'
-import json, sys
-path = sys.argv[1]
-with open(path, 'r', encoding='utf-8') as f:
-    data = json.load(f)
-if not data.get("passed"):
-    raise SystemExit(f"proposal-016 app proof failed: {data.get('proofStatus', 'unknown')}")
-print(f"==> Proposal 016 proof result: {data.get('proofStatus', 'unknown')}")
-if data.get("reportPath"):
-    print(f"==> Proposal 016 report artifact: {data['reportPath']}")
-PY
-  log "Proof result: $result_json"
 }
 
 run_full_suite() {
@@ -538,9 +445,7 @@ Available gates:
   fast            Guardrails + build + high-ROI unit/runtime tests
   ui-smoke        Focused operator-shell UI smoke tests
   proposal-006    Proposal 006 settings/provider/readiness gate
-  proposal-016    Proposal 016 execution-truth / recovery / app-proof gate
   proposal-014    Proposal 014 design-system and brand adoption gate
-  proposal-016    Proposal 016 execution-truth / recovery / app-proof gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -618,8 +523,11 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     guard_direct_run_insertion
-    log "proposal-006 focuses provider/setup UI proof; provider-platform unit truth remains in fast"
-    run_targeted_tests "proposal-006" "${PROPOSAL_006_UI_TESTS[@]}"
+    if [[ "${USE_TEST_PLANS:-}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/ProviderGate.xctestplan" ]]; then
+      run_test_plan "proposal-006" "ProviderGate"
+    else
+      run_targeted_tests "proposal-006" "${PROPOSAL_006_TESTS[@]}"
+    fi
     ;;
   proposal-012|p012)
     check_idle_environment strict
@@ -642,19 +550,6 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     run_targeted_tests "proposal-014" "${PROPOSAL_014_TESTS[@]}"
-    ;;
-  proposal-016|p016)
-    check_idle_environment strict
-    require_remote_ui_host
-    prepare_codesign_keychain
-    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
-      log "Latest crash log before run: $BEFORE_CRASH_LOG"
-    else
-      log "No prior Chainworks Forge crash logs found"
-    fi
-    guard_direct_run_insertion
-    run_targeted_tests "proposal-016" "${PROPOSAL_016_TESTS[@]}"
-    run_proposal_016_app_proof
     ;;
   full)
     check_idle_environment strict

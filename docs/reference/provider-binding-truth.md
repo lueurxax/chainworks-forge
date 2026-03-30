@@ -28,7 +28,6 @@ Related stable docs:
 - [provider-platform.md](provider-platform.md)
 - [operator-experience.md](operator-experience.md)
 - [runtime-contract.md](runtime-contract.md)
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md)
 
 ## Frozen binding rule
 
@@ -88,8 +87,6 @@ This applies to:
 - run comparison,
 - immutable run reports,
 - latest run summary.
-
-Current report and recovery surfaces should show frozen and runtime truth side-by-side, with explicit downgrade to `unverifiable` when runtime evidence is missing or contradictory.
 
 ## Historical truth after drift
 

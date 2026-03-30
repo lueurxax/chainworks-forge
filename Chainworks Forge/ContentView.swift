@@ -8,7 +8,6 @@ extension Notification.Name {
 
 struct ContentView: View {
     @Environment(ExecutionService.self) private var executionService
-    @Query(sort: \Run.startedAt, order: .reverse) private var allRuns: [Run]
     @State private var selectedTab: Tab = .ideas
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
@@ -34,7 +33,6 @@ struct ContentView: View {
         case deliveryPreflightReport = "delivery_preflight_report"
         case completedExportHub = "completed_export_hub"
         case accessibilityAudit = "accessibility_audit"
-        case proposal016Proof = "proposal_016_proof"
     }
 
     init() {
@@ -80,8 +78,6 @@ struct ContentView: View {
 
     private var tabShell: some View {
         VStack(spacing: 0) {
-            ShellBrandHeaderView()
-
             TabView(selection: $selectedTab) {
                 // P005-OPS §5: Primary operator landing surface
                 RunsHomeView()
@@ -128,6 +124,16 @@ struct ContentView: View {
                     .tag(Tab.providerSettings)
                     .accessibilityIdentifier("tab-provider-settings")
             }
+            // P005-OPS §10: Foreground banner as bottom overlay — avoids conflicting with macOS tab bar
+            .overlay(alignment: .bottom) {
+                ForegroundBannerView(
+                    waitingApprovalCount: executionService.pendingApprovalCount,
+                    blockedCount: executionService.blockedRunCount,
+                    failedCount: executionService.failedRunCount,
+                    onTap: { selectedTab = .runsHome }
+                )
+                .padding(.bottom, 8)
+            }
             .task(id: forcedInitialTab?.rawValue ?? "default") {
                 guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
                 // UI tests need a deterministic landing tab even when macOS restores prior scene state.
@@ -145,18 +151,6 @@ struct ContentView: View {
             }
             // Approval badge on Ideas tab when approvals are pending
             .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
-
-            // P005-OPS §10: render the banner as a sibling below the shell content so it
-            // remains discoverable on macOS even when TabView accessibility is volatile.
-            if allRuns.contains(where: { $0.status == .waitingApproval || $0.status == .blocked || $0.status == .failed }) {
-                ForegroundBannerView(
-                    waitingApprovalCount: allRuns.filter { $0.status == .waitingApproval }.count,
-                    blockedCount: allRuns.filter { $0.status == .blocked }.count,
-                    failedCount: allRuns.filter { $0.status == .failed }.count,
-                    onTap: { selectedTab = .runsHome }
-                )
-                .padding(.vertical, 8)
-            }
         }
     }
 
@@ -183,47 +177,7 @@ struct ContentView: View {
             UITestCompletedExportHubSurface()
         case .accessibilityAudit:
             UITestAccessibilityAuditSurface()
-        case .proposal016Proof:
-            UITestProposal016ProofSurface()
         }
-    }
-
-}
-
-private struct ShellBrandHeaderView: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
-            HStack(alignment: .firstTextBaseline, spacing: DesignTokens.Spacing.small) {
-                ForgeIconBridge.brandHorizontalLogo()
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 150, height: 28)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Chainworks Forge")
-                        .font(DesignTokens.Typography.cardTitle)
-                        .accessibilityIdentifier("shell-brand-title")
-                    Text("Bounded adopter shell")
-                        .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("shell-brand-subtitle")
-                }
-                Spacer(minLength: 0)
-                StatusCapsule(
-                    text: "Design system",
-                    color: DesignTokens.Action.primary,
-                    icon: "paintbrush.fill",
-                    size: .small,
-                    accessibilityIdentifier: "shell-brand-pill"
-                )
-            }
-        }
-        .padding(.horizontal, DesignTokens.Spacing.section)
-        .padding(.vertical, DesignTokens.Spacing.small)
-        .background(DesignTokens.Action.primary.opacity(0.05))
-        .overlay(Divider(), alignment: .bottom)
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("shell-brand-header")
     }
 }
 

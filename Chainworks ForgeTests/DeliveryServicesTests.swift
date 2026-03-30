@@ -2,7 +2,6 @@ import Testing
 import Foundation
 @testable import Chainworks_Forge
 
-@MainActor
 @Suite("Delivery Services")
 struct DeliveryServicesTests {
 

@@ -1,12 +1,12 @@
 import Foundation
 
-nonisolated struct ValidationIssue: Identifiable, Sendable {
+struct ValidationIssue: Identifiable, Sendable {
     let id: UUID
     let severity: Severity
     let message: String
     let location: String?
 
-    nonisolated enum Severity: String, Codable, Sendable {
+    enum Severity: String, Codable, Sendable {
         case error
         case warning
     }
@@ -19,7 +19,7 @@ nonisolated struct ValidationIssue: Identifiable, Sendable {
     }
 }
 
-nonisolated struct YAMLValidator: Sendable {
+struct YAMLValidator: Sendable {
 
     nonisolated static func validateAll(
         workflow: WorkflowDefinition,

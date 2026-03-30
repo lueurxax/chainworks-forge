@@ -233,10 +233,28 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         // Step 4: Close the session
         await sessionExecution.closeSession()
 
-        // Step 5: Resolve runtime/provider truth
+        // Step 5: Build receipt/transcript artifacts (ARCH-032)
         let resolvedProvider = override?.provider ?? agent.provider
         let resolvedModel = override?.model ?? agent.model
         let resolvedEffort = override?.effort ?? agent.effort
+
+        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
+            agentID: agent.id,
+            sessionID: sessionExecution.sessionID,
+            stageID: context.stageID,
+            iteration: context.iteration,
+            attemptNumber: context.attemptNumber,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            events: eventBridge.eventLog,
+            toolCalls: eventBridge.toolCalls,
+            finalContent: streamResult.finalContent,
+            succeeded: streamResult.succeeded,
+            errorMessage: streamResult.succeeded ? nil : "Execution did not produce final output",
+            provider: resolvedProvider,
+            model: resolvedModel,
+            effort: resolvedEffort
+        )
 
         // Step 6: Extract declared output artifacts from workspace
         var outputs: [String: Data] = [:]
@@ -260,22 +278,6 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             }
         }
 
-        // Proposal authoring and other non-worktree write agents may write to canonical
-        // catalog paths instead of the run artifact directory. Harvest those outputs if
-        // they were updated during this execution attempt.
-        for outputName in expectedOutputs where outputs[outputName] == nil {
-            guard let canonicalPath = resolvedCatalogArtifactPath(
-                for: outputName,
-                context: context
-            ) else { continue }
-            guard wasTouchedDuringExecution(canonicalPath, startedAt: startedAt) else { continue }
-            do {
-                outputs[outputName] = try Data(contentsOf: canonicalPath)
-            } catch {
-                print("Warning: Could not read canonical output '\(outputName)' at \(canonicalPath.path): \(error.localizedDescription)")
-            }
-        }
-
         // If the final output contains content but no files were written,
         // try to use the final content as the primary output
         if outputs.isEmpty, let content = streamResult.finalContent, !content.isEmpty {
@@ -295,49 +297,23 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             fallback: "Execution did not produce final output"
         )
 
-        // Step 7: Build receipt/transcript artifacts from canonical execution truth
-        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
-            agentID: agent.id,
-            sessionID: sessionExecution.sessionID,
-            stageID: context.stageID,
-            iteration: context.iteration,
-            attemptNumber: context.attemptNumber,
-            startedAt: startedAt,
-            completedAt: completedAt,
-            events: eventBridge.eventLog,
-            toolCalls: eventBridge.toolCalls,
-            finalContent: streamResult.finalContent,
-            succeeded: canonicalOutcome == .completed,
-            errorMessage: failureMessage,
-            provider: resolvedProvider,
-            model: resolvedModel,
-            effort: resolvedEffort
-        )
-
         // Add receipt artifacts to outputs
         for (name, data) in receiptArtifacts {
             outputs[name] = data
         }
 
-        // Step 8: Validate required outputs (Section 8.3)
+        // Step 7: Validate required outputs (Section 8.3)
         let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
 
         if !missingOutputs.isEmpty {
             // Stage should fail loudly — silent success is worse than a visible crash
-            let mismatchNotes = detectAlternateOutputFilenames(
-                expectedOutputs: missingOutputs,
-                outputDirectory: outputDir
-            )
             let missingList = missingOutputs.joined(separator: ", ")
-            let mismatchSuffix = mismatchNotes.isEmpty
-                ? ""
-                : " (alternate files found: \(mismatchNotes.joined(separator: "; ")))"
             return AgentResult(
                 outputs: outputs, // Still include receipts/transcripts for debugging
-                logSnippet: "Missing required outputs: \(missingList)\(mismatchSuffix). Session: \(sessionExecution.sessionID)",
+                logSnippet: "Missing required outputs: \(missingList). Session: \(sessionExecution.sessionID)",
                 costCents: estimateCost(streamResult: streamResult),
                 succeeded: false,
-                errorMessage: "Required outputs missing: \(missingList)\(mismatchSuffix)",
+                errorMessage: "Required outputs missing: \(missingList)",
                 sessionID: sessionExecution.sessionID,
                 durationSeconds: completedAt.timeIntervalSince(startedAt),
                 providerReceipt: UsageReceiptNormalizer.makeReceipt(
@@ -415,52 +391,6 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 rawFinishEvent: streamResult.finishRaw
             )
         )
-    }
-
-    private func detectAlternateOutputFilenames(
-        expectedOutputs: [String],
-        outputDirectory: URL
-    ) -> [String] {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: outputDirectory,
-            includingPropertiesForKeys: nil
-        ) else {
-            return []
-        }
-
-        var notes: [String] = []
-        for expected in expectedOutputs {
-            let alternates = contents.compactMap { url -> String? in
-                let filename = url.lastPathComponent
-                guard filename != expected else { return nil }
-                guard url.deletingPathExtension().lastPathComponent == expected else { return nil }
-                return filename
-            }
-            if !alternates.isEmpty {
-                notes.append("\(expected) -> \(alternates.joined(separator: ", "))")
-            }
-        }
-        return notes
-    }
-
-    private func resolvedCatalogArtifactPath(
-        for outputName: String,
-        context: ExecutionContext
-    ) -> URL? {
-        guard let catalog = context.catalog,
-              let hintedPath = catalog.artifacts[outputName] else {
-            return nil
-        }
-        return PathTemplateResolver.resolvePath(hintedPath, projectRoot: context.projectRoot)
-    }
-
-    private func wasTouchedDuringExecution(_ url: URL, startedAt: Date) -> Bool {
-        guard FileManager.default.fileExists(atPath: url.path),
-              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-            return false
-        }
-        let modifiedAt = (attributes[.modificationDate] as? Date) ?? .distantPast
-        return modifiedAt >= startedAt.addingTimeInterval(-1)
     }
 
     // MARK: - Private Helpers

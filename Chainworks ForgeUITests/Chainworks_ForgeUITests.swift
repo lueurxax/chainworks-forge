@@ -1962,46 +1962,6 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "PA012_NonHappyPath")
     }
 
-    func testProposal016AppLevelProofSurface() throws {
-        let app = makeApp(directSurface: "proposal_016_proof")
-        defer { terminateIfRunning(app) }
-        launchClean(app)
-
-        XCTAssertTrue(
-            anyElement(app, identifier: "ui-test-direct-surface-ready-proposal_016_proof").waitForExistence(timeout: 20),
-            "Proposal 016 proof surface must render via its direct surface"
-        )
-
-        let runProofButton = app.buttons["p016-run-proof"].firstMatch
-        XCTAssertTrue(runProofButton.waitForExistence(timeout: 10), "Proposal 016 proof must expose Run Proof")
-        runProofButton.click()
-
-        let status = anyElement(app, identifier: "p016-proof-status")
-        XCTAssertTrue(status.waitForExistence(timeout: 10), "Proof status must render")
-
-        let deadline = Date().addingTimeInterval(20)
-        while Date() < deadline {
-            if status.label.contains("PASS") || status.label.contains("FAIL") {
-                break
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-        }
-
-        XCTAssertTrue(status.label.contains("PASS"), "Proposal 016 proof must pass (got: \(status.label))")
-        XCTAssertTrue(
-            anyElement(app, identifier: "p016-limit-reason").waitForExistence(timeout: 5),
-            "Proof surface must expose the limit-exhaustion report reason"
-        )
-        XCTAssertTrue(
-            anyElement(app, identifier: "p016-runtime-trust").waitForExistence(timeout: 5),
-            "Proof surface must expose runtime trust"
-        )
-        XCTAssertTrue(
-            anyElement(app, identifier: "p016-policy-summary").waitForExistence(timeout: 5),
-            "Proof surface must expose policy-stop recovery summary"
-        )
-    }
-
     func testProposal014ShellBrandHeaderVisible() throws {
         let app = makeApp(
             seededIdeaTitle: "P014 Shell Brand",

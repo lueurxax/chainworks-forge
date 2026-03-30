@@ -1,6 +1,6 @@
 import Foundation
 
-nonisolated struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
+struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     var family: ProviderFamily
     var displayName: String
@@ -34,8 +34,8 @@ nonisolated struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendabl
     }
 }
 
-nonisolated enum ProviderDefaults {
-    nonisolated static func defaultModel(for family: ProviderFamily) -> String {
+enum ProviderDefaults {
+    static func defaultModel(for family: ProviderFamily) -> String {
         switch family {
         case .codex:
             return "gpt-5-codex"
@@ -46,14 +46,14 @@ nonisolated enum ProviderDefaults {
         }
     }
 
-    nonisolated static func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {
+    static func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {
         if family.gooseFirstPreferred && transport == .gooseServer {
             return "\(family.displayName) Goose"
         }
         return "\(family.displayName) \(transport.displayName)"
     }
 
-    nonisolated static func model(_ model: String, isCompatibleWith family: ProviderFamily) -> Bool {
+    static func model(_ model: String, isCompatibleWith family: ProviderFamily) -> Bool {
         let lower = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lower.isEmpty else { return true }
 
@@ -76,7 +76,7 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
     case claude
     case gemini
 
-    nonisolated var runtimeProviderIdentifier: String {
+    var runtimeProviderIdentifier: String {
         switch self {
         case .codex:
             return "codex"
@@ -87,11 +87,11 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    nonisolated var displayName: String {
+    var displayName: String {
         rawValue.capitalized
     }
 
-    nonisolated var gooseFirstPreferred: Bool {
+    var gooseFirstPreferred: Bool {
         switch self {
         case .codex, .claude:
             return true
@@ -100,7 +100,7 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    nonisolated static func from(runtimeIdentifier: String) -> ProviderFamily? {
+    static func from(runtimeIdentifier: String) -> ProviderFamily? {
         switch runtimeIdentifier {
         case "codex":
             return .codex
@@ -120,7 +120,7 @@ enum ProviderTransport: String, Codable, CaseIterable, Sendable {
     case httpAPI
     case gooseServer = "goose_server"
 
-    nonisolated var displayName: String {
+    var displayName: String {
         switch self {
         case .cli:
             return "CLI"
@@ -133,7 +133,7 @@ enum ProviderTransport: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    nonisolated var isGooseBacked: Bool {
+    var isGooseBacked: Bool {
         self == .gooseServer
     }
 }
@@ -143,7 +143,7 @@ enum ProviderAuthMode: String, Codable, CaseIterable, Sendable {
     case apiKey
     case sessionToken
 
-    nonisolated var displayName: String {
+    var displayName: String {
         switch self {
         case .none:
             return "None"
@@ -170,7 +170,7 @@ struct ProviderHealthSnapshot: Codable, Equatable, Sendable {
     let blockingIssues: [String]
 }
 
-nonisolated struct ProviderCapabilities: Codable, Equatable, Sendable {
+struct ProviderCapabilities: Codable, Equatable, Sendable {
     var supportsStreaming: Bool
     var supportsTools: Bool
     var supportsStructuredOutput: Bool
@@ -179,7 +179,7 @@ nonisolated struct ProviderCapabilities: Codable, Equatable, Sendable {
     var supportsFileEditing: Bool
     var supportsSandboxHints: Bool
 
-    nonisolated static func `default`(for family: ProviderFamily) -> ProviderCapabilities {
+    static func `default`(for family: ProviderFamily) -> ProviderCapabilities {
         switch family {
         case .codex, .claude:
             return ProviderCapabilities(

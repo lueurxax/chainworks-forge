@@ -11,7 +11,6 @@ import SwiftData
 /// diff/test context (when available), and the next valid operator actions.
 struct BlockedRunRecoveryView: View {
     let run: Run
-    @Environment(ExecutionService.self) private var executionService
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @State private var recoveryPath: RecoveryPath = .undetermined
@@ -634,15 +633,6 @@ struct BlockedRunRecoveryView: View {
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
                 dismiss()
 
-            case .resumeRun(let stageID):
-                let compiler = RunPlanCompiler(modelContext: modelContext)
-                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
-                dismiss()
-
-            case .retryAggregateStep(let stageID):
-                _ = try coordinator.retryAggregateStep(run: run, stageID: stageID)
-                dismiss()
-
             case .cloneRunFrozenSnapshot:
                 guard let idea = run.idea else {
                     errorMessage = "No idea associated with this run."
@@ -734,8 +724,8 @@ struct BlockedRunRecoveryView: View {
 
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
-        case .resumeFromApprovalGate, .resumeRun: return DesignTokens.Action.approve
-        case .retryAgent, .retryStage, .retryAggregateStep: return DesignTokens.Action.caution
+        case .resumeFromApprovalGate: return DesignTokens.Action.approve
+        case .retryAgent, .retryStage: return DesignTokens.Action.caution
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
         case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }
@@ -745,14 +735,10 @@ struct BlockedRunRecoveryView: View {
         switch action {
         case .resumeFromApprovalGate(let stageID):
             return "Re-arm the approval gate at \(stageID) and continue execution."
-        case .resumeRun(let stageID):
-            return "Resume execution from stage \(stageID) using the existing run state."
         case .retryAgent(let stageID, let agentID):
             return "Retry agent \(agentID) in stage \(stageID) from its last checkpoint."
         case .retryStage(let stageID):
             return "Reset all agents in stage \(stageID) and re-execute from the beginning."
-        case .retryAggregateStep(let stageID):
-            return "Re-run the aggregate recovery step for stage \(stageID) without cloning the run."
         case .cloneRunFrozenSnapshot:
             return "Create a new run using the original frozen workflow and catalog snapshots."
         case .cloneRunCurrentConfig:

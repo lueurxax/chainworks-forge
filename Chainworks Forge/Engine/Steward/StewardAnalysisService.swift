@@ -181,8 +181,7 @@ final class StewardAnalysisService {
                 inputArtifacts: stewardInputs,
                 variables: [:],
                 ideaBody: "",
-                providerBinding: nil,
-                catalog: catalog
+                providerBinding: nil
             )
 
             do {
@@ -232,8 +231,7 @@ final class StewardAnalysisService {
                 inputArtifacts: auditorInputs,
                 variables: [:],
                 ideaBody: "",
-                providerBinding: nil,
-                catalog: catalog
+                providerBinding: nil
             )
 
             do {

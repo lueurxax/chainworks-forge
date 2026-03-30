@@ -73,6 +73,8 @@ enum GooseStreamEventMapper {
             return .textChunk(text: "")
         }
 
+        let role = messageDict["role"] as? String ?? "assistant"
+
         // Process content items and return the most significant event.
         // In practice, goosed sends one content item per Message event.
         for content in contentArray {
@@ -85,6 +87,7 @@ enum GooseStreamEventMapper {
 
             case "toolrequest":
                 let toolName = extractToolName(from: content)
+                let id = content["id"] as? String ?? "unknown"
                 let raw = serializeToJSON(content) ?? "{}"
                 return .toolCallStarted(toolName: toolName, raw: raw)
 

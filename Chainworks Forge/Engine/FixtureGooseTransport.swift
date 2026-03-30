@@ -469,7 +469,7 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         let line = "\(taskName) @ \(ISO8601DateFormatter().string(from: Date()))\n"
         if FileManager.default.fileExists(atPath: proofFile.path) {
             if let handle = try? FileHandle(forWritingTo: proofFile) {
-                _ = try? handle.seekToEnd()
+                try? handle.seekToEnd()
                 try? handle.write(contentsOf: Data(line.utf8))
                 try? handle.close()
             }

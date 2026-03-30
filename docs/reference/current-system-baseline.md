@@ -24,14 +24,16 @@ At the current baseline, the product includes:
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
 - live Goose-backed execution for real provider sessions,
+- canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
 - an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
+- an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
 - repo-backed full delivery with dedicated worktrees and manual release,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
 - Forge Steward system-health analysis,
-- a documented design system direction for brand and UI rollout.
+- a stable design-kit authority for future visual changes.
 
 ## Canonical subsystem map
 
@@ -43,7 +45,7 @@ Use these reference docs as the current source of truth:
 | YAML and catalog parsing | [yaml-dsl-parser.md](yaml-dsl-parser.md) |
 | Execution engine | [workflow-execution-engine.md](workflow-execution-engine.md) |
 | Frozen runtime and resume truth | [runtime-contract.md](runtime-contract.md) |
-| Execution truth, settlement, and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
+| Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Goose server transport | [goose-server-transport.md](goose-server-transport.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
@@ -58,6 +60,7 @@ Use these reference docs as the current source of truth:
 | MVP sign-off | [mvp-sign-off.md](mvp-sign-off.md) |
 | Steward | [forge-steward.md](forge-steward.md) |
 | Test strategy and gates | [test-suite-architecture.md](test-suite-architecture.md), [test-gates.md](test-gates.md), [agent-ui-test-execution.md](agent-ui-test-execution.md) |
+| Design-system adoption | [design-system-and-brand-application.md](design-system-and-brand-application.md) |
 | UI/brand design authority | [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) |
 
 ## Canonical product boundaries
@@ -163,4 +166,3 @@ For current proof status rather than system-contract truth, use:
 - [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md)
 - [../evidence/mvp-sign-off-proof.md](../evidence/mvp-sign-off-proof.md)
 - [../evidence/goose-server-transport-verification.md](../evidence/goose-server-transport-verification.md)
-- [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md)

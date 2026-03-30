@@ -62,13 +62,11 @@ struct EdgeCase: Sendable {
     let expected: Bool
 }
 
-@MainActor
 @Suite("TransitionEvaluator")
 struct TransitionEvaluatorTests {
 
     // MARK: - Helpers
 
-    @MainActor
     private func makeContext(
         artifacts: Set<String> = [],
         approvalGranted: Bool = false,
@@ -86,11 +84,9 @@ struct TransitionEvaluatorTests {
     // MARK: - always
 
     @Test("always returns true")
-    @MainActor
-    func alwaysReturnsTrue() async {
+    func alwaysReturnsTrue() {
         let ctx = makeContext()
-        let result = TransitionEvaluator.evaluate(.always, context: ctx)
-        #expect(result)
+        #expect(TransitionEvaluator.evaluate(.always, context: ctx))
     }
 
     // MARK: - artifactExists (parameterized)
@@ -99,8 +95,7 @@ struct TransitionEvaluatorTests {
         ArtifactExistsCase(label: "present", artifacts: ["idea_brief", "proposal_current"], queryArtifact: "idea_brief", expected: true),
         ArtifactExistsCase(label: "missing", artifacts: ["proposal_current"], queryArtifact: "idea_brief", expected: false)
     ])
-    @MainActor
-    func artifactExists(testCase: ArtifactExistsCase) async {
+    func artifactExists(testCase: ArtifactExistsCase) {
         let ctx = makeContext(artifacts: testCase.artifacts)
         let result = TransitionEvaluator.evaluate(.artifactExists(testCase.queryArtifact), context: ctx)
         #expect(result == testCase.expected)
@@ -109,8 +104,7 @@ struct TransitionEvaluatorTests {
     // MARK: - approvalGranted (parameterized)
 
     @Test("approval granted", arguments: [true, false])
-    @MainActor
-    func approvalGranted(granted: Bool) async {
+    func approvalGranted(granted: Bool) {
         let ctx = makeContext(approvalGranted: granted)
         let result = TransitionEvaluator.evaluate(.approvalGranted, context: ctx)
         #expect(result == granted)
@@ -123,8 +117,7 @@ struct TransitionEvaluatorTests {
         ExpressionLiteralCase(label: "quoted true", expression: "'true'", expected: true),
         ExpressionLiteralCase(label: "false string", expression: "false", expected: false)
     ])
-    @MainActor
-    func expressionLiterals(testCase: ExpressionLiteralCase) async {
+    func expressionLiterals(testCase: ExpressionLiteralCase) {
         let ctx = makeContext()
         let result = TransitionEvaluator.evaluate(.expression(testCase.expression), context: ctx)
         #expect(result == testCase.expected)
@@ -136,8 +129,7 @@ struct TransitionEvaluatorTests {
         ExpressionExistsCase(label: "present", artifacts: ["proposal_current"], expression: "exists('proposal_current')", expected: true),
         ExpressionExistsCase(label: "missing", artifacts: [], expression: "exists('proposal_current')", expected: false)
     ])
-    @MainActor
-    func expressionExists(testCase: ExpressionExistsCase) async {
+    func expressionExists(testCase: ExpressionExistsCase) {
         let ctx = makeContext(artifacts: testCase.artifacts)
         let result = TransitionEvaluator.evaluate(.expression(testCase.expression), context: ctx)
         #expect(result == testCase.expected)
@@ -149,8 +141,7 @@ struct TransitionEvaluatorTests {
         (true, true),
         (false, false)
     ])
-    @MainActor
-    func expressionApprovalGranted(granted: Bool, expected: Bool) async {
+    func expressionApprovalGranted(granted: Bool, expected: Bool) {
         let ctx = makeContext(approvalGranted: granted)
         let result = TransitionEvaluator.evaluate(.expression("approval.granted == true"), context: ctx)
         #expect(result == expected)
@@ -164,8 +155,7 @@ struct TransitionEvaluatorTests {
         VarsComparisonCase(label: "greater or equal", variableKey: "revision_count", variableValue: .int(3), expression: "vars.revision_count >= 3", expected: true),
         VarsComparisonCase(label: "less than fails", variableKey: "revision_count", variableValue: .int(2), expression: "vars.revision_count > 3", expected: false)
     ])
-    @MainActor
-    func varsComparison(testCase: VarsComparisonCase) async {
+    func varsComparison(testCase: VarsComparisonCase) {
         let ctx = makeContext(variables: [testCase.variableKey: testCase.variableValue])
         let result = TransitionEvaluator.evaluate(.expression(testCase.expression), context: ctx)
         #expect(result == testCase.expected)
@@ -179,8 +169,7 @@ struct TransitionEvaluatorTests {
         ArtifactFieldCase(label: "double score <= target", artifactName: "proposal_review_summary", fieldName: "aggregate_score", fieldValue: .double(9.0), expression: "proposal_review_summary.aggregate_score <= 9.1", expected: true),
         ArtifactFieldCase(label: "string status != implemented", artifactName: "audit_report", fieldName: "status", fieldValue: .string("Needs Work"), expression: "audit_report.status != 'Implemented'", expected: true)
     ])
-    @MainActor
-    func artifactFieldComparison(testCase: ArtifactFieldCase) async {
+    func artifactFieldComparison(testCase: ArtifactFieldCase) {
         let ctx = makeContext(
             artifactFields: [testCase.artifactName: [testCase.fieldName: testCase.fieldValue]]
         )
@@ -196,8 +185,7 @@ struct TransitionEvaluatorTests {
         LogicalExpressionCase(label: "or one true", artifacts: ["proposal_current"], variables: ["count": .int(1)], expression: "exists('proposal_current') or vars.count > 3", expected: true),
         LogicalExpressionCase(label: "or both false", artifacts: [], variables: ["count": .int(1)], expression: "exists('proposal_current') or vars.count > 3", expected: false)
     ])
-    @MainActor
-    func logicalExpressions(testCase: LogicalExpressionCase) async {
+    func logicalExpressions(testCase: LogicalExpressionCase) {
         let ctx = makeContext(
             artifacts: testCase.artifacts,
             variables: testCase.variables
@@ -209,8 +197,7 @@ struct TransitionEvaluatorTests {
     // MARK: - evaluateFirst
 
     @Test("evaluateFirst picks correct transition")
-    @MainActor
-    func evaluateFirstPicksCorrectTransition() async {
+    func evaluateFirstPicksCorrectTransition() {
         let transitions = [
             ExecutableTransition(to: "state_a", condition: .artifactExists("missing")),
             ExecutableTransition(to: "state_b", condition: .artifactExists("idea_brief")),
@@ -218,13 +205,11 @@ struct TransitionEvaluatorTests {
         ]
         let ctx = makeContext(artifacts: ["idea_brief"])
         let result = TransitionEvaluator.evaluateFirst(transitions: transitions, context: ctx)
-        let destination = result?.to
-        #expect(destination == "state_b")
+        #expect(result?.to == "state_b")
     }
 
     @Test("evaluateFirst returns nil when none match")
-    @MainActor
-    func evaluateFirstReturnsNilWhenNoneMatch() async {
+    func evaluateFirstReturnsNilWhenNoneMatch() {
         let transitions = [
             ExecutableTransition(to: "state_a", condition: .artifactExists("missing")),
         ]
@@ -240,8 +225,7 @@ struct TransitionEvaluatorTests {
         EdgeCase(label: "missing var returns false", variables: [:], expression: "vars.missing_var == 42", expected: false),
         EdgeCase(label: "int compared to double", variables: ["val": .double(3.0)], expression: "vars.val == 3", expected: true)
     ])
-    @MainActor
-    func edgeCases(testCase: EdgeCase) async {
+    func edgeCases(testCase: EdgeCase) {
         let ctx = makeContext(variables: testCase.variables)
         let result = TransitionEvaluator.evaluate(.expression(testCase.expression), context: ctx)
         #expect(result == testCase.expected)

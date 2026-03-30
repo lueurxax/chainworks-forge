@@ -56,6 +56,32 @@ enum LiveRuntimeReadiness: Sendable {
     case unavailable(reason: String, recovery: String)
 }
 
+private struct ApprovalResolutionDiagnostic: Codable, Sendable {
+    struct ApprovalSnapshot: Codable, Sendable {
+        let approvalID: UUID
+        let stageID: String
+        let decision: String
+        let requestedAt: Date
+        let decidedAt: Date?
+        let comment: String?
+    }
+
+    let runID: UUID
+    let workflowID: String
+    let approvalRequestID: UUID
+    let stageID: String
+    let granted: Bool
+    let recordedAt: Date
+    let runStatusBefore: String
+    let runStatusAfter: String
+    let currentStageBefore: String?
+    let currentStageAfter: String?
+    let stageStatusBefore: String?
+    let stageStatusAfter: String?
+    let approvalBefore: ApprovalSnapshot?
+    let approvalAfter: ApprovalSnapshot?
+}
+
 // MARK: - ExecutionService (app-scoped @Observable singleton — ARCH-022)
 
 /// App-scoped service managing all active workflow orchestrators.
@@ -80,6 +106,10 @@ final class ExecutionService {
 
     /// Optional fixture or externally injected live runtime configuration.
     private let fixedLiveRuntimeConfiguration: LiveRuntimeConfiguration?
+
+    /// UI-test-only override used to force the unavailable recovery lane while
+    /// keeping the live entrypoint visible for owner-path proofs.
+    private let forceUITestLiveRuntimeUnavailable: Bool
 
     /// Optional managed Goose server bridge.
     let gooseServerManager: GooseServerManager?
@@ -113,6 +143,8 @@ final class ExecutionService {
         self.catalog = catalog
         self.stewardConfig = stewardConfig
         self.fixedLiveRuntimeConfiguration = liveRuntimeConfiguration
+        self.forceUITestLiveRuntimeUnavailable =
+            ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] == "1"
         self.gooseServerManager = gooseServerManager
         self.notificationService = notificationService ?? MainActor.assumeIsolated {
             NotificationService()
@@ -131,30 +163,63 @@ final class ExecutionService {
         plan: RunPlan,
         workspace: RunWorkspace
     ) {
-        attachOrchestrator(
-            run: run,
-            plan: plan,
-            workspace: workspace,
-            resumeStateID: nil
-        )
-    }
-
-    /// Manually re-attach and resume an existing run after an explicit operator recovery action.
-    /// Used for retry/stage resume paths where RecoveryCoordinator has already updated persisted truth
-    /// but no active orchestrator is currently attached to launch the new pending work.
-    func resumeRun(run: Run, compiler: RunPlanCompiler, stageID: String? = nil) throws {
         guard activeOrchestrators[run.id] == nil else { return }
-        let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: run)
-        let resumeStateID = stageID ?? run.currentStageID
-        RuntimeDiagnostics.log(
-            "executionService.resumeRun runID=\(run.id.uuidString) explicitStageID=\(stageID ?? "nil") derivedCurrentStageID=\(run.currentStageID ?? "nil") resumeStateID=\(resumeStateID ?? "nil") status=\(run.status.rawValue)"
-        )
-        attachOrchestrator(
+        guard !requiresLiveRuntimeConfiguration(for: plan) else {
+            run.status = .blocked
+            run.driftDetails = "Live runtime is not configured for workflow \(plan.workflowID)"
+            return
+        }
+        let resolvedExecutor = executorForRun(plan: plan)
+
+        let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
             workspace: workspace,
-            resumeStateID: resumeStateID
+            executor: resolvedExecutor,
+            modelContext: modelContext,
+            catalog: catalog
         )
+
+        // Wire up approval callback
+        orchestrator.onApprovalRequest = { [weak self] request in
+            self?.pendingApprovals[request.id] = request
+            // P005-OPS §10: Fire approval-required notification and update dock badge
+            let stageLabel = run.stageExecutions.first(where: { $0.stageID == request.stageID })?.label ?? request.stageID
+            self?.notificationService.notifyApprovalRequired(run: run, stageLabel: stageLabel)
+            self?.refreshDockBadge()
+        }
+
+        // Wire up completion callback
+        orchestrator.onComplete = { [weak self] _ in
+            self?.activeOrchestrators.removeValue(forKey: run.id)
+            // Clean up any pending approvals for this run
+            self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
+            self?.synchronizeIdeaStatus(for: run)
+            try? self?.modelContext.save()
+
+            // P005-OPS §6: Emit report on stable checkpoint
+            self?.emitReportIfNeeded(for: run)
+
+            // Proposal 008 (REQ-006): Record app-driven benchmark execution if run is linked to a cohort.
+            if let modelContext = self?.modelContext {
+                self?.recordBenchmarkExecutionIfNeeded(run: run, modelContext: modelContext)
+            }
+
+            // P005-OPS §10: Fire notifications
+            self?.fireCompletionNotification(for: run)
+
+            // Steward V1: post-run hook trigger
+            if run.status == .completed {
+                self?.notifyRunCompleted()
+            }
+        }
+
+        activeOrchestrators[run.id] = orchestrator
+        synchronizeIdeaStatus(for: run)
+
+        Task { @MainActor in
+            await orchestrator.start()
+        }
     }
 
     // MARK: - Resume Interrupted Runs
@@ -169,13 +234,50 @@ final class ExecutionService {
             for action in actions {
                 switch action {
                 case .resume(let run, let plan, let workspace):
-                    guard activeOrchestrators[run.id] == nil else { continue }
-                    attachOrchestrator(
+                    guard !requiresLiveRuntimeConfiguration(for: plan) else {
+                        run.status = .blocked
+                        run.driftDetails = "Live runtime is not configured for workflow \(plan.workflowID)"
+                        continue
+                    }
+                    let resolvedExecutor = executorForRun(plan: plan)
+                    let orchestrator = WorkflowOrchestrator(
                         run: run,
                         plan: plan,
                         workspace: workspace,
-                        resumeStateID: run.currentStageID
+                        executor: resolvedExecutor,
+                        modelContext: modelContext,
+                        catalog: catalog
                     )
+
+                    orchestrator.onApprovalRequest = { [weak self] request in
+                        self?.pendingApprovals[request.id] = request
+                        // P005-OPS §10: Fire approval notification + badge on resume path too
+                        let stageLabel = run.stageExecutions.first(where: { $0.stageID == request.stageID })?.label ?? request.stageID
+                        self?.notificationService.notifyApprovalRequired(run: run, stageLabel: stageLabel)
+                        self?.refreshDockBadge()
+                    }
+
+                    orchestrator.onComplete = { [weak self] _ in
+                        self?.activeOrchestrators.removeValue(forKey: run.id)
+                        self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
+                        self?.synchronizeIdeaStatus(for: run)
+                        try? self?.modelContext.save()
+                        self?.emitReportIfNeeded(for: run)
+
+                        // Proposal 008 (REQ-006): Record app-driven benchmark execution on resume path.
+                        if let modelContext = self?.modelContext {
+                            self?.recordBenchmarkExecutionIfNeeded(run: run, modelContext: modelContext)
+                        }
+
+                        self?.fireCompletionNotification(for: run)
+                    }
+
+                    activeOrchestrators[run.id] = orchestrator
+
+                    let resumeStateID = run.currentStageID
+                    Task { @MainActor in
+                        await orchestrator.start(from: resumeStateID)
+                    }
 
                 case .needsDecision(let run, let reason):
                     // Mark as blocked, needs user intervention
@@ -202,19 +304,53 @@ final class ExecutionService {
     /// Resolve a pending approval.
     func resolveApproval(approvalID: UUID, granted: Bool, comment: String? = nil) {
         guard let request = pendingApprovals[approvalID] else { return }
+        let descriptor = FetchDescriptor<Run>()
+        guard let run = (try? modelContext.fetch(descriptor))?.first(where: { $0.id == request.runID }) else { return }
+
+        let priorApproval = run.approvals.first(where: { $0.id == approvalID || $0.stageID == request.stageID })
+        let beforeDiagnostic = ApprovalResolutionDiagnostic(
+            runID: run.id,
+            workflowID: run.workflowID,
+            approvalRequestID: approvalID,
+            stageID: request.stageID,
+            granted: granted,
+            recordedAt: Date(),
+            runStatusBefore: run.status.rawValue,
+            runStatusAfter: run.status.rawValue,
+            currentStageBefore: run.currentStageID,
+            currentStageAfter: run.currentStageID,
+            stageStatusBefore: run.stageExecutions.first(where: { $0.stageID == request.stageID })?.status.rawValue,
+            stageStatusAfter: run.stageExecutions.first(where: { $0.stageID == request.stageID })?.status.rawValue,
+            approvalBefore: priorApproval.map(Self.makeApprovalSnapshot),
+            approvalAfter: priorApproval.map(Self.makeApprovalSnapshot)
+        )
 
         // Remove from pending
         pendingApprovals.removeValue(forKey: approvalID)
 
         // Find the orchestrator and forward the resolution
         if let orchestrator = activeOrchestrators[request.runID] {
-            orchestrator.resolveApproval(
-                approvalID: request.id,
+            orchestrator.resolveApproval(stageID: request.stageID, granted: granted, comment: comment)
+            let updatedApproval = run.approvals.first(where: { $0.id == approvalID || $0.stageID == request.stageID })
+            let diagnostic = ApprovalResolutionDiagnostic(
+                runID: run.id,
+                workflowID: run.workflowID,
+                approvalRequestID: approvalID,
                 stageID: request.stageID,
-                lineageID: request.lineageID,
                 granted: granted,
-                comment: comment
+                recordedAt: Date(),
+                runStatusBefore: beforeDiagnostic.runStatusBefore,
+                runStatusAfter: run.status.rawValue,
+                currentStageBefore: beforeDiagnostic.currentStageBefore,
+                currentStageAfter: run.currentStageID,
+                stageStatusBefore: beforeDiagnostic.stageStatusBefore,
+                stageStatusAfter: run.stageExecutions.first(where: { $0.stageID == request.stageID })?.status.rawValue,
+                approvalBefore: beforeDiagnostic.approvalBefore,
+                approvalAfter: updatedApproval.map(Self.makeApprovalSnapshot)
             )
+            try? persistApprovalResolutionDiagnostic(diagnostic, for: run)
+            try? modelContext.save()
+            refreshDockBadge()
         }
     }
 
@@ -293,7 +429,7 @@ final class ExecutionService {
     }
 
     var supportsLiveExecution: Bool {
-        liveRuntimeConfiguration != nil
+        forceUITestLiveRuntimeUnavailable || liveRuntimeConfiguration != nil
     }
 
     private func synchronizeIdeaStatus(for run: Run) {
@@ -302,75 +438,14 @@ final class ExecutionService {
         try? modelContext.save()
     }
 
-    private func attachOrchestrator(
-        run: Run,
-        plan: RunPlan,
-        workspace: RunWorkspace,
-        resumeStateID: String?
-    ) {
-        guard activeOrchestrators[run.id] == nil else { return }
-        RuntimeDiagnostics.log(
-            "executionService.attachOrchestrator runID=\(run.id.uuidString) workflowID=\(plan.workflowID) resumeStateID=\(resumeStateID ?? "nil") currentStageID=\(run.currentStageID ?? "nil") status=\(run.status.rawValue)"
-        )
-        guard !requiresLiveRuntimeConfiguration(for: plan) else {
-            run.status = .blocked
-            run.driftDetails = "Live runtime is not configured for workflow \(plan.workflowID)"
-            RuntimeDiagnostics.log(
-                "executionService.attachOrchestrator blockedMissingRuntime runID=\(run.id.uuidString) workflowID=\(plan.workflowID)"
-            )
-            return
-        }
-
-        let resolvedExecutor = executorForRun(plan: plan)
-        let orchestrator = WorkflowOrchestrator(
-            run: run,
-            plan: plan,
-            workspace: workspace,
-            executor: resolvedExecutor,
-            modelContext: modelContext,
-            catalog: catalog
-        )
-
-        orchestrator.onApprovalRequest = { [weak self] request in
-            self?.pendingApprovals[request.id] = request
-            let stageLabel = run.stageExecutions.first(where: { $0.stageID == request.stageID })?.label ?? request.stageID
-            self?.notificationService.notifyApprovalRequired(run: run, stageLabel: stageLabel)
-            self?.refreshDockBadge()
-        }
-
-        orchestrator.onComplete = { [weak self] _ in
-            RuntimeDiagnostics.log(
-                "executionService.orchestratorComplete runID=\(run.id.uuidString) status=\(run.status.rawValue) currentStageID=\(run.currentStageID ?? "nil")"
-            )
-            self?.activeOrchestrators.removeValue(forKey: run.id)
-            self?.pendingApprovals = self?.pendingApprovals.filter { $0.value.runID != run.id } ?? [:]
-            self?.synchronizeIdeaStatus(for: run)
-            self?.emitReportIfNeeded(for: run)
-
-            if let modelContext = self?.modelContext {
-                self?.recordBenchmarkExecutionIfNeeded(run: run, modelContext: modelContext)
-            }
-
-            self?.fireCompletionNotification(for: run)
-
-            if run.status == .completed {
-                self?.notifyRunCompleted()
-            }
-        }
-
-        activeOrchestrators[run.id] = orchestrator
-        synchronizeIdeaStatus(for: run)
-
-        Task { @MainActor in
-            if let resumeStateID {
-                await orchestrator.start(from: resumeStateID)
-            } else {
-                await orchestrator.start()
-            }
-        }
-    }
-
     var liveRuntimeReadiness: LiveRuntimeReadiness {
+        if forceUITestLiveRuntimeUnavailable {
+            return .unavailable(
+                reason: "Live runtime is unavailable for this proof lane.",
+                recovery: "Connect a Goose backend or enable the fixture backend to unlock live workflows."
+            )
+        }
+
         if let gooseServerManager, let liveRuntimeConfiguration {
             switch gooseServerManager.launchState {
             case .running, .external:
@@ -599,5 +674,64 @@ final class ExecutionService {
         let waitingApproval = allRuns.filter { $0.status == .waitingApproval }.count
         let blocked = allRuns.filter { $0.status == .blocked }.count
         notificationService.updateDockBadge(waitingApprovalCount: waitingApproval, blockedCount: blocked)
+    }
+
+    private static func makeApprovalSnapshot(_ approval: Approval) -> ApprovalResolutionDiagnostic.ApprovalSnapshot {
+        ApprovalResolutionDiagnostic.ApprovalSnapshot(
+            approvalID: approval.id,
+            stageID: approval.stageID,
+            decision: approval.decision.rawValue,
+            requestedAt: approval.requestedAt,
+            decidedAt: approval.decidedAt,
+            comment: approval.comment
+        )
+    }
+
+    private func persistApprovalResolutionDiagnostic(
+        _ diagnostic: ApprovalResolutionDiagnostic,
+        for run: Run
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(diagnostic)
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let timestamp = formatter.string(from: diagnostic.recordedAt).replacingOccurrences(of: ":", with: "")
+        let name = "approval_resolution_diagnostic_\(timestamp).json"
+
+        let stageExecutions = run.stageExecutions.filter { $0.stageID == diagnostic.stageID }
+        let latestStage = stageExecutions.sorted {
+            if $0.iteration == $1.iteration {
+                if $0.attemptNumber == $1.attemptNumber {
+                    return $0.startedAt < $1.startedAt
+                }
+                return $0.attemptNumber < $1.attemptNumber
+            }
+            return $0.iteration < $1.iteration
+        }.last
+
+        let workspace = RunWorkspace(
+            runID: run.id,
+            workspaceRoot: URL(fileURLWithPath: run.workspaceRoot, isDirectory: true),
+            artifactRoot: URL(fileURLWithPath: run.artifactRoot, isDirectory: true),
+            worktreeRoot: run.worktreeRoot.flatMap { URL(fileURLWithPath: $0, isDirectory: true) }
+        )
+
+        _ = try ArtifactManager(modelContext: modelContext).persistSystemArtifact(
+            name: name,
+            data: data,
+            contractID: "approval_resolution_diagnostic_v1",
+            format: .json,
+            workspace: workspace,
+            stageID: diagnostic.stageID,
+            iteration: latestStage?.iteration ?? 1,
+            agentID: "system_approval",
+            provider: "system",
+            model: nil,
+            effort: nil,
+            attemptNumber: latestStage?.attemptNumber ?? 1
+        )
     }
 }

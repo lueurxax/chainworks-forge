@@ -41,10 +41,7 @@ final class GooseSessionBridge: Sendable {
         let model = override?.model ?? agent.model
 
         // Proposal 007 §7.7: Validate path boundaries before write-capable execution
-        let writableRoot = Self.resolveWritableRoot(agent: agent, context: context)
-        if agent.worktreeWriteEnabled,
-           let worktreeRoot = context.workspace.worktreeRoot,
-           writableRoot?.standardizedFileURL == worktreeRoot.standardizedFileURL {
+        if agent.worktreeWriteEnabled, let worktreeRoot = context.workspace.worktreeRoot {
             try RepoSafetyGuard.validateWorktreeReady(worktreeRoot: worktreeRoot.path)
         }
 
@@ -52,13 +49,10 @@ final class GooseSessionBridge: Sendable {
         // REQ-005: Use worktree as working directory with write access for write-enabled agents.
         // For read-only repo-backed stages, prefer the frozen project root over the ephemeral
         // run workspace so proposal/review agents inspect the actual target repository.
-        let useWritableRoot = agent.worktreeWriteEnabled && writableRoot != nil
-        let useRepoWorktree = agent.worktreeWriteEnabled
-            && context.workspace.worktreeRoot != nil
-            && writableRoot?.standardizedFileURL == context.workspace.worktreeRoot?.standardizedFileURL
+        let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
         let readOnlyRoot = context.projectRoot?.path ?? context.workspace.workspaceRoot.path
-        let workingDirectory = useWritableRoot
-            ? writableRoot!.path
+        let workingDirectory = useWorktree
+            ? context.workspace.worktreeRoot!.path
             : readOnlyRoot
 
         let sessionRequest = GooseSessionRequest(
@@ -68,10 +62,10 @@ final class GooseSessionBridge: Sendable {
             provider: provider,
             executionPolicy: GooseExecutionPolicy(
                 permissionProfileID: agent.permissionProfile,
-                workspaceMode: useWritableRoot ? "read_write" : "read_only",
-                gitOperationsAllowed: useRepoWorktree,
+                workspaceMode: useWorktree ? "read_write" : "read_only",
+                gitOperationsAllowed: useWorktree,
                 releaseOperationsAllowed: false,
-                repoWritesAllowed: useRepoWorktree
+                repoWritesAllowed: useWorktree
             ),
             metadata: [
                 "run_id": context.workspace.runID.uuidString,
@@ -116,29 +110,16 @@ final class GooseSessionBridge: Sendable {
     ) -> ExecutionPacket {
         // Proposal 013: V2 resolver — catalog-driven contract resolution
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
-        let outputSchemas = expectedOutputs.compactMap { outputName -> (String, OutputContractSchemaV2)? in
-            guard let schema = OutputContractResolverV2.resolveSchema(
-                for: outputName,
-                agent: agent,
-                catalog: context.catalog
-            ) else { return nil }
-            return (outputName, schema)
-        }
 
         // 1. System prompt
-        let systemPrompt = buildSystemPrompt(
-            agent: agent,
-            expectedOutputs: expectedOutputs,
-            outputSchemas: outputSchemas
-        )
+        let systemPrompt = buildSystemPrompt(agent: agent, expectedOutputs: expectedOutputs)
 
         // 2. Task directive
         let taskDirective = buildTaskDirective(
             agent: agent,
             task: task,
             context: context,
-            expectedOutputs: expectedOutputs,
-            outputSchemas: outputSchemas
+            expectedOutputs: expectedOutputs
         )
 
         // 3. Context attachments (input artifacts + workspace info)
@@ -146,17 +127,11 @@ final class GooseSessionBridge: Sendable {
 
         // Workspace context attachment
         let projectRootDescription = context.projectRoot?.path ?? "not provided"
-        let writableRoot = resolveWritableRoot(agent: agent, context: context)
-        let writableRootDescription = writableRoot?.path ?? "not provisioned"
-        let useWritableRoot = agent.worktreeWriteEnabled && writableRoot != nil
-        let usesRepoWorktree = agent.worktreeWriteEnabled
-            && context.workspace.worktreeRoot != nil
-            && writableRoot?.standardizedFileURL == context.workspace.worktreeRoot?.standardizedFileURL
-        let boundaryNote = usesRepoWorktree
+        let worktreeRootDescription = context.workspace.worktreeRoot?.path ?? "not provisioned"
+        let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
+        let boundaryNote = useWorktree
             ? "IMPORTANT: This agent has write access to the worktree root. All file operations must use explicit absolute paths within the worktree root."
-            : useWritableRoot
-                ? "IMPORTANT: This agent has write access to the writable root shown below. Use explicit absolute paths within that root for edits, while writing required outputs to their declared canonical paths."
-                : context.projectRoot != nil
+            : context.projectRoot != nil
                 ? "IMPORTANT: Treat the project root as the only source tree. Ignore any unexpected server cwd drift and use explicit absolute paths within the project root for reads, while writing outputs only into the artifact root."
                 : "IMPORTANT: No implicit working directory is allowed. All file operations must use explicit absolute paths within the workspace root."
         attachments.append(GooseContextAttachment(
@@ -170,7 +145,7 @@ final class GooseSessionBridge: Sendable {
             Workspace Root: \(context.workspace.workspaceRoot.path)
             Project Root: \(projectRootDescription)
             Artifact Root: \(context.workspace.artifactRoot.path)
-            Writable Root: \(writableRootDescription)
+            Worktree Root: \(worktreeRootDescription)
             \(boundaryNote)
             """,
             path: nil
@@ -208,8 +183,7 @@ final class GooseSessionBridge: Sendable {
 
     private static func buildSystemPrompt(
         agent: ResolvedAgent,
-        expectedOutputs: [String],
-        outputSchemas: [(String, OutputContractSchemaV2)]
+        expectedOutputs: [String]
     ) -> String {
         var parts: [String] = []
 
@@ -231,9 +205,6 @@ final class GooseSessionBridge: Sendable {
             parts.append("You must produce outputs conforming to contract: \(contract)")
             if !expectedOutputs.isEmpty {
                 parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
-            }
-            if !outputSchemas.isEmpty {
-                parts.append("Machine-readable primary artifacts are mandatory. Human-readable notes are optional only as separate companion files and never replace required outputs.")
             }
         }
 
@@ -260,8 +231,7 @@ final class GooseSessionBridge: Sendable {
         agent: ResolvedAgent,
         task: AgentTask,
         context: ExecutionContext,
-        expectedOutputs: [String],
-        outputSchemas: [(String, OutputContractSchemaV2)]
+        expectedOutputs: [String]
     ) -> String {
         var parts: [String] = []
 
@@ -288,32 +258,6 @@ final class GooseSessionBridge: Sendable {
             parts.append("Use the exact filenames listed above.")
             parts.append("Do not add file extensions like .md, .txt, or .json unless the filename above already includes that extension.")
             parts.append("Output directory: \(context.workspace.artifactRoot.path)/\(context.stageID).\(context.iteration)/\(agent.id)/\(context.attemptNumber)/")
-            let canonicalOutputPaths = expectedOutputs.compactMap { output -> String? in
-                guard let path = resolveCatalogArtifactPath(for: output, context: context) else { return nil }
-                return "- \(output): \(path)"
-            }
-            if !canonicalOutputPaths.isEmpty {
-                parts.append("")
-                parts.append("### Canonical Output Paths")
-                parts.append("If a canonical path is listed below, write the required output there. The runtime will collect it from that path.")
-                canonicalOutputPaths.forEach { parts.append($0) }
-            }
-            if !outputSchemas.isEmpty {
-                parts.append("")
-                parts.append("### Machine Output Requirements")
-                parts.append("Each required output file listed above is the primary contract artifact.")
-                parts.append("Filename must be exactly the declared output name above.")
-                parts.append("Do not add file extensions such as .md or .json unless the declared output name already includes that extension.")
-                parts.append("Do not substitute markdown, prose, or alternate filenames for these files.")
-                for (outputName, schema) in outputSchemas {
-                    let fields = schema.requiredFields.joined(separator: ", ")
-                    parts.append("- \(outputName): write a \(schema.machineFormat.rawValue.uppercased()) object")
-                    if !fields.isEmpty {
-                        parts.append("  Required fields: \(fields)")
-                    }
-                }
-                parts.append("If you want to include a human-readable explanation, write it as an additional companion file after writing the required machine artifact.")
-            }
         }
 
         if agent.outputContract == "proposal_review_v1" || agent.outputContract == "proposal_review_summary_v1" {
@@ -358,25 +302,6 @@ final class GooseSessionBridge: Sendable {
         parts.append("Complete the task and produce all required output files. Do not continue beyond the task scope.")
 
         return parts.joined(separator: "\n")
-    }
-
-    private static func resolveWritableRoot(agent: ResolvedAgent, context: ExecutionContext) -> URL? {
-        guard agent.worktreeWriteEnabled else { return nil }
-        if let worktreeRoot = context.workspace.worktreeRoot {
-            return worktreeRoot
-        }
-        guard let configuredPath = agent.worktreePath else {
-            return nil
-        }
-        return PathTemplateResolver.resolvePath(configuredPath, projectRoot: context.projectRoot)
-    }
-
-    private static func resolveCatalogArtifactPath(for outputName: String, context: ExecutionContext) -> String? {
-        guard let catalog = context.catalog,
-              let hintedPath = catalog.artifacts[outputName] else {
-            return nil
-        }
-        return PathTemplateResolver.resolvePath(hintedPath, projectRoot: context.projectRoot).path
     }
 
     // MARK: - Validation
