@@ -284,10 +284,6 @@ enum OutputContractResolverV2 {
         contractID: String,
         contract: ArtifactContract
     ) -> ValidationMode {
-        // Proposal reviews: structured with potential human companion
-        if contractID.hasPrefix("proposal_review") {
-            return .structuredWithHumanCompanion
-        }
         // JSON contracts default to strict structured
         if contract.format == "json" {
             return .strictStructured
@@ -300,7 +296,7 @@ enum OutputContractResolverV2 {
 // MARK: - Output Validation Result
 
 /// Result of validating a single output against its contract.
-struct OutputValidationResult: Codable, Sendable, Equatable {
+nonisolated struct OutputValidationResult: Codable, Sendable, Equatable {
     let outputName: String
     let contractID: String?
     let status: OutputValidationStatus
@@ -309,7 +305,7 @@ struct OutputValidationResult: Codable, Sendable, Equatable {
     let rawPayloadSize: Int
 }
 
-enum OutputValidationStatus: String, Codable, Sendable, Equatable {
+nonisolated enum OutputValidationStatus: String, Codable, Sendable, Equatable {
     case passed
     case failed
     case noContractDeclared

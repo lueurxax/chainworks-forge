@@ -33,6 +33,7 @@ struct ContentView: View {
         case deliveryPreflightReport = "delivery_preflight_report"
         case completedExportHub = "completed_export_hub"
         case accessibilityAudit = "accessibility_audit"
+        case proposal016Proof = "proposal_016_proof"
     }
 
     init() {
@@ -133,6 +134,12 @@ struct ContentView: View {
             )
             .padding(.bottom, 8)
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                BrandMarkView(style: .symbol, surfaceRole: .toolbarBranding, maxHeight: 18)
+                    .accessibilityIdentifier("content-shell-brand-mark")
+            }
+        }
         .task(id: forcedInitialTab?.rawValue ?? "default") {
             guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
             // UI tests need a deterministic landing tab even when macOS restores prior scene state.
@@ -175,6 +182,8 @@ struct ContentView: View {
             UITestCompletedExportHubSurface()
         case .accessibilityAudit:
             UITestAccessibilityAuditSurface()
+        case .proposal016Proof:
+            UITestProposal016ProofSurface()
         }
     }
 }

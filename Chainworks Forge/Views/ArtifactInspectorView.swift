@@ -113,7 +113,7 @@ struct ArtifactInspectorView: View {
         HStack(spacing: 3) {
             Image(systemName: icon)
                 .font(.caption2)
-            Text("\(label): \(value)")
+            Text(verbatim: "\(label): \(value)")
                 .font(.caption2)
         }
         .padding(.horizontal, 8)

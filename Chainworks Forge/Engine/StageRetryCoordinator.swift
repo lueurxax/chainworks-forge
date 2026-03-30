@@ -14,6 +14,7 @@ import SwiftData
 final class StageRetryCoordinator {
 
     private let modelContext: ModelContext
+    private lazy var uniquenessGuard = ActiveExecutionUniquenessGuard(modelContext: modelContext)
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
@@ -27,12 +28,14 @@ final class StageRetryCoordinator {
     func retryFailedAgent(
         run: Run,
         stage: StageExecution,
-        failedAgent: AgentExecution
+        failedAgent: AgentExecution,
+        allowNonBlockingRetry: Bool = false
     ) throws -> AgentExecution {
-        guard failedAgent.status == .failed else {
+        guard failedAgent.blocksForwardProgress || allowNonBlockingRetry else {
             throw StageRetryError.agentNotFailed(failedAgent.agentID)
         }
 
+        stage.lineageID = stage.lineageID ?? Self.stageLineageID(stageID: stage.stageID, iteration: stage.iteration)
         // Compute next agent attempt number
         let existingAttempts = stage.agentExecutions
             .filter { $0.agentID == failedAgent.agentID }
@@ -66,8 +69,8 @@ final class StageRetryCoordinator {
 
         // Update stage status — do NOT increment attemptNumber (§5.3 Rule 1)
         stage.status = .running
-        stage.completedAt = nil
         stage.retryMode = RetryMode.agentRetry.rawValue
+        uniquenessGuard.activateStageExecution(stage, run: run, desiredStatus: .running)
 
         // Update run status
         run.status = .running
@@ -87,8 +90,14 @@ final class StageRetryCoordinator {
             throw StageRetryError.stageNotFailed(stage.stageID)
         }
 
+        let lineageID = stage.lineageID ?? Self.stageLineageID(stageID: stage.stageID, iteration: stage.iteration)
+
         // Mark old stage as terminal
         stage.completedAt = stage.completedAt ?? Date()
+        stage.lineageID = lineageID
+        stage.settlementKind = .superseded
+        stage.settledAt = stage.completedAt
+        stage.activeOwnerToken = nil
 
         // Create new stage execution with incremented attempt
         let newStage = StageExecution(
@@ -101,14 +110,20 @@ final class StageRetryCoordinator {
         newStage.retryMode = RetryMode.stageRetry.rawValue
         newStage.triggerReason = "stage_retry_via_recovery"
         newStage.supersedesAttemptNumber = stage.attemptNumber
+        newStage.lineageID = lineageID
         newStage.run = run
 
         modelContext.insert(newStage)
+        uniquenessGuard.activateStageExecution(newStage, run: run, desiredStatus: .ready)
 
         // Update run status
         run.status = .ready
 
         return newStage
+    }
+
+    private static func stageLineageID(stageID: String, iteration: Int) -> String {
+        "\(stageID)::iteration:\(iteration)"
     }
 
     // MARK: - Recovery Policy (§5.4)
@@ -118,36 +133,66 @@ final class StageRetryCoordinator {
         for run: Run,
         failedStage: StageExecution?,
         failedAgent: AgentExecution?,
-        validationFailure: ValidationFailureRecord?
+        validationFailure: ValidationFailureRecord?,
+        aggregateFailure: Bool = false
     ) -> RecoveryActionSnapshot {
         var availableActions: [RecoveryActionDetail] = []
         var recommendedAction: RecoveryActionDetail?
 
         if let failedAgent, let failedStage {
             let retryAgentAction = RecoveryActionDetail(
-                action: .retryFailedAgent,
+                action: failedAgent.isAggregateProposalReviewStep ? .retryAggregateStep : .retryFailedAgent,
                 stageID: failedStage.stageID,
                 agentID: failedAgent.agentID,
-                explanation: "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused.",
+                explanation: failedAgent.isAggregateProposalReviewStep
+                    ? "Retry only the aggregate proposal review step. Contract-valid reviewer outputs are reused."
+                    : "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused.",
                 staysInSameRun: true,
                 reusesSiblingOutputs: true,
                 reExecutesWholeStage: false
             )
             availableActions.append(retryAgentAction)
 
-            // For output-contract mismatch: recommend operator inspection first
-            if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
+            let requiresOperatorInspection =
+                (validationFailure?.failureClass == .outputContractMismatch)
+                || failedAgent.defaultRetryRequiresOperatorDecision
+
+            if requiresOperatorInspection {
+                let explanation: String
+                if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
+                    explanation = "Output contract mismatch detected. Inspect raw output before retrying."
+                } else if ExecutionTruthSupport.isPolicyBoundStopReason(failedAgent.providerStopReason) {
+                    explanation = "Provider policy-bound terminal stop detected. Automatic same-run retry is not recommended without an explicit narrower operator decision."
+                } else {
+                    explanation = "Provider/app limit exhaustion detected. Automatic same-run retry is not recommended without an explicit narrower operator decision."
+                }
                 recommendedAction = RecoveryActionDetail(
                     action: .operatorInspection,
                     stageID: failedStage.stageID,
                     agentID: failedAgent.agentID,
-                    explanation: "Output contract mismatch detected. Inspect raw output before retrying.",
+                    explanation: explanation,
                     staysInSameRun: true,
                     reusesSiblingOutputs: false,
                     reExecutesWholeStage: false
                 )
             } else {
                 recommendedAction = retryAgentAction
+            }
+        }
+
+        if let failedStage, aggregateFailure, !(failedAgent?.isAggregateProposalReviewStep ?? false) {
+            let retryAggregateAction = RecoveryActionDetail(
+                action: .retryAggregateStep,
+                stageID: failedStage.stageID,
+                agentID: nil,
+                explanation: "Retry only the aggregate proposal review step. Contract-valid reviewer outputs are reused.",
+                staysInSameRun: true,
+                reusesSiblingOutputs: true,
+                reExecutesWholeStage: false
+            )
+            availableActions.append(retryAggregateAction)
+            if recommendedAction == nil {
+                recommendedAction = retryAggregateAction
             }
         }
 
@@ -195,6 +240,20 @@ final class StageRetryCoordinator {
     }
 }
 
+private extension AgentExecution {
+    var defaultRetryRequiresOperatorDecision: Bool {
+        if let canonicalOutcome {
+            switch canonicalOutcome {
+            case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput:
+                return true
+            default:
+                break
+            }
+        }
+        return ExecutionTruthSupport.isPolicyBoundStopReason(providerStopReason)
+    }
+}
+
 // MARK: - Retry Mode (§5.3)
 
 enum RetryMode: String, Codable, Sendable {
@@ -229,6 +288,7 @@ struct RecoveryActionDetail: Codable, Sendable, Equatable {
 
 enum RecoveryActionType: String, Codable, Sendable, Equatable {
     case retryFailedAgent = "retry_failed_agent"
+    case retryAggregateStep = "retry_aggregate_step"
     case retryFailedStage = "retry_failed_stage"
     case cloneRunFrozenSnapshot = "clone_run_frozen_snapshot"
     case cloneRunCurrentConfig = "clone_run_current_config"

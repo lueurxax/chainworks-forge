@@ -28,9 +28,12 @@ struct GooseProviderConnectionAssistantView: View {
             List {
                 // Proposal 012 (L-04): Journey visualization with 3-step progress
                 Section("Journey") {
-                    Text("Goose Connection Assistant")
-                        .font(.title2.bold())
-                        .accessibilityIdentifier("goose-assistant-title")
+                    ForgeIdentityHeader(
+                        title: "Goose Connection Assistant",
+                        subtitle: "Configure, verify, and return through the same Goose-backed path the live runtime uses for Codex and Claude.",
+                        surfaceRole: .setupIdentity
+                    )
+                    .accessibilityIdentifier("goose-assistant-title")
 
                     // 3-step progress indicator: Configure → Verify → Connected
                     journeyProgressIndicator
@@ -57,7 +60,7 @@ struct GooseProviderConnectionAssistantView: View {
                                 .controlSize(.small)
                             Text("Verifying…")
                                 .font(DesignTokens.Typography.supporting)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         } else {
                             StatusCapsule(
                                 text: journeyState.displayName,
@@ -70,7 +73,7 @@ struct GooseProviderConnectionAssistantView: View {
                     .accessibilityIdentifier("goose-assistant-state")
                     Text(origin.canonicalReturnPath)
                         .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 }
 
                 if snapshot == nil && draftProvider == nil {
@@ -117,10 +120,10 @@ struct GooseProviderConnectionAssistantView: View {
                     .accessibilityIdentifier("goose-assistant-return")
 
                     if let lastSavedMessage {
-                        Text(lastSavedMessage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .accessibilityIdentifier("goose-assistant-save-message")
+                            Text(lastSavedMessage)
+                                .font(.caption)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                                .accessibilityIdentifier("goose-assistant-save-message")
                     }
                 }
 
@@ -137,7 +140,7 @@ struct GooseProviderConnectionAssistantView: View {
                         Section("Current Guidance") {
                             Text("No diagnostics captured yet. Run Goose verification to populate handshake facts and remediation.")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         }
                     }
                 }
@@ -262,7 +265,7 @@ struct GooseProviderConnectionAssistantView: View {
         VStack(spacing: DesignTokens.Spacing.compact) {
             ZStack {
                 Circle()
-                    .fill(isComplete ? DesignTokens.Status.success.opacity(0.15) : isActive ? DesignTokens.Action.primary.opacity(0.15) : Color.secondary.opacity(0.1))
+                    .fill(isComplete ? DesignTokens.Status.success.opacity(0.15) : isActive ? DesignTokens.Neutral.brandWash : DesignTokens.Neutral.panelSubtle)
                     .frame(width: 32, height: 32)
                 if isActive && !isComplete {
                     ProgressView()
@@ -270,18 +273,18 @@ struct GooseProviderConnectionAssistantView: View {
                 } else {
                     Image(systemName: isComplete ? "checkmark" : icon)
                         .font(.caption.bold())
-                        .foregroundStyle(isComplete ? DesignTokens.Status.success : isActive ? DesignTokens.Action.primary : .secondary)
+                        .foregroundStyle(isComplete ? DesignTokens.Status.success : isActive ? DesignTokens.Action.primary : DesignTokens.Neutral.textSecondary)
                 }
             }
             Text(title)
                 .font(DesignTokens.Typography.micro)
-                .foregroundStyle(isComplete || isActive ? .primary : .secondary)
+                .foregroundStyle(isComplete || isActive ? .primary : DesignTokens.Neutral.textSecondary)
         }
     }
 
     private func journeyConnector(isComplete: Bool) -> some View {
         Rectangle()
-            .fill(isComplete ? DesignTokens.Status.success : Color.secondary.opacity(0.3))
+            .fill(isComplete ? DesignTokens.Status.success : DesignTokens.Neutral.quietOutline)
             .frame(height: 2)
             .frame(maxWidth: 40)
     }

@@ -6,6 +6,7 @@ import Foundation
 
 /// Unit tests for GooseStreamEventMapper.
 /// Validates that all goosed MessageEvent types are correctly mapped to GooseStreamEvent.
+@MainActor
 @Suite("GooseStreamEventMapper")
 struct GooseStreamEventMapperTests {
 

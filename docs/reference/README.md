@@ -12,6 +12,7 @@ Implementation-oriented reference docs for Chainworks Forge.
 
 - [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, lineage settlement, startup repair, aggregate truth, and recovery/report read precedence
 
 ## Live Execution
 
@@ -39,6 +40,10 @@ Implementation-oriented reference docs for Chainworks Forge.
 ## System Health
 
 - [forge-steward.md](forge-steward.md) — Forge Steward V1 (Observer): deterministic metrics, anomaly detection, cohorting, dossier building, trigger mechanisms
+
+## Evidence
+
+- [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md) — consolidated implementation/proof story for the execution-truth and recovery slice
 
 ## Risk Analysis
 

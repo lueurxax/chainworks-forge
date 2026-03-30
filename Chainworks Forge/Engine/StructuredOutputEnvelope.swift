@@ -5,7 +5,7 @@ import Foundation
 /// Persisted wrapper for structured outputs that captures raw payload,
 /// parsed payload, validation result, and origin metadata.
 /// This ensures validation never becomes the point where all downstream evidence disappears.
-struct StructuredOutputEnvelope: Codable, Sendable, Identifiable, Equatable {
+nonisolated struct StructuredOutputEnvelope: Codable, Sendable, Identifiable, Equatable {
     let id: UUID
     let timestamp: Date
 

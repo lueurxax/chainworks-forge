@@ -55,6 +55,30 @@ struct GooseSessionBridgeTests {
         )
     }
 
+    private func makeMetaWriteAgent(id: String = "proposal_writer") -> ResolvedAgent {
+        ResolvedAgent(
+            id: id,
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "test_provider",
+            model: "test_model",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "PROPOSAL_WRITE",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Write proposal outputs.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["idea_brief"],
+            outputs: ["proposal_current"],
+            worktreeWriteEnabled: true,
+            worktreeStrategy: "meta_only",
+            worktreePath: "${CHAINWORKS_META_ROOT:-.chainworks}/proposals"
+        )
+    }
+
     private func makeTask() -> AgentTask {
         AgentTask(agent: "test_agent", task: "test_task", inputs: ["input_artifact"], outputs: ["output_artifact"])
     }
@@ -231,6 +255,81 @@ struct GooseSessionBridgeTests {
         #expect(packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
+    @Test("Proposal review packet requires JSON primary artifact")
+    func proposalReviewPacketRequiresJSONPrimaryArtifact() {
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Proposal Reviewer / Architect",
+            mode: "proposal_review.architect",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 8,
+            temperature: 0,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: "architect",
+            prompt: "Review as architect",
+            outputContract: "proposal_review_v1",
+            requiresHumanApproval: false,
+            inputs: ["idea_brief", "proposal_current"],
+            outputs: ["proposal_review_architect"]
+        )
+        let task = AgentTask(
+            agent: "proposal_reviewer_architect",
+            task: "review",
+            inputs: ["idea_brief", "proposal_current"],
+            outputs: ["proposal_review_architect"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks",
+                runtime: "goose",
+                transport: "rest_sse",
+                description: "test",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "manual",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: [:],
+            contracts: [
+                "proposal_review_v1": ArtifactContract(
+                    format: "json",
+                    requiredFields: ["agent_id", "role", "score", "decision"]
+                )
+            ],
+            backendProfiles: [:],
+            permissionProfiles: [:],
+            agents: []
+        )
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "",
+            providerBinding: nil,
+            catalog: catalog
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.systemPrompt.contains("Machine-readable primary artifacts are mandatory"))
+        #expect(packet.taskDirective.contains("proposal_review_architect: write a JSON object"))
+        #expect(packet.taskDirective.contains("Required fields: agent_id, role, score, decision"))
+        #expect(packet.taskDirective.contains("Do not substitute markdown, prose, or alternate filenames"))
+    }
+
     @Test("Packet without input artifacts")
     func packetWithoutInputArtifacts() {
         let agent = makeAgent()
@@ -403,6 +502,122 @@ struct GooseSessionBridgeTests {
         let lastRequest = await transport.lastSessionRequest
         #expect(lastRequest?.workingDirectory == worktreeRoot.path)
         #expect(lastRequest?.executionPolicy?.workspaceMode == "read_write")
+    }
+
+    @Test("Meta-only writable execution uses configured writable root")
+    func sessionBridgeUsesConfiguredMetaRootForWritableExecution() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "bridge-meta-root",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-meta-root",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        )
+
+        let bridge = GooseSessionBridge(transport: transport)
+        let agent = makeMetaWriteAgent()
+        let task = AgentTask(agent: agent.id, task: "draft_proposal", inputs: ["idea_brief"], outputs: ["proposal_current"])
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let projectRoot = workspace.workspaceRoot.appendingPathComponent("repo", isDirectory: true)
+        let metaRoot = projectRoot.appendingPathComponent(".chainworks/proposals", isDirectory: true)
+        try FileManager.default.createDirectory(at: metaRoot, withIntermediateDirectories: true)
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: projectRoot,
+            stageID: "state_2_proposal_drafted",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: task,
+            context: context,
+            override: nil
+        )
+
+        let lastRequest = await transport.lastSessionRequest
+        #expect(lastRequest?.workingDirectory == metaRoot.standardizedFileURL.path)
+        #expect(lastRequest?.executionPolicy?.workspaceMode == "read_write")
+        #expect(lastRequest?.executionPolicy?.repoWritesAllowed == false)
+    }
+
+    @Test("Packet resolves env-templated catalog artifact path")
+    func packetResolvesEnvTemplatedCatalogArtifactPath() {
+        let agent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "test_provider",
+            model: "test_model",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "ORCH",
+            skillRef: "orchestrator_core",
+            skillRole: nil,
+            prompt: "Normalize idea into brief.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["input.idea"],
+            outputs: ["idea_brief"]
+        )
+        let task = AgentTask(
+            agent: "lead_orchestrator",
+            task: "normalize_idea_and_prepare_proposal_brief",
+            inputs: ["input.idea"],
+            outputs: ["idea_brief"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let projectRoot = workspace.workspaceRoot.appendingPathComponent("repo", isDirectory: true)
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: projectRoot,
+            stageID: "state_1_idea_received",
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil,
+            catalog: AgentCatalog(
+                schemaVersion: 1,
+                app: AppConfig(
+                    name: "Chainworks",
+                    runtime: "goose",
+                    transport: "rest_sse",
+                    description: "test",
+                    ideaInputMode: "text",
+                    singleActiveRunPerIdea: true,
+                    runResumePolicy: "manual",
+                    requiredProviders: []
+                ),
+                paths: ["meta_root": "${CHAINWORKS_META_ROOT:-.chainworks}"],
+                artifacts: ["idea_brief": "${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md"],
+                skills: [:],
+                contracts: [:],
+                backendProfiles: [:],
+                permissionProfiles: [:],
+                agents: []
+            )
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        #expect(packet.taskDirective.contains(projectRoot.appendingPathComponent(".chainworks/context/idea.md").path))
     }
 
     // MARK: - LiveExecutionOverride Tests

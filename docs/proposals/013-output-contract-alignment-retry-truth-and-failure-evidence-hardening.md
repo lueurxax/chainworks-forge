@@ -22,7 +22,7 @@ The deeper layer is runtime truth:
 - aggregate and report truth can drift away from actual stage lineage,
 - reports can show configured provider/model truth instead of actual runtime truth.
 
-That lower layer is now further addressed by the companion migration slice [016-transport-outcome-truth-stage-settlement-and-resume-idempotency.md](016-transport-outcome-truth-stage-settlement-and-resume-idempotency.md).
+That lower layer is now addressed by the implemented execution-truth baseline in [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md).
 
 What remains after that lower layer is still important and still proposal-worthy:
 
@@ -34,7 +34,7 @@ What remains after that lower layer is still important and still proposal-worthy
 
 Proposal 013 is the bounded follow-up slice for that higher layer.
 
-### 1.1 Relationship to Proposal 016
+### 1.1 Relationship to the execution-truth baseline
 
 Earlier versions of Proposal 013 tried to absorb transport truth, stage settlement, retry lineage, and recovery/report alignment in one slice.
 
@@ -44,7 +44,7 @@ Proposal 013 remains the right bounded proposal for contract alignment, failure 
 What changed is only the causal map around it:
 
 - Proposal 013 owns contract and evidence semantics,
-- Proposal 016 owns the deeper execution-truth migration where stale active records, contradictory transport outcomes, or provider-truth drift corrupt what Proposal 013 later reads.
+- the execution-truth baseline owns the deeper runtime layer where stale active records, contradictory transport outcomes, or provider-truth drift corrupt what Proposal 013 later reads.
 
 The app cannot fully trust contract-alignment conclusions if the runtime still does not know:
 
@@ -54,8 +54,8 @@ The app cannot fully trust contract-alignment conclusions if the runtime still d
 4. which provider/model actually executed,
 5. whether the aggregate step itself settled or never produced its required output.
 
-Proposal 016 repairs that substrate.
-Proposal 013 remains valid whether 016 lands before it, alongside it, or after an initial partial 013 rollout, but report/recovery trust should be capped until the 016 migration is also applied.
+The execution-truth baseline repairs that substrate.
+Proposal 013 remains valid alongside that baseline, but report/recovery trust should be capped until the lower-layer migration is also applied.
 
 ### 1.2 What this proposal is
 
@@ -79,7 +79,7 @@ Proposal 013 is **not**:
 - a skill-resolution proposal,
 - or a general UI-polish bucket.
 
-Those lower-level runtime truths belong to Proposal 016.
+Those lower-level runtime truths belong to the execution-truth baseline.
 
 ---
 
@@ -248,6 +248,26 @@ Rules:
 4. If the app wants reviewer outputs as JSON, the agents and aggregate step must actually emit JSON and any rendered markdown must be explicitly secondary.
 5. `proposal_review_summary` must be treated as a first-class contract citizen, not a fallback or implicit transition artifact.
 6. Aggregate contract validation must attach to the aggregate state's canonical `StageExecution` and its failed-stage evidence path; it must not introduce a parallel aggregate terminality authority.
+7. Aggregate execution may consume only normalized, contract-valid reviewer outputs; raw invalid reviewer artifacts are evidence only and must not be treated as aggregate inputs.
+
+### 4.5 Legacy contract-schema migration rule
+
+Proposal 013 does not require a flag day migration of the entire catalog before the mandatory adopters can land.
+
+During migration:
+
+- legacy `format` maps into `machine_format`
+- `validation_mode` gets a safe default derived from the contract class:
+  - proposal-review outputs default to `structured_with_human_companion`
+  - strictly machine-only outputs default to `strict_structured`
+- `human_format` may be derived until catalog migration finishes
+- `raw_artifact_name` and `normalized_artifact_name` may be derived from the output name until catalog migration finishes
+
+Rules:
+
+1. The canonical authority remains `AgentCatalog.contracts`; migration defaults are a bridge, not a second schema source.
+2. Mandatory adopters may land incrementally, but a migrated adopter must not rely on silent fallback once its contract is explicitly upgraded.
+3. Catalog-wide cleanup may finish later, but mandatory adopters in this proposal must be explicit and test-covered.
 
 ---
 
@@ -293,7 +313,7 @@ The app can still leave the operator in an ambiguous state:
 
 ### 6.2 Required evidence behavior
 
-Proposal 013 requires canonical failure evidence even on the current runtime and benefits further from Proposal 016 once lower settlement truth is repaired.
+Proposal 013 requires canonical failure evidence even on the current runtime and benefits from the execution-truth baseline once lower settlement truth is repaired.
 Within that boundary, Proposal 013 requires:
 
 1. contract failure after output generation must persist:
@@ -305,6 +325,7 @@ Within that boundary, Proposal 013 requires:
 2. the aggregate step must produce the same evidence bundle when `proposal_review_summary` fails validation or is missing after fan-out completes
 3. reports, exports, and recovery surfaces must reference the canonical failure object directly, not only a derived summary
 4. canonical failure evidence may contain sensitive data, so operator-visible summaries should default to summarized or redacted presentation unless explicit full-detail inspection is requested
+5. aggregate input eligibility must be explicit: only reviewer outputs that already passed contract normalization/validation may feed `proposal_review_summary`; invalid raw reviewer artifacts remain evidence only.
 
 ### 6.3 Required recovery behavior
 
@@ -322,6 +343,22 @@ and must expose the narrowest valid recovery action from the canonical recovery 
 - `Clone Current Config`
 
 `Clone run` is not acceptable as the only surviving path when narrower recovery is valid.
+
+Required precedence:
+
+| Failure class | Required narrowest action |
+|---|---|
+| invalid reviewer contract, aggregate not started | `Retry Failed Agent` |
+| reviewer fan-out valid, aggregate missing or aggregate contract-invalid | `Retry Aggregate Step` |
+| stage-level settlement is canonical but one reviewer attempt is the only invalid input | `Retry Failed Agent` |
+| stage-level settlement canonical, multiple reviewer outputs invalid or stage must be rebuilt | `Retry Failed Stage` |
+| lower-layer runtime truth is `legacy_unverifiable`, startup repair incomplete, or canonical failed step cannot be trusted | block same-run retry and prefer clone or explicit operator stop |
+
+Rules:
+
+1. Recovery UI must not invent its own priority order from raw artifacts on disk.
+2. `Retry Aggregate Step` is valid only when reviewer inputs are already contract-valid and the aggregate step is the narrowest broken unit.
+3. Clone is fallback, not the default operator escape hatch, unless lower-layer execution truth is not trustworthy enough for same-run recovery.
 
 ---
 
@@ -434,7 +471,7 @@ Proposal 013 does **not** own:
 - broader transport policy enforcement beyond `structured_output`,
 - or workflow-topology redesign.
 
-Those lower-level runtime-truth repairs are owned by Proposal 016, but they are a companion migration slice rather than a reason to invalidate this proposal's contract/evidence scope.
+Those lower-level runtime-truth repairs are owned by the execution-truth baseline, but they are a companion slice rather than a reason to invalidate this proposal's contract/evidence scope.
 
 ---
 

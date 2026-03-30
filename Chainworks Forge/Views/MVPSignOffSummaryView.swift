@@ -661,7 +661,7 @@ struct MVPSignOffSummaryView: View {
 
         do {
             let builder = SignOffEvidencePackBuilder(modelContext: modelContext)
-            let packet = try builder.buildCohortPacket(cohort: cohort, snapshot: snapshot)
+            let packet = builder.buildCohortPacket(cohort: cohort, snapshot: snapshot)
             let exportDir = desktopURL.appendingPathComponent(
                 "signoff-packet-\(snapshot.id.uuidString.prefix(8))",
                 isDirectory: true

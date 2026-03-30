@@ -1,6 +1,6 @@
 import Foundation
 
-struct CompactWorkflowValidator: Sendable {
+nonisolated struct CompactWorkflowValidator: Sendable {
 
     nonisolated static func validate(_ compact: CompactWorkflowDefinition) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []

@@ -1,6 +1,6 @@
 import Foundation
 
-struct ProviderExecutionReceipt: Sendable, Codable, Equatable {
+nonisolated struct ProviderExecutionReceipt: Sendable, Codable, Equatable {
     let providerFamily: String
     let configuredProviderID: UUID?
     let model: String

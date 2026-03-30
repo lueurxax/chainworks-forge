@@ -1045,9 +1045,6 @@ final class Chainworks_ForgeUITests: XCTestCase {
         defer { terminateIfRunning(runsApp) }
         launchClean(runsApp)
 
-        let runsScreen = AppScreen(app: runsApp)
-        try XCTSkipUnless(runsScreen.waitForTabs(timeout: 30),
-                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
         XCTAssertTrue(
             anyElement(runsApp, identifier: "ui-test-window-size-1024x768").waitForExistence(timeout: 10),
             "RunsHome proving path must expose the 1024x768 window-size marker"
@@ -1070,11 +1067,8 @@ final class Chainworks_ForgeUITests: XCTestCase {
         defer { terminateIfRunning(ideasApp) }
         launchClean(ideasApp)
 
-        let ideasScreen = AppScreen(app: ideasApp)
         let ideas = IdeasScreen(app: ideasApp)
-        try XCTSkipUnless(ideasScreen.waitForTabs(timeout: 30),
-                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
-        XCTAssertTrue(ideasScreen.selectTab("Ideas"))
+        revealSidebarIfNeeded(ideasApp)
         XCTAssertTrue(
             anyElement(ideasApp, identifier: "ui-test-window-size-1024x768").waitForExistence(timeout: 10),
             "IdeaList proving path must expose the 1024x768 window-size marker"
@@ -1105,9 +1099,6 @@ final class Chainworks_ForgeUITests: XCTestCase {
         defer { terminateIfRunning(runsApp) }
         launchClean(runsApp)
 
-        let runsScreen = AppScreen(app: runsApp)
-        try XCTSkipUnless(runsScreen.waitForTabs(timeout: 30),
-                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
         let runsHomeRow = anyElement(runsApp, identifier: "runs-home-adopter-slice-summary")
         let labeledRunsHome = waitForLabeledPrefix(runsApp, prefix: "Runs Home. Waiting approval ", timeout: 15)
         XCTAssertTrue(
@@ -1143,31 +1134,50 @@ final class Chainworks_ForgeUITests: XCTestCase {
             seededIdeaWorkspaceRoot: repoRootPath(),
             initialTab: "Ideas",
             uiTestWindowSize: "1024x768",
-            increaseContrast: true
+            increaseContrast: true,
+            focusProof: true
         )
         defer { terminateIfRunning(ideasApp) }
         launchClean(ideasApp)
 
-        let ideasScreen = AppScreen(app: ideasApp)
-        try XCTSkipUnless(ideasScreen.waitForTabs(timeout: 30),
-                          "Skipping: macOS SwiftUI tabs not discoverable in this environment")
-        XCTAssertTrue(ideasScreen.selectTab("Ideas"))
-        let totalIdeasChip = anyElement(ideasApp, identifier: "ideas-summary-chip-total")
-        let activeIdeasChip = anyElement(ideasApp, identifier: "ideas-summary-chip-active")
+        revealSidebarIfNeeded(ideasApp)
+        let summaryStrip = anyElement(ideasApp, identifier: "ideas-summary-strip-owner")
         XCTAssertTrue(
-            totalIdeasChip.waitForExistence(timeout: 15) || activeIdeasChip.waitForExistence(timeout: 15),
-            "IdeaList adopter slice must expose summary-strip chips as accessible static text"
+            summaryStrip.waitForExistence(timeout: 15),
+            "IdeaList adopter slice must expose the summary strip as an owner-level accessibility surface"
         )
-        let visibleIdeasChip = totalIdeasChip.exists ? totalIdeasChip : activeIdeasChip
-        XCTAssertFalse(visibleIdeasChip.label.isEmpty, "IdeaList summary chips must have textual VoiceOver labels")
+        XCTAssertTrue(
+            summaryStrip.label.contains("ideas")
+                && summaryStrip.label.contains("drafts")
+                && summaryStrip.label.contains("active"),
+            "IdeaList summary strip must preserve textual count labels for VoiceOver"
+        )
         XCTAssertTrue(
             anyElement(ideasApp, identifier: "ui-test-accessibility-increase-contrast").waitForExistence(timeout: 5),
             "IdeaList proof must run with Increase Contrast enabled"
         )
         XCTAssertTrue(
-            anyElement(ideasApp, identifier: "\(visibleIdeasChip.identifier)-increase-contrast").waitForExistence(timeout: 5)
-                || accessibilityValueString(visibleIdeasChip).contains("increase contrast"),
-            "IdeaList summary chips must react to Increase Contrast on the real owner surface"
+            anyElement(ideasApp, identifier: "ideas-summary-strip-increase-contrast").waitForExistence(timeout: 5)
+                || accessibilityValueString(summaryStrip).contains("increase contrast"),
+            "IdeaList summary strip must react to Increase Contrast on the real owner surface"
+        )
+        let ideas = IdeasScreen(app: ideasApp)
+        XCTAssertTrue(ideas.openIdea(named: "P012 Accessibility Idea"), "IdeaList owner proof must reach the seeded idea detail")
+        let ideaFocusOrder = anyElement(ideasApp, identifier: "idea-detail-focus-order")
+        XCTAssertTrue(ideaFocusOrder.waitForExistence(timeout: 10), "IdeaList owner path must expose a focus-order marker")
+        let initialFocusProof = "\(ideaFocusOrder.label) \(accessibilityValueString(ideaFocusOrder))"
+        XCTAssertTrue(
+            initialFocusProof.contains("Archive Idea")
+                || initialFocusProof.contains("Start New Run")
+                || initialFocusProof.contains("Start Another Run"),
+            "IdeaList focus proof must start on a real owner-level action"
+        )
+        ideasApp.typeKey(.tab, modifierFlags: [])
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        let advancedFocusProof = "\(ideaFocusOrder.label) \(accessibilityValueString(ideaFocusOrder))"
+        XCTAssertTrue(
+            advancedFocusProof.contains("Start New Run") || advancedFocusProof.contains("Start Another Run"),
+            "IdeaList focus order must continue from archive action into Start New Run"
         )
         screenshot(ideasApp, name: "P012_A11Y_IdeaList_IncreaseContrast")
         terminateIfRunning(ideasApp)
@@ -1270,6 +1280,63 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 || preflightModes.contains("reduce transparency")
         )
         screenshot(preflightApp, name: "P012_A11Y_DeliveryPreflight_Settings")
+    }
+
+    private func revealSidebarIfNeeded(_ app: XCUIApplication) {
+        let totalChip = anyElement(app, identifier: "ideas-summary-chip-total")
+        let activeChip = anyElement(app, identifier: "ideas-summary-chip-active")
+        guard !(totalChip.exists || activeChip.exists) else { return }
+
+        let showSidebar = app.buttons["Show Sidebar"].firstMatch
+        guard showSidebar.waitForExistence(timeout: 2), showSidebar.isHittable else { return }
+
+        showSidebar.click()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+    }
+
+    func testProposal016AppLevelProofSurface() throws {
+        let app = makeApp(directSurface: "proposal_016_proof")
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "ui-test-direct-surface-ready-proposal_016_proof").waitForExistence(timeout: 20),
+            "Proposal 016 proof surface must render via its direct surface"
+        )
+
+        let runProofButton = app.buttons["p016-run-proof"].firstMatch
+        XCTAssertTrue(runProofButton.waitForExistence(timeout: 10), "Proposal 016 proof must expose Run Proof")
+        runProofButton.click()
+
+        let status = anyElement(app, identifier: "p016-proof-status")
+        XCTAssertTrue(status.waitForExistence(timeout: 10), "Proof status must render")
+
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if status.label.contains("PASS") || status.label.contains("FAIL") {
+                break
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+
+        XCTAssertTrue(status.label.contains("PASS"), "Proposal 016 proof must pass (got: \(status.label))")
+        XCTAssertTrue(
+            anyElement(app, identifier: "p016-limit-reason").waitForExistence(timeout: 5),
+            "Proof surface must expose the limit-exhaustion report reason"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p016-runtime-trust").waitForExistence(timeout: 5),
+            "Proof surface must expose runtime trust"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p016-policy-summary").waitForExistence(timeout: 5),
+            "Proof surface must expose policy-stop recovery summary"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p016-repair-summary").waitForExistence(timeout: 5),
+            "Proof surface must expose startup repair summary"
+        )
+        screenshot(app, name: "P016_AppLevelProof")
     }
 
     // MARK: - REQ-011: Start Run Sheet UI

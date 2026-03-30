@@ -129,6 +129,7 @@ struct Chainworks_ForgeApp: App {
             StageExecution.self,
             AgentExecution.self,
             Approval.self,
+            AggregateSettlementRecord.self,
             Artifact.self,
             StewardAnalysis.self,
             StewardAnalysisRunLink.self,
@@ -161,7 +162,7 @@ struct Chainworks_ForgeApp: App {
     /// to find (and click) elements hidden behind the wrong window — leading
     /// to indefinite hangs.
     init() {
-        if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+        if Self.isTestHost || ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
             UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         }
         UIAutomationDiagnostics.log(
@@ -182,6 +183,18 @@ struct Chainworks_ForgeApp: App {
 
 final class AutomationFallbackAppDelegate: NSObject, NSApplicationDelegate {
     private var fallbackWindow: NSWindow?
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        !Chainworks_ForgeApp.isTestHost
+    }
+
+    func application(_ app: NSApplication, shouldSaveApplicationState coder: NSCoder) -> Bool {
+        !Chainworks_ForgeApp.isTestHost
+    }
+
+    func application(_ app: NSApplication, shouldRestoreApplicationState coder: NSCoder) -> Bool {
+        !Chainworks_ForgeApp.isTestHost
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard Chainworks_ForgeApp.isUIAutomationHost else { return }
@@ -216,8 +229,8 @@ final class AutomationFallbackAppDelegate: NSObject, NSApplicationDelegate {
             window.orderFrontRegardless()
 
             NSApp.setActivationPolicy(.regular)
-            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-            NSApp.activate(ignoringOtherApps: true)
+            _ = NSRunningApplication.current.activate()
+            NSApp.activate()
 
             fallbackWindow = window
             UIAutomationDiagnostics.log("fallbackWindowCreated windows=\(NSApp.windows.count) isVisible=\(window.isVisible)")
@@ -252,8 +265,8 @@ private struct RootHostView: View {
                 }
 
                 let shouldContinue = await MainActor.run { () -> Bool in
-                    NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-                    NSApp.activate(ignoringOtherApps: true)
+                    _ = NSRunningApplication.current.activate()
+                    NSApp.activate()
 
                     var shouldRetry = true
                     for window in NSApp.windows {
@@ -348,6 +361,7 @@ struct AppBootstrapView: View {
         let isUnitTestHost = isTestHost && !isUIAutomationHost
         let disableEagerUITestBootstrap = isUIAutomationHost && environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1"
         let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled
+        let isProposal016ProofHarness = Proposal016ExecutionTruthHarness.isEnabled
 
         let appConfigurationStore = AppConfigurationStore()
         let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
@@ -365,7 +379,7 @@ struct AppBootstrapView: View {
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
-        if !isUnitTestHost && !disableEagerUITestBootstrap && !isProposal007DogfoodHarness {
+        if !isUnitTestHost && !disableEagerUITestBootstrap && !isProposal007DogfoodHarness && !isProposal016ProofHarness {
             await gooseServerManager.bootstrap()
         }
         let liveRuntimeConfiguration = isUnitTestHost
@@ -426,6 +440,25 @@ struct AppBootstrapView: View {
                     print("Proposal 007 dogfood harness completed: \(result.exportPath)")
                 } catch {
                     print("Proposal 007 dogfood harness failed: \(error.localizedDescription)")
+                }
+
+                #if os(macOS)
+                NSApp.terminate(nil)
+                #endif
+            }
+        }
+
+        if isProposal016ProofHarness,
+           dogfoodHarnessStarted == false {
+            dogfoodHarnessStarted = true
+            Task { @MainActor in
+                let harness = Proposal016ExecutionTruthHarness(modelContext: modelContext)
+
+                do {
+                    let result = try await harness.runFromEnvironment()
+                    print("Proposal 016 proof harness completed: \(result.proofStatus)")
+                } catch {
+                    print("Proposal 016 proof harness failed: \(error.localizedDescription)")
                 }
 
                 #if os(macOS)
@@ -530,6 +563,13 @@ struct AppBootstrapView: View {
                                 .environment(gooseServerManager)
                         case .accessibilityAudit:
                             UITestAccessibilityAuditSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .proposal016Proof:
+                            UITestProposal016ProofSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)

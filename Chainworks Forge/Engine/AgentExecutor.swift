@@ -21,7 +21,7 @@ protocol AgentExecutor: Sendable {
 // MARK: - ExecutionContext
 
 /// Context provided to an agent executor for a single task execution.
-struct ExecutionContext: Sendable {
+nonisolated struct ExecutionContext: Sendable {
     /// The run's workspace (paths, isolation boundaries).
     let workspace: RunWorkspace
     /// Preferred read-only project root for repo-backed runs before a writable worktree exists.
@@ -41,6 +41,8 @@ struct ExecutionContext: Sendable {
     let ideaBody: String
     /// Resolved provider binding frozen at run start.
     let providerBinding: ResolvedProviderBinding?
+    /// Optional catalog for contract/schema-aware prompt assembly.
+    let catalog: AgentCatalog?
 
     init(
         workspace: RunWorkspace,
@@ -51,7 +53,8 @@ struct ExecutionContext: Sendable {
         inputArtifacts: [String: Data],
         variables: [String: AnyCodableValue],
         ideaBody: String,
-        providerBinding: ResolvedProviderBinding?
+        providerBinding: ResolvedProviderBinding?,
+        catalog: AgentCatalog? = nil
     ) {
         self.workspace = workspace
         self.projectRoot = projectRoot
@@ -62,6 +65,7 @@ struct ExecutionContext: Sendable {
         self.variables = variables
         self.ideaBody = ideaBody
         self.providerBinding = providerBinding
+        self.catalog = catalog
     }
 }
 
@@ -69,7 +73,7 @@ struct ExecutionContext: Sendable {
 
 /// Result of an agent execution.
 /// Contains in-memory artifact data (ARCH-030: executor returns Data, not file URLs).
-struct AgentResult: Sendable {
+nonisolated struct AgentResult: Sendable {
     /// Output artifacts produced by the agent. Key: artifact name, Value: raw data.
     let outputs: [String: Data]
     /// Optional log snippet for display.

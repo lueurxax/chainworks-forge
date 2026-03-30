@@ -9,6 +9,7 @@ enum PreviewSupport {
         StageExecution.self,
         AgentExecution.self,
         Approval.self,
+        AggregateSettlementRecord.self,
         Artifact.self
     ])
 

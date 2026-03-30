@@ -10,6 +10,7 @@ struct ApprovalRequest: Identifiable, Sendable {
     let id: UUID
     let runID: UUID
     let stageID: String
+    let lineageID: String
     let stageLabel: String
     /// Artifact names available for review (§5.2, §8.2).
     let precedingArtifacts: [String]
@@ -89,6 +90,11 @@ final class WorkflowOrchestrator {
     private var liveAgentExecutionsByAgentID: [String: [AgentExecution]] = [:]
     /// Frozen provider bindings captured at run start.
     private let providerBindingsByAgentID: [String: ResolvedProviderBinding]
+    /// Frozen binding provenances captured at run start.
+    private let bindingProvenancesByAgentID: [String: FrozenBindingProvenance]
+    private var uniquenessGuard: ActiveExecutionUniquenessGuard {
+        ActiveExecutionUniquenessGuard(modelContext: modelContext)
+    }
 
     // MARK: - Delivery Integration (Proposal 007)
 
@@ -118,6 +124,7 @@ final class WorkflowOrchestrator {
         self.currentStateID = plan.initialStateID
         self.runtimeVariables = plan.variables
         self.providerBindingsByAgentID = Self.decodeProviderBindings(from: run.providerBindingSnapshotJSON)
+        self.bindingProvenancesByAgentID = Self.decodeBindingProvenances(from: run.bindingProvenanceJSON)
         configureLiveEventBridge()
     }
 
@@ -162,9 +169,25 @@ final class WorkflowOrchestrator {
 
     /// Resolve an approval (called from UI or ExecutionService).
     func resolveApproval(stageID: String, granted: Bool, comment: String? = nil) {
-        RuntimeDiagnostics.log("resolveApproval stageID=\(stageID) granted=\(granted)")
+        let lineageID = canonicalApprovalLineageID(for: stageID)
+            ?? canonicalWaitingApprovalStage(for: stageID)?.lineageID
+            ?? canonicalStageExecution(for: stageID)?.lineageID
+            ?? "\(stageID)::approval"
+        guard let approval = canonicalRequestedApproval(for: stageID, lineageID: lineageID) else { return }
+        resolveApproval(
+            approvalID: approval.id,
+            stageID: stageID,
+            lineageID: lineageID,
+            granted: granted,
+            comment: comment
+        )
+    }
+
+    func resolveApproval(approvalID: UUID, stageID: String, lineageID: String, granted: Bool, comment: String? = nil) {
+        RuntimeDiagnostics.log("resolveApproval stageID=\(stageID) lineageID=\(lineageID) granted=\(granted)")
         // Find or create the Approval record
-        let approval = run.approvals.first { $0.stageID == stageID && $0.decision == .requested }
+        let approval = run.approvals.first(where: { $0.id == approvalID })
+            ?? canonicalRequestedApproval(for: stageID, lineageID: lineageID)
         if let approval {
             approval.decision = granted ? .granted : .rejected
             approval.decidedAt = Date()
@@ -177,9 +200,12 @@ final class WorkflowOrchestrator {
             run.status = .running
 
             // Mark the stage execution as completed
-            if let stageExec = run.stageExecutions.first(where: { $0.stageID == stageID && $0.status == .waitingApproval }) {
+            if let stageExec = canonicalWaitingApprovalStage(for: stageID, lineageID: lineageID) {
                 stageExec.status = .completed
                 stageExec.completedAt = Date()
+                stageExec.settlementKind = .completed
+                stageExec.settledAt = stageExec.completedAt
+                stageExec.activeOwnerToken = nil
             }
 
             // Evaluate transitions from the approved state and resume
@@ -191,6 +217,13 @@ final class WorkflowOrchestrator {
             run.status = .cancelled
             isCancelled = true
             isRunning = false
+            if let stageExec = canonicalWaitingApprovalStage(for: stageID, lineageID: lineageID) {
+                stageExec.status = .blocked
+                stageExec.settlementKind = .blocked
+                stageExec.settledAt = Date()
+                stageExec.completedAt = stageExec.completedAt ?? stageExec.settledAt
+                stageExec.activeOwnerToken = nil
+            }
             onComplete?(false)
         }
     }
@@ -205,7 +238,7 @@ final class WorkflowOrchestrator {
 
         // Execute run_after_approval block if present
         if let runAfterApproval = state.runAfterApproval {
-            if let stageExec = run.stageExecutions.first(where: { $0.stageID == stageID }) {
+            if let stageExec = canonicalStageExecution(for: stageID) {
                 let success = await executeRunBlock(runAfterApproval, state: state, stageExec: stageExec)
                 if !success {
                     RuntimeDiagnostics.log("resumeAfterApproval runAfterApprovalFailed stageID=\(stageID)")
@@ -333,17 +366,7 @@ final class WorkflowOrchestrator {
     /// Execute a single state: run block, then check approval.
     private func executeState(_ state: ExecutableState) async -> StateResult {
         RuntimeDiagnostics.log("executeState begin stateID=\(state.id)")
-        // Create StageExecution lazily (ARCH-027)
-        let iteration = currentIteration(for: state.id)
-        let stageExec = StageExecution(
-            stageID: state.id,
-            label: state.label,
-            status: .running,
-            iteration: iteration,
-            attemptNumber: 1
-        )
-        stageExec.run = run
-        modelContext.insert(stageExec)
+        let stageExec = claimOrCreateStageExecution(for: state)
 
         // Proposal 007: Provision worktree before executing implementation states
         do {
@@ -352,6 +375,9 @@ final class WorkflowOrchestrator {
             RuntimeDiagnostics.log("executeState worktreeProvisioningFailed stateID=\(state.id) error=\(error.localizedDescription)")
             stageExec.status = .failed
             stageExec.completedAt = Date()
+            stageExec.settlementKind = .failed
+            stageExec.settledAt = stageExec.completedAt
+            stageExec.activeOwnerToken = nil
             stageExec.label = "\(state.label) — worktree provisioning failed: \(error.localizedDescription)"
             return .failed
         }
@@ -363,6 +389,9 @@ final class WorkflowOrchestrator {
                 RuntimeDiagnostics.log("executeState runBlockFailed stateID=\(state.id)")
                 stageExec.status = .failed
                 stageExec.completedAt = Date()
+                stageExec.settlementKind = .failed
+                stageExec.settledAt = stageExec.completedAt
+                stageExec.activeOwnerToken = nil
                 return .failed
             }
         }
@@ -370,20 +399,19 @@ final class WorkflowOrchestrator {
         // Check if approval is required
         if state.approvalRequired {
             stageExec.status = .waitingApproval
+            stageExec.activeOwnerToken = stageExec.activeOwnerToken ?? UUID().uuidString
             run.status = .waitingApproval
             isPaused = true
 
             // Create approval record
-            let approval = Approval(stageID: state.id)
-            approval.decision = .requested
-            approval.run = run
-            modelContext.insert(approval)
+            let approval = existingOrRestoredApproval(for: state, stageExec: stageExec)
 
             // Publish approval request with preceding artifact names (§5.2, §8.2)
             let request = ApprovalRequest(
                 id: approval.id,
                 runID: workspace.runID,
                 stageID: state.id,
+                lineageID: approval.lineageID ?? approvalLineageID(for: stageExec),
                 stageLabel: state.label,
                 precedingArtifacts: Array(producedArtifactNames.sorted()),
                 requestedAt: Date(),
@@ -401,6 +429,9 @@ final class WorkflowOrchestrator {
                 RuntimeDiagnostics.log("executeState runAfterApprovalFailed stateID=\(state.id)")
                 stageExec.status = .failed
                 stageExec.completedAt = Date()
+                stageExec.settlementKind = .failed
+                stageExec.settledAt = stageExec.completedAt
+                stageExec.activeOwnerToken = nil
                 return .failed
             }
         }
@@ -416,6 +447,9 @@ final class WorkflowOrchestrator {
                 handleLoopBudgetExhausted(state: state, counter: loop.counter, count: newCount)
                 stageExec.status = .completed
                 stageExec.completedAt = Date()
+                stageExec.settlementKind = .completed
+                stageExec.settledAt = stageExec.completedAt
+                stageExec.activeOwnerToken = nil
                 return .succeeded // Let transition evaluator decide next state
             }
 
@@ -425,6 +459,9 @@ final class WorkflowOrchestrator {
 
         stageExec.status = .completed
         stageExec.completedAt = Date()
+        stageExec.settlementKind = .completed
+        stageExec.settledAt = stageExec.completedAt
+        stageExec.activeOwnerToken = nil
         RuntimeDiagnostics.log("executeState completed stateID=\(state.id)")
         return .succeeded
     }
@@ -462,21 +499,11 @@ final class WorkflowOrchestrator {
             return false
         }
 
-        // Create AgentExecution lazily (ARCH-027)
-        let agentExec = AgentExecution(
-            agentID: agent.id,
-            agentTitle: agent.title,
-            taskName: task.task,
-            status: .running,
-            provider: agent.provider,
-            effort: agent.effort
+        let agentExec = claimOrCreateAgentExecution(
+            for: task,
+            agent: agent,
+            stageExec: stageExec
         )
-        // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
-        agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
-        agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
-
-        agentExec.stageExecution = stageExec
-        modelContext.insert(agentExec)
         registerLiveExecution(agentExec, for: agent.id)
 
         // Gather input artifacts
@@ -498,6 +525,14 @@ final class WorkflowOrchestrator {
                 rawErrorMessage: error.localizedDescription,
                 rawFinishEvent: nil
             )
+            persistAggregateSettlementIfNeeded(
+                task: task,
+                stageExec: stageExec,
+                agentExec: agentExec,
+                availableInputNames: [],
+                outputArtifactName: nil,
+                validationFailure: nil
+            )
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
         }
@@ -515,7 +550,8 @@ final class WorkflowOrchestrator {
             inputArtifacts: inputData,
             variables: runtimeVariables,
             ideaBody: run.idea?.body ?? "",
-            providerBinding: providerBindingsByAgentID[agent.id]
+            providerBinding: providerBindingsByAgentID[agent.id],
+            catalog: catalog
         )
 
         // Proposal 007 REQ-008 / REQ-011: Route release agents through ReleaseOpsCoordinator
@@ -556,6 +592,14 @@ final class WorkflowOrchestrator {
                 failedAgentExec: agentExec,
                 validationFailure: nil,
                 additionalEnvelopes: []
+            )
+            persistAggregateSettlementIfNeeded(
+                task: task,
+                stageExec: stageExec,
+                agentExec: agentExec,
+                availableInputNames: Array(inputData.keys),
+                outputArtifactName: nil,
+                validationFailure: nil
             )
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
@@ -657,6 +701,14 @@ final class WorkflowOrchestrator {
                         validationFailure: failureRecord,
                         additionalEnvelopes: envelopes
                     )
+                    persistAggregateSettlementIfNeeded(
+                        task: task,
+                        stageExec: stageExec,
+                        agentExec: agentExec,
+                        availableInputNames: Array(inputData.keys),
+                        outputArtifactName: artifacts.first(where: { $0.name == "proposal_review_summary" })?.name ?? task.outputs?.first,
+                        validationFailure: failureRecord
+                    )
 
                     unregisterLiveExecution(agentExec, for: agent.id)
                     return false
@@ -692,6 +744,14 @@ final class WorkflowOrchestrator {
                     run.totalCostCents = (run.totalCostCents ?? 0) + cost
                 }
                 agentExec.status = .completed
+                persistAggregateSettlementIfNeeded(
+                    task: task,
+                    stageExec: stageExec,
+                    agentExec: agentExec,
+                    availableInputNames: Array(inputData.keys),
+                    outputArtifactName: artifacts.first(where: { $0.name == "proposal_review_summary" })?.name ?? task.outputs?.first,
+                    validationFailure: nil
+                )
                 // Proposal 013 §8.2: Record compaction outcome truth
                 updateCompactionOutcome(agentExec: agentExec, succeeded: true)
             } catch {
@@ -713,6 +773,14 @@ final class WorkflowOrchestrator {
                     failedAgentExec: agentExec,
                     validationFailure: nil,
                     additionalEnvelopes: []
+                )
+                persistAggregateSettlementIfNeeded(
+                    task: task,
+                    stageExec: stageExec,
+                    agentExec: agentExec,
+                    availableInputNames: Array(inputData.keys),
+                    outputArtifactName: task.outputs?.first,
+                    validationFailure: nil
                 )
                 // Proposal 013 §8.2: Record compaction outcome truth
                 updateCompactionOutcome(agentExec: agentExec, succeeded: false)
@@ -744,6 +812,14 @@ final class WorkflowOrchestrator {
                         validationFailure: nil,
                         additionalEnvelopes: envelopes
                     )
+                    persistAggregateSettlementIfNeeded(
+                        task: task,
+                        stageExec: stageExec,
+                        agentExec: agentExec,
+                        availableInputNames: Array(inputData.keys),
+                        outputArtifactName: artifacts.first(where: { $0.name == "proposal_review_summary" })?.name ?? task.outputs?.first,
+                        validationFailure: nil
+                    )
                 } catch {
                     agentExec.logSnippet = mergedLogSnippet(
                         existing: agentExec.logSnippet,
@@ -757,8 +833,15 @@ final class WorkflowOrchestrator {
                     validationFailure: nil,
                     additionalEnvelopes: []
                 )
+                persistAggregateSettlementIfNeeded(
+                    task: task,
+                    stageExec: stageExec,
+                    agentExec: agentExec,
+                    availableInputNames: Array(inputData.keys),
+                    outputArtifactName: task.outputs?.first,
+                    validationFailure: nil
+                )
             }
-            agentExec.status = .failed
             agentExec.logSnippet = result.errorMessage
             // Proposal 013 §8.2: Record compaction outcome truth
             updateCompactionOutcome(agentExec: agentExec, succeeded: false)
@@ -783,6 +866,11 @@ final class WorkflowOrchestrator {
     private func decodeOutputEnvelopes(from agentExec: AgentExecution) -> [StructuredOutputEnvelope] {
         guard let data = agentExec.outputEnvelopesJSON else { return [] }
         return (try? JSONDecoder().decode([StructuredOutputEnvelope].self, from: data)) ?? []
+    }
+
+    private func decodedConsumedInputNames(for agentExec: AgentExecution) -> [String] {
+        guard let data = agentExec.consumedInputArtifactNamesJSON else { return [] }
+        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
     }
 
     private func mergedOutputEnvelopes(
@@ -843,6 +931,63 @@ final class WorkflowOrchestrator {
             recoverySnapshot: recoverySnapshot
         )
         stageExec.evidencePacketJSON = try? JSONEncoder().encode(evidencePacket)
+    }
+
+    private func persistAggregateSettlementIfNeeded(
+        task: AgentTask,
+        stageExec: StageExecution,
+        agentExec: AgentExecution,
+        availableInputNames: [String],
+        outputArtifactName: String?,
+        validationFailure: ValidationFailureRecord?
+    ) {
+        let declaredAggregateOutput = outputArtifactName == "proposal_review_summary"
+            ? outputArtifactName
+            : task.outputs?.first(where: { $0 == "proposal_review_summary" })
+        let isAggregateStep = task.task == "aggregate_proposal_reviews"
+            || declaredAggregateOutput == "proposal_review_summary"
+            || agentExec.isAggregateProposalReviewStep
+        guard isAggregateStep, let canonicalOutcome = agentExec.canonicalOutcome else { return }
+
+        let lineageID = stageExec.lineageID ?? stageLineageID(stageID: stageExec.stageID, iteration: stageExec.iteration)
+        stageExec.lineageID = lineageID
+
+        let requiredInputs = task.inputs ?? []
+        let availableSet = Set(availableInputNames)
+        let coverage = AggregateInputCoverage(
+            requiredInputs: requiredInputs,
+            availableInputs: requiredInputs.filter { availableSet.contains($0) },
+            missingInputs: requiredInputs.filter { !availableSet.contains($0) }
+        )
+
+        let descriptor = FetchDescriptor<AggregateSettlementRecord>()
+        let existing = (try? modelContext.fetch(descriptor))?.last(where: {
+            $0.stageExecutionID == stageExec.id && $0.aggregateStepID == task.task
+        })
+        let record = existing ?? AggregateSettlementRecord(
+            runID: run.id,
+            stageExecutionID: stageExec.id,
+            aggregateStepID: task.task,
+            lineageID: lineageID,
+            canonicalOutcome: canonicalOutcome
+        )
+
+        record.runID = run.id
+        record.stageExecutionID = stageExec.id
+        record.aggregateStepID = task.task
+        record.lineageID = lineageID
+        record.canonicalOutcome = canonicalOutcome
+        record.inputCoverageJSON = try? JSONEncoder().encode(coverage)
+        record.outputArtifactName = declaredAggregateOutput
+        record.validationFailureJSON = validationFailure.flatMap { try? JSONEncoder().encode($0) }
+            ?? stageExec.validationFailureJSON
+            ?? agentExec.validationFailureJSON
+        record.evidencePacketJSON = stageExec.evidencePacketJSON
+        record.settledAt = agentExec.settledAt ?? agentExec.completedAt ?? stageExec.settledAt ?? Date()
+
+        if existing == nil {
+            modelContext.insert(record)
+        }
     }
 
     // MARK: - Release Agent Execution (Proposal 007 REQ-008 / REQ-011)
@@ -1070,20 +1215,11 @@ final class WorkflowOrchestrator {
         for task in tasks {
             guard let agent = plan.agentBindings[task.agent] else { continue }
 
-            let agentExec = AgentExecution(
-                agentID: agent.id,
-                agentTitle: agent.title,
-                taskName: task.task,
-                status: .running,
-                provider: agent.provider,
-                effort: agent.effort
+            let agentExec = claimOrCreateAgentExecution(
+                for: task,
+                agent: agent,
+                stageExec: stageExec
             )
-            // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
-            agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
-            agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
-
-            agentExec.stageExecution = stageExec
-            modelContext.insert(agentExec)
             registerLiveExecution(agentExec, for: agent.id)
 
             taskAgentPairs.append((task, agent, agentExec))
@@ -1130,7 +1266,8 @@ final class WorkflowOrchestrator {
                     inputArtifacts: gatheredInputs,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? "",
-                    providerBinding: providerBindingsByAgentID[agent.id]
+                    providerBinding: providerBindingsByAgentID[agent.id],
+                    catalog: catalog
                 )
                 let executor = self.executor
                 pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(gatheredInputs.keys).sorted())
@@ -1169,7 +1306,6 @@ final class WorkflowOrchestrator {
             agentExec.completedAt = Date()
 
             guard let result = optResult, result.succeeded else {
-                agentExec.status = .failed
                 agentExec.logSnippet = optResult?.errorMessage ?? "Execution failed"
                 if let result = optResult {
                     applyExecutionTruth(from: result, to: agentExec)
@@ -1186,6 +1322,14 @@ final class WorkflowOrchestrator {
                         rawFinishEvent: nil
                     )
                 }
+                persistAggregateSettlementIfNeeded(
+                    task: pair.task,
+                    stageExec: stageExec,
+                    agentExec: agentExec,
+                    availableInputNames: decodedConsumedInputNames(for: agentExec),
+                    outputArtifactName: pair.task.outputs?.first,
+                    validationFailure: nil
+                )
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
@@ -1244,6 +1388,14 @@ final class WorkflowOrchestrator {
                     run.totalCostCents = (run.totalCostCents ?? 0) + cost
                 }
                 agentExec.status = .completed
+                persistAggregateSettlementIfNeeded(
+                    task: pair.task,
+                    stageExec: stageExec,
+                    agentExec: agentExec,
+                    availableInputNames: decodedConsumedInputNames(for: agentExec),
+                    outputArtifactName: artifacts.first(where: { $0.name == "proposal_review_summary" })?.name ?? pair.task.outputs?.first,
+                    validationFailure: nil
+                )
             } catch {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Output validation or persistence error: \(error.localizedDescription)"
@@ -1257,6 +1409,14 @@ final class WorkflowOrchestrator {
                     runtimeModel: agentExec.runtimeModel,
                     rawErrorMessage: error.localizedDescription,
                     rawFinishEvent: result.outcomeEnvelope?.rawFinishEvent
+                )
+                persistAggregateSettlementIfNeeded(
+                    task: pair.task,
+                    stageExec: stageExec,
+                    agentExec: agentExec,
+                    availableInputNames: decodedConsumedInputNames(for: agentExec),
+                    outputArtifactName: pair.task.outputs?.first,
+                    validationFailure: nil
                 )
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
@@ -1307,10 +1467,159 @@ final class WorkflowOrchestrator {
 
     // MARK: - Helpers
 
+    private func claimOrCreateStageExecution(for state: ExecutableState) -> StageExecution {
+        let iteration = currentIteration(for: state.id)
+        return uniquenessGuard.claimOrCreateStageExecution(
+            run: run,
+            stageID: state.id,
+            label: state.label,
+            iteration: iteration,
+            desiredStatus: .running
+        )
+    }
+
+    private func claimOrCreateAgentExecution(
+        for task: AgentTask,
+        agent: ResolvedAgent,
+        stageExec: StageExecution
+    ) -> AgentExecution {
+        let pendingRetries = stageExec.agentExecutions
+            .filter { $0.agentID == agent.id && $0.status == .pending }
+            .sorted(by: { lhs, rhs in
+                let lhsAttempt = lhs.agentAttemptNumber ?? 0
+                let rhsAttempt = rhs.agentAttemptNumber ?? 0
+                if lhsAttempt != rhsAttempt {
+                    return lhsAttempt < rhsAttempt
+                }
+                return lhs.startedAt < rhs.startedAt
+            })
+
+        if let pendingRetry = pendingRetries.last(where: { $0.taskName == task.task }) ?? pendingRetries.last {
+            pendingRetry.status = AgentStatus.running
+            pendingRetry.taskName = task.task
+            pendingRetry.provider = agent.provider
+            pendingRetry.effort = agent.effort
+            pendingRetry.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
+            pendingRetry.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
+            pendingRetry.resolvedBackendProfileID = agent.backendProfileID
+            return pendingRetry
+        }
+
+        let agentExec = AgentExecution(
+            agentID: agent.id,
+            agentTitle: agent.title,
+            taskName: task.task,
+            status: .running,
+            provider: agent.provider,
+            effort: agent.effort
+        )
+        agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
+        agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
+        agentExec.stageExecution = stageExec
+        modelContext.insert(agentExec)
+        return agentExec
+    }
+
+    private func canonicalActiveStageExecution(for stageID: String) -> StageExecution? {
+        run.stageExecutions
+            .filter { $0.stageID == stageID && Self.activeStageStatuses.contains($0.status) }
+            .sorted { lhs, rhs in
+                if lhs.iteration != rhs.iteration {
+                    return lhs.iteration < rhs.iteration
+                }
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.startedAt < rhs.startedAt
+            }
+            .last
+    }
+
+    private func canonicalWaitingApprovalStage(for stageID: String, lineageID: String? = nil) -> StageExecution? {
+        run.stageExecutions
+            .filter {
+                $0.stageID == stageID
+                    && $0.status == .waitingApproval
+                    && (lineageID == nil || $0.lineageID == lineageID)
+            }
+            .sorted { lhs, rhs in
+                if lhs.iteration != rhs.iteration {
+                    return lhs.iteration < rhs.iteration
+                }
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.startedAt < rhs.startedAt
+            }
+            .last
+    }
+
+    private func canonicalStageExecution(for stageID: String) -> StageExecution? {
+        run.stageExecutions
+            .filter { $0.stageID == stageID }
+            .sorted { lhs, rhs in
+                if lhs.iteration != rhs.iteration {
+                    return lhs.iteration < rhs.iteration
+                }
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.startedAt < rhs.startedAt
+            }
+            .last
+    }
+
+    private func canonicalRequestedApproval(for stageID: String, lineageID: String? = nil) -> Approval? {
+        let requested = run.approvals
+            .filter {
+                $0.stageID == stageID
+                    && $0.decision == .requested
+                    && (lineageID == nil || $0.lineageID == lineageID)
+            }
+            .sorted { $0.requestedAt < $1.requestedAt }
+        if let canonical = requested.last {
+            return canonical
+        }
+
+        guard let lineageID else { return nil }
+        return run.approvals
+            .filter { $0.lineageID == lineageID && $0.decision == .requested }
+            .sorted { $0.requestedAt < $1.requestedAt }
+            .last
+    }
+
+    private func stageLineageID(stageID: String, iteration: Int) -> String {
+        "\(stageID)::iteration:\(iteration)"
+    }
+
+    private func approvalLineageID(for stageExec: StageExecution) -> String {
+        "\(stageExec.lineageID ?? stageLineageID(stageID: stageExec.stageID, iteration: stageExec.iteration))::approval"
+    }
+
     private func currentIteration(for stageID: String) -> Int {
         guard !run.isDeleted, run.modelContext != nil else { return 1 }
-        let existing = run.stageExecutions.filter { $0.stageID == stageID }
-        return existing.count + 1
+        let existing = run.stageExecutions
+            .filter { $0.stageID == stageID }
+            .sorted { lhs, rhs in
+                if lhs.iteration != rhs.iteration {
+                    return lhs.iteration < rhs.iteration
+                }
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.startedAt < rhs.startedAt
+            }
+
+        guard let latest = existing.last else { return 1 }
+
+        switch latest.status {
+        case .pending, .ready, .running, .waitingApproval, .blocked:
+            // Resume/retry-in-place keeps the same logical iteration.
+            return latest.iteration
+        case .completed, .failed, .skipped:
+            // Re-entering a previously settled state starts a new logical iteration.
+            return latest.iteration + 1
+        }
     }
 
     private var currentWorkspace: RunWorkspace {
@@ -1338,6 +1647,9 @@ final class WorkflowOrchestrator {
 
     private func isApprovalGranted(for stageID: String) -> Bool {
         guard !run.isDeleted, run.modelContext != nil else { return false }
+        if let lineageID = canonicalApprovalLineageID(for: stageID) {
+            return run.approvals.contains { $0.lineageID == lineageID && $0.decision == .granted }
+        }
         return run.approvals.contains { $0.stageID == stageID && $0.decision == .granted }
     }
 
@@ -1362,7 +1674,9 @@ final class WorkflowOrchestrator {
             return false
         }
 
-        let approval = existingOrRestoredApproval(for: state)
+        let stageExec = canonicalWaitingApprovalStage(for: state.id) ?? claimOrCreateStageExecution(for: state)
+        uniquenessGuard.activateStageExecution(stageExec, run: run, desiredStatus: .waitingApproval)
+        let approval = existingOrRestoredApproval(for: state, stageExec: stageExec)
         isRunning = false
         isPaused = true
         currentStateID = stateID
@@ -1372,6 +1686,7 @@ final class WorkflowOrchestrator {
             id: approval.id,
             runID: workspace.runID,
             stageID: state.id,
+            lineageID: approval.lineageID ?? approvalLineageID(for: stageExec),
             stageLabel: state.label,
             precedingArtifacts: Array(producedArtifactNames.sorted()),
             requestedAt: approval.requestedAt,
@@ -1381,16 +1696,23 @@ final class WorkflowOrchestrator {
         return true
     }
 
-    private func existingOrRestoredApproval(for state: ExecutableState) -> Approval {
-        if let existing = run.approvals.first(where: { $0.stageID == state.id && $0.decision == .requested }) {
-            return existing
-        }
+    private func existingOrRestoredApproval(for state: ExecutableState, stageExec: StageExecution) -> Approval {
+        let lineageID = approvalLineageID(for: stageExec)
+        return uniquenessGuard.claimOrCreateRequestedApproval(
+            run: run,
+            stageID: state.id,
+            lineageID: lineageID
+        )
+    }
 
-        let approval = Approval(stageID: state.id)
-        approval.decision = .requested
-        approval.run = run
-        modelContext.insert(approval)
-        return approval
+    private func canonicalApprovalLineageID(for stageID: String) -> String? {
+        if let waiting = canonicalWaitingApprovalStage(for: stageID) {
+            return approvalLineageID(for: waiting)
+        }
+        if let stage = canonicalStageExecution(for: stageID) {
+            return approvalLineageID(for: stage)
+        }
+        return canonicalRequestedApproval(for: stageID)?.lineageID
     }
 
     private func gatherInputs(for task: AgentTask) -> [String: Data] {
@@ -1929,14 +2251,6 @@ final class WorkflowOrchestrator {
         rawFinishEvent: String? = nil,
         envelope: OutcomeEnvelope? = nil
     ) {
-        agentExec.canonicalOutcome = canonicalOutcome
-        agentExec.transportErrorKind = transportErrorKind
-        agentExec.providerStopReason = providerStopReason
-        agentExec.outputPresence = outputPresence
-        agentExec.runtimeProvider = runtimeProvider
-        agentExec.runtimeModel = runtimeModel
-        agentExec.settledAt = agentExec.completedAt ?? Date()
-
         let resolvedEnvelope = envelope ?? OutcomeEnvelope(
             canonicalOutcome: canonicalOutcome,
             transportErrorKind: transportErrorKind,
@@ -1945,12 +2259,30 @@ final class WorkflowOrchestrator {
             rawErrorMessage: rawErrorMessage,
             rawFinishEvent: rawFinishEvent
         )
-        agentExec.outcomeEnvelopeJSON = encodeOutcomeEnvelope(resolvedEnvelope)
+        ExecutionTruthSupport.persistTerminalTruth(
+            for: agentExec,
+            canonicalOutcome: canonicalOutcome,
+            transportErrorKind: transportErrorKind,
+            providerStopReason: providerStopReason,
+            outputPresence: outputPresence,
+            runtimeProvider: runtimeProvider,
+            runtimeModel: runtimeModel,
+            rawErrorMessage: rawErrorMessage,
+            rawFinishEvent: rawFinishEvent,
+            envelope: resolvedEnvelope,
+            frozenBindings: providerBindingsByAgentID,
+            frozenProvenances: bindingProvenancesByAgentID
+        )
     }
 
     private static func decodeProviderBindings(from data: Data?) -> [String: ResolvedProviderBinding] {
         guard let data else { return [:] }
         return (try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)) ?? [:]
+    }
+
+    private static func decodeBindingProvenances(from data: Data?) -> [String: FrozenBindingProvenance] {
+        guard let data else { return [:] }
+        return (try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data)) ?? [:]
     }
 
     private func mergedLogSnippet(existing: String?, result: String?) -> String? {
@@ -1966,6 +2298,8 @@ final class WorkflowOrchestrator {
         guard let result, !result.isEmpty else { return existing }
         return result
     }
+
+    private static let activeStageStatuses: Set<StageStatus> = [.running, .ready, .waitingApproval]
 
     private func encodeArtifactNameList(_ names: [String]) -> Data? {
         try? JSONEncoder().encode(names)

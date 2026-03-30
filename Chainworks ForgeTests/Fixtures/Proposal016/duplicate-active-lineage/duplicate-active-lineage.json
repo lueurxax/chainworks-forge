@@ -1,0 +1,25 @@
+{
+  "lineageID": "state_2_proposal_drafted::iteration:1",
+  "stages": [
+    {
+      "stageID": "state_2_proposal_drafted",
+      "label": "Proposal drafted",
+      "status": "running",
+      "iteration": 1,
+      "attemptNumber": 1,
+      "lineageID": "state_2_proposal_drafted::iteration:1",
+      "startedAt": 10,
+      "activeOwnerToken": "stale-owner"
+    },
+    {
+      "stageID": "state_2_proposal_drafted",
+      "label": "Proposal drafted",
+      "status": "running",
+      "iteration": 1,
+      "attemptNumber": 2,
+      "lineageID": "state_2_proposal_drafted::iteration:1",
+      "startedAt": 20,
+      "activeOwnerToken": null
+    }
+  ]
+}

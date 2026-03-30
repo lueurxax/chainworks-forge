@@ -34,12 +34,12 @@ struct ProviderSettingsView: View {
                     }
                 }
                 Section {
-                    Text("Provider Settings")
-                        .font(.title2.bold())
-                        .accessibilityIdentifier("provider-settings-title")
-                    Text("Use Goose-backed setup first for Codex and Claude. Treat raw paths and storage as advanced configuration, not the primary setup journey.")
-                        .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
+                    ForgeIdentityHeader(
+                        title: "Provider Settings",
+                        subtitle: "Use Goose-backed setup first for Codex and Claude. Treat raw paths and storage as advanced configuration, not the primary setup journey.",
+                        surfaceRole: .setupIdentity
+                    )
+                    .accessibilityIdentifier("provider-settings-title")
                     Button("Open First Run Wizard") {
                         showWizard = true
                     }
@@ -303,7 +303,7 @@ struct ProviderSettingsView: View {
                             Spacer()
                             StatusCapsule(
                                 text: provider.family.displayName,
-                                color: .blue,
+                                color: DesignTokens.Action.primary,
                                 size: .small
                             )
                         }
@@ -319,7 +319,7 @@ struct ProviderSettingsView: View {
                         if provider.family.gooseFirstPreferred && provider.transport != .gooseServer {
                             Label("Goose-first setup is preferred for this family", systemImage: "info.circle")
                                 .font(DesignTokens.Typography.micro)
-                                .foregroundStyle(.blue)
+                                .foregroundStyle(DesignTokens.Action.primary)
                         }
 
                         // Proposal 012 (L-12): Inline health with distinct states

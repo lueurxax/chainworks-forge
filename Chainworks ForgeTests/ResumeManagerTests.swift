@@ -11,7 +11,7 @@ struct ResumeManagerTests {
     let compiler: RunPlanCompiler
 
     init() throws {
-        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
+        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self])
         let config = ModelConfiguration("ResumeManagerTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
         context = container.mainContext
@@ -108,6 +108,7 @@ struct ResumeManagerTests {
     func classifyResumeableRun() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
         try context.save()
 
         let manager = ResumeManager(modelContext: context)
@@ -125,10 +126,221 @@ struct ResumeManagerTests {
         }
     }
 
+    @Test("Resume manager repairs duplicate active stage siblings before resume")
+    func repairsDuplicateActiveStageSiblingsBeforeResume() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
+
+        let older = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSinceNow: -60),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        older.run = run
+        context.insert(older)
+
+        let newer = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        newer.run = run
+        context.insert(newer)
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(actions.count == 1)
+        if case .resume = actions[0] {
+            #expect(true)
+        } else {
+            Issue.record("Expected repaired run to remain resumable")
+        }
+
+        #expect(older.lineageID == newer.lineageID)
+        #expect(older.status == .blocked)
+        #expect(older.settlementKind == .repaired)
+        #expect(older.settledAt != nil)
+        #expect(older.activeOwnerToken == nil)
+        #expect(newer.activeOwnerToken != nil)
+    }
+
+    @Test("Resume manager settles stale running stage when terminal agent truth already exists")
+    func settlesStaleRunningStageFromTerminalAgentTruth() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
+
+        let stage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSinceNow: -120),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let agent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSinceNow: -119),
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agent.canonicalOutcome = .failedAfterOutputValidation
+        agent.outputPresence = .durableOutput
+        agent.settledAt = Date(timeIntervalSinceNow: -118)
+        agent.completedAt = Date(timeIntervalSinceNow: -118)
+        agent.stageExecution = stage
+        context.insert(agent)
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        _ = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(stage.status == .failed)
+        #expect(stage.settlementKind == .failed)
+        #expect(stage.settledAt != nil)
+        #expect(stage.activeOwnerToken == nil)
+    }
+
+    @Test("Resume manager backfills deterministic legacy validation failure truth before repair")
+    func backfillsLegacyValidationFailureTruth() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
+
+        let stage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSinceNow: -120),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let agent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSinceNow: -119),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agent.completedAt = Date(timeIntervalSinceNow: -118)
+        agent.outputEnvelopesJSON = try JSONEncoder().encode([
+            StructuredOutputEnvelope(
+                outputName: "proposal_current",
+                agentID: "proposal_writer",
+                stageID: stage.stageID,
+                runID: run.id,
+                rawPayloadSize: 256,
+                rawPayloadPersisted: true,
+                contractID: "proposal_current_v1",
+                normalizedArtifactProduced: false,
+                provider: "anthropic",
+                model: "claude-opus-4.6",
+                effort: "high",
+                sessionID: "legacy-writer",
+                durationSeconds: 1.0
+            )
+        ])
+        agent.validationFailureJSON = try JSONEncoder().encode(
+            ValidationFailureRecord(
+                agentID: "proposal_writer",
+                stageID: stage.stageID,
+                runID: run.id,
+                outputResults: [],
+                failureSummary: "Validation failed after output generation",
+                failureClass: .outputContractMismatch,
+                contractMetadata: [],
+                rawOutputExists: true,
+                receiptExists: false,
+                transcriptExists: false,
+                recoveryRecommendation: RecoveryRecommendation(
+                    action: .retryFailedAgent,
+                    explanation: "Retry",
+                    source: .runtimePolicy
+                )
+            )
+        )
+        agent.stageExecution = stage
+        context.insert(agent)
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        _ = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(agent.canonicalOutcome == .failedAfterOutputValidation)
+        #expect(agent.outputPresence == .durableOutput)
+        #expect(agent.settledAt != nil)
+        #expect(stage.status == .failed)
+    }
+
+    @Test("Resume manager fails closed for legacy rows without deterministic outcome evidence")
+    func legacyRowsWithoutDeterministicEvidenceRequireExplicitDecision() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
+
+        let stage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSinceNow: -120),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let agent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSinceNow: -119),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agent.completedAt = Date(timeIntervalSinceNow: -118)
+        agent.stageExecution = stage
+        context.insert(agent)
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(run.runtimeTrustLevel == RuntimeBindingTrustLevel.unverifiable.rawValue)
+        #expect(agent.canonicalOutcome == nil)
+        #expect(actions.count == 1)
+        if case .needsDecision(_, let reason) = actions[0] {
+            #expect(reason.contains("legacy") || reason.contains("unverifiable"))
+        } else {
+            Issue.record("Expected explicit operator decision for legacy unverifiable row")
+        }
+    }
+
     @Test("Classify compiler version mismatch")
     func classifyCompilerVersionMismatch() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
         try context.save()
 
         let manager = ResumeManager(modelContext: context)
@@ -146,6 +358,7 @@ struct ResumeManagerTests {
     func sideEffectStageDetected() async throws {
         let (run, _, _) = try makeRunFromPlan()
         run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
 
         let stage = StageExecution(stageID: "commit_and_push", label: "Commit", status: .running)
         stage.run = run
@@ -160,6 +373,42 @@ struct ResumeManagerTests {
             #expect(reason.contains("side-effect"), "Should mention side-effect: \(reason)")
         } else if case .resume = actions[0] {
             // Also acceptable if no drift detected — the side-effect check is for running stages
+        }
+    }
+
+    @Test("Blocked run requires explicit decision instead of auto resume at launch")
+    func blockedRunRequiresExplicitDecision() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .blocked
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.serverVerified.rawValue
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(actions.count == 1)
+        if case .needsDecision(_, let reason) = actions[0] {
+            #expect(reason.contains("blocked runs are not auto-resumed"))
+        } else {
+            Issue.record("Expected blocked run to require manual decision")
+        }
+    }
+
+    @Test("Legacy running run requires explicit decision instead of auto resume at launch")
+    func legacyRunningRunRequiresExplicitDecision() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .running
+        run.runtimeTrustLevel = RuntimeBindingTrustLevel.unverifiable.rawValue
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(actions.count == 1)
+        if case .needsDecision(_, let reason) = actions[0] {
+            #expect(reason.contains("explicit operator resume"))
+        } else {
+            Issue.record("Expected legacy running run to require manual decision")
         }
     }
 
@@ -210,6 +459,103 @@ struct ResumeManagerTests {
         #expect(service.activeOrchestrators.count == 1)
 
         await service.cancelRun(runID: run.id)
+    }
+
+    @Test("ExecutionService manual resume after retry launches pending retry attempt")
+    func executionServiceManualResumeAfterRetryLaunchesPendingAttempt() async throws {
+        let workflow = try loadLiveWorkflow()
+        let catalog = try loadCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let refineStateID = "state_4_proposal_refined"
+
+        let idea = Idea(title: "Manual Recovery Retry", body: "Resume pending retry attempt")
+        context.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ManualRecoveryRetry-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+        run.status = .blocked
+
+        let stage = StageExecution(
+            stageID: refineStateID,
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSinceNow: -60),
+            status: .blocked,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        stage.lineageID = "\(refineStateID)::iteration:2"
+        stage.run = run
+        context.insert(stage)
+
+        let failedAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "refine_proposal",
+            startedAt: Date(timeIntervalSinceNow: -59),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        failedAgent.completedAt = Date(timeIntervalSinceNow: -58)
+        failedAgent.canonicalOutcome = .timedOutBeforeOutput
+        failedAgent.outputPresence = .none
+        failedAgent.logSnippet = "Execution timed out before output was produced"
+        failedAgent.stageExecution = stage
+        context.insert(failedAgent)
+        try context.save()
+
+        let recovery = RecoveryCoordinator(modelContext: context)
+        _ = try recovery.retryAgent(run: run, stageID: refineStateID, agentID: "proposal_writer")
+
+        let pendingRetry = try #require(stage.agentExecutions.first(where: { $0.agentAttemptNumber == 2 }))
+        #expect(pendingRetry.status == .pending)
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(),
+            catalog: catalog,
+            liveRuntimeConfiguration: LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://fixture.local")!,
+                apiKey: nil,
+                override: LiveExecutionOverride(
+                    enabled: true,
+                    provider: "claude_code",
+                    model: "fixture-model",
+                    effort: "high"
+                ),
+                transportMode: .fixtureProposalLoopSuccess,
+                transportAPI: .bespoke
+            )
+        )
+
+        try service.resumeRun(run: run, compiler: compiler, stageID: refineStateID)
+
+        await awaitCondition("Manual recovery should attach orchestrator and launch retry attempt", timeout: 5.0) {
+            service.orchestrator(for: run.id) != nil
+                && stage.agentExecutions.contains(where: { $0.agentAttemptNumber == 2 && $0.startedAt != nil && $0.status != .pending })
+        }
+
+        #expect(service.orchestrator(for: run.id) != nil)
+        let launchedRetry = try #require(stage.agentExecutions.first(where: { $0.agentAttemptNumber == 2 }))
+        #expect(launchedRetry.status != .pending)
     }
 
     // MARK: - Live Executor Routing
@@ -405,5 +751,103 @@ struct ResumeManagerTests {
         #expect(run.status == .waitingApproval)
         #expect(run.stageExecutions.count == 1, "Approval restore must not duplicate the waiting stage")
         #expect(service.orchestrator(for: run.id) != nil, "Resumed live run should still be attached to an orchestrator")
+    }
+
+    @Test("ExecutionService resume waiting approval repairs duplicate approval siblings before restore")
+    func executionServiceResumeWaitingApprovalRepairsDuplicateApprovals() async throws {
+        let workflow = try loadLiveWorkflow()
+        let catalog = try loadCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let idea = Idea(title: "Resume Approval Repair", body: "Duplicate gate repair")
+        context.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeApprovalRepair-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+        run.status = .waitingApproval
+
+        let olderStage = StageExecution(
+            stageID: "state_5_proposal_approval",
+            label: "Human approval: proposal quality",
+            startedAt: Date(timeIntervalSinceNow: -60),
+            status: .waitingApproval,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        olderStage.run = run
+        context.insert(olderStage)
+
+        let newerStage = StageExecution(
+            stageID: "state_5_proposal_approval",
+            label: "Human approval: proposal quality",
+            startedAt: Date(),
+            status: .waitingApproval,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        newerStage.run = run
+        context.insert(newerStage)
+
+        let olderApproval = Approval(stageID: "state_5_proposal_approval", decision: .requested)
+        olderApproval.requestedAt = Date(timeIntervalSinceNow: -60)
+        olderApproval.run = run
+        context.insert(olderApproval)
+
+        let newerApproval = Approval(stageID: "state_5_proposal_approval", decision: .requested)
+        newerApproval.requestedAt = Date()
+        newerApproval.run = run
+        context.insert(newerApproval)
+        try context.save()
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(),
+            catalog: catalog,
+            liveRuntimeConfiguration: LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://fixture.local")!,
+                apiKey: nil,
+                override: LiveExecutionOverride(
+                    enabled: true,
+                    provider: "claude_code",
+                    model: "fixture-model",
+                    effort: "high"
+                ),
+                transportMode: .fixtureProposalLoopSuccess,
+                transportAPI: .bespoke
+            )
+        )
+
+        service.resumeInterruptedRuns(compiler: compiler)
+
+        await awaitCondition("Duplicate approval repair should restore one pending approval", timeout: 3.0) {
+            service.pendingApprovalCount == 1
+        }
+
+        #expect(run.approvals.filter { $0.decision == .requested }.count == 1)
+        #expect(run.approvals.filter { $0.repairedAt != nil }.count == 1)
+        #expect(run.stageExecutions.filter { $0.status == .waitingApproval }.count == 1)
+        #expect(run.stageExecutions.filter { $0.settlementKind == .repaired }.count == 1)
+        #expect(olderApproval.lineageID == newerApproval.lineageID)
+        #expect(newerApproval.lineageID == "\(newerStage.lineageID ?? "")::approval")
+        #expect(newerStage.activeOwnerToken != nil)
+        #expect(olderStage.activeOwnerToken == nil)
     }
 }

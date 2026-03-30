@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 
 // MARK: - P005-OPS §7.4 + Proposal 008 §7.2: Recovery Sheet
 
@@ -37,7 +38,15 @@ struct RecoverySheet: View {
                     }
 
                     GroupBox("Runtime Trust") {
-                        RuntimeProvenanceBadge(trustLevel: context.trustSummary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            RuntimeProvenanceBadge(trustLevel: context.trustSummary)
+                            if let bindingSummary = context.bindingSummary {
+                                Text(bindingSummary)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
                     }
 
                     // Proposal 013 (§7.3): Evidence summary
@@ -74,7 +83,7 @@ struct RecoverySheet: View {
                             HStack {
                                 Image(systemName: suggested.systemImage)
                                     .font(.title3)
-                                    .foregroundStyle(.blue)
+                                    .foregroundStyle(DesignTokens.Action.primary)
                                 VStack(alignment: .leading) {
                                     Text(suggested.label)
                                         .font(.headline)
@@ -120,7 +129,7 @@ struct RecoverySheet: View {
                     // Proposal 008 (§7.2): Stage history disclosure
                     DisclosureGroup("Stage History", isExpanded: $showStageHistory) {
                         VStack(alignment: .leading, spacing: 4) {
-                            ForEach(run.stageExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { stage in
+                            ForEach(canonicalStageHistory) { stage in
                                 HStack {
                                     Image(systemName: stageStatusIcon(stage.status))
                                         .foregroundStyle(stageStatusColor(stage.status))
@@ -152,7 +161,7 @@ struct RecoverySheet: View {
                                 ForEach(receiptArtifacts) { receipt in
                                     HStack {
                                         Image(systemName: "doc.text.fill")
-                                            .foregroundStyle(.blue)
+                                            .foregroundStyle(DesignTokens.Action.primary)
                                             .frame(width: 20)
                                         VStack(alignment: .leading) {
                                             Text(receipt.name)
@@ -220,19 +229,32 @@ struct RecoverySheet: View {
         errorMessage = nil
 
         let coordinator = RecoveryCoordinator(modelContext: modelContext)
+        let compiler = RunPlanCompiler(modelContext: modelContext)
 
         do {
             switch action {
+            case .resumeRun(let stageID):
+                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
+                dismiss()
+
             case .retryAgent(let stageID, let agentID):
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
+                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
+                dismiss()
+
+            case .retryAggregateStep(let stageID):
+                _ = try coordinator.retryAggregateStep(run: run, stageID: stageID)
+                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
                 dismiss()
 
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
+                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
                 dismiss()
 
             case .resumeFromApprovalGate(let stageID):
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
+                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
                 dismiss()
 
             case .cloneRunFrozenSnapshot:
@@ -299,8 +321,12 @@ struct RecoverySheet: View {
     // Proposal 013 §7.2: Action explanation with reuse/re-execution/same-run-vs-clone semantics
     private func recoveryActionExplanation(_ action: RecoveryAction) -> String {
         switch action {
+        case .resumeRun(let stageID):
+            return "Re-attaches the existing run and continues '\(stageID)' using the already prepared pending work."
         case .retryAgent(_, let agentID):
             return "Retries only agent '\(agentID)' in the same run. Successful sibling outputs are reused."
+        case .retryAggregateStep(let stageID):
+            return "Retries only the aggregate review step in '\(stageID)'. Contract-valid reviewer outputs are reused."
         case .retryStage(let stageID):
             return "Re-executes the entire '\(stageID)' stage in the same run. All agents re-run."
         case .resumeFromApprovalGate:
@@ -334,5 +360,24 @@ struct RecoverySheet: View {
         case .skipped: return .gray
         case .pending, .ready: return .secondary
         }
+    }
+
+    private var canonicalStageHistory: [StageExecution] {
+        let grouped = Dictionary(grouping: run.stageExecutions) { stage in
+            stage.lineageID ?? "\(stage.stageID)::\(stage.iteration)"
+        }
+
+        return grouped.values.compactMap { stages in
+            stages.max { lhs, rhs in
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                if lhs.startedAt != rhs.startedAt {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+        }
+        .sorted { $0.startedAt < $1.startedAt }
     }
 }

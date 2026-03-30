@@ -1,6 +1,6 @@
 import Foundation
 
-struct StewardConfig: Codable, Hashable, Sendable {
+nonisolated struct StewardConfig: Codable, Hashable, Sendable {
     let schemaVersion: Int
     let windows: WindowConfig
     let thresholds: [String: ThresholdEntry]
@@ -12,7 +12,7 @@ struct StewardConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct WindowConfig: Codable, Hashable, Sendable {
+nonisolated struct WindowConfig: Codable, Hashable, Sendable {
     let observationWindowSize: Int
     let baselineWindowSize: Int
     let minimumWindowSize: Int
@@ -26,12 +26,12 @@ struct WindowConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct ThresholdEntry: Codable, Hashable, Sendable {
+nonisolated struct ThresholdEntry: Codable, Hashable, Sendable {
     let method: String
     let trigger: Double
 }
 
-struct TriggerConfig: Codable, Hashable, Sendable {
+nonisolated struct TriggerConfig: Codable, Hashable, Sendable {
     let postRunHook: PostRunHookConfig
     let onConfigChange: OnConfigChangeConfig
     let schedule: ScheduleConfig
@@ -43,7 +43,7 @@ struct TriggerConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct PostRunHookConfig: Codable, Hashable, Sendable {
+nonisolated struct PostRunHookConfig: Codable, Hashable, Sendable {
     let enabled: Bool
     let runInterval: Int
 
@@ -53,11 +53,11 @@ struct PostRunHookConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct OnConfigChangeConfig: Codable, Hashable, Sendable {
+nonisolated struct OnConfigChangeConfig: Codable, Hashable, Sendable {
     let enabled: Bool
 }
 
-struct ScheduleConfig: Codable, Hashable, Sendable {
+nonisolated struct ScheduleConfig: Codable, Hashable, Sendable {
     let enabled: Bool
     let cron: String
 }

@@ -135,8 +135,8 @@ final class EvidencePackBuilder {
         // 7. Agent execution detail
         let agentDetail = run.stageExecutions
             .sorted { $0.startedAt < $1.startedAt }
-            .flatMap { stage in
-                stage.agentExecutions.map { agent -> [String: Any] in
+            .reduce(into: [[String: Any]]()) { entries, stage in
+                entries += stage.agentExecutions.map { agent -> [String: Any] in
                     [
                         "stageID": stage.stageID,
                         "agentID": agent.agentID,

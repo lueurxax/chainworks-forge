@@ -17,7 +17,7 @@ struct WorkspaceIsolationTests {
     init() throws {
         let schema = Schema([
             Idea.self, Run.self, StageExecution.self,
-            AgentExecution.self, Approval.self, Artifact.self
+            AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self
         ])
         let config = ModelConfiguration("WorkspaceIsolationTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])

@@ -55,9 +55,12 @@ struct ReleaseGateView: View {
             HStack {
                 Image(systemName: "shippingbox.fill")
                     .font(.title2)
-                    .foregroundStyle(.orange)
-                Text("Manual Release Gate")
-                    .font(.title2.bold())
+                    .foregroundStyle(DesignTokens.Action.caution)
+                ForgeSectionHeader(
+                    title: "Manual Release Gate",
+                    subtitle: "Review context, receipts, and release destination before approving a repo-backed delivery handoff.",
+                    tint: DesignTokens.Action.caution
+                )
                 Spacer()
                 statusBadge
             }
@@ -128,7 +131,7 @@ struct ReleaseGateView: View {
             if focusProofEnabled {
                 Text("Focused: \(focusedTarget?.label ?? "None")")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     .padding(.top, 2)
                     .padding(.leading, 2)
                     .accessibilityIdentifier("release-gate-focus-order")
@@ -158,8 +161,7 @@ struct ReleaseGateView: View {
     private var releaseContextSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                Label("Release Context", systemImage: "doc.text")
-                    .font(.headline)
+                ForgeSectionHeader(title: "Release Context", systemImage: "doc.text")
 
                 LabeledContent("Workflow") {
                     Text(run.workflowTitle)
@@ -181,8 +183,7 @@ struct ReleaseGateView: View {
     private var reviewSummarySection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                Label("Review Summary", systemImage: "checklist")
-                    .font(.headline)
+                ForgeSectionHeader(title: "Review Summary", systemImage: "checklist")
 
                 reviewRow("Audit Report", artifactName: "audit_report", in: allArtifacts)
                 reviewRow("Security Report", artifactName: "security_report", in: allArtifacts)
@@ -232,8 +233,7 @@ struct ReleaseGateView: View {
         if let config = deliveryConfig {
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
-                    Label("Repository", systemImage: "arrow.triangle.branch")
-                        .font(.headline)
+                    ForgeSectionHeader(title: "Repository", systemImage: "arrow.triangle.branch")
 
                     LabeledContent("Repo") {
                         Text(config.repoIdentifier)
@@ -276,27 +276,26 @@ struct ReleaseGateView: View {
 
     @ViewBuilder
     private var diffStatAndSpendSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                Label("Change Summary", systemImage: "chart.bar.doc.horizontal")
-                    .font(.headline)
+            GroupBox {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForgeSectionHeader(title: "Change Summary", systemImage: "chart.bar.doc.horizontal")
 
                 let allArtifacts = run.stageExecutions
                     .flatMap(\.agentExecutions)
                     .flatMap(\.artifacts)
 
                 // Diff stat
-                if let changedFiles = allArtifacts.first(where: { $0.name == "changed_files_manifest" }) {
+                if allArtifacts.contains(where: { $0.name == "changed_files_manifest" }) {
                     LabeledContent("Changed Files") {
                         Text("Available")
                             .font(.caption)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(DesignTokens.Status.success)
                     }
                 } else {
                     LabeledContent("Changed Files") {
                         Text("Not yet produced")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     }
                 }
 
@@ -320,7 +319,7 @@ struct ReleaseGateView: View {
                     } else {
                         Text("Estimated / unavailable")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     }
                 }
 
@@ -342,7 +341,7 @@ struct ReleaseGateView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Decision Context", systemImage: "doc.text.magnifyingglass")
-                    .font(.headline)
+                    .font(DesignTokens.Typography.sectionHeader)
 
                 let contextArtifacts: [(name: String, label: String, icon: String)] = [
                     ("approved_proposal", "Open Proposal", "doc.text"),
@@ -366,7 +365,7 @@ struct ReleaseGateView: View {
                                     Spacer()
                                     Image(systemName: "chevron.right")
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 }
                                 .font(.callout)
                             }
@@ -383,7 +382,7 @@ struct ReleaseGateView: View {
                                     Spacer()
                                     Image(systemName: "chevron.right")
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 }
                                 .font(.callout)
                             }
@@ -393,11 +392,11 @@ struct ReleaseGateView: View {
                     } else {
                         HStack {
                             Label(item.label, systemImage: item.icon)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             Spacer()
                             Text("—")
                                 .font(.caption)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(DesignTokens.Neutral.textTertiary)
                         }
                         .font(.callout)
                     }
@@ -415,22 +414,23 @@ struct ReleaseGateView: View {
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Release Target", systemImage: "shippingbox")
-                        .font(.headline)
+                        .font(DesignTokens.Typography.sectionHeader)
 
                     LabeledContent("Target") {
                         Text(config.releaseTargetLabel)
                     }
                     LabeledContent("Mode") {
-                        Text(config.releaseMode.rawValue.capitalized)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(config.releaseMode == .sandbox ? Color.blue.opacity(0.15) : Color.orange.opacity(0.15))
-                            .clipShape(Capsule())
+                        StatusCapsule(
+                            text: config.releaseMode.rawValue.capitalized,
+                            color: config.releaseMode == .sandbox ? DesignTokens.Action.primary : DesignTokens.Action.caution,
+                            size: .small,
+                            accessibilityIdentifier: "release-gate-release-mode"
+                        )
                     }
                     LabeledContent("Safety") {
                         Text("Dedicated worktree \u{00B7} Manual gate \u{00B7} Deterministic services")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
