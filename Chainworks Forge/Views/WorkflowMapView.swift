@@ -3,6 +3,7 @@ import SwiftData
 
 struct WorkflowMapView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
     @Environment(ExecutionService.self) private var executionService
 
     let run: Run
@@ -32,6 +33,25 @@ struct WorkflowMapView: View {
                     .accessibilityIdentifier("workflow-map-timeline")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(workflowStatusProofLabel(for: projection))
+            .accessibilityValue(accessibilitySettingsDescription)
+            .overlay(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityElement()
+                        .accessibilityLabel(workflowStatusProofLabel(for: projection))
+                        .accessibilityValue(accessibilitySettingsDescription)
+                        .accessibilityIdentifier("workflow-map-status-proof")
+
+                    ForEach(activeAccessibilitySettingIdentifiers, id: \.self) { identifier in
+                        Color.clear
+                            .frame(width: 1, height: 1)
+                            .accessibilityIdentifier(identifier)
+                    }
+                }
+            }
             .accessibilityIdentifier("workflow-map-view")
         } else {
             ContentUnavailableView(
@@ -41,6 +61,44 @@ struct WorkflowMapView: View {
             )
             .accessibilityIdentifier("workflow-map-view")
         }
+    }
+
+    private func workflowStatusProofLabel(for projection: WorkflowMapProjection) -> String {
+        let statuses = projection.stages
+            .map(\.status)
+            .map { $0.rawValue.replacingOccurrences(of: "_", with: " ").capitalized }
+        let uniqueStatuses = Array(NSOrderedSet(array: statuses)) as? [String] ?? statuses
+        return uniqueStatuses.isEmpty
+            ? "Workflow map has no stage statuses"
+            : "Workflow map stage statuses: \(uniqueStatuses.joined(separator: ", "))"
+    }
+
+    private var accessibilitySettingsDescription: String {
+        var modes: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            modes.append("differentiate without color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            modes.append("increase contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            modes.append("reduce transparency")
+        }
+        return modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
+    }
+
+    private var activeAccessibilitySettingIdentifiers: [String] {
+        var identifiers: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            identifiers.append("workflow-map-status-proof-differentiate-without-color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            identifiers.append("workflow-map-status-proof-increase-contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            identifiers.append("workflow-map-status-proof-reduce-transparency")
+        }
+        return identifiers
     }
 }
 
@@ -274,12 +332,20 @@ private struct WorkflowMapStatusBadge: View {
             accessibilityIdentifier: "workflow-map-status-\(status.rawValue)"
         )
         .overlay(alignment: .topLeading) {
-            Color.clear
-                .frame(width: 1, height: 1)
-                .accessibilityElement()
-                .accessibilityLabel(statusLabel)
-                .accessibilityValue(accessibilitySettingsDescription)
-                .accessibilityIdentifier("workflow-map-status-\(status.rawValue)")
+            VStack(alignment: .leading, spacing: 1) {
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityElement()
+                    .accessibilityLabel(statusLabel)
+                    .accessibilityValue(accessibilitySettingsDescription)
+                    .accessibilityIdentifier("workflow-map-status-\(status.rawValue)")
+
+                ForEach(activeAccessibilitySettingIdentifiers, id: \.self) { identifier in
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier(identifier)
+                }
+            }
         }
     }
 
@@ -312,6 +378,19 @@ private struct WorkflowMapStatusBadge: View {
             modes.append("reduce transparency")
         }
         return modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
+    }
+    private var activeAccessibilitySettingIdentifiers: [String] {
+        var identifiers: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            identifiers.append("workflow-map-status-\(status.rawValue)-differentiate-without-color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            identifiers.append("workflow-map-status-\(status.rawValue)-increase-contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            identifiers.append("workflow-map-status-\(status.rawValue)-reduce-transparency")
+        }
+        return identifiers
     }
 }
 

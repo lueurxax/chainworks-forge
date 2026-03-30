@@ -49,7 +49,7 @@ struct UITestWorkflowMapSurface: View {
         ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"]
     }
 
-    private var targetRun: Run? {
+    private func projectionBackedRun() -> Run? {
         let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
         let runs = (try? modelContext.fetch(descriptor)) ?? []
         if let seededIdeaTitle,
@@ -59,6 +59,19 @@ struct UITestWorkflowMapSurface: View {
         }
         if let projectionBackedRun = runs.first(where: { projection(for: $0) != nil }) {
             return projectionBackedRun
+        }
+        return nil
+    }
+
+    private var targetRun: Run? {
+        if let seededRun = projectionBackedRun() {
+            return seededRun
+        }
+        if ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DISABLE_WORKFLOW_MAP_SEED"] != "1" {
+            PreviewSupport.seedWorkflowMapPreviewData(context: modelContext)
+            if let seededRun = projectionBackedRun() {
+                return seededRun
+            }
         }
         return makeFallbackRun()
     }
