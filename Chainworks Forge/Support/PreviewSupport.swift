@@ -30,8 +30,8 @@ enum PreviewSupport {
             initialConfiguration: AppConfiguration(
                 runStorageBasePath: "/Users/user/Library/Application Support/Chainworks Forge/runs",
                 worktreeBasePath: "/Users/user/Library/Application Support/Chainworks Forge/worktrees",
-                workflowSourcePath: "/Users/user/Documents/Chainworks Forge/examples/workflows/workflow.yaml",
-                agentCatalogSourcePath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml",
+                workflowSourcePath: repoExampleURL("workflows/workflow.yaml").path,
+                agentCatalogSourcePath: repoExampleURL("agents/agents.yaml").path,
                 supportBundleExportPath: "/Users/user/Library/Application Support/Chainworks Forge/exports",
                 gooseServerHost: "127.0.0.1",
                 gooseServerPort: 51200,
@@ -220,8 +220,8 @@ enum PreviewSupport {
             workflowTitle: title,
             workflowSnapshotHash: snapshotBundle?.workflowHash ?? "workflow-hash-\(title)",
             catalogSnapshotHash: snapshotBundle?.catalogHash ?? "catalog-hash-\(title)",
-            workflowSourcePath: "/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml",
-            catalogSourcePath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml",
+            workflowSourcePath: repoExampleURL("workflows/proposal-loop-live.yaml").path,
+            catalogSourcePath: repoExampleURL("agents/agents.yaml").path,
             workflowSnapshotJSON: snapshotBundle?.workflowData ?? Data("workflow".utf8),
             catalogSnapshotJSON: snapshotBundle?.catalogData ?? Data("catalog".utf8),
             workspaceRoot: "/tmp/\(UUID().uuidString)",
@@ -280,8 +280,8 @@ enum PreviewSupport {
         workflowHash: String,
         catalogHash: String
     )? {
-        let workflowURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml")
-        let catalogURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml")
+        let workflowURL = repoExampleURL("workflows/proposal-loop-live.yaml")
+        let catalogURL = repoExampleURL("agents/agents.yaml")
 
         guard
             FileManager.default.isReadableFile(atPath: workflowURL.path),
@@ -395,8 +395,8 @@ enum PreviewSupport {
 
     @MainActor
     static func seedWorkflowMapPreviewData(context: ModelContext) {
-        let workflowURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml")
-        let catalogURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml")
+        let workflowURL = repoExampleURL("workflows/proposal-loop-live.yaml")
+        let catalogURL = repoExampleURL("agents/agents.yaml")
 
         guard
             FileManager.default.isReadableFile(atPath: workflowURL.path),
@@ -609,6 +609,40 @@ enum PreviewSupport {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try? encoder.encode(options)
+    }
+
+    private static func repoExampleURL(_ relativePath: String) -> URL {
+        let trimmedPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let fileManager = FileManager.default
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let candidateRoots: [URL] = [
+            URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true),
+            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true),
+            Bundle.main.bundleURL,
+            Bundle.main.bundleURL.deletingLastPathComponent(),
+            sourceRoot
+        ]
+
+        for root in candidateRoots {
+            let directCandidate = root.appendingPathComponent(trimmedPath)
+            if fileManager.isReadableFile(atPath: directCandidate.path) {
+                return directCandidate
+            }
+
+            let examplesCandidate = root
+                .appendingPathComponent("examples", isDirectory: true)
+                .appendingPathComponent(trimmedPath)
+            if fileManager.isReadableFile(atPath: examplesCandidate.path) {
+                return examplesCandidate
+            }
+        }
+
+        return URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples", isDirectory: true)
+            .appendingPathComponent(trimmedPath)
     }
 
     private static func mapStageStatus(from status: RunStatus) -> StageStatus {

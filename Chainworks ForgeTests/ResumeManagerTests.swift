@@ -224,6 +224,10 @@ struct ResumeManagerTests {
         try loadTestLiveWorkflow()
     }
 
+    private func loadFullMVPLiveWorkflow() throws -> WorkflowDefinition {
+        try loadTestFullMVPLiveWorkflow()
+    }
+
     @Test("ExecutionService uses live executor for live workflow")
     func executionServiceUsesLiveExecutorForLiveWorkflow() async throws {
         let workflow = try loadLiveWorkflow()
@@ -405,5 +409,90 @@ struct ResumeManagerTests {
         #expect(run.status == .waitingApproval)
         #expect(run.stageExecutions.count == 1, "Approval restore must not duplicate the waiting stage")
         #expect(service.orchestrator(for: run.id) != nil, "Resumed live run should still be attached to an orchestrator")
+    }
+
+    @Test("ExecutionService approval resolution persists decision for fresh context reads")
+    func executionServiceApprovalResolutionPersistsDecisionForFreshContextReads() async throws {
+        let workflow = try loadFullMVPLiveWorkflow()
+        let catalog = try loadCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let idea = Idea(title: "Persist Approval", body: "Approval should survive relaunch")
+        context.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PersistApproval-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+        run.status = .waitingApproval
+
+        let stageExec = StageExecution(
+            stageID: "state_3_initial_proposal_approval",
+            label: "Human approval: initial proposal matches intent",
+            status: .waitingApproval,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        stageExec.run = run
+        context.insert(stageExec)
+
+        let approval = Approval(stageID: "state_3_initial_proposal_approval", decision: .requested)
+        approval.run = run
+        context.insert(approval)
+        try context.save()
+
+        let executor = SimulatedAgentExecutor()
+        let service = ExecutionService(
+            modelContext: context,
+            executor: executor,
+            catalog: catalog,
+            liveRuntimeConfiguration: LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://fixture.local")!,
+                apiKey: nil,
+                override: LiveExecutionOverride(
+                    enabled: true,
+                    provider: "claude_code",
+                    model: "fixture-model",
+                    effort: "high"
+                ),
+                transportMode: .fixtureFullMVPSuccess,
+                transportAPI: .bespoke
+            )
+        )
+
+        service.resumeInterruptedRuns(compiler: compiler)
+        await awaitCondition("Pending approval should be restored", timeout: 3.0) {
+            service.pendingApprovalCount == 1
+        }
+
+        guard let requestID = service.pendingApprovals.keys.first else {
+            Issue.record("Expected pending approval request")
+            return
+        }
+
+        service.resolveApproval(approvalID: requestID, granted: true, comment: "persist now")
+
+        let freshContext = ModelContext(container)
+        let approvalFetch = FetchDescriptor<Approval>()
+        let fetchedApprovals = try freshContext.fetch(approvalFetch)
+        let fetchedApproval = try #require(fetchedApprovals.first(where: { $0.run?.id == run.id }))
+        #expect(fetchedApproval.decision == .granted)
+        #expect(fetchedApproval.decidedAt != nil)
     }
 }

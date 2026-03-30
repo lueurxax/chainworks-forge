@@ -255,7 +255,45 @@ final class GooseSessionBridge: Sendable {
                 parts.append("- \(output)")
             }
             parts.append("")
+            parts.append("Use the exact filenames listed above.")
+            parts.append("Do not add file extensions like .md, .txt, or .json unless the filename above already includes that extension.")
             parts.append("Output directory: \(context.workspace.artifactRoot.path)/\(context.stageID).\(context.iteration)/\(agent.id)/\(context.attemptNumber)/")
+        }
+
+        if agent.outputContract == "proposal_review_v1" || agent.outputContract == "proposal_review_summary_v1" {
+            parts.append("")
+            parts.append("### Structured Output Requirements")
+            parts.append("Each required output file must contain exactly one top-level JSON object and nothing else.")
+            parts.append("Do not write markdown, tables, headings, fences, narrative prose, or companion files unless they are explicitly listed as required outputs.")
+            parts.append("If you want to explain the review, put that explanation inside JSON fields required by the contract.")
+
+            if agent.outputContract == "proposal_review_v1" {
+                parts.append("")
+                parts.append("#### Required Fields for proposal_review_v1:")
+                parts.append("- agent_id: String (use '\(agent.id)')")
+                parts.append("- role: String")
+                parts.append("- score: Number (0-10)")
+                parts.append("- decision: String")
+                parts.append("- verdict: String")
+                parts.append("- summary: String")
+                parts.append("- issues: Array of Strings")
+                parts.append("- blocking_issues: Array of Strings")
+                parts.append("- non_blocking_issues: Array of Strings")
+                parts.append("- suggestions: Array of Strings")
+                parts.append("- assumptions: Array of Strings")
+            } else if agent.outputContract == "proposal_review_summary_v1" {
+                parts.append("")
+                parts.append("#### Required Fields for proposal_review_summary_v1:")
+                parts.append("- pass: Boolean")
+                parts.append("- average_score: Number")
+                parts.append("- aggregate_score: Number")
+                parts.append("- min_individual_score: Number")
+                parts.append("- blocker_count: Integer")
+                parts.append("- summary: String")
+                parts.append("- required_changes: Array of Strings")
+                parts.append("- recurring_themes: Array of Strings")
+                parts.append("- decision: String")
+            }
         }
 
         // Stop condition

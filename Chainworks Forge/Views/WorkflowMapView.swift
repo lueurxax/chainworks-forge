@@ -3,6 +3,7 @@ import SwiftData
 
 struct WorkflowMapView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
     @Environment(ExecutionService.self) private var executionService
 
     let run: Run
@@ -32,7 +33,13 @@ struct WorkflowMapView: View {
                     .accessibilityIdentifier("workflow-map-timeline")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(workflowStatusProofLabel(for: projection))
+            .accessibilityValue(accessibilitySettingsDescription)
             .accessibilityIdentifier("workflow-map-view")
+            .overlay(alignment: .topLeading) {
+                workflowAccessibilityProofMarkers(for: projection)
+            }
         } else {
             ContentUnavailableView(
                 "Workflow Map Unavailable",
@@ -41,6 +48,64 @@ struct WorkflowMapView: View {
             )
             .accessibilityIdentifier("workflow-map-view")
         }
+    }
+
+    @ViewBuilder
+    private func workflowAccessibilityProofMarkers(for projection: WorkflowMapProjection) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel(workflowStatusProofLabel(for: projection))
+                .accessibilityValue(accessibilitySettingsDescription)
+                .accessibilityIdentifier("workflow-map-status-proof")
+
+            ForEach(activeAccessibilitySettingIdentifiers, id: \.self) { identifier in
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityElement()
+                    .accessibilityLabel(identifier.replacingOccurrences(of: "workflow-map-status-proof-", with: "").replacingOccurrences(of: "-", with: " "))
+                    .accessibilityIdentifier(identifier)
+            }
+        }
+        .allowsHitTesting(false)
+        .opacity(0.001)
+    }
+
+    private func workflowStatusProofLabel(for projection: WorkflowMapProjection) -> String {
+        let statuses = projection.stages.reduce(into: [String]()) { partialResult, stage in
+            let label = stage.status.rawValue
+                .replacingOccurrences(of: "_", with: " ")
+                .capitalized
+            if partialResult.contains(label) == false {
+                partialResult.append(label)
+            }
+        }
+
+        let summary = statuses.isEmpty ? "Unavailable" : statuses.joined(separator: ", ")
+        return "Workflow map stage statuses: \(summary)"
+    }
+
+    private var accessibilitySettingsDescription: String {
+        let activeModes = activeAccessibilitySettingIdentifiers.map {
+            $0.replacingOccurrences(of: "workflow-map-status-proof-", with: "")
+                .replacingOccurrences(of: "-", with: " ")
+        }
+        return activeModes.isEmpty ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
+    }
+
+    private var activeAccessibilitySettingIdentifiers: [String] {
+        var identifiers: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            identifiers.append("workflow-map-status-proof-differentiate-without-color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            identifiers.append("workflow-map-status-proof-increase-contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            identifiers.append("workflow-map-status-proof-reduce-transparency")
+        }
+        return identifiers
     }
 }
 
@@ -193,7 +258,7 @@ private struct WorkflowMapStageCard: View {
                     Text("\(loopTelemetry.current)/\(loopTelemetry.max)")
                         .font(.caption2)
                 }
-                .tint(loopTelemetry.exhausted ? .orange : .blue)
+                .tint(loopTelemetry.exhausted ? DesignTokens.Action.caution : DesignTokens.Action.primary)
             }
         }
         .padding(12)
@@ -201,11 +266,11 @@ private struct WorkflowMapStageCard: View {
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(.background)
-                .shadow(color: .black.opacity(0.04), radius: 4, y: 2)
+                .shadow(color: DesignTokens.Status.neutral.opacity(0.12), radius: 4, y: 2)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(stage.isCurrent ? Color.accentColor : isHovered ? Color.accentColor.opacity(0.5) : Color.secondary.opacity(0.18), lineWidth: stage.isCurrent ? 2 : isHovered ? 1.5 : 1)
+                .stroke(stage.isCurrent ? DesignTokens.Action.primary : isHovered ? DesignTokens.Action.primary.opacity(0.5) : DesignTokens.Status.neutral.opacity(0.18), lineWidth: stage.isCurrent ? 2 : isHovered ? 1.5 : 1)
         )
         // Proposal 012 (L-05): Hover effect and tap popover
         .onHover { hovering in
@@ -294,21 +359,21 @@ private struct WorkflowMapOccurrenceRow: View {
                 .lineLimit(1)
         }
         .padding(8)
-        .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(DesignTokens.Status.neutral.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var panelColor: Color {
         switch occurrence.state {
         case .thinking:
-            return .blue
+            return DesignTokens.Status.running
         case .completed:
-            return .green
+            return DesignTokens.Status.success
         case .notStarted, .ready, .waitingInput:
-            return .secondary
+            return DesignTokens.Status.neutral
         case .failed:
-            return .red
+            return DesignTokens.Status.error
         case .skipped:
-            return .gray
+            return DesignTokens.Status.neutral
         }
     }
 }
@@ -379,15 +444,15 @@ private struct WorkflowMapHandoffLedger: View {
     private func color(for kind: WorkflowMapEdgeKind) -> Color {
         switch kind {
         case .sequence:
-            return .blue
+            return DesignTokens.Action.primary
         case .fanout:
-            return .indigo
+            return DesignTokens.Status.running
         case .join:
-            return .green
+            return DesignTokens.Status.success
         case .transition:
-            return .secondary
+            return DesignTokens.Status.neutral
         case .loop:
-            return .orange
+            return DesignTokens.Action.caution
         }
     }
 }
@@ -425,19 +490,19 @@ private struct WorkflowMapAgentPanels: View {
                     WorkflowMapAgentPanel(
                         title: "Active",
                         icon: "bolt.fill",
-                        tint: .blue,
+                        tint: DesignTokens.Status.running,
                         occurrences: activeOccurrences
                     )
                     WorkflowMapAgentPanel(
                         title: "Completed",
                         icon: "checkmark.circle.fill",
-                        tint: .green,
+                        tint: DesignTokens.Status.success,
                         occurrences: completedOccurrences
                     )
                     WorkflowMapAgentPanel(
                         title: "Pending",
                         icon: "clock",
-                        tint: .secondary,
+                        tint: DesignTokens.Status.neutral,
                         occurrences: pendingOccurrences
                     )
                 }
@@ -475,7 +540,7 @@ private struct WorkflowMapAgentPanel: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(DesignTokens.Status.neutral.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 
@@ -512,7 +577,7 @@ private struct WorkflowMapLoopTelemetryView: View {
                                     Text(loop.exhausted ? "Budget reached" : "Budget available")
                                         .font(.caption)
                                 }
-                                .tint(loop.exhausted ? .orange : .blue)
+                                .tint(loop.exhausted ? DesignTokens.Action.caution : DesignTokens.Action.primary)
                             }
                         }
                     }
@@ -529,9 +594,31 @@ private struct WorkflowMapTimelineView: View {
 
     var body: some View {
         GroupBox("Live Timeline") {
-            if projection.liveTimeline.isEmpty {
+            if projection.liveTimeline.isEmpty, projection.persistedTimeline.isEmpty {
                 Text("No live timeline events are available for this run.")
                     .foregroundStyle(.secondary)
+            } else if projection.liveTimeline.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("No in-memory live stream is attached. Showing persisted checkpoints.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(projection.persistedTimeline.prefix(8))) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(entry.title)
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                Text(entry.timestamp, format: .dateTime.hour().minute().second())
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(entry.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(projection.liveTimeline.prefix(8))) { entry in

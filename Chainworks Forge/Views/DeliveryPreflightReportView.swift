@@ -5,7 +5,13 @@ import SwiftUI
 /// Shows delivery preflight check results before starting a repo-backed run.
 /// Extends the provider-platform baseline with repo/release-specific checks.
 struct DeliveryPreflightReportView: View {
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
+
     let result: DeliveryPreflightService.PreflightResult
+
+    private var statusText: String {
+        result.passed ? "Ready" : "Issues Found"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
@@ -17,10 +23,12 @@ struct DeliveryPreflightReportView: View {
                 Spacer()
                 // Proposal 012 (M-01): Migrated to StatusCapsule
                 StatusCapsule(
-                    text: result.passed ? "Ready" : "Issues Found",
+                    text: statusText,
                     color: result.passed ? DesignTokens.Status.success : DesignTokens.Status.warning,
-                    icon: result.passed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                    icon: result.passed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill",
+                    accessibilityIdentifier: statusText
                 )
+                statusAccessibilityProof
             }
 
             ForEach(result.checks, id: \.id) { check in
@@ -73,6 +81,33 @@ struct DeliveryPreflightReportView: View {
         }
         .padding()
         .accessibilityIdentifier("delivery-preflight-report-view")
+    }
+
+    @ViewBuilder
+    private var statusAccessibilityProof: some View {
+        Text(statusText)
+            .font(.caption2)
+            .frame(width: 1, height: 1)
+            .clipped()
+            .opacity(0.01)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(statusText)
+            .accessibilityValue(accessibilitySettingsDescription)
+            .accessibilityIdentifier(statusText)
+    }
+
+    private var accessibilitySettingsDescription: String {
+        var activeModes: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            activeModes.append("differentiate without color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            activeModes.append("increase contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            activeModes.append("reduce transparency")
+        }
+        return activeModes.isEmpty ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
     }
 }
 

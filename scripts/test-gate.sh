@@ -45,6 +45,22 @@ PROPOSAL_012_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
 )
 
+PROPOSAL_014_TESTS=(
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal014ShellBrandHeaderVisible"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal014ForegroundBannerVisible"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testApprovalGateViewSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testLiveRuntimeUnavailableShowsRecoveryGuidance"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsWizardFlowSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsExportSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testPilotReadinessRefreshSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testGooseAssistantSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testWorkflowMapSurfaceShowsAfterRunStart"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testReleaseGateSurfaceShowsDecisionContextActions"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 
 log() {
@@ -98,12 +114,24 @@ default_codesign_keychain() {
 
 prepare_codesign_keychain() {
   local keychain password
+  local login_keychain system_keychain
+  local -a search_list
   keychain="$(default_codesign_keychain)"
   password="${CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD:-}"
+  login_keychain="$HOME/Library/Keychains/login.keychain-db"
+  system_keychain="/Library/Keychains/System.keychain"
 
   [[ -f "$keychain" ]] || return 0
 
-  security list-keychains -d user -s "$keychain" >/dev/null
+  search_list=("$keychain")
+  if [[ -f "$login_keychain" && "$login_keychain" != "$keychain" ]]; then
+    search_list+=("$login_keychain")
+  fi
+  if [[ -f "$system_keychain" ]]; then
+    search_list+=("$system_keychain")
+  fi
+
+  security list-keychains -d user -s "${search_list[@]}" >/dev/null
   security default-keychain -d user -s "$keychain" >/dev/null
 
   if [[ -z "$password" ]]; then
@@ -417,6 +445,7 @@ Available gates:
   fast            Guardrails + build + high-ROI unit/runtime tests
   ui-smoke        Focused operator-shell UI smoke tests
   proposal-006    Proposal 006 settings/provider/readiness gate
+  proposal-014    Proposal 014 design-system and brand adoption gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -510,6 +539,17 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     run_targeted_tests "proposal-012" "${PROPOSAL_012_TESTS[@]}"
+    ;;
+  proposal-014|p014)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    run_targeted_tests "proposal-014" "${PROPOSAL_014_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

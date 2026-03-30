@@ -212,14 +212,12 @@ enum OutputContractResolverV2 {
                     rawPayloadSize: data.count
                 )
             } else {
-                // structured_with_human_companion: JSON present but incomplete — still pass,
-                // the companion human output covers the gap (§4.3 Rule 2)
                 return OutputValidationResult(
                     outputName: name,
                     contractID: schema.contractID,
-                    status: .passed,
+                    status: .failed,
                     missingFields: missingFields,
-                    validationError: nil,
+                    validationError: "Missing required fields: \(missingFields.joined(separator: ", "))",
                     rawPayloadSize: data.count
                 )
             }
@@ -238,29 +236,12 @@ enum OutputContractResolverV2 {
             )
         }
 
-        // structured_with_human_companion (§4.3 Rule 2):
-        // If not JSON, accept non-empty human-readable text as the companion format.
-        // Per proposal: "If the app wants proposal reviews as markdown, the contract must say markdown."
-        // Since validation mode is structured_with_human_companion, markdown IS acceptable.
-        if let text = String(data: data, encoding: .utf8),
-           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return OutputValidationResult(
-                outputName: name,
-                contractID: schema.contractID,
-                status: .passed,
-                missingFields: [],
-                validationError: nil,
-                rawPayloadSize: data.count
-            )
-        }
-
-        // Empty or unreadable output
         return OutputValidationResult(
             outputName: name,
             contractID: schema.contractID,
             status: .failed,
             missingFields: schema.requiredFields,
-            validationError: "Output is neither valid JSON nor non-empty human-readable text",
+            validationError: "Output is not valid JSON or not a JSON object",
             rawPayloadSize: data.count
         )
     }
@@ -284,9 +265,9 @@ enum OutputContractResolverV2 {
         contractID: String,
         contract: ArtifactContract
     ) -> ValidationMode {
-        // Proposal reviews: structured with potential human companion
+        // Proposal review outputs are strict machine JSON.
         if contractID.hasPrefix("proposal_review") {
-            return .structuredWithHumanCompanion
+            return .strictStructured
         }
         // JSON contracts default to strict structured
         if contract.format == "json" {

@@ -231,6 +231,53 @@ struct GooseSessionBridgeTests {
         #expect(packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
+    @Test("Proposal review packet requires exact JSON artifact names")
+    func proposalReviewPacketRequiresExactJSONArtifactNames() {
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Proposal Reviewer / Architect",
+            mode: "review",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 16,
+            temperature: 0,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: nil,
+            prompt: "Review the proposal.",
+            outputContract: "proposal_review_v1",
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_architect"]
+        )
+        let task = AgentTask(agent: agent.id, task: "review_proposal", inputs: ["proposal_current"], outputs: ["proposal_review_architect"])
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            iteration: 2,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("proposal_review_architect"))
+        #expect(packet.taskDirective.contains("exact filenames"))
+        #expect(packet.taskDirective.contains("Do not add file extensions"))
+        #expect(packet.taskDirective.contains("top-level JSON object"))
+        #expect(packet.taskDirective.contains("Do not write markdown"))
+        #expect(packet.taskDirective.contains("Required Fields for proposal_review_v1:"))
+        #expect(packet.taskDirective.contains("agent_id: String (use 'proposal_reviewer_architect')"))
+        #expect(packet.taskDirective.contains("score: Number (0-10)"))
+    }
+
     @Test("Packet without input artifacts")
     func packetWithoutInputArtifacts() {
         let agent = makeAgent()

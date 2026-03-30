@@ -346,6 +346,7 @@ struct AppBootstrapView: View {
         let isTestHost = environment["XCTestConfigurationFilePath"] != nil
         let isUIAutomationHost = environment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
         let isUnitTestHost = isTestHost && !isUIAutomationHost
+        let forceLiveRuntimeUnavailable = environment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] == "1"
         let disableEagerUITestBootstrap = isUIAutomationHost && environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1"
         let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled
 
@@ -365,10 +366,10 @@ struct AppBootstrapView: View {
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
-        if !isUnitTestHost && !disableEagerUITestBootstrap && !isProposal007DogfoodHarness {
+        if !isUnitTestHost && !forceLiveRuntimeUnavailable && !disableEagerUITestBootstrap && !isProposal007DogfoodHarness {
             await gooseServerManager.bootstrap()
         }
-        let liveRuntimeConfiguration = isUnitTestHost
+        let liveRuntimeConfiguration = isUnitTestHost || forceLiveRuntimeUnavailable
             ? nil
             : Self.loadLiveRuntimeConfiguration(gooseServerManager: gooseServerManager)
         // The simulated executor remains the safe default, but Proposal 004 live runs

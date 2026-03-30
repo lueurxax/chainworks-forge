@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 
 // MARK: - P005-OPS §7.4 + Proposal 008 §7.2: Recovery Sheet
 
@@ -45,7 +46,7 @@ struct RecoverySheet: View {
                         GroupBox("Evidence") {
                             HStack {
                                 Image(systemName: "doc.text.magnifyingglass")
-                                    .foregroundStyle(.orange)
+                                    .foregroundStyle(DesignTokens.Status.warning)
                                 VStack(alignment: .leading) {
                                     Text(evidenceSummary)
                                         .font(.caption)
@@ -62,6 +63,7 @@ struct RecoverySheet: View {
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
+                                    .tint(DesignTokens.Action.primary)
                                 }
                             }
                         }
@@ -74,7 +76,7 @@ struct RecoverySheet: View {
                             HStack {
                                 Image(systemName: suggested.systemImage)
                                     .font(.title3)
-                                    .foregroundStyle(.blue)
+                                    .foregroundStyle(actionColor(suggested))
                                 VStack(alignment: .leading) {
                                     Text(suggested.label)
                                         .font(.headline)
@@ -87,6 +89,7 @@ struct RecoverySheet: View {
                                     executeAction(suggested)
                                 }
                                 .buttonStyle(.borderedProminent)
+                                .tint(actionColor(suggested))
                                 .disabled(isExecuting)
                             }
                         }
@@ -98,6 +101,7 @@ struct RecoverySheet: View {
                                 HStack {
                                     Image(systemName: action.systemImage)
                                         .frame(width: 24)
+                                        .foregroundStyle(actionColor(action))
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(action.label)
                                             .font(.callout)
@@ -111,6 +115,7 @@ struct RecoverySheet: View {
                                         executeAction(action)
                                     }
                                     .buttonStyle(.bordered)
+                                    .tint(actionColor(action))
                                     .disabled(isExecuting)
                                 }
                             }
@@ -128,13 +133,16 @@ struct RecoverySheet: View {
                                     Text(stage.label)
                                         .font(.caption)
                                     Spacer()
-                                    Text(stage.status.rawValue)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                    StatusCapsule(
+                                        text: stage.status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
+                                        color: stageStatusColor(stage.status),
+                                        size: .small,
+                                        accessibilityIdentifier: "recovery-stage-\(stage.id)-status"
+                                    )
                                     if stage.attemptNumber > 1 {
                                         Text("(attempt \(stage.attemptNumber))")
                                             .font(.caption2)
-                                            .foregroundStyle(.orange)
+                                            .foregroundStyle(DesignTokens.Status.warning)
                                     }
                                 }
                             }
@@ -152,7 +160,7 @@ struct RecoverySheet: View {
                                 ForEach(receiptArtifacts) { receipt in
                                     HStack {
                                         Image(systemName: "doc.text.fill")
-                                            .foregroundStyle(.blue)
+                                            .foregroundStyle(DesignTokens.Status.success)
                                             .frame(width: 20)
                                         VStack(alignment: .leading) {
                                             Text(receipt.name)
@@ -167,12 +175,12 @@ struct RecoverySheet: View {
                         }
                     }
 
-                    if let error = errorMessage {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .padding(.horizontal)
-                    }
+                if let error = errorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(DesignTokens.Status.error)
+                        .padding(.horizontal)
+                }
 
                 } else {
                     ProgressView("Loading recovery context...")
@@ -326,13 +334,22 @@ struct RecoverySheet: View {
 
     private func stageStatusColor(_ status: StageStatus) -> Color {
         switch status {
-        case .completed: return .green
-        case .failed: return .red
-        case .running: return .blue
-        case .waitingApproval: return .orange
-        case .blocked: return .red
-        case .skipped: return .gray
-        case .pending, .ready: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .running: return DesignTokens.Status.running
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .blocked: return DesignTokens.Status.error
+        case .skipped: return DesignTokens.Status.cancelled
+        case .pending, .ready: return DesignTokens.Status.neutral
+        }
+    }
+
+    private func actionColor(_ action: RecoveryAction) -> Color {
+        switch action {
+        case .resumeFromApprovalGate: return DesignTokens.Action.approve
+        case .retryAgent, .retryStage: return DesignTokens.Action.caution
+        case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
+        case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }
     }
 }

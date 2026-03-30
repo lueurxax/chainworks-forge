@@ -37,31 +37,31 @@ struct ForegroundBannerView: View {
     }
 
     private var bannerColor: Color {
-        if blockedCount > 0 || failedCount > 0 { return .red }
-        return .orange
+        if blockedCount > 0 || failedCount > 0 { return DesignTokens.Status.error }
+        return DesignTokens.Status.warning
     }
 
     var body: some View {
         if totalAttention > 0 {
             Button(action: onTap) {
-                HStack(spacing: 8) {
+                HStack(spacing: ForgeSpacing.small) {
                     Image(systemName: bannerIcon)
                         .foregroundStyle(.white)
                     Text(bannerText)
-                        .font(.caption.bold())
+                        .font(ForgeTypography.supporting.bold())
                         .foregroundStyle(.white)
                     Spacer()
                     Text("View in Runs Home →")
-                        .font(.caption2)
+                        .font(ForgeTypography.micro)
                         .foregroundStyle(.white.opacity(0.8))
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, ForgeSpacing.medium)
                 .padding(.vertical, 6)
                 .background(bannerColor.gradient)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .clipShape(RoundedRectangle(cornerRadius: ForgeRadius.card))
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 12)
+            .padding(.horizontal, ForgeSpacing.medium)
             .padding(.top, 4)
             // Proposal 012 (M-04): Banner is positioned at .bottom via overlay alignment,
             // so the transition must slide from the bottom edge, not the top.

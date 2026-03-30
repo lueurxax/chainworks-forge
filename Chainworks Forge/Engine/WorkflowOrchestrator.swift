@@ -1582,11 +1582,12 @@ final class WorkflowOrchestrator {
             try requireString(json["decision"], field: "decision", agentID: agentID, contractID: contractID, outputName: outputName)
             try requireString(json["verdict"], field: "verdict", agentID: agentID, contractID: contractID, outputName: outputName)
             try requireString(json["summary"], field: "summary", agentID: agentID, contractID: contractID, outputName: outputName)
-            try requireArray(json["issues"], field: "issues", agentID: agentID, contractID: contractID, outputName: outputName)
-            try requireArray(json["blocking_issues"], field: "blocking_issues", agentID: agentID, contractID: contractID, outputName: outputName)
-            try requireArray(json["non_blocking_issues"], field: "non_blocking_issues", agentID: agentID, contractID: contractID, outputName: outputName)
-            try requireArray(json["suggestions"], field: "suggestions", agentID: agentID, contractID: contractID, outputName: outputName)
-            try requireArray(json["assumptions"], field: "assumptions", agentID: agentID, contractID: contractID, outputName: outputName)
+            // Allow empty arrays or nulls for these fields to avoid failures with codex-like models
+            if json["issues"] != nil { try requireArray(json["issues"], field: "issues", agentID: agentID, contractID: contractID, outputName: outputName) }
+            if json["blocking_issues"] != nil { try requireArray(json["blocking_issues"], field: "blocking_issues", agentID: agentID, contractID: contractID, outputName: outputName) }
+            if json["non_blocking_issues"] != nil { try requireArray(json["non_blocking_issues"], field: "non_blocking_issues", agentID: agentID, contractID: contractID, outputName: outputName) }
+            if json["suggestions"] != nil { try requireArray(json["suggestions"], field: "suggestions", agentID: agentID, contractID: contractID, outputName: outputName) }
+            if json["assumptions"] != nil { try requireArray(json["assumptions"], field: "assumptions", agentID: agentID, contractID: contractID, outputName: outputName) }
         case "proposal_review_summary_v1":
             try requireBool(json["pass"], field: "pass", agentID: agentID, contractID: contractID, outputName: outputName)
             try requireNumber(json["average_score"], field: "average_score", agentID: agentID, contractID: contractID, outputName: outputName)

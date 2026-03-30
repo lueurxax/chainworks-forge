@@ -77,79 +77,83 @@ struct ContentView: View {
     }
 
     private var tabShell: some View {
-        TabView(selection: $selectedTab) {
-            // P005-OPS §5: Primary operator landing surface
-            RunsHomeView()
-                .tabItem { Label("Runs Home", systemImage: "house") }
-                .tag(Tab.runsHome)
-                .accessibilityIdentifier("tab-runs-home")
+        VStack(spacing: 0) {
+            ShellBrandHeaderView()
 
-            IdeaListView()
-                .tabItem { Label("Ideas", systemImage: "lightbulb") }
-                .tag(Tab.ideas)
-                .accessibilityIdentifier("tab-ideas")
+            TabView(selection: $selectedTab) {
+                // P005-OPS §5: Primary operator landing surface
+                RunsHomeView()
+                    .tabItem { Label("Runs Home", systemImage: "house") }
+                    .tag(Tab.runsHome)
+                    .accessibilityIdentifier("tab-runs-home")
 
-            ApprovalInboxView()
-                .tabItem {
-                    Label("Approvals", systemImage: "checkmark.seal")
-                }
-                .tag(Tab.approvals)
-                .badge(executionService.pendingApprovalCount)
-                .accessibilityIdentifier("tab-approvals")
+                IdeaListView()
+                    .tabItem { Label("Ideas", systemImage: "lightbulb") }
+                    .tag(Tab.ideas)
+                    .accessibilityIdentifier("tab-ideas")
 
-            AgentCatalogView(
-                catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
-            )
-            .tabItem { Label("Agent Catalog", systemImage: "person.3") }
-            .tag(Tab.agentCatalog)
-            .accessibilityIdentifier("tab-agent-catalog")
+                ApprovalInboxView()
+                    .tabItem {
+                        Label("Approvals", systemImage: "checkmark.seal")
+                    }
+                    .tag(Tab.approvals)
+                    .badge(executionService.pendingApprovalCount)
+                    .accessibilityIdentifier("tab-approvals")
 
-            WorkflowInspectorView(
-                workflowURL: exampleFileURL(bundleName: "workflow", repoRelativePath: "examples/workflows/workflow.yaml"),
-                compactWorkflowURL: exampleFileURL(bundleName: "proposal-to-release", repoRelativePath: "examples/workflows/proposal-to-release.yaml"),
-                catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
-            )
-            .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
-            .tag(Tab.workflowInspector)
-            .accessibilityIdentifier("tab-workflow-inspector")
+                AgentCatalogView(
+                    catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
+                )
+                .tabItem { Label("Agent Catalog", systemImage: "person.3") }
+                .tag(Tab.agentCatalog)
+                .accessibilityIdentifier("tab-agent-catalog")
 
-            PilotReadinessView()
-                .tabItem { Label("Pilot Readiness", systemImage: "checkmark.shield") }
-                .tag(Tab.pilotReadiness)
-                .accessibilityIdentifier("tab-pilot-readiness")
+                WorkflowInspectorView(
+                    workflowURL: exampleFileURL(bundleName: "workflow", repoRelativePath: "examples/workflows/workflow.yaml"),
+                    compactWorkflowURL: exampleFileURL(bundleName: "proposal-to-release", repoRelativePath: "examples/workflows/proposal-to-release.yaml"),
+                    catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
+                )
+                .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
+                .tag(Tab.workflowInspector)
+                .accessibilityIdentifier("tab-workflow-inspector")
 
-            ProviderSettingsView()
-                .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
-                .tag(Tab.providerSettings)
-                .accessibilityIdentifier("tab-provider-settings")
+                PilotReadinessView()
+                    .tabItem { Label("Pilot Readiness", systemImage: "checkmark.shield") }
+                    .tag(Tab.pilotReadiness)
+                    .accessibilityIdentifier("tab-pilot-readiness")
+
+                ProviderSettingsView()
+                    .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
+                    .tag(Tab.providerSettings)
+                    .accessibilityIdentifier("tab-provider-settings")
+            }
+            // P005-OPS §10: Foreground banner as bottom overlay — avoids conflicting with macOS tab bar
+            .overlay(alignment: .bottom) {
+                ForegroundBannerView(
+                    waitingApprovalCount: executionService.pendingApprovalCount,
+                    blockedCount: executionService.blockedRunCount,
+                    failedCount: executionService.failedRunCount,
+                    onTap: { selectedTab = .runsHome }
+                )
+                .padding(.bottom, 8)
+            }
+            .task(id: forcedInitialTab?.rawValue ?? "default") {
+                guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
+                // UI tests need a deterministic landing tab even when macOS restores prior scene state.
+                selectedTab = forcedInitialTab
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab)) { notification in
+                guard
+                    let rawValue = notification.userInfo?["tab"] as? String,
+                    let tab = Tab(rawValue: rawValue)
+                else { return }
+                selectedTab = tab
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in
+                selectedTab = .runsHome
+            }
+            // Approval badge on Ideas tab when approvals are pending
+            .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
         }
-        // P005-OPS §10: Foreground banner as bottom overlay — avoids conflicting with macOS tab bar
-        .overlay(alignment: .bottom) {
-            ForegroundBannerView(
-                waitingApprovalCount: executionService.pendingApprovalCount,
-                blockedCount: executionService.blockedRunCount,
-                failedCount: executionService.failedRunCount,
-                onTap: { selectedTab = .runsHome }
-            )
-            .padding(.bottom, 8)
-        }
-        .task(id: forcedInitialTab?.rawValue ?? "default") {
-            guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
-            // UI tests need a deterministic landing tab even when macOS restores prior scene state.
-            selectedTab = forcedInitialTab
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab)) { notification in
-            guard
-                let rawValue = notification.userInfo?["tab"] as? String,
-                let tab = Tab(rawValue: rawValue)
-            else { return }
-            selectedTab = tab
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in
-            selectedTab = .runsHome
-        }
-        // Approval badge on Ideas tab when approvals are pending
-        .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
     }
 
     @ViewBuilder
@@ -176,6 +180,43 @@ struct ContentView: View {
         case .accessibilityAudit:
             UITestAccessibilityAuditSurface()
         }
+    }
+}
+
+private struct ShellBrandHeaderView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+            HStack(alignment: .firstTextBaseline, spacing: DesignTokens.Spacing.small) {
+                ForgeIconBridge.brandHorizontalLogo()
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 150, height: 28)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Chainworks Forge")
+                        .font(DesignTokens.Typography.cardTitle)
+                        .accessibilityIdentifier("shell-brand-title")
+                    Text("Bounded adopter shell")
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("shell-brand-subtitle")
+                }
+                Spacer(minLength: 0)
+                StatusCapsule(
+                    text: "Design system",
+                    color: DesignTokens.Action.primary,
+                    icon: "paintbrush.fill",
+                    size: .small,
+                    accessibilityIdentifier: "shell-brand-pill"
+                )
+            }
+        }
+        .padding(.horizontal, DesignTokens.Spacing.section)
+        .padding(.vertical, DesignTokens.Spacing.small)
+        .background(DesignTokens.Action.primary.opacity(0.05))
+        .overlay(Divider(), alignment: .bottom)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("shell-brand-header")
     }
 }
 

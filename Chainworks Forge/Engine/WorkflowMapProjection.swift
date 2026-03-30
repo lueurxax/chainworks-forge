@@ -51,6 +51,7 @@ struct WorkflowMapProjection: Sendable {
     let edges: [WorkflowMapEdge]
     let loops: [WorkflowMapLoopTelemetry]
     let liveTimeline: [LiveExecutionTimelineEntry]
+    let persistedTimeline: [WorkflowMapPersistedTimelineEntry]
 
     var activeOccurrences: [WorkflowMapOccurrenceProjection] {
         occurrences.filter { $0.state == .thinking }
@@ -83,6 +84,13 @@ struct WorkflowMapProjection: Sendable {
     var skippedOccurrences: [WorkflowMapOccurrenceProjection] {
         occurrences.filter { $0.state == .skipped }
     }
+}
+
+struct WorkflowMapPersistedTimelineEntry: Identifiable, Sendable {
+    let id: String
+    let title: String
+    let detail: String
+    let timestamp: Date
 }
 
 struct WorkflowMapStageProjection: Identifiable, Sendable {

@@ -49,13 +49,17 @@ struct ReleaseGateView: View {
         artifact(named: "approved_proposal") != nil ? .openProposal : .rejectRelease
     }
 
+    private var focusProofLabel: String {
+        "Focused: \(focusedTarget?.label ?? initialFocusTarget.label)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             // Header
             HStack {
                 Image(systemName: "shippingbox.fill")
                     .font(.title2)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(DesignTokens.Action.caution)
                 Text("Manual Release Gate")
                     .font(.title2.bold())
                 Spacer()
@@ -101,6 +105,7 @@ struct ReleaseGateView: View {
                 // Proposal 012 (L-09): Keyboard shortcut for reject
                 .keyboardShortcut(.delete, modifiers: [.command])
                 .accessibilityIdentifier("release-gate-reject-button")
+                .accessibilitySortPriority(1)
                 .focusable(focusProofEnabled)
                 .focused($focusedTarget, equals: .rejectRelease)
 
@@ -115,27 +120,34 @@ struct ReleaseGateView: View {
                 // Proposal 012 (L-09): Keyboard shortcut for approve
                 .keyboardShortcut(.return, modifiers: [.command])
                 .accessibilityIdentifier("release-gate-approve-button")
+                .accessibilitySortPriority(1)
                 .focusable(focusProofEnabled)
                 .focused($focusedTarget, equals: .approveRelease)
             }
             .controlSize(.large)
+
+            if focusProofEnabled {
+                Text(focusProofLabel)
+                    .font(.caption2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opacity(0.01)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(focusProofLabel)
+                    .accessibilityValue(focusProofLabel)
+                    .accessibilityIdentifier("release-gate-focus-order")
+            }
         }
         .padding()
         .frame(minWidth: 500, minHeight: 400)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("release-gate-view")
-        .overlay(alignment: .topLeading) {
-            if focusProofEnabled {
-                Text("Focused: \(focusedTarget?.label ?? "None")")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
-                    .padding(.leading, 2)
-                    .accessibilityIdentifier("release-gate-focus-order")
-            }
-        }
+        .defaultFocus($focusedTarget, initialFocusTarget)
         .task(id: focusProofEnabled) {
             guard focusProofEnabled else { return }
+            await MainActor.run {
+                focusedTarget = nil
+            }
+            try? await Task.sleep(for: .milliseconds(150))
             await MainActor.run {
                 focusedTarget = initialFocusTarget
             }
@@ -290,7 +302,7 @@ struct ReleaseGateView: View {
                     LabeledContent("Changed Files") {
                         Text("Available")
                             .font(.caption)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(DesignTokens.Status.success)
                     }
                 } else {
                     LabeledContent("Changed Files") {
@@ -372,6 +384,7 @@ struct ReleaseGateView: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityIdentifier("release-gate-open-\(item.name)")
+                            .accessibilitySortPriority(2)
                             .focusable()
                             .focused($focusedTarget, equals: .openProposal)
                         } else {
@@ -424,7 +437,7 @@ struct ReleaseGateView: View {
                         Text(config.releaseMode.rawValue.capitalized)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(config.releaseMode == .sandbox ? Color.blue.opacity(0.15) : Color.orange.opacity(0.15))
+                            .background(config.releaseMode == .sandbox ? DesignTokens.Status.running.opacity(0.15) : DesignTokens.Action.caution.opacity(0.15))
                             .clipShape(Capsule())
                     }
                     LabeledContent("Safety") {

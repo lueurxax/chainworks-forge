@@ -62,8 +62,10 @@ struct StatusCapsule: View {
 
     private var fontSize: Font {
         switch size {
-        case .small:  return .caption2
-        case .regular: return .caption2.bold()
+        case .small:
+            return ForgeTypography.statusCapsuleSmall
+        case .regular:
+            return ForgeTypography.statusCapsule
         }
     }
 
@@ -78,7 +80,7 @@ struct StatusCapsule: View {
         if isIncreasedContrast {
             return color.opacity(0.24)
         }
-        return color.opacity(DesignTokens.badgeBackgroundOpacity)
+        return color.opacity(ForgeColor.Badge.backgroundOpacity)
     }
 
     private var borderLineWidth: CGFloat {
@@ -144,14 +146,14 @@ struct StatusCapsule: View {
 #Preview("StatusCapsule Sizes") {
     VStack(spacing: 12) {
         HStack(spacing: 8) {
-            StatusCapsule(text: "Running", color: DesignTokens.Status.running, icon: "play.circle.fill", size: .small)
-            StatusCapsule(text: "Completed", color: DesignTokens.Status.success, icon: "checkmark.circle.fill", size: .small)
-            StatusCapsule(text: "Failed", color: DesignTokens.Status.error, icon: "xmark.circle.fill", size: .small)
+            StatusCapsule(text: "Running", color: ForgeStatusColor.running, icon: "play.circle.fill", size: .small)
+            StatusCapsule(text: "Completed", color: ForgeStatusColor.success, icon: "checkmark.circle.fill", size: .small)
+            StatusCapsule(text: "Failed", color: ForgeStatusColor.error, icon: "xmark.circle.fill", size: .small)
         }
         HStack(spacing: 8) {
-            StatusCapsule(text: "Awaiting Approval", color: DesignTokens.Status.warning, icon: "checkmark.seal")
-            StatusCapsule(text: "Blocked", color: DesignTokens.Status.error, icon: "exclamationmark.triangle.fill")
-            StatusCapsule(text: "Cancelled", color: DesignTokens.Status.cancelled)
+            StatusCapsule(text: "Awaiting Approval", color: ForgeStatusColor.warning, icon: "checkmark.seal")
+            StatusCapsule(text: "Blocked", color: ForgeStatusColor.error, icon: "exclamationmark.triangle.fill")
+            StatusCapsule(text: "Cancelled", color: ForgeStatusColor.cancelled)
         }
     }
     .padding()

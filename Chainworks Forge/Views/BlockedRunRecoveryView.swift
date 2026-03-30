@@ -44,11 +44,11 @@ struct BlockedRunRecoveryView: View {
 
         var tint: Color {
             switch self {
-            case .resume: return .green
-            case .retry: return .orange
-            case .clone: return .blue
-            case .cancel: return .red
-            case .undetermined: return .secondary
+            case .resume: return DesignTokens.Action.approve
+            case .retry: return DesignTokens.Action.caution
+            case .clone: return DesignTokens.Action.primary
+            case .cancel: return DesignTokens.Status.cancelled
+            case .undetermined: return DesignTokens.Status.neutral
             }
         }
     }
@@ -88,7 +88,7 @@ struct BlockedRunRecoveryView: View {
                 if let errorMessage {
                     Text(errorMessage)
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(DesignTokens.Status.error)
                         .padding(.top, 4)
                 }
             }
@@ -135,7 +135,13 @@ struct BlockedRunRecoveryView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    statusCapsule
+                    StatusCapsule(
+                        text: run.presentationStatusLabel,
+                        color: blockerColor,
+                        icon: blockerIcon,
+                        size: .small,
+                        accessibilityIdentifier: "blocked-run-status"
+                    )
                 }
 
                 Divider()
@@ -198,8 +204,13 @@ struct BlockedRunRecoveryView: View {
                     .font(.title2)
                     .foregroundStyle(recoveryPath.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Recovery Path: \(recoveryPath.rawValue)")
-                        .font(.headline)
+                    StatusCapsule(
+                        text: recoveryPath.rawValue,
+                        color: recoveryPath.tint,
+                        icon: recoveryPath.icon,
+                        size: .small,
+                        accessibilityIdentifier: "blocked-run-recovery-path"
+                    )
                     Text(recoveryPathDescription)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -231,7 +242,7 @@ struct BlockedRunRecoveryView: View {
                                     .frame(width: 10, height: 10)
                                 if index < sortedStages.count - 1 {
                                     Rectangle()
-                                        .fill(Color.secondary.opacity(0.3))
+                                        .fill(DesignTokens.Status.neutral.opacity(0.3))
                                         .frame(width: 2)
                                         .frame(maxHeight: .infinity)
                                 }
@@ -246,13 +257,12 @@ struct BlockedRunRecoveryView: View {
                                     Text(stage.label)
                                         .font(.subheadline.bold())
                                     Spacer()
-                                    Text(stage.status.rawValue)
-                                        .font(.caption2)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(stageColor(stage.status).opacity(0.15))
-                                        .foregroundStyle(stageColor(stage.status))
-                                        .clipShape(Capsule())
+                                    StatusCapsule(
+                                        text: stage.status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
+                                        color: stageColor(stage.status),
+                                        size: .small,
+                                        accessibilityIdentifier: "blocked-run-stage-\(stage.id)-status"
+                                    )
                                 }
                                 HStack(spacing: 12) {
                                     Text(stage.stageID)
@@ -271,7 +281,7 @@ struct BlockedRunRecoveryView: View {
                                         HStack(spacing: 4) {
                                             Image(systemName: "person.circle")
                                                 .font(.caption2)
-                                                .foregroundStyle(.red)
+                                                .foregroundStyle(DesignTokens.Status.error)
                                             Text("\(agent.agentTitle): \(agent.logSnippet ?? "no detail")")
                                                 .font(.caption2)
                                                 .foregroundStyle(.secondary)
@@ -298,8 +308,8 @@ struct BlockedRunRecoveryView: View {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(receiptArtifacts) { artifact in
                     HStack(spacing: 8) {
-                        Image(systemName: "doc.seal.fill")
-                            .foregroundStyle(.green)
+                        Image(systemName: "doc.text.fill")
+                            .foregroundStyle(DesignTokens.Status.success)
                             .font(.caption)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(artifact.name)
@@ -319,17 +329,17 @@ struct BlockedRunRecoveryView: View {
                             }
                         }
                         Spacer()
-                        Text(artifact.format.rawValue)
-                            .font(.caption2)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.1))
-                            .clipShape(Capsule())
+                        StatusCapsule(
+                            text: artifact.format.rawValue.uppercased(),
+                            color: DesignTokens.Status.neutral,
+                            size: .small,
+                            accessibilityIdentifier: "blocked-run-receipt-format-\(artifact.id)"
+                        )
                     }
                 }
             }
         } label: {
-            Label("Preserved Receipts (\(receiptArtifacts.count))", systemImage: "doc.seal")
+            Label("Preserved Receipts (\(receiptArtifacts.count))", systemImage: "doc.text")
         }
     }
 
@@ -345,7 +355,7 @@ struct BlockedRunRecoveryView: View {
                                 HStack(spacing: 6) {
                                     Image(systemName: "chevron.left.forwardslash.chevron.right")
                                         .font(.caption2)
-                                        .foregroundStyle(.blue)
+                                        .foregroundStyle(DesignTokens.Action.primary)
                                     Text(artifact.name)
                                         .font(.caption.monospaced())
                                     Spacer()
@@ -367,7 +377,7 @@ struct BlockedRunRecoveryView: View {
                                 HStack(spacing: 6) {
                                     Image(systemName: "testtube.2")
                                         .font(.caption2)
-                                        .foregroundStyle(.purple)
+                                        .foregroundStyle(DesignTokens.Status.neutral)
                                     Text(artifact.name)
                                         .font(.caption.monospaced())
                                     Spacer()
@@ -440,7 +450,7 @@ struct BlockedRunRecoveryView: View {
                         HStack(spacing: 12) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.title3)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(DesignTokens.Status.error)
                                 .frame(width: 28)
 
                             VStack(alignment: .leading, spacing: 2) {
@@ -514,26 +524,16 @@ struct BlockedRunRecoveryView: View {
 
     private var blockerColor: Color {
         switch run.status {
-        case .failed, .blocked: return .red
-        case .waitingApproval: return .orange
-        case .cancelled: return .gray
-        default: return .secondary
+        case .failed, .blocked: return DesignTokens.Status.error
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .cancelled: return DesignTokens.Status.cancelled
+        default: return DesignTokens.Status.neutral
         }
     }
 
     private var currentStageName: String {
         guard let stageID = run.currentStageID else { return "None" }
         return run.stageExecutions.first(where: { $0.stageID == stageID })?.label ?? stageID
-    }
-
-    private var statusCapsule: some View {
-        Text(run.presentationStatusLabel)
-            .font(.caption.bold())
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(blockerColor.opacity(0.15))
-            .foregroundStyle(blockerColor)
-            .clipShape(Capsule())
     }
 
     private var recoveryPathDescription: String {
@@ -712,22 +712,22 @@ struct BlockedRunRecoveryView: View {
 
     private func stageColor(_ status: StageStatus) -> Color {
         switch status {
-        case .completed: return .green
-        case .failed: return .red
-        case .running: return .blue
-        case .waitingApproval: return .orange
-        case .blocked: return .red
-        case .skipped: return .gray
-        case .pending, .ready: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .running: return DesignTokens.Status.running
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .blocked: return DesignTokens.Status.error
+        case .skipped: return DesignTokens.Status.cancelled
+        case .pending, .ready: return DesignTokens.Status.neutral
         }
     }
 
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
-        case .resumeFromApprovalGate: return .green
-        case .retryAgent, .retryStage: return .orange
-        case .cloneRunFrozenSnapshot: return .blue
-        case .cloneRunCurrentConfig: return .indigo
+        case .resumeFromApprovalGate: return DesignTokens.Action.approve
+        case .retryAgent, .retryStage: return DesignTokens.Action.caution
+        case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
+        case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }
     }
 

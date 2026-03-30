@@ -27,14 +27,14 @@ struct RunsHomeView: View {
             HStack(alignment: .firstTextBaseline, spacing: DesignTokens.Spacing.small) {
                 Text("Runs Home")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DesignTokens.Status.neutral)
                     .accessibilityIdentifier("runs-home-owner-ready")
 
                 Spacer(minLength: DesignTokens.Spacing.small)
 
                 Text(runsHomeAccessibilitySummary)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DesignTokens.Status.neutral)
                     .multilineTextAlignment(.trailing)
                     .accessibilityLabel(runsHomeAccessibilityLabel)
                     .accessibilityValue(runsHomeAccessibilityValue)
@@ -54,7 +54,7 @@ struct RunsHomeView: View {
                 if !waitingApprovalRuns.isEmpty {
                     Text("Waiting Approval")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(DesignTokens.Status.warning)
                         .accessibilityIdentifier("runs-home-section-waiting-approval")
 
                     Section {
@@ -73,7 +73,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Waiting Approval", systemImage: "checkmark.seal")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(DesignTokens.Status.warning)
                     }
                 }
 
@@ -95,7 +95,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Blocked", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.red)
+                            .foregroundStyle(DesignTokens.Status.error)
                     }
                 }
 
@@ -117,7 +117,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Running", systemImage: "play.fill")
-                            .foregroundStyle(.blue)
+                            .foregroundStyle(DesignTokens.Status.running)
                     }
                 }
 
@@ -139,7 +139,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Recently Completed", systemImage: "checkmark.circle")
-                            .foregroundStyle(.green)
+                            .foregroundStyle(DesignTokens.Status.success)
                     }
                 }
 
@@ -595,22 +595,22 @@ struct ParentIdeaArchiveBadge: View {
         if let latestRun = idea.latestRun {
             switch latestRun.presentationStatus {
             case .pending, .ready:
-                return .gray
+                return DesignTokens.Status.neutral
             case .running:
-                return .green
+                return DesignTokens.Status.running
             case .waitingApproval, .cancelling:
-                return .orange
+                return DesignTokens.Status.warning
             case .blocked:
-                return .yellow
+                return DesignTokens.Status.warning
             case .completed:
-                return .mint
+                return DesignTokens.Status.success
             case .failed:
-                return .red
+                return DesignTokens.Status.error
             case .cancelled:
-                return .gray
+                return DesignTokens.Status.cancelled
             }
         }
-        return .green
+        return DesignTokens.Status.success
     }
 }
 
@@ -822,13 +822,13 @@ struct RunDetailPanel: View {
 
     private func stageColor(_ status: StageStatus) -> Color {
         switch status {
-        case .completed: return .green
-        case .failed: return .red
-        case .running: return .blue
-        case .waitingApproval: return .orange
-        case .blocked: return .red
-        case .skipped: return .gray
-        case .pending, .ready: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .running: return DesignTokens.Status.running
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .blocked: return DesignTokens.Status.error
+        case .skipped: return DesignTokens.Status.neutral
+        case .pending, .ready: return DesignTokens.Status.neutral
         }
     }
 }

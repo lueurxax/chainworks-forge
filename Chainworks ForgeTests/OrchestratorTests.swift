@@ -1338,12 +1338,10 @@ struct OrchestratorTests {
 
         await orchestrator.start()
 
-        // Proposal 013 §4.3: structured_with_human_companion mode now accepts markdown reviews.
-        // Non-JSON review output ("not valid json") is treated as human companion text and PASSES validation.
-        // The run completes successfully because the human companion is accepted.
-        #expect(run.status == .completed)
+        // Proposal-review outputs are strict JSON. Markdown-only output must block the run.
+        #expect(run.status == .blocked || run.status == .failed)
         let agentExec = run.stageExecutions.first?.agentExecutions.first
-        #expect(agentExec?.status == .completed)
+        #expect(agentExec?.status == .failed)
         // Raw outputs are persisted as artifacts
         #expect(agentExec?.artifacts.isEmpty == false)
     }

@@ -39,8 +39,7 @@ enum ProposalReviewContractAdapter {
     }
 
     /// Resolve the contract schema for a proposal review output.
-    /// Returns a schema with structured_with_human_companion validation mode,
-    /// meaning both machine JSON and human-readable companion are valid.
+    /// Proposal-review outputs are strict JSON machine artifacts.
     static func resolveReviewSchema(for outputName: String, catalog: AgentCatalog?) -> OutputContractSchemaV2? {
         guard isReviewOutput(outputName) || isReviewSummary(outputName) else { return nil }
 
@@ -51,13 +50,12 @@ enum ProposalReviewContractAdapter {
         return OutputContractSchemaV2.from(
             contractID: contractID,
             contract: contract,
-            validationMode: .structuredWithHumanCompanion
+            validationMode: .strictStructured
         )
     }
 
-    /// Validate a proposal review output, accepting both JSON and markdown.
-    /// Per §4.3: structured_with_human_companion mode must persist both
-    /// machine-valid structured output AND human-readable companion.
+    /// Validate a proposal review output.
+    /// Proposal-review outputs must be top-level JSON objects with all required fields.
     static func validateReviewOutput(
         outputName: String,
         data: Data,
@@ -99,25 +97,12 @@ enum ProposalReviewContractAdapter {
             }
         }
 
-        // If not JSON, check if it's markdown (human companion)
-        if let text = String(data: data, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Markdown companion is acceptable under structured_with_human_companion
-            return OutputValidationResult(
-                outputName: outputName,
-                contractID: schema.contractID,
-                status: .passed,
-                missingFields: [],
-                validationError: nil,
-                rawPayloadSize: data.count
-            )
-        }
-
         return OutputValidationResult(
             outputName: outputName,
             contractID: schema.contractID,
             status: .failed,
             missingFields: schema.requiredFields,
-            validationError: "Output is neither valid JSON nor non-empty text",
+            validationError: "Output is not valid JSON or not a JSON object",
             rawPayloadSize: data.count
         )
     }

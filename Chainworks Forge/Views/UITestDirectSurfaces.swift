@@ -57,10 +57,21 @@ struct UITestWorkflowMapSurface: View {
            projection(for: seededRun) != nil {
             return seededRun
         }
-        if let projectionBackedRun = runs.first(where: { projection(for: $0) != nil }) {
+        if let projectionBackedRun = projectionBackedRun(from: runs) {
             return projectionBackedRun
         }
+        if ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DISABLE_WORKFLOW_MAP_SEED"] != "1" {
+            PreviewSupport.seedWorkflowMapPreviewData(context: modelContext)
+            let refreshedRuns = (try? modelContext.fetch(descriptor)) ?? []
+            if let projectionBackedRun = projectionBackedRun(from: refreshedRuns) {
+                return projectionBackedRun
+            }
+        }
         return makeFallbackRun()
+    }
+
+    private func projectionBackedRun(from runs: [Run]) -> Run? {
+        runs.first(where: { projection(for: $0) != nil })
     }
 
     private func projection(for run: Run) -> WorkflowMapProjection? {
@@ -344,7 +355,7 @@ struct UITestReleaseGateSurface: View {
             Button("Release gate seeded") {}
                 .buttonStyle(.plain)
                 .font(.headline)
-                .accessibilityIdentifier("ui-test-release-gate-surface-ready")
+                .accessibilityIdentifier("ui-test-direct-surface-ready-release_gate")
 
             ReleaseGateView(
                 run: targetRun,
@@ -919,7 +930,7 @@ struct UITestProposal013EvidenceSurface: View {
                     outputName: "proposal_review_po",
                     contractID: "proposal_review_v1",
                     machineFormat: "json",
-                    validationMode: "structured_with_human_companion",
+                    validationMode: "strict_structured",
                     requiredFieldCount: 11
                 )
             ],
