@@ -146,6 +146,43 @@ struct LiveProposalWorkflowTests {
         #expect(variables["min_individual_proposal_score"] != nil)
     }
 
+    @Test("Review transitions use average score and blockers to loop back for refinement")
+    func liveWorkflowReviewTransitionUsesAverageScoreAndBlockers() throws {
+        let (_, catalog) = try loadLiveWorkflowAndCatalog()
+        let workflow = try loadTestLiveWorkflow()
+        let (_, modelContext) = try makeTestModelContainer()
+        let plan = try RunPlanCompiler(modelContext: modelContext).previewCompile(
+            workflow: workflow,
+            catalog: catalog
+        )
+
+        guard let reviewState = plan.states["state_3_proposal_reviewed"] else {
+            Issue.record("Missing state: state_3_proposal_reviewed")
+            return
+        }
+
+        let context = TransitionEvaluator.EvaluationContext(
+            producedArtifactNames: ["proposal_review_summary"],
+            approvalGranted: false,
+            variables: plan.variables,
+            artifactFields: [
+                "proposal_review_summary": [
+                    "average_score": .double(9.0),
+                    "aggregate_score": .int(36),
+                    "min_individual_score": .int(9),
+                    "blocker_count": .int(1)
+                ]
+            ]
+        )
+
+        let transition = TransitionEvaluator.evaluateFirst(
+            transitions: reviewState.transitions,
+            context: context
+        )
+
+        #expect(transition?.to == "state_4_proposal_refined")
+    }
+
     // MARK: - Receipt Builder Tests
 
     @Test("Receipt builder produces valid JSON")

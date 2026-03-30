@@ -57,7 +57,7 @@ struct UITestWorkflowMapSurface: View {
            projection(for: seededRun) != nil {
             return seededRun
         }
-        if let projectionBackedRun = runs.first(where: { projection(for: $0) != nil }) {
+        if let projectionBackedRun = projectionBackedRun(from: runs) {
             return projectionBackedRun
         }
         return nil
@@ -76,12 +76,34 @@ struct UITestWorkflowMapSurface: View {
         return makeFallbackRun()
     }
 
+    private func projectionBackedRun(from runs: [Run]) -> Run? {
+        runs.first(where: { projection(for: $0) != nil })
+    }
+
     private func projection(for run: Run) -> WorkflowMapProjection? {
         let service = WorkflowMapProjectionService(
             modelContext: modelContext,
             executionService: executionService
         )
         return service.projection(for: run)
+    }
+
+    private func workflowStatusProofLabel(for run: Run) -> String {
+        guard let projection = projection(for: run) else {
+            return "Workflow map stage statuses: Unavailable"
+        }
+
+        let statuses = projection.stages.reduce(into: [String]()) { partialResult, stage in
+            let label = stage.status.rawValue
+                .replacingOccurrences(of: "_", with: " ")
+                .capitalized
+            if partialResult.contains(label) == false {
+                partialResult.append(label)
+            }
+        }
+
+        let summary = statuses.isEmpty ? "Unavailable" : statuses.joined(separator: ", ")
+        return "Workflow map stage statuses: \(summary)"
     }
 
     private func makeFallbackRun() -> Run {
@@ -170,6 +192,12 @@ struct UITestWorkflowMapSurface: View {
                             Text("Status: \(targetRun.presentationStatusLabel)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            Text(workflowStatusProofLabel(for: targetRun))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(workflowStatusProofLabel(for: targetRun))
+                                .accessibilityIdentifier("workflow-map-view")
                         }
 
                         if hasProjection || isFallbackProjectionRun {
@@ -357,7 +385,7 @@ struct UITestReleaseGateSurface: View {
             Button("Release gate seeded") {}
                 .buttonStyle(.plain)
                 .font(.headline)
-                .accessibilityIdentifier("ui-test-release-gate-surface-ready")
+                .accessibilityIdentifier("ui-test-direct-surface-ready-release_gate")
 
             ReleaseGateView(
                 run: targetRun,
@@ -932,7 +960,7 @@ struct UITestProposal013EvidenceSurface: View {
                     outputName: "proposal_review_po",
                     contractID: "proposal_review_v1",
                     machineFormat: "json",
-                    validationMode: "structured_with_human_companion",
+                    validationMode: "strict_structured",
                     requiredFieldCount: 11
                 )
             ],

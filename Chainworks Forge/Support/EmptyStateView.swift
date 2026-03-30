@@ -1,47 +1,10 @@
 import SwiftUI
 
-// MARK: - Proposal 012 §4 / L-01: Standardised Empty State
-
-/// Wrapper around `ContentUnavailableView` that applies
-/// consistent icon sizing, multicolor rendering, and optional
-/// call-to-action.
-///
-/// Usage:
-/// ```
-/// StyledEmptyState(
-///     title: "No Runs",
-///     systemImage: "tray",
-///     description: "Start a run from the Ideas tab.",
-///     actionTitle: "Go to Ideas"
-/// ) { /* action */ }
-/// ```
-struct StyledEmptyState: View {
-    let title: String
-    let systemImage: String
-    var description: String?
-    var actionTitle: String?
-    var action: (() -> Void)?
-
-    var body: some View {
-        ContentUnavailableView {
-            Label(title, systemImage: systemImage)
-                .symbolRenderingMode(.multicolor)
-                .font(.system(size: 48))
-        } description: {
-            if let description {
-                Text(description)
-            }
-        } actions: {
-            if let actionTitle, let action {
-                Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
-            }
-        }
-    }
-}
-
-// MARK: - Preview
+// MARK: - Proposal 014 / Compatibility Facade
+//
+// `ForgeEmptyState` is the canonical shared primitive. This alias keeps the
+// current call sites working while the codebase migrates onto the Forge layer.
+typealias StyledEmptyState = ForgeEmptyState
 
 #Preview("StyledEmptyState — with action") {
     StyledEmptyState(

@@ -34,7 +34,7 @@ scoring:
   proposal:
     aggregate_formula: round((po.score + ux.score + ui.score + architect.score) / 4, 2)
     pass_when:
-      - aggregate_score > vars.proposal_score_target
+      - average_score > vars.proposal_score_target
       - min_individual_score >= vars.min_individual_proposal_score
       - blocker_count == 0
 
@@ -116,9 +116,9 @@ states:
       max: vars.max_proposal_revision_cycles
     transitions:
       - to: state_5_proposal_approval
-        when: "proposal_review_summary.aggregate_score > vars.proposal_score_target"
+        when: "proposal_review_summary.average_score > vars.proposal_score_target and proposal_review_summary.min_individual_score >= vars.min_individual_proposal_score and proposal_review_summary.blocker_count == 0"
       - to: state_4_proposal_refined
-        when: "'true'"
+        when: "proposal_review_summary.average_score <= vars.proposal_score_target or proposal_review_summary.min_individual_score < vars.min_individual_proposal_score or proposal_review_summary.blocker_count > 0"
 
   state_4_proposal_refined:
     label: Proposal refined

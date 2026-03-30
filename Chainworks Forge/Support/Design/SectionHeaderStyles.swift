@@ -4,13 +4,14 @@ struct ForgeSectionHeader: View {
     let title: String
     var subtitle: String? = nil
     var systemImage: String? = nil
+    var symbol: String? = nil
     var tint: Color = DesignTokens.Brand.forgeBlueSoft
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
             HStack(spacing: DesignTokens.Spacing.small) {
-                if let systemImage {
-                    Image(systemName: systemImage)
+                if let iconName = systemImage ?? symbol {
+                    Image(systemName: iconName)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(tint)
                 }

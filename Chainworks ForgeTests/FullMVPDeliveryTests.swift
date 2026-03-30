@@ -280,6 +280,39 @@ struct FullMVPWorkflowTests {
         #expect(implCriteria.contains { $0.contains("audit_report.status") })
         #expect(implCriteria.contains { $0.contains("security_report.status") })
     }
+
+    @Test("Full MVP review transitions loop to refinement when blockers remain despite high summed score")
+    func fullMVPReviewTransitionUsesAverageScoreAndBlockers() throws {
+        let workflow = try loadTestFullMVPLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        guard let reviewState = plan.states["state_4_proposal_reviewed"] else {
+            Issue.record("Missing state: state_4_proposal_reviewed")
+            return
+        }
+
+        let context = TransitionEvaluator.EvaluationContext(
+            producedArtifactNames: ["proposal_review_summary"],
+            approvalGranted: false,
+            variables: plan.variables,
+            artifactFields: [
+                "proposal_review_summary": [
+                    "average_score": .double(9.0),
+                    "aggregate_score": .int(36),
+                    "min_individual_score": .int(9),
+                    "blocker_count": .int(1)
+                ]
+            ]
+        )
+
+        let transition = TransitionEvaluator.evaluateFirst(
+            transitions: reviewState.transitions,
+            context: context
+        )
+
+        #expect(transition?.to == "state_5_proposal_refined")
+    }
 }
 
 // MARK: - Release Ops Tests (§13.1)

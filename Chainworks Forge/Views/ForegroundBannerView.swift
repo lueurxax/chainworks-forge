@@ -38,36 +38,38 @@ struct ForegroundBannerView: View {
 
     private var bannerColor: Color {
         if blockedCount > 0 || failedCount > 0 { return DesignTokens.Status.error }
-        return DesignTokens.Action.caution
+        return DesignTokens.Status.warning
     }
 
     var body: some View {
         if totalAttention > 0 {
-            Button(action: onTap) {
-                HStack(spacing: 8) {
-                    Image(systemName: bannerIcon)
-                        .foregroundStyle(.white)
-                    Text(bannerText)
-                        .font(DesignTokens.Typography.supporting.weight(.bold))
-                        .foregroundStyle(.white)
-                    Spacer()
-                    Text("View in Runs Home →")
-                        .font(DesignTokens.Typography.micro)
-                        .foregroundStyle(.white.opacity(0.8))
+            ZStack(alignment: .topLeading) {
+                Button(action: onTap) {
+                    HStack(spacing: ForgeSpacing.small) {
+                        Image(systemName: bannerIcon)
+                            .foregroundStyle(.white)
+                        Text(bannerText)
+                            .font(ForgeTypography.supporting.bold())
+                            .foregroundStyle(.white)
+                        Spacer()
+                        Text("View in Runs Home →")
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
+                    .padding(.horizontal, ForgeSpacing.medium)
+                    .padding(.vertical, 6)
+                    .background(bannerColor.gradient)
+                    .clipShape(RoundedRectangle(cornerRadius: ForgeRadius.card))
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.card, style: .continuous)
-                        .fill(LinearGradient(colors: [bannerColor, bannerColor.opacity(0.82)], startPoint: .leading, endPoint: .trailing))
-                )
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
+            .padding(.horizontal, ForgeSpacing.medium)
             .padding(.top, 4)
             // Proposal 012 (M-04): Banner is positioned at .bottom via overlay alignment,
             // so the transition must slide from the bottom edge, not the top.
             .transition(.move(edge: .bottom).combined(with: .opacity))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Foreground attention banner. \(bannerText)")
             .accessibilityIdentifier("foreground-attention-banner")
         }
     }

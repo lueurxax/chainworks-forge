@@ -16,12 +16,18 @@ enum PreviewSupport {
     private static func repoExampleURL(_ relativePath: String) -> URL {
         let fileManager = FileManager.default
         let trimmedPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let sourceFileURL = URL(fileURLWithPath: #filePath)
+        let sourceTargetRoot = sourceFileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceRepoRoot = sourceTargetRoot.deletingLastPathComponent()
         let candidateRoots: [URL] = [
             URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true),
             URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true),
             Bundle.main.bundleURL,
             Bundle.main.bundleURL.deletingLastPathComponent(),
-            URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            sourceTargetRoot,
+            sourceRepoRoot
         ]
 
         for root in candidateRoots {

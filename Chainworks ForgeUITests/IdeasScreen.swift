@@ -188,19 +188,28 @@ struct IdeasScreen {
     }
 
     @discardableResult
-    private func revealSidebarIfNeeded() -> Bool {
-        let toggleLabels = ["Show Sidebar", "Hide Sidebar", "Toggle Sidebar", "Show Navigation", "Hide Navigation"]
+    func revealSidebarIfNeeded() -> Bool {
+        let visibleSignals = [
+            app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "idea-list")).firstMatch,
+            app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-summary-chip-total")).firstMatch,
+            app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-summary-chip-active")).firstMatch,
+            app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@", "ideas-new-idea-inline")).firstMatch
+        ]
+        if visibleSignals.contains(where: \.exists) {
+            return true
+        }
 
-        for label in toggleLabels {
+        let revealLabels = ["Show Sidebar", "Show Navigation", "Toggle Sidebar"]
+        for label in revealLabels {
             let button = app.buttons[label].firstMatch
             if button.waitForExistence(timeout: 1), button.isHittable {
                 button.click()
                 RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-                return true
+                return visibleSignals.contains(where: \.exists)
             }
         }
 
-        return false
+        return visibleSignals.contains(where: \.exists)
     }
 
     /// Creates a test idea and returns true on success. Assumes tabs are already visible.
@@ -290,7 +299,20 @@ struct IdeasScreen {
         }
         guard startButton.exists else { return false }
         startButton.click()
-        return true
+        let sheetSignals = [
+            app.otherElements["execution-mode-list"].firstMatch,
+            app.otherElements["workflow-preset-list"].firstMatch,
+            app.buttons["workflow-start-run-confirm-button"].firstMatch,
+            app.otherElements["live-runtime-missing-block"].firstMatch
+        ]
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            if sheetSignals.contains(where: \.exists) {
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        return sheetSignals.contains(where: \.exists)
     }
 
     /// Scrolls a SwiftUI Form element into the hittable viewport.

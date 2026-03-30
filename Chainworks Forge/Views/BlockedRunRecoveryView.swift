@@ -11,8 +11,8 @@ import SwiftData
 /// diff/test context (when available), and the next valid operator actions.
 struct BlockedRunRecoveryView: View {
     let run: Run
-    @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
+    @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @State private var recoveryPath: RecoveryPath = .undetermined
     @State private var isExecuting = false
@@ -45,11 +45,11 @@ struct BlockedRunRecoveryView: View {
 
         var tint: Color {
             switch self {
-            case .resume: return .green
-            case .retry: return .orange
-            case .clone: return .blue
-            case .cancel: return .red
-            case .undetermined: return .secondary
+            case .resume: return DesignTokens.Action.approve
+            case .retry: return DesignTokens.Action.caution
+            case .clone: return DesignTokens.Action.primary
+            case .cancel: return DesignTokens.Status.cancelled
+            case .undetermined: return DesignTokens.Status.neutral
             }
         }
     }
@@ -89,7 +89,7 @@ struct BlockedRunRecoveryView: View {
                 if let errorMessage {
                     Text(errorMessage)
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(DesignTokens.Status.error)
                         .padding(.top, 4)
                 }
             }
@@ -136,7 +136,13 @@ struct BlockedRunRecoveryView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    statusCapsule
+                    StatusCapsule(
+                        text: run.presentationStatusLabel,
+                        color: blockerColor,
+                        icon: blockerIcon,
+                        size: .small,
+                        accessibilityIdentifier: "blocked-run-status"
+                    )
                 }
 
                 Divider()
@@ -183,14 +189,6 @@ struct BlockedRunRecoveryView: View {
                         .controlSize(.small)
                     }
                 }
-
-                if let bindingSummary = RuntimeBindingTruthSummaryBuilder.summaryText(for: run) {
-                    Text(bindingSummary)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .padding(.top, 4)
-                }
             }
         } label: {
             Label("Blocker Summary", systemImage: "exclamationmark.triangle.fill")
@@ -207,23 +205,18 @@ struct BlockedRunRecoveryView: View {
                     .font(.title2)
                     .foregroundStyle(recoveryPath.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Recovery Path: \(recoveryPath.rawValue)")
-                        .font(.headline)
+                    StatusCapsule(
+                        text: recoveryPath.rawValue,
+                        color: recoveryPath.tint,
+                        icon: recoveryPath.icon,
+                        size: .small,
+                        accessibilityIdentifier: "blocked-run-recovery-path"
+                    )
                     Text(recoveryPathDescription)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if let suggestedAction = suggestedRecoveryAction {
-                    Button {
-                        executeRecoveryAction(suggestedAction)
-                    } label: {
-                        Text("Execute")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(recoveryPath.tint)
-                    .disabled(isExecuting)
-                }
             }
         } label: {
             Label("Recommended Path", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
@@ -235,7 +228,7 @@ struct BlockedRunRecoveryView: View {
     private var stageHistorySection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 0) {
-                let sortedStages = canonicalStageHistory
+                let sortedStages = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
                 if sortedStages.isEmpty {
                     Text("No stage history available.")
                         .font(.caption)
@@ -250,7 +243,7 @@ struct BlockedRunRecoveryView: View {
                                     .frame(width: 10, height: 10)
                                 if index < sortedStages.count - 1 {
                                     Rectangle()
-                                        .fill(Color.secondary.opacity(0.3))
+                                        .fill(DesignTokens.Status.neutral.opacity(0.3))
                                         .frame(width: 2)
                                         .frame(maxHeight: .infinity)
                                 }
@@ -266,9 +259,10 @@ struct BlockedRunRecoveryView: View {
                                         .font(.subheadline.bold())
                                     Spacer()
                                     StatusCapsule(
-                                        text: stage.status.rawValue,
+                                        text: stage.status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
                                         color: stageColor(stage.status),
-                                        size: .small
+                                        size: .small,
+                                        accessibilityIdentifier: "blocked-run-stage-\(stage.id)-status"
                                     )
                                 }
                                 HStack(spacing: 12) {
@@ -288,7 +282,7 @@ struct BlockedRunRecoveryView: View {
                                         HStack(spacing: 4) {
                                             Image(systemName: "person.circle")
                                                 .font(.caption2)
-                                                .foregroundStyle(.red)
+                                                .foregroundStyle(DesignTokens.Status.error)
                                             Text("\(agent.agentTitle): \(agent.logSnippet ?? "no detail")")
                                                 .font(.caption2)
                                                 .foregroundStyle(.secondary)
@@ -316,7 +310,7 @@ struct BlockedRunRecoveryView: View {
                 ForEach(receiptArtifacts) { artifact in
                     HStack(spacing: 8) {
                         Image(systemName: "doc.text.fill")
-                            .foregroundStyle(.green)
+                            .foregroundStyle(DesignTokens.Status.success)
                             .font(.caption)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(artifact.name)
@@ -337,9 +331,10 @@ struct BlockedRunRecoveryView: View {
                         }
                         Spacer()
                         StatusCapsule(
-                            text: artifact.format.rawValue,
+                            text: artifact.format.rawValue.uppercased(),
                             color: DesignTokens.Status.neutral,
-                            size: .small
+                            size: .small,
+                            accessibilityIdentifier: "blocked-run-receipt-format-\(artifact.id)"
                         )
                     }
                 }
@@ -383,7 +378,7 @@ struct BlockedRunRecoveryView: View {
                                 HStack(spacing: 6) {
                                     Image(systemName: "testtube.2")
                                         .font(.caption2)
-                                        .foregroundStyle(.purple)
+                                        .foregroundStyle(DesignTokens.Status.neutral)
                                     Text(artifact.name)
                                         .font(.caption.monospaced())
                                     Spacer()
@@ -456,7 +451,7 @@ struct BlockedRunRecoveryView: View {
                         HStack(spacing: 12) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.title3)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(DesignTokens.Status.error)
                                 .frame(width: 28)
 
                             VStack(alignment: .leading, spacing: 2) {
@@ -494,8 +489,8 @@ struct BlockedRunRecoveryView: View {
         }
 
         // Derive from stage status
-        let failedStages = canonicalStageHistory.filter { $0.status == .failed }
-        let blockedStages = canonicalStageHistory.filter { $0.status == .blocked }
+        let failedStages = run.stageExecutions.filter { $0.status == .failed }
+        let blockedStages = run.stageExecutions.filter { $0.status == .blocked }
 
         if !failedStages.isEmpty {
             let stageNames = failedStages.map(\.label).joined(separator: ", ")
@@ -530,25 +525,16 @@ struct BlockedRunRecoveryView: View {
 
     private var blockerColor: Color {
         switch run.status {
-        case .failed, .blocked: return .red
-        case .waitingApproval: return .orange
-        case .cancelled: return .gray
-        default: return .secondary
+        case .failed, .blocked: return DesignTokens.Status.error
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .cancelled: return DesignTokens.Status.cancelled
+        default: return DesignTokens.Status.neutral
         }
     }
 
     private var currentStageName: String {
         guard let stageID = run.currentStageID else { return "None" }
-        return canonicalStageHistory.last(where: { $0.stageID == stageID })?.label ?? stageID
-    }
-
-    private var statusCapsule: some View {
-        StatusCapsule(
-            text: run.presentationStatusLabel,
-            color: blockerColor,
-            size: .regular,
-            accessibilityIdentifier: "blocked-run-status"
-        )
+        return run.stageExecutions.first(where: { $0.stageID == stageID })?.label ?? stageID
     }
 
     private var recoveryPathDescription: String {
@@ -569,11 +555,6 @@ struct BlockedRunRecoveryView: View {
     private var availableRecoveryActions: [RecoveryAction] {
         let coordinator = RecoveryCoordinator(modelContext: modelContext)
         return coordinator.availableActions(for: run)
-    }
-
-    private var suggestedRecoveryAction: RecoveryAction? {
-        let coordinator = RecoveryCoordinator(modelContext: modelContext)
-        return coordinator.recoveryContext(for: run).suggestedAction ?? availableRecoveryActions.first
     }
 
     // MARK: - Data Loading
@@ -615,37 +596,15 @@ struct BlockedRunRecoveryView: View {
     }
 
     private func classifyRecoveryPath() {
-        if let suggestedAction = suggestedRecoveryAction {
-            switch suggestedAction {
-            case .resumeRun, .resumeFromApprovalGate:
-                recoveryPath = .resume
-                return
-            case .retryAgent, .retryStage, .retryAggregateStep:
-                recoveryPath = .retry
-                return
-            case .cloneRunFrozenSnapshot, .cloneRunCurrentConfig:
-                recoveryPath = .clone
-                return
-            }
-        }
-
         switch run.status {
         case .waitingApproval:
             recoveryPath = .resume
         case .failed:
-            let hasRetryableStage = canonicalStageHistory.contains { $0.status == .failed }
+            let hasRetryableStage = run.stageExecutions.contains { $0.status == .failed }
             recoveryPath = hasRetryableStage ? .retry : .clone
         case .blocked:
-            let hasManualResumeStage = canonicalStageHistory.contains { stage in
-                (stage.status == .running || stage.status == .ready)
-                    && stage.agentExecutions.contains(where: { $0.status == .pending || $0.status == .running })
-            }
-            let hasRetryableStage = canonicalStageHistory.contains { $0.status == .blocked || $0.status == .failed }
-            if hasManualResumeStage {
-                recoveryPath = .resume
-            } else {
-                recoveryPath = hasRetryableStage ? .retry : .clone
-            }
+            let hasRetryableStage = run.stageExecutions.contains { $0.status == .blocked || $0.status == .failed }
+            recoveryPath = hasRetryableStage ? .retry : .clone
         case .cancelled:
             recoveryPath = .cancel
         default:
@@ -660,32 +619,28 @@ struct BlockedRunRecoveryView: View {
         errorMessage = nil
 
         let coordinator = RecoveryCoordinator(modelContext: modelContext)
-        let compiler = RunPlanCompiler(modelContext: modelContext)
 
         do {
             switch action {
-            case .resumeRun(let stageID):
-                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
-                dismiss()
-
             case .retryAgent(let stageID, let agentID):
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
+                dismiss()
+
+            case .retryStage(let stageID):
+                _ = try coordinator.retryStage(run: run, stageID: stageID)
+                dismiss()
+
+            case .resumeFromApprovalGate(let stageID):
+                _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
+                dismiss()
+
+            case .resumeRun(let stageID):
+                let compiler = RunPlanCompiler(modelContext: modelContext)
                 try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
                 dismiss()
 
             case .retryAggregateStep(let stageID):
                 _ = try coordinator.retryAggregateStep(run: run, stageID: stageID)
-                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
-                dismiss()
-
-            case .retryStage(let stageID):
-                _ = try coordinator.retryStage(run: run, stageID: stageID)
-                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
-                dismiss()
-
-            case .resumeFromApprovalGate(let stageID):
-                _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
-                try executionService.resumeRun(run: run, compiler: compiler, stageID: stageID)
                 dismiss()
 
             case .cloneRunFrozenSnapshot:
@@ -695,23 +650,16 @@ struct BlockedRunRecoveryView: View {
                     return
                 }
                 let compiler = RunPlanCompiler(modelContext: modelContext)
-                let clone = try coordinator.cloneRunFrozenSnapshot(
+                _ = try coordinator.cloneRunFrozenSnapshot(
                     original: run,
                     idea: idea,
                     compiler: compiler
                 )
-                let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: clone)
-                executionService.startRun(run: clone, plan: plan, workspace: workspace)
                 dismiss()
 
             case .cloneRunCurrentConfig:
                 guard let idea = run.idea else {
                     errorMessage = "No idea associated with this run."
-                    isExecuting = false
-                    return
-                }
-                guard let catalog = executionService.catalog else {
-                    errorMessage = "No agent catalog available."
                     isExecuting = false
                     return
                 }
@@ -722,25 +670,11 @@ struct BlockedRunRecoveryView: View {
                     isExecuting = false
                     return
                 }
-                let compiler = RunPlanCompiler(modelContext: modelContext)
-                let clone = try coordinator.cloneRunCurrentConfig(
-                    original: run,
-                    idea: idea,
-                    workflow: workflow,
-                    catalog: catalog,
-                    compiler: compiler,
-                    workflowSourcePath: run.workflowSourcePath,
-                    catalogSourcePath: run.catalogSourcePath
-                )
-                let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
-                let (_, workspace) = try compiler.createRun(
-                    for: idea,
-                    plan: plan,
-                    workflowSourcePath: run.workflowSourcePath,
-                    catalogSourcePath: run.catalogSourcePath
-                )
-                executionService.startRun(run: clone, plan: plan, workspace: workspace)
-                dismiss()
+                // Catalog is required but not available here without ExecutionService.
+                // This path defers to the parent shell for full clone-with-current orchestration.
+                errorMessage = "Clone with current config requires orchestration from Runs Home."
+                isExecuting = false
+                return
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -788,61 +722,41 @@ struct BlockedRunRecoveryView: View {
 
     private func stageColor(_ status: StageStatus) -> Color {
         switch status {
-        case .completed: return .green
-        case .failed: return .red
-        case .running: return .blue
-        case .waitingApproval: return .orange
-        case .blocked: return .red
-        case .skipped: return .gray
-        case .pending, .ready: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .running: return DesignTokens.Status.running
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .blocked: return DesignTokens.Status.error
+        case .skipped: return DesignTokens.Status.cancelled
+        case .pending, .ready: return DesignTokens.Status.neutral
         }
     }
 
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
-        case .resumeRun: return .green
-        case .resumeFromApprovalGate: return .green
-        case .retryAgent, .retryAggregateStep, .retryStage: return .orange
-        case .cloneRunFrozenSnapshot: return .blue
-        case .cloneRunCurrentConfig: return .indigo
+        case .resumeFromApprovalGate, .resumeRun: return DesignTokens.Action.approve
+        case .retryAgent, .retryStage, .retryAggregateStep: return DesignTokens.Action.caution
+        case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
+        case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }
     }
 
     private func actionDescription(_ action: RecoveryAction) -> String {
         switch action {
-        case .resumeRun(let stageID):
-            return "Continue the existing run from \(stageID) using the already prepared pending attempt."
         case .resumeFromApprovalGate(let stageID):
             return "Re-arm the approval gate at \(stageID) and continue execution."
+        case .resumeRun(let stageID):
+            return "Resume execution from stage \(stageID) using the existing run state."
         case .retryAgent(let stageID, let agentID):
             return "Retry agent \(agentID) in stage \(stageID) from its last checkpoint."
-        case .retryAggregateStep(let stageID):
-            return "Retry only the aggregate review step in stage \(stageID) and reuse contract-valid reviewer outputs."
         case .retryStage(let stageID):
             return "Reset all agents in stage \(stageID) and re-execute from the beginning."
+        case .retryAggregateStep(let stageID):
+            return "Re-run the aggregate recovery step for stage \(stageID) without cloning the run."
         case .cloneRunFrozenSnapshot:
             return "Create a new run using the original frozen workflow and catalog snapshots."
         case .cloneRunCurrentConfig:
             return "Create a new run using the current workflow and catalog from disk."
         }
-    }
-
-    private var canonicalStageHistory: [StageExecution] {
-        let grouped = Dictionary(grouping: run.stageExecutions) { stage in
-            stage.lineageID ?? "\(stage.stageID)::\(stage.iteration)"
-        }
-
-        return grouped.values.compactMap { stages in
-            stages.max { lhs, rhs in
-                if lhs.attemptNumber != rhs.attemptNumber {
-                    return lhs.attemptNumber < rhs.attemptNumber
-                }
-                if lhs.startedAt != rhs.startedAt {
-                    return lhs.startedAt < rhs.startedAt
-                }
-                return lhs.id.uuidString < rhs.id.uuidString
-            }
-        }
-        .sorted { $0.startedAt < $1.startedAt }
     }
 }

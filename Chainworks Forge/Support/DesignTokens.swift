@@ -1,13 +1,10 @@
 import SwiftUI
 
-// MARK: - Proposal 012 §4: Design System Foundation
-
-/// Centralised semantic design tokens for Chainworks Forge.
-/// Adopted first by the Phase 3 bounded adopter slice
-/// (`RunsHomeView`, `WorkflowMapView`, `ReleaseGateView`,
-/// `DeliveryPreflightReportView`, `IdeaListView`).
-/// Expansion beyond the adopter slice requires verification
-/// per §4.4 guardrails.
+// MARK: - Proposal 014 / Backward-Compatible Facade
+//
+// The canonical shared primitives now live under `Support/Design/Forge*`.
+// `DesignTokens` remains as a compatibility facade so existing adopters keep
+// compiling while the codebase stays on a single design authority.
 enum DesignTokens {
     enum Brand {
         static let forgeBlue = Color(red: 11.0 / 255.0, green: 31.0 / 255.0, blue: 42.0 / 255.0)
@@ -30,45 +27,33 @@ enum DesignTokens {
     }
 
     // MARK: - Semantic Status Colors (M-02)
-
     enum Status {
-        static let success   = Color.green
-        static let warning   = Color.orange
-        static let error     = Color.red
-        static let running   = Color.blue
-        static let neutral   = Color.secondary
-        static let cancelled = Color.gray
+        static let success = ForgeStatusColor.success
+        static let warning = ForgeStatusColor.warning
+        static let error = ForgeStatusColor.error
+        static let running = ForgeStatusColor.running
+        static let neutral = ForgeStatusColor.neutral
+        static let cancelled = ForgeStatusColor.cancelled
     }
 
     enum Action {
-        static let primary     = Brand.forgeBlueSoft
-        static let destructive = Color.red
-        static let approve     = Color.green
-        static let caution     = Brand.accent
+        static let primary = ForgeColor.Brand.accent
+        static let destructive = ForgeStatusColor.error
+        static let approve = ForgeStatusColor.success
+        static let caution = ForgeStatusColor.warning
     }
-
-    // MARK: - Spacing (§4.2)
 
     enum Spacing {
-        /// 4pt — Tight inline spacing
-        static let compact: CGFloat  = 4
-        /// 8pt — Between related items
-        static let small: CGFloat    = 8
-        /// 12pt — Between sections within a group
-        static let medium: CGFloat   = 12
-        /// 16pt — Between GroupBoxes/sections
-        static let large: CGFloat    = 16
-        /// 20pt — Between major content blocks
-        static let section: CGFloat  = 20
+        static let compact = ForgeSpacing.compact
+        static let small = ForgeSpacing.small
+        static let medium = ForgeSpacing.medium
+        static let large = ForgeSpacing.large
+        static let section = ForgeSpacing.section
     }
 
-    // MARK: - Corner Radius (§4.3)
-
     enum CornerRadius {
-        /// 14pt continuous — Stage cards, agent panels
-        static let card: CGFloat  = 14
-        /// 16pt continuous — Larger containers
-        static let panel: CGFloat = 16
+        static let card = ForgeRadius.card
+        static let panel = ForgeRadius.panel
     }
 
     enum Shadow {
@@ -94,11 +79,12 @@ enum DesignTokens {
     // | Micro           | .caption2                            | Timestamps, metadata, badges   |
 
     enum Typography {
-        static let sectionHeader: Font = .headline
-        static let cardTitle: Font     = .subheadline.weight(.semibold)
-        static let body: Font          = .body
-        static let supporting: Font    = .caption
-        static let micro: Font         = .caption2
+        static let screenTitle = ForgeTypography.screenTitle
+        static let sectionHeader = ForgeTypography.sectionHeader
+        static let cardTitle = ForgeTypography.cardTitle
+        static let body = ForgeTypography.body
+        static let supporting = ForgeTypography.supporting
+        static let micro = ForgeTypography.micro
     }
 
     enum Motion {

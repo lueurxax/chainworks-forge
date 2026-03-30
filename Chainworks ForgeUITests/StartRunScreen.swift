@@ -79,18 +79,49 @@ struct StartRunScreen {
         return signals.contains(where: \.exists)
     }
 
+    private func waitForMissingRuntimeGuidance(timeout: TimeInterval = 5) -> Bool {
+        let signals = [
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "live-runtime-missing-block"))
+                .firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "live-runtime-unavailable-title"))
+                .firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "live-runtime-unavailable-guidance"))
+                .firstMatch
+        ]
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if signals.contains(where: \.exists) {
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        return signals.contains(where: \.exists)
+    }
+
     /// Selects Live execution mode. Returns true if Live mode was found and selected.
     func selectLiveMode() -> Bool {
         if waitForLiveWorkflowChoices(timeout: 1) {
             return true
         }
+        if waitForMissingRuntimeGuidance(timeout: 1) {
+            return true
+        }
         let candidates = [
             app.buttons["execution-mode-live-button"].firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "execution-mode-live-button"))
+                .firstMatch,
             app.descendants(matching: .any)
                 .matching(NSPredicate(format: "identifier == %@ AND label == %@", "execution-mode-list", "Live"))
                 .firstMatch,
             app.radioButtons["execution-mode-live"].firstMatch,
             app.buttons["execution-mode-live"].firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@ AND label == %@", "execution-mode-live-button", "Live"))
+                .firstMatch,
             app.buttons["Live"].firstMatch,
             app.radioButtons["Live"].firstMatch,
             app.segmentedControls.buttons["Live"].firstMatch
@@ -98,14 +129,21 @@ struct StartRunScreen {
         for candidate in candidates {
             if candidate.waitForExistence(timeout: 2) {
                 candidate.click()
-                return waitForLiveWorkflowChoices()
+                return waitForLiveWorkflowChoices() || waitForMissingRuntimeGuidance()
+            }
+        }
+        if app.otherElements["execution-mode-list"].firstMatch.waitForExistence(timeout: 1) {
+            app.typeKey(.pageDown, modifierFlags: [])
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            if waitForMissingRuntimeGuidance(timeout: 2) {
+                return true
             }
         }
         let predicate = NSPredicate(format: "label == %@ AND isEnabled == true", "Live")
         let fallback = app.descendants(matching: .any).matching(predicate).firstMatch
         guard fallback.waitForExistence(timeout: 2) else { return false }
         fallback.click()
-        return waitForLiveWorkflowChoices()
+        return waitForLiveWorkflowChoices() || waitForMissingRuntimeGuidance()
     }
 
     @discardableResult

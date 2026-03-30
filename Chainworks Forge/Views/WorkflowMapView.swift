@@ -37,22 +37,8 @@ struct WorkflowMapView: View {
             .accessibilityLabel(workflowStatusProofLabel(for: projection))
             .accessibilityValue(accessibilitySettingsDescription)
             .overlay(alignment: .topLeading) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement()
-                        .accessibilityLabel(workflowStatusProofLabel(for: projection))
-                        .accessibilityValue(accessibilitySettingsDescription)
-                        .accessibilityIdentifier("workflow-map-status-proof")
-
-                    ForEach(activeAccessibilitySettingIdentifiers, id: \.self) { identifier in
-                        Color.clear
-                            .frame(width: 1, height: 1)
-                            .accessibilityIdentifier(identifier)
-                    }
-                }
+                workflowAccessibilityProofMarkers(for: projection)
             }
-            .accessibilityIdentifier("workflow-map-view")
         } else {
             ContentUnavailableView(
                 "Workflow Map Unavailable",
@@ -63,28 +49,52 @@ struct WorkflowMapView: View {
         }
     }
 
+    @ViewBuilder
+    private func workflowAccessibilityProofMarkers(for projection: WorkflowMapProjection) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel(workflowStatusProofLabel(for: projection))
+                .accessibilityValue(accessibilitySettingsDescription)
+                .accessibilityIdentifier("workflow-map-status-proof")
+
+            ForEach(activeAccessibilitySettingIdentifiers, id: \.self) { identifier in
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityElement()
+                    .accessibilityLabel(
+                        identifier
+                            .replacingOccurrences(of: "workflow-map-status-proof-", with: "")
+                            .replacingOccurrences(of: "-", with: " ")
+                    )
+                    .accessibilityIdentifier(identifier)
+            }
+        }
+        .allowsHitTesting(false)
+        .opacity(0.001)
+    }
+
     private func workflowStatusProofLabel(for projection: WorkflowMapProjection) -> String {
-        let statuses = projection.stages
-            .map(\.status)
-            .map { $0.rawValue.replacingOccurrences(of: "_", with: " ").capitalized }
-        let uniqueStatuses = Array(NSOrderedSet(array: statuses)) as? [String] ?? statuses
-        return uniqueStatuses.isEmpty
-            ? "Workflow map has no stage statuses"
-            : "Workflow map stage statuses: \(uniqueStatuses.joined(separator: ", "))"
+        let statuses = projection.stages.reduce(into: [String]()) { partialResult, stage in
+            let label = stage.status.rawValue
+                .replacingOccurrences(of: "_", with: " ")
+                .capitalized
+            if partialResult.contains(label) == false {
+                partialResult.append(label)
+            }
+        }
+
+        let summary = statuses.isEmpty ? "Unavailable" : statuses.joined(separator: ", ")
+        return "Workflow map stage statuses: \(summary)"
     }
 
     private var accessibilitySettingsDescription: String {
-        var modes: [String] = []
-        if uiTestAccessibilitySettings.differentiateWithoutColor {
-            modes.append("differentiate without color")
+        let activeModes = activeAccessibilitySettingIdentifiers.map {
+            $0.replacingOccurrences(of: "workflow-map-status-proof-", with: "")
+                .replacingOccurrences(of: "-", with: " ")
         }
-        if uiTestAccessibilitySettings.increaseContrast {
-            modes.append("increase contrast")
-        }
-        if uiTestAccessibilitySettings.reduceTransparency {
-            modes.append("reduce transparency")
-        }
-        return modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
+        return activeModes.isEmpty ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
     }
 
     private var activeAccessibilitySettingIdentifiers: [String] {

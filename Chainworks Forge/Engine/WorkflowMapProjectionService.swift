@@ -20,6 +20,7 @@ final class WorkflowMapProjectionService {
         let topology = WorkflowMapTopologyBuilder(plan: plan)
         let orderedStateIDs = topology.orderedStateIDs()
         let liveTimeline = Array(executionService.orchestrator(for: run.id)?.liveTimeline.reversed() ?? [])
+        let persistedTimeline = buildPersistedTimeline(run: run, plan: plan)
         let providerBindings = decodeProviderBindings(from: run.providerBindingSnapshotJSON)
 
         let stages: [WorkflowMapStageProjection] = orderedStateIDs.enumerated().compactMap { index, stateID in
@@ -65,8 +66,41 @@ final class WorkflowMapProjectionService {
             occurrences: occurrences,
             edges: edges,
             loops: loops,
-            liveTimeline: liveTimeline
+            liveTimeline: liveTimeline,
+            persistedTimeline: persistedTimeline
         )
+    }
+
+    private func buildPersistedTimeline(run: Run, plan: RunPlan) -> [WorkflowMapPersistedTimelineEntry] {
+        var entries: [WorkflowMapPersistedTimelineEntry] = []
+
+        for stage in run.stageExecutions {
+            let timestamp = stage.completedAt ?? stage.startedAt
+            let stageLabel = plan.states[stage.stageID]?.label ?? stage.label
+            entries.append(
+                WorkflowMapPersistedTimelineEntry(
+                    id: "stage::\(stage.id.uuidString)",
+                    title: stageLabel,
+                    detail: "Persisted stage status: \(stage.status.rawValue.replacingOccurrences(of: "_", with: " "))",
+                    timestamp: timestamp
+                )
+            )
+        }
+
+        for approval in run.approvals {
+            let timestamp = approval.decidedAt ?? approval.requestedAt
+            let stageLabel = plan.states[approval.stageID]?.label ?? approval.stageID
+            entries.append(
+                WorkflowMapPersistedTimelineEntry(
+                    id: "approval::\(approval.id.uuidString)",
+                    title: stageLabel,
+                    detail: "Persisted approval \(approval.decision.rawValue.replacingOccurrences(of: "_", with: " "))",
+                    timestamp: timestamp
+                )
+            )
+        }
+
+        return entries.sorted { $0.timestamp > $1.timestamp }
     }
 
     private func buildStageProjection(

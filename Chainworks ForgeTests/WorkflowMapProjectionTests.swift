@@ -35,4 +35,24 @@ struct WorkflowMapProjectionTests {
         #expect((projection?.edges.contains(where: { $0.kind == .transition }) ?? false))
         #expect((projection?.edges.contains(where: { $0.kind == .fanout || $0.kind == .join || $0.kind == .sequence }) ?? false))
     }
+
+    @Test("Projection provides persisted timeline fallback when no live orchestrator is attached")
+    mutating func projectionProvidesPersistedTimelineFallback() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(descriptor).first)
+
+        let projection = try #require(service.projection(for: run))
+        #expect(projection.liveTimeline.isEmpty)
+        #expect(!projection.persistedTimeline.isEmpty)
+        #expect(projection.persistedTimeline.contains { $0.detail.contains("Persisted") })
+    }
 }
