@@ -379,7 +379,6 @@ private struct WorkflowMapStatusBadge: View {
         }
         return modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
     }
-
     private var activeAccessibilitySettingIdentifiers: [String] {
         var identifiers: [String] = []
         if uiTestAccessibilitySettings.differentiateWithoutColor {
