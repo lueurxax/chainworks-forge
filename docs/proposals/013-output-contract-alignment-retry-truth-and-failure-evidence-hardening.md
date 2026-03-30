@@ -22,7 +22,7 @@ The deeper layer is runtime truth:
 - aggregate and report truth can drift away from actual stage lineage,
 - reports can show configured provider/model truth instead of actual runtime truth.
 
-That lower layer is now further addressed by the companion migration slice [016-transport-outcome-truth-stage-settlement-and-resume-idempotency.md](016-transport-outcome-truth-stage-settlement-and-resume-idempotency.md).
+That lower layer is now addressed by the implemented execution-truth baseline in [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md).
 
 What remains after that lower layer is still important and still proposal-worthy:
 
@@ -34,7 +34,7 @@ What remains after that lower layer is still important and still proposal-worthy
 
 Proposal 013 is the bounded follow-up slice for that higher layer.
 
-### 1.1 Relationship to Proposal 016
+### 1.1 Relationship to the execution-truth baseline
 
 Earlier versions of Proposal 013 tried to absorb transport truth, stage settlement, retry lineage, and recovery/report alignment in one slice.
 
@@ -44,7 +44,7 @@ Proposal 013 remains the right bounded proposal for contract alignment, failure 
 What changed is only the causal map around it:
 
 - Proposal 013 owns contract and evidence semantics,
-- Proposal 016 owns the deeper execution-truth migration where stale active records, contradictory transport outcomes, or provider-truth drift corrupt what Proposal 013 later reads.
+- the execution-truth baseline owns the deeper runtime layer where stale active records, contradictory transport outcomes, or provider-truth drift corrupt what Proposal 013 later reads.
 
 The app cannot fully trust contract-alignment conclusions if the runtime still does not know:
 
@@ -54,8 +54,8 @@ The app cannot fully trust contract-alignment conclusions if the runtime still d
 4. which provider/model actually executed,
 5. whether the aggregate step itself settled or never produced its required output.
 
-Proposal 016 repairs that substrate.
-Proposal 013 remains valid whether 016 lands before it, alongside it, or after an initial partial 013 rollout, but report/recovery trust should be capped until the 016 migration is also applied.
+The execution-truth baseline repairs that substrate.
+Proposal 013 remains valid alongside that baseline, but report/recovery trust should be capped until the lower-layer migration is also applied.
 
 ### 1.2 What this proposal is
 
@@ -79,7 +79,7 @@ Proposal 013 is **not**:
 - a skill-resolution proposal,
 - or a general UI-polish bucket.
 
-Those lower-level runtime truths belong to Proposal 016.
+Those lower-level runtime truths belong to the execution-truth baseline.
 
 ---
 
@@ -313,7 +313,7 @@ The app can still leave the operator in an ambiguous state:
 
 ### 6.2 Required evidence behavior
 
-Proposal 013 requires canonical failure evidence even on the current runtime and benefits further from Proposal 016 once lower settlement truth is repaired.
+Proposal 013 requires canonical failure evidence even on the current runtime and benefits from the execution-truth baseline once lower settlement truth is repaired.
 Within that boundary, Proposal 013 requires:
 
 1. contract failure after output generation must persist:
@@ -471,7 +471,7 @@ Proposal 013 does **not** own:
 - broader transport policy enforcement beyond `structured_output`,
 - or workflow-topology redesign.
 
-Those lower-level runtime-truth repairs are owned by Proposal 016, but they are a companion migration slice rather than a reason to invalidate this proposal's contract/evidence scope.
+Those lower-level runtime-truth repairs are owned by the execution-truth baseline, but they are a companion slice rather than a reason to invalidate this proposal's contract/evidence scope.
 
 ---
 

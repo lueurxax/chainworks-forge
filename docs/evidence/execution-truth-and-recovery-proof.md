@@ -1,6 +1,6 @@
 # Execution Truth and Recovery Proof
 
-Current implementation and proof status for the execution-truth / settlement / recovery slice that was implemented through Proposal 016.
+Current implementation and proof status for the execution-truth / settlement / recovery slice in the current Chainworks Forge baseline.
 
 ## Status
 
@@ -60,22 +60,16 @@ Accepted app-level proof comes from the `Proposal016ExecutionTruthHarness` autor
 - legacy rows without canonical truth remain `unverifiable`,
 - standard report/recovery surfaces expose frozen-vs-runtime binding truth honestly.
 
-## Consolidated historical trail
+## Consolidation note
 
-The raw proposal artifact trail should now be treated as historical implementation evidence, not the primary contract:
+The original Proposal 016 draft, review, evidence, research, and implementation-audit files were transitional implementation artifacts.
 
-- proposal: `docs/proposals/016-transport-outcome-truth-stage-settlement-and-resume-idempotency.md`
-- proposal review: `docs/reviews/016-transport-outcome-truth-stage-settlement-and-resume-idempotency-review.md`
-- evidence pack: `docs/reviews/016-transport-outcome-truth-stage-settlement-and-resume-idempotency-evidence-pack.md`
-- research pack: `docs/proposals/016-transport-outcome-truth-stage-settlement-and-resume-idempotency.review/research-pack.md`
-- implementation audits:
-  - `...IMPLEMENTATION_AUDIT_R1.md`
-  - `...IMPLEMENTATION_AUDIT_R2.md`
-  - `...IMPLEMENTATION_AUDIT_R3.md`
-  - `...IMPLEMENTATION_AUDIT_R4.md`
+They have been removed after consolidation into:
 
-Those files remain useful as implementation history.
-They are no longer the authoritative day-to-day source for system behavior.
+- [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md)
+- this proof document
+
+The stable reference/evidence pair above is now the only long-lived documentation surface for this slice.
 
 ## Current interpretation
 
@@ -107,5 +101,4 @@ Use:
 - [../reference/provider-binding-truth.md](../reference/provider-binding-truth.md) for the narrower binding-provenance contract,
 - [../reference/run-control.md](../reference/run-control.md) for the cancellation/control layer.
 
-Do not treat the old proposal/review/audit files as the primary source anymore.
-Those are now a historical implementation trail behind the stable reference and proof pair above.
+Do not recreate proposal-local duplicates for this slice unless a future change genuinely needs a new delta proposal.

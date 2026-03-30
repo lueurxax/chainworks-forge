@@ -1,6 +1,6 @@
 # Execution Truth and Recovery
 
-Stable reference for canonical agent outcome truth, stage settlement, resume idempotency, aggregate settlement, and recovery/report read behavior that were implemented through Proposal 016.
+Stable reference for canonical agent outcome truth, stage settlement, resume idempotency, aggregate settlement, and recovery/report read behavior in the current Chainworks Forge baseline.
 
 ## Purpose
 
