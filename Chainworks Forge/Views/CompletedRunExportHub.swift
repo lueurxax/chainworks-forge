@@ -298,7 +298,7 @@ struct CompletedRunExportHub: View {
 
                 HStack(spacing: 16) {
                     HStack(spacing: 4) {
-                        Image(systemName: "doc.seal.fill")
+                        Image(systemName: "doc.text.fill")
                             .foregroundStyle(.green)
                         Text("\(receiptArtifacts.count) delivery receipt(s)")
                             .font(.caption)
@@ -322,7 +322,7 @@ struct CompletedRunExportHub: View {
                 } else {
                     ForEach(receiptArtifacts) { artifact in
                         HStack(spacing: 6) {
-                            Image(systemName: "doc.seal")
+                            Image(systemName: "doc.text")
                                 .font(.caption2)
                                 .foregroundStyle(.green)
                             Text(artifact.name)
@@ -336,7 +336,7 @@ struct CompletedRunExportHub: View {
                 }
             }
         } label: {
-            Label("Receipts", systemImage: "doc.seal")
+            Label("Receipts", systemImage: "doc.text")
         }
     }
 
@@ -822,7 +822,7 @@ struct CompletedRunExportHub: View {
 
     private func artifactIcon(_ artifact: Artifact) -> String {
         if artifact.name.localizedCaseInsensitiveContains("receipt") {
-            return "doc.seal"
+            return "doc.text"
         }
         switch artifact.format {
         case .json: return "curlybraces"

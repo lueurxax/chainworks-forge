@@ -25,6 +25,7 @@ import Foundation
 ///   -scheme "Chainworks Forge" -destination "platform=macOS" \
 ///   -only-testing:"Chainworks ForgeTests/GooseServerLiveIntegrationTests"
 /// ```
+@MainActor
 @Suite("Goose Server Live Integration", .tags(.live), .timeLimit(.minutes(2)))
 struct GooseServerLiveIntegrationTests {
 

@@ -75,6 +75,14 @@ struct FirstRunSetupWizard: View {
                     }
                 }
 
+                Section {
+                    ForgeIdentityHeader(
+                        title: "First Run Setup",
+                        subtitle: "Configure workspace paths, verify Goose-backed providers, then launch the safe sample path from one guided setup surface.",
+                        surfaceRole: .setupIdentity
+                    )
+                }
+
                 // Show sections based on current step (all visible but highlighted)
                 Section("Workspace & YAML") {
                     TextField("Run Storage Base Path", text: $runStorageBasePath)
@@ -120,11 +128,11 @@ struct FirstRunSetupWizard: View {
 
                     Text("\(providerSettingsStore.settings.configuredProviders.count) provider(s) configured")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         .accessibilityIdentifier("first-run-provider-count")
                     Text("Codex and Claude are Goose-first in the app. Use Goose-backed transport unless you intentionally need CLI fallback.")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
 
                     ForEach(providerSettingsStore.settings.configuredProviders.filter { $0.family.gooseFirstPreferred }) { provider in
                         Button("Open \(provider.family.displayName) Goose Assistant") {
@@ -177,13 +185,13 @@ struct FirstRunSetupWizard: View {
                         } else {
                             Text("Configuration is ready for a sample run.")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 .accessibilityIdentifier("first-run-preflight-ready")
                         }
                     } else {
                         Text("Save configuration, then verify provider and workspace readiness.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             .accessibilityIdentifier("first-run-preflight-placeholder")
                     }
 
@@ -209,7 +217,7 @@ struct FirstRunSetupWizard: View {
                     if let transferMessage {
                         Text(transferMessage)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             .accessibilityIdentifier("first-run-transfer-message")
                     }
                 }
@@ -217,7 +225,7 @@ struct FirstRunSetupWizard: View {
                 Section("Sample Run Path") {
                     Text("Creates a sample idea and launches the current safe workflow path with frozen provider bindings.")
                         .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
 
                     // Proposal 012 (L-12): Footer-level blocking progress during save/launch
                     Button {
@@ -385,13 +393,13 @@ struct FirstRunSetupWizard: View {
                 }
                 .padding(.horizontal, DesignTokens.Spacing.small)
                 .padding(.vertical, DesignTokens.Spacing.compact)
-                .background(currentStep == step ? Color.accentColor.opacity(0.1) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                .background(currentStep == step ? DesignTokens.Neutral.brandWash : Color.clear, in: RoundedRectangle(cornerRadius: 6))
                 .onTapGesture { currentStep = step }
 
                 if step.rawValue < WizardStep.allCases.count - 1 {
                     Image(systemName: "chevron.right")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(DesignTokens.Neutral.textTertiary)
                         .padding(.horizontal, 2)
                 }
             }
@@ -414,7 +422,7 @@ struct FirstRunSetupWizard: View {
     private func stepColor(_ step: WizardStep) -> Color {
         if stepCompleted(step) { return DesignTokens.Status.success }
         if currentStep == step { return DesignTokens.Action.primary }
-        return .secondary
+        return DesignTokens.Neutral.textSecondary
     }
 
     private func exportSettings() {

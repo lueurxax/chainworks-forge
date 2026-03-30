@@ -1,6 +1,6 @@
 import Foundation
 
-struct AppConfiguration: Codable, Equatable, Sendable {
+nonisolated struct AppConfiguration: Codable, Equatable, Sendable {
     var runStorageBasePath: String
     var worktreeBasePath: String?
     var workflowSourcePath: String
@@ -42,19 +42,19 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         self.activeConfigurationSource = activeConfigurationSource
     }
 
-    var runStorageBaseURL: URL {
+    nonisolated var runStorageBaseURL: URL {
         URL(fileURLWithPath: runStorageBasePath, isDirectory: true)
     }
 
-    var workflowSourceURL: URL {
+    nonisolated var workflowSourceURL: URL {
         URL(fileURLWithPath: workflowSourcePath)
     }
 
-    var agentCatalogSourceURL: URL {
+    nonisolated var agentCatalogSourceURL: URL {
         URL(fileURLWithPath: agentCatalogSourcePath)
     }
 
-    var gooseServerBaseURL: URL? {
+    nonisolated var gooseServerBaseURL: URL? {
         var components = URLComponents()
         components.scheme = gooseServerTLS ? "https" : "http"
         components.host = gooseServerHost
@@ -62,7 +62,7 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         return components.url
     }
 
-    static func seededDefault() -> AppConfiguration {
+    nonisolated static func seededDefault() -> AppConfiguration {
         let repoRoot = defaultRepositoryRoot()
         let supportRoot = defaultSupportRoot()
         let runStorage = supportRoot.appendingPathComponent("runs", isDirectory: true)
@@ -84,11 +84,17 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         )
     }
 
-    static func defaultRepositoryRoot() -> URL {
+    nonisolated static func defaultRepositoryRoot() -> URL {
         let fileManager = FileManager.default
-        var candidates = [
-            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
-        ]
+        var candidates: [URL] = []
+
+        if let explicitRoot = ProcessInfo.processInfo.environment["CHAINWORKS_REPO_ROOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitRoot.isEmpty {
+            candidates.append(URL(fileURLWithPath: explicitRoot, isDirectory: true))
+        }
+
+        candidates.append(URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true))
 
         if allowsDocumentsFallbackForCurrentProcess {
             candidates.append(
@@ -106,7 +112,7 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         return candidates[0]
     }
 
-    static func defaultSupportRoot() -> URL {
+    nonisolated static func defaultSupportRoot() -> URL {
         let fileManager = FileManager.default
 
         if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
@@ -125,7 +131,7 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         return appSupport.appendingPathComponent("Chainworks Forge", isDirectory: true)
     }
 
-    static func defaultGooseServerBinaryPath() -> String? {
+    nonisolated static func defaultGooseServerBinaryPath() -> String? {
         let candidates = [
             "/Applications/Goose.app/Contents/Resources/bin/goosed",
             NSHomeDirectory() + "/Applications/Goose.app/Contents/Resources/bin/goosed"
@@ -136,7 +142,7 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         }
     }
 
-    static var allowsDocumentsFallbackForCurrentProcess: Bool {
+    nonisolated static var allowsDocumentsFallbackForCurrentProcess: Bool {
         let environment = ProcessInfo.processInfo.environment
         return environment["CHAINWORKS_IN_MEMORY_STORE"] != "1"
             && environment["CHAINWORKS_UI_TEST_SESSION_ID"] == nil
@@ -144,12 +150,12 @@ struct AppConfiguration: Codable, Equatable, Sendable {
     }
 }
 
-enum ConfigurationSource: String, Codable, CaseIterable, Sendable {
+nonisolated enum ConfigurationSource: String, Codable, CaseIterable, Sendable {
     case persistedSettings = "persisted_settings"
     case seededFromEnv = "seeded_from_env"
     case developmentEnvOverride = "development_env_override"
 
-    var displayName: String {
+    nonisolated var displayName: String {
         switch self {
         case .persistedSettings:
             return "Persisted Settings"

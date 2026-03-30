@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Full Workflow Definition
 
-struct WorkflowDefinition: Codable, Sendable {
+nonisolated struct WorkflowDefinition: Codable, Sendable {
     let schemaVersion: Int
     let workflow: WorkflowMeta
     let variables: [String: AnyCodableValue]?
@@ -19,7 +19,7 @@ struct WorkflowDefinition: Codable, Sendable {
     }
 }
 
-struct WorkflowMeta: Codable, Sendable {
+nonisolated struct WorkflowMeta: Codable, Sendable {
     let id: String
     let name: String
     let usesAgentCatalog: String?
@@ -36,7 +36,7 @@ struct WorkflowMeta: Codable, Sendable {
     }
 }
 
-struct WorkflowState: Codable, Sendable {
+nonisolated struct WorkflowState: Codable, Sendable {
     let label: String
     let type: String?
     let owner: String
@@ -76,30 +76,30 @@ struct WorkflowState: Codable, Sendable {
     }
 }
 
-struct RunBlock: Codable, Sendable {
+nonisolated struct RunBlock: Codable, Sendable {
     let sequence: [AgentTask]?
     let parallel: [AgentTask]?
     let then: [AgentTask]?
 }
 
-struct AgentTask: Codable, Sendable {
+nonisolated struct AgentTask: Codable, Sendable {
     let agent: String
     let task: String
     let inputs: [String]?
     let outputs: [String]?
 }
 
-struct Transition: Codable, Sendable {
+nonisolated struct Transition: Codable, Sendable {
     let to: String
     let when: String
 }
 
-struct LoopConfig: Codable, Sendable {
+nonisolated struct LoopConfig: Codable, Sendable {
     let counter: String
     let max: String
 }
 
-struct FailurePolicy: Codable, Sendable {
+nonisolated struct FailurePolicy: Codable, Sendable {
     let onError: String
     let onLoopBudgetExhausted: String
     let preserveArtifacts: Bool
@@ -111,7 +111,7 @@ struct FailurePolicy: Codable, Sendable {
     }
 }
 
-struct ExecutionConfig: Codable, Sendable {
+nonisolated struct ExecutionConfig: Codable, Sendable {
     let singleActiveRunPerIdea: Bool
     let resumePolicy: String
     /// Proposal 011 (REQ-004): when true, the workflow requires a valid project directory.
@@ -141,16 +141,16 @@ struct ExecutionConfig: Codable, Sendable {
     }
 }
 
-struct IdeaInputConfig: Codable, Sendable {
+nonisolated struct IdeaInputConfig: Codable, Sendable {
     let mode: String
 }
 
-struct ScoringConfig: Codable, Sendable {
+nonisolated struct ScoringConfig: Codable, Sendable {
     let proposal: ProposalScoring?
     let implementation: ImplementationScoring?
 }
 
-struct ProposalScoring: Codable, Sendable {
+nonisolated struct ProposalScoring: Codable, Sendable {
     let aggregateFormula: String?
     let passWhen: [String]?
 
@@ -160,7 +160,7 @@ struct ProposalScoring: Codable, Sendable {
     }
 }
 
-struct ImplementationScoring: Codable, Sendable {
+nonisolated struct ImplementationScoring: Codable, Sendable {
     let implementedWhen: [String]?
 
     enum CodingKeys: String, CodingKey {
@@ -170,7 +170,7 @@ struct ImplementationScoring: Codable, Sendable {
 
 // MARK: - Type-erased Codable value
 
-enum AnyCodableValue: Codable, Sendable {
+nonisolated enum AnyCodableValue: Codable, Sendable {
     case string(String)
     case int(Int)
     case double(Double)

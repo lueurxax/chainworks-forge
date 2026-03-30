@@ -27,14 +27,14 @@ struct RunsHomeView: View {
             HStack(alignment: .firstTextBaseline, spacing: DesignTokens.Spacing.small) {
                 Text("Runs Home")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     .accessibilityIdentifier("runs-home-owner-ready")
 
                 Spacer(minLength: DesignTokens.Spacing.small)
 
                 Text(runsHomeAccessibilitySummary)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     .multilineTextAlignment(.trailing)
                     .accessibilityLabel(runsHomeAccessibilityLabel)
                     .accessibilityValue(runsHomeAccessibilityValue)
@@ -54,7 +54,7 @@ struct RunsHomeView: View {
                 if !waitingApprovalRuns.isEmpty {
                     Text("Waiting Approval")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(DesignTokens.Status.warning)
                         .accessibilityIdentifier("runs-home-section-waiting-approval")
 
                     Section {
@@ -73,7 +73,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Waiting Approval", systemImage: "checkmark.seal")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(DesignTokens.Status.warning)
                     }
                 }
 
@@ -95,7 +95,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Blocked", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.red)
+                            .foregroundStyle(DesignTokens.Status.error)
                     }
                 }
 
@@ -117,7 +117,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Running", systemImage: "play.fill")
-                            .foregroundStyle(.blue)
+                            .foregroundStyle(DesignTokens.Status.running)
                     }
                 }
 
@@ -139,7 +139,7 @@ struct RunsHomeView: View {
                         }
                     } header: {
                         Label("Recently Completed", systemImage: "checkmark.circle")
-                            .foregroundStyle(.green)
+                            .foregroundStyle(DesignTokens.Status.success)
                     }
                 }
 
@@ -336,10 +336,10 @@ struct RunsHomeRow: View {
 
         var color: Color {
             switch self {
-            case .critical: return .red
-            case .high: return .orange
-            case .normal: return .blue
-            case .low: return .secondary
+            case .critical: return DesignTokens.Status.error
+            case .high: return DesignTokens.Status.warning
+            case .normal: return DesignTokens.Status.running
+            case .low: return DesignTokens.Status.neutral
             }
         }
 
@@ -513,6 +513,7 @@ struct RuntimeProvenanceBadge: View {
         case "fixture_verified": return "Fixture / verified"
         case "server_unverified": return "Goose server / trust pending"
         case "server_verified": return "Goose server / verified"
+        case "unverifiable": return "Runtime truth / unverifiable"
         default: return "Unknown"
         }
     }
@@ -522,6 +523,7 @@ struct RuntimeProvenanceBadge: View {
         case "fixture_verified": return "checkmark.shield.fill"
         case "server_verified": return "checkmark.shield.fill"
         case "server_unverified": return "shield.lefthalf.filled"
+        case "unverifiable": return "exclamationmark.shield.fill"
         default: return "questionmark.circle"
         }
     }
@@ -531,6 +533,7 @@ struct RuntimeProvenanceBadge: View {
         case "fixture_verified": return DesignTokens.Status.success
         case "server_verified": return DesignTokens.Status.success
         case "server_unverified": return DesignTokens.Status.warning
+        case "unverifiable": return DesignTokens.Status.warning
         default: return DesignTokens.Status.neutral
         }
     }
@@ -637,7 +640,7 @@ struct RunDetailPanel: View {
                             .font(.title2.bold())
                         Text(run.workflowTitle)
                             .font(.title3)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         HStack {
                             StatusCapsule(
                                 text: run.presentationStatusLabel,
@@ -670,9 +673,11 @@ struct RunDetailPanel: View {
                                 .foregroundStyle(stageColor(stage.status))
                             Text(stage.label)
                             Spacer()
-                            Text(stage.status.rawValue)
-                                .font(DesignTokens.Typography.supporting)
-                                .foregroundStyle(.secondary)
+                            StatusCapsule(
+                                text: stage.status.rawValue,
+                                color: stageColor(stage.status),
+                                size: .small
+                            )
                         }
                     }
 
@@ -734,7 +739,7 @@ struct RunDetailPanel: View {
                     if let evidenceExportMessage {
                         Text(evidenceExportMessage)
                             .font(DesignTokens.Typography.supporting)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             .transition(.opacity)
                     }
                 }
@@ -822,13 +827,13 @@ struct RunDetailPanel: View {
 
     private func stageColor(_ status: StageStatus) -> Color {
         switch status {
-        case .completed: return .green
-        case .failed: return .red
-        case .running: return .blue
-        case .waitingApproval: return .orange
-        case .blocked: return .red
-        case .skipped: return .gray
-        case .pending, .ready: return .secondary
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .running: return DesignTokens.Status.running
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .blocked: return DesignTokens.Status.error
+        case .skipped: return DesignTokens.Status.cancelled
+        case .pending, .ready: return DesignTokens.Status.neutral
         }
     }
 }

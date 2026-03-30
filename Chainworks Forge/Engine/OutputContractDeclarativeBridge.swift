@@ -111,7 +111,9 @@ enum OutputContractDeclarativeBridge {
             requiresHumanApproval: definition.requiresHumanApproval,
             inputs: definition.inputs,
             outputs: definition.outputs,
-            worktreeWriteEnabled: definition.worktreePolicy?.writeEnabled ?? false
+            worktreeWriteEnabled: definition.worktreePolicy?.writeEnabled ?? false,
+            worktreeStrategy: definition.worktreePolicy?.strategy,
+            worktreePath: definition.worktreePolicy?.path
         )
     }
 }

@@ -43,6 +43,7 @@ Use these reference docs as the current source of truth:
 | YAML and catalog parsing | [yaml-dsl-parser.md](yaml-dsl-parser.md) |
 | Execution engine | [workflow-execution-engine.md](workflow-execution-engine.md) |
 | Frozen runtime and resume truth | [runtime-contract.md](runtime-contract.md) |
+| Execution truth, settlement, and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Goose server transport | [goose-server-transport.md](goose-server-transport.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
@@ -162,3 +163,4 @@ For current proof status rather than system-contract truth, use:
 - [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md)
 - [../evidence/mvp-sign-off-proof.md](../evidence/mvp-sign-off-proof.md)
 - [../evidence/goose-server-transport-verification.md](../evidence/goose-server-transport-verification.md)
+- [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md)

@@ -2,6 +2,7 @@ import Testing
 import Foundation
 @testable import Chainworks_Forge
 
+@MainActor
 @Suite("ProviderBindingTruth", .tags(.fast, .provider))
 struct ProviderBindingTruthTests {
     @Test("Codex family accepts gpt models without cross-family warning")

@@ -1,9 +1,9 @@
 import Foundation
 import CryptoKit
 
-struct DefinitionHasher: Sendable {
+nonisolated struct DefinitionHasher: Sendable {
 
-    static let canonicalEncoder: JSONEncoder = {
+    nonisolated static let canonicalEncoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601

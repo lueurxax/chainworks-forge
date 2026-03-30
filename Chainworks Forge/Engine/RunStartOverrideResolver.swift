@@ -9,7 +9,7 @@ struct RunStartOverride: Codable, Equatable, Sendable {
 struct RunStartOptions: Codable, Equatable, Sendable {
     var overridesByBackendProfileID: [String: RunStartOverride] = [:]
 
-    static let empty = RunStartOptions()
+    nonisolated static let empty = RunStartOptions()
 }
 
 enum RunStartOverrideResolver {
@@ -37,7 +37,9 @@ enum RunStartOverrideResolver {
                 requiresHumanApproval: agent.requiresHumanApproval,
                 inputs: agent.inputs,
                 outputs: agent.outputs,
-                worktreeWriteEnabled: agent.worktreeWriteEnabled
+                worktreeWriteEnabled: agent.worktreeWriteEnabled,
+                worktreeStrategy: agent.worktreeStrategy,
+                worktreePath: agent.worktreePath
             ))
         })
 

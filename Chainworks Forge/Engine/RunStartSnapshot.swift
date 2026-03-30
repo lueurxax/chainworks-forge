@@ -10,7 +10,7 @@ struct RunStartSnapshot: Sendable {
     let deliveryConfiguration: DeliveryConfiguration?
     let deliveryPreflightJSON: Data?
 
-    static let empty = RunStartSnapshot(
+    nonisolated static let empty = RunStartSnapshot(
         providerBindingSnapshotJSON: nil,
         bindingProvenanceJSON: nil,
         startOptionsJSON: nil,

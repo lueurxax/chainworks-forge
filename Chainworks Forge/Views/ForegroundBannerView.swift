@@ -37,8 +37,8 @@ struct ForegroundBannerView: View {
     }
 
     private var bannerColor: Color {
-        if blockedCount > 0 || failedCount > 0 { return .red }
-        return .orange
+        if blockedCount > 0 || failedCount > 0 { return DesignTokens.Status.error }
+        return DesignTokens.Action.caution
     }
 
     var body: some View {
@@ -48,17 +48,19 @@ struct ForegroundBannerView: View {
                     Image(systemName: bannerIcon)
                         .foregroundStyle(.white)
                     Text(bannerText)
-                        .font(.caption.bold())
+                        .font(DesignTokens.Typography.supporting.weight(.bold))
                         .foregroundStyle(.white)
                     Spacer()
                     Text("View in Runs Home →")
-                        .font(.caption2)
+                        .font(DesignTokens.Typography.micro)
                         .foregroundStyle(.white.opacity(0.8))
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .background(bannerColor.gradient)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .background(
+                    RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.card, style: .continuous)
+                        .fill(LinearGradient(colors: [bannerColor, bannerColor.opacity(0.82)], startPoint: .leading, endPoint: .trailing))
+                )
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 12)

@@ -91,43 +91,43 @@ Proposal 014 is done only when all five answers are explicit in code, previews, 
 
 Proposal 014 delivers four tightly coupled layers.
 
-### Layer Q: Brand Tokens and Assets
+### Layer Q: Existing design-system authority plus bounded extension
 
 | Component | Responsibility |
 |---|---|
-| **ForgeColor** | Canonical color tokens derived from Design Kit v1 |
-| **ForgeTypography** | Canonical type scale for screen title, section, label, body, and meta text |
-| **ForgeSpacing / ForgeRadius** | Shared spacing and corner-radius primitives |
-| **ForgeStatusColor** | Semantic status palette separate from generic action styling |
+| **DesignTokens** | Existing canonical token authority for status, action, spacing, radius, and typography |
+| **StatusCapsule** | Existing bounded shared badge primitive |
+| **StyledEmptyState** | Existing shared empty-state wrapper |
+| **DesignTokens extension** | Add only the missing brand-aligned tokens that are not already represented in `DesignTokens` |
 | **Brand Asset Set** | Logo variants, app icon assets, monochrome symbol assets, and usage rules |
 
-### Layer R: Shared UI Primitives
+### Layer R: Primitive completion, not primitive replacement
 
 | Component | Responsibility |
 |---|---|
-| **StatusCapsule** | Unified badge/chip primitive aligned to the design kit |
-| **ForgePanel / ForgeCardStyle** | Shared surface styling for cards, panels, grouped content, and secondary containers |
-| **ForgeSectionHeader** | Reusable section-title treatment with typographic consistency |
-| **ForgeEmptyState** | Branded empty-state wrapper that avoids generic placeholder screens |
-| **ForgeIconBridge** | Controlled mapping from product states/actions to the branded symbol system |
+| **StatusCapsule** | Keep as the canonical badge/chip primitive and extend only if design-kit coverage is missing |
+| **Panel / card helpers** | Add shared panel styling only where current adopted surfaces still drift visually |
+| **Section-header helpers** | Fill gaps in section-title consistency without creating a second typography authority |
+| **StyledEmptyState enhancement** | Extend the existing wrapper if brand treatment needs to improve |
+| **Icon usage rules** | Bounded mapping from product states/actions to brand-safe iconography without replacing clear SF Symbols blindly |
 
-### Layer S: Surface Migration
-
-| Component | Responsibility |
-|---|---|
-| **Shell Migration Pack** | App shell, runs list, ideas list, summary strips, and brand entry points |
-| **Run-Centric Migration Pack** | Run detail, workflow map, approval gate, release gate, and delivery-preflight surfaces |
-| **Setup Migration Pack** | Provider settings, pilot readiness, first-run setup, and Goose remediation assistant |
-| **Secondary Surface Pack** | Archive, new-idea, recovery, banner, and supporting surfaces |
-
-### Layer T: Verification and Rollout Evidence
+### Layer S: Current adoption rebaseline plus remaining migration
 
 | Component | Responsibility |
 |---|---|
-| **Preview Matrix** | Per-surface visual proof for the audited operator surfaces |
-| **Brand Application Checklist** | Logo/icon/token/motion/accessibility verification gate |
-| **Min-Window and Keyboard Proof** | Keep 1024×768 usability and keyboard behaviors intact |
-| **Design Adoption Review Pack** | Screenshot set and checklists for final proposal-readiness review |
+| **Current adopted slice** | Record which shell, run-centric, and setup surfaces are already on `DesignTokens` / `StatusCapsule` |
+| **Remaining migration pack** | Focus only on surfaces still visually outside the adopted slice or still missing design-kit behaviors |
+| **Brand application pack** | Apply icons/logo/asset usage in bounded locations without reopening already-complete UI-quality work |
+| **Secondary completion pack** | Finish archive, recovery, banner, and supporting surfaces that still visibly drift |
+
+### Layer T: Existing proof-lane extension
+
+| Component | Responsibility |
+|---|---|
+| **Preview-backed owners** | Per-surface visual proof for audited owner surfaces already defined by the UI-quality baseline |
+| **`proposal-012` gate extension** | Canonical min-window, adopter-slice accessibility, and secondary runtime proof lane |
+| **`ui-smoke` continuity proof** | Canonical shell-level no-regression lane |
+| **Brand application checklist** | Bounded additional checks for logo/icon/token application attached to the existing proof owners |
 
 ---
 
@@ -213,23 +213,20 @@ Disallowed:
 
 ## 5. Design-system file structure
 
-Proposal 014 adopts the design kit's suggested direction, with repo-local naming aligned to existing SwiftUI support code.
+Proposal 014 adopts the design kit's direction, but it does so by extending the current repo-local authority instead of creating a parallel `Forge*` stack beside it.
 
 Initial target structure:
 
 ```text
 Support/
+  DesignTokens.swift
+  StatusCapsule.swift
+  StyledEmptyState.swift
   Design/
-    ForgeColor.swift
-    ForgeTypography.swift
-    ForgeSpacing.swift
-    ForgeRadius.swift
-    ForgeTheme.swift
-    StatusCapsule.swift
-    ForgePanel.swift
-    ForgeSectionHeader.swift
-    ForgeEmptyState.swift
-    ForgeIconBridge.swift
+    DesignTokenExtensions.swift
+    PanelStyles.swift
+    SectionHeaderStyles.swift
+    IconUsageRules.swift
 Assets.xcassets/
   Brand/
   AppIcon.appiconset/
@@ -241,10 +238,18 @@ Design/
 
 Rules:
 
-1. token files are the only source of truth for adopted surfaces,
-2. asset-catalog integration may consume generated/finalized source assets from `Design/`,
-3. no second ad-hoc token namespace is introduced in view files,
-4. surfaces not yet migrated may temporarily keep old styling, but must not fork the new tokens.
+1. `DesignTokens`, `StatusCapsule`, and `StyledEmptyState` remain the current canonical owners unless explicitly superseded in place.
+2. Any new helper files extend that system; they do not create a second long-lived token namespace.
+3. Asset-catalog integration may consume generated/finalized source assets from `Design/`.
+4. No ad-hoc token namespace is introduced directly in view files.
+5. Surfaces not yet migrated may temporarily keep old styling, but must not fork the shared owners.
+
+Implementation guard:
+
+- reject new view-local token namespaces on adopter surfaces,
+- reject new ad-hoc badge/card primitives that duplicate `StatusCapsule` or the shared panel recipe,
+- prefer lightweight drift guards for patterns such as `Color(red:`, local `Font.system(...)`, new capsule badges outside `StatusCapsule`, and local panel background/shadow recipes,
+- treat temporary wrappers as migration shims only if they point back to the canonical owners and carry an explicit removal plan.
 
 ---
 
@@ -252,42 +257,60 @@ Rules:
 
 Proposal 014 uses the audited-surface inventory from [reference/ui-quality-and-polish.md](../reference/ui-quality-and-polish.md) rather than inventing a new scope list.
 
-### 6.1 Phase 1: Foundation and shell
+### 6.1 Current adopted slice at `HEAD`
 
-First adopters:
+The current tree is not a blank slate.
+These surfaces already use the bounded shared system in meaningful ways:
 
-- `ContentView`
 - `RunsHomeView`
 - `IdeaListView`
+- `WorkflowMapView`
+- `ReleaseGateView`
+- `DeliveryPreflightReportView`
+- `ProviderSettingsView`
+- `PilotReadinessView`
+- `FirstRunSetupWizard`
+- `GooseProviderConnectionAssistantView`
+
+Proposal 014 therefore treats them as **rebaseline owners**, not untouched future adopters.
+
+### 6.2 Phase 1: Canonical authority cleanup and token completion
+
+First work items:
+
+- `RunsHomeView`
 - `ForegroundBannerView`
+- `ContentView`
+- shared support files under `Support/`
 
 Goals:
 
-- establish app-level color and typography rhythm,
-- introduce the new badge/panel tokens on the most visible shell surfaces,
-- apply the design-kit hierarchy so the product immediately reads as `Run -> Stage -> Agent -> Artifact`,
-- introduce bounded brand identity in the shell without turning it into a splash screen.
+- keep one explicit authority for tokens and primitives,
+- add any missing panel/section/icon rules into the current shared system,
+- remove residual visual drift in the app shell and banner path,
+- keep the product hierarchy legible while introducing bounded brand identity.
 
-### 6.2 Phase 2: Run-centric and delivery surfaces
+### 6.3 Phase 2: Already-adopted surfaces that still need brand-level completion
 
-Second adopters:
+Rebaseline-and-complete surfaces:
 
-- `RunDetailPanel`
 - `WorkflowMapView`
 - `ApprovalGateView`
 - `ReleaseGateView`
 - `DeliveryPreflightReportView`
+- `RunDetailPanel`
+- `IdeaListView`
 
 Goals:
 
-- align status chips, panels, and section hierarchy,
+- preserve the current `DesignTokens` / `StatusCapsule` ownership,
+- finish design-kit hierarchy, panel, and brand-accent alignment on run-centric surfaces,
 - make approval and release surfaces feel like trust-bearing product checkpoints,
-- keep run-critical information legible while adopting the new token system,
 - ensure workflow topology and delivery surfaces share one visual vocabulary.
 
-### 6.3 Phase 3: Setup and provider surfaces
+### 6.4 Phase 3: Setup and remediation completion
 
-Third adopters:
+Rebaseline-and-complete surfaces:
 
 - `ProviderSettingsView`
 - `PilotReadinessView`
@@ -296,12 +319,12 @@ Third adopters:
 
 Goals:
 
-- bring heavy operator/setup surfaces into the same system,
+- bring already-adopted heavy setup surfaces into full design-kit alignment,
 - keep important commands above the fold or in toolbars/sticky footers as required by the design kit,
 - avoid turning dense setup forms into decorative layouts,
 - keep troubleshooting and readiness semantics explicit.
 
-### 6.4 Phase 4: Secondary and supporting surfaces
+### 6.5 Phase 4: Secondary and supporting surfaces
 
 Final adopters:
 
@@ -315,6 +338,27 @@ Goals:
 - finish consistency work,
 - unify empty-state and helper surfaces,
 - close remaining visual drift without reopening flow ownership.
+
+### 6.6 Behavioral boundary for recovery and failed-stage surfaces
+
+Proposal 014 does not own recovery behavior.
+For `RecoverySheet`, `BlockedRunRecoveryView`, failed-stage evidence surfaces, and repair panels:
+
+- Proposal 014 owns styling only:
+  - spacing,
+  - typography,
+  - panel hierarchy,
+  - icon/logo application,
+  - bounded badge/empty-state treatment.
+- Behavioral ownership remains with the recovery/runtime proposals and references:
+  - Proposal 013 output-contract and recovery truth work,
+  - current recovery/runtime reference docs.
+- Proposal 014 must not redefine:
+  - retry/resume semantics,
+  - stage-settlement truth,
+  - failed-stage evidence truth,
+  - blocked-run repair logic,
+  - recovery-action availability rules.
 
 ---
 
@@ -344,7 +388,32 @@ Non-goals:
 - large decorative hero art in operator views,
 - replacing core runtime status indicators with branding.
 
-### 7.3 Iconography adoption
+### 7.3 Canonical asset naming and integration contract
+
+| Canonical asset | Asset/catalog name | Allowed surfaces | Not allowed |
+|---|---|---|---|
+| Primary horizontal logo | `chainworks-forge-logo-horizontal` | README/docs, launch-adjacent setup surfaces, bounded shell/header moments that already carry product identity | dense operator panels, approval/release bodies, repeated per-screen branding |
+| Square app icon master | `chainworks-forge-app-icon` | app icon pipeline, installer/export handoff, docs/app-icon references | inline content decoration inside operational screens |
+| Monochrome product symbol | `chainworks-forge-symbol-monochrome` | compact branded shell affordances, small supporting marks where a product symbol is clearer than text | replacing legible operational SF Symbols in dense controls |
+| Dark-safe hero/logo variant | `chainworks-forge-hero-dark` | README/docs and dark marketing-adjacent handoff surfaces | runtime operator panels |
+| Light-safe hero/logo variant | `chainworks-forge-hero-light` | README/docs and light marketing-adjacent handoff surfaces | runtime operator panels |
+
+Integration rules:
+
+- full logo may be used only on docs, README, app-icon/launch-adjacent surfaces, and other explicitly approved product-identity anchors,
+- symbol-only variants may be used for compact branded shell moments, but not as decoration across every screen,
+- dense operational controls and workflow panels should keep SF Symbols unless a branded symbol is equally legible at operational sizes,
+- approval, recovery, release, run-progress, and evidence panels must not introduce large decorative logo treatment,
+- toolbars should prefer symbol-only branding if branding is needed at all; they must not become repeated horizontal-logo environments.
+
+Orange accent rules:
+
+- allowed for bounded brand details, logo accents, and sparse product-identity emphasis,
+- forbidden as a large-surface fill,
+- forbidden as a substitute for status semantics,
+- forbidden as the default color for operational controls that already carry action or status meaning.
+
+### 7.4 Iconography adoption
 
 The branded icon system should be introduced only where it materially improves product identity and clarity.
 
@@ -376,50 +445,98 @@ Proposal 014 is a visual-system rollout, not permission to hide or reframe criti
 
 ## 9. Implementation plan
 
-### Phase 1: Token and asset foundation
+### Phase 1: Current-owner rebaseline and authority cleanup
 
-- [ ] Introduce `ForgeColor`, `ForgeTypography`, `ForgeSpacing`, `ForgeRadius`, and `ForgeStatusColor`
-- [ ] Introduce `StatusCapsule` and one shared panel/header primitive
+- [ ] Confirm `DesignTokens`, `StatusCapsule`, and `StyledEmptyState` as the canonical bounded shared system
+- [ ] Add only the missing token/panel/header/icon helpers around that existing system
 - [ ] Create the bounded brand asset lane (`Design/` + asset-catalog integration path)
 - [ ] Apply the corrected motion baseline where already known (`ForegroundBannerView` and other low-risk transitions)
 
-### Phase 2: Shell adoption
+Exit gate:
 
-- [ ] Migrate `ContentView`, `RunsHomeView`, and `IdeaListView` to the new tokens/primitives
-- [ ] Rework summary strips, chips, and panels into the design-kit hierarchy
+- token authority is singular and explicit,
+- no parallel token or primitive namespace exists on the bounded slice,
+- shell/banner drift is reduced without changing behavioral ownership,
+- brand asset naming and integration rules are committed into the shared contract.
+
+### Phase 2: Shell and run-surface completion
+
+- [ ] Rebaseline `ContentView`, `RunsHomeView`, `IdeaListView`, and `RunDetailPanel` against current adoption status
+- [ ] Finish summary-strip, chip, panel, and hierarchy alignment where the current token slice is still incomplete
 - [ ] Apply bounded brand identity to the app shell without harming density or clarity
 
-### Phase 3: Run and delivery adoption
+Exit gate:
 
-- [ ] Migrate `RunDetailPanel`, `WorkflowMapView`, `ApprovalGateView`, `ReleaseGateView`, and `DeliveryPreflightReportView`
-- [ ] Unify run-centric status and stage affordances
+- shell and run-centric hierarchy read as one visual system,
+- summary strips, chips, and panels come from shared owners rather than local recipes,
+- above-the-fold commands remain visible and trustworthy,
+- bounded brand application is present without repeated-logo drift.
+
+### Phase 3: Run-centric, delivery, and setup completion
+
+- [ ] Finish design-kit alignment for `WorkflowMapView`, `ApprovalGateView`, `ReleaseGateView`, `DeliveryPreflightReportView`, `ProviderSettingsView`, `PilotReadinessView`, `FirstRunSetupWizard`, and `GooseProviderConnectionAssistantView`
+- [ ] Unify remaining run-centric and setup-surface status/stage affordances under the current shared authority
 - [ ] Verify approval/release checkpoints still read as high-trust operational surfaces
 
-### Phase 4: Setup and remediation adoption
+Exit gate:
 
-- [ ] Migrate setup/readiness/remediation surfaces
-- [ ] Apply the design-kit hierarchy to form-heavy and diagnostics-heavy screens
-- [ ] Keep advanced controls subordinate and above-the-fold actions obvious
+- run-centric, delivery, and setup surfaces share one status/action/panel vocabulary,
+- remediation and setup screens look like part of the same product system rather than a separate tool lane,
+- proof-owner gates remain green for affected surfaces,
+- no setup or release surface loses command clarity to decorative treatment.
 
-### Phase 5: Secondary surfaces and final pass
+### Phase 4: Secondary surfaces and final pass
 
 - [ ] Finish archive/new-idea/recovery/empty-state migration
 - [ ] Apply final icon/logo integration where approved
-- [ ] Produce final screenshot and preview evidence pack
+- [ ] Produce the final screenshot and preview evidence set through the existing proof owners
+
+Exit gate:
+
+- archive, new-idea, recovery, and empty-state surfaces no longer drift visually,
+- recovery/report seams adopt only visual changes and do not absorb runtime ownership,
+- preview and screenshot artifacts read as one coherent product system,
+- no adopter surface remains on ad-hoc styling once the phase is declared done.
 
 ---
 
 ## 10. Verification criteria
 
+Proposal 014 does not create a second proof lane.
+It extends the current canonical proof owners:
+
+- preview-backed owner surfaces from the UI-quality baseline,
+- approved-host `proposal-012` for min-window, adopter-slice accessibility, and secondary runtime surfaces,
+- approved-host `ui-smoke` for shell continuity,
+- approved-host `proposal-006` where provider/setup surfaces are affected.
+
 Each migrated phase must be verified through:
 
-1. **Preview proof** for the migrated surfaces listed in the UI quality baseline.
-2. **Min-window proof** at `1024x768` for every migrated surface that declares min-window ownership.
-3. **Cross-view consistency proof** that badges, spacing, panel styling, and typography now come from shared primitives rather than local ad-hoc styling.
-4. **Brand application proof** that the logo/icon/accent usage follows the design-kit restraint rules.
-5. **Accessibility proof** for Differentiate Without Color Alone, Increase Contrast, Reduce Transparency, VoiceOver labels/traits, and keyboard-only modal flows.
-6. **No-regression interaction proof** for approval, release, setup, recovery, and above-the-fold action discoverability.
-7. **Screenshot review pack** covering shell, run-progress, workflow-map, approval, release, provider/setup, and recovery surfaces.
+1. **Preview proof** for migrated owner surfaces already named by the UI-quality baseline.
+2. **Min-window proof** through the existing `proposal-012` owner checks at `1024x768`.
+3. **Cross-view consistency proof** that badges, spacing, panel styling, and typography come from the current shared owners instead of local ad-hoc styling.
+4. **Brand application proof** that logo/icon/accent usage follows the design-kit restraint rules and is attached to the same owner surfaces under review.
+5. **Accessibility proof** through the bounded current contract first:
+   - `proposal-012` for adopter-slice Differentiate Without Color, Increase Contrast, Reduce Transparency, VoiceOver labels/traits, and focus order,
+   - `ui-smoke` for shell continuity and no-regression interaction reachability.
+6. **Provider/setup proof** through `proposal-006` whenever the migrated surfaces include settings, readiness, onboarding, or Goose remediation.
+7. **Screenshot/review artifact** may be added, but only as a bounded supplement to the canonical proof owners above, not as a replacement for them.
+
+For Proposal 014, the bounded adopter slice that must stay anchored to those proof owners is:
+
+- `RunsHomeView`
+- `WorkflowMapView`
+- `ReleaseGateView`
+- `DeliveryPreflightReportView`
+- touched `IdeaListView` chips and supporting run-list affordances
+
+And the accessibility settings that must be evidenced for that slice are:
+
+- Differentiate Without Color,
+- Increase Contrast,
+- Reduce Transparency,
+- VoiceOver labels/traits,
+- focus-order continuity on the same owner surfaces.
 
 ---
 
@@ -451,13 +568,62 @@ Each migrated phase must be verified through:
 Proposal 014 is complete only when all of the following are true:
 
 1. the app has a real code-level token system derived from Design Kit v1,
-2. the primary operator surfaces use shared typography, color, spacing, and badge primitives instead of local ad-hoc styling,
-3. the shell and run-centric surfaces visibly reflect the approved Chainworks Forge brand language,
-4. logo/app-icon/symbol application exists in bounded approved integration points,
-5. no migrated surface regresses keyboard, accessibility, or operator-trust behaviors,
-6. screenshot and preview evidence shows a coherent visual system across shell, run, setup, and recovery surfaces.
+2. that token system is an explicit evolution of `DesignTokens` / `StatusCapsule` / `StyledEmptyState`, not a parallel authority,
+3. the primary operator surfaces use shared typography, color, spacing, and badge primitives instead of local ad-hoc styling,
+4. the rollout plan and current adoption status match current-head reality,
+5. canonical proof remains anchored to preview-backed owner surfaces plus `proposal-012`, `proposal-006`, and `ui-smoke`,
+6. the shell and run-centric surfaces visibly reflect the approved Chainworks Forge brand language,
+7. logo/app-icon/symbol application exists in bounded approved integration points,
+8. no migrated surface regresses keyboard, accessibility, or operator-trust behaviors,
+9. screenshot and preview evidence shows a coherent visual system across shell, run, setup, and recovery surfaces.
 
 ---
+
+## Appendix A. Token mapping and drift rules
+
+Proposal 014 extends the current authority instead of inventing a new design dictionary.
+The mapping below is the migration contract.
+
+| Category | Current owner | Mapping type | Notes |
+|---|---|---|---|
+| Surface/background neutrals | `DesignTokens` neutrals and panel backgrounds | kept plus bounded extension | add missing semantic neutrals in place; do not create per-surface gray palettes |
+| Status colors | `DesignTokens.Status` | kept as canonical | status meaning stays separate from brand accent and action color |
+| Action colors | `DesignTokens.Action` | kept plus bounded extension | action affordances remain distinct from status semantics |
+| Brand accent | `DesignTokens` extension | new in-place extension | sparse brand accent only; not a second semantic color lane |
+| Typography scale | `DesignTokens.Typography` | kept plus bounded extension | hierarchy changes must route through the shared typography owner |
+| Spacing | `DesignTokens.Spacing` | kept as-is unless proven incomplete | no per-view spacing ladders |
+| Radius | `DesignTokens.CornerRadius` | kept as-is unless proven incomplete | no alternative card/chip radius namespace |
+| Shadow/panel treatment | shared panel helpers layered on current authority | bounded extension | panel recipes may be added, but only as shared helpers |
+| Motion | shared motion baselines attached to current surfaces | bounded extension | restrained motion only; no decorative secondary motion lane |
+
+Forbidden local replacement patterns:
+
+- view-local color constants that duplicate semantic tokens,
+- local font hierarchies that bypass `DesignTokens.Typography`,
+- new capsule or badge primitives that duplicate `StatusCapsule`,
+- local panel/shadow/background recipes on adopter surfaces,
+- use of brand accent as a replacement for status or action semantics.
+
+## Appendix B. Canonical naming cleanup
+
+The canonical shared empty-state primitive is `StyledEmptyState`.
+
+- Proposal 014 should refer to the primitive as `StyledEmptyState`.
+- If the repo still temporarily stores that type in `EmptyStateView.swift`, that file is treated as the owner of `StyledEmptyState` until the file rename lands.
+- Proposal 014 must not introduce a second long-lived empty-state primitive name during migration.
+
+## Appendix C. Brand-safe surface application
+
+Bounded application rules:
+
+- use the full logo only on documentation, README, app-icon/launch-adjacent surfaces, and other explicitly approved identity anchors,
+- use symbol-only branding only where compact product identity adds value without reducing operational clarity,
+- keep SF Symbols for dense workflow controls, status actions, and operator-critical controls unless a branded symbol is equally legible,
+- keep orange accent sparse and bounded to brand moments rather than broad operational UI fill.
+
+Recovery-surface reminder:
+
+- on `RecoverySheet`, `BlockedRunRecoveryView`, failed-stage evidence surfaces, and repair panels, Proposal 014 owns visual treatment only; behavioral ownership remains with the recovery/runtime lane.
 
 ## 14. Final recommendation
 

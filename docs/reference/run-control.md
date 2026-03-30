@@ -20,6 +20,7 @@ Related stable docs:
 - [idea-lifecycle.md](idea-lifecycle.md)
 - [operator-experience.md](operator-experience.md)
 - [runtime-contract.md](runtime-contract.md)
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md)
 
 ## Scope
 
@@ -79,6 +80,8 @@ Settlement log entries record:
 - whether session close was attempted,
 - whether session close succeeded,
 - settlement timestamp.
+
+Where cancellation reaches an `AgentExecution`, current runtime truth also records whether cancellation happened before or after durable output. That finer classification belongs to [execution-truth-and-recovery.md](execution-truth-and-recovery.md), while this document remains the run-control contract.
 
 ## Operator-visible truth
 

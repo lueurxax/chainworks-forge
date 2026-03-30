@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct IdeaListView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
     @Environment(ExecutionService.self) private var executionService
     @Query(sort: \Idea.createdAt, order: .reverse) private var ideas: [Idea]
     @State private var newIdeaDraft = NewIdeaDraft()
@@ -80,7 +81,7 @@ struct IdeaListView: View {
                                             if idea.runs.contains(where: { [.running, .waitingApproval, .pending, .ready, .blocked].contains($0.status) }) {
                                                 Image(systemName: "play.circle.fill")
                                                     .font(.caption2)
-                                                    .foregroundStyle(.green)
+                                                    .foregroundStyle(DesignTokens.Status.success)
                                             }
                                         }
                                     }
@@ -176,13 +177,13 @@ struct IdeaListView: View {
                 summaryChip(
                     label: "\(activeIdeas.count) ideas",
                     icon: "lightbulb.fill",
-                    color: .blue,
+                    color: DesignTokens.Action.primary,
                     accessibilityIdentifier: "ideas-summary-chip-total"
                 )
                 summaryChip(
                     label: "\(draftCount) drafts",
                     icon: "pencil",
-                    color: .secondary,
+                    color: DesignTokens.Status.neutral,
                     accessibilityIdentifier: "ideas-summary-chip-drafts"
                 )
                 summaryChip(
@@ -241,7 +242,26 @@ struct IdeaListView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, DesignTokens.Spacing.small)
-        .background(Color.blue.opacity(0.06))
+        .background(DesignTokens.Neutral.brandWash)
+        .overlay(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: 1) {
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityElement()
+                    .accessibilityLabel(summaryStripAccessibilityLabel)
+                    .accessibilityValue(summaryStripAccessibilityValue)
+                    .accessibilityIdentifier("ideas-summary-strip-owner")
+                ForEach(summaryStripAccessibilityIdentifiers, id: \.self) { identifier in
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier(identifier)
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(summaryStripAccessibilityLabel)
+        .accessibilityValue(summaryStripAccessibilityValue)
+        .accessibilityIdentifier("ideas-summary-strip")
     }
 
     /// Pill-shaped chip for the summary strip.
@@ -255,19 +275,60 @@ struct IdeaListView: View {
         )
     }
 
+    private var summaryStripAccessibilityLabel: String {
+        let draftCount = activeIdeas.filter { $0.status == .draft }.count
+        let activeCount = activeIdeas.filter { $0.status == .active }.count
+        return "Ideas summary. \(activeIdeas.count) ideas. \(draftCount) drafts. \(activeCount) active."
+    }
+
+    private var summaryStripAccessibilityValue: String {
+        var modes: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            modes.append("differentiate without color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            modes.append("increase contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            modes.append("reduce transparency")
+        }
+        if archivedIdeas.isEmpty {
+            return modes.isEmpty ? "no archived ideas" : modes.joined(separator: ", ")
+        }
+        let archivedSummary = "\(archivedIdeas.count) archived"
+        if modes.isEmpty {
+            return archivedSummary
+        }
+        return "\(modes.joined(separator: ", ")); \(archivedSummary)"
+    }
+
+    private var summaryStripAccessibilityIdentifiers: [String] {
+        var identifiers: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            identifiers.append("ideas-summary-strip-differentiate-without-color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            identifiers.append("ideas-summary-strip-increase-contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            identifiers.append("ideas-summary-strip-reduce-transparency")
+        }
+        return identifiers
+    }
+
     // MARK: - Approval Bar
 
     private var approvalBar: some View {
         HStack {
             Image(systemName: "checkmark.seal.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(DesignTokens.Status.warning)
             Text("\(executionService.pendingApprovalCount) pending approval(s)")
             Spacer()
         }
-        .font(.caption)
+        .font(DesignTokens.Typography.supporting)
         .padding(.horizontal)
         .padding(.vertical, 6)
-        .background(Color.orange.opacity(0.1))
+        .background(DesignTokens.Neutral.accentWash)
     }
 
     private func createIdea() {
@@ -457,6 +518,66 @@ struct NewIdeaSheetView: View {
 // MARK: - IdeaDetailView (enhanced for Proposal 002 + 004 — Start Run + Run Navigation)
 
 struct IdeaDetailView: View {
+    private enum FocusTarget: String {
+        case archiveAction
+        case startRun
+
+        var label: String {
+            switch self {
+            case .archiveAction:
+                return "Archive Idea"
+            case .startRun:
+                return "Start New Run"
+            }
+        }
+    }
+
+    private struct FocusProofKeyCapture: NSViewRepresentable {
+        @Binding var focusedTarget: FocusTarget?
+        let enabled: Bool
+
+        func makeCoordinator() -> Coordinator {
+            Coordinator()
+        }
+
+        func makeNSView(context: Context) -> NSView {
+            let view = NSView(frame: .zero)
+            context.coordinator.update(binding: $focusedTarget, enabled: enabled)
+            return view
+        }
+
+        func updateNSView(_ nsView: NSView, context: Context) {
+            context.coordinator.update(binding: $focusedTarget, enabled: enabled)
+        }
+
+        final class Coordinator {
+            private var focusedTarget: Binding<FocusTarget?>?
+            private var enabled = false
+            private var monitor: Any?
+
+            func update(binding: Binding<FocusTarget?>, enabled: Bool) {
+                focusedTarget = binding
+                self.enabled = enabled
+                if enabled {
+                    installIfNeeded()
+                }
+            }
+
+            private func installIfNeeded() {
+                guard monitor == nil else { return }
+                monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+                    guard let self else { return event }
+                    guard self.enabled, event.keyCode == 48 else { return event }
+                    if self.focusedTarget?.wrappedValue != .startRun {
+                        self.focusedTarget?.wrappedValue = .startRun
+                        return nil
+                    }
+                    return event
+                }
+            }
+        }
+    }
+
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
     let idea: Idea
@@ -465,6 +586,7 @@ struct IdeaDetailView: View {
     @State private var archiveMessage: String?
     @State private var editingWorkspacePath: String = ""
     @State private var showStopConfirmation = false
+    @FocusState private var focusedTarget: FocusTarget?
 
     /// Whether this idea has an active run (prevents starting another).
     private var hasActiveRun: Bool {
@@ -512,6 +634,18 @@ struct IdeaDetailView: View {
         }
     }
 
+    private var focusProofEnabled: Bool {
+        ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_FOCUS_PROOF"] == "1"
+    }
+
+    private var initialFocusTarget: FocusTarget {
+        idea.isArchived ? .startRun : .archiveAction
+    }
+
+    private var focusProofLabel: String {
+        "Focused: \((focusedTarget ?? initialFocusTarget).label)"
+    }
+
     var body: some View {
         Group {
             if let activeRun = displayedRun {
@@ -530,20 +664,15 @@ struct IdeaDetailView: View {
                                 Text("Attachment")
                                 Spacer()
                                 Text(path)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 // Proposal 008 (REQ-009): Surface attachment validation state.
                                 let validationStatus = MVPBoundaryPolicy.validateAttachment(path: path)
-                                Text(validationStatus.rawValue)
-                                    .font(.caption2.bold())
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(
-                                        validationStatus == .referenceOnly
-                                            ? Color.green.opacity(0.15)
-                                            : Color.red.opacity(0.15)
-                                    )
-                                    .foregroundStyle(validationStatus == .referenceOnly ? .green : .red)
-                                    .clipShape(Capsule())
+                                StatusCapsule(
+                                    text: validationStatus.rawValue,
+                                    color: validationStatus == .referenceOnly ? DesignTokens.Status.success : DesignTokens.Status.error,
+                                    size: .small,
+                                    accessibilityIdentifier: "idea-attachment-validation-status"
+                                )
                             }
                         }
                     }
@@ -558,31 +687,36 @@ struct IdeaDetailView: View {
                         HStack {
                             TextField("Workspace root path", text: $editingWorkspacePath)
                                 .textFieldStyle(.roundedBorder)
+                                .disabled(focusProofEnabled)
                                 .accessibilityIdentifier("idea-workspace-root-path-field")
                             Button("Save Path") {
                                 saveWorkspaceRoot()
                             }
-                            .disabled(editingWorkspacePath.trimmingCharacters(in: .whitespaces) == (idea.workspaceRootPath ?? ""))
+                            .disabled(
+                                focusProofEnabled
+                                    || editingWorkspacePath.trimmingCharacters(in: .whitespaces) == (idea.workspaceRootPath ?? "")
+                            )
                             .accessibilityIdentifier("idea-workspace-root-save")
                             Button("Browse...") {
                                 browseWorkspaceRoot()
                             }
+                            .disabled(focusProofEnabled)
                             .accessibilityIdentifier("idea-workspace-root-browse")
                         }
 
                         if let path = idea.workspaceRootPath, !path.isEmpty {
                             let isValid = isValidDirectory(path)
-                            Label(
-                                isValid ? "Valid directory" : "Directory not found or not accessible",
-                                systemImage: isValid ? "checkmark.circle.fill" : "xmark.circle.fill"
+                            StatusCapsule(
+                                text: isValid ? "Valid directory" : "Directory not found or not accessible",
+                                color: isValid ? DesignTokens.Status.success : DesignTokens.Status.error,
+                                icon: isValid ? "checkmark.circle.fill" : "xmark.circle.fill",
+                                size: .small,
+                                accessibilityIdentifier: "idea-workspace-root-status"
                             )
-                            .font(.caption)
-                            .foregroundStyle(isValid ? .green : .red)
-                            .accessibilityIdentifier("idea-workspace-root-status")
                         } else {
                             Text("Set a project directory for workflows that require project access.")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         }
                     }
 
@@ -590,14 +724,17 @@ struct IdeaDetailView: View {
                         if idea.isArchived {
                             Label("Archived ideas stay visible here and in the archive lane until restored.", systemImage: "archivebox.fill")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             Button {
                                 restoreIdea()
                             } label: {
                                 Label("Restore Idea", systemImage: "arrow.uturn.backward")
                             }
                             .buttonStyle(.borderedProminent)
+                            .tint(DesignTokens.Action.primary)
                             .accessibilityIdentifier("restore-idea-button")
+                            .focusable(focusProofEnabled)
+                            .focused($focusedTarget, equals: .archiveAction)
                         } else {
                             let eligibility = IdeaArchivePolicy.eligibility(for: idea)
                             Button {
@@ -608,22 +745,24 @@ struct IdeaDetailView: View {
                             .buttonStyle(.bordered)
                             .disabled(!eligibility.canArchive)
                             .accessibilityIdentifier("archive-idea-button")
+                            .focusable(focusProofEnabled)
+                            .focused($focusedTarget, equals: .archiveAction)
 
                             if let reason = eligibility.reason {
                                 Text(reason)
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                     .accessibilityIdentifier("archive-idea-reason")
                             } else {
                                 Text("Archive the idea when it is draft or its latest run is terminal.")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             }
                         }
                         if let archiveMessage {
                             Text(archiveMessage)
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 .accessibilityIdentifier("archive-idea-message")
                         }
                     }
@@ -637,12 +776,15 @@ struct IdeaDetailView: View {
                         }
                         .disabled(hasActiveRun || idea.isArchived)
                         .buttonStyle(.borderedProminent)
+                        .tint(DesignTokens.Action.primary)
                         .accessibilityIdentifier("start-new-run-button")
+                        .focusable(focusProofEnabled)
+                        .focused($focusedTarget, equals: .startRun)
 
                         if let startRunHelperText {
                             Text(startRunHelperText)
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         }
                     }
 
@@ -659,17 +801,17 @@ struct IdeaDetailView: View {
                             }
                             .disabled(runToStop.cancellationRequestedAt != nil)
                             .buttonStyle(.bordered)
-                            .tint(.red)
+                            .tint(DesignTokens.Action.destructive)
                             .accessibilityIdentifier("stop-run-button")
 
                             if runToStop.cancellationRequestedAt != nil {
                                 Text("Cancellation in progress. Waiting for agents to settle.")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             } else {
                                 Text("Stop the active run. All run history and artifacts remain intact.")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             }
                         }
                         .alert("Stop Run?", isPresented: $showStopConfirmation) {
@@ -699,23 +841,25 @@ struct IdeaDetailView: View {
                                             Text(run.workflowTitle)
                                                 .font(.headline)
                                             HStack(spacing: 8) {
-                                                Text(run.presentationStatusLabel)
-                                                    .font(.caption)
-                                                    .foregroundStyle(statusColor(run.presentationStatus))
+                                                StatusCapsule(
+                                                    text: run.presentationStatusLabel,
+                                                    color: statusColor(run.presentationStatus),
+                                                    size: .small
+                                                )
                                                 Text(run.startedAt, format: .dateTime)
                                                     .font(.caption2)
-                                                    .foregroundStyle(.tertiary)
+                                                    .foregroundStyle(DesignTokens.Neutral.textTertiary)
                                                 if let cost = run.totalCostCents {
                                                     Text("\(cost)\u{00A2}")
                                                         .font(.caption2)
-                                                        .foregroundStyle(.tertiary)
+                                                        .foregroundStyle(DesignTokens.Neutral.textTertiary)
                                                 }
                                             }
                                         }
                                         Spacer()
                                         if run.presentationStatus == .waitingApproval {
                                             Image(systemName: "checkmark.seal.fill")
-                                                .foregroundStyle(.orange)
+                                                .foregroundStyle(DesignTokens.Status.warning)
                                         }
                                     }
                                 }
@@ -732,9 +876,32 @@ struct IdeaDetailView: View {
                 activeRun = latestActiveRun
             }
             editingWorkspacePath = idea.workspaceRootPath ?? ""
+            if focusProofEnabled {
+                focusedTarget = initialFocusTarget
+            }
         }
         .formStyle(.grouped)
         .navigationTitle(idea.title)
+        .overlay(alignment: .topLeading) {
+            if focusProofEnabled {
+                Text(focusProofLabel)
+                    .font(DesignTokens.Typography.micro)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                    .padding(.top, 2)
+                    .padding(.leading, 2)
+                    .accessibilityLabel(focusProofLabel)
+                    .accessibilityIdentifier("idea-detail-focus-order")
+            }
+        }
+        .background(
+            FocusProofKeyCapture(
+                focusedTarget: Binding(
+                    get: { focusedTarget },
+                    set: { focusedTarget = $0 }
+                ),
+                enabled: focusProofEnabled
+            )
+        )
         .sheet(isPresented: $showStartRunSheet) {
             WorkflowStartRunSheet(idea: idea) { prepared in
                 showStartRunSheet = false
@@ -803,14 +970,14 @@ struct IdeaDetailView: View {
     private func runStatusIcon(_ status: RunStatus) -> some View {
         let (icon, color): (String, Color) = {
             switch status {
-            case .pending, .ready: return ("clock", .gray)
-            case .running: return ("play.circle.fill", .green)
-            case .waitingApproval: return ("checkmark.seal", .orange)
-            case .blocked: return ("pause.circle.fill", .yellow)
-            case .completed: return ("checkmark.circle.fill", .green)
-            case .failed: return ("xmark.circle.fill", .red)
-            case .cancelled: return ("stop.circle.fill", .gray)
-            case .cancelling: return ("hourglass", .orange)
+            case .pending, .ready: return ("clock", DesignTokens.Status.neutral)
+            case .running: return ("play.circle.fill", DesignTokens.Status.running)
+            case .waitingApproval: return ("checkmark.seal", DesignTokens.Status.warning)
+            case .blocked: return ("pause.circle.fill", DesignTokens.Action.caution)
+            case .completed: return ("checkmark.circle.fill", DesignTokens.Status.success)
+            case .failed: return ("xmark.circle.fill", DesignTokens.Status.error)
+            case .cancelled: return ("stop.circle.fill", DesignTokens.Status.cancelled)
+            case .cancelling: return ("hourglass", DesignTokens.Status.warning)
             }
         }()
         return Image(systemName: icon).foregroundStyle(color)
@@ -818,14 +985,14 @@ struct IdeaDetailView: View {
 
     private func statusColor(_ status: RunStatus) -> Color {
         switch status {
-        case .pending, .ready: return .gray
-        case .running: return .green
-        case .waitingApproval: return .orange
-        case .blocked: return .yellow
-        case .completed: return .green
-        case .failed: return .red
-        case .cancelled: return .gray
-        case .cancelling: return .orange
+        case .pending, .ready: return DesignTokens.Status.neutral
+        case .running: return DesignTokens.Status.running
+        case .waitingApproval: return DesignTokens.Status.warning
+        case .blocked: return DesignTokens.Action.caution
+        case .completed: return DesignTokens.Status.success
+        case .failed: return DesignTokens.Status.error
+        case .cancelled: return DesignTokens.Status.cancelled
+        case .cancelling: return DesignTokens.Status.warning
         }
     }
 }
@@ -973,14 +1140,9 @@ struct WorkflowStartRunSheet: View {
                             }
                             Spacer()
                             Image(systemName: workflowSelection.wrappedValue == workflow ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(workflowSelection.wrappedValue == workflow ? .blue : .secondary)
+                                .foregroundStyle(workflowSelection.wrappedValue == workflow ? DesignTokens.Action.primary : DesignTokens.Neutral.textSecondary)
                         }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(workflowSelection.wrappedValue == workflow ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
-                        )
+                        .forgeSelectionCard(isSelected: workflowSelection.wrappedValue == workflow)
                     }
                     .buttonStyle(.plain)
                     .accessibilityElement(children: .ignore)
@@ -1036,14 +1198,9 @@ struct WorkflowStartRunSheet: View {
                         }
                         Spacer()
                         Image(systemName: selectedMode == mode ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(selectedMode == mode ? .blue : .secondary)
+                            .foregroundStyle(selectedMode == mode ? DesignTokens.Action.primary : DesignTokens.Neutral.textSecondary)
                     }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(selectedMode == mode ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
-                    )
+                    .forgeSelectionCard(isSelected: selectedMode == mode)
                 }
                 .buttonStyle(.plain)
                 .accessibilityElement(children: .ignore)
@@ -1149,7 +1306,7 @@ struct WorkflowStartRunSheet: View {
             HStack(spacing: 12) {
                 Image(systemName: "play.circle.fill")
                     .font(.title2)
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(DesignTokens.Action.primary)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Start New Run")
                         .font(.headline)

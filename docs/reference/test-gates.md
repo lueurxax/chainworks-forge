@@ -142,11 +142,10 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ### `proposal-006`
 
-Provider-platform gate for settings/diagnostics/readiness work.
+Provider/setup UI sign-off gate for settings/diagnostics/readiness work.
 
 Scope:
 
-- `ProviderPlatformTests`
 - `testProviderSettingsWizardFlowSurface`
 - `testProviderSettingsExportSurface`
 - `testPilotReadinessRefreshSurface`
@@ -173,7 +172,9 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 Important:
 
-- the repository supports `ProviderGate.xctestplan` as metadata, but the canonical agent path still runs targeted tests by default
+- provider-platform unit/runtime truth remains anchored to the canonical `fast` gate
+- `proposal-006` is the bounded approved-host UI proof for provider/settings/readiness surfaces
+- the repository may still keep `ProviderGate.xctestplan` as diagnostic metadata, but it is not the required proof owner for this gate
 
 ### `proposal-012`
 
@@ -211,6 +212,41 @@ Canonical remote form:
 
 ```bash
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-012"
+```
+
+### `proposal-016`
+
+Execution-truth / settlement / recovery proof gate for the implemented Proposal 016 slice.
+
+Scope:
+
+- `ActiveExecutionUniquenessGuardTests`
+- `Proposal016Tests`
+- `RuntimeBindingTruthSummaryTests`
+- `LegacyExecutionTruthBackfillTests`
+- `HistoricalRunReplayTests`
+- `Proposal013Tests`
+- `OrchestratorTests`
+- `RunCancellationCoordinatorTests`
+- `ResumeManagerTests`
+- `RecoveryCoordinatorTests`
+- app-launched `Proposal016ExecutionTruthHarness` proof
+
+Use when:
+
+- reproving canonical execution-truth behavior on current head
+- validating startup repair, legacy backfill, aggregate settlement, or narrow recovery behavior
+- collecting current-head evidence for execution-truth / recovery audits
+
+Host policy:
+
+- same proof path is valid locally or on the approved remote host
+- the wrapper gate refuses to start if other test/app processes are already running
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-016
 ```
 
 ### `full`

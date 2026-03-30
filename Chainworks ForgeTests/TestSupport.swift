@@ -13,16 +13,21 @@ import SwiftData
 
 // MARK: - ModelContext Factory
 
+private enum TestModelContextRetainer {
+    static var containers: [ModelContainer] = []
+}
+
 /// Creates an in-memory ModelContext suitable for unit testing.
 /// Includes all Chainworks Forge model types.
 @MainActor
 func makeTestModelContext() throws -> ModelContext {
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
-        AgentExecution.self, Approval.self, Artifact.self
+        AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self
     ])
     let config = ModelConfiguration("TestContext-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
     let container = try ModelContainer(for: schema, configurations: [config])
+    TestModelContextRetainer.containers.append(container)
     return container.mainContext
 }
 
@@ -31,7 +36,7 @@ func makeTestModelContext() throws -> ModelContext {
 func makeTestModelContainer() throws -> (container: ModelContainer, context: ModelContext) {
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
-        AgentExecution.self, Approval.self, Artifact.self
+        AgentExecution.self, Approval.self, AggregateSettlementRecord.self, Artifact.self
     ])
     let config = ModelConfiguration("TestContainer-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
     let container = try ModelContainer(for: schema, configurations: [config])
@@ -42,6 +47,7 @@ func makeTestModelContainer() throws -> (container: ModelContainer, context: Mod
 
 /// Creates a RunWorkspace backed by a temporary directory.
 /// The caller is responsible for cleanup via `cleanupWorkspace(_:)`.
+@MainActor
 func makeTestWorkspace(
     runID: UUID = UUID(),
     tempDir: URL? = nil
@@ -55,6 +61,7 @@ func makeTestWorkspace(
 }
 
 /// Cleans up a workspace's temp directory.
+@MainActor
 func cleanupWorkspace(_ workspace: RunWorkspace) {
     if FileManager.default.fileExists(atPath: workspace.workspaceRoot.path) {
         try? FileManager.default.removeItem(at: workspace.workspaceRoot)
@@ -65,6 +72,7 @@ func cleanupWorkspace(_ workspace: RunWorkspace) {
 
 /// Creates a ResolvedAgent with sensible defaults for testing.
 /// Override only the parameters you care about.
+@MainActor
 func makeTestAgent(
     id: String = "test_agent",
     title: String? = nil,
@@ -110,6 +118,7 @@ func makeTestAgent(
 // MARK: - ExecutionContext Factory
 
 /// Creates an ExecutionContext with sensible defaults for testing.
+@MainActor
 func makeTestExecutionContext(
     runID: UUID = UUID(),
     stageID: String = "stage_1",
@@ -136,6 +145,7 @@ func makeTestExecutionContext(
 // MARK: - AgentTask Factory
 
 /// Creates an AgentTask with sensible defaults for testing.
+@MainActor
 func makeTestTask(
     agent: String = "test_agent",
     task: String = "do_work",
@@ -186,6 +196,7 @@ func makeTestRun(
 final class TestBundleMarker: NSObject {}
 
 /// Loads the canonical workflow fixture from the test bundle.
+@MainActor
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
     let url = try #require(
         Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
@@ -195,6 +206,7 @@ func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
 }
 
 /// Loads the canonical agent catalog fixture from the test bundle.
+@MainActor
 func loadTestCanonicalCatalog() throws -> AgentCatalog {
     let url = try #require(
         Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml"),
@@ -204,6 +216,7 @@ func loadTestCanonicalCatalog() throws -> AgentCatalog {
 }
 
 /// Loads the live proposal loop workflow fixture from the test bundle.
+@MainActor
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
     let url = try #require(
         Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
@@ -213,6 +226,7 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
 }
 
 /// Loads the full MVP live workflow fixture from the test bundle.
+@MainActor
 func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
     let url = try #require(
         Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
@@ -222,6 +236,7 @@ func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
 }
 
 /// Loads the compact workflow fixture from the test bundle.
+@MainActor
 func loadTestCompactWorkflow() throws -> CompactWorkflowDefinition {
     let url = try #require(
         Bundle(for: TestBundleMarker.self).url(forResource: "proposal-to-release", withExtension: "yaml"),
@@ -235,6 +250,7 @@ func loadTestCompactWorkflow() throws -> CompactWorkflowDefinition {
 // MARK: - Swift Testing Assertion Helpers
 
 /// Expects that a Run has reached the `.completed` status (Swift Testing variant).
+@MainActor
 func expectRunCompleted(_ run: Run, sourceLocation: SourceLocation = #_sourceLocation) {
     let stages = run.stageExecutions.map { "\($0.stageID)=\($0.status.rawValue)" }.joined(separator: ", ")
     #expect(
@@ -245,6 +261,7 @@ func expectRunCompleted(_ run: Run, sourceLocation: SourceLocation = #_sourceLoc
 }
 
 /// Expects that a Run has reached the `.blocked` status (Swift Testing variant).
+@MainActor
 func expectRunBlocked(_ run: Run, sourceLocation: SourceLocation = #_sourceLocation) {
     #expect(
         run.status == .blocked,
@@ -254,6 +271,7 @@ func expectRunBlocked(_ run: Run, sourceLocation: SourceLocation = #_sourceLocat
 }
 
 /// Expects that a Run is waiting for approval (Swift Testing variant).
+@MainActor
 func expectRunWaitingApproval(_ run: Run, sourceLocation: SourceLocation = #_sourceLocation) {
     #expect(
         run.status == .waitingApproval,
@@ -263,6 +281,7 @@ func expectRunWaitingApproval(_ run: Run, sourceLocation: SourceLocation = #_sou
 }
 
 /// Expects that an artifact with the given name exists in the run's stage executions (Swift Testing variant).
+@MainActor
 func expectArtifactExists(
     _ name: String,
     in run: Run,
@@ -279,6 +298,7 @@ func expectArtifactExists(
 }
 
 /// Expects that an artifact with the given name exists on disk and is non-empty (Swift Testing variant).
+@MainActor
 func expectArtifactNonEmpty(
     _ name: String,
     in run: Run,

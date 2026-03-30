@@ -3,11 +3,13 @@
 | Field | Value |
 |---|---|
 | Date | 2026-03-29 |
-| Status | Draft |
+| Status | Implemented |
 | Author | Engineer (single-engineer project) |
 | Depends on | [reference/runtime-contract.md](../reference/runtime-contract.md), [reference/workflow-execution-engine.md](../reference/workflow-execution-engine.md), [reference/operator-experience.md](../reference/operator-experience.md), [reference/full-mvp-delivery.md](../reference/full-mvp-delivery.md), [reference/mvp-sign-off.md](../reference/mvp-sign-off.md), [reference/current-system-baseline.md](../reference/current-system-baseline.md) |
 | Scope | Transport outcome normalization, atomic stage settlement, aggregate-step settlement truth, resume / relaunch idempotency, stale execution repair, runtime binding provenance migration over existing frozen-binding truth, and report / recovery alignment to canonical execution truth |
 | Goal | Repair the lower execution-truth layer underneath the current 011/013 persistence seams so every agent and stage attempt settles exactly once with durable canonical truth, and later contract, report, and recovery surfaces stop describing contradictory runtime history. |
+
+> **Implementation note:** This proposal is now implemented. Use [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) as the stable contract and [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md) as the consolidated proof story. The review, evidence-pack, research-pack, and implementation-audit files remain historical implementation artifacts.
 
 ---
 
@@ -254,6 +256,59 @@ Rules:
 This proposal intentionally prefers a **separate persisted outcome field** over overloading `AgentStatus`, because the current status enum is already used broadly by run orchestration and UI grouping and should remain a coarse lifecycle channel.
 Truthful cancellation therefore remains visible in `AgentStatus.cancelled`, but its canonical explanation must also be representable in the new outcome columns.
 
+#### 4.3.1 Required mapping from `canonicalOutcome` back to coarse `AgentStatus`
+
+`AgentStatus` remains coarse and lossy on purpose.
+Proposal 016 therefore requires one explicit mapping table so orchestration, UI badges, and report grouping do not reinterpret the same terminal outcome differently.
+
+| `canonicalOutcome` | Required coarse `AgentStatus` | Why |
+|---|---|---|
+| `completed` | `completed` | Clean success |
+| `completed_with_transport_error` | `completed` | Durable useful output won; transport defect remains in canonical fields |
+| `failed_before_output` | `failed` | No durable output survived |
+| `failed_after_output_validation` | `failed` | Durable output exists, but the attempt is terminally invalid |
+| `timed_out_before_output` | `failed` | Timeout with no durable output |
+| `timed_out_after_output` | `failed` | Timeout after durable output; retry/report must read canonical fields for nuance |
+| `cancelled_before_output` | `cancelled` | Truthful operator/runtime cancellation before output |
+| `cancelled_after_output` | `cancelled` | Truthful cancellation after durable output |
+| `limit_exhausted_before_output` | `failed` | No durable output survived limit exhaustion |
+| `limit_exhausted_after_output` | `failed` | Durable output survived, but the attempt did not complete cleanly |
+
+Rules:
+
+1. `AgentStatus` must never be used to recover the lost nuance between `completed_with_transport_error`, `timed_out_after_output`, `failed_after_output_validation`, or `limit_exhausted_after_output`.
+2. UI grouping may use coarse `AgentStatus`, but detail surfaces, recovery policy, and reports must always read the canonical fields first.
+3. Any new canonical outcome added later must ship with an explicit row in this table before implementation is considered complete.
+
+#### 4.3.2 Receipt authority stack
+
+Proposal 016 explicitly separates three receipt/evidence layers so readers do not invent sideways reconciliation logic:
+
+1. **raw provider/session receipt**
+   - provider-native payloads, headers, session-close details, transcripts
+2. **normalized `ExecutionReceiptV2` / diagnostic envelope**
+   - normalized transport facts and supporting evidence references
+3. **flattened persisted columns on `AgentExecution`**
+   - `canonicalOutcome`
+   - `transportErrorKind`
+   - `providerStopReason`
+   - `outputPresence`
+   - `settledAt`
+   - `runtimeProvider`
+   - `runtimeModel`
+
+Rules:
+
+1. Flattened persisted columns are canonical for readers.
+2. Readers must not reconcile sideways between raw receipt JSON and envelope JSON once flattened columns already exist.
+3. Raw receipts and normalized envelopes exist to explain canonical columns, not to compete with them.
+4. Reader order is fixed:
+   - flattened columns first
+   - normalized envelope / `ExecutionReceiptV2` second
+   - raw receipt/session artifacts third
+   - legacy fallback mapping last
+5. If the raw receipt contradicts the flattened columns on a non-legacy row, the runtime must treat that as a writer-time bug or migration defect, not as permission for the reader to “choose the better truth.”
+
 ### 4.4 Legacy migration and backfill policy
 
 Backfill must be deterministic and fail closed when durable evidence is insufficient.
@@ -425,6 +480,26 @@ with semantics:
 - used by startup repair to determine whether a new approval request is a duplicate sibling or a legitimate new lineage.
 
 If the implementation chooses a different field name, the semantics above are mandatory.
+
+### 7.2.1 Required lineage propagation rules
+
+Proposal 016 requires one explicit propagation table so retries, repair, approvals, and aggregate settlement all speak the same lineage language.
+
+| Event | Required lineage rule |
+|---|---|
+| same-run agent retry inside an existing stage lineage | preserve the existing `StageExecution.lineageID` |
+| same-run stage retry | preserve the existing `StageExecution.lineageID` |
+| startup repair of stale active stage | preserve the existing `StageExecution.lineageID` |
+| startup repair of stale approval sibling | preserve the existing `Approval.lineageID` |
+| approval re-arm for the same logical gate | preserve the existing `Approval.lineageID` |
+| clone run / clone current config | create a new lineage namespace in the new run; do not reuse stage or approval lineage from the source run |
+| aggregate settlement record creation | inherit the aggregate stage's `lineageID` |
+
+Rules:
+
+1. `lineageID` is stable for the same logical lineage and only changes when a new run or explicitly new logical lineage is created.
+2. A repair pass must never invent a fresh lineage for a stale record that clearly belongs to an existing lineage.
+3. Aggregate settlement must not introduce a parallel lineage vocabulary.
 
 ### 7.3 Guard placement on create-paths
 

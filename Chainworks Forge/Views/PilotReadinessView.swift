@@ -364,6 +364,7 @@ struct PilotReadinessView: View {
     private var readinessHeroBanner: some View {
         if isRefreshing {
             HStack(spacing: DesignTokens.Spacing.medium) {
+                BrandMarkView(style: .symbol, surfaceRole: .setupIdentity)
                 ProgressView()
                     .controlSize(.regular)
                 VStack(alignment: .leading) {
@@ -371,7 +372,7 @@ struct PilotReadinessView: View {
                         .font(.title3.bold())
                     Text("Running diagnostics and preflight checks.")
                         .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 }
             }
             .padding(.vertical, DesignTokens.Spacing.small)
@@ -382,23 +383,20 @@ struct PilotReadinessView: View {
             let hasWarnings = !report.warnings.isEmpty
 
             HStack(spacing: DesignTokens.Spacing.medium) {
-                Image(systemName: hasBlockers ? "xmark.circle.fill" : hasWarnings ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                    .font(.system(size: 36))
-                    .foregroundStyle(hasBlockers ? DesignTokens.Status.error : hasWarnings ? DesignTokens.Status.warning : DesignTokens.Status.success)
-                    .symbolRenderingMode(.multicolor)
+                BrandMarkView(style: .symbol, surfaceRole: .setupIdentity, maxHeight: 32)
 
                 VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
                     Text(hasBlockers ? "\(report.blockingIssues.count) Issue(s) Found" : hasWarnings ? "Ready with Warnings" : "System Ready")
                         .font(.title3.bold())
                     Text("\(passCount)/\(totalCount) checks pass")
                         .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 }
                 Spacer()
                 // Progress ring
                 ZStack {
                     Circle()
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 4)
+                        .stroke(DesignTokens.Neutral.quietOutline, lineWidth: 4)
                     Circle()
                         .trim(from: 0, to: totalCount > 0 ? CGFloat(passCount) / CGFloat(totalCount) : 0)
                         .stroke(
@@ -415,16 +413,14 @@ struct PilotReadinessView: View {
             .accessibilityIdentifier("pilot-readiness-title")
         } else {
             HStack(spacing: DesignTokens.Spacing.medium) {
-                Image(systemName: "questionmark.circle")
-                    .font(.system(size: 36))
-                    .foregroundStyle(.secondary)
+                BrandMarkView(style: .symbol, surfaceRole: .setupIdentity, maxHeight: 32)
                 VStack(alignment: .leading) {
                     Text("Pilot Readiness")
                         .font(.title3.bold())
                         .accessibilityIdentifier("pilot-readiness-title")
                     Text("Refresh to check system readiness.")
                         .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 }
             }
             .padding(.vertical, DesignTokens.Spacing.small)

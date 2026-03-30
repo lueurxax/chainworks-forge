@@ -93,6 +93,12 @@ the run.
 
 **Cancellation**: Sets `isCancelled`, updates run status, stops the loop.
 
+**Execution-truth owners**:
+
+- `ActiveExecutionUniquenessGuard` prevents duplicate active stage and approval owners on create paths.
+- `AggregateSettlementRecord` persists subordinate aggregate truth tied to the aggregate stage lineage.
+- canonical retry/resume behavior adopts existing pending work on the same lineage before creating new attempts.
+
 ### Agent Executor Protocol (`AgentExecutor.swift`)
 
 ```swift
@@ -187,6 +193,8 @@ Side-effect detection uses permission profiles (`RELEASE_GIT`, `RELEASE_PUBLISH`
 the `requiresHumanApproval` flag, and stage-name heuristics (commit, push, release,
 publish, deploy).
 
+The current resume path also owns fail-closed legacy backfill and startup repair for stale active lineage records.
+
 ### Execution Service (`ExecutionService.swift`)
 
 App-scoped `@MainActor @Observable` singleton (ARCH-022). Manages the collection
@@ -204,6 +212,7 @@ Responsibilities:
   `GooseAgentExecutor` with the configured transport (bespoke `GooseTransport` or
   `GooseServerTransport`) and optional provider/model override.
 - **Post-run hooks** -- triggers Steward analysis and emits run reports on completion.
+- **Manual recovery attach** -- resumes existing runs from canonical settlement / retry state instead of creating ad hoc duplicate work.
 
 ---
 
@@ -218,6 +227,7 @@ Responsibilities:
 | ARCH-025 | `RunWorkspace` defines the isolation boundary. All artifact paths must resolve within it. |
 | ARCH-026 | Artifact root is `{workspaceRoot}/artifacts/` -- already run-scoped, no extra nesting. |
 | ARCH-027 | `StageExecution` and `AgentExecution` records are created lazily on state entry, not upfront. |
+| ARCH-032 | `ActiveExecutionUniquenessGuard` is the primary create-path owner for stage/approval lineage uniqueness; startup repair is secondary cleanup. |
 | ARCH-028 | `ExecutionService` maintains a collection of orchestrators, not a singleton. |
 | ARCH-029 | Resume safety: compiler version check, drift detection, side-effect stage detection. |
 | ARCH-030 | Executors return `[String: Data]`. `ArtifactManager` is the sole disk writer. |

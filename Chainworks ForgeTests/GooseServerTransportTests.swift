@@ -7,6 +7,7 @@ import Foundation
 /// Unit and integration tests for GooseServerTransport.
 /// Covers initialization, protocol conformance, ChatRequest encoding (REQ-010),
 /// and full mock-HTTP round-trip (REQ-011).
+@MainActor
 @Suite("GooseServerTransport", .serialized)
 struct GooseServerTransportTests {
 
@@ -157,7 +158,7 @@ struct GooseServerTransportTests {
             baseURL: URL(string: "https://127.0.0.1:51200")!,
             secretKey: "test-secret"
         )
-        #expect(transport != nil)
+        #expect(!String(describing: type(of: transport)).isEmpty)
     }
 
     @Test("GooseTransport (bespoke) conforms to GooseTransportProtocol")
@@ -166,7 +167,7 @@ struct GooseServerTransportTests {
             baseURL: URL(string: "http://localhost:3000")!,
             apiKey: "test-key"
         )
-        #expect(transport != nil)
+        #expect(!String(describing: type(of: transport)).isEmpty)
     }
 
     @Test("FixtureGooseTransport conforms to GooseTransportProtocol")
@@ -174,7 +175,7 @@ struct GooseServerTransportTests {
         let transport: any GooseTransportProtocol = FixtureGooseTransport(
             scenario: .proposalLoopSuccess
         )
-        #expect(transport != nil)
+        #expect(!String(describing: type(of: transport)).isEmpty)
     }
 
     // MARK: - LiveRuntimeConfiguration with transportAPI

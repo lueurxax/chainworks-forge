@@ -75,17 +75,15 @@ private struct WorkflowMapStatChip: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Label(label, systemImage: systemImage)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(DesignTokens.Typography.supporting)
+                .foregroundStyle(DesignTokens.Neutral.textSecondary)
             Text(value)
-                .font(.headline)
+                .font(DesignTokens.Typography.sectionHeader)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .forgeInsetPanel(tone: .quiet)
     }
 }
 
@@ -96,9 +94,13 @@ private struct WorkflowMapTopologyView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Topology")
-                .font(.headline)
-                .accessibilityIdentifier("workflow-map-topology-title")
+            ForgeSectionHeader(
+                title: "Topology",
+                subtitle: "Stages remain primary, with transitions and loops grouped under the run rather than competing with it.",
+                systemImage: "square.stack.3d.up",
+                tint: DesignTokens.Brand.forgeBlueSoft
+            )
+            .accessibilityIdentifier("workflow-map-topology-title")
             GroupBox {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 12) {
@@ -130,11 +132,11 @@ private struct WorkflowMapStageCard: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(stage.label)
-                        .font(.headline)
+                        .font(DesignTokens.Typography.sectionHeader)
                         .lineLimit(2)
                     Text(stage.ownerAgentTitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 }
                 Spacer()
                 WorkflowMapStatusBadge(status: stage.status)
@@ -150,13 +152,13 @@ private struct WorkflowMapStageCard: View {
                 }
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(DesignTokens.Neutral.textSecondary)
             .lineLimit(1)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("\(stage.communicationCount) communications")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(DesignTokens.Typography.supporting)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 ForEach(Array(stage.occurrences.prefix(3))) { occurrence in
                     WorkflowMapOccurrenceRow(occurrence: occurrence)
                 }
@@ -170,16 +172,16 @@ private struct WorkflowMapStageCard: View {
             if !stage.transitions.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Transitions")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                     ForEach(stage.transitions) { edge in
                         Text("→ \(edge.toLabel)")
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DesignTokens.Neutral.textSecondary)
                         if let detail = edge.detail, !detail.isEmpty {
                             Text(detail)
                                 .font(.caption2)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(DesignTokens.Neutral.textTertiary)
                         }
                     }
                 }
@@ -199,13 +201,17 @@ private struct WorkflowMapStageCard: View {
         .padding(12)
         .frame(width: 250, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.background)
-                .shadow(color: .black.opacity(0.04), radius: 4, y: 2)
+            RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.panel, style: .continuous)
+                .fill(stage.isCurrent ? DesignTokens.Neutral.brandWash : DesignTokens.Neutral.surface)
+                .shadow(
+                    color: DesignTokens.Shadow.cardColor.opacity(isHovered ? 1 : 0.8),
+                    radius: DesignTokens.Shadow.cardRadius,
+                    y: DesignTokens.Shadow.cardYOffset
+                )
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(stage.isCurrent ? Color.accentColor : isHovered ? Color.accentColor.opacity(0.5) : Color.secondary.opacity(0.18), lineWidth: stage.isCurrent ? 2 : isHovered ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.panel, style: .continuous)
+                .stroke(stageCardBorderColor, lineWidth: stage.isCurrent ? 2 : isHovered ? 1.5 : 1)
         )
         // Proposal 012 (L-05): Hover effect and tap popover
         .onHover { hovering in
@@ -239,18 +245,42 @@ private struct WorkflowMapStageCard: View {
             .frame(minWidth: 280)
         }
     }
+
+    private var stageCardBorderColor: Color {
+        if stage.isCurrent {
+            return DesignTokens.Brand.forgeBlueSoft
+        }
+        if isHovered {
+            return DesignTokens.Brand.forgeBlueSoft.opacity(0.45)
+        }
+        return DesignTokens.Neutral.quietOutline
+    }
 }
 
 // Proposal 012 (M-01): Migrated to StatusCapsule
 private struct WorkflowMapStatusBadge: View {
+    @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
+
     let status: WorkflowMapStageState
+
+    private var statusLabel: String {
+        status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized
+    }
 
     var body: some View {
         StatusCapsule(
-            text: status.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
+            text: statusLabel,
             color: statusColor,
             accessibilityIdentifier: "workflow-map-status-\(status.rawValue)"
         )
+        .overlay(alignment: .topLeading) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel(statusLabel)
+                .accessibilityValue(accessibilitySettingsDescription)
+                .accessibilityIdentifier("workflow-map-status-\(status.rawValue)")
+        }
     }
 
     private var statusColor: Color {
@@ -269,6 +299,20 @@ private struct WorkflowMapStatusBadge: View {
             return DesignTokens.Status.cancelled
         }
     }
+
+    private var accessibilitySettingsDescription: String {
+        var modes: [String] = []
+        if uiTestAccessibilitySettings.differentiateWithoutColor {
+            modes.append("differentiate without color")
+        }
+        if uiTestAccessibilitySettings.increaseContrast {
+            modes.append("increase contrast")
+        }
+        if uiTestAccessibilitySettings.reduceTransparency {
+            modes.append("reduce transparency")
+        }
+        return modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
+    }
 }
 
 private struct WorkflowMapOccurrenceRow: View {
@@ -286,29 +330,28 @@ private struct WorkflowMapOccurrenceRow: View {
             }
             Text(occurrence.taskName)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 .lineLimit(2)
             Text("\(occurrence.provider) · \(occurrence.model) · \(occurrence.effort)")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(DesignTokens.Neutral.textTertiary)
                 .lineLimit(1)
         }
-        .padding(8)
-        .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .forgeInsetPanel(tone: .quiet)
     }
 
     private var panelColor: Color {
         switch occurrence.state {
         case .thinking:
-            return .blue
+            return DesignTokens.Status.running
         case .completed:
-            return .green
+            return DesignTokens.Status.success
         case .notStarted, .ready, .waitingInput:
-            return .secondary
+            return DesignTokens.Status.neutral
         case .failed:
-            return .red
+            return DesignTokens.Status.error
         case .skipped:
-            return .gray
+            return DesignTokens.Status.cancelled
         }
     }
 }
@@ -331,7 +374,7 @@ private struct WorkflowMapHandoffLedger: View {
         GroupBox("Handoffs") {
             if edges.isEmpty {
                 Text("No handoff edges were derived from the frozen workflow snapshot.")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(edges) { edge in
@@ -347,11 +390,11 @@ private struct WorkflowMapHandoffLedger: View {
                             Spacer()
                             Text(edge.kind.rawValue.replacingOccurrences(of: "_", with: " "))
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DesignTokens.Neutral.textSecondary)
                             if let detail = edge.detail, !detail.isEmpty {
                                 Text(detail)
                                     .font(.caption2)
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(DesignTokens.Neutral.textTertiary)
                             }
                         }
                         .padding(.vertical, 2)
@@ -379,15 +422,15 @@ private struct WorkflowMapHandoffLedger: View {
     private func color(for kind: WorkflowMapEdgeKind) -> Color {
         switch kind {
         case .sequence:
-            return .blue
+            return DesignTokens.Status.running
         case .fanout:
-            return .indigo
+            return DesignTokens.Brand.forgeBlueSoft
         case .join:
-            return .green
+            return DesignTokens.Status.success
         case .transition:
-            return .secondary
+            return DesignTokens.Status.neutral
         case .loop:
-            return .orange
+            return DesignTokens.Status.warning
         }
     }
 }
@@ -417,27 +460,34 @@ private struct WorkflowMapAgentPanels: View {
         ]
 
         VStack(alignment: .leading, spacing: 8) {
-            Text("Agents")
-                .font(.headline)
-                .accessibilityIdentifier("workflow-map-agents-title")
+            ForgeSectionHeader(
+                title: "Agents",
+                subtitle: "Active, completed, and pending agents share one vocabulary so runtime state reads consistently across the map.",
+                systemImage: "person.3",
+                tint: DesignTokens.Brand.forgeBlueSoft
+            )
+            .accessibilityIdentifier("workflow-map-agents-title")
             GroupBox {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                     WorkflowMapAgentPanel(
                         title: "Active",
                         icon: "bolt.fill",
-                        tint: .blue,
+                        tint: DesignTokens.Status.running,
+                        tone: .brand,
                         occurrences: activeOccurrences
                     )
                     WorkflowMapAgentPanel(
                         title: "Completed",
                         icon: "checkmark.circle.fill",
-                        tint: .green,
+                        tint: DesignTokens.Status.success,
+                        tone: .success,
                         occurrences: completedOccurrences
                     )
                     WorkflowMapAgentPanel(
                         title: "Pending",
                         icon: "clock",
-                        tint: .secondary,
+                        tint: DesignTokens.Status.neutral,
+                        tone: .quiet,
                         occurrences: pendingOccurrences
                     )
                 }
@@ -450,6 +500,7 @@ private struct WorkflowMapAgentPanel: View {
     let title: String
     let icon: String
     let tint: Color
+    let tone: ForgePanelTone
     let occurrences: [WorkflowMapOccurrenceProjection]
 
     var body: some View {
@@ -465,17 +516,16 @@ private struct WorkflowMapAgentPanel: View {
 
             if occurrences.isEmpty {
                 Text("No \(title.lowercased()) agents.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(DesignTokens.Typography.supporting)
+                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
             } else {
                 ForEach(occurrences) { occurrence in
                     WorkflowMapOccurrenceRow(occurrence: occurrence)
                 }
             }
         }
-        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .forgePanel(tone: tone)
     }
 }
 
@@ -486,13 +536,17 @@ private struct WorkflowMapLoopTelemetryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Loop Telemetry")
-                .font(.headline)
-                .accessibilityIdentifier("workflow-map-loops-title")
+            ForgeSectionHeader(
+                title: "Loop Telemetry",
+                subtitle: "Loop counters stay secondary to the stage path and surface only the budget and exhaustion state that operators need.",
+                systemImage: "repeat",
+                tint: DesignTokens.Status.warning
+            )
+            .accessibilityIdentifier("workflow-map-loops-title")
             GroupBox {
                 if projection.loops.isEmpty {
                     Text("No loop counters were declared in the frozen workflow snapshot.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                 } else {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(projection.loops) { loop in
@@ -503,7 +557,7 @@ private struct WorkflowMapLoopTelemetryView: View {
                                     Spacer()
                                     Text("\(loop.current)/\(loop.max)")
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 }
                                 ProgressView(value: loop.progress) {
                                     Text(loop.counter)
@@ -512,7 +566,7 @@ private struct WorkflowMapLoopTelemetryView: View {
                                     Text(loop.exhausted ? "Budget reached" : "Budget available")
                                         .font(.caption)
                                 }
-                                .tint(loop.exhausted ? .orange : .blue)
+                                .tint(loop.exhausted ? DesignTokens.Status.warning : DesignTokens.Status.running)
                             }
                         }
                     }
@@ -528,36 +582,45 @@ private struct WorkflowMapTimelineView: View {
     let projection: WorkflowMapProjection
 
     var body: some View {
-        GroupBox("Live Timeline") {
-            if projection.liveTimeline.isEmpty {
-                Text("No live timeline events are available for this run.")
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(projection.liveTimeline.prefix(8))) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(entry.agentTitle)
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text(entry.event.type.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(entry.event.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            HStack(spacing: 8) {
-                                Text(entry.stageID)
-                                if let sessionID = entry.event.sessionID {
-                                    Text(sessionID)
+        VStack(alignment: .leading, spacing: 8) {
+            ForgeSectionHeader(
+                title: "Live Timeline",
+                subtitle: "Recent workflow events stay concise and subordinate to the current run and stage context.",
+                systemImage: "clock.arrow.circlepath",
+                tint: DesignTokens.Brand.forgeBlueSoft
+            )
+
+            GroupBox {
+                if projection.liveTimeline.isEmpty {
+                    Text("No live timeline events are available for this run.")
+                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(projection.liveTimeline.prefix(8))) { entry in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(entry.agentTitle)
+                                        .font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text(entry.event.type.rawValue)
+                                        .font(.caption2)
+                                        .foregroundStyle(DesignTokens.Neutral.textSecondary)
                                 }
-                                Text(entry.event.timestamp, format: .dateTime.hour().minute().second())
+                                Text(entry.event.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(DesignTokens.Neutral.textSecondary)
+                                HStack(spacing: 8) {
+                                    Text(entry.stageID)
+                                    if let sessionID = entry.event.sessionID {
+                                        Text(sessionID)
+                                    }
+                                    Text(entry.event.timestamp, format: .dateTime.hour().minute().second())
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(DesignTokens.Neutral.textTertiary)
                             }
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .forgeInsetPanel(tone: .quiet)
                         }
-                        .padding(.vertical, 2)
                     }
                 }
             }
