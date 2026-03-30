@@ -13,6 +13,34 @@ enum PreviewSupport {
         Artifact.self
     ])
 
+    private static func repoExampleURL(_ relativePath: String) -> URL {
+        let fileManager = FileManager.default
+        let trimmedPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let candidateRoots: [URL] = [
+            URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true),
+            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true),
+            Bundle.main.bundleURL,
+            Bundle.main.bundleURL.deletingLastPathComponent(),
+            URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        ]
+
+        for root in candidateRoots {
+            let directCandidate = root.appendingPathComponent(trimmedPath, isDirectory: false)
+            if fileManager.isReadableFile(atPath: directCandidate.path) {
+                return directCandidate
+            }
+
+            let examplesCandidate = root.appendingPathComponent("examples", isDirectory: true)
+                .appendingPathComponent(trimmedPath, isDirectory: false)
+            if fileManager.isReadableFile(atPath: examplesCandidate.path) {
+                return examplesCandidate
+            }
+        }
+
+        return URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true)
+            .appendingPathComponent(trimmedPath, isDirectory: false)
+    }
+
     @MainActor
     static func makeModelContainer(seed: ((ModelContext) -> Void)? = nil) -> ModelContainer {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
@@ -26,13 +54,16 @@ enum PreviewSupport {
 
     @MainActor
     static func makeAppConfigurationStore() -> AppConfigurationStore {
-        AppConfigurationStore(
+        let workflowSourceURL = repoExampleURL("workflows/workflow.yaml")
+        let agentCatalogURL = repoExampleURL("agents/agents.yaml")
+
+        return AppConfigurationStore(
             fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("preview-app-configuration.json"),
             initialConfiguration: AppConfiguration(
                 runStorageBasePath: "/Users/user/Library/Application Support/Chainworks Forge/runs",
                 worktreeBasePath: "/Users/user/Library/Application Support/Chainworks Forge/worktrees",
-                workflowSourcePath: "/Users/user/Documents/Chainworks Forge/examples/workflows/workflow.yaml",
-                agentCatalogSourcePath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml",
+                workflowSourcePath: workflowSourceURL.path,
+                agentCatalogSourcePath: agentCatalogURL.path,
                 supportBundleExportPath: "/Users/user/Library/Application Support/Chainworks Forge/exports",
                 gooseServerHost: "127.0.0.1",
                 gooseServerPort: 51200,
@@ -214,6 +245,8 @@ enum PreviewSupport {
         let now = Date()
         let previewState = previewStateMapping(for: status)
         let snapshotBundle = previewSnapshots()
+        let workflowSourceURL = repoExampleURL("workflows/proposal-loop-live.yaml")
+        let catalogSourceURL = repoExampleURL("agents/agents.yaml")
         let run = Run(
             startedAt: now.addingTimeInterval(-2400),
             status: status,
@@ -221,8 +254,8 @@ enum PreviewSupport {
             workflowTitle: title,
             workflowSnapshotHash: snapshotBundle?.workflowHash ?? "workflow-hash-\(title)",
             catalogSnapshotHash: snapshotBundle?.catalogHash ?? "catalog-hash-\(title)",
-            workflowSourcePath: "/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml",
-            catalogSourcePath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml",
+            workflowSourcePath: workflowSourceURL.path,
+            catalogSourcePath: catalogSourceURL.path,
             workflowSnapshotJSON: snapshotBundle?.workflowData ?? Data("workflow".utf8),
             catalogSnapshotJSON: snapshotBundle?.catalogData ?? Data("catalog".utf8),
             workspaceRoot: "/tmp/\(UUID().uuidString)",
@@ -281,8 +314,8 @@ enum PreviewSupport {
         workflowHash: String,
         catalogHash: String
     )? {
-        let workflowURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml")
-        let catalogURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml")
+        let workflowURL = repoExampleURL("workflows/proposal-loop-live.yaml")
+        let catalogURL = repoExampleURL("agents/agents.yaml")
 
         guard
             FileManager.default.isReadableFile(atPath: workflowURL.path),
@@ -396,8 +429,8 @@ enum PreviewSupport {
 
     @MainActor
     static func seedWorkflowMapPreviewData(context: ModelContext) {
-        let workflowURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml")
-        let catalogURL = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml")
+        let workflowURL = repoExampleURL("workflows/proposal-loop-live.yaml")
+        let catalogURL = repoExampleURL("agents/agents.yaml")
 
         guard
             FileManager.default.isReadableFile(atPath: workflowURL.path),
