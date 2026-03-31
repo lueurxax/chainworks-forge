@@ -819,10 +819,15 @@ private struct UITestCompletedExportHubHarness: View {
 /// Shows validation failure, evidence panel, narrow retry, and prior inspectability.
 struct UITestProposal013EvidenceSurface: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(ExecutionService.self) private var executionService
     @State private var proofRun: Run?
     @State private var evidencePacket: FailedStageEvidencePacket?
     @State private var proofStatus: String = "Not started"
     @State private var proofSteps: [String] = []
+    @State private var fanoutArtifactCount: Int = 0
+    @State private var aggregateFailureSummary: String = "Not evaluated"
+    @State private var narrowestActionSummary: String = "Not evaluated"
+    @State private var proofCompleted: Bool = false
 
     var body: some View {
         ScrollView {
@@ -835,10 +840,33 @@ struct UITestProposal013EvidenceSurface: View {
                     .font(.subheadline)
                     .foregroundStyle(proofStatus.contains("PASS") ? .green : .orange)
                     .accessibilityIdentifier("p013-proof-status")
+                    .accessibilityLabel(proofStatus)
+                    .accessibilityValue(proofStatus)
 
                 ForEach(Array(proofSteps.enumerated()), id: \.offset) { _, step in
                     Text(step)
                         .font(.caption.monospaced())
+                }
+
+                LabeledContent("Fan-out Artifacts") {
+                    Text("\(fanoutArtifactCount)/4")
+                        .accessibilityIdentifier("p013-fanout-artifacts")
+                        .accessibilityLabel("\(fanoutArtifactCount)/4")
+                        .accessibilityValue("\(fanoutArtifactCount)/4")
+                }
+
+                LabeledContent("Aggregate Failure") {
+                    Text(aggregateFailureSummary)
+                        .accessibilityIdentifier("p013-aggregate-failure")
+                        .accessibilityLabel(aggregateFailureSummary)
+                        .accessibilityValue(aggregateFailureSummary)
+                }
+
+                LabeledContent("Narrowest Valid Action") {
+                    Text(narrowestActionSummary)
+                        .accessibilityIdentifier("p013-narrowest-action")
+                        .accessibilityLabel(narrowestActionSummary)
+                        .accessibilityValue(narrowestActionSummary)
                 }
 
                 if let packet = evidencePacket {
@@ -846,145 +874,60 @@ struct UITestProposal013EvidenceSurface: View {
                         .accessibilityIdentifier("p013-evidence-panel")
                 }
 
+                if let proofRun {
+                    BlockedRunRecoveryView(run: proofRun)
+                        .frame(minHeight: 520)
+                        .accessibilityIdentifier("p013-recovery-view")
+                }
+
                 Button("Run Proof") {
-                    runProof()
+                    Task { await runProof() }
                 }
                 .buttonStyle(.borderedProminent)
                 .accessibilityIdentifier("p013-run-proof")
+
+                if proofCompleted {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier("p013-proof-complete")
+                }
             }
             .padding()
         }
         .frame(minWidth: 600, minHeight: 500)
     }
 
-    private func runProof() {
+    private func runProof() async {
         proofSteps = []
         proofStatus = "Running..."
-
-        // Step 1: Create a blocked run with validation failure evidence
-        let idea = Idea(title: "P013 Proof Idea", body: "Automated proof for Proposal 013", status: .active)
-        modelContext.insert(idea)
-        proofSteps.append("[1/7] Created idea")
-
-        let run = Run(
-            startedAt: Date(),
-            status: .blocked,
-            workflowID: "p013-proof",
-            workflowTitle: "P013 Proof",
-            workflowSnapshotHash: "proof-hash",
-            catalogSnapshotHash: "proof-catalog",
-            workflowSourcePath: "/proof/wf.yaml",
-            catalogSourcePath: "/proof/ag.yaml",
-            workflowSnapshotJSON: Data(),
-            catalogSnapshotJSON: Data(),
-            workspaceRoot: NSTemporaryDirectory(),
-            artifactRoot: NSTemporaryDirectory() + "artifacts/",
-            planCompilerVersion: 1
+        fanoutArtifactCount = 0
+        aggregateFailureSummary = "Not evaluated"
+        narrowestActionSummary = "Not evaluated"
+        proofCompleted = false
+        let harness = Proposal013AppProofHarness(
+            modelContext: modelContext,
+            executionService: executionService
         )
-        run.idea = idea
-        modelContext.insert(run)
-        proofSteps.append("[2/7] Created blocked run")
 
-        // Step 2: Create failed stage with validation failure evidence
-        let stage = StageExecution(
-            stageID: "state_4_proposal_reviewed",
-            label: "Proposal reviewed",
-            status: .failed,
-            iteration: 1,
-            attemptNumber: 1
-        )
-        stage.run = run
-        modelContext.insert(stage)
+        do {
+            proofSteps.append("[1/5] Launching fixture-backed proposal loop")
+            let (run, packet, result) = try await harness.run()
+            proofSteps.append("[2/5] Run reached \(result.terminalStatus)")
+            proofSteps.append("[3/5] Fan-out artifacts persisted: \(result.fanoutArtifactCount)/4")
+            proofSteps.append("[4/5] Aggregate failure captured: \(result.aggregateFailureSummary)")
+            proofSteps.append("[5/5] Narrowest action: \(result.narrowestActionSummary)")
 
-        let agent = AgentExecution(
-            agentID: "proposal_reviewer_po",
-            agentTitle: "Proposal Reviewer / PO",
-            taskName: "review_proposal",
-            status: .failed,
-            provider: "claude_code",
-            effort: "high"
-        )
-        agent.completedAt = Date()
-        agent.stageExecution = stage
-        modelContext.insert(agent)
-
-        // Step 3: Persist validation failure record
-        let failureRecord = ValidationFailureRecord(
-            agentID: "proposal_reviewer_po",
-            stageID: "state_4_proposal_reviewed",
-            runID: run.id,
-            outputResults: [
-                OutputValidationResult(
-                    outputName: "proposal_review_po",
-                    contractID: "proposal_review_v1",
-                    status: .failed,
-                    missingFields: ["score", "decision"],
-                    validationError: "Output is not valid JSON or not a JSON object",
-                    rawPayloadSize: 2048
-                )
-            ],
-            failureSummary: "Output contract mismatch: reviewer produced markdown instead of JSON",
-            failureClass: .outputContractMismatch,
-            contractMetadata: [
-                ContractValidationMetadata(
-                    outputName: "proposal_review_po",
-                    contractID: "proposal_review_v1",
-                    machineFormat: "json",
-                    validationMode: "strict_structured",
-                    requiredFieldCount: 11
-                )
-            ],
-            rawOutputExists: true,
-            receiptExists: true,
-            transcriptExists: false,
-            recoveryRecommendation: RecoveryRecommendation(
-                action: .retryFailedAgent,
-                explanation: "Raw output exists on disk. Retry the agent with the same inputs.",
-                source: .runtimePolicy
-            )
-        )
-        agent.validationFailureJSON = try? JSONEncoder().encode(failureRecord)
-        proofSteps.append("[3/7] Persisted validation failure record")
-
-        // Step 4: Persist stage evidence packet
-        let packet = FailedStageEvidenceBuilder.buildEvidencePacket(
-            stageExecution: stage,
-            failedAgent: agent,
-            validationFailure: failureRecord,
-            outputEnvelopes: [],
-            recoverySnapshot: nil
-        )
-        stage.evidencePacketJSON = try? JSONEncoder().encode(packet)
-        evidencePacket = packet
-        proofSteps.append("[4/7] Persisted stage evidence packet")
-
-        // Step 5: Verify recovery actions available
-        let coordinator = RecoveryCoordinator(modelContext: modelContext)
-        let actions = coordinator.availableActions(for: run)
-        let hasRetry = actions.contains(where: {
-            if case .retryAgent = $0 { return true }
-            return false
-        })
-        proofSteps.append("[5/7] Recovery actions: \(actions.map(\.label).joined(separator: ", ")) — retry available: \(hasRetry)")
-
-        // Step 6: Verify evidence packet is buildable
-        let builtPacket = coordinator.buildEvidencePacket(for: run)
-        proofSteps.append("[6/7] Evidence packet buildable: \(builtPacket != nil), failure class: \(builtPacket?.failureClass.rawValue ?? "none")")
-
-        // Step 7: Verify context is operator-mediated for contract mismatch
-        let context = coordinator.recoveryContext(for: run)
-        let isOperatorMediated = context.suggestedAction == nil
-        proofSteps.append("[7/7] Operator-mediated (no auto-suggest for contract mismatch): \(isOperatorMediated)")
-
-        self.proofRun = run
-
-        // Final verdict
-        if hasRetry && builtPacket != nil && isOperatorMediated {
-            proofStatus = "PASS — All Proposal 013 Section 10.2 proof steps verified"
-        } else {
-            proofStatus = "FAIL — Some proof steps did not verify"
+            fanoutArtifactCount = result.fanoutArtifactCount
+            aggregateFailureSummary = result.aggregateFailureSummary
+            narrowestActionSummary = result.narrowestActionSummary
+            proofRun = run
+            evidencePacket = packet
+            proofStatus = result.proofStatus
+            proofCompleted = true
+        } catch {
+            proofStatus = "FAIL — \(error.localizedDescription)"
+            proofSteps.append("Harness error: \(error.localizedDescription)")
+            proofCompleted = true
         }
-
-        try? modelContext.save()
     }
 }

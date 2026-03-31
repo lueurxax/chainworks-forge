@@ -12,16 +12,26 @@ struct Proposal013Tests {
 
     @Test("OutputContractSchemaV2 derives from ArtifactContract correctly")
     func schemaDerivesFromCatalogContract() {
-        let contract = ArtifactContract(format: "json", requiredFields: ["agent_id", "score", "decision"])
+        let contract = ArtifactContract(
+            format: "json",
+            requiredFields: ["agent_id", "score", "decision"],
+            machineFormat: "json",
+            validationMode: "strict_structured",
+            rawArtifactName: "proposal_review_po_raw",
+            normalizedArtifactName: "proposal_review_po"
+        )
         let schema = OutputContractSchemaV2.from(
             contractID: "proposal_review_v1",
             contract: contract,
-            validationMode: .strictStructured
+            validationMode: .humanOnly,
+            outputName: "proposal_review_po"
         )
         #expect(schema.contractID == "proposal_review_v1")
         #expect(schema.machineFormat == .json)
         #expect(schema.validationMode == .strictStructured)
         #expect(schema.requiredFields == ["agent_id", "score", "decision"])
+        #expect(schema.rawArtifactName == "proposal_review_po_raw")
+        #expect(schema.normalizedArtifactName == "proposal_review_po")
     }
 
     @Test("OutputContractSchemaV2 supports structured_with_human_companion mode")
@@ -103,6 +113,59 @@ struct Proposal013Tests {
         )
 
         #expect(results["proposal_review_po"]?.status == .passed)
+    }
+
+    @Test("Validation passes for all four proposal review fan-out outputs")
+    func validationPassesForAllReviewerOutputs() {
+        let catalog = makeTestCatalog(withContracts: [
+            "proposal_review_v1": ArtifactContract(format: "json", requiredFields: ["agent_id", "score", "decision"])
+        ])
+        let reviewJSON = try! JSONSerialization.data(withJSONObject: [
+            "agent_id": "reviewer",
+            "score": 8,
+            "decision": "approve"
+        ])
+        let outputs = [
+            "proposal_review_architect",
+            "proposal_review_po",
+            "proposal_review_ui",
+            "proposal_review_ux",
+        ]
+
+        for outputName in outputs {
+            let result = ProposalReviewContractAdapter.validateReviewOutput(
+                outputName: outputName,
+                data: reviewJSON,
+                catalog: catalog
+            )
+            #expect(result.status == .passed)
+            #expect(result.contractID == "proposal_review_v1")
+        }
+    }
+
+    @Test("Validation passes for valid aggregate proposal review summary JSON")
+    func validationPassesForValidAggregateSummaryJSON() {
+        let catalog = makeTestCatalog(withContracts: [
+            "proposal_review_summary_v1": ArtifactContract(
+                format: "json",
+                requiredFields: ["average_score", "min_individual_score", "blocker_count", "decision"]
+            )
+        ])
+        let summaryJSON = try! JSONSerialization.data(withJSONObject: [
+            "average_score": 8.0,
+            "min_individual_score": 7.0,
+            "blocker_count": 0,
+            "decision": "approve"
+        ])
+
+        let result = ProposalReviewContractAdapter.validateReviewOutput(
+            outputName: "proposal_review_summary",
+            data: summaryJSON,
+            catalog: catalog
+        )
+
+        #expect(result.status == .passed)
+        #expect(result.contractID == "proposal_review_summary_v1")
     }
 
     @Test("Validation fails for JSON output missing required fields (strict_structured)")
@@ -213,7 +276,9 @@ struct Proposal013Tests {
                     contractID: "proposal_review_v1",
                     machineFormat: "json",
                     validationMode: "strict_structured",
-                    requiredFieldCount: 3
+                    requiredFieldCount: 3,
+                    rawArtifactName: "proposal_review_po_raw",
+                    normalizedArtifactName: "proposal_review_po"
                 )
             ],
             rawOutputExists: true,
@@ -235,6 +300,40 @@ struct Proposal013Tests {
         let decoded = try! JSONDecoder().decode(ValidationFailureRecord.self, from: encoded)
         #expect(decoded.id == record.id)
         #expect(decoded.failureSummary == record.failureSummary)
+    }
+
+    @Test("Validation failure summary includes failing output name")
+    func validationFailureSummaryIncludesOutputName() {
+        let catalog = makeTestCatalog(withContracts: [
+            "proposal_review_summary_v1": ArtifactContract(
+                format: "json",
+                requiredFields: ["agent_id"],
+                machineFormat: "json",
+                validationMode: "strict_structured"
+            )
+        ])
+        let agent = makeTestResolvedAgent(outputContract: nil, outputs: ["proposal_review_summary"])
+        let failure = ArtifactPersistenceOrderingPolicy.buildFailureRecord(
+            validationResults: [
+                "proposal_review_summary": OutputValidationResult(
+                    outputName: "proposal_review_summary",
+                    contractID: "proposal_review_summary_v1",
+                    status: .failed,
+                    missingFields: ["agent_id"],
+                    validationError: "Output is not valid JSON or not a JSON object",
+                    rawPayloadSize: 64
+                )
+            ],
+            agent: agent,
+            stageID: "state_3_proposal_reviewed",
+            runID: UUID(),
+            rawOutputExists: true,
+            receiptExists: true,
+            transcriptExists: true,
+            catalog: catalog
+        )
+
+        #expect(failure?.failureSummary.contains("proposal_review_summary") == true)
     }
 
     // MARK: - Layer M: Structured Output Envelope
@@ -347,7 +446,7 @@ struct Proposal013Tests {
 
         #expect(packet.stageID == "state_4_proposal_reviewed")
         #expect(packet.failedAgentID == "proposal_reviewer_po")
-        #expect(packet.rawOutputsExist == false)  // No envelopes with rawPayloadPersisted
+        #expect(packet.rawOutputsExist == true)  // Canonical validation evidence must carry raw-output truth forward
         #expect(packet.receiptExists == true)
         #expect(packet.failureClass == .outputContractMismatch)
     }
@@ -380,6 +479,183 @@ struct Proposal013Tests {
         #expect(report.stageID == "state_4_proposal_reviewed")
         #expect(report.currentAttemptNumber == 2)
         #expect(report.stageHistory.count == 1)  // Only this attempt visible directly
+    }
+
+    @MainActor
+    @Test("RecoveryCoordinator honors canonical aggregate retry snapshot for blocked stages")
+    func recoveryCoordinatorHonorsCanonicalAggregateRetrySnapshot() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let aggregateAgent = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "aggregate_proposal_reviews",
+            startedAt: Date(timeIntervalSince1970: 110),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        aggregateAgent.stageExecution = stage
+        context.insert(aggregateAgent)
+
+        let snapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 120),
+            runID: run.id,
+            recommendedAction: RecoveryActionDetail(
+                action: .retryFailedAggregateStep,
+                stageID: stage.stageID,
+                agentID: aggregateAgent.agentID,
+                explanation: "Retry only the aggregate summary step.",
+                staysInSameRun: true,
+                reusesSiblingOutputs: true,
+                reExecutesWholeStage: false
+            ),
+            availableActions: [
+                RecoveryActionDetail(
+                    action: .retryFailedAggregateStep,
+                    stageID: stage.stageID,
+                    agentID: aggregateAgent.agentID,
+                    explanation: "Retry only the aggregate summary step.",
+                    staysInSameRun: true,
+                    reusesSiblingOutputs: true,
+                    reExecutesWholeStage: false
+                ),
+                RecoveryActionDetail(
+                    action: .retryFailedStage,
+                    stageID: stage.stageID,
+                    agentID: nil,
+                    explanation: "Retry the whole stage.",
+                    staysInSameRun: true,
+                    reusesSiblingOutputs: false,
+                    reExecutesWholeStage: true
+                ),
+                RecoveryActionDetail(
+                    action: .cloneRunFrozenSnapshot,
+                    stageID: nil,
+                    agentID: nil,
+                    explanation: "Clone fallback.",
+                    staysInSameRun: false,
+                    reusesSiblingOutputs: false,
+                    reExecutesWholeStage: false
+                )
+            ],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        stage.recoverySnapshotJSON = try JSONEncoder().encode(snapshot)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let actions = coordinator.availableActions(for: run)
+        #expect(actions.first == .retryAggregateStep(stageID: stage.stageID, agentID: aggregateAgent.agentID))
+        #expect(actions.contains(.retryStage(stageID: stage.stageID)))
+
+        let recoveryContext = coordinator.recoveryContext(for: run)
+        #expect(recoveryContext.allowedActions.first == .retryAggregateStep(stageID: stage.stageID, agentID: aggregateAgent.agentID))
+    }
+
+    @MainActor
+    @Test("RecoveryCoordinator prefers persisted stage evidence packet for aggregate contract failures")
+    func recoveryCoordinatorPrefersPersistedStageEvidencePacket() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let validationFailure = ValidationFailureRecord(
+            agentID: "lead_orchestrator",
+            stageID: stage.stageID,
+            runID: run.id,
+            outputResults: [
+                OutputValidationResult(
+                    outputName: "proposal_review_summary",
+                    contractID: "proposal_review_summary_v1",
+                    status: .failed,
+                    missingFields: [],
+                    validationError: "Output is not valid JSON or not a JSON object",
+                    rawPayloadSize: 2048
+                )
+            ],
+            failureSummary: "Aggregate summary contract mismatch: proposal_review_summary was persisted as markdown instead of structured JSON",
+            failureClass: .outputContractMismatch,
+            contractMetadata: [
+                ContractValidationMetadata(
+                    outputName: "proposal_review_summary",
+                    contractID: "proposal_review_summary_v1",
+                    machineFormat: "json",
+                    validationMode: "strict_structured",
+                    requiredFieldCount: 8,
+                    rawArtifactName: nil,
+                    normalizedArtifactName: nil
+                )
+            ],
+            rawOutputExists: true,
+            receiptExists: true,
+            transcriptExists: true,
+            recoveryRecommendation: RecoveryRecommendation(
+                action: .operatorInspection,
+                explanation: "Inspect the aggregate summary evidence before retrying the aggregate step.",
+                source: .runtimePolicy
+            )
+        )
+        stage.validationFailureJSON = try JSONEncoder().encode(validationFailure)
+
+        let packet = FailedStageEvidenceBuilder.buildEvidencePacket(
+            stageExecution: stage,
+            failedAgent: nil,
+            validationFailure: validationFailure,
+            outputEnvelopes: [
+                StructuredOutputEnvelope(
+                    outputName: "proposal_review_summary",
+                    agentID: "lead_orchestrator",
+                    stageID: stage.stageID,
+                    runID: run.id,
+                    rawPayloadSize: 2048,
+                    rawPayloadChecksum: "summary-checksum",
+                    rawPayloadPersisted: true,
+                    contractID: "proposal_review_summary_v1",
+                    provider: "claude_code"
+                )
+            ],
+            recoverySnapshot: nil
+        )
+        stage.evidencePacketJSON = try JSONEncoder().encode(packet)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let recoveredPacket = try #require(coordinator.buildEvidencePacket(for: run))
+        #expect(recoveredPacket.failureSummary == packet.failureSummary)
+        #expect(recoveredPacket.failureClass == .outputContractMismatch)
+        #expect(recoveredPacket.rawOutputsExist == true)
+        #expect(recoveredPacket.receiptExists == true)
+        #expect(recoveredPacket.transcriptExists == true)
+
+        let recoveryContext = coordinator.recoveryContext(for: run)
+        #expect(recoveryContext.reason.contains("proposal_review_summary"))
+        #expect(recoveryContext.evidenceSummary == "raw output present, receipt present, transcript present")
+        #expect(recoveryContext.failureClass == ValidationFailureClass.outputContractMismatch.rawValue)
     }
 
     // MARK: - Layer P: Proposal Draft Compaction
@@ -586,6 +862,40 @@ struct Proposal013Tests {
             catalog: catalog
         )
         #expect(result.status == .failed)
+    }
+
+    @Test("ProposalReviewContractAdapter rejects markdown-only aggregate summary outputs")
+    func reviewSummaryRejectsMarkdown() {
+        let catalog = makeTestCatalog(withContracts: [
+            "proposal_review_summary_v1": ArtifactContract(
+                format: "json",
+                requiredFields: [
+                    "pass",
+                    "average_score",
+                    "aggregate_score",
+                    "min_individual_score",
+                    "blocker_count",
+                    "summary",
+                    "required_changes",
+                    "recurring_themes",
+                    "decision"
+                ]
+            )
+        ])
+
+        let markdownData = Data("""
+        | Metric | Value |
+        | --- | --- |
+        | Average Score | 9.2 |
+        """.utf8)
+
+        let result = ProposalReviewContractAdapter.validateReviewOutput(
+            outputName: "proposal_review_summary",
+            data: markdownData,
+            catalog: catalog
+        )
+        #expect(result.status == .failed)
+        #expect(result.validationError == "Output is not valid JSON or not a JSON object")
     }
 
     // MARK: - Canonical Motivating-Class Regression (§10.3)
@@ -948,6 +1258,114 @@ struct Proposal013Tests {
     }
 
     @MainActor
+    @Test("Fixture-backed proposal loop blocks on aggregate contract mismatch with canonical evidence")
+    func fixtureBackedProposalLoopBlocksOnAggregateContractMismatch() async throws {
+        let (container, context) = try makeTestModelContainer()
+        let workflow = try loadTestLiveWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let compiler = RunPlanCompiler(modelContext: context)
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+
+        let idea = Idea(
+            title: "P013 Fixture Aggregate Failure",
+            body: "Drive the live proposal loop until aggregate contract failure.",
+            workspaceRootPath: AppConfiguration.defaultRepositoryRoot().path
+        )
+        context.insert(idea)
+
+        let workflowPath = AppConfiguration.defaultRepositoryRoot()
+            .appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
+            .path
+        let catalogPath = AppConfiguration.defaultRepositoryRoot()
+            .appendingPathComponent("examples/agents/agents.yaml")
+            .path
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: workflowPath,
+            catalogSourcePath: catalogPath
+        )
+
+        let liveConfig = LiveRuntimeConfiguration(
+            baseURL: URL(string: "http://fixture.local")!,
+            apiKey: nil,
+            override: LiveExecutionOverride(
+                enabled: true,
+                provider: "claude_code",
+                model: "fixture-model",
+                effort: "high"
+            ),
+            transportMode: .fixtureProposal013AggregateFailure,
+            transportAPI: .bespoke
+        )
+        let service = ExecutionService(
+            modelContext: context,
+            executor: StaticResultExecutor(result: AgentResult(
+                outputs: [:],
+                logSnippet: nil,
+                costCents: nil,
+                succeeded: true,
+                errorMessage: nil,
+                sessionID: nil,
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: nil,
+                configuredProviderID: nil,
+                adapterVersion: nil
+            )),
+            catalog: catalog,
+            liveRuntimeConfiguration: liveConfig
+        )
+
+        service.startRun(run: run, plan: plan, workspace: workspace)
+        let blockedRun = try await waitForRunStatus(
+            runID: run.id,
+            expected: .blocked,
+            context: context,
+            timeoutMilliseconds: 15_000
+        )
+
+        guard let reviewStage = blockedRun.stageExecutions.last(where: { $0.stageID == "state_3_proposal_reviewed" }) else {
+            Issue.record("Missing blocked review stage")
+            return
+        }
+        let producedArtifacts = Set(reviewStage.agentExecutions.flatMap(\.artifacts).map(\.name))
+        #expect(producedArtifacts.contains("proposal_review_architect"))
+        #expect(producedArtifacts.contains("proposal_review_po"))
+        #expect(producedArtifacts.contains("proposal_review_ui"))
+        #expect(producedArtifacts.contains("proposal_review_ux"))
+
+        guard let aggregateAgent = reviewStage.agentExecutions.first(where: { $0.agentID == "lead_orchestrator" }) else {
+            Issue.record("Missing aggregate agent execution")
+            return
+        }
+        #expect(aggregateAgent.status == .failed)
+        #expect(aggregateAgent.validationFailureJSON != nil)
+
+        let validationFailure = try JSONDecoder().decode(
+            ValidationFailureRecord.self,
+            from: try #require(aggregateAgent.validationFailureJSON)
+        )
+        #expect(validationFailure.failureClass == .outputContractMismatch)
+        #expect(validationFailure.failureSummary.contains("proposal_review_summary"))
+
+        #expect(reviewStage.evidencePacketJSON != nil)
+        let packet = try JSONDecoder().decode(
+            FailedStageEvidencePacket.self,
+            from: try #require(reviewStage.evidencePacketJSON)
+        )
+        #expect(packet.failureClass == .outputContractMismatch)
+        #expect(packet.validationFailure?.failureSummary.contains("proposal_review_summary") == true)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let actions = coordinator.availableActions(for: blockedRun)
+        #expect(actions.contains(.retryAggregateStep(stageID: reviewStage.stageID, agentID: aggregateAgent.agentID)))
+        #expect(actions.contains(.retryStage(stageID: reviewStage.stageID)))
+
+        withExtendedLifetime(container) {}
+    }
+
+    @MainActor
     @Test("RunReportBuilder synthesizes failure evidence and canonical retry path when packet is missing")
     func runReportSynthesizesFailureEvidenceAndRetryPath() throws {
         let context = try makeP013TestContext()
@@ -1044,7 +1462,9 @@ struct Proposal013Tests {
                     contractID: "proposal_review_v1",
                     machineFormat: "json",
                     validationMode: "strict_structured",
-                    requiredFieldCount: 3
+                    requiredFieldCount: 3,
+                    rawArtifactName: nil,
+                    normalizedArtifactName: nil
                 )
             ],
             rawOutputExists: true,
@@ -1225,6 +1645,44 @@ struct Proposal013Tests {
         #expect(hasProposalReviewArtifact)
         #expect(!hasFailedReviewArtifact)
     }
+
+    @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
+    func proposal013AppProofCanonicalPassRule() {
+        let packet = FailedStageEvidencePacket(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 1_000),
+            stageID: "state_3_proposal_reviewed",
+            stageLabel: "Proposal reviewed",
+            stageAttemptNumber: 1,
+            failedAgentID: "lead_orchestrator",
+            failedAgentTitle: "Lead / Orchestrator",
+            failureSummary: "Aggregate summary contract validation failed after reviewer outputs were persisted.",
+            failureClass: .agentReportedFailure,
+            rawOutputsExist: true,
+            receiptExists: false,
+            transcriptExists: true,
+            validationFailure: nil,
+            outputEnvelopes: [],
+            timing: StageTiming(
+                stageStartedAt: Date(timeIntervalSince1970: 1_000),
+                stageCompletedAt: Date(timeIntervalSince1970: 1_010),
+                agentStartedAt: Date(timeIntervalSince1970: 1_001),
+                agentCompletedAt: Date(timeIntervalSince1970: 1_009),
+                agentDurationSeconds: 8
+            ),
+            recoverySnapshot: nil
+        )
+
+        #expect(
+            Proposal013AppProofHarness.isCanonicalPass(
+                terminalStatus: .blocked,
+                fanoutArtifactCount: 4,
+                evidencePacket: packet,
+                narrowestAction: "Retry Aggregate Step",
+                hasAggregateRetry: true
+            )
+        )
+    }
 }
 
 // MARK: - Test Helpers
@@ -1256,7 +1714,10 @@ private func makeTestCatalog(
     )
 }
 
-private func makeTestResolvedAgent(outputContract: String?) -> ResolvedAgent {
+private func makeTestResolvedAgent(
+    outputContract: String?,
+    outputs: [String] = ["proposal_review_po"]
+) -> ResolvedAgent {
     ResolvedAgent(
         id: "proposal_reviewer_po",
         title: "Reviewer PO",
@@ -1274,7 +1735,7 @@ private func makeTestResolvedAgent(outputContract: String?) -> ResolvedAgent {
         outputContract: outputContract,
         requiresHumanApproval: false,
         inputs: ["idea_brief", "proposal_current"],
-        outputs: ["proposal_review_po"],
+        outputs: outputs,
         worktreeWriteEnabled: false
     )
 }
@@ -1287,6 +1748,37 @@ private func makeP013TestContext() throws -> ModelContext {
         configurations: config
     )
     return ModelContext(container)
+}
+
+@MainActor
+private func waitForRunStatus(
+    runID: UUID,
+    expected: RunStatus,
+    context: ModelContext,
+    timeoutMilliseconds: Int
+) async throws -> Run {
+    let deadline = Date().addingTimeInterval(Double(timeoutMilliseconds) / 1000.0)
+    while Date() < deadline {
+        let descriptor = FetchDescriptor<Run>()
+        if let run = try context.fetch(descriptor).first(where: { $0.id == runID }) {
+            if run.status == expected {
+                return run
+            }
+            if run.status == .failed || run.status == .cancelled {
+                throw NSError(
+                    domain: "Proposal013Tests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Run ended as \(run.status.rawValue) before reaching \(expected.rawValue)"]
+                )
+            }
+        }
+        try await Task.sleep(for: .milliseconds(100))
+    }
+    throw NSError(
+        domain: "Proposal013Tests",
+        code: 2,
+        userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for run \(runID) to reach \(expected.rawValue)"]
+    )
 }
 
 /// Static executor that returns the same result for every execution.

@@ -102,6 +102,10 @@ skills:
 contracts:
   proposal_review_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_raw
+    normalized_artifact_name: proposal_review_normalized
     required_fields:
     - agent_id
     - role
@@ -116,6 +120,10 @@ contracts:
     - assumptions
   proposal_review_summary_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_summary_raw
+    normalized_artifact_name: proposal_review_summary
     required_fields:
     - pass
     - average_score

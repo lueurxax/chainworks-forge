@@ -41,6 +41,8 @@ struct ExecutionContext: Sendable {
     let ideaBody: String
     /// Resolved provider binding frozen at run start.
     let providerBinding: ResolvedProviderBinding?
+    /// Optional contract catalog for catalog-driven prompt/runtime hints.
+    let catalog: AgentCatalog?
 
     init(
         workspace: RunWorkspace,
@@ -51,7 +53,8 @@ struct ExecutionContext: Sendable {
         inputArtifacts: [String: Data],
         variables: [String: AnyCodableValue],
         ideaBody: String,
-        providerBinding: ResolvedProviderBinding?
+        providerBinding: ResolvedProviderBinding?,
+        catalog: AgentCatalog? = nil
     ) {
         self.workspace = workspace
         self.projectRoot = projectRoot
@@ -62,6 +65,7 @@ struct ExecutionContext: Sendable {
         self.variables = variables
         self.ideaBody = ideaBody
         self.providerBinding = providerBinding
+        self.catalog = catalog
     }
 }
 
@@ -152,7 +156,7 @@ struct AgentResult: Sendable {
 
 enum OutputContractResolver {
     static func expectedOutputs(for task: AgentTask, agent: ResolvedAgent) -> [String] {
-        task.outputs ?? agent.outputs
+        OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
     }
 
     static func contractID(
@@ -160,34 +164,11 @@ enum OutputContractResolver {
         agent: ResolvedAgent,
         catalog: AgentCatalog?
     ) -> String? {
-        switch outputName {
-        case "proposal_review_po", "proposal_review_ux", "proposal_review_ui", "proposal_review_architect":
-            return "proposal_review_v1"
-        case "proposal_review_summary":
-            return "proposal_review_summary_v1"
-        case "prepush_review_report":
-            return "prepush_review_v1"
-        case "final_feature_report":
-            return "final_feature_report_v1"
-        default:
-            break
-        }
-
-        guard let catalog else { return nil }
-        if catalog.contracts[outputName] != nil {
-            return outputName
-        }
-        let versioned = "\(outputName)_v1"
-        if catalog.contracts[versioned] != nil {
-            return versioned
-        }
-
-        if let explicit = agent.outputContract,
-           explicitContract(explicit, matches: outputName) {
-            return explicit
-        }
-
-        return nil
+        OutputContractResolverV2.resolveContractID(
+            for: outputName,
+            agent: agent,
+            catalog: catalog
+        )
     }
 
     static func contract(
@@ -200,15 +181,6 @@ enum OutputContractResolver {
             return nil
         }
         return catalog.contracts[contractID]
-    }
-
-    private static func explicitContract(_ contractID: String, matches outputName: String) -> Bool {
-        guard let stem = contractID.range(of: #"_v\d+$"#, options: .regularExpression).map({
-            String(contractID[..<$0.lowerBound])
-        }) else {
-            return contractID == outputName
-        }
-        return stem == outputName
     }
 }
 

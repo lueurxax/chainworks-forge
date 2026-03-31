@@ -15,6 +15,7 @@ enum GooseTransportAPI: String, Codable, Sendable {
 enum LiveTransportMode: Sendable {
     case network
     case fixtureProposalLoopSuccess
+    case fixtureProposal013AggregateFailure
     case fixtureFullMVPSuccess
 }
 
@@ -44,6 +45,8 @@ struct LiveRuntimeConfiguration: Sendable {
                 return "Goose server (goosed)"
             }
         case .fixtureProposalLoopSuccess:
+            return "Fixture backend"
+        case .fixtureProposal013AggregateFailure:
             return "Fixture backend"
         case .fixtureFullMVPSuccess:
             return "Fixture backend"
@@ -523,6 +526,8 @@ final class ExecutionService {
             }
         case .fixtureProposalLoopSuccess:
             transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
+        case .fixtureProposal013AggregateFailure:
+            transport = FixtureGooseTransport(scenario: .proposal013AggregateFailure)
         case .fixtureFullMVPSuccess:
             transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
         }

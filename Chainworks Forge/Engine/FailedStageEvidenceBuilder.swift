@@ -19,12 +19,13 @@ struct FailedStageEvidenceBuilder {
         recoverySnapshot: RecoveryActionSnapshot?
     ) -> FailedStageEvidencePacket {
         let stageAgents = stageExecution.agentExecutions
-        let rawOutputsExist = outputEnvelopes.contains { $0.rawPayloadPersisted }
+        let rawOutputsExist = (validationFailure?.rawOutputExists == true)
+            || outputEnvelopes.contains { $0.rawPayloadPersisted }
             || stageAgents.contains { !$0.artifacts.isEmpty }
-        let receiptExists = stageAgents.contains {
+        let receiptExists = (validationFailure?.receiptExists == true) || stageAgents.contains {
             $0.providerReceiptJSON != nil || $0.artifacts.contains(where: { $0.name.hasSuffix("_receipt.json") })
         }
-        let transcriptExists = stageAgents.contains {
+        let transcriptExists = (validationFailure?.transcriptExists == true) || stageAgents.contains {
             $0.transcriptPath != nil
                 || $0.transcriptArtifactPath != nil
                 || $0.artifacts.contains(where: { $0.name.hasSuffix("_transcript.md") })

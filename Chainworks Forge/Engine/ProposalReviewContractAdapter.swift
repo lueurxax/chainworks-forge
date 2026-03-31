@@ -50,7 +50,8 @@ enum ProposalReviewContractAdapter {
         return OutputContractSchemaV2.from(
             contractID: contractID,
             contract: contract,
-            validationMode: .strictStructured
+            validationMode: .strictStructured,
+            outputName: outputName
         )
     }
 

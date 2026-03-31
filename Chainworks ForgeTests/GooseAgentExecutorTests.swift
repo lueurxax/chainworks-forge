@@ -296,6 +296,52 @@ struct GooseAgentExecutorTests {
         #expect(result.errorMessage?.contains("limit") == true || result.errorMessage?.contains("output") == true)
     }
 
+    @MainActor
+    @Test("Durable structured outputs with neutral stop are treated as completed and receipt reflects success")
+    func durableStructuredOutputsWithNeutralStopUseDurableTruth() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(events: [
+            .sessionStarted(raw: "{}"),
+            .finish(reason: "stop", totalTokens: 42, raw: #"{"type":"Finish","reason":"stop"}"#),
+            .sessionClosed(raw: "{}")
+        ])
+
+        let executor = GooseAgentExecutor(transport: transport)
+        let agent = makeAgent(id: "lead_orchestrator", outputs: ["proposal_review_summary"])
+        let task = makeTask(agent: "lead_orchestrator", task: "aggregate_proposal_reviews")
+        let context = makeContext()
+
+        let outputDir = context.workspace.artifactRoot
+            .appendingPathComponent("\(context.stageID).\(context.iteration)", isDirectory: true)
+            .appendingPathComponent(agent.id, isDirectory: true)
+            .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        let summary = """
+        {
+          "average_score": 8.25,
+          "min_individual_score": 7.0,
+          "blocker_count": 0,
+          "decision": "approve"
+        }
+        """
+        try Data(summary.utf8).write(to: outputDir.appendingPathComponent("proposal_review_summary"))
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(result.canonicalOutcome == .completed)
+        #expect(result.outputPresence == .durableOutput)
+        #expect(result.errorMessage == nil)
+
+        let receiptKey = try #require(result.outputs.keys.first { $0.hasSuffix("_receipt.json") })
+        let receiptData = try #require(result.outputs[receiptKey])
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(ExecutionReceipt.self, from: receiptData)
+        #expect(receipt.succeeded)
+        #expect(receipt.errorMessage == nil)
+    }
+
     /// testGooseExecutorSessionCreationFailure
     @MainActor
     @Test("Executor handles session creation failure gracefully")

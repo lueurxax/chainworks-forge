@@ -5,7 +5,7 @@
 | Date | 2026-03-29 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [reference/workflow-execution-engine.md](../reference/workflow-execution-engine.md), [reference/runtime-contract.md](../reference/runtime-contract.md), [reference/goose-server-transport.md](../reference/goose-server-transport.md), [reference/current-system-baseline.md](../reference/current-system-baseline.md), [013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md](013-output-contract-alignment-retry-truth-and-failure-evidence-hardening.md) |
+| Depends on | [reference/workflow-execution-engine.md](../reference/workflow-execution-engine.md), [reference/runtime-contract.md](../reference/runtime-contract.md), [reference/goose-server-transport.md](../reference/goose-server-transport.md), [reference/current-system-baseline.md](../reference/current-system-baseline.md), [reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) |
 | Scope | Skill resolution, skill type dispatch, runtime injection of skill content into agent execution context, skill-role customization, skill provenance, skill preflight validation, and operator skill visibility |
 | Goal | Make every `skills.*` definition, every `agents.*.skill_ref`, and every `agents.*.skill_role` in the agent catalog a runtime-authoritative declaration that changes agent execution behavior — not metadata-only annotation. |
 
@@ -27,7 +27,7 @@ Every agent in the catalog references a skill through `skill_ref`, and some refe
 
 The current runtime treats all of these identically: **the skill name is copied as a string into `ResolvedAgent`, hashed for Steward provenance, and then ignored**. No type dispatch, no content loading, no prompt injection, no role customization.
 
-Proposal 013 explicitly documented this gap in Appendix B (Tier 3) and deferred it:
+The implemented output-contract and failure-evidence reference explicitly documented this gap in its tiered coverage and deferred it:
 
 > *SkillResolutionBridge — Resolving `skills.*`, `skill_ref`, and `skill_role` into live execution requires skill-system design beyond this bounded slice.*
 
@@ -399,9 +399,9 @@ Skill preflight results are shown as a dedicated section:
 | Skill versioning or dependency management | Skills are identified by content hash, not by version number |
 | Skill hot-reload during a running execution | RunPlanSnapshot freezes skills at run creation time |
 | Skill marketplace or sharing mechanism | Local-first single-engineer tool; sharing is filesystem copy |
-| Permission profile enforcement at transport level | Remains Tier 3 per Proposal 013 Appendix B; separate from skill resolution |
-| `required_tools` enforcement at transport level | Remains Tier 3 per Proposal 013 Appendix B; separate from skill resolution |
-| Backend runtime settings propagation (`max_turns`, `temperature`, `effort`) | Remains Tier 3 per Proposal 013 Appendix B; separate from skill resolution |
+| Permission profile enforcement at transport level | Remains Tier 3 per the output-contract tier classification; separate from skill resolution |
+| `required_tools` enforcement at transport level | Remains Tier 3 per the output-contract tier classification; separate from skill resolution |
+| Backend runtime settings propagation (`max_turns`, `temperature`, `effort`) | Remains Tier 3 per the output-contract tier classification; separate from skill resolution |
 
 ---
 
@@ -417,9 +417,9 @@ Skill preflight results are shown as a dedicated section:
 
 ---
 
-## 13. Migration from Proposal 013 tier classification
+## 13. Migration from the output-contract tier classification
 
-Proposal 013 Appendix B classified skills as Tier 3 (later proposal):
+The output-contract and failure-evidence reference classified skills as Tier 3 (later proposal):
 
 > | `skills.*` | Partial | Skill definitions exist in YAML, but skill content is not resolved into live execution. |
 > | `agents.*.skill_ref` / `skill_role` | Partial | Parsed, validated, displayed, and hashed into provenance; NOT injected into Goose prompts or tool/session policy. |

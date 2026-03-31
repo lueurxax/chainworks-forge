@@ -625,6 +625,10 @@ struct BlockedRunRecoveryView: View {
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
                 dismiss()
 
+            case .retryAggregateStep(let stageID, let agentID):
+                _ = try coordinator.retryAggregateStep(run: run, stageID: stageID, agentID: agentID)
+                dismiss()
+
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
                 dismiss()
@@ -725,7 +729,7 @@ struct BlockedRunRecoveryView: View {
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
         case .resumeFromApprovalGate: return DesignTokens.Action.approve
-        case .retryAgent, .retryStage: return DesignTokens.Action.caution
+        case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
         case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }
@@ -735,6 +739,8 @@ struct BlockedRunRecoveryView: View {
         switch action {
         case .resumeFromApprovalGate(let stageID):
             return "Re-arm the approval gate at \(stageID) and continue execution."
+        case .retryAggregateStep(let stageID, let agentID):
+            return "Retry aggregate step \(agentID) in stage \(stageID) with existing reviewer outputs."
         case .retryAgent(let stageID, let agentID):
             return "Retry agent \(agentID) in stage \(stageID) from its last checkpoint."
         case .retryStage(let stageID):

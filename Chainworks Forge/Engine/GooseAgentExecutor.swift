@@ -238,24 +238,6 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         let resolvedModel = override?.model ?? agent.model
         let resolvedEffort = override?.effort ?? agent.effort
 
-        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
-            agentID: agent.id,
-            sessionID: sessionExecution.sessionID,
-            stageID: context.stageID,
-            iteration: context.iteration,
-            attemptNumber: context.attemptNumber,
-            startedAt: startedAt,
-            completedAt: completedAt,
-            events: eventBridge.eventLog,
-            toolCalls: eventBridge.toolCalls,
-            finalContent: streamResult.finalContent,
-            succeeded: streamResult.succeeded,
-            errorMessage: streamResult.succeeded ? nil : "Execution did not produce final output",
-            provider: resolvedProvider,
-            model: resolvedModel,
-            effort: resolvedEffort
-        )
-
         // Step 6: Extract declared output artifacts from workspace
         var outputs: [String: Data] = [:]
 
@@ -297,13 +279,40 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             fallback: "Execution did not produce final output"
         )
 
-        // Add receipt artifacts to outputs
+        // Step 7: Validate required outputs (Section 8.3)
+        let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
+        let finalCanonicalOutcome: AgentCanonicalOutcome
+        let finalErrorMessage: String?
+
+        if !missingOutputs.isEmpty {
+            finalCanonicalOutcome = canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome
+            finalErrorMessage = "Required outputs missing: \(missingOutputs.joined(separator: ", "))"
+        } else {
+            finalCanonicalOutcome = canonicalOutcome
+            finalErrorMessage = failureMessage
+        }
+
+        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
+            agentID: agent.id,
+            sessionID: sessionExecution.sessionID,
+            stageID: context.stageID,
+            iteration: context.iteration,
+            attemptNumber: context.attemptNumber,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            events: eventBridge.eventLog,
+            toolCalls: eventBridge.toolCalls,
+            finalContent: streamResult.finalContent,
+            succeeded: finalCanonicalOutcome == .completed,
+            errorMessage: finalErrorMessage,
+            provider: resolvedProvider,
+            model: resolvedModel,
+            effort: resolvedEffort
+        )
+
         for (name, data) in receiptArtifacts {
             outputs[name] = data
         }
-
-        // Step 7: Validate required outputs (Section 8.3)
-        let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
 
         if !missingOutputs.isEmpty {
             // Stage should fail loudly — silent success is worse than a visible crash
@@ -329,14 +338,14 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
                 resolvedModel: context.providerBinding?.model ?? resolvedModel,
                 configuredProviderID: context.providerBinding?.configuredProviderID,
                 adapterVersion: context.providerBinding?.adapterVersion,
-                canonicalOutcome: canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome,
+                canonicalOutcome: finalCanonicalOutcome,
                 transportErrorKind: nil,
                 providerStopReason: streamResult.finishReason,
                 outputPresence: outputPresence,
                 runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
                 runtimeModel: context.providerBinding?.model ?? resolvedModel,
                 outcomeEnvelope: OutcomeEnvelope(
-                    canonicalOutcome: canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome,
+                    canonicalOutcome: finalCanonicalOutcome,
                     transportErrorKind: nil,
                     providerStopReason: streamResult.finishReason,
                     outputPresence: outputPresence,
@@ -376,18 +385,18 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
             resolvedModel: context.providerBinding?.model ?? resolvedModel,
             configuredProviderID: context.providerBinding?.configuredProviderID,
             adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: canonicalOutcome,
+            canonicalOutcome: finalCanonicalOutcome,
             transportErrorKind: nil,
             providerStopReason: streamResult.finishReason,
             outputPresence: outputPresence,
             runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
             runtimeModel: context.providerBinding?.model ?? resolvedModel,
             outcomeEnvelope: OutcomeEnvelope(
-                canonicalOutcome: canonicalOutcome,
+                canonicalOutcome: finalCanonicalOutcome,
                 transportErrorKind: nil,
                 providerStopReason: streamResult.finishReason,
                 outputPresence: outputPresence,
-                rawErrorMessage: failureMessage,
+                rawErrorMessage: finalErrorMessage,
                 rawFinishEvent: streamResult.finishRaw
             )
         )

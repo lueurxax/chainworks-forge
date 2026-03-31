@@ -9,6 +9,7 @@ import XCTest
 
 final class Chainworks_ForgeUITests: XCTestCase {
     private static let defaultApprovedRemoteHosts = ["SMacBook.local", "SMacBook"]
+    private var launchedApplications: Set<ObjectIdentifier> = []
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -193,22 +194,27 @@ final class Chainworks_ForgeUITests: XCTestCase {
     /// and attempts to bring the primary window to front.
     private func launchClean(_ app: XCUIApplication) {
         app.launch()
+        launchedApplications.insert(ObjectIdentifier(app))
         app.activate()
         RunLoop.current.run(until: Date().addingTimeInterval(1.0))
         dismissSystemPermissionDialogs()
     }
 
     private func terminateIfRunning(_ app: XCUIApplication) {
+        let appID = ObjectIdentifier(app)
+        guard launchedApplications.contains(appID) else { return }
         guard app.state == .runningForeground || app.state == .runningBackground else { return }
         app.activate()
         app.terminate()
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
             if app.state == .notRunning || app.state == .unknown {
+                launchedApplications.remove(appID)
                 return
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         }
+        launchedApplications.remove(appID)
     }
 
     /// Takes an evidence screenshot. Silently skips if app has crashed/terminated.
@@ -1106,6 +1112,61 @@ final class Chainworks_ForgeUITests: XCTestCase {
             "Completed export hub must surface export feedback after a successful export"
         )
         screenshot(app, name: "REQ016_ExportHub_Exported")
+    }
+
+    func testProposal013AppProofSurface() throws {
+        let app = makeApp(
+            liveFixtureMode: "proposal013_aggregate_failure",
+            directSurface: "proposal013_proof"
+        )
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-proposal013_proof")
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "Proposal 013 direct surface must finish bootstrap"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p013-proof-banner").waitForExistence(timeout: 10),
+            "Proposal 013 proof surface must render its banner"
+        )
+
+        app.buttons["p013-run-proof"].firstMatch.click()
+
+        let proofStatus = anyElement(app, identifier: "p013-proof-status")
+        XCTAssertTrue(proofStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(
+            anyElement(app, identifier: "p013-proof-complete").waitForExistence(timeout: 20)
+                || waitForLabeledPrefix(app, prefix: "PASS", timeout: 20) != nil
+                || waitForLabeledPrefix(app, prefix: "FAIL", timeout: 20) != nil,
+            "Proposal 013 proof surface must reach a terminal proof state"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p013-evidence-panel").waitForExistence(timeout: 20),
+            "Proposal 013 proof must render the failed-stage evidence panel"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p013-recovery-view").waitForExistence(timeout: 20),
+            "Proposal 013 proof must render the shell-owned recovery view"
+        )
+        XCTAssertEqual(
+            anyElement(app, identifier: "p013-fanout-artifacts").label,
+            "4/4",
+            "Proposal 013 app proof must seed all four reviewer fan-out artifacts"
+        )
+        XCTAssertEqual(
+            anyElement(app, identifier: "p013-narrowest-action").label,
+            "Retry Aggregate Step",
+            "Proposal 013 app proof must expose aggregate retry as the narrowest valid action"
+        )
+        XCTAssertTrue(
+            proofStatus.label.contains("PASS"),
+            "Proposal 013 app proof must finish in PASS state"
+        )
+
+        screenshot(app, name: "P013_App_Proof")
     }
 
     func testProposal012AppendixAMinWindowOwnersAt1024x768() throws {

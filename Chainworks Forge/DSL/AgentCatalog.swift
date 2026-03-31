@@ -96,10 +96,38 @@ struct PermissionProfile: Codable, Sendable {
 struct ArtifactContract: Codable, Sendable {
     let format: String
     let requiredFields: [String]
+    let machineFormat: String?
+    let humanFormat: String?
+    let validationMode: String?
+    let rawArtifactName: String?
+    let normalizedArtifactName: String?
+
+    init(
+        format: String,
+        requiredFields: [String],
+        machineFormat: String? = nil,
+        humanFormat: String? = nil,
+        validationMode: String? = nil,
+        rawArtifactName: String? = nil,
+        normalizedArtifactName: String? = nil
+    ) {
+        self.format = format
+        self.requiredFields = requiredFields
+        self.machineFormat = machineFormat
+        self.humanFormat = humanFormat
+        self.validationMode = validationMode
+        self.rawArtifactName = rawArtifactName
+        self.normalizedArtifactName = normalizedArtifactName
+    }
 
     enum CodingKeys: String, CodingKey {
         case format
         case requiredFields = "required_fields"
+        case machineFormat = "machine_format"
+        case humanFormat = "human_format"
+        case validationMode = "validation_mode"
+        case rawArtifactName = "raw_artifact_name"
+        case normalizedArtifactName = "normalized_artifact_name"
     }
 }
 

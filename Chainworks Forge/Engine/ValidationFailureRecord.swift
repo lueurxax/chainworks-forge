@@ -96,6 +96,8 @@ struct ContractValidationMetadata: Codable, Sendable, Equatable {
     let machineFormat: String
     let validationMode: String
     let requiredFieldCount: Int
+    let rawArtifactName: String?
+    let normalizedArtifactName: String?
 }
 
 // MARK: - Recovery Recommendation

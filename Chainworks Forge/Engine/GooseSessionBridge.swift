@@ -112,14 +112,19 @@ final class GooseSessionBridge: Sendable {
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
         // 1. System prompt
-        let systemPrompt = buildSystemPrompt(agent: agent, expectedOutputs: expectedOutputs)
+        let systemPrompt = buildSystemPrompt(
+            agent: agent,
+            expectedOutputs: expectedOutputs,
+            catalog: context.catalog
+        )
 
         // 2. Task directive
         let taskDirective = buildTaskDirective(
             agent: agent,
             task: task,
             context: context,
-            expectedOutputs: expectedOutputs
+            expectedOutputs: expectedOutputs,
+            catalog: context.catalog
         )
 
         // 3. Context attachments (input artifacts + workspace info)
@@ -183,9 +188,11 @@ final class GooseSessionBridge: Sendable {
 
     private static func buildSystemPrompt(
         agent: ResolvedAgent,
-        expectedOutputs: [String]
+        expectedOutputs: [String],
+        catalog: AgentCatalog?
     ) -> String {
         var parts: [String] = []
+        let structuredHints = structuredOutputHints(agent: agent, expectedOutputs: expectedOutputs, catalog: catalog)
 
         // Agent role
         parts.append("You are \(agent.title) (ID: \(agent.id)).")
@@ -206,6 +213,12 @@ final class GooseSessionBridge: Sendable {
             if !expectedOutputs.isEmpty {
                 parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
             }
+        } else if !structuredHints.isEmpty {
+            parts.append("")
+            parts.append("## Output Contracts")
+            let contractList = Array(Set(structuredHints.map(\.contractID))).sorted().joined(separator: ", ")
+            parts.append("You must produce outputs conforming to the structured contract(s): \(contractList)")
+            parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
         }
 
         // Boundaries
@@ -231,9 +244,11 @@ final class GooseSessionBridge: Sendable {
         agent: ResolvedAgent,
         task: AgentTask,
         context: ExecutionContext,
-        expectedOutputs: [String]
+        expectedOutputs: [String],
+        catalog: AgentCatalog?
     ) -> String {
         var parts: [String] = []
+        let structuredHints = structuredOutputHints(agent: agent, expectedOutputs: expectedOutputs, catalog: catalog)
 
         parts.append("## Task: \(task.task)")
         parts.append("")
@@ -260,39 +275,18 @@ final class GooseSessionBridge: Sendable {
             parts.append("Output directory: \(context.workspace.artifactRoot.path)/\(context.stageID).\(context.iteration)/\(agent.id)/\(context.attemptNumber)/")
         }
 
-        if agent.outputContract == "proposal_review_v1" || agent.outputContract == "proposal_review_summary_v1" {
+        if !structuredHints.isEmpty {
             parts.append("")
             parts.append("### Structured Output Requirements")
             parts.append("Each required output file must contain exactly one top-level JSON object and nothing else.")
             parts.append("Do not write markdown, tables, headings, fences, narrative prose, or companion files unless they are explicitly listed as required outputs.")
             parts.append("If you want to explain the review, put that explanation inside JSON fields required by the contract.")
-
-            if agent.outputContract == "proposal_review_v1" {
+            for hint in structuredHints {
                 parts.append("")
-                parts.append("#### Required Fields for proposal_review_v1:")
-                parts.append("- agent_id: String (use '\(agent.id)')")
-                parts.append("- role: String")
-                parts.append("- score: Number (0-10)")
-                parts.append("- decision: String")
-                parts.append("- verdict: String")
-                parts.append("- summary: String")
-                parts.append("- issues: Array of Strings")
-                parts.append("- blocking_issues: Array of Strings")
-                parts.append("- non_blocking_issues: Array of Strings")
-                parts.append("- suggestions: Array of Strings")
-                parts.append("- assumptions: Array of Strings")
-            } else if agent.outputContract == "proposal_review_summary_v1" {
-                parts.append("")
-                parts.append("#### Required Fields for proposal_review_summary_v1:")
-                parts.append("- pass: Boolean")
-                parts.append("- average_score: Number")
-                parts.append("- aggregate_score: Number")
-                parts.append("- min_individual_score: Number")
-                parts.append("- blocker_count: Integer")
-                parts.append("- summary: String")
-                parts.append("- required_changes: Array of Strings")
-                parts.append("- recurring_themes: Array of Strings")
-                parts.append("- decision: String")
+                parts.append("#### Required Fields for \(hint.contractID):")
+                for field in hint.requiredFields {
+                    parts.append("- \(field)")
+                }
             }
         }
 
@@ -302,6 +296,101 @@ final class GooseSessionBridge: Sendable {
         parts.append("Complete the task and produce all required output files. Do not continue beyond the task scope.")
 
         return parts.joined(separator: "\n")
+    }
+
+    private struct StructuredOutputHint {
+        let outputName: String
+        let contractID: String
+        let requiredFields: [String]
+    }
+
+    private static func structuredOutputHints(
+        agent: ResolvedAgent,
+        expectedOutputs: [String],
+        catalog: AgentCatalog?
+    ) -> [StructuredOutputHint] {
+        var hintsByOutput: [String: StructuredOutputHint] = [:]
+
+        for outputName in expectedOutputs {
+            if let catalog,
+               let schema = OutputContractResolverV2.resolveSchema(
+                    for: outputName,
+                    agent: agent,
+                    catalog: catalog
+               ),
+               schema.validationMode != .humanOnly {
+                hintsByOutput[outputName] = StructuredOutputHint(
+                    outputName: outputName,
+                    contractID: schema.contractID,
+                    requiredFields: schema.requiredFields
+                )
+                continue
+            }
+
+            if isProposalReviewOutput(outputName) {
+                hintsByOutput[outputName] = StructuredOutputHint(
+                    outputName: outputName,
+                    contractID: ProposalReviewContractAdapter.reviewContractID,
+                    requiredFields: reviewRequiredFields(agentID: agent.id)
+                )
+            } else if isProposalReviewSummaryOutput(outputName) {
+                hintsByOutput[outputName] = StructuredOutputHint(
+                    outputName: outputName,
+                    contractID: ProposalReviewContractAdapter.summaryContractID,
+                    requiredFields: reviewSummaryRequiredFields()
+                )
+            }
+        }
+
+        return hintsByOutput.values.sorted {
+            if $0.outputName != $1.outputName {
+                return $0.outputName < $1.outputName
+            }
+            return $0.contractID < $1.contractID
+        }
+    }
+
+    private static func reviewRequiredFields(agentID: String) -> [String] {
+        [
+            "agent_id: String (use '\(agentID)')",
+            "role: String",
+            "score: Number (0-10)",
+            "decision: String",
+            "verdict: String",
+            "summary: String",
+            "issues: Array of Strings",
+            "blocking_issues: Array of Strings",
+            "non_blocking_issues: Array of Strings",
+            "suggestions: Array of Strings",
+            "assumptions: Array of Strings"
+        ]
+    }
+
+    private static func reviewSummaryRequiredFields() -> [String] {
+        [
+            "pass: Boolean",
+            "average_score: Number",
+            "aggregate_score: Number",
+            "min_individual_score: Number",
+            "blocker_count: Integer",
+            "summary: String",
+            "required_changes: Array of Strings",
+            "recurring_themes: Array of Strings",
+            "decision: String"
+        ]
+    }
+
+    private static func isProposalReviewOutput(_ outputName: String) -> Bool {
+        [
+            "proposal_review_po",
+            "proposal_review_ux",
+            "proposal_review_ui",
+            "proposal_review_architect"
+        ].contains(outputName)
+    }
+
+    private static func isProposalReviewSummaryOutput(_ outputName: String) -> Bool {
+        outputName == "proposal_review_summary"
     }
 
     // MARK: - Validation

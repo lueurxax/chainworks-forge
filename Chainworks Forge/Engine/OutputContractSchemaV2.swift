@@ -67,17 +67,18 @@ extension OutputContractSchemaV2 {
         validationMode: ValidationMode = .strictStructured,
         outputName: String? = nil
     ) -> OutputContractSchemaV2 {
-        let machineFormat = ContractFormat(rawValue: contract.format) ?? .json
-        // Proposal 013 §4.3: For structured_with_human_companion, declare both formats
-        let humanFormat: ContractFormat? = (validationMode == .structuredWithHumanCompanion) ? .markdown : nil
-        let rawName = outputName.map { "\($0)_raw" }
-        let normalizedName = outputName
+        let resolvedValidationMode = ValidationMode(rawValue: contract.validationMode ?? "") ?? validationMode
+        let machineFormat = ContractFormat(rawValue: contract.machineFormat ?? contract.format) ?? .json
+        let humanFormat = contract.humanFormat.flatMap(ContractFormat.init(rawValue:))
+            ?? (resolvedValidationMode == .structuredWithHumanCompanion ? .markdown : nil)
+        let rawName = contract.rawArtifactName ?? outputName
+        let normalizedName = contract.normalizedArtifactName ?? outputName
 
         return OutputContractSchemaV2(
             contractID: contractID,
             machineFormat: machineFormat,
             humanFormat: humanFormat,
-            validationMode: validationMode,
+            validationMode: resolvedValidationMode,
             requiredFields: contract.requiredFields,
             rawArtifactName: rawName,
             normalizedArtifactName: normalizedName

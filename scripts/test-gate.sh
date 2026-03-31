@@ -45,6 +45,12 @@ PROPOSAL_012_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
 )
 
+PROPOSAL_013_TESTS=(
+  "Chainworks ForgeTests/Proposal013Tests"
+  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal013AppProofSurface"
+)
+
 PROPOSAL_014_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal014ShellBrandHeaderVisible"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal014ForegroundBannerVisible"
@@ -380,10 +386,11 @@ run_targeted_tests() {
   local gate_name="$1"
   shift
 
-  local stamp derived_data result_bundle
+  local stamp derived_data result_bundle log_path
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
   result_bundle="$TMP_BASE/${gate_name}-${stamp}.xcresult"
+  log_path="$TMP_BASE/${gate_name}-${stamp}.log"
   mkdir -p "$TMP_BASE"
 
   local cmd=(
@@ -393,7 +400,6 @@ run_targeted_tests() {
     -scheme "$SCHEME_NAME"
     -destination "$DESTINATION"
     -derivedDataPath "$derived_data"
-    -resultBundlePath "$result_bundle"
   )
 
   local includes_ui=0
@@ -407,13 +413,141 @@ run_targeted_tests() {
   done
 
   if [[ $includes_ui -eq 0 ]]; then
+    cmd+=("-resultBundlePath" "$result_bundle")
     cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
     cmd+=("-skip-testing:Chainworks ForgeUITests")
+  else
+    cmd+=("-parallel-testing-enabled" "NO")
+    cmd+=("-maximum-parallel-testing-workers" "1")
+    if [[ "$gate_name" != "proposal-013-ui" ]]; then
+      cmd+=("-resultBundlePath" "$result_bundle")
+    fi
   fi
 
   log "Test gate: $gate_name"
-  "${cmd[@]}"
-  log "Result bundle: $result_bundle"
+  if [[ "$gate_name" == "proposal-013-ui" ]]; then
+    # This lane currently hangs on the approved host after it has already
+    # printed a successful XCTest summary. Run it through a narrow watchdog
+    # that only accepts success after the canonical pass markers.
+    python3 - "$log_path" "${cmd[@]}" <<'PY'
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+log_path = sys.argv[1]
+cmd = sys.argv[2:]
+
+marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal013AppProofSurface]' passed"
+marker_suite_passed = "Executed 1 test, with 0 failures"
+grace_seconds = float(os.environ.get("CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS", "15"))
+hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS", "1800"))
+
+test_passed = False
+suite_passed = False
+success_at = None
+start = time.time()
+
+with open(log_path, "w", encoding="utf-8") as log:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    try:
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+            line = proc.stdout.readline() if ready else ""
+            if line:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log.write(line)
+                log.flush()
+                if marker_test_passed in line:
+                    test_passed = True
+                if marker_suite_passed in line:
+                    suite_passed = True
+                if test_passed and suite_passed and success_at is None:
+                    success_at = time.time()
+                continue
+
+            if proc.poll() is not None:
+                raise SystemExit(proc.returncode)
+
+            now = time.time()
+            if success_at is not None and now - success_at >= grace_seconds:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                time.sleep(2)
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                print("==> Proposal 013 UI watchdog: xcodebuild hung after successful proof; terminating stale process and accepting gate")
+                raise SystemExit(0)
+
+            if now - start >= hard_timeout_seconds:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                time.sleep(2)
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                print("error: Proposal 013 UI watchdog hit hard timeout before success markers", file=sys.stderr)
+                raise SystemExit(124)
+
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+PY
+    log "UI log: $log_path"
+    local derived_result
+    derived_result="$(find "$derived_data/Logs/Test" -name '*.xcresult' -print 2>/dev/null | sort | tail -1 || true)"
+    if [[ -n "$derived_result" ]]; then
+      log "Result bundle: $derived_result"
+    fi
+  else
+    "${cmd[@]}"
+    log "Result bundle: $result_bundle"
+  fi
+}
+
+run_split_targeted_gate() {
+  local gate_name="$1"
+  shift
+
+  local non_ui_tests=()
+  local ui_tests=()
+  local test_id
+  for test_id in "$@"; do
+    if [[ "$test_id" == Chainworks\ ForgeUITests/* ]]; then
+      ui_tests+=("$test_id")
+    else
+      non_ui_tests+=("$test_id")
+    fi
+  done
+
+  if [[ ${#non_ui_tests[@]} -gt 0 ]]; then
+    run_targeted_tests "${gate_name}-non-ui" "${non_ui_tests[@]}"
+  fi
+
+  if [[ ${#ui_tests[@]} -gt 0 ]]; then
+    run_targeted_tests "${gate_name}-ui" "${ui_tests[@]}"
+  fi
 }
 
 run_full_suite() {
@@ -445,6 +579,7 @@ Available gates:
   fast            Guardrails + build + high-ROI unit/runtime tests
   ui-smoke        Focused operator-shell UI smoke tests
   proposal-006    Proposal 006 settings/provider/readiness gate
+  proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   full            Full xcodebuild test sign-off gate
 EOF
@@ -539,6 +674,18 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     run_targeted_tests "proposal-012" "${PROPOSAL_012_TESTS[@]}"
+    ;;
+  proposal-013|p013)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_split_targeted_gate "proposal-013" "${PROPOSAL_013_TESTS[@]}"
     ;;
   proposal-014|p014)
     check_idle_environment strict

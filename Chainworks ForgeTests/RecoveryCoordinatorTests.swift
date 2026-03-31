@@ -82,6 +82,86 @@ struct RecoveryCoordinatorTests {
         #expect(clone.id != run.id)
         #expect(idea.runs.contains(where: { $0.id == clone.id }))
     }
+
+    @Test("Recovery context prefers persisted recovery snapshot suggestion")
+    func recoveryContextPrefersPersistedSnapshotSuggestion() throws {
+        let context = try makeRecoveryContext()
+        let idea = Idea(title: "Blocked Idea", body: "Body", status: .active)
+        context.insert(idea)
+
+        let run = makeRun(status: .blocked)
+        run.idea = idea
+        idea.runs.append(run)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        run.stageExecutions.append(stage)
+        context.insert(stage)
+
+        let agent = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "aggregate_proposal_reviews",
+            startedAt: Date(),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agent.stageExecution = stage
+        stage.agentExecutions.append(agent)
+        context.insert(agent)
+
+        let failureRecord = ValidationFailureRecord(
+            agentID: agent.agentID,
+            stageID: stage.stageID,
+            runID: run.id,
+            outputResults: [],
+            failureSummary: "Persistence failed after aggregate output generation",
+            failureClass: .persistenceFailure,
+            contractMetadata: [],
+            rawOutputExists: true,
+            receiptExists: true,
+            transcriptExists: false,
+            recoveryRecommendation: RecoveryRecommendation(
+                action: .cloneRun,
+                explanation: "Use the current config clone for this proof.",
+                source: .runtimePolicy
+            )
+        )
+        agent.validationFailureJSON = try JSONEncoder().encode(failureRecord)
+
+        let snapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(),
+            runID: run.id,
+            recommendedAction: RecoveryActionDetail(
+                action: .cloneRunCurrentConfig,
+                stageID: nil,
+                agentID: nil,
+                explanation: "Use the current config clone for this proof.",
+                staysInSameRun: false,
+                reusesSiblingOutputs: false,
+                reExecutesWholeStage: false
+            ),
+            availableActions: [],
+            validationFailureID: failureRecord.id,
+            source: .runtimePolicy
+        )
+        stage.recoverySnapshotJSON = try JSONEncoder().encode(snapshot)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let recoveryContext = coordinator.recoveryContext(for: run)
+
+        #expect(recoveryContext.suggestedAction == .cloneRunCurrentConfig)
+    }
 }
 
 private func makeRecoveryContext() throws -> ModelContext {
@@ -119,6 +199,18 @@ private func makeRecoveryWorkflow() -> WorkflowDefinition {
                 run: nil,
                 runAfterApproval: nil,
                 loop: nil,
+                transitions: [
+                    Transition(to: "state_2", when: "always")
+                ]
+            ),
+            "state_2": WorkflowState(
+                label: "Completed",
+                type: "end",
+                owner: "lead_orchestrator",
+                approval: nil,
+                run: nil,
+                runAfterApproval: nil,
+                loop: nil,
                 transitions: []
             )
         ]
@@ -140,7 +232,14 @@ private func makeRecoveryCatalog() -> AgentCatalog {
         ),
         paths: [:],
         artifacts: [:],
-        skills: [:],
+        skills: [
+            "orchestrator_core": SkillRef(
+                type: "inline_skill",
+                path: nil,
+                name: "Orchestrator Core",
+                description: "Recovery test skill"
+            )
+        ],
         contracts: [:],
         backendProfiles: [
             "writer_profile": BackendProfile(
@@ -152,7 +251,15 @@ private func makeRecoveryCatalog() -> AgentCatalog {
                 structuredOutput: ""
             )
         ],
-        permissionProfiles: [:],
+        permissionProfiles: [
+            "ORCH": PermissionProfile(
+                filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                shell: ShellPermissions(allow: nil, deny: nil),
+                network: NetworkPermissions(allow: nil),
+                mcp: MCPPermissions(allow: nil)
+            )
+        ],
         agents: [
             AgentDefinition(
                 id: "lead_orchestrator",

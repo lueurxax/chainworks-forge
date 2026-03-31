@@ -235,6 +235,10 @@ struct RecoverySheet: View {
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
                 dismiss()
 
+            case .retryAggregateStep(let stageID, let agentID):
+                _ = try coordinator.retryAggregateStep(run: run, stageID: stageID, agentID: agentID)
+                dismiss()
+
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
                 dismiss()
@@ -309,6 +313,8 @@ struct RecoverySheet: View {
         switch action {
         case .retryAgent(_, let agentID):
             return "Retries only agent '\(agentID)' in the same run. Successful sibling outputs are reused."
+        case .retryAggregateStep(_, let agentID):
+            return "Retries only the aggregate step '\(agentID)' in the same run. Reviewer outputs are reused."
         case .retryStage(let stageID):
             return "Re-executes the entire '\(stageID)' stage in the same run. All agents re-run."
         case .resumeFromApprovalGate:
@@ -347,7 +353,7 @@ struct RecoverySheet: View {
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
         case .resumeFromApprovalGate: return DesignTokens.Action.approve
-        case .retryAgent, .retryStage: return DesignTokens.Action.caution
+        case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
         case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }

@@ -265,12 +265,16 @@ enum OutputContractResolverV2 {
         contractID: String,
         contract: ArtifactContract
     ) -> ValidationMode {
+        if let declared = contract.validationMode,
+           let explicitMode = ValidationMode(rawValue: declared) {
+            return explicitMode
+        }
         // Proposal review outputs are strict machine JSON.
         if contractID.hasPrefix("proposal_review") {
             return .strictStructured
         }
         // JSON contracts default to strict structured
-        if contract.format == "json" {
+        if (contract.machineFormat ?? contract.format) == "json" {
             return .strictStructured
         }
         // Markdown/other: human only

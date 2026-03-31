@@ -65,7 +65,7 @@ extension ArtifactFormat {
 
         // 2. If an output contract exists, use its declared format
         if let contract {
-            return ArtifactFormat(rawValue: contract.format) ?? .json
+            return ArtifactFormat(rawValue: contract.machineFormat ?? contract.format) ?? .json
         }
 
         // 3. Fallback: treat as report (generic structured output)

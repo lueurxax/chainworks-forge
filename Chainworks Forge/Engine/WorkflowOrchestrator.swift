@@ -515,7 +515,8 @@ final class WorkflowOrchestrator {
             inputArtifacts: inputData,
             variables: runtimeVariables,
             ideaBody: run.idea?.body ?? "",
-            providerBinding: providerBindingsByAgentID[agent.id]
+            providerBinding: providerBindingsByAgentID[agent.id],
+            catalog: catalog
         )
 
         // Proposal 007 REQ-008 / REQ-011: Route release agents through ReleaseOpsCoordinator
@@ -1130,7 +1131,8 @@ final class WorkflowOrchestrator {
                     inputArtifacts: gatheredInputs,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? "",
-                    providerBinding: providerBindingsByAgentID[agent.id]
+                    providerBinding: providerBindingsByAgentID[agent.id],
+                    catalog: catalog
                 )
                 let executor = self.executor
                 pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(gatheredInputs.keys).sorted())
@@ -1495,16 +1497,14 @@ final class WorkflowOrchestrator {
                 agent: agent,
                 catalog: catalog
             ),
-            let catalog,
-            let contract = catalog.contracts[contractID],
-            contract.format == "json" else {
+            let schema = OutputContractResolverV2.resolveSchema(for: outputName, agent: agent, catalog: catalog),
+            schema.machineFormat == .json else {
                 continue
             }
 
             // Proposal 013 §4.3: Skip strict field validation for structured_with_human_companion
             // contracts — the V2 validation has already accepted the output.
-            let schema = OutputContractResolverV2.resolveSchema(for: outputName, agent: agent, catalog: catalog)
-            if schema?.validationMode == .structuredWithHumanCompanion {
+            if schema.validationMode == .structuredWithHumanCompanion {
                 // Try JSON extraction for transition evaluation, but don't throw on failure
                 if let fields = tryExtractScalarFields(from: data) {
                     validated[outputName] = fields
@@ -1519,7 +1519,7 @@ final class WorkflowOrchestrator {
                 outputName: outputName
             )
 
-            for field in contract.requiredFields where json[field] == nil {
+            for field in schema.requiredFields where json[field] == nil {
                 throw ExecutionError.outputContractViolation(
                     agentID: agent.id,
                     contractID: contractID,

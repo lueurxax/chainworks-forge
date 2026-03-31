@@ -75,6 +75,24 @@ final class StageRetryCoordinator {
         return retryExec
     }
 
+    // MARK: - Retry Failed Aggregate Step (§5.2, Rule 3)
+
+    /// Retry the failed aggregate step within the current stage attempt.
+    /// Equivalent to an agent-level retry with aggregate-specific guardrails.
+    func retryFailedAggregateStep(
+        run: Run,
+        stage: StageExecution,
+        failedAggregateAgent: AgentExecution
+    ) throws -> AgentExecution {
+        guard isAggregateStep(failedAggregateAgent) else {
+            throw StageRetryError.invalidRetryState(
+                "Attempted aggregate retry on non-aggregate agent '\(failedAggregateAgent.agentID)'"
+            )
+        }
+
+        return try retryFailedAgent(run: run, stage: stage, failedAgent: failedAggregateAgent)
+    }
+
     // MARK: - Retry Failed Stage (§5.2, Rule 2)
 
     /// Retry the entire failed stage with a new stage attempt.
@@ -124,11 +142,18 @@ final class StageRetryCoordinator {
         var recommendedAction: RecoveryActionDetail?
 
         if let failedAgent, let failedStage {
+            let isAggregate = isAggregateStep(failedAgent)
+            let retryActionType: RecoveryActionType = isAggregate
+                ? .retryFailedAggregateStep
+                : .retryFailedAgent
+            let retryActionDescription = isAggregate
+                ? "Retry only the failed aggregate step '\(failedAgent.agentTitle)' in the same run. Reviewer outputs are reused."
+                : "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused."
             let retryAgentAction = RecoveryActionDetail(
-                action: .retryFailedAgent,
+                action: retryActionType,
                 stageID: failedStage.stageID,
                 agentID: failedAgent.agentID,
-                explanation: "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused.",
+                explanation: retryActionDescription,
                 staysInSameRun: true,
                 reusesSiblingOutputs: true,
                 reExecutesWholeStage: false
@@ -229,10 +254,20 @@ struct RecoveryActionDetail: Codable, Sendable, Equatable {
 
 enum RecoveryActionType: String, Codable, Sendable, Equatable {
     case retryFailedAgent = "retry_failed_agent"
+    case retryFailedAggregateStep = "retry_failed_aggregate_step"
     case retryFailedStage = "retry_failed_stage"
     case cloneRunFrozenSnapshot = "clone_run_frozen_snapshot"
     case cloneRunCurrentConfig = "clone_run_current_config"
     case operatorInspection = "operator_inspection"
+}
+
+private func isAggregateStep(_ agent: AgentExecution) -> Bool {
+    let normalizedTaskName = agent.taskName
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return normalizedTaskName == "aggregate_proposal_reviews"
+        || normalizedTaskName == "aggregate_proposal_review"
+        || normalizedTaskName.contains("aggregate_proposal_reviews")
 }
 
 // MARK: - Errors

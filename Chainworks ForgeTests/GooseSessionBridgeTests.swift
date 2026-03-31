@@ -278,6 +278,69 @@ struct GooseSessionBridgeTests {
         #expect(packet.taskDirective.contains("score: Number (0-10)"))
     }
 
+    @Test("Aggregate review summary packet requires strict JSON artifact names even without agent outputContract")
+    func aggregateReviewSummaryPacketRequiresStrictJSONArtifactNamesWithoutAgentOutputContract() {
+        let agent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "claude",
+            model: "claude-opus-4.6",
+            effort: "high",
+            maxTurns: 16,
+            temperature: 0,
+            permissionProfile: "ORCH",
+            skillRef: "orchestrator_core",
+            skillRole: nil,
+            prompt: "Aggregate only structured outputs.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect"
+            ],
+            outputs: ["proposal_review_summary", "run_state", "orchestrator_summary"]
+        )
+        let task = AgentTask(
+            agent: agent.id,
+            task: "aggregate_proposal_reviews",
+            inputs: [
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect"
+            ],
+            outputs: ["proposal_review_summary"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            iteration: 4,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("proposal_review_summary"))
+        #expect(packet.taskDirective.contains("exact filenames"))
+        #expect(packet.taskDirective.contains("Do not add file extensions"))
+        #expect(packet.taskDirective.contains("top-level JSON object"))
+        #expect(packet.taskDirective.contains("Do not write markdown"))
+        #expect(packet.taskDirective.contains("Required Fields for proposal_review_summary_v1:"))
+        #expect(packet.taskDirective.contains("pass: Boolean"))
+        #expect(packet.taskDirective.contains("average_score: Number"))
+        #expect(packet.taskDirective.contains("decision: String"))
+    }
+
     @Test("Packet without input artifacts")
     func packetWithoutInputArtifacts() {
         let agent = makeAgent()

@@ -171,7 +171,10 @@ enum ArtifactPersistenceOrderingPolicy {
         guard !failedResults.isEmpty else { return nil }
 
         let failureSummary = failedResults
-            .compactMap { $0.validationError }
+            .map { result in
+                let explanation = result.validationError ?? "Validation failed"
+                return "\(result.outputName): \(explanation)"
+            }
             .joined(separator: "; ")
 
         let contractMetadata = failedResults.compactMap { result -> ContractValidationMetadata? in
@@ -184,7 +187,9 @@ enum ArtifactPersistenceOrderingPolicy {
                 contractID: contractID,
                 machineFormat: schema.machineFormat.rawValue,
                 validationMode: schema.validationMode.rawValue,
-                requiredFieldCount: schema.requiredFields.count
+                requiredFieldCount: schema.requiredFields.count,
+                rawArtifactName: schema.rawArtifactName,
+                normalizedArtifactName: schema.normalizedArtifactName
             )
         }
 

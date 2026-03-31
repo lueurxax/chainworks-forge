@@ -6,6 +6,7 @@ import Foundation
 final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     enum Scenario {
         case proposalLoopSuccess
+        case proposal013AggregateFailure
         case fullMVPSuccess
         case fullMVPRefineThenSuccess
     }
@@ -69,6 +70,8 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     ) -> [GooseStreamEvent] {
         switch scenario {
         case .proposalLoopSuccess:
+            return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
+        case .proposal013AggregateFailure:
             return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
         case .fullMVPSuccess:
             return fullMVPSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
@@ -226,6 +229,14 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         case "proposal_review_architect":
             return reviewerJSON(agentID: agentID, role: "architect", score: 9.3)
         case "proposal_review_summary":
+            if case .proposal013AggregateFailure = scenario {
+                return """
+                # Proposal Review Summary
+
+                Average score: 9.25
+                Decision: proceed
+                """
+            }
             return """
             {
               "pass": true,

@@ -390,7 +390,9 @@ final class RunReportBuilder {
     private func retryPathDescription(from snapshot: RecoveryActionSnapshot?) -> String? {
         guard let snapshot else { return nil }
         let retryAction = snapshot.availableActions.first {
-            $0.action == .retryFailedAgent || $0.action == .retryFailedStage
+            $0.action == .retryFailedAgent
+            || $0.action == .retryFailedAggregateStep
+            || $0.action == .retryFailedStage
         } ?? snapshot.recommendedAction
 
         guard let action = retryAction else { return nil }
@@ -398,6 +400,9 @@ final class RunReportBuilder {
         case .retryFailedAgent:
             guard let agentID = action.agentID, let stageID = action.stageID else { return nil }
             return "Retry agent '\(agentID)' in stage '\(stageID)'"
+        case .retryFailedAggregateStep:
+            guard let agentID = action.agentID, let stageID = action.stageID else { return nil }
+            return "Retry aggregate step '\(agentID)' in stage '\(stageID)'"
         case .retryFailedStage:
             guard let stageID = action.stageID else { return nil }
             return "Retry stage '\(stageID)'"
@@ -425,7 +430,9 @@ final class RunReportBuilder {
         }
 
         let hasSameRunRecovery = snapshot.availableActions.contains { detail in
-            detail.action == .retryFailedAgent || detail.action == .retryFailedStage
+            detail.action == .retryFailedAgent
+            || detail.action == .retryFailedAggregateStep
+            || detail.action == .retryFailedStage
         }
         if hasSameRunRecovery {
             return "Use same-run recovery from the canonical recovery snapshot; clone run is fallback only."

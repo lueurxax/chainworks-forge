@@ -536,6 +536,13 @@ struct AppBootstrapView: View {
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
                                 .environment(gooseServerManager)
+                        case .proposal013Proof:
+                            UITestProposal013EvidenceSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -688,6 +695,22 @@ struct AppBootstrapView: View {
                 apiKey: nil,
                 override: override,
                 transportMode: .fixtureProposalLoopSuccess,
+                transportAPI: .bespoke
+            )
+        }
+        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal013_aggregate_failure" {
+            let override = LiveExecutionOverride(
+                enabled: true,
+                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
+                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
+                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
+            )
+
+            return LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://fixture.local")!,
+                apiKey: nil,
+                override: override,
+                transportMode: .fixtureProposal013AggregateFailure,
                 transportAPI: .bespoke
             )
         }
