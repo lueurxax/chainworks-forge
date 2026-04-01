@@ -51,6 +51,25 @@ The current MVP provider set is:
 - `Claude Code`
 - `Gemini`
 
+## Current Status
+
+The repository is past the scaffold stage. The implemented system now includes:
+
+- frozen run snapshots, YAML validation, provenance, and deterministic execution truth
+- operator-facing run, approval, report, recovery, and comparison surfaces
+- provider configuration, remediation, and live Goose-backed execution slices
+- repo-backed delivery, release gating, benchmark/sign-off, and export flows
+- stable reference documentation under [`docs/reference`](docs/reference)
+- proof artifacts under [`docs/evidence`](docs/evidence)
+
+Active proposal work is currently concentrated in:
+
+- [`docs/proposals/015-skill-resolution-and-runtime-injection.md`](docs/proposals/015-skill-resolution-and-runtime-injection.md)
+- [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
+- [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
+
+The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
+
 ## Implemented Today
 
 The repository is no longer a scaffold. It already contains the core control-plane and runtime slices:
@@ -85,15 +104,6 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - approved-host current-head proof gates
 - layered test gates for fast runtime validation, remote UI smoke, and full sign-off
 
-## What Is Still Active
-
-This repo is still under active product and hardening work. Current active areas are mostly about:
-
-- output-contract alignment, retry truth, and failure-evidence hardening
-- broader design-system adoption and brand application
-
-The best source of truth for that work is the docs index and the active proposals, not this README.
-
 ## Repository Layout
 
 ```text
@@ -113,12 +123,21 @@ Chainworks Forge/
   scripts/                      operational helpers, including test gates
 ```
 
-## Getting Started
+## Installation And Local Setup
 
 ### Requirements
 
-- macOS
+- macOS compatible with the app target (`MACOSX_DEPLOYMENT_TARGET = 26.2`)
 - Xcode `26.3` or newer
+- a configured provider runtime if you want live agent execution (`Codex`, `Claude Code`, or `Gemini`)
+- optional: an approved remote UI host if you need canonical UI smoke or full sign-off gates
+
+### Clone The Repository
+
+```bash
+git clone <your-remote-url> "Chainworks Forge"
+cd "Chainworks Forge"
+```
 
 ### Open The Project
 
@@ -126,11 +145,13 @@ Chainworks Forge/
 open "Chainworks Forge.xcodeproj"
 ```
 
-### Build
+### Build And Launch
 
 ```bash
 ./scripts/test-gate.sh build
 ```
+
+Then run the app from Xcode. On first launch, use `Settings` to configure providers, diagnostics, and remediation. If you want live execution, make sure the selected provider is reachable and any required local services are running.
 
 ### Default Engineering Gate
 
@@ -139,6 +160,10 @@ open "Chainworks Forge.xcodeproj"
 ```
 
 The repository uses layered test gates. The canonical proving path is the gate runner, not raw `xcodebuild -testPlan ...` commands.
+
+### Optional Remote UI Host
+
+Remote UI execution is still repo-policy-bound. If you need canonical UI proof lanes, use the approved remote host configuration documented in [`docs/reference/agent-ui-test-execution.md`](docs/reference/agent-ui-test-execution.md).
 
 ## Test Gates
 
@@ -166,6 +191,7 @@ Important:
 Start here:
 
 - [`docs/README.md`](docs/README.md) — documentation index and reading order
+- [`docs/reference/current-system-baseline.md`](docs/reference/current-system-baseline.md) — current-head subsystem map and baseline
 - [`docs/ps/chainworks-forge-mvp.md`](docs/ps/chainworks-forge-mvp.md) — MVP scope and requirements
 - [`docs/research/chainworks_core_idea.md`](docs/research/chainworks_core_idea.md) — product vision and positioning
 
@@ -173,19 +199,28 @@ Implemented-system references:
 
 - [`docs/reference/workflow-execution-engine.md`](docs/reference/workflow-execution-engine.md)
 - [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
+- [`docs/reference/execution-truth-and-recovery.md`](docs/reference/execution-truth-and-recovery.md)
+- [`docs/reference/output-contracts-failure-evidence-and-recovery.md`](docs/reference/output-contracts-failure-evidence-and-recovery.md)
+- [`docs/reference/session-lineage-reuse-and-operator-reset.md`](docs/reference/session-lineage-reuse-and-operator-reset.md)
+- [`docs/reference/context-strategy-and-experiment-framework.md`](docs/reference/context-strategy-and-experiment-framework.md)
 - [`docs/reference/operator-experience.md`](docs/reference/operator-experience.md)
 - [`docs/reference/provider-platform.md`](docs/reference/provider-platform.md)
 - [`docs/reference/ui-quality-and-polish.md`](docs/reference/ui-quality-and-polish.md)
+- [`docs/reference/design-system-and-brand-application.md`](docs/reference/design-system-and-brand-application.md)
 - [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
 - [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
 
 Examples:
 
+- [`examples/README.md`](examples/README.md)
 - [`examples/agents/agents.yaml`](examples/agents/agents.yaml)
+- [`examples/agents/agents_with_gemini.yaml`](examples/agents/agents_with_gemini.yaml)
 - [`examples/workflows/workflow.yaml`](examples/workflows/workflow.yaml)
+- [`examples/workflows/proposal-loop-live.yaml`](examples/workflows/proposal-loop-live.yaml)
+- [`examples/workflows/full-mvp-live.yaml`](examples/workflows/full-mvp-live.yaml)
 - [`examples/workflows/proposal-to-release.yaml`](examples/workflows/proposal-to-release.yaml)
 
 ## Brand Assets
 
-Brand sources and rendered assets live under [`docs/brand`](docs/brand). The app icon set used by the macOS target lives under [`Chainworks Forge/Assets.xcassets/AppIcon.appiconset`](Chainworks%20Forge/Assets.xcassets/AppIcon.appiconset).
+Brand sources and rendered assets live under [`docs/brand`](docs/brand). The app icon set used by the macOS target lives under [`Chainworks Forge/Assets.xcassets/AppIcon.appiconset`](<Chainworks Forge/Assets.xcassets/AppIcon.appiconset>).

@@ -167,6 +167,10 @@ struct ResolvedAgent: Sendable {
     let outputs: [String]
     /// Proposal 007 REQ-005: When true, the agent operates against the provisioned worktree with write access.
     let worktreeWriteEnabled: Bool
+    
+    // Proposal 018: Session reuse policy
+    let sessionReuseScope: SessionReuseScope
+    let sessionFamilyID: String?
 
     init(
         id: String,
@@ -186,7 +190,9 @@ struct ResolvedAgent: Sendable {
         requiresHumanApproval: Bool,
         inputs: [String],
         outputs: [String],
-        worktreeWriteEnabled: Bool = false
+        worktreeWriteEnabled: Bool = false,
+        sessionReuseScope: SessionReuseScope = .same_invocation_owner,
+        sessionFamilyID: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -206,6 +212,8 @@ struct ResolvedAgent: Sendable {
         self.inputs = inputs
         self.outputs = outputs
         self.worktreeWriteEnabled = worktreeWriteEnabled
+        self.sessionReuseScope = sessionReuseScope
+        self.sessionFamilyID = sessionFamilyID
     }
 }
 

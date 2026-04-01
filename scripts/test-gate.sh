@@ -19,6 +19,7 @@ FAST_TESTS=(
   "Chainworks ForgeTests/ResumeManagerTests"
   "Chainworks ForgeTests/ArtifactManagerTests"
   "Chainworks ForgeTests/RunTests"
+  "Chainworks ForgeTests/AgentSessionTests"
 )
 
 UI_SMOKE_TESTS=(
@@ -65,6 +66,18 @@ PROPOSAL_014_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testReleaseGateSurfaceShowsDecisionContextActions"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
+)
+
+PROPOSAL_018_TESTS=(
+  "Chainworks ForgeTests/AgentSessionTests"
+  "Chainworks ForgeTests/GooseAgentExecutorTests"
+)
+
+PROPOSAL_019_TESTS=(
+  "Chainworks ForgeTests/Proposal019Tests"
+  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeTests/GooseAgentExecutorTests"
+  "Chainworks ForgeTests/OrchestratorTests"
 )
 
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
@@ -187,16 +200,29 @@ require_remote_ui_host() {
 
 check_idle_environment() {
   local mode="${1:-strict}"
-  local pattern='xcodebuild|xctest|XCTest|debugserver'
-  if [[ "$mode" == "strict" ]]; then
-    pattern+='|Chainworks Forge.app/Contents/MacOS/Chainworks Forge'
-  fi
   local matches
   matches="$(
     {
-      ps -axo pid=,command= \
-        | grep -E "$pattern" \
-        | grep -v -E 'grep -E|egrep |pgrep -fal|ps -axo pid=,command=|ps aux \| egrep|scripts/test-gate.sh'
+      ps -axo pid=,comm=,args= \
+        | awk -v mode="$mode" '
+            {
+              pid = $1
+              comm = $2
+              $1 = ""
+              $2 = ""
+              sub(/^[[:space:]]+/, "", $0)
+              args = $0
+
+              if (comm ~ /^(xcodebuild|xctest|XCTest|debugserver)$/) {
+                print pid " " args
+                next
+              }
+
+              if (mode == "strict" && args ~ /Chainworks Forge\.app\/Contents\/MacOS\/Chainworks Forge/) {
+                print pid " " args
+              }
+            }
+          '
     } || true
   )"
   if [[ -n "$matches" ]]; then
@@ -581,6 +607,8 @@ Available gates:
   proposal-006    Proposal 006 settings/provider/readiness gate
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
+  proposal-018    Proposal 018 session lineage reuse and operator reset gate
+  proposal-019    Proposal 019 context-strategy framework gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -697,6 +725,28 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     run_targeted_tests "proposal-014" "${PROPOSAL_014_TESTS[@]}"
+    ;;
+  proposal-018|p018)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-018"
+    run_targeted_tests "proposal-018" "${PROPOSAL_018_TESTS[@]}"
+    ;;
+  proposal-019|p019)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-019"
+    run_targeted_tests "proposal-019" "${PROPOSAL_019_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

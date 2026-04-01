@@ -126,8 +126,36 @@ struct OrchestratorTests {
                 providerReceipt: nil,
                 resolvedModel: agent.model,
                 configuredProviderID: nil,
-                adapterVersion: nil
+                adapterVersion: nil,
+                canonicalOutcome: .completed,
+                sessionReuseDisposition: .fresh
             )
+        }
+    }
+
+    private actor SequencedExecutionBox {
+        private var remaining: [AgentResult]
+        private(set) var models: [String] = []
+
+        init(results: [AgentResult]) {
+            self.remaining = results
+        }
+
+        func next(model: String) -> AgentResult {
+            models.append(model)
+            return remaining.removeFirst()
+        }
+    }
+
+    private struct SequencedExecutor: AgentExecutor {
+        let box: SequencedExecutionBox
+
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            await box.next(model: agent.model)
         }
     }
 
@@ -252,6 +280,145 @@ struct OrchestratorTests {
         #expect(run.completedAt != nil)
         #expect(executor.executedTasks.count == 1)
         #expect(!run.stageExecutions.isEmpty)
+    }
+
+    @Test("Strategy escalation reruns retryable failures with the escalated tier model")
+    func strategyEscalationRerunsWithEscalatedModelTier() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "agent_1": ResolvedProviderBinding(
+                agentID: "agent_1",
+                backendProfileID: "bp",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.claude.rawValue,
+                providerIdentifier: ProviderFamily.claude.runtimeProviderIdentifier,
+                model: "claude-sonnet-4",
+                effort: "high",
+                transport: "goose_server",
+                adapterVersion: "v1"
+            )
+        ])
+
+        let agent = makeAgent(
+            id: "agent_1",
+            backendProfileID: "bp",
+            outputs: ["output_1"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "agent_1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "agent_1", task: "do_work", inputs: nil, outputs: ["output_1"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "agent_1",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["agent_1": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let firstFailure = AgentResult(
+            outputs: [:],
+            logSnippet: "transport failure",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "timed out while streaming",
+            sessionID: nil,
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "claude-sonnet-4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .timedOutBeforeOutput,
+            sessionReuseDisposition: .fresh,
+            transportErrorKind: .timeout,
+            outputPresence: .none,
+            runtimeProvider: "claude_code",
+            runtimeModel: "claude-sonnet-4"
+        )
+        let secondSuccess = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "claude-opus-4.6",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: "claude_code",
+            runtimeModel: "claude-opus-4.6"
+        )
+        let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let models = await box.models
+        #expect(models == ["claude-sonnet-4", "claude-opus-4.6"])
+        #expect(run.status == .completed)
+
+        let agentExec = try #require(run.stageExecutions.first?.agentExecutions.first)
+        #expect(agentExec.modelTierUsed == "frontier")
+        let signals = try #require(
+            agentExec.limitPressureSignalsJSON.flatMap {
+                try? JSONDecoder().decode(StrategyLimitPressureSignals.self, from: $0)
+            }
+        )
+        #expect(signals.escalationCount == 1)
+        #expect(signals.retryableEscalationCount == 1)
     }
 
     // MARK: - Multi-State Workflow
@@ -423,6 +590,7 @@ struct OrchestratorTests {
                     backendPolicyVersion: "mock-v1"
                 )
             ),
+            sessionError: nil,
             events: [
                 .sessionStarted(raw: #"{"session_id":"live-session-001"}"#),
                 .promptSubmitted(raw: #"{"request_id":"request-123"}"#),
@@ -534,6 +702,9 @@ struct OrchestratorTests {
             configuredProviderID: nil,
             adapterVersion: "adapter-v2",
             canonicalOutcome: .completed,
+            sessionLineageID: nil,
+            sessionGenerationID: nil,
+            sessionReuseDisposition: .fresh,
             transportErrorKind: nil,
             providerStopReason: "end_turn",
             outputPresence: .durableOutput,
@@ -645,6 +816,9 @@ struct OrchestratorTests {
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .completed,
+            sessionLineageID: nil,
+            sessionGenerationID: nil,
+            sessionReuseDisposition: .fresh,
             transportErrorKind: nil,
             providerStopReason: "end_turn",
             outputPresence: .durableOutput,
@@ -1324,7 +1498,9 @@ struct OrchestratorTests {
             providerReceipt: nil,
             resolvedModel: "fixture-model",
             configuredProviderID: nil,
-            adapterVersion: nil
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
         )
 
         let orchestrator = WorkflowOrchestrator(
@@ -1811,7 +1987,9 @@ struct OrchestratorTests {
             providerReceipt: nil,
             resolvedModel: nil,
             configuredProviderID: nil,
-            adapterVersion: nil
+            adapterVersion: nil,
+            canonicalOutcome: .failedBeforeOutput,
+            sessionReuseDisposition: .fresh
         )
 
         let orchestrator = WorkflowOrchestrator(

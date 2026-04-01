@@ -252,6 +252,39 @@ Important:
 - the gate keeps its historical proposal label for reproducibility
 - the documentation source of truth for the slice is now [design-system-and-brand-application.md](design-system-and-brand-application.md), not the old proposal file
 
+### `proposal-019`
+
+Context-strategy framework gate for strategy handoff, lazy evidence, telemetry, and recommendation proof.
+
+Scope:
+
+- `Proposal019Tests`
+- `GooseSessionBridgeTests`
+- `GooseAgentExecutorTests`
+- `OrchestratorTests`
+
+Use when:
+
+- reproving the implemented context-strategy slice on the current head
+- validating lazy-evidence retrieval and tier-escalation behavior
+- verifying canonical strategy telemetry and recommendation proof owners
+
+Host policy:
+
+- local macOS gate
+- this is a named repository-owned proof lane, not just an ad-hoc focused `xcodebuild test`
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-019
+```
+
+Important:
+
+- this gate is the canonical proof path for the implemented strategy slice
+- the stable documentation source of truth for the slice is now [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md), not the old proposal file
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
@@ -315,6 +348,12 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ```bash
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-012"
+```
+
+### Context-strategy proof
+
+```bash
+./scripts/test-gate.sh proposal-019
 ```
 
 ## Why This Exists

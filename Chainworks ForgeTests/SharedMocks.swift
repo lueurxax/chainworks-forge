@@ -47,44 +47,49 @@ struct StubGooseTransport: GooseTransportProtocol, Sendable {
 
 // MARK: - Lane B: ObservableGooseTransport (actor-backed observable mock)
 
-/// Actor-backed observable mock for tests that need to assert on request content,
+/// Lock-backed observable mock for tests that need to assert on request content,
 /// session lifecycle, and call counts after execution.
 ///
 /// Applicable to: GooseAgentExecutorTests, GooseSessionBridgeTests, OrchestratorTests,
 /// and session-lifecycle tests in GooseServerTransportTests.
 ///
-/// Key difference from SharedMockGooseTransport: `actor` provides compiler-verified
-/// Sendable safety without `@unchecked`. Observable state is accessed via `await`
-/// from tests, which is natural in async test functions.
-actor ObservableGooseTransport: GooseTransportProtocol {
-    // Stimulus configuration
-    var createSessionResult: GooseSessionResponse?
-    var createSessionError: Error?
-    var streamEvents: [GooseStreamEvent] = []
+/// Keep the surface async-friendly for tests, but avoid actor/protocol isolation
+/// mismatches with the synchronous `submitPrompt` requirement.
+final class ObservableGooseTransport: GooseTransportProtocol, @unchecked Sendable {
+    private struct State {
+        var createSessionResult: GooseSessionResponse?
+        var createSessionError: Error?
+        var streamEvents: [GooseStreamEvent] = []
+        var closeSessionCalled = false
+        var lastSessionID: String?
+        var lastSessionRequest: GooseSessionRequest?
+        var createSessionCallCount = 0
+        var submitPromptCallCount = 0
+    }
 
-    // Observable state
-    private(set) var closeSessionCalled = false
-    private(set) var lastSessionID: String?
-    private(set) var lastSessionRequest: GooseSessionRequest?
-    private(set) var createSessionCallCount = 0
-    private(set) var submitPromptCallCount = 0
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     /// Convenience configuration method for test setup.
     func configure(
         sessionResult: GooseSessionResponse? = nil,
         sessionError: Error? = nil,
         events: [GooseStreamEvent] = []
-    ) {
-        self.createSessionResult = sessionResult
-        self.createSessionError = sessionError
-        self.streamEvents = events
+    ) async {
+        state.withLock { state in
+            state.createSessionResult = sessionResult
+            state.createSessionError = sessionError
+            state.streamEvents = events
+        }
     }
 
     func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-        createSessionCallCount += 1
-        lastSessionRequest = request
-        if let error = createSessionError { throw error }
-        return createSessionResult ?? GooseSessionResponse(
+        let (result, error): (GooseSessionResponse?, Error?) = state.withLock { state in
+            state.createSessionCallCount += 1
+            state.lastSessionRequest = request
+            return (state.createSessionResult, state.createSessionError)
+        }
+        if let error { throw error }
+        return result ?? GooseSessionResponse(
             sessionId: "obs-\(UUID().uuidString.prefix(8))",
             status: "active",
             policyAcknowledgement: GoosePolicyAcknowledgement(
@@ -97,24 +102,48 @@ actor ObservableGooseTransport: GooseTransportProtocol {
         sessionID: String,
         prompt: GoosePromptRequest
     ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
-        submitPromptCallCount += 1
-        lastSessionID = sessionID
-        let events = streamEvents
+        let events = state.withLock { state in
+            state.submitPromptCallCount += 1
+            state.lastSessionID = sessionID
+            return state.streamEvents
+        }
         return AsyncThrowingStream { c in
             Task { for e in events { c.yield(e) }; c.finish() }
         }
     }
 
     func closeSession(sessionID: String) async throws {
-        closeSessionCalled = true
+        state.withLock { $0.closeSessionCalled = true }
     }
 
-    func reset() {
-        closeSessionCalled = false
-        lastSessionID = nil
-        lastSessionRequest = nil
-        createSessionCallCount = 0
-        submitPromptCallCount = 0
+    func reset() async {
+        state.withLock { state in
+            state.closeSessionCalled = false
+            state.lastSessionID = nil
+            state.lastSessionRequest = nil
+            state.createSessionCallCount = 0
+            state.submitPromptCallCount = 0
+        }
+    }
+
+    var closeSessionCalled: Bool {
+        get async { state.withLock { $0.closeSessionCalled } }
+    }
+
+    var lastSessionID: String? {
+        get async { state.withLock { $0.lastSessionID } }
+    }
+
+    var lastSessionRequest: GooseSessionRequest? {
+        get async { state.withLock { $0.lastSessionRequest } }
+    }
+
+    var createSessionCallCount: Int {
+        get async { state.withLock { $0.createSessionCallCount } }
+    }
+
+    var submitPromptCallCount: Int {
+        get async { state.withLock { $0.submitPromptCallCount } }
     }
 }
 

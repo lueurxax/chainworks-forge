@@ -99,6 +99,28 @@ final class GooseSessionBridge: Sendable {
         )
     }
 
+    /// Submit a task prompt to an existing Goose session.
+    func executeInExistingSession(
+        sessionID: String,
+        packet: ExecutionPacket
+    ) async throws -> GooseSessionExecution {
+        let promptRequest = GoosePromptRequest(
+            content: packet.taskDirective,
+            context: packet.contextAttachments
+        )
+
+        let eventStream = transport.submitPrompt(
+            sessionID: sessionID,
+            prompt: promptRequest
+        )
+
+        return GooseSessionExecution(
+            sessionID: sessionID,
+            eventStream: eventStream,
+            transport: transport
+        )
+    }
+
     // MARK: - Execution Packet Construction (Section 8.2)
 
     /// Build a structured execution packet for the agent.
@@ -110,6 +132,14 @@ final class GooseSessionBridge: Sendable {
     ) -> ExecutionPacket {
         // Proposal 013: V2 resolver — catalog-driven contract resolution
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
+        let handoffPacket = context.handoffPacket
+        let lazyEvidenceToolAssets = handoffPacket.flatMap { handoff -> LazyEvidenceToolAssets? in
+            guard !handoff.lazyArtifactRefs.isEmpty else { return nil }
+            return ensureLazyEvidenceToolAssets(
+                lazyArtifacts: handoff.lazyArtifactRefs,
+                artifactRoot: context.workspace.artifactRoot
+            )
+        }
 
         // 1. System prompt
         let systemPrompt = buildSystemPrompt(
@@ -124,7 +154,8 @@ final class GooseSessionBridge: Sendable {
             task: task,
             context: context,
             expectedOutputs: expectedOutputs,
-            catalog: context.catalog
+            catalog: context.catalog,
+            lazyEvidenceToolAssets: lazyEvidenceToolAssets
         )
 
         // 3. Context attachments (input artifacts + workspace info)
@@ -156,15 +187,76 @@ final class GooseSessionBridge: Sendable {
             path: nil
         ))
 
-        // Input artifact attachments
-        for (name, data) in context.inputArtifacts {
-            let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
+        // Input artifact attachments (strategy-aware handoff)
+        if let handoff = handoffPacket {
+            for (name, data) in handoff.mandatoryArtifacts.sorted(by: { $0.key < $1.key }) {
+                let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
+                attachments.append(GooseContextAttachment(
+                    type: "artifact",
+                    name: name,
+                    content: content,
+                    path: nil
+                ))
+            }
+
+            for (name, summary) in handoff.summaries.sorted(by: { $0.key < $1.key }) {
+                attachments.append(GooseContextAttachment(
+                    type: "text",
+                    name: "summary_\(name)",
+                    content: summary,
+                    path: nil
+                ))
+            }
+
+            if let lazyEvidenceToolAssets {
+                attachments.append(GooseContextAttachment(
+                    type: "file",
+                    name: "LazyEvidenceTool",
+                    content: "Executable helper for on-demand lazy artifact retrieval.",
+                    path: lazyEvidenceToolAssets.executablePath
+                ))
+                attachments.append(GooseContextAttachment(
+                    type: "text",
+                    name: "lazy_evidence_manifest",
+                    content: buildLazyEvidenceToolManifest(handoff.lazyArtifactRefs),
+                    path: nil
+                ))
+            }
+
+            for (name, pointer) in handoff.lazyArtifactRefs.sorted(by: { $0.key < $1.key }) {
+                if let path = pointer.absolutePath {
+                    attachments.append(GooseContextAttachment(
+                        type: "file",
+                        name: "lazy_\(name)",
+                        content: buildLazyArtifactAttachmentContent(pointer: pointer),
+                        path: path
+                    ))
+                } else {
+                    attachments.append(GooseContextAttachment(
+                        type: "text",
+                        name: "lazy_\(name)",
+                        content: buildLazyArtifactAttachmentContent(pointer: pointer),
+                        path: nil
+                    ))
+                }
+            }
+
             attachments.append(GooseContextAttachment(
-                type: "artifact",
-                name: name,
-                content: content,
+                type: "text",
+                name: "strategy_fingerprint",
+                content: handoff.fingerprintMaterial,
                 path: nil
             ))
+        } else {
+            for (name, data) in context.inputArtifacts {
+                let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
+                attachments.append(GooseContextAttachment(
+                    type: "artifact",
+                    name: name,
+                    content: content,
+                    path: nil
+                ))
+            }
         }
 
         // Idea body attachment
@@ -245,7 +337,8 @@ final class GooseSessionBridge: Sendable {
         task: AgentTask,
         context: ExecutionContext,
         expectedOutputs: [String],
-        catalog: AgentCatalog?
+        catalog: AgentCatalog?,
+        lazyEvidenceToolAssets: LazyEvidenceToolAssets?
     ) -> String {
         var parts: [String] = []
         let structuredHints = structuredOutputHints(agent: agent, expectedOutputs: expectedOutputs, catalog: catalog)
@@ -254,7 +347,30 @@ final class GooseSessionBridge: Sendable {
         parts.append("")
 
         // Input artifacts
-        if !context.inputArtifacts.isEmpty {
+        if let handoff = context.handoffPacket {
+            if !handoff.mandatoryArtifacts.isEmpty || !handoff.summaries.isEmpty || !handoff.lazyArtifactRefs.isEmpty {
+                parts.append("### Strategy Handoff")
+                parts.append("Profile: \(handoff.profileID)")
+                parts.append("Mode: \(handoff.mode.rawValue)")
+                parts.append("Mandatory artifacts:")
+                for name in handoff.mandatoryArtifacts.keys.sorted() { parts.append("- \(name)") }
+                if !handoff.summaries.isEmpty {
+                    parts.append("Summarized artifacts:")
+                    for name in handoff.summaries.keys.sorted() { parts.append("- \(name)") }
+                }
+                if !handoff.lazyArtifactRefs.isEmpty {
+                    parts.append("Lazy artifacts:")
+                    for name in handoff.lazyArtifactRefs.keys.sorted() { parts.append("- \(name)") }
+                    parts.append("Lazy artifacts are omitted from inline prompt context.")
+                    if let lazyEvidenceToolAssets {
+                        parts.append("Use the executable `get_lazy_artifact` helper attached as LazyEvidenceTool for canonical on-demand evidence retrieval.")
+                        parts.append("Run: \(lazyEvidenceToolAssets.executablePath) <artifact_name>")
+                    }
+                    parts.append("Load lazy artifacts on demand from the attached file paths only when they become necessary.")
+                }
+                parts.append("")
+            }
+        } else if !context.inputArtifacts.isEmpty {
             parts.append("### Input Artifacts")
             for name in context.inputArtifacts.keys.sorted() {
                 parts.append("- \(name)")
@@ -273,19 +389,48 @@ final class GooseSessionBridge: Sendable {
             parts.append("Use the exact filenames listed above.")
             parts.append("Do not add file extensions like .md, .txt, or .json unless the filename above already includes that extension.")
             parts.append("Output directory: \(context.workspace.artifactRoot.path)/\(context.stageID).\(context.iteration)/\(agent.id)/\(context.attemptNumber)/")
+            parts.append("Before stopping, verify that every required output file exists on disk in the output directory and is non-empty.")
+            parts.append("If any required output file is missing or empty, continue working and fix that before you stop.")
         }
 
         if !structuredHints.isEmpty {
             parts.append("")
             parts.append("### Structured Output Requirements")
-            parts.append("Each required output file must contain exactly one top-level JSON object and nothing else.")
+            parts.append("CRITICAL: Each required output file must contain exactly one top-level JSON object and nothing else.")
             parts.append("Do not write markdown, tables, headings, fences, narrative prose, or companion files unless they are explicitly listed as required outputs.")
+            parts.append("Do not wrap the JSON in code fences (``` or ```json). Write raw JSON only.")
             parts.append("If you want to explain the review, put that explanation inside JSON fields required by the contract.")
             for hint in structuredHints {
                 parts.append("")
                 parts.append("#### Required Fields for \(hint.contractID):")
                 for field in hint.requiredFields {
                     parts.append("- \(field)")
+                }
+
+                // For proposal_review contracts, provide an explicit JSON template
+                // to prevent codex/gpt providers from producing invalid output
+                if hint.contractID == "proposal_review_v1" {
+                    parts.append("")
+                    parts.append("Your output file MUST be valid JSON matching this exact structure:")
+                    parts.append("""
+                    {
+                      "agent_id": "\(agent.id)",
+                      "role": "\(agent.skillRole ?? agent.mode)",
+                      "score": 7,
+                      "decision": "approve",
+                      "verdict": "The proposal is well-structured...",
+                      "summary": "Brief summary of the review...",
+                      "issues": ["issue 1", "issue 2"],
+                      "blocking_issues": [],
+                      "non_blocking_issues": ["minor concern 1"],
+                      "suggestions": ["suggestion 1"],
+                      "assumptions": ["assumption 1"]
+                    }
+                    """)
+                    parts.append("Replace the example values with your actual review content. Keep the exact field names.")
+                    parts.append("The \"agent_id\" field MUST be exactly \"\(agent.id)\".")
+                    parts.append("The \"score\" field MUST be a number from 0 to 10.")
+                    parts.append("The \"decision\" field MUST be one of: \"approve\", \"revise\", or \"reject\".")
                 }
             }
         }
@@ -296,6 +441,114 @@ final class GooseSessionBridge: Sendable {
         parts.append("Complete the task and produce all required output files. Do not continue beyond the task scope.")
 
         return parts.joined(separator: "\n")
+    }
+
+    private static func buildLazyArtifactAttachmentContent(pointer: ArtifactPointer) -> String {
+        var lines: [String] = []
+        lines.append("artifact_name: \(pointer.artifactName)")
+        if let path = pointer.absolutePath {
+            lines.append("absolute_path: \(path)")
+        }
+        lines.append("byte_count: \(pointer.byteCount)")
+        return lines.joined(separator: "\n")
+    }
+
+    private static func buildLazyEvidenceToolManifest(_ lazyArtifacts: [String: ArtifactPointer]) -> String {
+        struct LazyEvidenceToolManifest: Codable {
+            struct ArtifactEntry: Codable {
+                let path: String?
+                let byteCount: Int
+            }
+
+            let toolName: String
+            let owner: String
+            let invocation: String
+            let artifacts: [String: ArtifactEntry]
+        }
+
+        let manifest = LazyEvidenceToolManifest(
+            toolName: "get_lazy_artifact",
+            owner: "LazyEvidenceTool",
+            invocation: "LazyEvidenceTool.get_lazy_artifact(\"artifact_name\")",
+            artifacts: lazyArtifacts.mapValues { pointer in
+                LazyEvidenceToolManifest.ArtifactEntry(path: pointer.absolutePath, byteCount: pointer.byteCount)
+            }
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(manifest),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{\"toolName\":\"get_lazy_artifact\",\"owner\":\"LazyEvidenceTool\"}"
+        }
+        return json
+    }
+
+    private static func ensureLazyEvidenceToolAssets(
+        lazyArtifacts: [String: ArtifactPointer],
+        artifactRoot: URL
+    ) -> LazyEvidenceToolAssets? {
+        let toolsDirectory = artifactRoot.appendingPathComponent(".lazy-evidence-tools", isDirectory: true)
+        let manifestPath = toolsDirectory.appendingPathComponent("lazy_evidence_manifest.json")
+        let executablePath = toolsDirectory.appendingPathComponent("get_lazy_artifact")
+
+        do {
+            try FileManager.default.createDirectory(
+                at: toolsDirectory,
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+            try buildLazyEvidenceToolManifest(lazyArtifacts).write(to: manifestPath, atomically: true, encoding: .utf8)
+            try buildLazyEvidenceToolScript().write(to: executablePath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o755)],
+                ofItemAtPath: executablePath.path
+            )
+            return LazyEvidenceToolAssets(
+                executablePath: executablePath.path,
+                manifestPath: manifestPath.path
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private static func buildLazyEvidenceToolScript() -> String {
+        """
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        import sys
+
+        def main() -> int:
+            if len(sys.argv) != 2:
+                print("usage: get_lazy_artifact <artifact_name>", file=sys.stderr)
+                return 64
+
+            artifact_name = sys.argv[1]
+            manifest_path = pathlib.Path(__file__).with_name("lazy_evidence_manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entry = manifest.get("artifacts", {}).get(artifact_name)
+            if not entry:
+                print(f"lazy artifact not found: {artifact_name}", file=sys.stderr)
+                return 66
+
+            path = entry.get("path")
+            if not path:
+                print(f"lazy artifact path unavailable: {artifact_name}", file=sys.stderr)
+                return 66
+
+            sys.stdout.buffer.write(pathlib.Path(path).read_bytes())
+            return 0
+
+        if __name__ == "__main__":
+            raise SystemExit(main())
+        """
+    }
+
+    private struct LazyEvidenceToolAssets {
+        let executablePath: String
+        let manifestPath: String
     }
 
     private struct StructuredOutputHint {
@@ -431,11 +684,24 @@ struct GooseSessionExecution: Sendable {
 
     /// Close the session after execution completes.
     func closeSession() async {
-        do {
-            try await transport.closeSession(sessionID: sessionID)
-        } catch {
-            // Log but don't fail — session may already be closed by the backend
-            print("Warning: Failed to close Goose session \(sessionID): \(error.localizedDescription)")
+        // ARCH-027: Perform cleanup in a detached task.
+        // If the main execution task was cancelled (e.g. by watchdog), the current 
+        // async context is already marked as cancelled. A detached task ensures 
+        // the DELETE request actually reaches the server regardless of the agent's state.
+        Task.detached(priority: .background) {
+            do {
+                try await transport.closeSession(sessionID: sessionID)
+            } catch {
+                let msg = error.localizedDescription
+                // 404 means the session was already closed by the backend (idle timeout or concurrent cleanup).
+                // 'cancelled' is redundant here as we are already cleaning up.
+                let isAlreadyClosed = msg.contains("404") || msg.contains("not found")
+                let isCancelled = msg.contains("cancelled") || (error as? CancellationError) != nil
+
+                if !isAlreadyClosed && !isCancelled {
+                    print("Warning: Failed to cleanup Goose session \(sessionID): \(msg)")
+                }
+            }
         }
     }
 }

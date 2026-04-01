@@ -59,6 +59,23 @@ import SwiftData
     var repoRevisionBefore: String?
     var repoRevisionAfter: String?
 
+    // Proposal 018: Session lineage and reuse fields
+    var sessionLineageID: UUID?
+    var sessionGenerationID: UUID?
+    var rehydratedFromCheckpointArtifactID: UUID?
+    var invocationOwnerKey: String? // Exact owner tuple for reuse decisions
+    var sessionReuseScope: SessionReuseScope?
+    var sessionFamilyID: String?
+    var sessionReuseDisposition: SessionReuseDisposition?
+    var sessionResetReason: String?
+
+    // Proposal 019: Strategy telemetry fields persisted on the canonical execution row.
+    var inputPayloadBytes: Int = 0
+    var handoffMode: String?
+    var limitPressureSignalsJSON: Data?
+    var modelTierUsed: String?
+    var promotedArtifactNamesJSON: Data?
+
     @Relationship(inverse: \StageExecution.agentExecutions)
     var stageExecution: StageExecution?
 

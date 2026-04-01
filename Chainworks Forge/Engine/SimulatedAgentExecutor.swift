@@ -70,7 +70,9 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
                 ),
                 resolvedModel: binding?.model ?? agent.model,
                 configuredProviderID: binding?.configuredProviderID,
-                adapterVersion: binding?.adapterVersion
+                adapterVersion: binding?.adapterVersion,
+                canonicalOutcome: .failedBeforeOutput,
+                sessionReuseDisposition: .fresh
             )
         }
 
@@ -117,7 +119,9 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
             ),
             resolvedModel: binding?.model ?? agent.model,
             configuredProviderID: binding?.configuredProviderID,
-            adapterVersion: binding?.adapterVersion
+            adapterVersion: binding?.adapterVersion,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
         )
     }
 

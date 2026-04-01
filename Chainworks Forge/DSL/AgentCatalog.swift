@@ -56,6 +56,10 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let requiresHumanApproval: Bool
     let prompt: String
     let notes: String?
+    
+    // Proposal 018: Session reuse policy
+    let sessionReuseScope: String?
+    let sessionFamilyID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, title, mode, prompt, notes, inputs, outputs
@@ -67,6 +71,8 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         case requiredTools = "required_tools"
         case outputContract = "output_contract"
         case requiresHumanApproval = "requires_human_approval"
+        case sessionReuseScope = "session_reuse_scope"
+        case sessionFamilyID = "session_family_id"
     }
 }
 

@@ -3,6 +3,18 @@ import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
+@MainActor
+private enum TestModelContainerRetainer {
+    static var containers: [ModelContainer] = []
+
+    static func retain(_ container: ModelContainer) {
+        containers.append(container)
+        if containers.count > 64 {
+            containers.removeFirst(containers.count - 64)
+        }
+    }
+}
+
 // MARK: - Shared Test Support
 //
 // Centralised test helpers extracted from duplicated code across 5+ test files.
@@ -19,10 +31,13 @@ import SwiftData
 func makeTestModelContext() throws -> ModelContext {
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
-        AgentExecution.self, Approval.self, Artifact.self
+        AgentExecution.self, Approval.self, Artifact.self,
+        // Proposal 018
+        AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self
     ])
     let config = ModelConfiguration("TestContext-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
     let container = try ModelContainer(for: schema, configurations: [config])
+    TestModelContainerRetainer.retain(container)
     return container.mainContext
 }
 
@@ -31,10 +46,13 @@ func makeTestModelContext() throws -> ModelContext {
 func makeTestModelContainer() throws -> (container: ModelContainer, context: ModelContext) {
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
-        AgentExecution.self, Approval.self, Artifact.self
+        AgentExecution.self, Approval.self, Artifact.self,
+        // Proposal 018
+        AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self
     ])
     let config = ModelConfiguration("TestContainer-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
     let container = try ModelContainer(for: schema, configurations: [config])
+    TestModelContainerRetainer.retain(container)
     return (container, container.mainContext)
 }
 
@@ -113,6 +131,8 @@ func makeTestAgent(
 func makeTestExecutionContext(
     runID: UUID = UUID(),
     stageID: String = "stage_1",
+    ownerExecutionLineageID: UUID = UUID(),
+    stageLineageID: String? = nil,
     iteration: Int = 1,
     attemptNumber: Int = 1,
     inputArtifacts: [String: Data] = [:],
@@ -124,6 +144,8 @@ func makeTestExecutionContext(
     return ExecutionContext(
         workspace: ws,
         stageID: stageID,
+        stageLineageID: stageLineageID,
+        ownerExecutionLineageID: ownerExecutionLineageID,
         iteration: iteration,
         attemptNumber: attemptNumber,
         inputArtifacts: inputArtifacts,

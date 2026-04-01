@@ -162,6 +162,82 @@ struct RecoveryCoordinatorTests {
 
         #expect(recoveryContext.suggestedAction == .cloneRunCurrentConfig)
     }
+
+    @Test("Retry agent targets latest failed attempt in repeated stage lineage")
+    func retryAgentTargetsLatestFailedAttemptInRepeatedStageLineage() throws {
+        let context = try makeRecoveryContext()
+        let idea = Idea(title: "Blocked Idea", body: "Body", status: .active)
+        context.insert(idea)
+
+        let run = makeRun(status: .blocked)
+        run.idea = idea
+        idea.runs.append(run)
+        context.insert(run)
+
+        let earlierStage = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        earlierStage.run = run
+        run.stageExecutions.append(earlierStage)
+        context.insert(earlierStage)
+
+        let earlierAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "refine_proposal",
+            startedAt: Date(timeIntervalSince1970: 110),
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        earlierAgent.stageExecution = earlierStage
+        earlierStage.agentExecutions.append(earlierAgent)
+        context.insert(earlierAgent)
+
+        let failedStage = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        failedStage.run = run
+        run.stageExecutions.append(failedStage)
+        context.insert(failedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "refine_proposal",
+            startedAt: Date(timeIntervalSince1970: 210),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        failedAgent.stageExecution = failedStage
+        failedStage.agentExecutions.append(failedAgent)
+        context.insert(failedAgent)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let updatedRun = try coordinator.retryAgent(
+            run: run,
+            stageID: "state_5_proposal_refined",
+            agentID: "proposal_writer"
+        )
+
+        #expect(updatedRun.status == .running)
+        #expect(failedStage.status == .running)
+
+        let retryAttempts = failedStage.agentExecutions.filter { $0.agentID == "proposal_writer" && $0.status == .pending }
+        #expect(retryAttempts.count == 1)
+        #expect(retryAttempts.first?.supersedesAgentExecutionID == failedAgent.id)
+    }
 }
 
 private func makeRecoveryContext() throws -> ModelContext {
@@ -276,7 +352,9 @@ private func makeRecoveryCatalog() -> AgentCatalog {
                 outputContract: nil,
                 requiresHumanApproval: false,
                 prompt: "test",
-                notes: nil
+                notes: nil,
+                sessionReuseScope: nil,
+                sessionFamilyID: nil
             )
         ]
     )

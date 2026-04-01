@@ -229,6 +229,10 @@ final class RunReportBuilder {
             waitingApprovalStage: historicalStages.last(where: { $0.status == .waitingApproval }),
             snapshot: currentRecoverySnapshot
         )
+        let contextStrategyProfileID = strategyProfileID(for: run)
+        let strategyAssignmentMode = strategyAssignmentMode(for: run)
+        let strategyRecommendationState = strategyRecommendationState(for: run)
+        let strategyTelemetryComplete = hasCanonicalStrategyTelemetry(for: run)
 
         return RunReportPayload(
             ideaTitle: run.idea?.title ?? "Unknown",
@@ -255,6 +259,10 @@ final class RunReportBuilder {
             agentsUsed: agentsUsed,
             approvalEntries: approvalEntries,
             keyArtifacts: keyArtifactEntries,
+            contextStrategyProfileID: contextStrategyProfileID,
+            strategyAssignmentMode: strategyAssignmentMode,
+            strategyRecommendationState: strategyRecommendationState,
+            strategyTelemetryComplete: strategyTelemetryComplete,
             blockedReason: blockedReason,
             retryPath: retryPath,
             resumePath: resumePath,
@@ -507,7 +515,21 @@ final class RunReportBuilder {
             lines.append("- \(artifact.name)\(pinLabel) (\(artifact.format)) — \(artifact.agentID) / \(artifact.stageID)")
         }
         lines.append("")
-        lines.append("## 8. Recovery Notes")
+        lines.append("## 8. Strategy Context (Proposal 019)")
+        if let profileID = payload.contextStrategyProfileID {
+            lines.append("- Profile: \(profileID)")
+        } else {
+            lines.append("- Profile: not captured")
+        }
+        if let assignmentMode = payload.strategyAssignmentMode {
+            lines.append("- Assignment mode: \(assignmentMode)")
+        }
+        if let recommendationState = payload.strategyRecommendationState {
+            lines.append("- Recommendation state: \(recommendationState)")
+        }
+        lines.append("- Canonical strategy telemetry: \(payload.strategyTelemetryComplete ? "ready" : "incomplete")")
+        lines.append("")
+        lines.append("## 9. Recovery Notes")
         if let reason = payload.blockedReason { lines.append("- Blocked reason: \(reason)") }
         if let retry = payload.retryPath { lines.append("- Retry path: \(retry)") }
         if let resume = payload.resumePath { lines.append("- Resume path: \(resume)") }
@@ -521,7 +543,7 @@ final class RunReportBuilder {
         }
         // Proposal 013: Failure evidence summaries
         if !payload.failureEvidenceSummaries.isEmpty {
-            lines.append("## 9. Failure Evidence (Proposal 013)")
+            lines.append("## 10. Failure Evidence (Proposal 013)")
             for evidence in payload.failureEvidenceSummaries {
                 lines.append("- **\(evidence.stageLabel)** (\(evidence.stageID))")
                 lines.append("  - Failure class: \(evidence.failureClass)")
@@ -532,7 +554,7 @@ final class RunReportBuilder {
             }
         }
         lines.append("")
-        lines.append("## 10. Outcome")
+        lines.append("## 11. Outcome")
         lines.append("- \(payload.runStatus)")
         lines.append("")
         return lines.joined(separator: "\n")
@@ -556,6 +578,9 @@ final class RunReportBuilder {
         lines.append("Elapsed: \(formattedDuration(payload.elapsedSeconds))")
         if let cost = payload.totalCostCents { lines.append("Cost: \(cost) cents") }
         if let drift = payload.driftNote { lines.append("Drift: \(drift)") }
+        if let profile = payload.contextStrategyProfileID { lines.append("Strategy: \(profile)") }
+        if let mode = payload.strategyAssignmentMode { lines.append("Strategy mode: \(mode)") }
+        if let state = payload.strategyRecommendationState { lines.append("Strategy recommendation state: \(state)") }
         lines.append("")
         return lines.joined(separator: "\n")
     }
@@ -569,7 +594,11 @@ final class RunReportBuilder {
             "trust": payload.runtimeTrustLevel,
             "completedStages": payload.completedStages,
             "failedStages": payload.failedStages,
-            "elapsedSeconds": payload.elapsedSeconds
+            "elapsedSeconds": payload.elapsedSeconds,
+            "contextStrategyProfileID": payload.contextStrategyProfileID as Any,
+            "strategyAssignmentMode": payload.strategyAssignmentMode as Any,
+            "strategyRecommendationState": payload.strategyRecommendationState as Any,
+            "strategyTelemetryComplete": payload.strategyTelemetryComplete
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys]) else {
             return "{}"
@@ -604,6 +633,27 @@ final class RunReportBuilder {
     private func decodeFrozenProvenances(from run: Run) -> [String: FrozenBindingProvenance] {
         guard let data = run.bindingProvenanceJSON else { return [:] }
         return (try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data)) ?? [:]
+    }
+
+    private func strategyProfileID(for run: Run) -> String? {
+        let value = run.contextStrategyProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func strategyAssignmentMode(for run: Run) -> String? {
+        let value = run.strategyAssignmentMode.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func strategyRecommendationState(for run: Run) -> String? {
+        let value = run.strategyRecommendationState.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func hasCanonicalStrategyTelemetry(for run: Run) -> Bool {
+        SessionReuseKPIExporter.hasCanonicalStrategyTelemetry(
+            SessionReuseKPIExporter.decodeSummary(from: run.sessionKPIExportJSON)
+        )
     }
 
     private func formattedDuration(_ seconds: Double) -> String {
@@ -668,6 +718,12 @@ struct RunReportPayload: Codable, Sendable {
 
     // Key artifacts
     let keyArtifacts: [ArtifactEntry]
+
+    // Proposal 019: Strategy context
+    let contextStrategyProfileID: String?
+    let strategyAssignmentMode: String?
+    let strategyRecommendationState: String?
+    let strategyTelemetryComplete: Bool
 
     // Recovery notes
     let blockedReason: String?

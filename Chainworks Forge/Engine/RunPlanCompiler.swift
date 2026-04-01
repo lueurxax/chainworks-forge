@@ -187,7 +187,9 @@ final class RunPlanCompiler {
                 requiresHumanApproval: agentDef.requiresHumanApproval,
                 inputs: agentDef.inputs,
                 outputs: agentDef.outputs,
-                worktreeWriteEnabled: agentDef.worktreePolicy?.writeEnabled ?? false
+                worktreeWriteEnabled: agentDef.worktreePolicy?.writeEnabled ?? false,
+                sessionReuseScope: SessionReuseScope(rawValue: agentDef.sessionReuseScope ?? "") ?? .same_invocation_owner,
+                sessionFamilyID: agentDef.sessionFamilyID
             )
         }
 

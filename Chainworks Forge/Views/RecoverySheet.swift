@@ -86,7 +86,7 @@ struct RecoverySheet: View {
                                 }
                                 Spacer()
                                 Button("Execute") {
-                                    executeAction(suggested)
+                                    beginExecuteAction(suggested)
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .tint(actionColor(suggested))
@@ -112,7 +112,7 @@ struct RecoverySheet: View {
                                     }
                                     Spacer()
                                     Button("Execute") {
-                                        executeAction(action)
+                                        beginExecuteAction(action)
                                     }
                                     .buttonStyle(.bordered)
                                     .tint(actionColor(action))
@@ -223,29 +223,49 @@ struct RecoverySheet: View {
         }
     }
 
-    private func executeAction(_ action: RecoveryAction) {
+    @MainActor
+    private func beginExecuteAction(_ action: RecoveryAction) {
+        guard !isExecuting else { return }
         isExecuting = true
         errorMessage = nil
 
+        Task { @MainActor in
+            await executeAction(action)
+        }
+    }
+
+    @MainActor
+    private func executeAction(_ action: RecoveryAction) async {
         let coordinator = RecoveryCoordinator(modelContext: modelContext)
 
         do {
             switch action {
             case .retryAgent(let stageID, let agentID):
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
             case .retryAggregateStep(let stageID, let agentID):
                 _ = try coordinator.retryAggregateStep(run: run, stageID: stageID, agentID: agentID)
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
             case .resumeFromApprovalGate(let stageID):
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
                 dismiss()
+
+            case .resetAgentSession(let stageID, let agentID):
+                _ = try await coordinator.resetAgentSession(run: run, stageID: stageID, agentID: agentID)
+                // Just reset, refresh context
+                recoveryContext = coordinator.recoveryContext(for: run)
 
             case .cloneRunFrozenSnapshot:
                 guard let idea = run.idea else {
@@ -280,6 +300,24 @@ struct RecoverySheet: View {
                     break
                 }
                 let compiler = RunPlanCompiler(modelContext: modelContext)
+                let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
+                    .resolveSelection(
+                        selectedProfileID: run.contextStrategyProfileID,
+                        cohortID: run.experimentCohortID
+                    )
+                let startSnapshot = RunStartSnapshot(
+                    providerBindingSnapshotJSON: nil,
+                    bindingProvenanceJSON: nil,
+                    startOptionsJSON: nil,
+                    frozenWorkspaceRootPath: run.frozenWorkspaceRootPath,
+                    deliveryConfiguration: nil,
+                    deliveryPreflightJSON: nil,
+                    contextStrategyProfileID: strategySelection.profileID,
+                    strategyAssignmentMode: strategySelection.assignmentMode,
+                    strategyRecommendationState: strategySelection.recommendationState,
+                    contextStrategySnapshotJSON: try JSONEncoder().encode(strategySelection.profile),
+                    promotedHandoffArtifactsJSON: run.promotedHandoffArtifactsJSON
+                )
                 let clone = try coordinator.cloneRunCurrentConfig(
                     original: run,
                     idea: idea,
@@ -287,7 +325,8 @@ struct RecoverySheet: View {
                     catalog: catalog,
                     compiler: compiler,
                     workflowSourcePath: run.workflowSourcePath,
-                    catalogSourcePath: run.catalogSourcePath
+                    catalogSourcePath: run.catalogSourcePath,
+                    startSnapshot: startSnapshot
                 )
                 let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
                 let (_, workspace) = try compiler.createRun(
@@ -319,6 +358,8 @@ struct RecoverySheet: View {
             return "Re-executes the entire '\(stageID)' stage in the same run. All agents re-run."
         case .resumeFromApprovalGate:
             return "Resumes from the approval gate in the same run. No re-execution."
+        case .resetAgentSession(_, let agentID):
+            return "Discard live provider session for '\(agentID)' and force a fresh session on retry."
         case .cloneRunFrozenSnapshot:
             return "Creates a new run using the frozen snapshot. This run becomes terminal history."
         case .cloneRunCurrentConfig:
@@ -354,6 +395,7 @@ struct RecoverySheet: View {
         switch action {
         case .resumeFromApprovalGate: return DesignTokens.Action.approve
         case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
+        case .resetAgentSession: return DesignTokens.Status.error
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
         case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }

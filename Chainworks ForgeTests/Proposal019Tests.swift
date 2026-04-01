@@ -1,0 +1,761 @@
+import Testing
+import Foundation
+import SwiftData
+@testable import Chainworks_Forge
+
+@MainActor
+@Suite("Proposal 019")
+struct Proposal019Tests {
+
+    @Test("Run start snapshot freezes selected context strategy into persisted run truth")
+    func runStartSnapshotFreezesSelectedContextStrategy() throws {
+        let (_, context) = try makeTestModelContainer()
+        let workspace = makeTestWorkspace()
+        let run = makeTestRun(workspace: workspace, context: context)
+
+        let profile = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                .runtimeProfile(profileID: "selective_compression_and_escalation")
+        )
+        let snapshot = RunStartSnapshot(
+            providerBindingSnapshotJSON: nil,
+            bindingProvenanceJSON: nil,
+            startOptionsJSON: nil,
+            frozenWorkspaceRootPath: nil,
+            deliveryConfiguration: nil,
+            deliveryPreflightJSON: nil,
+            contextStrategyProfileID: "selective_compression_and_escalation",
+            strategyAssignmentMode: "manual_override",
+            strategyRecommendationState: StrategyRecommendationStatus.notEvaluated.rawValue,
+            contextStrategySnapshotJSON: try JSONEncoder().encode(profile)
+        )
+
+        snapshot.apply(to: run)
+        let roundTrip = RunStartSnapshot.from(run: run)
+
+        #expect(run.contextStrategyProfileID == "selective_compression_and_escalation")
+        #expect(run.strategyAssignmentMode == "manual_override")
+        #expect(roundTrip.contextStrategyProfileID == "selective_compression_and_escalation")
+        #expect(roundTrip.strategyAssignmentMode == "manual_override")
+        let restored = try JSONDecoder().decode(ContextStrategyProfile.self, from: try #require(roundTrip.contextStrategySnapshotJSON))
+        #expect(restored.defaultHandoffMode == .selective)
+    }
+
+    @Test("Handoff compiler compiles selective compression into packet-friendly strategy payload")
+    func handoffCompilerCompilesSelectiveCompression() throws {
+        let profile = try #require(StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"])
+        let compiler = HandoffCompiler()
+        let context = makeTestExecutionContext(
+            inputArtifacts: [
+                "idea_brief": Data("short idea".utf8),
+                "proposal_current": Data("full proposal body".utf8),
+                "proposal_review_all": Data(String(repeating: "review ", count: 80).utf8),
+                "security_audit_raw": Data("sensitive raw audit".utf8)
+            ]
+        )
+        let agent = makeTestAgent(
+            id: "proposal_writer",
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let task = makeTestTask(
+            agent: "proposal_writer",
+            task: "refine_proposal",
+            inputs: ["idea_brief", "proposal_current", "proposal_review_all", "security_audit_raw"],
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+
+        let handoff = compiler.compile(
+            profileID: "selective_compression_and_escalation",
+            profile: profile,
+            agent: agent,
+            task: task,
+            context: context
+        )
+
+        #expect(handoff.profileID == "selective_compression_and_escalation")
+        #expect(handoff.mode == .selective)
+        #expect(handoff.mandatoryArtifacts.keys.sorted() == ["idea_brief", "proposal_current"])
+        #expect(handoff.summaries.keys.sorted() == ["proposal_review_all"])
+        #expect(handoff.lazyArtifactRefs.keys.sorted() == ["security_audit_raw"])
+        #expect(handoff.summaryMetrics.compactionCount == 1)
+        #expect(handoff.summaryMetrics.lazyArtifactCount == 1)
+    }
+
+    @Test("Operator-promoted artifacts become mandatory in strategy handoff")
+    func promotedArtifactsBecomeMandatoryInHandoffPacket() throws {
+        let profile = try #require(StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"])
+        let compiler = HandoffCompiler()
+        let context = makeTestExecutionContext(
+            inputArtifacts: [
+                "idea_brief": Data("short idea".utf8),
+                "proposal_current": Data("full proposal body".utf8),
+                "proposal_review_all": Data("review summary".utf8),
+                "security_audit_raw": Data("sensitive raw audit".utf8)
+            ]
+        )
+        let agent = makeTestAgent(
+            id: "proposal_writer",
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let task = makeTestTask(
+            agent: "proposal_writer",
+            task: "refine_proposal",
+            inputs: ["idea_brief", "proposal_current", "proposal_review_all", "security_audit_raw"],
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+
+        let handoff = compiler.compile(
+            profileID: "selective_compression_and_escalation",
+            profile: profile,
+            agent: agent,
+            task: task,
+            context: context,
+            promotedArtifacts: ["security_audit_raw"]
+        )
+
+        #expect(handoff.mandatoryArtifacts["security_audit_raw"] != nil)
+        #expect(handoff.lazyArtifactRefs["security_audit_raw"] == nil)
+        #expect(handoff.promotedArtifacts == ["security_audit_raw"])
+    }
+
+    @Test("Strategy comparison degrades to insufficient evidence without canonical telemetry set")
+    func strategyComparisonRequiresCanonicalEvidenceBeforeRecommendation() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Strategy compare", body: "Test")
+        context.insert(idea)
+
+        let runA = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runA.idea = idea
+        runA.contextStrategyProfileID = "current_mixed_baseline"
+        runA.strategyAssignmentMode = "default"
+
+        let runB = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runB.idea = idea
+        runB.contextStrategyProfileID = "selective_compression_and_escalation"
+        runB.strategyAssignmentMode = "manual_override"
+
+        context.insert(runA)
+        context.insert(runB)
+
+        let comparison = try #require(RunComparisonService(modelContext: context).compare(runA, runB))
+        let recommendation = try #require(comparison.strategyRecommendation)
+
+        #expect(recommendation.status == .insufficientEvidence)
+        #expect(recommendation.proofOwner == "shell_comparison_lane")
+        #expect(recommendation.evaluationSetComplete == false)
+    }
+
+    @Test("Strategy comparison requires canonical strategy telemetry fields, not only coarse KPI totals")
+    func strategyComparisonRequiresCanonicalStrategyTelemetry() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Strategy telemetry", body: "Test")
+        context.insert(idea)
+
+        let runA = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runA.idea = idea
+        runA.contextStrategyProfileID = "current_mixed_baseline"
+        runA.strategyAssignmentMode = "default"
+        runA.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runA.sessionKPIExportJSON = Data(#"{"runID":"A","totalExecutions":4}"#.utf8)
+
+        let runB = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runB.idea = idea
+        runB.contextStrategyProfileID = "selective_compression_and_escalation"
+        runB.strategyAssignmentMode = "manual_override"
+        runB.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runB.sessionKPIExportJSON = Data(#"{"runID":"B","totalExecutions":4}"#.utf8)
+
+        context.insert(runA)
+        context.insert(runB)
+
+        let comparison = try #require(RunComparisonService(modelContext: context).compare(runA, runB))
+        let recommendation = try #require(comparison.strategyRecommendation)
+
+        #expect(recommendation.status == .insufficientEvidence)
+        #expect(recommendation.evaluationSetComplete == false)
+        #expect(comparison.strategyComparison.evidenceComplete == false)
+    }
+
+    @Test("KPI export extends canonical run telemetry with strategy signals")
+    func kpiExportIncludesStrategyTelemetrySummary() throws {
+        let (_, context) = try makeTestModelContainer()
+        let workspace = makeTestWorkspace()
+        let run = makeTestRun(workspace: workspace, context: context)
+        run.promotedHandoffArtifactsJSON = try JSONEncoder().encode(["security_audit_raw"])
+
+        let stage = StageExecution(stageID: "state_4_proposal_reviewed", label: "Proposal reviewed", status: .completed)
+        stage.run = run
+        context.insert(stage)
+
+        let execution = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "aggregate_proposal_reviews",
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        execution.stageExecution = stage
+        execution.limitPressureSignalsJSON = try JSONEncoder().encode(
+            StrategyLimitPressureSignals(
+                inputPayloadBytes: 1200,
+                payloadBytesBeforeStrategy: 2400,
+                payloadBytesAfterStrategy: 1200,
+                payloadReductionBytes: 1200,
+                mandatoryArtifactCount: 2,
+                summarizedArtifactCount: 1,
+                lazyArtifactCount: 3,
+                lazyEvidenceHitCount: 2,
+                lazyEvidenceHitRate: 2.0 / 3.0,
+                compactionCount: 1,
+                cacheEffectiveness: 0.0,
+                compactionChurnCount: 0,
+                escalationCount: 0,
+                retryableEscalationCount: 0,
+                contractFailureCount: 0,
+                operatorPromotedArtifactCount: 1
+            )
+        )
+        context.insert(execution)
+
+        let summary = SessionReuseKPIExporter.exportKPIs(for: run.id, context: context)
+
+        #expect(summary.strategyTelemetry.totalPayloadReductionBytes == 1200)
+        #expect(summary.strategyTelemetry.averageLazyArtifactCount == 3.0)
+        #expect(summary.strategyTelemetry.totalLazyEvidenceHitCount == 2)
+        #expect(summary.strategyTelemetry.averageLazyEvidenceHitRate == 2.0 / 3.0)
+        #expect(summary.strategyTelemetry.operatorPromotedArtifactCount == 1)
+        #expect(summary.strategyTelemetry.totalPromotedArtifactUsages == 1)
+    }
+
+    @Test("Experiment coordinator assigns a deterministic cohort profile from frozen steward config")
+    func experimentCoordinatorAssignsDeterministicCohortProfile() throws {
+        let coordinator = StrategyExperimentCoordinator(config: .defaultConfig)
+        let cohortID = UUID(uuidString: "00000000-0000-0000-0000-000000000123")!
+
+        let first = coordinator.resolveSelection(selectedProfileID: nil, cohortID: cohortID)
+        let second = coordinator.resolveSelection(selectedProfileID: nil, cohortID: cohortID)
+
+        #expect(first.profileID == second.profileID)
+        #expect(first.assignmentMode == "experiment_cohort")
+        #expect(StewardConfig.defaultConfig.contextStrategyProfiles[first.profileID] != nil)
+    }
+
+    @Test("Frozen snapshot clone preserves strategy assignment and frozen profile snapshot")
+    func frozenSnapshotClonePreservesStrategySnapshot() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Frozen strategy clone", body: "Test")
+        context.insert(idea)
+
+        let workflow = try loadTestCanonicalWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let compiler = RunPlanCompiler(modelContext: context)
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let profile = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                .runtimeProfile(profileID: "selective_compression_and_escalation")
+        )
+        let startSnapshot = RunStartSnapshot(
+            contextStrategyProfileID: "selective_compression_and_escalation",
+            strategyAssignmentMode: "manual_override",
+            strategyRecommendationState: StrategyRecommendationStatus.notEvaluated.rawValue,
+            contextStrategySnapshotJSON: try JSONEncoder().encode(profile),
+            promotedHandoffArtifactsJSON: try JSONEncoder().encode(["security_audit_raw"])
+        )
+
+        let (original, _) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "/tmp/workflow.yaml",
+            catalogSourcePath: "/tmp/agents.yaml",
+            startSnapshot: startSnapshot
+        )
+        original.status = .blocked
+
+        let clone = try RecoveryCoordinator(modelContext: context).cloneRunFrozenSnapshot(
+            original: original,
+            idea: idea,
+            compiler: compiler
+        )
+
+        #expect(clone.id != original.id)
+        #expect(clone.contextStrategyProfileID == "selective_compression_and_escalation")
+        #expect(clone.strategyAssignmentMode == "manual_override")
+        #expect(clone.contextStrategySnapshotJSON == original.contextStrategySnapshotJSON)
+        #expect(clone.promotedHandoffArtifactsJSON == original.promotedHandoffArtifactsJSON)
+    }
+
+    @Test("Current-config clone can adopt a newer strategy selection than the frozen source run")
+    func currentConfigCloneUsesCurrentStrategySelection() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Current config strategy clone", body: "Test")
+        context.insert(idea)
+
+        let workflow = try loadTestCanonicalWorkflow()
+        let catalog = try loadTestCanonicalCatalog()
+        let compiler = RunPlanCompiler(modelContext: context)
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let originalProfile = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["current_mixed_baseline"]?
+                .runtimeProfile(profileID: "current_mixed_baseline")
+        )
+        let originalSnapshot = RunStartSnapshot(
+            contextStrategyProfileID: "current_mixed_baseline",
+            strategyAssignmentMode: "default",
+            strategyRecommendationState: StrategyRecommendationStatus.notEvaluated.rawValue,
+            contextStrategySnapshotJSON: try JSONEncoder().encode(originalProfile)
+        )
+
+        let (original, _) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: "/tmp/workflow.yaml",
+            catalogSourcePath: "/tmp/agents.yaml",
+            startSnapshot: originalSnapshot
+        )
+        original.status = .blocked
+
+        let selection = StrategyExperimentCoordinator(config: .defaultConfig)
+            .resolveSelection(selectedProfileID: "fresh_control", cohortID: original.experimentCohortID)
+        let currentSnapshot = RunStartSnapshot(
+            contextStrategyProfileID: selection.profileID,
+            strategyAssignmentMode: selection.assignmentMode,
+            strategyRecommendationState: selection.recommendationState,
+            contextStrategySnapshotJSON: try JSONEncoder().encode(selection.profile),
+            promotedHandoffArtifactsJSON: try JSONEncoder().encode(["proposal_review_all"])
+        )
+
+        let clone = try RecoveryCoordinator(modelContext: context).cloneRunCurrentConfig(
+            original: original,
+            idea: idea,
+            workflow: workflow,
+            catalog: catalog,
+            compiler: compiler,
+            workflowSourcePath: "/tmp/workflow.yaml",
+            catalogSourcePath: "/tmp/agents.yaml",
+            startSnapshot: currentSnapshot
+        )
+
+        #expect(clone.id != original.id)
+        #expect(clone.contextStrategyProfileID == "fresh_control")
+        #expect(clone.strategyAssignmentMode == selection.assignmentMode)
+        let restored = try JSONDecoder().decode(ContextStrategyProfile.self, from: try #require(clone.contextStrategySnapshotJSON))
+        #expect(restored.profileID == "fresh_control")
+        let promoted = try JSONDecoder().decode([String].self, from: try #require(clone.promotedHandoffArtifactsJSON))
+        #expect(promoted == ["proposal_review_all"])
+    }
+
+    @Test("Continuity mode overrides runtime session reuse scope for long continuity and fresh control profiles")
+    func continuityModeOverridesRuntimeSessionReuseScope() throws {
+        let longContinuity = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["manual_like_long_continuity"]?
+                .runtimeProfile(profileID: "manual_like_long_continuity")
+        )
+        let freshControl = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["fresh_control"]?
+                .runtimeProfile(profileID: "fresh_control")
+        )
+
+        let lead = makeTestAgent(id: "lead_orchestrator", outputs: ["proposal_review_summary"])
+        let writer = makeTestAgent(id: "proposal_writer", outputs: ["proposal_current"])
+        let reviewer = makeTestAgent(id: "proposal_reviewer_ui", outputs: ["proposal_review_ui"])
+
+        #expect(
+            WorkflowOrchestrator.effectiveSessionReuseScope(for: lead, profile: longContinuity)
+                == .same_agent_family_within_run
+        )
+        #expect(
+            WorkflowOrchestrator.effectiveSessionReuseScope(for: writer, profile: longContinuity)
+                == .same_agent_family_within_run
+        )
+        #expect(
+            WorkflowOrchestrator.effectiveSessionReuseScope(for: reviewer, profile: longContinuity)
+                == .none
+        )
+        #expect(
+            WorkflowOrchestrator.effectiveSessionReuseScope(for: lead, profile: freshControl)
+                == .none
+        )
+    }
+
+    @Test("Canonical comparison recommendation cites evaluation set when evidence is complete")
+    func strategyComparisonProducesRecommendationWithEvaluationSet() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Strategy recommendation", body: "Test")
+        context.insert(idea)
+
+        let runA = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runA.idea = idea
+        runA.workflowFamily = "proposal_loop_live"
+        runA.contextStrategyProfileID = "selective_compression_and_escalation"
+        runA.strategyAssignmentMode = "manual_override"
+        runA.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runA.status = .completed
+        runA.totalCostCents = 0
+        runA.completedAt = runA.startedAt.addingTimeInterval(30)
+        runA.sessionKPIExportJSON = makeCanonicalStrategyKPIJSON(runID: runA.id)
+
+        let runB = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runB.idea = idea
+        runB.workflowFamily = "proposal_loop_live"
+        runB.contextStrategyProfileID = "current_mixed_baseline"
+        runB.strategyAssignmentMode = "default"
+        runB.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runB.status = .blocked
+        runB.totalCostCents = 100_000
+        runB.completedAt = runB.startedAt.addingTimeInterval(30)
+        runB.sessionKPIExportJSON = makeCanonicalStrategyKPIJSON(runID: runB.id)
+
+        context.insert(runA)
+        context.insert(runB)
+
+        let comparison = try #require(RunComparisonService(modelContext: context).compare(runA, runB))
+        let recommendation = comparison.strategyRecommendation
+
+        #expect(recommendation.status == .candidateWinner)
+        #expect(recommendation.proofOwner == "shell_comparison_lane")
+        #expect(recommendation.evaluationSetComplete == true)
+        #expect(recommendation.evaluationSetSummary.contains(String(runA.id.uuidString.prefix(8))))
+        #expect(recommendation.evaluationSetSummary.contains(String(runB.id.uuidString.prefix(8))))
+        #expect(recommendation.recommendedProfileID == "selective_compression_and_escalation")
+    }
+
+    @Test("Selective compression demonstrates measurable savings through canonical KPI export lane")
+    func selectiveCompressionDemonstratesMeasurableSavings() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Strategy savings proof", body: "Test")
+        context.insert(idea)
+
+        let runA = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runA.idea = idea
+        runA.workflowFamily = "proposal_loop_live"
+        runA.contextStrategyProfileID = "selective_compression_and_escalation"
+        runA.strategyAssignmentMode = "manual_override"
+        runA.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runA.status = .completed
+        runA.totalCostCents = 15
+        runA.completedAt = runA.startedAt.addingTimeInterval(45)
+        context.insert(runA)
+
+        let runB = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runB.idea = idea
+        runB.workflowFamily = "proposal_loop_live"
+        runB.contextStrategyProfileID = "current_mixed_baseline"
+        runB.strategyAssignmentMode = "default"
+        runB.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runB.status = .blocked
+        runB.totalCostCents = 180
+        runB.completedAt = runB.startedAt.addingTimeInterval(75)
+        context.insert(runB)
+
+        try attachStrategyProofData(
+            to: runA,
+            context: context,
+            payloadBefore: 4_096,
+            payloadAfter: 1_536,
+            reduction: 2_560,
+            compactionCount: 2,
+            lazyCount: 3
+        )
+        try attachStrategyProofData(
+            to: runB,
+            context: context,
+            payloadBefore: 4_096,
+            payloadAfter: 4_096,
+            reduction: 0,
+            compactionCount: 0,
+            lazyCount: 0
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        runA.sessionKPIExportJSON = try encoder.encode(SessionReuseKPIExporter.exportKPIs(for: runA.id, context: context))
+        runB.sessionKPIExportJSON = try encoder.encode(SessionReuseKPIExporter.exportKPIs(for: runB.id, context: context))
+
+        let comparison = try #require(RunComparisonService(modelContext: context).compare(runA, runB))
+
+        #expect(comparison.strategyComparison.evidenceComplete)
+        #expect(comparison.strategyRecommendation.status == .candidateWinner)
+        #expect(comparison.strategyRecommendation.recommendedProfileID == "selective_compression_and_escalation")
+        #expect(comparison.strategyRecommendation.rationale.contains("outperformed"))
+    }
+
+    @Test("Strategy recommendation prefers normalized telemetry over cheaper but escalation-heavy runs")
+    func strategyRecommendationPrefersCanonicalTelemetryOverCoarseCost() throws {
+        let (_, context) = try makeTestModelContainer()
+        let idea = Idea(title: "Telemetry scoring", body: "Test")
+        context.insert(idea)
+
+        let runA = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runA.idea = idea
+        runA.workflowFamily = "proposal_loop_live"
+        runA.contextStrategyProfileID = "selective_compression_and_escalation"
+        runA.strategyAssignmentMode = "manual_override"
+        runA.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runA.status = .completed
+        runA.totalCostCents = 220
+        runA.completedAt = runA.startedAt.addingTimeInterval(75)
+        runA.sessionKPIExportJSON = makeCanonicalStrategyKPIJSON(
+            runID: runA.id,
+            totalCostCents: 220,
+            payloadReductionBytes: 2_560,
+            averageCacheEffectiveness: 0.82,
+            totalCompactionChurn: 1,
+            totalEscalationCount: 0,
+            totalRetryableEscalationCount: 0,
+            totalContractFailureCount: 0,
+            operatorPromotedArtifactCount: 1,
+            totalPromotedArtifactUsages: 1
+        )
+
+        let runB = Run(
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        runB.idea = idea
+        runB.workflowFamily = "proposal_loop_live"
+        runB.contextStrategyProfileID = "fresh_control"
+        runB.strategyAssignmentMode = "manual_override"
+        runB.strategyRecommendationState = StrategyRecommendationStatus.notEvaluated.rawValue
+        runB.status = .completed
+        runB.totalCostCents = 40
+        runB.completedAt = runB.startedAt.addingTimeInterval(20)
+        runB.sessionKPIExportJSON = makeCanonicalStrategyKPIJSON(
+            runID: runB.id,
+            totalCostCents: 40,
+            payloadReductionBytes: 0,
+            averageCacheEffectiveness: 0.05,
+            totalCompactionChurn: 5,
+            totalEscalationCount: 3,
+            totalRetryableEscalationCount: 3,
+            totalContractFailureCount: 2,
+            operatorPromotedArtifactCount: 0,
+            totalPromotedArtifactUsages: 4
+        )
+
+        context.insert(runA)
+        context.insert(runB)
+
+        let comparison = try #require(RunComparisonService(modelContext: context).compare(runA, runB))
+
+        #expect(comparison.strategyComparison.evidenceComplete)
+        #expect(comparison.strategyRecommendation.status == .candidateWinner)
+        #expect(comparison.strategyRecommendation.recommendedProfileID == "selective_compression_and_escalation")
+    }
+}
+
+private func makeCanonicalStrategyKPIJSON(
+    runID: UUID,
+    totalCostCents: Int64 = 256,
+    payloadReductionBytes: Int64 = 2048,
+    averageCacheEffectiveness: Double = 0.75,
+    totalCompactionChurn: Int = 1,
+    totalEscalationCount: Int = 0,
+    totalRetryableEscalationCount: Int = 0,
+    totalContractFailureCount: Int = 0,
+    operatorPromotedArtifactCount: Int = 1,
+    totalPromotedArtifactUsages: Int = 1
+) -> Data {
+    let summary = SessionReuseKPIExporter.RunKPISummary(
+        runID: runID,
+        exportedAt: Date(timeIntervalSince1970: 1_000),
+        totalExecutions: 4,
+        totalReusedExecutions: 2,
+        overallReusePercentage: 0.5,
+        totalColdStartTokensSaved: 128,
+        totalSessionGrowthTokens: 64,
+        totalForcedBudgetResets: 0,
+        totalTokenSavingsVersusFreshBaseline: totalCostCents,
+        perAgentKPIs: [],
+    strategyTelemetry: SessionReuseKPIExporter.StrategyTelemetrySummary(
+            totalPayloadBytesBeforeStrategy: 4096,
+            totalPayloadBytesAfterStrategy: 4096 - payloadReductionBytes,
+            totalPayloadReductionBytes: payloadReductionBytes,
+            averageLazyArtifactCount: 2.0,
+            totalLazyEvidenceHitCount: 1,
+            averageLazyEvidenceHitRate: 0.5,
+            averageCacheEffectiveness: averageCacheEffectiveness,
+            totalCompactionChurn: totalCompactionChurn,
+            totalEscalationCount: totalEscalationCount,
+            totalRetryableEscalationCount: totalRetryableEscalationCount,
+            totalContractFailureCount: totalContractFailureCount,
+            operatorPromotedArtifactCount: operatorPromotedArtifactCount,
+            totalPromotedArtifactUsages: totalPromotedArtifactUsages
+        )
+    )
+
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    return (try? encoder.encode(summary)) ?? Data()
+}
+
+@MainActor
+private func attachStrategyProofData(
+    to run: Run,
+    context: ModelContext,
+    payloadBefore: Int,
+    payloadAfter: Int,
+    reduction: Int,
+    compactionCount: Int,
+    lazyCount: Int
+) throws {
+    let stage = StageExecution(
+        stageID: "state_4_proposal_reviewed",
+        label: "Proposal reviewed",
+        status: .completed,
+        iteration: 1,
+        attemptNumber: 1
+    )
+    stage.run = run
+    context.insert(stage)
+
+    let execution = AgentExecution(
+        agentID: "lead_orchestrator",
+        agentTitle: "Lead / Orchestrator",
+        taskName: "aggregate_proposal_reviews",
+        status: .completed,
+        provider: "claude_code",
+        effort: "high"
+    )
+    execution.stageExecution = stage
+    execution.limitPressureSignalsJSON = try JSONEncoder().encode(
+        StrategyLimitPressureSignals(
+            inputPayloadBytes: payloadAfter,
+            payloadBytesBeforeStrategy: payloadBefore,
+            payloadBytesAfterStrategy: payloadAfter,
+            payloadReductionBytes: reduction,
+            mandatoryArtifactCount: 2,
+            summarizedArtifactCount: compactionCount,
+            lazyArtifactCount: lazyCount,
+            lazyEvidenceHitCount: lazyCount == 0 ? 0 : 1,
+            lazyEvidenceHitRate: lazyCount == 0 ? 0.0 : (1.0 / Double(lazyCount)),
+            compactionCount: compactionCount,
+            cacheEffectiveness: 0.8,
+            compactionChurnCount: compactionCount,
+            escalationCount: 0,
+            retryableEscalationCount: 0,
+            contractFailureCount: 0,
+            operatorPromotedArtifactCount: 0
+        )
+    )
+    context.insert(execution)
+
+    let lineage = AgentSessionLineage(
+        runID: run.id,
+        agentID: "lead_orchestrator",
+        lineageID: UUID().uuidString,
+        sessionReuseScope: .same_invocation_owner
+    )
+    context.insert(lineage)
+
+    let generation = AgentSessionGeneration(
+        generation: 1,
+        invocationOwnerKey: "proof-owner",
+        providerSessionID: "session-\(UUID().uuidString)",
+        bindingFingerprint: "binding",
+        workingDirectory: "/tmp",
+        workspaceMode: "read_only",
+        runtimeProvider: "claude",
+        runtimeModel: "claude-opus-4.6"
+    )
+    generation.turnCount = 1
+    generation.estimatedInputTokens = Int64(payloadBefore / 4)
+    generation.cumulativePromptTokens = Int64(payloadAfter / 4)
+    generation.cumulativeCostCents = run.totalCostCents ?? 0
+    generation.lineage = lineage
+    lineage.generations.append(generation)
+    lineage.activeGenerationID = generation.id
+    context.insert(generation)
+
+    let created = AgentSessionEvent(generationID: generation.id, eventType: .created)
+    created.lineage = lineage
+    lineage.events.append(created)
+    context.insert(created)
+}

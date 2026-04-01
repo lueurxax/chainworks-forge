@@ -16,6 +16,8 @@ struct RunReportView: View {
     @State private var reportArtifacts: [Artifact] = []
     @State private var summaryContent: String?
     @State private var selectedReportContent: String?
+    @State private var strategyRecommendation: StrategyRecommendation?
+    @State private var strategyPairComparison: RunComparison?
     // Proposal 008 (REQ-012): Loading/timeout/retry states for report surfaces.
     @State private var isLoadingReport = true
     @State private var loadError: String?
@@ -28,6 +30,7 @@ struct RunReportView: View {
         case immutableHistory = "Immutable History"
         case exportHub = "Export Hub"
         case signOffSummary = "Sign-Off"
+        case strategySummary = "Strategy"
     }
 
     var body: some View {
@@ -58,6 +61,11 @@ struct RunReportView: View {
 
             HStack {
                 ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
+                StrategyBadge(
+                    profileID: strategyProfileID(for: run),
+                    assignmentMode: strategyAssignmentMode(for: run),
+                    recommendationState: effectiveStrategyRecommendationState(for: run)
+                )
                 Spacer()
             }
             .padding(.horizontal)
@@ -79,6 +87,8 @@ struct RunReportView: View {
 
                 case .signOffSummary:
                     MVPSignOffSummaryView(run: run)
+                case .strategySummary:
+                    strategySummaryContent
                 }
             }
         }
@@ -98,6 +108,7 @@ struct RunReportView: View {
 
         if run.status == .completed || run.status == .failed {
             tabs.append(.exportHub)
+            tabs.append(.strategySummary)
         }
 
         // Sign-off tab visible if run might be linked to a benchmark
@@ -116,6 +127,7 @@ struct RunReportView: View {
         case .immutableHistory: return "lock.fill"
         case .exportHub: return "shippingbox"
         case .signOffSummary: return "checkmark.seal"
+        case .strategySummary: return "chart.bar"
         }
     }
 
@@ -125,6 +137,7 @@ struct RunReportView: View {
         case .immutableHistory: return "Immutable history — never overwritten"
         case .exportHub: return "Export hub — completed run evidence and receipts"
         case .signOffSummary: return "Sign-off summary — benchmark evaluation"
+        case .strategySummary: return "Strategy summary — shell-owned comparison lane"
         }
     }
 
@@ -134,6 +147,7 @@ struct RunReportView: View {
         case .immutableHistory: return .green
         case .exportHub: return .blue
         case .signOffSummary: return .purple
+        case .strategySummary: return .pink
         }
     }
 
@@ -212,6 +226,113 @@ struct RunReportView: View {
         }
     }
 
+    @ViewBuilder
+    private var strategySummaryContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            GroupBox("Strategy context") {
+                VStack(alignment: .leading, spacing: 6) {
+                    StrategyBadge(
+                        profileID: strategyProfileID(for: run),
+                        assignmentMode: strategyAssignmentMode(for: run),
+                        recommendationState: effectiveStrategyRecommendationState(for: run)
+                    )
+                    if let profile = strategyProfileID(for: run) {
+                        LabeledContent("Profile", value: profile)
+                    } else {
+                        LabeledContent("Profile", value: "not captured")
+                    }
+                    if let mode = strategyAssignmentMode(for: run) {
+                        LabeledContent("Assignment mode", value: mode)
+                    } else {
+                        LabeledContent("Assignment mode", value: "not captured")
+                    }
+                    if let state = strategyRecommendationState(for: run) {
+                        LabeledContent("Recommendation state", value: state)
+                    }
+                    let promotedArtifacts = promotedHandoffArtifacts(for: run)
+                    if !promotedArtifacts.isEmpty {
+                        LabeledContent("Promoted handoff artifacts", value: promotedArtifacts.joined(separator: ", "))
+                    }
+                }
+            }
+
+            if let telemetry = strategyTelemetrySummary(for: run) {
+                GroupBox("Strategy telemetry") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        LabeledContent("Payload reduction", value: "\(telemetry.totalPayloadReductionBytes) bytes")
+                        LabeledContent("Average cache effectiveness", value: String(format: "%.2f", telemetry.averageCacheEffectiveness))
+                        LabeledContent("Compaction churn", value: "\(telemetry.totalCompactionChurn)")
+                        LabeledContent("Escalations", value: "\(telemetry.totalEscalationCount)")
+                        LabeledContent("Promoted artifact count", value: "\(telemetry.operatorPromotedArtifactCount)")
+                    }
+                }
+            }
+
+            if let summary = strategyPairComparison {
+                GroupBox("Comparable run recommendation (shell-owned lane)") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let qualitySummary = summary.strategyComparison.qualityDeltaSummary {
+                            Text(qualitySummary)
+                                .font(.caption)
+                        }
+                        Label(
+                            "Status: \(summary.strategyRecommendation.status.rawValue)",
+                            systemImage: summary.strategyRecommendation.status == .candidateWinner ? "checkmark.circle" : "info.circle"
+                        )
+                        .foregroundStyle(strategyColor(summary.strategyRecommendation.status))
+                        if let recommended = summary.strategyRecommendation.recommendedProfileID {
+                            Text("Recommended profile: \(recommended)")
+                                .font(.caption)
+                        }
+                        Text("Proof owner: \(summary.strategyRecommendation.proofOwner)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("Evaluation set: \(summary.strategyRecommendation.evaluationSetSummary)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        if !summary.strategyRecommendation.holdCriteria.isEmpty {
+                            Text("Hold criteria: \(summary.strategyRecommendation.holdCriteria.joined(separator: ", "))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(summary.strategyRecommendation.rationale)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+            } else if let recommendation = strategyRecommendation {
+                GroupBox("Strategy recommendation") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Status: \(recommendation.status.rawValue)", systemImage: recommendation.status == .candidateWinner ? "checkmark.circle" : "info.circle")
+                            .foregroundStyle(strategyColor(recommendation.status))
+                        Text("Proof owner: \(recommendation.proofOwner)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("Evaluation set: \(recommendation.evaluationSetSummary)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        if !recommendation.holdCriteria.isEmpty {
+                            Text("Hold criteria: \(recommendation.holdCriteria.joined(separator: ", "))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(recommendation.rationale)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                ContentUnavailableView(
+                    "No strategy comparison",
+                    systemImage: "speedometer",
+                    description: Text("A compatible pair with different strategy settings is not available yet.")
+                )
+            }
+        }
+        .padding()
+    }
+
     // MARK: - Data Loading
 
     private func loadReportData() {
@@ -258,7 +379,45 @@ struct RunReportView: View {
             isTimedOut = true
         }
 
+        loadStrategyRecommendation()
         isLoadingReport = false
+    }
+
+    private func loadStrategyRecommendation() {
+        let service = RunComparisonService(modelContext: modelContext)
+        let peers = service.compatibleTargets(for: run).sorted { $0.startedAt > $1.startedAt }
+        strategyPairComparison = peers.compactMap { peer in
+            service.compare(run, peer)
+        }.first { candidate in
+            candidate.strategyComparison.profileA != candidate.strategyComparison.profileB
+        }
+        if let comparison = strategyPairComparison {
+            strategyRecommendation = comparison.strategyRecommendation
+        } else {
+            strategyRecommendation = nil
+        }
+    }
+
+    private func promotedHandoffArtifacts(for run: Run) -> [String] {
+        guard
+            let data = run.promotedHandoffArtifactsJSON,
+            let artifacts = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            return []
+        }
+        return artifacts
+    }
+
+    private func strategyTelemetrySummary(for run: Run) -> SessionReuseKPIExporter.StrategyTelemetrySummary? {
+        guard let data = run.sessionKPIExportJSON else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let summary = try? decoder.decode(SessionReuseKPIExporter.RunKPISummary.self, from: data) else {
+            return nil
+        }
+        return summary.strategyTelemetry
     }
 
     /// Proposal 008 (REQ-012): Retry report retrieval after error or timeout.
@@ -275,6 +434,38 @@ struct RunReportView: View {
             runID: run.id
         ) {
             try String(contentsOfFile: artifact.filePath, encoding: .utf8)
+        }
+    }
+
+    private func strategyProfileID(for run: Run) -> String? {
+        let value = run.contextStrategyProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func strategyAssignmentMode(for run: Run) -> String? {
+        let value = run.strategyAssignmentMode.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func strategyRecommendationState(for run: Run) -> String? {
+        let value = run.strategyRecommendationState.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func effectiveStrategyRecommendationState(for run: Run) -> String? {
+        strategyPairComparison?.strategyRecommendation.status.rawValue
+            ?? strategyRecommendation?.status.rawValue
+            ?? strategyRecommendationState(for: run)
+    }
+
+    private func strategyColor(_ status: StrategyRecommendationStatus) -> Color {
+        switch status {
+        case .candidateWinner:
+            return .green
+        case .insufficientEvidence:
+            return .orange
+        case .notEvaluated, .inconclusive:
+            return .secondary
         }
     }
 }

@@ -82,10 +82,11 @@ final class ExecutionEventBridge: @unchecked Sendable {
                 withLock {
                     _accumulatedText += text
                 }
-            case .toolCallStarted(let toolName, _):
+            case .toolCallStarted(let toolName, let raw):
                 withLock {
                     _toolCalls.append(ToolCallRecord(
                         toolName: toolName,
+                        rawPayload: raw,
                         startedAt: Date(),
                         completedAt: nil,
                         succeeded: nil
@@ -154,7 +155,7 @@ final class ExecutionEventBridge: @unchecked Sendable {
                 toolName: toolName
             )
         case .textChunk(let text):
-            return ExecutionEvent(type: .textChunk, timestamp: timestamp, detail: String(text.prefix(200)))
+            return ExecutionEvent(type: .textChunk, timestamp: timestamp, detail: text)
         case .finalOutput:
             return ExecutionEvent(type: .finalOutput, timestamp: timestamp, detail: "Final output received")
         case .finish(let reason, let totalTokens, _):
@@ -256,6 +257,7 @@ struct ExecutionEvent: Sendable, Identifiable {
 /// Record of a tool call during execution.
 struct ToolCallRecord: Sendable {
     let toolName: String
+    let rawPayload: String
     let startedAt: Date
     var completedAt: Date?
     var succeeded: Bool?

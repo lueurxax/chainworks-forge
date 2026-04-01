@@ -28,14 +28,16 @@ final class RecoveryCoordinator {
            let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run),
            let snapshotActions = recoveryActions(from: failedStage),
            !snapshotActions.isEmpty {
-            return snapshotActions
+            let validated = validateSnapshotActions(snapshotActions, stage: failedStage)
+            if !validated.isEmpty { return validated }
         }
 
         if case .blocked = run.status,
            let blockedStage = lastBlockedStage(in: run) ?? lastFailedStage(in: run),
            let snapshotActions = recoveryActions(from: blockedStage),
            !snapshotActions.isEmpty {
-            return snapshotActions
+            let validated = validateSnapshotActions(snapshotActions, stage: blockedStage)
+            if !validated.isEmpty { return validated }
         }
 
         var actions: [RecoveryAction] = []
@@ -48,6 +50,8 @@ final class RecoveryCoordinator {
                         actions.append(.retryAggregateStep(stageID: failedStage.stageID, agentID: failedAgent.agentID))
                     } else {
                         actions.append(.retryAgent(stageID: failedStage.stageID, agentID: failedAgent.agentID))
+                        // Proposal 018: Allow operator reset when an agent fails
+                        actions.append(.resetAgentSession(stageID: failedStage.stageID, agentID: failedAgent.agentID))
                     }
                 }
                 actions.append(.retryStage(stageID: failedStage.stageID))
@@ -64,6 +68,8 @@ final class RecoveryCoordinator {
                         actions.append(.retryAggregateStep(stageID: failedStage.stageID, agentID: failedAgent.agentID))
                     } else {
                         actions.append(.retryAgent(stageID: failedStage.stageID, agentID: failedAgent.agentID))
+                        // Proposal 018: Allow operator reset when an agent fails
+                        actions.append(.resetAgentSession(stageID: failedStage.stageID, agentID: failedAgent.agentID))
                     }
                 }
                 actions.append(.retryStage(stageID: failedStage.stageID))
@@ -96,10 +102,10 @@ final class RecoveryCoordinator {
         }
 
         // Find the stage and agent
-        guard let stage = run.stageExecutions.first(where: { $0.stageID == stageID }) else {
+        guard let stage = retryTargetStage(in: run, stageID: stageID) else {
             throw RecoveryError.stageNotFound(stageID)
         }
-        guard let agent = stage.agentExecutions.first(where: { $0.agentID == agentID }) else {
+        guard let agent = retryTargetAgent(in: stage, agentID: agentID) else {
             throw RecoveryError.agentNotFound(agentID)
         }
 
@@ -135,10 +141,10 @@ final class RecoveryCoordinator {
         }
 
         // Find the stage and aggregate agent
-        guard let stage = run.stageExecutions.first(where: { $0.stageID == stageID }) else {
+        guard let stage = retryTargetStage(in: run, stageID: stageID) else {
             throw RecoveryError.stageNotFound(stageID)
         }
-        guard let agent = stage.agentExecutions.first(where: { $0.agentID == agentID }) else {
+        guard let agent = retryTargetAgent(in: stage, agentID: agentID) else {
             throw RecoveryError.agentNotFound(agentID)
         }
         guard isAggregateStep(agent) else {
@@ -225,6 +231,22 @@ final class RecoveryCoordinator {
         return run
     }
 
+    /// Reset an agent's reusable session lineage (Proposal 018).
+    func resetAgentSession(run: Run, stageID: String, agentID: String) async throws -> Run {
+        guard isProposalLoopReadOnly(run) else {
+            throw RecoveryError.notProposalLoopRun
+        }
+
+        let resetCoordinator = SessionResetCoordinator(modelContext: modelContext)
+        try await resetCoordinator.resetAgentSession(runID: run.id, agentID: agentID)
+
+        // Emit recovery report noting the reset
+        _ = try reportBuilder.emitReport(for: run)
+
+        try modelContext.save()
+        return run
+    }
+
     /// Clone a run using the frozen snapshot.
     func cloneRunFrozenSnapshot(
         original: Run,
@@ -263,7 +285,8 @@ final class RecoveryCoordinator {
         catalog: AgentCatalog,
         compiler: RunPlanCompiler,
         workflowSourcePath: String,
-        catalogSourcePath: String
+        catalogSourcePath: String,
+        startSnapshot: RunStartSnapshot = .empty
     ) throws -> Run {
         guard isProposalLoopReadOnly(original) else {
             throw RecoveryError.notProposalLoopRun
@@ -275,7 +298,8 @@ final class RecoveryCoordinator {
             for: idea,
             plan: plan,
             workflowSourcePath: workflowSourcePath,
-            catalogSourcePath: catalogSourcePath
+            catalogSourcePath: catalogSourcePath,
+            startSnapshot: startSnapshot
         )
         clone.runtimeTrustLevel = original.runtimeTrustLevel
 
@@ -419,6 +443,26 @@ final class RecoveryCoordinator {
             .last
     }
 
+    private func retryTargetStage(in run: Run, stageID: String) -> StageExecution? {
+        let matching = run.stageExecutions
+            .filter { $0.stageID == stageID }
+            .sorted { $0.startedAt < $1.startedAt }
+
+        return matching.last(where: { $0.status == .failed || $0.status == .blocked })
+            ?? matching.last
+    }
+
+    private func retryTargetAgent(in stage: StageExecution, agentID: String) -> AgentExecution? {
+        let matching = stage.agentExecutions
+            .filter { $0.agentID == agentID }
+            .sorted { $0.startedAt < $1.startedAt }
+
+        // Only return a failed agent execution for retry.
+        // Falling back to a non-failed execution would cause StageRetryCoordinator
+        // to reject it with agentNotFailed, making the button appear non-responsive.
+        return matching.last(where: { $0.status == .failed })
+    }
+
     private func lastApprovalGateStage(in run: Run) -> StageExecution? {
         run.stageExecutions
             .filter { $0.status == .waitingApproval }
@@ -466,6 +510,20 @@ final class RecoveryCoordinator {
             return packetValidation
         }
         return lastFailedAgent(in: stage).flatMap { decodeValidationFailure(from: $0) }
+    }
+
+    /// Validate snapshot-based recovery actions against current state.
+    /// Filters out stale agent-retry actions where the agent is no longer failed.
+    private func validateSnapshotActions(_ actions: [RecoveryAction], stage: StageExecution) -> [RecoveryAction] {
+        actions.filter { action in
+            switch action {
+            case .retryAgent(_, let agentID), .retryAggregateStep(_, let agentID), .resetAgentSession(_, let agentID):
+                // Only keep agent-level actions if there's actually a failed execution for that agent
+                return stage.agentExecutions.contains { $0.agentID == agentID && $0.status == .failed }
+            case .retryStage, .resumeFromApprovalGate, .cloneRunFrozenSnapshot, .cloneRunCurrentConfig:
+                return true
+            }
+        }
     }
 
     private func recoveryActions(from stage: StageExecution) -> [RecoveryAction]? {
@@ -526,6 +584,7 @@ enum RecoveryAction: Identifiable, Equatable {
     case retryAggregateStep(stageID: String, agentID: String)
     case retryStage(stageID: String)
     case resumeFromApprovalGate(stageID: String)
+    case resetAgentSession(stageID: String, agentID: String)
     case cloneRunFrozenSnapshot
     case cloneRunCurrentConfig
 
@@ -535,6 +594,7 @@ enum RecoveryAction: Identifiable, Equatable {
         case .retryAggregateStep(let stageID, let agentID): return "retryAggregateStep_\(stageID)_\(agentID)"
         case .retryStage(let stageID): return "retryStage_\(stageID)"
         case .resumeFromApprovalGate(let stageID): return "resumeGate_\(stageID)"
+        case .resetAgentSession(let stageID, let agentID): return "resetSession_\(stageID)_\(agentID)"
         case .cloneRunFrozenSnapshot: return "cloneFrozen"
         case .cloneRunCurrentConfig: return "cloneCurrent"
         }
@@ -546,6 +606,7 @@ enum RecoveryAction: Identifiable, Equatable {
         case .retryAggregateStep: return "Retry Aggregate Step"
         case .retryStage: return "Retry Stage"
         case .resumeFromApprovalGate: return "Resume from Approval Gate"
+        case .resetAgentSession: return "Reset Agent Session"
         case .cloneRunFrozenSnapshot: return "Clone Run (Frozen Snapshot)"
         case .cloneRunCurrentConfig: return "Clone Run (Current Config)"
         }
@@ -557,6 +618,7 @@ enum RecoveryAction: Identifiable, Equatable {
         case .retryAggregateStep: return "arrow.counterclockwise"
         case .retryStage: return "arrow.counterclockwise"
         case .resumeFromApprovalGate: return "play.fill"
+        case .resetAgentSession: return "trash.circle"
         case .cloneRunFrozenSnapshot: return "doc.on.doc"
         case .cloneRunCurrentConfig: return "doc.on.doc.fill"
         }

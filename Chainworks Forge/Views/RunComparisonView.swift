@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 
 // MARK: - P005-OPS §8: Run Comparison View
 
@@ -18,6 +19,7 @@ struct RunComparisonView: View {
                 if let comparison {
                     VStack(alignment: .leading, spacing: 16) {
                         comparisonHeader(comparison)
+                        strategySection(comparison)
                         snapshotSection(comparison)
                         trustSection(comparison)
                         bindingsSection(comparison)
@@ -72,6 +74,60 @@ struct RunComparisonView: View {
             HStack(spacing: 8) {
                 ParentIdeaArchiveBadge(title: "Run A parent", idea: runA.idea)
                 ParentIdeaArchiveBadge(title: "Run B parent", idea: runB.idea)
+            }
+            HStack(spacing: 8) {
+                StrategyBadge(
+                    profileID: c.strategyComparison.profileA,
+                    assignmentMode: c.strategyComparison.assignmentModeA,
+                    recommendationState: runA.strategyRecommendationState
+                )
+                StrategyBadge(
+                    profileID: c.strategyComparison.profileB,
+                    assignmentMode: c.strategyComparison.assignmentModeB,
+                    recommendationState: runB.strategyRecommendationState
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func strategySection(_ c: RunComparison) -> some View {
+        GroupBox("Strategy (Proposal 019)") {
+            VStack(alignment: .leading, spacing: 6) {
+                comparisonRow("Profile A", valueA: c.strategyComparison.profileA ?? "—", valueB: c.strategyComparison.profileB ?? "—", delta: nil)
+                comparisonRow("Assign Mode", valueA: c.strategyComparison.assignmentModeA ?? "—", valueB: c.strategyComparison.assignmentModeB ?? "—", delta: nil)
+                comparisonRow("Evidence", valueA: c.strategyComparison.evidenceComplete ? "complete" : "incomplete", valueB: " ", delta: nil)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Divider()
+                HStack(alignment: .top, spacing: 8) {
+                    Text("Recommendation")
+                        .font(.caption.monospaced())
+                    Spacer()
+                    Text(c.strategyRecommendation.status.rawValue)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(strategyColor(c.strategyRecommendation.status))
+                }
+                Text("Proof owner: \(c.strategyRecommendation.proofOwner)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Evaluation set: \(c.strategyRecommendation.evaluationSetSummary)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if let recommendedProfile = c.strategyRecommendation.recommendedProfileID {
+                    Text("Recommended profile: \(recommendedProfile)")
+                        .font(.caption)
+                }
+                if let quality = c.strategyComparison.qualityDeltaSummary {
+                    Text(quality)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if !c.strategyRecommendation.holdCriteria.isEmpty {
+                    Text("Hold criteria: \(c.strategyRecommendation.holdCriteria.joined(separator: ", "))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -314,5 +370,16 @@ struct RunComparisonView: View {
             return match ? .green : .orange
         }
         return .blue
+    }
+
+    private func strategyColor(_ status: StrategyRecommendationStatus) -> Color {
+        switch status {
+        case .candidateWinner:
+            return .green
+        case .insufficientEvidence:
+            return .orange
+        case .notEvaluated, .inconclusive:
+            return .secondary
+        }
     }
 }

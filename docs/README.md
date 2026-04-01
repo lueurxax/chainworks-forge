@@ -2,61 +2,33 @@
 
 Repository documentation for Chainworks Forge.
 
-## Organization
+## Start Here
 
-- `reference/` — implemented system documentation: architecture, runtime contracts, engine, transport, steward
-- `proposals/` — active proposals for features not yet implemented
-- `evidence/` — integration proof artifacts (live Goose connection, etc.)
-- `research/` — product vision, architecture investigations, comparative analysis
-- `ps/` — product/problem statements and MVP framing
+If you are new to the repo, read these in order:
 
-## Reading Order
-
-1. [research/chainworks_core_idea.md](research/chainworks_core_idea.md) — product vision
-2. [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md) — MVP problem statement
-3. [reference/domain-model.md](reference/domain-model.md) — persistence layer
-4. [reference/yaml-dsl-parser.md](reference/yaml-dsl-parser.md) — YAML DSL
-5. [reference/architecture-decisions.md](reference/architecture-decisions.md) — AD log
-6. [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — execution engine
-7. [reference/runtime-contract.md](reference/runtime-contract.md) — runtime contracts
-8. [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — canonical outcomes, stage-owned recovery evidence, approval restore, and report/recovery read truth
-9. [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — catalog-backed output contracts, aggregate summary hardening, failed-stage evidence, same-run retry truth, Tier 1 declarative enforcement, and bounded proposal compaction
-10. [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — live proposal loop
-11. [reference/goose-server-transport.md](reference/goose-server-transport.md) — Goose transport
-12. [reference/operator-experience.md](reference/operator-experience.md) — operator shell baseline
-13. [reference/provider-platform.md](reference/provider-platform.md) — provider/settings baseline
-14. [reference/run-control.md](reference/run-control.md) — stop/cancel truth and settlement
-15. [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — idea-owned workspace and frozen run contract
-16. [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — frozen provider/model provenance truth
-17. [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — archive and restore baseline
-18. [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Goose-backed provider remediation path
-19. [reference/live-workflow-map.md](reference/live-workflow-map.md) — run-detail topology baseline
-20. [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — implemented UI readability, accessibility, and bounded design-system hardening contract
-21. [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — implemented Forge token lane, brand assets, and shell/run/setup/recovery adoption
-22. [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — repo-backed worktree, implementation loop, manual release, evidence export
-23. [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — benchmark, launch gate, export hub, and current-head sign-off rules
-24. [reference/current-system-baseline.md](reference/current-system-baseline.md) — current-head subsystem map and reusable review baseline
-25. [reference/forge-steward.md](reference/forge-steward.md) — system health observer
-26. [reference/workspace-isolation-risk.md](reference/workspace-isolation-risk.md) — isolation risk
-27. [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure, mock lanes, tags, and plans
-28. [reference/test-gates.md](reference/test-gates.md) — layered local/CI test gates
-29. [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — how agents should run preview, XCUITest, and app-launched proof paths
-30. [../examples/agents/agents.yaml](../examples/agents/agents.yaml) — agent catalog
-31. [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml) — canonical workflow
+1. [../README.md](../README.md) — product summary, setup, test gates, and current status
+2. [research/chainworks_core_idea.md](research/chainworks_core_idea.md) — product vision and positioning
+3. [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md) — MVP scope and requirements
+4. [reference/current-system-baseline.md](reference/current-system-baseline.md) — current-head subsystem map
+5. [reference/README.md](reference/README.md) — implemented-system reference index
+6. [../examples/README.md](../examples/README.md) — runnable YAML examples and presets
 
 ## Status
 
 - Owner: single-engineer working repo
-- Last updated: 2026-03-31
-- State: active — foundation, execution engine, execution-truth baseline, output-contract and failure-evidence slice, live Goose transport, UI quality slice, design-system adoption slice, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
+- Last updated: 2026-04-01
+- State: active — foundation, execution engine, execution-truth baseline, output-contract and failure-evidence slice, session-lineage reuse slice, context-strategy framework slice, live Goose transport, UI quality slice, design-system adoption slice, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
 
-## Reference (implemented)
+## Implemented Reference Docs
 
-See [reference/README.md](reference/README.md) for the full index. Key docs:
+The canonical source of truth for implemented behavior is [`reference/`](reference). Use [`reference/README.md`](reference/README.md) for the full index. High-signal entry points:
 
+- [reference/current-system-baseline.md](reference/current-system-baseline.md) — current-head subsystem map for review and planning work
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Stable canonical outcome, recovery, and report/read-truth contract
 - [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Stable output-contract authority, failed-stage evidence, narrow recovery, and declarative contract enforcement
+- [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Stable per-run session reuse, generation history, checkpoint refresh, and shell-owned reset contract
+- [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Stable strategy-profile freezing, handoff compilation, lazy evidence, normalized telemetry, and shell-owned recommendation contract
 - [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
 - [reference/operator-experience.md](reference/operator-experience.md) — Stable operator shell baseline and contracts
 - [reference/provider-platform.md](reference/provider-platform.md) — Stable multi-provider/settings/diagnostics baseline
@@ -70,7 +42,6 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Stable workflow topology and agent-activity surface
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Stable repo-backed delivery slice: worktrees, implementation loop, manual release, evidence export
 - [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — Stable benchmark, recovery/export, and launch-gate sign-off contract
-- [reference/current-system-baseline.md](reference/current-system-baseline.md) — Stable current-head subsystem map for review and proposal dependency normalization
 - [reference/forge-steward.md](reference/forge-steward.md) — V1 observer: metrics, anomaly detection, cohorting, triggers
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 - [reference/domain-model.md](reference/domain-model.md) — SwiftData models and persistence
@@ -79,15 +50,32 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 - [reference/test-gates.md](reference/test-gates.md) — layered fast/UI/proposal/full gates
 - [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — Stable agent-facing UI execution rules and fallback proof paths
 
-## Proposals (active, not yet implemented)
+## Active Proposals
 
-- [proposals/018-agent-session-lineage-reuse-and-operator-reset.md](proposals/018-agent-session-lineage-reuse-and-operator-reset.md) — reusable agent session lineage within one run plus explicit operator reset
+Active work that is not yet fully promoted into `reference/` lives under [`proposals/`](proposals):
 
-## Evidence
+- [proposals/015-skill-resolution-and-runtime-injection.md](proposals/015-skill-resolution-and-runtime-injection.md)
+- [proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
+- [proposals/020-dynamic-cycle-addition.md](proposals/020-dynamic-cycle-addition.md)
+
+## Examples
+
+Runnable agent catalogs and workflow presets live under [`../examples`](../examples):
+
+- [../examples/README.md](../examples/README.md)
+- [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
+- [../examples/agents/agents_with_gemini.yaml](../examples/agents/agents_with_gemini.yaml)
+- [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
+- [../examples/workflows/proposal-loop-live.yaml](../examples/workflows/proposal-loop-live.yaml)
+- [../examples/workflows/full-mvp-live.yaml](../examples/workflows/full-mvp-live.yaml)
+
+## Evidence And Proof
 
 - [evidence/goose-server-transport-verification.md](evidence/goose-server-transport-verification.md) -- Goose server transport verification record
 - [evidence/execution-truth-and-recovery-proof.md](evidence/execution-truth-and-recovery-proof.md) -- consolidated implementation/proof status for the execution-truth and recovery slice
 - [evidence/output-contracts-failure-evidence-and-recovery-proof.md](evidence/output-contracts-failure-evidence-and-recovery-proof.md) -- consolidated implementation/proof status for output contracts, failure evidence, and narrow recovery
+- [evidence/session-lineage-reuse-and-operator-reset-proof.md](evidence/session-lineage-reuse-and-operator-reset-proof.md) -- consolidated implementation/proof status for session-lineage reuse, checkpointing, and operator reset
+- [evidence/context-strategy-and-experiment-framework-proof.md](evidence/context-strategy-and-experiment-framework-proof.md) -- consolidated implementation/proof status for context strategies, lazy evidence, normalized telemetry, and strategy recommendation output
 - [evidence/ui-quality-and-polish-proof.md](evidence/ui-quality-and-polish-proof.md) -- consolidated implementation/proof status for the UI quality and visual polish slice
 - [evidence/design-system-and-brand-application-proof.md](evidence/design-system-and-brand-application-proof.md) -- consolidated implementation/proof status for the design-system and brand-application slice
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
@@ -102,3 +90,7 @@ See [reference/README.md](reference/README.md) for the full index. Key docs:
 ## Product
 
 - [ps/chainworks-forge-mvp.md](ps/chainworks-forge-mvp.md) — MVP problem statement
+
+## Historical Reviews
+
+Historical proposal reviews, audit reports, and evidence packs live under [`reviews/`](reviews). They are useful as decision history, but they are not the canonical source of truth for current behavior. For current behavior, prefer `reference/` and `evidence/`.

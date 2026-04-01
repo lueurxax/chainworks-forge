@@ -35,6 +35,10 @@ struct RunComparisonService {
         }
     }
 
+    private enum StrategyTelemetryField {
+        static let proofOwner = "shell_comparison_lane"
+    }
+
     // MARK: - Comparison (§8.2)
 
     /// Produce a deterministic comparison between two compatible runs.
@@ -77,6 +81,8 @@ struct RunComparisonService {
         // Pinned artifact diff
         let pinnedDiff = computePinnedArtifactDiff(runA: runA, runB: runB)
 
+        let strategyComparison = strategyComparison(for: runA, against: runB)
+
         return RunComparison(
             runA_ID: runA.id,
             runB_ID: runB.id,
@@ -100,7 +106,9 @@ struct RunComparisonService {
             loopsB: loopsB,
             loopDelta: loopsB - loopsA,
             approvalDelta: approvalDelta,
-            pinnedArtifactDiff: pinnedDiff
+            pinnedArtifactDiff: pinnedDiff,
+            strategyComparison: strategyComparison.comparison,
+            strategyRecommendation: strategyComparison.recommendation
         )
     }
 
@@ -208,6 +216,219 @@ struct RunComparisonService {
             )
         }
     }
+
+    // MARK: - Strategy Recommendation (§019)
+
+    private func strategyComparison(for runA: Run, against runB: Run) -> (comparison: RunComparison.StrategyComparison, recommendation: StrategyRecommendation) {
+        let profileA = strategyProfileID(for: runA)
+        let profileB = strategyProfileID(for: runB)
+        let modeA = strategyAssignmentMode(for: runA)
+        let modeB = strategyAssignmentMode(for: runB)
+        let evidenceA = strategyEvidenceSnapshot(for: runA)
+        let evidenceB = strategyEvidenceSnapshot(for: runB)
+
+        guard
+            let profileA,
+            let profileB,
+            let modeA,
+            let modeB,
+            evidenceA.evidenceComplete,
+            evidenceB.evidenceComplete
+        else {
+            let evaluationSet = evaluationSetSummary(for: runA, runB)
+            return (
+                comparison: RunComparison.StrategyComparison(
+                    profileA: profileA,
+                    profileB: profileB,
+                    assignmentModeA: modeA,
+                    assignmentModeB: modeB,
+                    evidenceComplete: false,
+                    comparisonSignal: nil,
+                    qualityDeltaSummary: nil
+                ),
+                recommendation: StrategyRecommendation(
+                    status: .insufficientEvidence,
+                    proofOwner: StrategyTelemetryField.proofOwner,
+                    evaluationSetComplete: false,
+                    evaluationSetSummary: evaluationSet,
+                    holdCriteria: [
+                        "Canonical strategy profile IDs must be present for both runs.",
+                        "Strategy telemetry set must include canonical session KPI export JSON.",
+                        "Canonical assignment metadata must be complete."
+                    ],
+                    recommendedProfileID: nil,
+                    rationale: "Insufficient evidence to emit a safe strategy recommendation."
+                )
+            )
+        }
+
+        if profileA == profileB {
+            let evaluationSet = evaluationSetSummary(for: runA, runB)
+            return (
+                comparison: RunComparison.StrategyComparison(
+                    profileA: profileA,
+                    profileB: profileB,
+                    assignmentModeA: modeA,
+                    assignmentModeB: modeB,
+                    evidenceComplete: true,
+                    comparisonSignal: 0,
+                    qualityDeltaSummary: "Same strategy profile was used for both runs."
+                ),
+                recommendation: StrategyRecommendation(
+                    status: .notEvaluated,
+                    proofOwner: StrategyTelemetryField.proofOwner,
+                    evaluationSetComplete: false,
+                    evaluationSetSummary: evaluationSet,
+                    holdCriteria: [
+                        "A comparison requires different strategy profiles."
+                    ],
+                    recommendedProfileID: nil,
+                    rationale: "Runs used the same strategy profile; comparison is not actionable."
+                )
+            )
+        }
+
+        let scoreA = strategyScore(for: runA, profileID: profileA, evidence: evidenceA)
+        let scoreB = strategyScore(for: runB, profileID: profileB, evidence: evidenceB)
+
+        let comparisonSignal = scoreA - scoreB
+        let recommendationProfileID = comparisonSignal > 0 ? profileA : profileB
+        let winner = comparisonSignal > 0 ? "A" : comparisonSignal < 0 ? "B" : "tie"
+        let status: StrategyRecommendationStatus = winner == "tie" ? .inconclusive : .candidateWinner
+        let evaluationSet = evaluationSetSummary(for: runA, runB)
+
+        let rationale = makeRecommendationRationale(
+            winner: winner,
+            profileA: profileA,
+            profileB: profileB,
+            modeA: modeA,
+            modeB: modeB,
+            scoreA: scoreA,
+            scoreB: scoreB
+        )
+
+        return (
+            comparison: RunComparison.StrategyComparison(
+                profileA: profileA,
+                profileB: profileB,
+                assignmentModeA: modeA,
+                assignmentModeB: modeB,
+                evidenceComplete: true,
+                comparisonSignal: comparisonSignal,
+                qualityDeltaSummary: "ScoreA \(String(format: "%.2f", scoreA)) vs ScoreB \(String(format: "%.2f", scoreB))"
+            ),
+            recommendation: StrategyRecommendation(
+                status: status,
+                proofOwner: StrategyTelemetryField.proofOwner,
+                evaluationSetComplete: true,
+                evaluationSetSummary: evaluationSet,
+                holdCriteria: [
+                    "Canonical telemetry from session KPI export must be present for both runs.",
+                    "Recommendation can only be made from a compatibility-checked pair."
+                ],
+                recommendedProfileID: winner == "tie" ? nil : recommendationProfileID,
+                rationale: rationale
+            )
+        )
+    }
+
+    private func strategyProfileID(for run: Run) -> String? {
+        let value = run.contextStrategyProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func strategyAssignmentMode(for run: Run) -> String? {
+        let value = run.strategyAssignmentMode.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func strategyEvidenceSnapshot(for run: Run) -> (evidenceComplete: Bool, summary: SessionReuseKPIExporter.RunKPISummary?) {
+        let recommendationState = run.strategyRecommendationState.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !recommendationState.isEmpty || run.sessionKPIExportJSON != nil else {
+            return (false, nil)
+        }
+
+        let summary = SessionReuseKPIExporter.decodeSummary(from: run.sessionKPIExportJSON)
+        return (SessionReuseKPIExporter.hasCanonicalStrategyTelemetry(summary), summary)
+    }
+
+    private func strategyScore(
+        for run: Run,
+        profileID: String,
+        evidence: (evidenceComplete: Bool, summary: SessionReuseKPIExporter.RunKPISummary?)
+    ) -> Double {
+        let durationPenalty = elapsedTime(for: run) / 60_000.0
+        let qualityComponent = qualityComponent(for: run)
+        let reliabilityPenalty = (evidence.summary?.totalExecutions ?? 0) > 0 ? 0.0 : 1.0
+        let costPenalty = Double(run.totalCostCents ?? 0) / 2_500.0
+        let profilePenalty = profilePenalty(for: profileID)
+        let telemetry = evidence.summary?.strategyTelemetry
+        let reductionReward = Double(telemetry?.totalPayloadReductionBytes ?? 0) / 1_024.0
+        let lazyHitReward = (telemetry?.averageLazyEvidenceHitRate ?? 0.0) * 10.0
+        let cacheReward = (telemetry?.averageCacheEffectiveness ?? 0.0) * 25.0
+        let escalationPenalty = Double(telemetry?.totalEscalationCount ?? 0) * 12.0
+        let retryableEscalationPenalty = Double(telemetry?.totalRetryableEscalationCount ?? 0) * 8.0
+        let contractPenalty = Double(telemetry?.totalContractFailureCount ?? 0) * 25.0
+        let compactionPenalty = Double(telemetry?.totalCompactionChurn ?? 0) * 3.0
+        let operatorPenalty = Double(telemetry?.totalPromotedArtifactUsages ?? 0) * 2.0
+
+        return (qualityComponent * 100.0)
+            + reductionReward
+            + lazyHitReward
+            + cacheReward
+            - durationPenalty
+            - costPenalty
+            - reliabilityPenalty
+            - escalationPenalty
+            - retryableEscalationPenalty
+            - contractPenalty
+            - compactionPenalty
+            - operatorPenalty
+            - profilePenalty
+    }
+
+    private func evaluationSetSummary(for runA: Run, _ runB: Run) -> String {
+        let ideaID = runA.idea?.id.uuidString ?? "unknown-idea"
+        let family = runA.workflowFamily ?? runA.workflowID
+        let pair = "\(runA.id.uuidString.prefix(8)) vs \(runB.id.uuidString.prefix(8))"
+        return "paired canonical comparison (\(pair)) for idea \(ideaID), workflow family \(family)"
+    }
+
+    private func qualityComponent(for run: Run) -> Double {
+        let approvals = run.approvals
+        let requested = max(1, approvals.count)
+        let granted = approvals.filter { $0.decision == .granted }.count
+        let completion = run.status == .completed ? 1.0 : 0.0
+        let failures = Double(completionFails(for: run))
+        return completion + (Double(granted) / Double(requested)) - (0.25 * failures)
+    }
+
+    private func completionFails(for run: Run) -> Int {
+        run.stageExecutions.filter { $0.status == .failed || $0.status == .blocked }.count
+    }
+
+    private func profilePenalty(for profileID: String) -> Double {
+        max(0.0, 0.5 * Double(profileID.count - 10))
+    }
+
+    private func makeRecommendationRationale(
+        winner: String,
+        profileA: String,
+        profileB: String,
+        modeA: String,
+        modeB: String,
+        scoreA: Double,
+        scoreB: Double
+        ) -> String {
+        switch winner {
+        case "A":
+            return "Shell recommendation: profile '\(profileA)' (mode '\(modeA)') outperformed '\(profileB)' (mode '\(modeB)') in this canonical paired comparison. ScoreA=\(String(format: "%.2f", scoreA)), ScoreB=\(String(format: "%.2f", scoreB))."
+        case "B":
+            return "Shell recommendation: profile '\(profileB)' (mode '\(modeB)') outperformed '\(profileA)' (mode '\(modeA)') in this canonical paired comparison. ScoreA=\(String(format: "%.2f", scoreA)), ScoreB=\(String(format: "%.2f", scoreB))."
+        default:
+            return "Shell comparison is currently inconclusive: scoreA=\(String(format: "%.2f", scoreA)), scoreB=\(String(format: "%.2f", scoreB))."
+        }
+    }
 }
 
 // MARK: - Comparison Types
@@ -255,6 +476,20 @@ struct RunComparison: Identifiable {
 
     // Pinned artifacts
     let pinnedArtifactDiff: [PinnedArtifactDelta]
+
+    // Strategy comparison
+    let strategyComparison: StrategyComparison
+    let strategyRecommendation: StrategyRecommendation
+
+    struct StrategyComparison {
+        let profileA: String?
+        let profileB: String?
+        let assignmentModeA: String?
+        let assignmentModeB: String?
+        let evidenceComplete: Bool
+        let comparisonSignal: Double?
+        let qualityDeltaSummary: String?
+    }
 
     struct AgentBinding: Identifiable {
         let id = UUID()

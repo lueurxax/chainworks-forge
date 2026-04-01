@@ -23,6 +23,62 @@ thresholds:
     method: ratio
     trigger: 2.0
 
+context_strategy_profiles:
+  current_mixed_baseline:
+    default_handoff_mode: full_forward
+    agents:
+      "*":
+        handoff_policy:
+          mandatory:
+            - current_task_description
+          lazy:
+            - "*"
+  manual_like_long_continuity:
+    default_handoff_mode: full_forward
+    agents:
+      lead_orchestrator:
+        continuity_mode: family_within_run
+      proposal_writer:
+        continuity_mode: family_within_run
+      "*":
+        continuity_mode: none
+        handoff_policy:
+          mandatory:
+            - current_task_description
+          lazy:
+            - "*"
+  selective_compression_and_escalation:
+    default_handoff_mode: selective
+    default_model_tier: fast
+    escalation_model_tier: frontier
+    agents:
+      proposal_writer:
+        handoff_policy:
+          mandatory:
+            - idea_brief
+            - proposal_current
+          summarized:
+            - proposal_review_all
+          lazy:
+            - security_audit_raw
+      "*":
+        handoff_policy:
+          mandatory:
+            - current_task_description
+          lazy:
+            - "*"
+  fresh_control:
+    default_handoff_mode: full_forward
+    default_model_tier: frontier
+    agents:
+      "*":
+        continuity_mode: none
+        handoff_policy:
+          mandatory:
+            - current_task_description
+          lazy:
+            - "*"
+
 triggers:
   post_run_hook:
     enabled: false

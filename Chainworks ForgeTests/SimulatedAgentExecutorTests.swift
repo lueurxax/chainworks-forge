@@ -31,6 +31,7 @@ struct SimulatedAgentExecutorTests {
                 worktreeRoot: nil
             ),
             stageID: stageID,
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],

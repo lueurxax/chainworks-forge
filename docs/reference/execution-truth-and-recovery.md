@@ -51,7 +51,7 @@ Every settled `AgentExecution` uses exactly one canonical terminal outcome:
 - `limit_exhausted_before_output`
 - `limit_exhausted_after_output`
 
-These values live in [`Chainworks Forge/Models/ExecutionTruth.swift`](../../Chainworks%20Forge/Models/ExecutionTruth.swift) and are persisted on `AgentExecution.canonicalOutcome`.
+These values live in [`Chainworks Forge/Models/ExecutionTruth.swift`](<../../Chainworks Forge/Models/ExecutionTruth.swift>) and are persisted on `AgentExecution.canonicalOutcome`.
 
 ### Neutral finish markers are not success on their own
 

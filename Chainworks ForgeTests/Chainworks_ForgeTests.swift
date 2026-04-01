@@ -123,7 +123,8 @@ private func makeAgent(
         skillRef: skillRef, skillRole: nil, worktreePolicy: nil,
         requiredTools: nil, inputs: inputs, outputs: outputs,
         outputContract: outputContract, requiresHumanApproval: false,
-        prompt: "test prompt", notes: nil
+        prompt: "test prompt", notes: nil,
+        sessionReuseScope: nil, sessionFamilyID: nil
     )
 }
 

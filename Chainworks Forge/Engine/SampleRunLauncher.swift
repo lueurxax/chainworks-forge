@@ -34,6 +34,11 @@ struct SampleRunLauncher {
         let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: .empty)
         let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
         let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: .empty)
+        let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
+            .resolveSelection(
+                selectedProfileID: nil,
+                cohortID: nil
+            )
 
         let idea = Idea(
             title: sampleIdeaTitle(),
@@ -53,7 +58,11 @@ struct SampleRunLauncher {
                 startOptionsJSON: encodeStartOptions(.empty),
                 frozenWorkspaceRootPath: idea.workspaceRootPath,
                 deliveryConfiguration: nil,
-                deliveryPreflightJSON: nil
+                deliveryPreflightJSON: nil,
+                contextStrategyProfileID: strategySelection.profileID,
+                strategyAssignmentMode: strategySelection.assignmentMode,
+                strategyRecommendationState: strategySelection.recommendationState,
+                contextStrategySnapshotJSON: try JSONEncoder().encode(strategySelection.profile)
             )
         )
         idea.status = .active

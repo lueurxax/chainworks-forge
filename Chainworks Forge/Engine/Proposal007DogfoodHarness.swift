@@ -87,6 +87,11 @@ final class Proposal007DogfoodHarness {
         try ensureNoCrossFamilyMismatches(bindings: bindings)
         let adjustedPlan = RunStartOverrideResolver.applying(bindings: bindings, to: compiledPlan)
         let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
+        let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
+            .resolveSelection(
+                selectedProfileID: nil,
+                cohortID: nil
+            )
 
         let deliveryConfig = makeDeliveryConfiguration(for: idea, mode: mode)
         let preflight = await DeliveryPreflightService().validate(deliveryConfig)
@@ -101,7 +106,11 @@ final class Proposal007DogfoodHarness {
             startOptionsJSON: encode(startOptions),
             frozenWorkspaceRootPath: idea.workspaceRootPath,
             deliveryConfiguration: deliveryConfig,
-            deliveryPreflightJSON: try? JSONEncoder().encode(preflight)
+            deliveryPreflightJSON: try? JSONEncoder().encode(preflight),
+            contextStrategyProfileID: strategySelection.profileID,
+            strategyAssignmentMode: strategySelection.assignmentMode,
+            strategyRecommendationState: strategySelection.recommendationState,
+            contextStrategySnapshotJSON: try? JSONEncoder().encode(strategySelection.profile)
         )
 
         let (run, workspace) = try compiler.createRun(

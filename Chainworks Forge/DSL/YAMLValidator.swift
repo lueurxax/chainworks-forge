@@ -11,7 +11,7 @@ struct ValidationIssue: Identifiable, Sendable {
         case warning
     }
 
-    init(severity: Severity, message: String, location: String? = nil) {
+    nonisolated init(severity: Severity, message: String, location: String? = nil) {
         self.id = UUID()
         self.severity = severity
         self.message = message
@@ -21,7 +21,7 @@ struct ValidationIssue: Identifiable, Sendable {
 
 struct YAMLValidator: Sendable {
 
-    nonisolated static func validateAll(
+    static func validateAll(
         workflow: WorkflowDefinition,
         catalog: AgentCatalog
     ) -> [ValidationIssue] {
@@ -41,7 +41,7 @@ struct YAMLValidator: Sendable {
 
     // MARK: - State Graph
 
-    nonisolated static func validateStateGraph(_ workflow: WorkflowDefinition) -> [ValidationIssue] {
+    static func validateStateGraph(_ workflow: WorkflowDefinition) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
 
         // initial_state exists
@@ -87,7 +87,7 @@ struct YAMLValidator: Sendable {
 
     // MARK: - Agent References
 
-    nonisolated static func validateAgentReferences(workflow: WorkflowDefinition, catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateAgentReferences(workflow: WorkflowDefinition, catalog: AgentCatalog) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
         let catalogIDs = Set(catalog.agents.map(\.id))
 
@@ -106,14 +106,14 @@ struct YAMLValidator: Sendable {
         return issues
     }
 
-    private nonisolated static func allTasks(in block: RunBlock?) -> [AgentTask] {
+    private static func allTasks(in block: RunBlock?) -> [AgentTask] {
         guard let block else { return [] }
         return (block.sequence ?? []) + (block.parallel ?? []) + (block.then ?? [])
     }
 
     // MARK: - Catalog Internal Consistency
 
-    nonisolated static func validateBackendProfileRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateBackendProfileRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
         catalog.agents.compactMap { agent in
             catalog.backendProfiles[agent.backendProfile] == nil
                 ? ValidationIssue(severity: .error, message: "Agent '\(agent.id)' references non-existent backend profile '\(agent.backendProfile)'", location: "agents.\(agent.id).backend_profile")
@@ -121,7 +121,7 @@ struct YAMLValidator: Sendable {
         }
     }
 
-    nonisolated static func validatePermissionProfileRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validatePermissionProfileRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
         catalog.agents.compactMap { agent in
             catalog.permissionProfiles[agent.permissionProfile] == nil
                 ? ValidationIssue(severity: .error, message: "Agent '\(agent.id)' references non-existent permission profile '\(agent.permissionProfile)'", location: "agents.\(agent.id).permission_profile")
@@ -129,7 +129,7 @@ struct YAMLValidator: Sendable {
         }
     }
 
-    nonisolated static func validateSkillRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateSkillRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
         catalog.agents.compactMap { agent in
             catalog.skills[agent.skillRef] == nil
                 ? ValidationIssue(severity: .error, message: "Agent '\(agent.id)' references non-existent skill '\(agent.skillRef)'", location: "agents.\(agent.id).skill_ref")
@@ -137,7 +137,7 @@ struct YAMLValidator: Sendable {
         }
     }
 
-    nonisolated static func validateOutputContractRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateOutputContractRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
         catalog.agents.compactMap { agent in
             guard let contract = agent.outputContract else { return nil }
             return catalog.contracts[contract] == nil
@@ -146,7 +146,7 @@ struct YAMLValidator: Sendable {
         }
     }
 
-    nonisolated static func validateArtifactRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateArtifactRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
         let artifactIDs = Set(catalog.artifacts.keys)
         for agent in catalog.agents {
@@ -162,7 +162,7 @@ struct YAMLValidator: Sendable {
 
     // MARK: - Provider Coverage
 
-    nonisolated static func validateProviderCoverage(workflow: WorkflowDefinition, catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateProviderCoverage(workflow: WorkflowDefinition, catalog: AgentCatalog) -> [ValidationIssue] {
         let availableProviders = Set(catalog.backendProfiles.values.map(\.provider))
         return workflow.workflow.requiredProviders.compactMap { provider in
             availableProviders.contains(provider) ? nil
@@ -172,7 +172,7 @@ struct YAMLValidator: Sendable {
 
     // MARK: - Env Placeholders
 
-    nonisolated static func validateEnvPlaceholders(_ catalog: AgentCatalog) -> [ValidationIssue] {
+    static func validateEnvPlaceholders(_ catalog: AgentCatalog) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
         let wellFormedPattern = /\$\{([^}]*)\}/
 
@@ -220,7 +220,7 @@ struct YAMLValidator: Sendable {
 
     // MARK: - Steward Config Validation
 
-    nonisolated static func validateStewardConfig(_ config: StewardConfig) -> [ValidationIssue] {
+    static func validateStewardConfig(_ config: StewardConfig) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
 
         // Schema version
@@ -269,12 +269,68 @@ struct YAMLValidator: Sendable {
             issues.append(ValidationIssue(severity: .error, message: "post_run_hook.run_interval must be >= 1 when enabled", location: "triggers.post_run_hook.run_interval"))
         }
 
+        // Context strategy profiles
+        if config.contextStrategyProfiles.isEmpty {
+            issues.append(ValidationIssue(severity: .error, message: "context_strategy_profiles must contain at least one profile", location: "context_strategy_profiles"))
+        } else if !config.contextStrategyProfiles.keys.contains("selective_compression_and_escalation") {
+            issues.append(ValidationIssue(severity: .warning, message: "Recommended profile 'selective_compression_and_escalation' is missing", location: "context_strategy_profiles"))
+        }
+
+        for (profileID, profile) in config.contextStrategyProfiles {
+            if profile.agents.isEmpty {
+                issues.append(ValidationIssue(severity: .warning, message: "Profile '\(profileID)' has no agent entries", location: "context_strategy_profiles.\(profileID)"))
+            }
+
+            if profile.escalationModelTier != nil && profile.defaultModelTier == nil {
+                issues.append(ValidationIssue(severity: .warning, message: "Profile '\(profileID)' defines escalation_model_tier without default_model_tier", location: "context_strategy_profiles.\(profileID)"))
+            }
+
+            for (agentID, agentProfile) in profile.agents {
+                if agentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    issues.append(ValidationIssue(severity: .error, message: "Profile '\(profileID)' contains an empty agent key", location: "context_strategy_profiles.\(profileID)"))
+                }
+
+                guard agentProfile.handoffPolicy != nil || agentProfile.continuityMode != nil else {
+                    issues.append(ValidationIssue(
+                        severity: .warning,
+                        message: "Agent '\(agentID)' in profile '\(profileID)' has no handoff_policy or continuity_mode",
+                        location: "context_strategy_profiles.\(profileID).\(agentID)"
+                    ))
+                    continue
+                }
+
+                guard let policy = agentProfile.handoffPolicy else { continue }
+
+                for artifact in policy.mandatory where artifact.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    issues.append(ValidationIssue(
+                        severity: .error,
+                        message: "Empty artifact reference in mandatory list",
+                        location: "context_strategy_profiles.\(profileID).\(agentID).handoff_policy.mandatory"
+                    ))
+                }
+                for artifact in policy.summarized where artifact.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    issues.append(ValidationIssue(
+                        severity: .error,
+                        message: "Empty artifact reference in summarized list",
+                        location: "context_strategy_profiles.\(profileID).\(agentID).handoff_policy.summarized"
+                    ))
+                }
+                for artifact in policy.lazy where artifact.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    issues.append(ValidationIssue(
+                        severity: .error,
+                        message: "Empty artifact reference in lazy list",
+                        location: "context_strategy_profiles.\(profileID).\(agentID).handoff_policy.lazy"
+                    ))
+                }
+            }
+        }
+
         return issues
     }
 
     // MARK: - Run Block Semantics
 
-    nonisolated static func validateRunBlockSemantics(_ workflow: WorkflowDefinition) -> [ValidationIssue] {
+    static func validateRunBlockSemantics(_ workflow: WorkflowDefinition) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
         for (stateID, state) in workflow.states {
             if let run = state.run {
@@ -287,7 +343,7 @@ struct YAMLValidator: Sendable {
         return issues
     }
 
-    private nonisolated static func validateSingleRunBlock(_ block: RunBlock, stateID: String, blockName: String) -> [ValidationIssue] {
+    private static func validateSingleRunBlock(_ block: RunBlock, stateID: String, blockName: String) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
 
         if let seq = block.sequence, seq.isEmpty {

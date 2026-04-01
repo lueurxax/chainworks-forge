@@ -807,7 +807,9 @@ struct Proposal013Tests {
                     outputContract: "proposal_review_v1",
                     requiresHumanApproval: false,
                     prompt: "Review as PO",
-                    notes: nil
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
                 )
             ]
         )
@@ -1021,7 +1023,9 @@ struct Proposal013Tests {
             providerReceipt: nil,
             resolvedModel: "fixture-model",
             configuredProviderID: nil,
-            adapterVersion: nil
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
         )
 
         let failExecutor = StaticResultExecutor(result: malformedResult)
@@ -1105,7 +1109,9 @@ struct Proposal013Tests {
             providerReceipt: nil,
             resolvedModel: "fixture-model",
             configuredProviderID: nil,
-            adapterVersion: nil
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .reused
         )
 
         let successExecutor = StaticResultExecutor(result: successResult)
@@ -1234,7 +1240,9 @@ struct Proposal013Tests {
             providerReceipt: nil,
             resolvedModel: "fixture-model",
             configuredProviderID: nil,
-            adapterVersion: nil
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
         )
 
         let executor = StaticResultExecutor(result: markdownResult)
@@ -1311,7 +1319,9 @@ struct Proposal013Tests {
                 providerReceipt: nil,
                 resolvedModel: nil,
                 configuredProviderID: nil,
-                adapterVersion: nil
+                adapterVersion: nil,
+                canonicalOutcome: .completed,
+                sessionReuseDisposition: .fresh
             )),
             catalog: catalog,
             liveRuntimeConfiguration: liveConfig

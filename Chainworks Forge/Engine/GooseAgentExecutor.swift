@@ -4,78 +4,112 @@ import Foundation
 
 /// Concrete implementation of `AgentExecutor` using a Goose backend.
 /// Each execution creates an isolated session via `GooseSessionBridge` (ARCH-027).
-///
-/// Responsibilities:
-/// 1. Build the execution packet.
-/// 2. Create an isolated Goose session.
-/// 3. Bind prompt + task + input artifact references.
-/// 4. Stream execution events.
-/// 5. Persist raw transcript/receipt artifacts.
-/// 6. Extract declared output artifacts.
-/// 7. Return a structured `AgentResult`.
 final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     // MARK: - Dependencies
 
     let sessionBridge: GooseSessionBridge
     let override: LiveExecutionOverride?
+    let sessionManager: AgentSessionManager?
 
     /// Callback for live execution events (for UI streaming).
-    /// Called on arbitrary threads — the UI layer must dispatch to MainActor.
     var onExecutionEvent: (@Sendable (String, ExecutionEvent) -> Void)?
 
     // MARK: - Init
 
-    /// Proposal 005: accepts `any GooseTransportProtocol` instead of concrete `GooseTransport`.
     init(
         transport: any GooseTransportProtocol,
-        override: LiveExecutionOverride? = nil
+        override: LiveExecutionOverride? = nil,
+        sessionManager: AgentSessionManager? = nil
     ) {
         self.sessionBridge = GooseSessionBridge(transport: transport)
         self.override = override
+        self.sessionManager = sessionManager
     }
 
     // MARK: - AgentExecutor Protocol
 
-    /// Proposal 013: Maximum transport-level retry attempts for timeout errors.
-    private static let maxTransportRetries = 1
+    private static let maxTransportRetries = 2
+
+    /// Maximum wall-clock time for a single agent execution attempt before the watchdog
+    /// forcibly cancels it. Prevents runs from hanging for hours on stale sessions.
+    private static let executionTimeoutSeconds: TimeInterval = 1800 // 30 minutes
 
     func execute(
         task: AgentTask,
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> AgentResult {
-        // Proposal 013: Retry on transport timeout to handle sequential Goose processing
         var lastResult: AgentResult?
         for attempt in 0...Self.maxTransportRetries {
-            let result = try await executeAttempt(
+            let result = try await executeAttemptWithWatchdog(
                 task: task,
                 agent: agent,
                 context: context,
                 attemptIndex: attempt
             )
 
-            // If succeeded or not a timeout error, return immediately
-            if result.succeeded || !isTimeoutError(result) {
+            if result.succeeded || !isRetryableError(result) {
                 return result
             }
 
             lastResult = result
-
-            // Only retry on timeout, and only once
             if attempt < Self.maxTransportRetries {
-                // Brief pause before retry to let server recover
                 try? await Task.sleep(for: .seconds(2))
             }
         }
         return lastResult!
     }
 
-    /// Check if the result indicates a transport timeout.
-    private func isTimeoutError(_ result: AgentResult) -> Bool {
-        guard let error = result.errorMessage else { return false }
-        return error.contains("timed out") || error.contains("-1001") || error.contains("timeout")
+    /// Wraps `executeAttempt` with a wall-clock timeout watchdog.
+    /// If the attempt exceeds `executionTimeoutSeconds`, it is cancelled and
+    /// returns a timeout failure instead of hanging indefinitely.
+    private func executeAttemptWithWatchdog(
+        task: AgentTask,
+        agent: ResolvedAgent,
+        context: ExecutionContext,
+        attemptIndex: Int
+    ) async throws -> AgentResult {
+        do {
+            return try await withThrowingTaskGroup(of: AgentResult.self) { group in
+                group.addTask {
+                    try await self.executeAttempt(task: task, agent: agent, context: context, attemptIndex: attemptIndex)
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(Self.executionTimeoutSeconds))
+                    throw ExecutionError.timeout(agentID: agent.id, seconds: Int(Self.executionTimeoutSeconds))
+                }
+
+                // Return whichever finishes first
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            }
+        } catch is ExecutionError {
+            // Watchdog timeout triggered
+            return AgentResult.failure(
+                "Execution watchdog: agent '\(agent.id)' timed out after \(Int(Self.executionTimeoutSeconds))s (attempt \(attemptIndex))",
+                context: context,
+                override: override,
+                startedAt: Date()
+            )
+        }
     }
+
+    private func isRetryableError(_ result: AgentResult) -> Bool {
+        guard let error = result.errorMessage else { return false }
+        let isTransportError = error.contains("timed out") || error.contains("-1001") || error.contains("timeout")
+            || error.contains("Session not found") || error.contains("session not found")
+        let isContractViolation = error.contains("Required outputs missing") || error.contains("output contract")
+            || error.contains("not valid JSON") || error.contains("Missing required field")
+        let isWatchdogTimeout = error.contains("Execution watchdog")
+        if isContractViolation {
+            return false
+        }
+        return isTransportError || isWatchdogTimeout
+    }
+
+    // MARK: - Execution Attempt Flow
 
     private func executeAttempt(
         task: AgentTask,
@@ -84,447 +118,530 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         attemptIndex: Int
     ) async throws -> AgentResult {
         let startedAt = Date()
-        // Proposal 013: V2 resolver — catalog-driven contract resolution
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
-        // Step 1: Validate workspace (ARCH-025)
         try GooseSessionBridge.validateWorkspace(context.workspace)
 
-        // Step 2: Create isolated session and start execution
-        let sessionExecution: GooseSessionExecution
+        // 1. Resolve Session (Proposal 018)
+        let sessionInfo: SessionResolutionInfo
         do {
-            sessionExecution = try await sessionBridge.executeInIsolatedSession(
-                agent: agent,
-                task: task,
-                context: context,
-                override: override
-            )
+            sessionInfo = try await resolveSession(task: task, agent: agent, context: context)
         } catch {
-            return AgentResult(
-                outputs: [:],
-                logSnippet: "Session creation failed (attempt \(attemptIndex)): \(error.localizedDescription)",
-                costCents: nil,
-                succeeded: false,
-                errorMessage: "Session creation failed: \(error.localizedDescription)",
-                sessionID: nil,
-                durationSeconds: Date().timeIntervalSince(startedAt),
-                providerReceipt: nil,
-                resolvedModel: context.providerBinding?.model ?? override?.model ?? agent.model,
-                configuredProviderID: context.providerBinding?.configuredProviderID,
-                adapterVersion: context.providerBinding?.adapterVersion
+            return AgentResult.failure(
+                "Session creation failed (attempt \(attemptIndex)): \(error.localizedDescription)",
+                context: context,
+                override: override,
+                startedAt: startedAt
             )
         }
 
-        // Step 3: Process the event stream
+        // 2. Execute & Process Stream
         let eventBridge = ExecutionEventBridge()
         let agentID = agent.id
         let onEvent = onExecutionEvent
+// 2. Stream & Process
+let streamResult: ExecutionStreamResult
+let sessionID = sessionInfo.execution.sessionID
+print("[Session:Stream][\(sessionID)][Start] Agent: \(agent.id)")
 
-        let streamResult: ExecutionStreamResult
-        do {
-            streamResult = try await eventBridge.processStream(
-                sessionExecution.eventStream,
-                onEvent: { event in
-                    onEvent?(agentID, event)
+do {
+    streamResult = try await eventBridge.processStream(
+        sessionInfo.execution.eventStream,
+        onEvent: { [agentID] event in
+            // Structured event logging for visibility into "long-running" sessions
+            switch event.type {
+            case .toolCallStarted:
+                if let tool = event.toolName {
+                    print("[Session:Tool][\(sessionID)][Active] \(agentID) -> \(tool)")
                 }
-            )
-        } catch {
-            // Stream failed — still close the session and check for files on disk.
-            // Proposal 005 fix: goosed agents write files via developer tools BEFORE
-            // the SSE stream completes. If the stream errors (timeout, disconnect),
-            // the agent's output may already be on disk. We must still collect it
-            // and generate a receipt for audit evidence.
-            await sessionExecution.closeSession()
-
-            let completedAt = Date()
-            let resolvedProvider = override?.provider ?? agent.provider
-            let resolvedModel = override?.model ?? agent.model
-            let resolvedEffort = override?.effort ?? agent.effort
-
-            // Check for files the agent already wrote to disk
-            var salvaged: [String: Data] = [:]
-            let outputDir = context.workspace.artifactRoot
-                .appendingPathComponent("\(context.stageID).\(context.iteration)", isDirectory: true)
-                .appendingPathComponent(agent.id, isDirectory: true)
-                .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
-
-            for outputName in expectedOutputs {
-                let outputPath = outputDir.appendingPathComponent(outputName)
-                if FileManager.default.fileExists(atPath: outputPath.path),
-                   let data = try? Data(contentsOf: outputPath) {
-                    salvaged[outputName] = data
+            case .toolCallFinished:
+                if let tool = event.toolName {
+                    print("[Session:Tool][\(sessionID)][Done] \(agentID) -> \(tool)")
                 }
+            case .error:
+                print("[Session:Stream][\(sessionID)][Error] \(event.detail)")
+            case .finish:
+                print("[Session:Stream][\(sessionID)][Finish] \(event.detail)")
+            default:
+                break
             }
+            onEvent?(agentID, event)
+        }
+    )
+} catch {
+    print("[Session:Stream][\(sessionID)][Failed] \(error.localizedDescription)")
+    return await handleStreamFailure(
+        error: error,
+        sessionInfo: sessionInfo,
+        agent: agent,
+        context: context,
+        expectedOutputs: expectedOutputs,
+        startedAt: startedAt,
+        eventBridge: eventBridge
+    )
+}
 
-            // Generate receipt even on stream failure
-            let outputPresence: OutputPresence = salvaged.contains { key, _ in
-                !key.hasSuffix("_receipt.json") && !key.hasSuffix("_transcript.md")
-            } ? .durableOutput : .none
-            let transportKind = classifyTransportErrorKind(error.localizedDescription)
-            let canonicalOutcome = classifyStreamFailureOutcome(
-                errorMessage: error.localizedDescription,
-                outputPresence: outputPresence
-            )
-            let failureMessage = failureMessage(
-                for: canonicalOutcome,
-                fallback: "Stream processing failed: \(error.localizedDescription)"
-            )
-            let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
-                agentID: agent.id,
-                sessionID: sessionExecution.sessionID,
-                stageID: context.stageID,
-                iteration: context.iteration,
-                attemptNumber: context.attemptNumber,
-                startedAt: startedAt,
-                completedAt: completedAt,
-                events: eventBridge.eventLog,
-                toolCalls: eventBridge.toolCalls,
-                finalContent: nil,
-                succeeded: canonicalOutcome == .completed,
-                errorMessage: failureMessage,
-                provider: resolvedProvider,
-                model: resolvedModel,
-                effort: resolvedEffort
-            )
-            for (name, data) in receiptArtifacts {
-                salvaged[name] = data
-            }
+let completedAt = Date()
+await sessionInfo.execution.closeSession()
+print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeIntervalSince(startedAt)))s")
 
-            return AgentResult(
-                outputs: salvaged,
-                logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts from disk. Error: \(error.localizedDescription)",
-                costCents: nil,
-                succeeded: canonicalOutcome == .completed,
-                errorMessage: failureMessage,
-                sessionID: sessionExecution.sessionID,
-                durationSeconds: completedAt.timeIntervalSince(startedAt),
-                providerReceipt: UsageReceiptNormalizer.makeReceipt(
-                    providerFamily: context.providerBinding?.providerFamily ?? resolvedProvider,
-                    configuredProviderID: context.providerBinding?.configuredProviderID,
-                    model: context.providerBinding?.model ?? resolvedModel,
-                    effort: context.providerBinding?.effort ?? resolvedEffort,
-                    transport: context.providerBinding?.transport ?? "goose",
-                    costCents: nil,
-                    durationSeconds: completedAt.timeIntervalSince(startedAt),
-                    rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]
-                ),
-                resolvedModel: context.providerBinding?.model ?? resolvedModel,
-                configuredProviderID: context.providerBinding?.configuredProviderID,
-                adapterVersion: context.providerBinding?.adapterVersion,
-                canonicalOutcome: canonicalOutcome,
-                transportErrorKind: transportKind,
-                providerStopReason: nil,
-                outputPresence: outputPresence,
-                runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
-                runtimeModel: context.providerBinding?.model ?? resolvedModel,
-                outcomeEnvelope: OutcomeEnvelope(
-                    canonicalOutcome: canonicalOutcome,
-                    transportErrorKind: transportKind,
-                    providerStopReason: nil,
-                    outputPresence: outputPresence,
-                    rawErrorMessage: error.localizedDescription,
-                    rawFinishEvent: nil
-                )
-            )
+
+        // 3. Update Economics & Budget (Proposal 018)
+        let checkpoint = await updateEconomicsAndCheckBudget(
+            streamResult: streamResult,
+            sessionInfo: sessionInfo,
+            agent: agent,
+            context: context,
+            startedAt: startedAt,
+            completedAt: completedAt
+        )
+
+        // 4. Extract Outputs & Finalize
+        return finalizeSuccessResult(
+            streamResult: streamResult,
+            sessionInfo: sessionInfo,
+            checkpoint: checkpoint,
+            agent: agent,
+            context: context,
+            expectedOutputs: expectedOutputs,
+            eventBridge: eventBridge,
+            startedAt: startedAt,
+            completedAt: completedAt
+        )
+    }
+
+    // MARK: - Internal Steps
+
+    private struct SessionResolutionInfo {
+        let execution: GooseSessionExecution
+        let lineageID: UUID?
+        let generationID: UUID?
+        let reuseDisposition: SessionReuseDisposition
+        let ownerKey: String
+        let fingerprint: String
+    }
+
+    private func resolveSession(
+        task: AgentTask,
+        agent: ResolvedAgent,
+        context: ExecutionContext
+    ) async throws -> SessionResolutionInfo {
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let (workingDirectory, workspaceMode) = resolveWorkingDirectoryAndMode(agent: agent, context: context)
+        let fingerprint = calculateFingerprint(agent: agent, context: context, systemPrompt: packet.systemPrompt, workingDirectory: workingDirectory, workspaceMode: workspaceMode)
+        
+        let ownerKey = InvocationOwnerKeyBuilder.build(
+            runID: context.workspace.runID,
+            agentID: agent.id,
+            stageLineageID: context.stageLineageID ?? context.stageID,
+            taskName: task.task,
+            ownerExecutionLineageID: context.ownerExecutionLineageID
+        )
+
+        guard let sessionManager = sessionManager else {
+            let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            return SessionResolutionInfo(execution: execution, lineageID: nil, generationID: nil, reuseDisposition: .fresh, ownerKey: ownerKey, fingerprint: fingerprint)
         }
 
+        let lid = try await sessionManager.getOrCreateLineage(
+            runID: context.workspace.runID,
+            agentID: agent.id,
+            scope: agent.sessionReuseScope,
+            familyID: agent.sessionFamilyID
+        )
+        
+        let lineage = try await sessionManager.getLineage(id: lid)
+        // ARCH-001: Pass real recovery-branch truth (§4.1.1, §6.6).
+        // ownerExecutionLineageID is imported from execution truth and ties reuse to one branch.
+        let decision = SessionReusePolicy.evaluate(
+            lineage: lineage,
+            currentInvocationOwnerKey: ownerKey,
+            currentBindingFingerprint: fingerprint,
+            currentRecoveryBranchID: context.ownerExecutionLineageID
+        )
+        
+        switch decision {
+        case .reuse(let generation):
+            print("[Session:Resolve][\(lid)][Reuse] ID: \(generation.providerSessionID ?? "unknown") (Owner: \(ownerKey))")
+            // Attempt to reuse the existing provider session.
+            // If the session has expired on the backend (e.g. idle timeout, server restart),
+            // catch the "Session not found" error and fall back to a fresh session instead of failing.
+            do {
+                try await sessionManager.recordEvent(lineageID: lid, generationID: generation.id, type: .reused)
+                let execution = try await sessionBridge.executeInExistingSession(sessionID: generation.providerSessionID!, packet: packet)
+                return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: generation.id, reuseDisposition: .reused, ownerKey: ownerKey, fingerprint: fingerprint)
+            } catch {
+                let errorDesc = error.localizedDescription
+                if errorDesc.contains("Session not found") || errorDesc.contains("session not found") || errorDesc.contains("404") {
+                    // Session expired — invalidate the stale generation and create a fresh session
+                    print("[Session:Resolve][\(lid)][Expired] Fallback to fresh session: \(errorDesc)")
+                    try? await sessionManager.invalidateGeneration(generationID: generation.id, reason: "Stale session: \(errorDesc)")
+                    try? await sessionManager.recordEvent(lineageID: lid, generationID: generation.id, type: .invalidated)
+
+                    let freshExecution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+                    let gid = try await sessionManager.createGeneration(
+                        lineageID: lid,
+                        invocationOwnerKey: ownerKey,
+                        providerSessionID: freshExecution.sessionID,
+                        bindingFingerprint: fingerprint,
+                        workingDirectory: workingDirectory,
+                        workspaceMode: workspaceMode,
+                        runtimeProvider: context.providerBinding?.providerFamily ?? override?.provider ?? agent.provider,
+                        runtimeModel: context.providerBinding?.model ?? override?.model ?? agent.model
+                    )
+                    try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
+                    return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_transport_error, ownerKey: ownerKey, fingerprint: fingerprint)
+                }
+                throw error // Re-throw non-session errors
+            }
+
+        case .createFresh(let disposition, _):
+            let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            let gid = try await sessionManager.createGeneration(
+                lineageID: lid,
+                invocationOwnerKey: ownerKey,
+                providerSessionID: execution.sessionID,
+                bindingFingerprint: fingerprint,
+                workingDirectory: workingDirectory,
+                workspaceMode: workspaceMode,
+                runtimeProvider: context.providerBinding?.providerFamily ?? override?.provider ?? agent.provider,
+                runtimeModel: context.providerBinding?.model ?? override?.model ?? agent.model
+            )
+            try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
+            return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: disposition, ownerKey: ownerKey, fingerprint: fingerprint)
+            
+        case .requireReset:
+            let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            let gid = try await sessionManager.createGeneration(
+                lineageID: lid,
+                invocationOwnerKey: ownerKey,
+                providerSessionID: execution.sessionID,
+                bindingFingerprint: fingerprint,
+                workingDirectory: workingDirectory,
+                workspaceMode: workspaceMode,
+                runtimeProvider: context.providerBinding?.providerFamily ?? override?.provider ?? agent.provider,
+                runtimeModel: context.providerBinding?.model ?? override?.model ?? agent.model
+            )
+            try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .operator_reset)
+            return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_reset, ownerKey: ownerKey, fingerprint: fingerprint)
+        }
+    }
+
+    private func handleStreamFailure(
+        error: Error,
+        sessionInfo: SessionResolutionInfo,
+        agent: ResolvedAgent,
+        context: ExecutionContext,
+        expectedOutputs: [String],
+        startedAt: Date,
+        eventBridge: ExecutionEventBridge
+    ) async -> AgentResult {
+        await sessionInfo.execution.closeSession()
         let completedAt = Date()
+        
+        var salvaged = salvageOutputs(expectedOutputs: expectedOutputs, context: context, agent: agent)
+        let outputPresence: OutputPresence = salvaged.isEmpty ? .none : .durableOutput
+        let transportKind = classifyTransportErrorKind(error.localizedDescription)
+        let canonicalOutcome = classifyStreamFailureOutcome(errorMessage: error.localizedDescription, outputPresence: outputPresence)
+        
+        var checkpoint: AgentSessionCheckpoint?
+        if let gid = sessionInfo.generationID, let sessionManager = sessionManager {
+            if canonicalOutcome == .completedWithTransportError || canonicalOutcome == .timedOutAfterOutput {
+                checkpoint = AgentSessionCheckpointBuilder.build(
+                    executionResult: AgentResult.minimal(canonicalOutcome, sessionID: sessionInfo.execution.sessionID, duration: completedAt.timeIntervalSince(startedAt)),
+                    eventLog: eventBridge.eventLog,
+                    ownerKey: sessionInfo.ownerKey,
+                    scope: agent.sessionReuseScope,
+                    familyID: agent.sessionFamilyID
+                )
+                // DATA-001: Record checkpoint_created BEFORE invalidation (§6.4 rule 2)
+                let checkpointData = try? JSONEncoder().encode(checkpoint)
+                try? await sessionManager.recordCheckpointCreated(lineageID: sessionInfo.lineageID!, generationID: gid, checkpointData: checkpointData)
+                try? await sessionManager.invalidateGeneration(generationID: gid, reason: "Stream failure: \(error.localizedDescription)")
+                try? await sessionManager.recordEvent(lineageID: sessionInfo.lineageID!, generationID: gid, type: .invalidated)
+            }
+        }
 
-        // Step 4: Close the session
-        await sessionExecution.closeSession()
+        let failureMsg = failureMessage(for: canonicalOutcome, fallback: "Stream processing failed: \(error.localizedDescription)")
+        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
+            agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
+            startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: nil,
+            succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, provider: agent.provider, model: agent.model, effort: agent.effort,
+            sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue, sessionReuseScope: agent.sessionReuseScope.rawValue, sessionFamilyID: agent.sessionFamilyID
+        )
+        for (name, data) in receiptArtifacts { salvaged[name] = data }
+        let lazyEvidenceArtifactHits = detectLazyEvidenceArtifactHits(
+            toolCalls: eventBridge.toolCalls,
+            handoffPacket: context.handoffPacket
+        )
 
-        // Step 5: Build receipt/transcript artifacts (ARCH-032)
-        let resolvedProvider = override?.provider ?? agent.provider
-        let resolvedModel = override?.model ?? agent.model
-        let resolvedEffort = override?.effort ?? agent.effort
+        return AgentResult(
+            outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(error.localizedDescription)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: agent.provider, configuredProviderID: context.providerBinding?.configuredProviderID, model: agent.model, effort: agent.effort, transport: "goose", costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
+            resolvedModel: agent.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: outputPresence, runtimeProvider: agent.provider, runtimeModel: agent.model,
+            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: outputPresence, rawErrorMessage: error.localizedDescription, rawFinishEvent: nil),
+            lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
+        )
+    }
 
-        // Step 6: Extract declared output artifacts from workspace
-        var outputs: [String: Data] = [:]
+    private func updateEconomicsAndCheckBudget(
+        streamResult: ExecutionStreamResult,
+        sessionInfo: SessionResolutionInfo,
+        agent: ResolvedAgent,
+        context: ExecutionContext,
+        startedAt: Date,
+        completedAt: Date
+    ) async -> AgentSessionCheckpoint? {
+        guard let sessionManager = sessionManager, let gid = sessionInfo.generationID else { return nil }
 
-        // Try to read expected output files from the artifact directory
+        let cost = estimateCost(streamResult: streamResult) ?? 0
+        let tokens = Int64(streamResult.accumulatedText.count / 4)
+
+        try? await sessionManager.updateGenerationUsage(
+            generationID: gid, turnIncrement: 1, promptTokensIncrement: tokens, costCentsIncrement: cost, estimatedInputTokens: tokens
+        )
+
+        guard let lineage = try? await sessionManager.getLineage(id: sessionInfo.lineageID!),
+              let generation = lineage.generations.first(where: { $0.id == gid }) else { return nil }
+
+        // REQ-009: Build measured economic signals for ContextBudgetGuard (§6.3).
+        let economicSignals = buildEconomicSignals(
+            generation: generation,
+            currentTurnTokens: tokens,
+            sessionWasReused: sessionInfo.reuseDisposition == .reused || sessionInfo.reuseDisposition == .reused_after_resume
+        )
+
+        let budgetDecision = ContextBudgetGuard.evaluate(generation: generation, signals: economicSignals)
+        switch budgetDecision {
+        case .continueReuse:
+            return nil
+        case .compact(let reason), .invalidate(let reason):
+            let type: AgentSessionEventType = if case .compact = budgetDecision { .compacted } else { .budget_exceeded }
+            let checkpoint = AgentSessionCheckpointBuilder.build(
+                executionResult: AgentResult.minimal(.completed, sessionID: sessionInfo.execution.sessionID, duration: completedAt.timeIntervalSince(startedAt)),
+                eventLog: [],
+                ownerKey: sessionInfo.ownerKey,
+                scope: agent.sessionReuseScope,
+                familyID: agent.sessionFamilyID
+            )
+            // Record checkpoint creation before invalidation (§6.4)
+            let checkpointData = try? JSONEncoder().encode(checkpoint)
+            try? await sessionManager.recordCheckpointCreated(lineageID: sessionInfo.lineageID!, generationID: gid, checkpointData: checkpointData)
+            try? await sessionManager.invalidateGeneration(generationID: gid, reason: reason)
+            try? await sessionManager.recordEvent(lineageID: sessionInfo.lineageID!, generationID: gid, type: type)
+            return checkpoint
+        }
+    }
+
+    /// REQ-009: Compute measured reuse-economics signals for ContextBudgetGuard (§6.3).
+    private func buildEconomicSignals(
+        generation: AgentSessionGeneration,
+        currentTurnTokens: Int64,
+        sessionWasReused: Bool
+    ) -> ContextBudgetGuard.EconomicSignals {
+        // Fresh-session baseline: average tokens per turn from this generation's history.
+        let freshBaselineEstimate = max(1, generation.cumulativePromptTokens / max(1, Int64(generation.turnCount)))
+
+        // Transcript growth ratio: current prompt size vs. fresh baseline.
+        let transcriptGrowthRatio: Double = freshBaselineEstimate > 0
+            ? Double(generation.estimatedInputTokens) / Double(freshBaselineEstimate)
+            : 1.0
+
+        // Cached token share: fraction of the prompt that's reused static prefix.
+        let cachedTokenShare: Double
+        if sessionWasReused && generation.estimatedInputTokens > 0 {
+            let staticPrefix = max(0, generation.estimatedInputTokens - currentTurnTokens)
+            cachedTokenShare = Double(staticPrefix) / Double(generation.estimatedInputTokens)
+        } else {
+            cachedTokenShare = 0.0
+        }
+
+        // Normalized savings: positive = reuse cheaper, negative = reuse more expensive.
+        let freshCostCents = Double(freshBaselineEstimate) / 1000.0
+        let reuseCostCents = Double(generation.estimatedInputTokens) / 1000.0 * (1.0 - cachedTokenShare * 0.5)
+        let normalizedSavings = freshCostCents - reuseCostCents
+
+        // Effective prompt size as fraction of a typical 200k context window.
+        let contextWindowTokens: Double = 200_000
+        let effectivePromptSizeFraction = Double(generation.estimatedInputTokens) / contextWindowTokens
+
+        // Compaction churn: count how many times this generation has been compacted.
+        // We approximate from the generation's lineage events if available.
+        let compactionChurn = generation.lineage?.events
+            .filter { $0.generationID == generation.id && $0.eventType == .compacted }
+            .count ?? 0
+
+        return ContextBudgetGuard.EconomicSignals(
+            cachedTokenShare: cachedTokenShare,
+            normalizedSavingsVersusFresh: normalizedSavings,
+            transcriptGrowthRatio: transcriptGrowthRatio,
+            effectivePromptSizeFraction: effectivePromptSizeFraction,
+            compactionChurnCount: compactionChurn
+        )
+    }
+
+    private func finalizeSuccessResult(
+        streamResult: ExecutionStreamResult,
+        sessionInfo: SessionResolutionInfo,
+        checkpoint: AgentSessionCheckpoint?,
+        agent: ResolvedAgent,
+        context: ExecutionContext,
+        expectedOutputs: [String],
+        eventBridge: ExecutionEventBridge,
+        startedAt: Date,
+        completedAt: Date
+    ) -> AgentResult {
+        var outputs = salvageOutputs(expectedOutputs: expectedOutputs, context: context, agent: agent)
+        if outputs.isEmpty, let content = streamResult.finalContent, !content.isEmpty {
+            if let primary = expectedOutputs.first { outputs[primary] = content.data(using: .utf8) ?? Data() }
+        }
+
+        let outputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
+        let canonicalOutcome = classifyCompletedStreamOutcome(outputPresence: outputPresence, finishReason: streamResult.finishReason, hadExplicitFinalOutput: streamResult.finalContent != nil)
+        
+        let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
+        let finalOutcome: AgentCanonicalOutcome = !missingOutputs.isEmpty ? (canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome) : canonicalOutcome
+        let finalError: String? = if !missingOutputs.isEmpty {
+            "Required outputs missing: \(missingOutputs.joined(separator: ", "))"
+        } else if finalOutcome != .completed {
+            failureMessage(for: finalOutcome, fallback: "Execution did not produce final output")
+        } else {
+            nil
+        }
+
+        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
+            agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
+            startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: streamResult.finalContent,
+            succeeded: finalOutcome == .completed, errorMessage: finalError, provider: agent.provider, model: agent.model, effort: agent.effort,
+            sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue, sessionReuseScope: agent.sessionReuseScope.rawValue, sessionFamilyID: agent.sessionFamilyID
+        )
+        for (name, data) in receiptArtifacts { outputs[name] = data }
+        let lazyEvidenceArtifactHits = detectLazyEvidenceArtifactHits(
+            toolCalls: eventBridge.toolCalls,
+            handoffPacket: context.handoffPacket
+        )
+
+        let cost = estimateCost(streamResult: streamResult)
+        return AgentResult(
+            outputs: outputs, logSnippet: buildLogSnippet(agent: agent, sessionID: sessionInfo.execution.sessionID, streamResult: streamResult, startedAt: startedAt, completedAt: completedAt),
+            costCents: cost, succeeded: finalOutcome == .completed, errorMessage: finalOutcome == .completed ? nil : finalError, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: agent.provider, configuredProviderID: context.providerBinding?.configuredProviderID, model: agent.model, effort: agent.effort, transport: "goose", costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
+            resolvedModel: agent.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, runtimeProvider: agent.provider, runtimeModel: agent.model,
+            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: finalOutcome, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, rawErrorMessage: finalError, rawFinishEvent: streamResult.finishRaw),
+            lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
+        )
+    }
+
+    // MARK: - Private Helpers
+
+    private func salvageOutputs(expectedOutputs: [String], context: ExecutionContext, agent: ResolvedAgent) -> [String: Data] {
+        var salvaged: [String: Data] = [:]
         let outputDir = context.workspace.artifactRoot
             .appendingPathComponent("\(context.stageID).\(context.iteration)", isDirectory: true)
             .appendingPathComponent(agent.id, isDirectory: true)
             .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
 
         for outputName in expectedOutputs {
-            let outputPath = outputDir.appendingPathComponent(outputName)
-            if FileManager.default.fileExists(atPath: outputPath.path) {
-                do {
-                    let data = try Data(contentsOf: outputPath)
-                    outputs[outputName] = data
-                } catch {
-                    // Log but continue — will be caught by validation below
-                    print("Warning: Could not read output '\(outputName)': \(error.localizedDescription)")
-                }
+            let path = outputDir.appendingPathComponent(outputName)
+            if FileManager.default.fileExists(atPath: path.path), let data = try? Data(contentsOf: path) {
+                salvaged[outputName] = data
             }
         }
-
-        // If the final output contains content but no files were written,
-        // try to use the final content as the primary output
-        if outputs.isEmpty, let content = streamResult.finalContent, !content.isEmpty {
-            if let primaryOutput = expectedOutputs.first {
-                outputs[primaryOutput] = content.data(using: .utf8) ?? Data()
-            }
-        }
-
-        let outputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
-        let canonicalOutcome = classifyCompletedStreamOutcome(
-            outputPresence: outputPresence,
-            finishReason: streamResult.finishReason,
-            hadExplicitFinalOutput: streamResult.finalContent != nil
-        )
-        let failureMessage = canonicalOutcome == .completed ? nil : failureMessage(
-            for: canonicalOutcome,
-            fallback: "Execution did not produce final output"
-        )
-
-        // Step 7: Validate required outputs (Section 8.3)
-        let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
-        let finalCanonicalOutcome: AgentCanonicalOutcome
-        let finalErrorMessage: String?
-
-        if !missingOutputs.isEmpty {
-            finalCanonicalOutcome = canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome
-            finalErrorMessage = "Required outputs missing: \(missingOutputs.joined(separator: ", "))"
-        } else {
-            finalCanonicalOutcome = canonicalOutcome
-            finalErrorMessage = failureMessage
-        }
-
-        let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
-            agentID: agent.id,
-            sessionID: sessionExecution.sessionID,
-            stageID: context.stageID,
-            iteration: context.iteration,
-            attemptNumber: context.attemptNumber,
-            startedAt: startedAt,
-            completedAt: completedAt,
-            events: eventBridge.eventLog,
-            toolCalls: eventBridge.toolCalls,
-            finalContent: streamResult.finalContent,
-            succeeded: finalCanonicalOutcome == .completed,
-            errorMessage: finalErrorMessage,
-            provider: resolvedProvider,
-            model: resolvedModel,
-            effort: resolvedEffort
-        )
-
-        for (name, data) in receiptArtifacts {
-            outputs[name] = data
-        }
-
-        if !missingOutputs.isEmpty {
-            // Stage should fail loudly — silent success is worse than a visible crash
-            let missingList = missingOutputs.joined(separator: ", ")
-            return AgentResult(
-                outputs: outputs, // Still include receipts/transcripts for debugging
-                logSnippet: "Missing required outputs: \(missingList). Session: \(sessionExecution.sessionID)",
-                costCents: estimateCost(streamResult: streamResult),
-                succeeded: false,
-                errorMessage: "Required outputs missing: \(missingList)",
-                sessionID: sessionExecution.sessionID,
-                durationSeconds: completedAt.timeIntervalSince(startedAt),
-                providerReceipt: UsageReceiptNormalizer.makeReceipt(
-                    providerFamily: context.providerBinding?.providerFamily ?? resolvedProvider,
-                    configuredProviderID: context.providerBinding?.configuredProviderID,
-                    model: context.providerBinding?.model ?? resolvedModel,
-                    effort: context.providerBinding?.effort ?? resolvedEffort,
-                    transport: context.providerBinding?.transport ?? "goose",
-                    costCents: estimateCost(streamResult: streamResult),
-                    durationSeconds: completedAt.timeIntervalSince(startedAt),
-                    rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]
-                ),
-                resolvedModel: context.providerBinding?.model ?? resolvedModel,
-                configuredProviderID: context.providerBinding?.configuredProviderID,
-                adapterVersion: context.providerBinding?.adapterVersion,
-                canonicalOutcome: finalCanonicalOutcome,
-                transportErrorKind: nil,
-                providerStopReason: streamResult.finishReason,
-                outputPresence: outputPresence,
-                runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
-                runtimeModel: context.providerBinding?.model ?? resolvedModel,
-                outcomeEnvelope: OutcomeEnvelope(
-                    canonicalOutcome: finalCanonicalOutcome,
-                    transportErrorKind: nil,
-                    providerStopReason: streamResult.finishReason,
-                    outputPresence: outputPresence,
-                    rawErrorMessage: "Required outputs missing: \(missingList)",
-                    rawFinishEvent: streamResult.finishRaw
-                )
-            )
-        }
-
-        // Step 8: Return successful result
-        let logSnippet = buildLogSnippet(
-            agent: agent,
-            sessionID: sessionExecution.sessionID,
-            streamResult: streamResult,
-            startedAt: startedAt,
-            completedAt: completedAt
-        )
-
-        return AgentResult(
-            outputs: outputs,
-            logSnippet: logSnippet,
-            costCents: estimateCost(streamResult: streamResult),
-            succeeded: canonicalOutcome == .completed,
-            errorMessage: failureMessage,
-            sessionID: sessionExecution.sessionID,
-            durationSeconds: completedAt.timeIntervalSince(startedAt),
-            providerReceipt: UsageReceiptNormalizer.makeReceipt(
-                providerFamily: context.providerBinding?.providerFamily ?? resolvedProvider,
-                configuredProviderID: context.providerBinding?.configuredProviderID,
-                model: context.providerBinding?.model ?? resolvedModel,
-                effort: context.providerBinding?.effort ?? resolvedEffort,
-                transport: context.providerBinding?.transport ?? "goose",
-                costCents: estimateCost(streamResult: streamResult),
-                durationSeconds: completedAt.timeIntervalSince(startedAt),
-                rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]
-            ),
-            resolvedModel: context.providerBinding?.model ?? resolvedModel,
-            configuredProviderID: context.providerBinding?.configuredProviderID,
-            adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: finalCanonicalOutcome,
-            transportErrorKind: nil,
-            providerStopReason: streamResult.finishReason,
-            outputPresence: outputPresence,
-            runtimeProvider: context.providerBinding?.providerFamily ?? resolvedProvider,
-            runtimeModel: context.providerBinding?.model ?? resolvedModel,
-            outcomeEnvelope: OutcomeEnvelope(
-                canonicalOutcome: finalCanonicalOutcome,
-                transportErrorKind: nil,
-                providerStopReason: streamResult.finishReason,
-                outputPresence: outputPresence,
-                rawErrorMessage: finalErrorMessage,
-                rawFinishEvent: streamResult.finishRaw
-            )
-        )
+        return salvaged
     }
 
-    // MARK: - Private Helpers
-
-    private func buildLogSnippet(
-        agent: ResolvedAgent,
-        sessionID: String,
-        streamResult: ExecutionStreamResult,
-        startedAt: Date,
-        completedAt: Date
-    ) -> String {
+    private func buildLogSnippet(agent: ResolvedAgent, sessionID: String, streamResult: ExecutionStreamResult, startedAt: Date, completedAt: Date) -> String {
         let duration = String(format: "%.1f", completedAt.timeIntervalSince(startedAt))
-        let toolCount = streamResult.toolCalls.count
-        return "Live execution of '\(agent.id)' completed in \(duration)s. " +
-               "Session: \(sessionID). Tool calls: \(toolCount)."
+        return "Live execution of '\(agent.id)' completed in \(duration)s. Session: \(sessionID). Tool calls: \(streamResult.toolCalls.count)."
     }
 
     private func estimateCost(streamResult: ExecutionStreamResult) -> Int64? {
-        // Rough cost estimation based on text length
-        // In production, this would come from the provider's usage API
-        let inputChars = streamResult.accumulatedText.count
-        let estimatedTokens = inputChars / 4
-        // Rough: $0.01 per 1000 tokens = 1 cent per 1000 tokens
+        let estimatedTokens = streamResult.accumulatedText.count / 4
         return max(1, Int64(estimatedTokens / 1000))
+    }
+
+    private func detectLazyEvidenceArtifactHits(
+        toolCalls: [ToolCallRecord],
+        handoffPacket: HandoffPacket?
+    ) -> [String] {
+        guard let handoffPacket, !handoffPacket.lazyArtifactRefs.isEmpty else { return [] }
+        let lazyNames = Set(handoffPacket.lazyArtifactRefs.keys)
+        let hits = lazyNames.filter { artifactName in
+            toolCalls.contains { call in
+                let haystack = "\(call.toolName)\n\(call.rawPayload)".lowercased()
+                return haystack.contains("get_lazy_artifact") && haystack.contains(artifactName.lowercased())
+            }
+        }
+        return hits.sorted()
     }
 
     private func classifyTransportErrorKind(_ errorMessage: String) -> TransportErrorKind {
         let lowercased = errorMessage.lowercased()
-        if lowercased.contains("timed out") || lowercased.contains("timeout") || lowercased.contains("-1001") {
-            return .timeout
-        }
-        if lowercased.contains("provider") {
-            return .provider
-        }
-        if lowercased.contains("stream") {
-            return .stream
-        }
+        if lowercased.contains("timed out") || lowercased.contains("timeout") || lowercased.contains("-1001") { return .timeout }
+        if lowercased.contains("provider") { return .provider }
+        if lowercased.contains("stream") { return .stream }
         return .unknown
     }
 
-    private func classifyStreamFailureOutcome(
-        errorMessage: String,
-        outputPresence: OutputPresence
-    ) -> AgentCanonicalOutcome {
+    private func classifyStreamFailureOutcome(errorMessage: String, outputPresence: OutputPresence) -> AgentCanonicalOutcome {
         switch (classifyTransportErrorKind(errorMessage), outputPresence) {
-        case (.timeout, .durableOutput):
-            return .timedOutAfterOutput
-        case (.timeout, .none):
-            return .timedOutBeforeOutput
-        case (_, .durableOutput):
-            return .completedWithTransportError
-        case (_, .none):
-            return .failedBeforeOutput
+        case (.timeout, .durableOutput): return .timedOutAfterOutput
+        case (.timeout, .none): return .timedOutBeforeOutput
+        case (_, .durableOutput): return .completedWithTransportError
+        case (_, .none): return .failedBeforeOutput
         }
     }
 
-    private func classifyCompletedStreamOutcome(
-        outputPresence: OutputPresence,
-        finishReason: String?,
-        hadExplicitFinalOutput: Bool
-    ) -> AgentCanonicalOutcome {
-        guard let finishReason else {
-            return outputPresence == .durableOutput ? .completed : .failedBeforeOutput
-        }
-
-        if isLimitExhaustionReason(finishReason) {
-            return outputPresence == .durableOutput ? .limitExhaustedAfterOutput : .limitExhaustedBeforeOutput
-        }
-
-        if hadExplicitFinalOutput {
-            return .completed
-        }
-
-        if outputPresence == .durableOutput {
-            return .completed
-        }
-
-        if isNeutralFinishReason(finishReason) {
-            return .failedBeforeOutput
-        }
-
-        return .failedBeforeOutput
+    private func classifyCompletedStreamOutcome(outputPresence: OutputPresence, finishReason: String?, hadExplicitFinalOutput: Bool) -> AgentCanonicalOutcome {
+        guard let finishReason else { return outputPresence == .durableOutput ? .completed : .failedBeforeOutput }
+        if isLimitExhaustionReason(finishReason) { return outputPresence == .durableOutput ? .limitExhaustedAfterOutput : .limitExhaustedBeforeOutput }
+        return (hadExplicitFinalOutput || outputPresence == .durableOutput) ? .completed : .failedBeforeOutput
     }
 
     private func isLimitExhaustionReason(_ reason: String) -> Bool {
-        let normalized = reason.lowercased()
-        return normalized.contains("max_tokens")
-            || normalized.contains("max token")
-            || normalized.contains("rate_limit")
-            || normalized.contains("rate limit")
-            || normalized.contains("quota")
-            || normalized.contains("budget")
-            || normalized.contains("limit")
+        let r = reason.lowercased()
+        return r.contains("limit") || r.contains("quota") || r.contains("budget") || r.contains("max_tokens")
     }
 
-    private func isNeutralFinishReason(_ reason: String) -> Bool {
-        let normalized = reason.lowercased()
-        return normalized == "stop" || normalized == "session_closed" || normalized == "session closed"
-    }
-
-    private func failureMessage(
-        for outcome: AgentCanonicalOutcome,
-        fallback: String
-    ) -> String {
+    private func failureMessage(for outcome: AgentCanonicalOutcome, fallback: String) -> String {
         switch outcome {
-        case .limitExhaustedBeforeOutput:
-            return "Provider or app limit exhausted before output was produced"
-        case .limitExhaustedAfterOutput:
-            return "Provider or app limit exhausted after output was produced"
-        case .timedOutBeforeOutput:
-            return "Execution timed out before output was produced"
-        case .timedOutAfterOutput:
-            return "Execution timed out after output was produced"
-        case .completedWithTransportError:
-            return "Execution produced durable output but transport errored afterward"
-        case .failedBeforeOutput:
-            return fallback
-        case .failedAfterOutputValidation:
-            return "Output validation failed after output was produced"
-        case .cancelledBeforeOutput:
-            return "Execution was cancelled before output was produced"
-        case .cancelledAfterOutput:
-            return "Execution was cancelled after output was produced"
-        case .completed:
-            return fallback
+        case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput: return "Provider or app limit exhausted"
+        case .timedOutBeforeOutput, .timedOutAfterOutput: return "Execution timed out"
+        case .completedWithTransportError: return "Execution produced output but transport errored afterward"
+        case .failedAfterOutputValidation: return "Output validation failed"
+        case .cancelledBeforeOutput, .cancelledAfterOutput: return "Execution was cancelled"
+        case .completed, .failedBeforeOutput: return fallback
         }
+    }
+
+    private func resolveWorkingDirectoryAndMode(agent: ResolvedAgent, context: ExecutionContext) -> (String, String) {
+        let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
+        let workingDirectory = useWorktree ? context.workspace.worktreeRoot!.path : (context.projectRoot?.path ?? context.workspace.workspaceRoot.path)
+        return (workingDirectory, useWorktree ? "read_write" : "read_only")
+    }
+
+    private func calculateFingerprint(agent: ResolvedAgent, context: ExecutionContext, systemPrompt: String, workingDirectory: String, workspaceMode: String) -> String {
+        BindingFingerprintBuilder.build(
+            agent: agent,
+            provider: agent.provider,
+            model: agent.model,
+            effort: agent.effort,
+            systemPrompt: systemPrompt,
+            workingDirectory: workingDirectory,
+            workspaceMode: workspaceMode,
+            strategyFingerprintMaterial: context.handoffPacket?.fingerprintMaterial
+        )
+    }
+}
+
+extension AgentResult {
+    static func failure(_ msg: String, context: ExecutionContext, override: LiveExecutionOverride?, startedAt: Date) -> AgentResult {
+        AgentResult(outputs: [:], logSnippet: msg, costCents: nil, succeeded: false, errorMessage: msg, sessionID: nil, durationSeconds: Date().timeIntervalSince(startedAt), providerReceipt: nil, resolvedModel: override?.model ?? context.providerBinding?.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion)
+    }
+    
+    static func minimal(_ outcome: AgentCanonicalOutcome, sessionID: String, duration: Double) -> AgentResult {
+        AgentResult(outputs: [:], logSnippet: nil, costCents: nil, succeeded: outcome == .completed, errorMessage: nil, sessionID: sessionID, durationSeconds: duration, providerReceipt: nil, resolvedModel: nil, configuredProviderID: nil, adapterVersion: nil, canonicalOutcome: outcome)
     }
 }

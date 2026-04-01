@@ -144,6 +144,7 @@ struct GooseSessionBridgeTests {
         let context = ExecutionContext(
             workspace: workspace,
             stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -177,6 +178,7 @@ struct GooseSessionBridgeTests {
         let context = ExecutionContext(
             workspace: workspace,
             stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -202,6 +204,7 @@ struct GooseSessionBridgeTests {
             workspace: workspace,
             projectRoot: URL(fileURLWithPath: "/tmp/project-root", isDirectory: true),
             stageID: "state_2",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: ["input_artifact": Data("test input data".utf8)],
@@ -231,6 +234,106 @@ struct GooseSessionBridgeTests {
         #expect(packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
+    @Test("Packet includes strategy handoff artifacts and lazy references")
+    func packetIncludesStrategyHandoffArtifactsAndLazyRefs() throws {
+        let agent = makeAgent(id: "proposal_writer")
+        let task = AgentTask(
+            agent: "proposal_writer",
+            task: "refine_proposal",
+            inputs: ["idea_brief", "proposal_current", "proposal_review_all", "security_audit_raw"],
+            outputs: ["proposal_current"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let stewardProfile = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]
+        )
+        let profileData = try JSONEncoder().encode(stewardProfile)
+        let strategyProfile = try JSONDecoder().decode(ContextStrategyProfile.self, from: profileData)
+
+        let inputArtifacts: [String: Data] = [
+            "idea_brief": Data("short idea".utf8),
+            "proposal_current": Data("full proposal body".utf8),
+            "proposal_review_all": Data(String(repeating: "review ", count: 80).utf8),
+            "security_audit_raw": Data("sensitive raw audit".utf8)
+        ]
+        let lazyArtifactPath = workspace.artifactRoot
+            .appendingPathComponent("persisted-security-audit-raw.txt")
+        try Data("sensitive raw audit".utf8).write(to: lazyArtifactPath)
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_2",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: inputArtifacts,
+            inputArtifactPaths: ["security_audit_raw": lazyArtifactPath.path],
+            variables: [:],
+            ideaBody: "Build a great refined proposal",
+            providerBinding: nil,
+            contextStrategyProfileID: "selective_compression_and_escalation",
+            contextStrategyProfile: strategyProfile,
+            handoffPacket: HandoffCompiler().compile(
+                profileID: "selective_compression_and_escalation",
+                profile: strategyProfile,
+                agent: agent,
+                task: task,
+                context: .init(
+                    workspace: workspace,
+                    stageID: "state_2",
+                    ownerExecutionLineageID: UUID(),
+                    iteration: 1,
+                    attemptNumber: 1,
+                    inputArtifacts: inputArtifacts,
+                    inputArtifactPaths: ["security_audit_raw": lazyArtifactPath.path],
+                    variables: [:],
+                    ideaBody: "Build a great refined proposal",
+                    providerBinding: nil
+                )
+            )
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("Profile: selective_compression_and_escalation"))
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "idea_brief" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_current" })
+        #expect(packet.contextAttachments.contains { $0.type == "text" && $0.name == "summary_proposal_review_all" })
+        let lazyTool = try #require(packet.contextAttachments.first { $0.name == "LazyEvidenceTool" })
+        #expect(lazyTool.type == "file")
+        let lazyToolPath = try #require(lazyTool.path)
+        #expect(URL(fileURLWithPath: lazyToolPath).lastPathComponent == "get_lazy_artifact")
+        let lazyToolManifest = try #require(packet.contextAttachments.first { $0.name == "lazy_evidence_manifest" })
+        #expect(lazyToolManifest.type == "text")
+        #expect(lazyToolManifest.content?.contains("\"toolName\" : \"get_lazy_artifact\"") == true)
+        #expect(lazyToolManifest.content?.contains("\"owner\" : \"LazyEvidenceTool\"") == true)
+        #expect(lazyToolManifest.content?.contains("\"security_audit_raw\"") == true)
+        let lazyAttachment = try #require(packet.contextAttachments.first { $0.name == "lazy_security_audit_raw" })
+        #expect(lazyAttachment.type == "file")
+        #expect(lazyAttachment.path == lazyArtifactPath.path)
+        #expect(packet.taskDirective.contains("Use the executable `get_lazy_artifact` helper attached as LazyEvidenceTool for canonical on-demand evidence retrieval."))
+        #expect(packet.taskDirective.contains("Run: \(lazyToolPath) <artifact_name>"))
+        #expect(packet.taskDirective.contains("Load lazy artifacts on demand from the attached file paths only when they become necessary."))
+        #expect(packet.contextAttachments.contains { $0.name == "strategy_fingerprint" })
+
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: lazyToolPath)
+        process.arguments = ["security_audit_raw"]
+        process.standardOutput = stdout
+        try process.run()
+        process.waitUntilExit()
+
+        let helperOutput = String(
+            data: stdout.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )
+        #expect(process.terminationStatus == 0)
+        #expect(helperOutput == "sensitive raw audit")
+    }
+
     @Test("Proposal review packet requires exact JSON artifact names")
     func proposalReviewPacketRequiresExactJSONArtifactNames() {
         let agent = ResolvedAgent(
@@ -258,6 +361,7 @@ struct GooseSessionBridgeTests {
         let context = ExecutionContext(
             workspace: workspace,
             stageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
             iteration: 2,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -320,6 +424,7 @@ struct GooseSessionBridgeTests {
         let context = ExecutionContext(
             workspace: workspace,
             stageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
             iteration: 4,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -341,6 +446,55 @@ struct GooseSessionBridgeTests {
         #expect(packet.taskDirective.contains("decision: String"))
     }
 
+    @Test("Markdown output packet requires file existence verification before stop")
+    func markdownOutputPacketRequiresFileExistenceVerificationBeforeStop() {
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "authoring",
+            provider: "claude",
+            model: "claude-opus-4.6",
+            effort: "high",
+            maxTurns: 16,
+            temperature: 0,
+            permissionProfile: "RW_META",
+            skillRef: "proposal_writer",
+            skillRole: nil,
+            prompt: "Refine the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let task = AgentTask(
+            agent: agent.id,
+            task: "refine_proposal",
+            inputs: ["proposal_current"],
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_5_proposal_refined",
+            ownerExecutionLineageID: UUID(),
+            iteration: 6,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("proposal_current"))
+        #expect(packet.taskDirective.contains("proposal_revision_summary"))
+        #expect(packet.taskDirective.contains("verify that every required output file exists on disk"))
+        #expect(packet.taskDirective.contains("If any required output file is missing or empty, continue working"))
+    }
+
     @Test("Packet without input artifacts")
     func packetWithoutInputArtifacts() {
         let agent = makeAgent()
@@ -351,6 +505,7 @@ struct GooseSessionBridgeTests {
         let context = ExecutionContext(
             workspace: workspace,
             stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -381,7 +536,9 @@ struct GooseSessionBridgeTests {
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
                 )
-            )
+            ),
+            sessionError: nil,
+            events: []
         )
 
         let bridge = GooseSessionBridge(transport: transport)
@@ -393,6 +550,7 @@ struct GooseSessionBridgeTests {
         let context = ExecutionContext(
             workspace: workspace,
             stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -428,7 +586,9 @@ struct GooseSessionBridgeTests {
                     capabilityToken: "mock-project-root",
                     backendPolicyVersion: "mock-v1"
                 )
-            )
+            ),
+            sessionError: nil,
+            events: []
         )
 
         let bridge = GooseSessionBridge(transport: transport)
@@ -442,6 +602,7 @@ struct GooseSessionBridgeTests {
             workspace: workspace,
             projectRoot: projectRoot,
             stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],
@@ -474,7 +635,9 @@ struct GooseSessionBridgeTests {
                     capabilityToken: "mock-worktree-root",
                     backendPolicyVersion: "mock-v1"
                 )
-            )
+            ),
+            sessionError: nil,
+            events: []
         )
 
         let bridge = GooseSessionBridge(transport: transport)
@@ -495,6 +658,7 @@ struct GooseSessionBridgeTests {
             workspace: writableWorkspace,
             projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
             stageID: "state_7_implementation_started",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],

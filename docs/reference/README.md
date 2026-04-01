@@ -2,6 +2,8 @@
 
 Implementation-oriented reference docs for Chainworks Forge.
 
+If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md), then read the relevant subsystem documents below.
+
 ## Foundation Layer
 
 - [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking
@@ -14,6 +16,8 @@ Implementation-oriented reference docs for Chainworks Forge.
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
 - [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, stage-owned recovery evidence, approval restore, runtime binding truth, and report/recovery read precedence
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, aggregate summary hardening, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
+- [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage within one run, immutable generation history, budget-driven compaction, checkpoint rehydration, and shell-owned per-agent reset
+- [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 
 ## Live Execution
 
@@ -47,6 +51,8 @@ Implementation-oriented reference docs for Chainworks Forge.
 
 - [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md) — consolidated implementation/proof story for the execution-truth and recovery slice
 - [../evidence/output-contracts-failure-evidence-and-recovery-proof.md](../evidence/output-contracts-failure-evidence-and-recovery-proof.md) — consolidated implementation/proof story for output contracts, failure evidence, and narrow recovery
+- [../evidence/session-lineage-reuse-and-operator-reset-proof.md](../evidence/session-lineage-reuse-and-operator-reset-proof.md) — consolidated implementation/proof story for session-lineage reuse, checkpointing, and operator reset
+- [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md) — consolidated implementation/proof story for context strategies, lazy evidence, telemetry, and recommendation output
 - [../evidence/design-system-and-brand-application-proof.md](../evidence/design-system-and-brand-application-proof.md) — consolidated implementation/proof story for the design-system and brand-application slice
 
 ## Risk Analysis

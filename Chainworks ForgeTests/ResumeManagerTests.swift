@@ -212,6 +212,97 @@ struct ResumeManagerTests {
         await service.cancelRun(runID: run.id)
     }
 
+    @Test("ExecutionService resumes stage retry by attaching an orchestrator")
+    func executionServiceResumeRunAfterStageRetryAttachesOrchestrator() async throws {
+        let (run, plan, _) = try makeRunFromPlan()
+        run.status = .failed
+
+        let initialStateID = plan.initialStateID
+        let initialLabel = try #require(plan.states[initialStateID]?.label)
+
+        let failedStage = StageExecution(
+            stageID: initialStateID,
+            label: initialLabel,
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: initialStateID)
+
+        #expect(run.status == .ready)
+        #expect(run.currentStageID == initialStateID)
+
+        let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
+        let service = ExecutionService(modelContext: context, executor: executor)
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        await awaitCondition("Recovery-created ready run should attach and transition to running", timeout: 3.0) {
+            service.orchestrator(for: run.id) != nil && run.status == .running
+        }
+
+        #expect(service.orchestrator(for: run.id) != nil)
+        #expect(run.status == .running)
+
+        await service.cancelRun(runID: run.id)
+    }
+
+    @Test("ExecutionService resumes agent retry by attaching an orchestrator")
+    func executionServiceResumeRunAfterAgentRetryAttachesOrchestrator() async throws {
+        let (run, plan, _) = try makeRunFromPlan()
+        run.status = .failed
+
+        let initialStateID = plan.initialStateID
+        let initialLabel = try #require(plan.states[initialStateID]?.label)
+
+        let failedStage = StageExecution(
+            stageID: initialStateID,
+            label: initialLabel,
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "test_agent",
+            agentTitle: "Test Agent",
+            taskName: "test_task",
+            status: .failed,
+            provider: "test_provider",
+            effort: "high"
+        )
+        failedAgent.stageExecution = failedStage
+        context.insert(failedAgent)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryAgent(run: run, stageID: initialStateID, agentID: "test_agent")
+
+        #expect(run.status == .running)
+        #expect(run.currentStageID == initialStateID)
+
+        let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
+        let service = ExecutionService(modelContext: context, executor: executor)
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        await awaitCondition("Recovery-created running run should attach an orchestrator", timeout: 3.0) {
+            service.orchestrator(for: run.id) != nil && run.status == .running
+        }
+
+        #expect(service.orchestrator(for: run.id) != nil)
+        #expect(run.status == .running)
+
+        await service.cancelRun(runID: run.id)
+    }
+
     // MARK: - Live Executor Routing
 
     private func repositoryRootURL(file: StaticString = #filePath) -> URL {

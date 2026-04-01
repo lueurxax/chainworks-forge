@@ -162,6 +162,54 @@ final class ArtifactManager {
         return Set(artifacts.map(\.name))
     }
 
+    /// Proposal 018: Persist a session checkpoint artifact.
+    @discardableResult
+    @MainActor
+    func persistSessionCheckpoint(
+        checkpoint: AgentSessionCheckpoint,
+        agentExecution: AgentExecution,
+        workspace: RunWorkspace,
+        stageID: String,
+        iteration: Int,
+        attemptNumber: Int
+    ) throws -> Artifact {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(checkpoint)
+        
+        let name = "\(agentExecution.agentID)_session_checkpoint.json"
+        
+        // Write to disk
+        let storageResult = try ArtifactStorage.write(
+            data: data,
+            name: name,
+            stageID: stageID,
+            iteration: iteration,
+            agentID: agentExecution.agentID,
+            attemptNumber: attemptNumber,
+            artifactRoot: workspace.artifactRoot,
+            workspaceRoot: workspace.workspaceRoot
+        )
+        
+        let artifact = Artifact(
+            name: name,
+            contractID: "agent_session_checkpoint_v1",
+            format: .json,
+            filePath: storageResult.filePath,
+            runID: workspace.runID,
+            stageID: stageID,
+            agentID: agentExecution.agentID,
+            provider: agentExecution.provider,
+            attemptNumber: attemptNumber
+        )
+        artifact.checksumSHA256 = storageResult.checksumSHA256
+        artifact.sizeBytes = storageResult.sizeBytes
+        artifact.agentExecution = agentExecution
+        
+        modelContext.insert(artifact)
+        return artifact
+    }
+
     /// Persist a system-generated artifact that is not attached to a specific agent execution.
     @discardableResult
     @MainActor

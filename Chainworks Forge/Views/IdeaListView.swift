@@ -945,6 +945,7 @@ struct WorkflowStartRunSheet: View {
     @State private var selectedMode: ExecutionMode = .simulated
     @State private var selectedWorkflow: WorkflowPreset = .canonicalRelease
     @State private var startOptions: RunStartOptions = .empty
+    @State private var selectedContextStrategyProfileID = "current_mixed_baseline"
     @State private var preflightReport: PreflightReport?
     @State private var showPreflightSheet = false
     @State private var allowWarnStart = false
@@ -1079,6 +1080,12 @@ struct WorkflowStartRunSheet: View {
 
     private var selectedWorkflowURL: URL? {
         workflowURLs[selectedWorkflow]
+    }
+
+    private var availableContextStrategyProfileIDs: [String] {
+        let config = executionService.stewardConfig ?? .defaultConfig
+        let keys = config.contextStrategyProfiles.keys.sorted()
+        return keys.isEmpty ? ["current_mixed_baseline"] : keys
     }
 
     private var workflowSelection: Binding<WorkflowPreset> {
@@ -1305,6 +1312,31 @@ struct WorkflowStartRunSheet: View {
                     executionModeSelectionControl
 
                     workflowSelectionControl
+
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("Context Strategy", selection: $selectedContextStrategyProfileID) {
+                                ForEach(availableContextStrategyProfileIDs, id: \.self) { profileID in
+                                    Text(profileID).tag(profileID)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .accessibilityIdentifier("context-strategy-picker")
+
+                            Text("The selected strategy is frozen into the run snapshot and reused for resume, frozen clone, and comparison.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Context Strategy")
+                                .font(.subheadline.bold())
+                            Text("Choose the strategy profile for this run.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
 
                     if selectedMode == .live && !liveModeConfigured {
                         Text("Advanced setup: `CHAINWORKS_GOOSE_BASE_URL` or `CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success`, then relaunch the app.")
@@ -1887,6 +1919,11 @@ struct WorkflowStartRunSheet: View {
         providerBindings: [String: ResolvedProviderBinding]
     ) throws -> RunStartSnapshot {
         let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
+        let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
+            .resolveSelection(
+                selectedProfileID: selectedContextStrategyProfileID,
+                cohortID: nil
+            )
 
         let deliveryConfig: DeliveryConfiguration?
         let deliveryPreflightJSON: Data?
@@ -1919,7 +1956,11 @@ struct WorkflowStartRunSheet: View {
             startOptionsJSON: encodeStartOptions(startOptions),
             frozenWorkspaceRootPath: normalizedWorkspaceRoot,
             deliveryConfiguration: deliveryConfig,
-            deliveryPreflightJSON: deliveryPreflightJSON
+            deliveryPreflightJSON: deliveryPreflightJSON,
+            contextStrategyProfileID: strategySelection.profileID,
+            strategyAssignmentMode: strategySelection.assignmentMode,
+            strategyRecommendationState: strategySelection.recommendationState,
+            contextStrategySnapshotJSON: try JSONEncoder().encode(strategySelection.profile)
         )
     }
 

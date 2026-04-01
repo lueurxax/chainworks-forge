@@ -29,12 +29,18 @@ struct ExecutionContext: Sendable {
     let projectRoot: URL?
     /// The current stage ID.
     let stageID: String
+    /// Proposal 018: The stage lineage ID for this execution.
+    let stageLineageID: String?
+    /// Proposal 018: The execution ID (agent attempt) that owns this session.
+    let ownerExecutionLineageID: UUID
     /// The current iteration within this stage (for loop support).
     let iteration: Int
     /// The attempt number for this execution.
     let attemptNumber: Int
     /// Input artifacts available to this agent (name -> data).
     let inputArtifacts: [String: Data]
+    /// Optional absolute file paths for input artifacts when persisted artifacts already exist on disk.
+    let inputArtifactPaths: [String: String]
     /// Runtime variables (for prompt interpolation, etc.).
     let variables: [String: AnyCodableValue]
     /// The idea body text for the run.
@@ -43,29 +49,56 @@ struct ExecutionContext: Sendable {
     let providerBinding: ResolvedProviderBinding?
     /// Optional contract catalog for catalog-driven prompt/runtime hints.
     let catalog: AgentCatalog?
+    /// Frozen strategy profile ID selected for the run.
+    let contextStrategyProfileID: String?
+    /// How the strategy was assigned for this run.
+    let strategyAssignmentMode: String?
+    /// Frozen strategy profile used for this execution context.
+    let contextStrategyProfile: ContextStrategyProfile?
+    /// Strategy-compiled context handoff payload for this execution.
+    let handoffPacket: HandoffPacket?
+    
+    /// Proposal 018: Optional session lineage ID to force reuse or inspect.
+    var sessionLineageID: UUID?
 
     init(
         workspace: RunWorkspace,
         projectRoot: URL? = nil,
         stageID: String,
+        stageLineageID: String? = nil,
+        ownerExecutionLineageID: UUID,
         iteration: Int,
         attemptNumber: Int,
         inputArtifacts: [String: Data],
+        inputArtifactPaths: [String: String] = [:],
         variables: [String: AnyCodableValue],
         ideaBody: String,
         providerBinding: ResolvedProviderBinding?,
-        catalog: AgentCatalog? = nil
+        catalog: AgentCatalog? = nil,
+        contextStrategyProfileID: String? = nil,
+        strategyAssignmentMode: String? = nil,
+        contextStrategyProfile: ContextStrategyProfile? = nil,
+        handoffPacket: HandoffPacket? = nil,
+        sessionLineageID: UUID? = nil
     ) {
         self.workspace = workspace
         self.projectRoot = projectRoot
         self.stageID = stageID
+        self.stageLineageID = stageLineageID
+        self.ownerExecutionLineageID = ownerExecutionLineageID
         self.iteration = iteration
         self.attemptNumber = attemptNumber
         self.inputArtifacts = inputArtifacts
+        self.inputArtifactPaths = inputArtifactPaths
         self.variables = variables
         self.ideaBody = ideaBody
         self.providerBinding = providerBinding
         self.catalog = catalog
+        self.contextStrategyProfileID = contextStrategyProfileID
+        self.strategyAssignmentMode = strategyAssignmentMode
+        self.contextStrategyProfile = contextStrategyProfile
+        self.handoffPacket = handoffPacket
+        self.sessionLineageID = sessionLineageID
     }
 }
 
@@ -98,6 +131,12 @@ struct AgentResult: Sendable {
     let adapterVersion: String?
     /// Canonical terminal outcome for this attempt.
     let canonicalOutcome: AgentCanonicalOutcome?
+    /// Proposal 018: Session lineage results
+    let sessionLineageID: UUID?
+    let sessionGenerationID: UUID?
+    let sessionReuseDisposition: SessionReuseDisposition?
+    /// Proposal 018: Optional checkpoint data if session was invalidated/compacted
+    let sessionCheckpoint: AgentSessionCheckpoint?
     /// Normalized transport failure class, if any.
     let transportErrorKind: TransportErrorKind?
     /// Normalized provider/app stop reason, if any.
@@ -110,6 +149,8 @@ struct AgentResult: Sendable {
     let runtimeModel: String?
     /// Supporting diagnostic envelope for later readers.
     let outcomeEnvelope: OutcomeEnvelope?
+    /// Unique lazy-evidence artifacts actually fetched during execution.
+    let lazyEvidenceArtifactHits: [String]
 
     init(
         outputs: [String: Data],
@@ -124,12 +165,17 @@ struct AgentResult: Sendable {
         configuredProviderID: UUID?,
         adapterVersion: String?,
         canonicalOutcome: AgentCanonicalOutcome? = nil,
+        sessionLineageID: UUID? = nil,
+        sessionGenerationID: UUID? = nil,
+        sessionReuseDisposition: SessionReuseDisposition? = nil,
+        sessionCheckpoint: AgentSessionCheckpoint? = nil,
         transportErrorKind: TransportErrorKind? = nil,
         providerStopReason: String? = nil,
         outputPresence: OutputPresence = .none,
         runtimeProvider: String? = nil,
         runtimeModel: String? = nil,
-        outcomeEnvelope: OutcomeEnvelope? = nil
+        outcomeEnvelope: OutcomeEnvelope? = nil,
+        lazyEvidenceArtifactHits: [String] = []
     ) {
         self.outputs = outputs
         self.logSnippet = logSnippet
@@ -143,12 +189,17 @@ struct AgentResult: Sendable {
         self.configuredProviderID = configuredProviderID
         self.adapterVersion = adapterVersion
         self.canonicalOutcome = canonicalOutcome
+        self.sessionLineageID = sessionLineageID
+        self.sessionGenerationID = sessionGenerationID
+        self.sessionReuseDisposition = sessionReuseDisposition
+        self.sessionCheckpoint = sessionCheckpoint
         self.transportErrorKind = transportErrorKind
         self.providerStopReason = providerStopReason
         self.outputPresence = outputPresence
         self.runtimeProvider = runtimeProvider
         self.runtimeModel = runtimeModel
         self.outcomeEnvelope = outcomeEnvelope
+        self.lazyEvidenceArtifactHits = lazyEvidenceArtifactHits
     }
 }
 

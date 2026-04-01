@@ -124,11 +124,11 @@ Execution rule:
 
 Primary files:
 
-- [Chainworks_ForgeUITests.swift](../../Chainworks%20ForgeUITests/Chainworks_ForgeUITests.swift)
-- [StartRunScreen.swift](../../Chainworks%20ForgeUITests/StartRunScreen.swift)
-- [RunProgressScreen.swift](../../Chainworks%20ForgeUITests/RunProgressScreen.swift)
-- [IdeasScreen.swift](../../Chainworks%20ForgeUITests/IdeasScreen.swift)
-- [AppScreen.swift](../../Chainworks%20ForgeUITests/AppScreen.swift)
+- [Chainworks_ForgeUITests.swift](<../../Chainworks ForgeUITests/Chainworks_ForgeUITests.swift>)
+- [StartRunScreen.swift](<../../Chainworks ForgeUITests/StartRunScreen.swift>)
+- [RunProgressScreen.swift](<../../Chainworks ForgeUITests/RunProgressScreen.swift>)
+- [IdeasScreen.swift](<../../Chainworks ForgeUITests/IdeasScreen.swift>)
+- [AppScreen.swift](<../../Chainworks ForgeUITests/AppScreen.swift>)
 
 Focused XCUITest is the correct layer for operator-shell reachability, not for proving a full repo-backed delivery contract.
 
@@ -156,7 +156,7 @@ Use app-launched proof when the contract is larger than a surface smoke test:
 
 Canonical implementation:
 
-- [Proposal007DogfoodHarness.swift](../../Chainworks%20Forge/Engine/Proposal007DogfoodHarness.swift)
+- [Proposal007DogfoodHarness.swift](<../../Chainworks Forge/Engine/Proposal007DogfoodHarness.swift>)
 
 This path runs inside the app process, drives the run to terminal state, exports a real evidence pack, and persists a result JSON. It is the preferred fallback when `Chainworks ForgeUITests-Runner.app` is signing-broken, Gatekeeper-blocked, or too fragile for proposal-level truth.
 
@@ -194,7 +194,7 @@ Canonical SSH login:
 
 If infrastructure changes, update both:
 
-- [Chainworks_ForgeUITests.swift](../../Chainworks%20ForgeUITests/Chainworks_ForgeUITests.swift)
+- [Chainworks_ForgeUITests.swift](<../../Chainworks ForgeUITests/Chainworks_ForgeUITests.swift>)
 - [scripts/test-gate.sh](../../scripts/test-gate.sh)
 
 ### Remote macOS Host
@@ -394,8 +394,8 @@ CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP=1
 
 Relevant wiring:
 
-- [Chainworks_ForgeApp.swift](../../Chainworks%20Forge/Chainworks_ForgeApp.swift)
-- [Chainworks_ForgeUITests.swift](../../Chainworks%20ForgeUITests/Chainworks_ForgeUITests.swift)
+- [Chainworks_ForgeApp.swift](<../../Chainworks Forge/Chainworks_ForgeApp.swift>)
+- [Chainworks_ForgeUITests.swift](<../../Chainworks ForgeUITests/Chainworks_ForgeUITests.swift>)
 
 This is the canonical control for UI automation hosts. Agents should prefer it over ad hoc code edits or test-only runtime hacks.
 

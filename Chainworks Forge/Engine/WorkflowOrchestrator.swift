@@ -89,6 +89,11 @@ final class WorkflowOrchestrator {
     private var liveAgentExecutionsByAgentID: [String: [AgentExecution]] = [:]
     /// Frozen provider bindings captured at run start.
     private let providerBindingsByAgentID: [String: ResolvedProviderBinding]
+    private let contextStrategyProfileID: String?
+    private let strategyAssignmentMode: String?
+    private let contextStrategyProfile: ContextStrategyProfile?
+    private let promotedHandoffArtifacts: [String]
+    private let handoffCompiler: HandoffCompiler = .init()
 
     // MARK: - Delivery Integration (Proposal 007)
 
@@ -118,6 +123,10 @@ final class WorkflowOrchestrator {
         self.currentStateID = plan.initialStateID
         self.runtimeVariables = plan.variables
         self.providerBindingsByAgentID = Self.decodeProviderBindings(from: run.providerBindingSnapshotJSON)
+        self.contextStrategyProfileID = Self.decodeContextStrategyProfileID(from: run)
+        self.strategyAssignmentMode = Self.decodeStrategyAssignmentMode(from: run)
+        self.contextStrategyProfile = Self.decodeContextStrategyProfile(from: run)
+        self.promotedHandoffArtifacts = Self.decodePromotedHandoffArtifacts(from: run)
         configureLiveEventBridge()
     }
 
@@ -458,9 +467,10 @@ final class WorkflowOrchestrator {
         state: ExecutableState,
         stageExec: StageExecution
     ) async -> Bool {
-        guard let agent = plan.agentBindings[task.agent] else {
+        guard let resolvedAgent = plan.agentBindings[task.agent] else {
             return false
         }
+        let agent = effectiveAgent(from: resolvedAgent)
 
         // Create AgentExecution lazily (ARCH-027)
         let agentExec = AgentExecution(
@@ -504,19 +514,64 @@ final class WorkflowOrchestrator {
         agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(inputData.keys).sorted())
         agentExec.inputBindingsJSON = buildInputBindings(for: task)
         agentExec.resolvedBackendProfileID = agent.backendProfileID
+        let inputArtifactPaths = gatherInputArtifactPaths(for: task)
 
-        // Build execution context — Proposal 013: use actual stage attempt number
+        // Proposal 018: Record the exact owner tuple
+        let ownerKey = InvocationOwnerKeyBuilder.build(
+            runID: run.id,
+            agentID: agent.id,
+            stageLineageID: stageExec.lineageID ?? stageExec.stageID,
+            taskName: task.task,
+            ownerExecutionLineageID: agentExec.id
+        )
+        agentExec.invocationOwnerKey = ownerKey
+
+        // Build execution context — Proposal 018: add lineage and owner IDs
+        let handoffPacket = buildHandoffPacket(
+            profileID: contextStrategyProfileID,
+            profile: contextStrategyProfile,
+            agent: agent,
+            task: task,
+            inputArtifacts: inputData,
+            inputArtifactPaths: inputArtifactPaths
+        )
+        let primaryExecutionBinding = strategyAdjustedBinding(
+            for: agent,
+            baseBinding: providerBindingsByAgentID[agent.id],
+            modelTier: contextStrategyProfile?.defaultModelTier
+        )
+        let primaryExecutionAgent = strategyAdjustedAgent(
+            from: agent,
+            binding: primaryExecutionBinding
+        )
+        applyStrategyExecutionMetadata(
+            to: agentExec,
+            handoffPacket: handoffPacket,
+            inputArtifacts: inputData,
+            profile: contextStrategyProfile,
+            modelTierUsed: resolvedModelTierUsed(
+                requestedTier: contextStrategyProfile?.defaultModelTier,
+                effectiveAgent: primaryExecutionAgent
+            )
+        )
         let execContext = ExecutionContext(
             workspace: currentWorkspace,
             projectRoot: preferredProjectRoot,
             stageID: state.id,
+            stageLineageID: stageExec.lineageID,
+            ownerExecutionLineageID: agentExec.id,
             iteration: currentIteration(for: state.id),
             attemptNumber: stageExec.attemptNumber,
             inputArtifacts: inputData,
+            inputArtifactPaths: inputArtifactPaths,
             variables: runtimeVariables,
             ideaBody: run.idea?.body ?? "",
-            providerBinding: providerBindingsByAgentID[agent.id],
-            catalog: catalog
+            providerBinding: primaryExecutionBinding,
+            catalog: catalog,
+            contextStrategyProfileID: contextStrategyProfileID,
+            strategyAssignmentMode: strategyAssignmentMode,
+            contextStrategyProfile: contextStrategyProfile,
+            handoffPacket: handoffPacket
         )
 
         // Proposal 007 REQ-008 / REQ-011: Route release agents through ReleaseOpsCoordinator
@@ -534,9 +589,59 @@ final class WorkflowOrchestrator {
         }
 
         // Execute off-MainActor, marshal results back
-        let result: AgentResult
+        var result: AgentResult
+        var finalModelTierUsed = resolvedModelTierUsed(
+            requestedTier: contextStrategyProfile?.defaultModelTier,
+            effectiveAgent: primaryExecutionAgent
+        )
+        var escalationCount = 0
+        var retryableEscalationCount = 0
         do {
-            result = try await executor.execute(task: task, agent: agent, context: execContext)
+            result = try await executor.execute(task: task, agent: primaryExecutionAgent, context: execContext)
+            if shouldEscalateStrategyExecution(
+                result: result,
+                profile: contextStrategyProfile
+            ) {
+                let escalatedBinding = strategyAdjustedBinding(
+                    for: agent,
+                    baseBinding: providerBindingsByAgentID[agent.id],
+                    modelTier: contextStrategyProfile?.escalationModelTier
+                )
+                let escalatedAgent = strategyAdjustedAgent(
+                    from: agent,
+                    binding: escalatedBinding
+                )
+                let escalatedContext = ExecutionContext(
+                    workspace: currentWorkspace,
+                    projectRoot: preferredProjectRoot,
+                    stageID: state.id,
+                    stageLineageID: stageExec.lineageID,
+                    ownerExecutionLineageID: agentExec.id,
+                    iteration: currentIteration(for: state.id),
+                    attemptNumber: stageExec.attemptNumber,
+                    inputArtifacts: inputData,
+                    inputArtifactPaths: inputArtifactPaths,
+                    variables: runtimeVariables,
+                    ideaBody: run.idea?.body ?? "",
+                    providerBinding: escalatedBinding,
+                    catalog: catalog,
+                    contextStrategyProfileID: contextStrategyProfileID,
+                    strategyAssignmentMode: strategyAssignmentMode,
+                    contextStrategyProfile: contextStrategyProfile,
+                    handoffPacket: handoffPacket
+                )
+                result = try await executor.execute(
+                    task: task,
+                    agent: escalatedAgent,
+                    context: escalatedContext
+                )
+                finalModelTierUsed = resolvedModelTierUsed(
+                    requestedTier: contextStrategyProfile?.escalationModelTier,
+                    effectiveAgent: escalatedAgent
+                )
+                escalationCount = 1
+                retryableEscalationCount = 1
+            }
         } catch {
             agentExec.status = .failed
             agentExec.completedAt = Date()
@@ -573,6 +678,31 @@ final class WorkflowOrchestrator {
             existing: agentExec.logSnippet,
             result: result.logSnippet
         )
+        finalizeStrategyExecutionMetadata(
+            on: agentExec,
+            modelTierUsed: finalModelTierUsed,
+            escalationCount: escalationCount,
+            retryableEscalationCount: retryableEscalationCount,
+            lazyEvidenceHitCount: result.lazyEvidenceArtifactHits.count
+        )
+        // Proposal 018: Record session lineage and disposition (REQ-012 §5.3)
+        agentExec.sessionLineageID = result.sessionLineageID
+        agentExec.sessionGenerationID = result.sessionGenerationID
+        agentExec.sessionReuseDisposition = result.sessionReuseDisposition
+        agentExec.sessionReuseScope = agent.sessionReuseScope
+        agentExec.sessionFamilyID = agent.sessionFamilyID
+        // sessionResetReason is set during reset flow, not here
+        if result.sessionReuseDisposition == .fresh_after_reset {
+            agentExec.sessionResetReason = "Session was reset before this invocation"
+        }
+        // PROD-001: Persist structured session receipt fields for receipt/report consumption.
+        // SessionReuseReceiptFields is the canonical receipt extension for session provenance.
+        if let receiptFieldsData = try? JSONEncoder().encode(
+            SessionReuseReceiptFields.from(execution: agentExec)
+        ) {
+            agentExec.compactionMetadataJSON = agentExec.compactionMetadataJSON ?? receiptFieldsData
+        }
+
         applyExecutionTruth(from: result, to: agentExec)
         // Record sessionID from the executor (§6.1)
         if let sessionID = result.sessionID {
@@ -609,6 +739,16 @@ final class WorkflowOrchestrator {
                 // Persist output envelopes as evidence
                 agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
 
+                // Proposal 018 REQ-010: Persist enriched session checkpoint AFTER validation
+                // so that persistEnrichedCheckpoint reads real outputEnvelopesJSON as
+                // the canonical lastValidatedAggregateStateJSON (§6.4).
+                if let checkpoint = result.sessionCheckpoint {
+                    try persistEnrichedCheckpoint(
+                        checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
+                        stageID: state.id, iteration: currentIteration(for: state.id), attemptNumber: stageExec.attemptNumber
+                    )
+                }
+
                 // Step 3: Check for validation failures
                 let failedResults = validationResults.values.filter { $0.status == OutputValidationStatus.failed }
                 if !failedResults.isEmpty {
@@ -626,6 +766,7 @@ final class WorkflowOrchestrator {
 
                     if let failureRecord {
                         agentExec.validationFailureJSON = try? JSONEncoder().encode(failureRecord)
+                        incrementContractFailureCount(on: agentExec)
                         _ = try ArtifactPersistenceOrderingPolicy.persistFailureEvidence(
                             failureRecord: failureRecord,
                             workspace: currentWorkspace,
@@ -739,6 +880,15 @@ final class WorkflowOrchestrator {
                     )
                     capturePersistedExecutionEvidence(from: artifacts, for: agentExec)
                     agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
+
+                    // Proposal 018 REQ-010: Persist enriched session checkpoint (non-success path).
+                    if let checkpoint = result.sessionCheckpoint {
+                        try? persistEnrichedCheckpoint(
+                            checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
+                            stageID: state.id, iteration: currentIteration(for: state.id), attemptNumber: stageExec.attemptNumber
+                        )
+                    }
+
                     persistStageFailureEvidence(
                         stageExec: stageExec,
                         failedAgentExec: agentExec,
@@ -773,6 +923,54 @@ final class WorkflowOrchestrator {
             agentExec.transcriptArtifactPath = artifact.filePath
             agentExec.transcriptPath = artifact.filePath
         }
+    }
+
+    /// REQ-010: Enrich a checkpoint with real artifact UUIDs and validated aggregate state,
+    /// then persist it. This is the single canonical path for checkpoint persistence,
+    /// ensuring consistency across success and non-success flows.
+    ///
+    /// - `artifacts`: persisted Artifact objects from the current execution (may be empty on failure paths)
+    /// - `agentExec`: the execution record; `outputEnvelopesJSON` is read as validated aggregate state
+    /// - `result`: the agent result containing the raw checkpoint from the executor
+    @discardableResult
+    private func persistEnrichedCheckpoint(
+        checkpoint: AgentSessionCheckpoint,
+        artifacts: [Artifact],
+        agentExec: AgentExecution,
+        stageID: String,
+        iteration: Int,
+        attemptNumber: Int
+    ) throws -> Artifact {
+        let artifactIDs = artifacts.map(\.id)
+
+        // Build validated aggregate state from output envelopes if available.
+        // OutputEnvelopesJSON is the real validation truth persisted by the contract layer.
+        let validatedState: Data? = agentExec.outputEnvelopesJSON ?? checkpoint.lastValidatedAggregateStateJSON
+
+        let enrichedCheckpoint = AgentSessionCheckpoint(
+            machineSummary: checkpoint.machineSummary,
+            nextSteps: checkpoint.nextSteps,
+            durableLearnings: checkpoint.durableLearnings,
+            unresolvedBlockers: checkpoint.unresolvedBlockers,
+            openDecisions: checkpoint.openDecisions,
+            openQuestions: checkpoint.openQuestions,
+            unresolvedConstraints: checkpoint.unresolvedConstraints,
+            selectedArtifactReferences: artifactIDs.isEmpty ? checkpoint.selectedArtifactReferences : artifactIDs,
+            lastValidatedAggregateStateJSON: validatedState,
+            ownerAndBindingContextJSON: checkpoint.ownerAndBindingContextJSON,
+            scopeContextJSON: checkpoint.scopeContextJSON,
+            compactedConversationStateJSON: checkpoint.compactedConversationStateJSON
+        )
+        let checkpointArtifact = try artifactManager.persistSessionCheckpoint(
+            checkpoint: enrichedCheckpoint,
+            agentExecution: agentExec,
+            workspace: currentWorkspace,
+            stageID: stageID,
+            iteration: iteration,
+            attemptNumber: attemptNumber
+        )
+        agentExec.rehydratedFromCheckpointArtifactID = checkpointArtifact.id
+        return checkpointArtifact
     }
 
     private func hasPersistedTranscriptEvidence(for agentExec: AgentExecution) -> Bool {
@@ -1069,7 +1267,8 @@ final class WorkflowOrchestrator {
         var taskAgentPairs: [(task: AgentTask, agent: ResolvedAgent, agentExec: AgentExecution)] = []
 
         for task in tasks {
-            guard let agent = plan.agentBindings[task.agent] else { continue }
+            guard let resolvedAgent = plan.agentBindings[task.agent] else { continue }
+            let agent = effectiveAgent(from: resolvedAgent)
 
             let agentExec = AgentExecution(
                 agentID: agent.id,
@@ -1121,18 +1320,64 @@ final class WorkflowOrchestrator {
                 }
                 let task = pair.task
                 let agent = pair.agent
-                // Proposal 013: use actual stage attempt number
+                let inputArtifactPaths = gatherInputArtifactPaths(for: task)
+
+                // Proposal 018: Record the exact owner tuple
+                let ownerKey = InvocationOwnerKeyBuilder.build(
+                    runID: run.id,
+                    agentID: agent.id,
+                    stageLineageID: stageExec.lineageID ?? stageExec.stageID,
+                    taskName: task.task,
+                    ownerExecutionLineageID: pair.agentExec.id
+                )
+                pair.agentExec.invocationOwnerKey = ownerKey
+
+                // Build execution context — Proposal 018: add lineage and owner IDs
+                let handoffPacket = buildHandoffPacket(
+                    profileID: contextStrategyProfileID,
+                    profile: contextStrategyProfile,
+                    agent: agent,
+                    task: task,
+                    inputArtifacts: gatheredInputs,
+                    inputArtifactPaths: inputArtifactPaths
+                )
+                let primaryExecutionBinding = strategyAdjustedBinding(
+                    for: agent,
+                    baseBinding: providerBindingsByAgentID[agent.id],
+                    modelTier: contextStrategyProfile?.defaultModelTier
+                )
+                let primaryExecutionAgent = strategyAdjustedAgent(
+                    from: agent,
+                    binding: primaryExecutionBinding
+                )
+                self.applyStrategyExecutionMetadata(
+                    to: pair.agentExec,
+                    handoffPacket: handoffPacket,
+                    inputArtifacts: gatheredInputs,
+                    profile: self.contextStrategyProfile,
+                    modelTierUsed: resolvedModelTierUsed(
+                        requestedTier: contextStrategyProfile?.defaultModelTier,
+                        effectiveAgent: primaryExecutionAgent
+                    )
+                )
                 let execContext = ExecutionContext(
                     workspace: currentWorkspace,
                     projectRoot: preferredProjectRoot,
                     stageID: state.id,
+                    stageLineageID: stageExec.lineageID,
+                    ownerExecutionLineageID: pair.agentExec.id,
                     iteration: currentIteration(for: state.id),
                     attemptNumber: stageExec.attemptNumber,
                     inputArtifacts: gatheredInputs,
+                    inputArtifactPaths: inputArtifactPaths,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? "",
-                    providerBinding: providerBindingsByAgentID[agent.id],
-                    catalog: catalog
+                    providerBinding: primaryExecutionBinding,
+                    catalog: catalog,
+                    contextStrategyProfileID: contextStrategyProfileID,
+                    strategyAssignmentMode: strategyAssignmentMode,
+                    contextStrategyProfile: contextStrategyProfile,
+                    handoffPacket: handoffPacket
                 )
                 let executor = self.executor
                 pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(gatheredInputs.keys).sorted())
@@ -1142,7 +1387,7 @@ final class WorkflowOrchestrator {
                     do {
                         let result = try await executor.execute(
                             task: task,
-                            agent: agent,
+                            agent: primaryExecutionAgent,
                             context: execContext
                         )
                         return (index, result)
@@ -1198,6 +1443,12 @@ final class WorkflowOrchestrator {
             agentExec.configuredProviderID = result.configuredProviderID
             agentExec.adapterVersion = result.adapterVersion
             agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
+            
+            // Proposal 018: Record session lineage and disposition
+            agentExec.sessionLineageID = result.sessionLineageID
+            agentExec.sessionGenerationID = result.sessionGenerationID
+            agentExec.sessionReuseDisposition = result.sessionReuseDisposition
+
             applyExecutionTruth(from: result, to: agentExec)
             if let sessionID = result.sessionID {
                 agentExec.providerSessionID = sessionID
@@ -1206,6 +1457,13 @@ final class WorkflowOrchestrator {
             agentExec.logSnippet = mergedLogSnippet(
                 existing: agentExec.logSnippet,
                 result: result.logSnippet
+            )
+            finalizeStrategyExecutionMetadata(
+                on: agentExec,
+                modelTierUsed: agentExec.modelTierUsed ?? self.contextStrategyProfile?.defaultModelTier ?? "bound_runtime",
+                escalationCount: 0,
+                retryableEscalationCount: 0,
+                lazyEvidenceHitCount: result.lazyEvidenceArtifactHits.count
             )
 
             do {
@@ -1240,6 +1498,14 @@ final class WorkflowOrchestrator {
                         agentExec.transcriptArtifactPath = artifact.filePath
                         agentExec.transcriptPath = artifact.filePath
                     }
+                }
+
+                // Proposal 018 REQ-010: Persist enriched session checkpoint (parallel agent path).
+                if let checkpoint = result.sessionCheckpoint {
+                    try persistEnrichedCheckpoint(
+                        checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
+                        stageID: state.id, iteration: currentIteration(for: state.id), attemptNumber: stageExec.attemptNumber
+                    )
                 }
 
                 if let cost = result.costCents {
@@ -1322,6 +1588,97 @@ final class WorkflowOrchestrator {
             artifactRoot: workspace.artifactRoot,
             worktreeRoot: run.worktreeRoot.flatMap { URL(fileURLWithPath: $0) }
         )
+    }
+
+    private func buildHandoffPacket(
+        profileID: String?,
+        profile: ContextStrategyProfile?,
+        agent: ResolvedAgent,
+        task: AgentTask,
+        inputArtifacts: [String: Data],
+        inputArtifactPaths: [String: String]
+    ) -> HandoffPacket? {
+        guard let profileID,
+              let profile else {
+            return nil
+        }
+
+        let previewContext = ExecutionContext(
+            workspace: currentWorkspace,
+            projectRoot: preferredProjectRoot,
+            stageID: currentStateID,
+            ownerExecutionLineageID: UUID(),
+            iteration: currentIteration(for: currentStateID),
+            attemptNumber: 1,
+            inputArtifacts: inputArtifacts,
+            inputArtifactPaths: inputArtifactPaths,
+            variables: runtimeVariables,
+            ideaBody: run.idea?.body ?? "",
+            providerBinding: providerBindingsByAgentID[agent.id],
+            catalog: catalog,
+            contextStrategyProfileID: profileID,
+            strategyAssignmentMode: strategyAssignmentMode,
+            contextStrategyProfile: profile,
+            handoffPacket: nil
+        )
+
+        return handoffCompiler.compile(
+            profileID: profileID,
+            profile: profile,
+            agent: agent,
+            task: task,
+            context: previewContext,
+            promotedArtifacts: promotedHandoffArtifacts
+        )
+    }
+
+    private func effectiveAgent(from agent: ResolvedAgent) -> ResolvedAgent {
+        let effectiveScope = Self.effectiveSessionReuseScope(for: agent, profile: contextStrategyProfile)
+        guard effectiveScope != agent.sessionReuseScope else {
+            return agent
+        }
+
+        return ResolvedAgent(
+            id: agent.id,
+            title: agent.title,
+            mode: agent.mode,
+            backendProfileID: agent.backendProfileID,
+            provider: agent.provider,
+            model: agent.model,
+            effort: agent.effort,
+            maxTurns: agent.maxTurns,
+            temperature: agent.temperature,
+            permissionProfile: agent.permissionProfile,
+            skillRef: agent.skillRef,
+            skillRole: agent.skillRole,
+            prompt: agent.prompt,
+            outputContract: agent.outputContract,
+            requiresHumanApproval: agent.requiresHumanApproval,
+            inputs: agent.inputs,
+            outputs: agent.outputs,
+            worktreeWriteEnabled: agent.worktreeWriteEnabled,
+            sessionReuseScope: effectiveScope,
+            sessionFamilyID: agent.sessionFamilyID
+        )
+    }
+
+    static func effectiveSessionReuseScope(
+        for agent: ResolvedAgent,
+        profile: ContextStrategyProfile?
+    ) -> SessionReuseScope {
+        guard
+            let rule = profile?.agents[agent.id] ?? profile?.agents["*"],
+            let continuityMode = rule.continuityMode
+        else {
+            return agent.sessionReuseScope
+        }
+
+        switch continuityMode {
+        case .familyWithinRun:
+            return .same_agent_family_within_run
+        case .none:
+            return .none
+        }
     }
 
     private var preferredProjectRoot: URL? {
@@ -1449,6 +1806,20 @@ final class WorkflowOrchestrator {
         }
 
         return inputs
+    }
+
+    private func gatherInputArtifactPaths(for task: AgentTask) -> [String: String] {
+        guard let inputNames = task.inputs, !inputNames.isEmpty else { return [:] }
+        let artifacts = persistedArtifacts()
+        var paths: [String: String] = [:]
+
+        for name in inputNames {
+            if let artifact = artifacts.last(where: { $0.name == name }) {
+                paths[name] = artifact.filePath
+            }
+        }
+
+        return paths
     }
 
     /// P005-OPS §9.3: Build structured input bindings with producing agent traceability.
@@ -1840,6 +2211,61 @@ final class WorkflowOrchestrator {
                 liveTimeline.removeFirst(liveTimeline.count - 40)
             }
         }
+        
+        // Proposal 018: Update session audit trail on major events
+        if event.type == .sessionStarted || event.type == .sessionClosed || event.type == .error {
+            updateSessionAuditTrail()
+        }
+    }
+
+    /// Proposal 018: Final audit trail update on run completion.
+    /// Also generates KPI export and report bridge data (§8, REQ-013, PROD-001).
+    func updateSessionAuditTrailOnCompletion() {
+        updateSessionAuditTrail()
+        // REQ-013: Export KPIs on completion
+        if let kpiJSON = SessionReuseKPIExporter.exportJSON(for: run.id, context: modelContext) {
+            run.sessionKPIExportJSON = kpiJSON
+        }
+        // PROD-001: Generate structured lineage report for run-level reporting.
+        // SessionLineageReportBridge is the production consumer of lineage data
+        // for run reports and export surfaces.
+        if let reportJSON = SessionLineageReportBridge.generateReportJSON(for: run.id, context: modelContext) {
+            run.sessionLineageReportJSON = reportJSON
+        }
+    }
+
+    /// Proposal 018: Aggregates session events into a derived audit trail on the Run.
+    private func updateSessionAuditTrail() {
+        // Fetch all lineage/events for this run
+        let runID = run.id
+        let descriptor = FetchDescriptor<AgentSessionLineage>(
+            predicate: #Predicate<AgentSessionLineage> { $0.runID == runID }
+        )
+        
+        guard let lineages = try? modelContext.fetch(descriptor) else { return }
+        
+        struct AuditEntry: Codable {
+            let agentID: String
+            let eventType: String
+            let timestamp: Date
+            let generation: Int
+        }
+        
+        var allEntries: [AuditEntry] = []
+        for lineage in lineages {
+            for event in lineage.events {
+                let gen = lineage.generations.first(where: { $0.id == event.generationID })?.generation ?? 0
+                allEntries.append(AuditEntry(
+                    agentID: lineage.agentID,
+                    eventType: event.eventType.rawValue,
+                    timestamp: event.recordedAt,
+                    generation: gen
+                ))
+            }
+        }
+        
+        allEntries.sort { $0.timestamp < $1.timestamp }
+        run.sessionEventAuditDerivedJSON = try? JSONEncoder().encode(allEntries)
     }
 
     private func logSnippet(for event: ExecutionEvent, existing: String?) -> String {
@@ -1954,6 +2380,178 @@ final class WorkflowOrchestrator {
         return (try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)) ?? [:]
     }
 
+    private static func decodeContextStrategyProfileID(from run: Run) -> String? {
+        let profileID = run.contextStrategyProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return profileID.isEmpty ? nil : profileID
+    }
+
+    private static func decodeStrategyAssignmentMode(from run: Run) -> String? {
+        let mode = run.strategyAssignmentMode.trimmingCharacters(in: .whitespacesAndNewlines)
+        return mode.isEmpty ? nil : mode
+    }
+
+    private static func decodeContextStrategyProfile(from run: Run) -> ContextStrategyProfile? {
+        guard let json = run.contextStrategySnapshotJSON else { return nil }
+        if let profile = try? JSONDecoder().decode(ContextStrategyProfile.self, from: json) {
+            return profile
+        }
+        if let stewardProfile = try? JSONDecoder().decode(StewardContextStrategyProfile.self, from: json) {
+            let profileID = decodeContextStrategyProfileID(from: run) ?? "current_mixed_baseline"
+            return stewardProfile.runtimeProfile(profileID: profileID)
+        }
+        return nil
+    }
+
+    private static func decodePromotedHandoffArtifacts(from run: Run) -> [String] {
+        guard let data = run.promotedHandoffArtifactsJSON,
+              let names = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return names
+    }
+
+    private func strategyAdjustedBinding(
+        for agent: ResolvedAgent,
+        baseBinding: ResolvedProviderBinding?,
+        modelTier: String?
+    ) -> ResolvedProviderBinding? {
+        guard let baseBinding else { return nil }
+        guard let resolvedModel = resolveStrategyModel(for: agent, baseBinding: baseBinding, modelTier: modelTier) else {
+            return baseBinding
+        }
+
+        return ResolvedProviderBinding(
+            agentID: baseBinding.agentID,
+            backendProfileID: baseBinding.backendProfileID,
+            configuredProviderID: baseBinding.configuredProviderID,
+            providerFamily: baseBinding.providerFamily,
+            providerIdentifier: baseBinding.providerIdentifier,
+            model: resolvedModel,
+            effort: baseBinding.effort,
+            transport: baseBinding.transport,
+            adapterVersion: baseBinding.adapterVersion
+        )
+    }
+
+    private func strategyAdjustedAgent(
+        from agent: ResolvedAgent,
+        binding: ResolvedProviderBinding?
+    ) -> ResolvedAgent {
+        let resolvedModel = binding?.model ?? agent.model
+        guard resolvedModel != agent.model else { return agent }
+
+        return ResolvedAgent(
+            id: agent.id,
+            title: agent.title,
+            mode: agent.mode,
+            backendProfileID: agent.backendProfileID,
+            provider: agent.provider,
+            model: resolvedModel,
+            effort: agent.effort,
+            maxTurns: agent.maxTurns,
+            temperature: agent.temperature,
+            permissionProfile: agent.permissionProfile,
+            skillRef: agent.skillRef,
+            skillRole: agent.skillRole,
+            prompt: agent.prompt,
+            outputContract: agent.outputContract,
+            requiresHumanApproval: agent.requiresHumanApproval,
+            inputs: agent.inputs,
+            outputs: agent.outputs,
+            worktreeWriteEnabled: agent.worktreeWriteEnabled,
+            sessionReuseScope: agent.sessionReuseScope,
+            sessionFamilyID: agent.sessionFamilyID
+        )
+    }
+
+    private func resolveStrategyModel(
+        for agent: ResolvedAgent,
+        baseBinding: ResolvedProviderBinding?,
+        modelTier: String?
+    ) -> String? {
+        let normalizedTier = modelTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let normalizedTier, !normalizedTier.isEmpty else {
+            return baseBinding?.model ?? agent.model
+        }
+
+        let family = baseBinding.flatMap { ProviderFamily(rawValue: $0.providerFamily) }
+            ?? ProviderFamily.from(runtimeIdentifier: agent.provider)
+
+        switch (family, normalizedTier) {
+        case (.codex?, "fast"):
+            return "gpt-5.3-codex-spark"
+        case (.codex?, "frontier"):
+            return "GPT-5.4"
+        case (.claude?, "fast"):
+            return "claude-sonnet-4"
+        case (.claude?, "frontier"):
+            return "claude-opus-4.6"
+        case (.gemini?, "fast"):
+            return "gemini-2.5-flash"
+        case (.gemini?, "frontier"):
+            return "gemini-2.5-pro"
+        default:
+            return baseBinding?.model ?? agent.model
+        }
+    }
+
+    private func resolvedModelTierUsed(
+        requestedTier: String?,
+        effectiveAgent: ResolvedAgent
+    ) -> String {
+        let normalizedTier = requestedTier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedTier, !normalizedTier.isEmpty {
+            return normalizedTier
+        }
+        return effectiveAgent.model.isEmpty ? "bound_runtime" : "bound_runtime"
+    }
+
+    private func shouldEscalateStrategyExecution(
+        result: AgentResult,
+        profile: ContextStrategyProfile?
+    ) -> Bool {
+        guard !result.succeeded else { return false }
+        guard let profile else { return false }
+
+        let defaultTier = profile.defaultModelTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let escalationTier = profile.escalationModelTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let escalationTier, !escalationTier.isEmpty, escalationTier != defaultTier else {
+            return false
+        }
+
+        if result.canonicalOutcome == .failedAfterOutputValidation {
+            return false
+        }
+        if let error = result.errorMessage?.lowercased() {
+            if error.contains("required outputs missing")
+                || error.contains("output contract")
+                || error.contains("not valid json")
+                || error.contains("missing required field") {
+                return false
+            }
+            if error.contains("timed out")
+                || error.contains("timeout")
+                || error.contains("session not found")
+                || error.contains("-1001") {
+                return true
+            }
+        }
+
+        switch result.transportErrorKind {
+        case .timeout, .stream, .provider:
+            return true
+        default:
+            break
+        }
+
+        switch result.canonicalOutcome {
+        case .timedOutBeforeOutput, .timedOutAfterOutput, .completedWithTransportError:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func mergedLogSnippet(existing: String?, result: String?) -> String? {
         let existing = existing?.trimmingCharacters(in: .whitespacesAndNewlines)
         let result = result?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1966,6 +2564,113 @@ final class WorkflowOrchestrator {
 
         guard let result, !result.isEmpty else { return existing }
         return result
+    }
+
+    private func applyStrategyExecutionMetadata(
+        to agentExec: AgentExecution,
+        handoffPacket: HandoffPacket?,
+        inputArtifacts: [String: Data],
+        profile: ContextStrategyProfile?,
+        modelTierUsed: String? = nil
+    ) {
+        let totalInputBytes = inputArtifacts.values.reduce(0) { $0 + $1.count }
+        let summary = handoffPacket?.summaryMetrics
+        let payloadBytesBeforeStrategy = summary?.payloadBytesBeforeStrategy ?? totalInputBytes
+        let payloadBytesAfterStrategy = summary?.payloadBytesAfterStrategy ?? totalInputBytes
+        let payloadReductionBytes = summary?.payloadReductionBytes ?? 0
+        let cacheEffectiveness = payloadBytesBeforeStrategy > 0
+            ? Double(payloadReductionBytes) / Double(payloadBytesBeforeStrategy)
+            : nil
+        agentExec.inputPayloadBytes = summary?.payloadBytesAfterStrategy ?? totalInputBytes
+        agentExec.handoffMode = handoffPacket?.mode.rawValue ?? profile?.defaultHandoffMode.rawValue
+        agentExec.modelTierUsed = modelTierUsed ?? profile?.defaultModelTier ?? "bound_runtime"
+        agentExec.promotedArtifactNamesJSON = encodeArtifactNameList(handoffPacket?.promotedArtifacts ?? [])
+
+        let signals = StrategyLimitPressureSignals(
+            inputPayloadBytes: summary?.payloadBytesAfterStrategy ?? totalInputBytes,
+            payloadBytesBeforeStrategy: payloadBytesBeforeStrategy,
+            payloadBytesAfterStrategy: payloadBytesAfterStrategy,
+            payloadReductionBytes: payloadReductionBytes,
+            mandatoryArtifactCount: summary?.mandatoryArtifactCount ?? inputArtifacts.count,
+            summarizedArtifactCount: summary?.summarizedArtifactCount ?? 0,
+            lazyArtifactCount: summary?.lazyArtifactCount ?? 0,
+            lazyEvidenceHitCount: 0,
+            lazyEvidenceHitRate: summary?.lazyArtifactCount == 0 ? 0.0 : 0.0,
+            compactionCount: summary?.compactionCount ?? 0,
+            cacheEffectiveness: cacheEffectiveness,
+            compactionChurnCount: summary?.compactionCount ?? 0,
+            escalationCount: 0,
+            retryableEscalationCount: 0,
+            contractFailureCount: 0,
+            operatorPromotedArtifactCount: handoffPacket?.promotedArtifacts.count ?? 0
+        )
+        agentExec.limitPressureSignalsJSON = try? JSONEncoder().encode(signals)
+    }
+
+    private func finalizeStrategyExecutionMetadata(
+        on agentExec: AgentExecution,
+        modelTierUsed: String,
+        escalationCount: Int,
+        retryableEscalationCount: Int,
+        lazyEvidenceHitCount: Int
+    ) {
+        agentExec.modelTierUsed = modelTierUsed
+        guard
+            let data = agentExec.limitPressureSignalsJSON,
+            let signals = try? JSONDecoder().decode(StrategyLimitPressureSignals.self, from: data)
+        else {
+            return
+        }
+
+        let updated = StrategyLimitPressureSignals(
+            inputPayloadBytes: signals.inputPayloadBytes,
+            payloadBytesBeforeStrategy: signals.payloadBytesBeforeStrategy,
+            payloadBytesAfterStrategy: signals.payloadBytesAfterStrategy,
+            payloadReductionBytes: signals.payloadReductionBytes,
+            mandatoryArtifactCount: signals.mandatoryArtifactCount,
+            summarizedArtifactCount: signals.summarizedArtifactCount,
+            lazyArtifactCount: signals.lazyArtifactCount,
+            lazyEvidenceHitCount: lazyEvidenceHitCount,
+            lazyEvidenceHitRate: signals.lazyArtifactCount > 0
+                ? Double(lazyEvidenceHitCount) / Double(signals.lazyArtifactCount)
+                : 0.0,
+            compactionCount: signals.compactionCount,
+            cacheEffectiveness: signals.cacheEffectiveness,
+            compactionChurnCount: signals.compactionChurnCount,
+            escalationCount: escalationCount,
+            retryableEscalationCount: retryableEscalationCount,
+            contractFailureCount: signals.contractFailureCount,
+            operatorPromotedArtifactCount: signals.operatorPromotedArtifactCount
+        )
+        agentExec.limitPressureSignalsJSON = try? JSONEncoder().encode(updated)
+    }
+
+    private func incrementContractFailureCount(on agentExec: AgentExecution) {
+        guard
+            let data = agentExec.limitPressureSignalsJSON,
+            var signals = try? JSONDecoder().decode(StrategyLimitPressureSignals.self, from: data)
+        else {
+            return
+        }
+        signals = StrategyLimitPressureSignals(
+            inputPayloadBytes: signals.inputPayloadBytes,
+            payloadBytesBeforeStrategy: signals.payloadBytesBeforeStrategy,
+            payloadBytesAfterStrategy: signals.payloadBytesAfterStrategy,
+            payloadReductionBytes: signals.payloadReductionBytes,
+            mandatoryArtifactCount: signals.mandatoryArtifactCount,
+            summarizedArtifactCount: signals.summarizedArtifactCount,
+            lazyArtifactCount: signals.lazyArtifactCount,
+            lazyEvidenceHitCount: signals.lazyEvidenceHitCount,
+            lazyEvidenceHitRate: signals.lazyEvidenceHitRate,
+            compactionCount: signals.compactionCount,
+            cacheEffectiveness: signals.cacheEffectiveness,
+            compactionChurnCount: signals.compactionChurnCount,
+            escalationCount: signals.escalationCount,
+            retryableEscalationCount: signals.retryableEscalationCount,
+            contractFailureCount: signals.contractFailureCount + 1,
+            operatorPromotedArtifactCount: signals.operatorPromotedArtifactCount
+        )
+        agentExec.limitPressureSignalsJSON = try? JSONEncoder().encode(signals)
     }
 
     private func encodeArtifactNameList(_ names: [String]) -> Data? {

@@ -541,6 +541,7 @@ struct LiveGooseConnectionProofTests {
         let executionContext = ExecutionContext(
             workspace: workspace,
             stageID: "proof_stage",
+            ownerExecutionLineageID: UUID(),
             iteration: 1,
             attemptNumber: 1,
             inputArtifacts: [:],

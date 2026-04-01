@@ -176,6 +176,7 @@ final class StewardAnalysisService {
             let context = ExecutionContext(
                 workspace: stewardWorkspace,
                 stageID: "steward_analysis",
+                ownerExecutionLineageID: analysisID,
                 iteration: 1,
                 attemptNumber: 1,
                 inputArtifacts: stewardInputs,
@@ -226,6 +227,7 @@ final class StewardAnalysisService {
             let context = ExecutionContext(
                 workspace: auditWorkspace,
                 stageID: "steward_audit",
+                ownerExecutionLineageID: analysisID,
                 iteration: 1,
                 attemptNumber: 1,
                 inputArtifacts: auditorInputs,

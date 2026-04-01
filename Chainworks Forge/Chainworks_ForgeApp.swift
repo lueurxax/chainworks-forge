@@ -140,6 +140,10 @@ struct Chainworks_ForgeApp: App {
             BenchmarkExecutionRecord.self,
             BenchmarkPair.self,
             MVPSignOffDecisionSnapshot.self,
+            // Proposal 018: Agent Session Lineage
+            AgentSessionLineage.self,
+            AgentSessionGeneration.self,
+            AgentSessionEvent.self,
         ])
         let modelConfiguration = ModelConfiguration(
             schema: schema,

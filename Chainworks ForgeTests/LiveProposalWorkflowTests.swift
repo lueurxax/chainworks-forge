@@ -200,7 +200,13 @@ struct LiveProposalWorkflowTests {
                 ExecutionEvent(type: .finalOutput, timestamp: Date(), detail: "Done")
             ],
             toolCalls: [
-                ToolCallRecord(toolName: "read_file", startedAt: Date(), completedAt: Date(), succeeded: true)
+                ToolCallRecord(
+                    toolName: "read_file",
+                    rawPayload: "{}",
+                    startedAt: Date(),
+                    completedAt: Date(),
+                    succeeded: true
+                )
             ],
             finalContent: "Test output",
             succeeded: true,
@@ -263,5 +269,43 @@ struct LiveProposalWorkflowTests {
         #expect(result.toolCalls.first?.toolName == "test_tool")
         #expect(result.finalContent == "Done")
         #expect(events.count >= 6)
+    }
+
+    @Test("Transcript preserves full text chunk detail instead of truncating to preview")
+    func transcriptPreservesFullTextChunkDetail() async throws {
+        let bridge = ExecutionEventBridge()
+        let longChunk = String(repeating: "refine-proposal-context ", count: 20)
+
+        let stream = AsyncThrowingStream<GooseStreamEvent, Error> { continuation in
+            continuation.yield(.sessionStarted(raw: "{}"))
+            continuation.yield(.textChunk(text: longChunk))
+            continuation.yield(.sessionClosed(raw: "{}"))
+            continuation.finish()
+        }
+
+        _ = try await bridge.processStream(stream) { _ in }
+
+        let receipt = ExecutionReceiptBuilder.buildReceipt(
+            agentID: "proposal_writer",
+            sessionID: "session-123",
+            stageID: "state_5_proposal_refined",
+            iteration: 1,
+            attemptNumber: 1,
+            startedAt: Date(),
+            completedAt: Date().addingTimeInterval(1),
+            events: bridge.eventLog,
+            toolCalls: bridge.toolCalls,
+            finalContent: nil,
+            succeeded: true,
+            errorMessage: nil,
+            provider: "test_provider",
+            model: "test_model",
+            effort: "high"
+        )
+
+        let transcriptData = try #require(receipt["proposal_writer_transcript.md"])
+        let transcriptText = try #require(String(data: transcriptData, encoding: .utf8))
+
+        #expect(transcriptText.contains(longChunk))
     }
 }

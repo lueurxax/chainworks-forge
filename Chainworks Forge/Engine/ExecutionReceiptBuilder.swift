@@ -29,13 +29,16 @@ struct ExecutionReceiptBuilder: Sendable {
         errorMessage: String?,
         provider: String,
         model: String,
-        effort: String
+        effort: String,
+        sessionReuseDisposition: String? = nil,
+        sessionReuseScope: String? = nil,
+        sessionFamilyID: String? = nil
     ) -> [String: Data] {
         var artifacts: [String: Data] = [:]
 
-        // 1. Structured receipt (JSON)
+        // 1. Structured receipt (JSON) — Proposal 018: includes session provenance
         let receipt = ExecutionReceipt(
-            receiptVersion: "1.0",
+            receiptVersion: "1.1",
             agentID: agentID,
             sessionID: sessionID,
             stageID: stageID,
@@ -58,7 +61,10 @@ struct ExecutionReceiptBuilder: Sendable {
                     succeeded: tc.succeeded ?? false
                 )
             },
-            eventCount: events.count
+            eventCount: events.count,
+            sessionReuseDisposition: sessionReuseDisposition,
+            sessionReuseScope: sessionReuseScope,
+            sessionFamilyID: sessionFamilyID
         )
 
         let encoder = JSONEncoder()
@@ -170,6 +176,10 @@ struct ExecutionReceipt: Codable, Sendable {
     let toolCallCount: Int
     let toolCalls: [ReceiptToolCall]
     let eventCount: Int
+    // Proposal 018: Session provenance fields for receipt consumers (REQ-006, PROD-001)
+    let sessionReuseDisposition: String?
+    let sessionReuseScope: String?
+    let sessionFamilyID: String?
 
     enum CodingKeys: String, CodingKey {
         case receiptVersion = "receipt_version"
@@ -187,6 +197,9 @@ struct ExecutionReceipt: Codable, Sendable {
         case toolCallCount = "tool_call_count"
         case toolCalls = "tool_calls"
         case eventCount = "event_count"
+        case sessionReuseDisposition = "session_reuse_disposition"
+        case sessionReuseScope = "session_reuse_scope"
+        case sessionFamilyID = "session_family_id"
     }
 }
 

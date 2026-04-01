@@ -68,6 +68,20 @@ import SwiftData
     var releaseTargetID: String?
     var releaseMode: String?
 
+    // Proposal 018: Derived session event audit trail
+    var sessionEventAuditDerivedJSON: Data?
+    // Proposal 018 §8: Session reuse KPI export (REQ-013)
+    var sessionKPIExportJSON: Data?
+    // Proposal 018: Structured lineage report for run reports (PROD-001)
+    var sessionLineageReportJSON: Data?
+
+    // Proposal 019: Context strategy experiment metadata (immutable assignment + snapshot)
+    var contextStrategyProfileID: String = ""
+    var strategyAssignmentMode: String = "default"
+    var strategyRecommendationState: String = "not_evaluated"
+    var contextStrategySnapshotJSON: Data?
+    var promotedHandoffArtifactsJSON: Data?
+
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?
 
@@ -102,7 +116,12 @@ import SwiftData
         catalogSnapshotJSON: Data,
         workspaceRoot: String = "",
         artifactRoot: String = "",
-        planCompilerVersion: Int = 0
+        planCompilerVersion: Int = 0,
+        contextStrategyProfileID: String = "",
+        strategyAssignmentMode: String = "default",
+        strategyRecommendationState: String = "not_evaluated",
+        contextStrategySnapshotJSON: Data? = nil,
+        promotedHandoffArtifactsJSON: Data? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -119,6 +138,11 @@ import SwiftData
         self.workspaceRoot = workspaceRoot
         self.artifactRoot = artifactRoot
         self.planCompilerVersion = planCompilerVersion
+        self.contextStrategyProfileID = contextStrategyProfileID
+        self.strategyAssignmentMode = strategyAssignmentMode
+        self.strategyRecommendationState = strategyRecommendationState
+        self.contextStrategySnapshotJSON = contextStrategySnapshotJSON
+        self.promotedHandoffArtifactsJSON = promotedHandoffArtifactsJSON
     }
 }
 

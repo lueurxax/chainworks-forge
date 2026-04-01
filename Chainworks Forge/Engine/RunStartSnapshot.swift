@@ -9,6 +9,37 @@ struct RunStartSnapshot: Sendable {
     let frozenWorkspaceRootPath: String?
     let deliveryConfiguration: DeliveryConfiguration?
     let deliveryPreflightJSON: Data?
+    let contextStrategyProfileID: String?
+    let strategyAssignmentMode: String?
+    let strategyRecommendationState: String?
+    let contextStrategySnapshotJSON: Data?
+    let promotedHandoffArtifactsJSON: Data?
+
+    init(
+        providerBindingSnapshotJSON: Data? = nil,
+        bindingProvenanceJSON: Data? = nil,
+        startOptionsJSON: Data? = nil,
+        frozenWorkspaceRootPath: String? = nil,
+        deliveryConfiguration: DeliveryConfiguration? = nil,
+        deliveryPreflightJSON: Data? = nil,
+        contextStrategyProfileID: String? = nil,
+        strategyAssignmentMode: String? = nil,
+        strategyRecommendationState: String? = nil,
+        contextStrategySnapshotJSON: Data? = nil,
+        promotedHandoffArtifactsJSON: Data? = nil
+    ) {
+        self.providerBindingSnapshotJSON = providerBindingSnapshotJSON
+        self.bindingProvenanceJSON = bindingProvenanceJSON
+        self.startOptionsJSON = startOptionsJSON
+        self.frozenWorkspaceRootPath = frozenWorkspaceRootPath
+        self.deliveryConfiguration = deliveryConfiguration
+        self.deliveryPreflightJSON = deliveryPreflightJSON
+        self.contextStrategyProfileID = contextStrategyProfileID
+        self.strategyAssignmentMode = strategyAssignmentMode
+        self.strategyRecommendationState = strategyRecommendationState
+        self.contextStrategySnapshotJSON = contextStrategySnapshotJSON
+        self.promotedHandoffArtifactsJSON = promotedHandoffArtifactsJSON
+    }
 
     static let empty = RunStartSnapshot(
         providerBindingSnapshotJSON: nil,
@@ -16,7 +47,12 @@ struct RunStartSnapshot: Sendable {
         startOptionsJSON: nil,
         frozenWorkspaceRootPath: nil,
         deliveryConfiguration: nil,
-        deliveryPreflightJSON: nil
+        deliveryPreflightJSON: nil,
+        contextStrategyProfileID: nil,
+        strategyAssignmentMode: nil,
+        strategyRecommendationState: nil,
+        contextStrategySnapshotJSON: nil,
+        promotedHandoffArtifactsJSON: nil
     )
 
     func apply(to run: Run) {
@@ -25,6 +61,11 @@ struct RunStartSnapshot: Sendable {
         run.startOptionsJSON = startOptionsJSON
         run.frozenWorkspaceRootPath = frozenWorkspaceRootPath
         run.deliveryPreflightJSON = deliveryPreflightJSON
+        run.contextStrategyProfileID = contextStrategyProfileID ?? run.contextStrategyProfileID
+        run.strategyAssignmentMode = strategyAssignmentMode ?? run.strategyAssignmentMode
+        run.strategyRecommendationState = strategyRecommendationState ?? run.strategyRecommendationState
+        run.contextStrategySnapshotJSON = contextStrategySnapshotJSON
+        run.promotedHandoffArtifactsJSON = promotedHandoffArtifactsJSON ?? run.promotedHandoffArtifactsJSON
 
         guard let deliveryConfiguration else { return }
         let encoder = JSONEncoder()
@@ -51,7 +92,12 @@ struct RunStartSnapshot: Sendable {
             startOptionsJSON: run.startOptionsJSON,
             frozenWorkspaceRootPath: run.frozenWorkspaceRootPath,
             deliveryConfiguration: deliveryConfiguration,
-            deliveryPreflightJSON: run.deliveryPreflightJSON
+            deliveryPreflightJSON: run.deliveryPreflightJSON,
+            contextStrategyProfileID: run.contextStrategyProfileID,
+            strategyAssignmentMode: run.strategyAssignmentMode,
+            strategyRecommendationState: run.strategyRecommendationState,
+            contextStrategySnapshotJSON: run.contextStrategySnapshotJSON,
+            promotedHandoffArtifactsJSON: run.promotedHandoffArtifactsJSON
         )
     }
 }

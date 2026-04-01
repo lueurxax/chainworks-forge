@@ -12,6 +12,7 @@ import SwiftData
 struct BlockedRunRecoveryView: View {
     let run: Run
     @Environment(\.modelContext) private var modelContext
+    @Environment(ExecutionService.self) private var executionService
     @Environment(\.dismiss) private var dismiss
     @State private var recoveryPath: RecoveryPath = .undetermined
     @State private var isExecuting = false
@@ -19,9 +20,12 @@ struct BlockedRunRecoveryView: View {
     @State private var receiptArtifacts: [Artifact] = []
     @State private var diffArtifacts: [Artifact] = []
     @State private var testArtifacts: [Artifact] = []
+    @State private var promotedArtifacts: [String] = []
     // Proposal 013: Evidence-aware recovery
     @State private var evidencePacket: FailedStageEvidencePacket?
     @State private var showEvidencePanel = false
+    @State private var showSessionInspector = false
+    @State private var selectedLineage: AgentSessionLineage?
 
     // MARK: - Recovery Path Classification
 
@@ -99,6 +103,7 @@ struct BlockedRunRecoveryView: View {
             loadArtifactContext()
             loadEvidencePacket()
             classifyRecoveryPath()
+            loadPromotedArtifacts()
         }
         .sheet(isPresented: $showEvidencePanel) {
             if let packet = evidencePacket {
@@ -114,6 +119,20 @@ struct BlockedRunRecoveryView: View {
                     }
                 }
                 .frame(minWidth: 500, minHeight: 400)
+            }
+        }
+        .sheet(isPresented: $showSessionInspector) {
+            if let lineage = selectedLineage {
+                NavigationStack {
+                    AgentSessionInspector(lineage: lineage)
+                        .navigationTitle("Session Inspector")
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Close") { showSessionInspector = false }
+                            }
+                        }
+                }
+                .frame(minWidth: 400, minHeight: 500)
             }
         }
     }
@@ -175,6 +194,11 @@ struct BlockedRunRecoveryView: View {
 
                 HStack(spacing: 8) {
                     RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
+                    StrategyBadge(
+                        profileID: nonEmpty(run.contextStrategyProfileID),
+                        assignmentMode: nonEmpty(run.strategyAssignmentMode),
+                        recommendationState: nonEmpty(run.strategyRecommendationState)
+                    )
                     ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
                     // Proposal 013: Evidence panel button
                     if evidencePacket != nil {
@@ -187,6 +211,12 @@ struct BlockedRunRecoveryView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
+                }
+
+                if !promotedArtifacts.isEmpty {
+                    Text("Promoted handoff artifacts: \(promotedArtifacts.joined(separator: ", "))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         } label: {
@@ -286,6 +316,23 @@ struct BlockedRunRecoveryView: View {
                                                 .font(.caption2)
                                                 .foregroundStyle(.secondary)
                                                 .lineLimit(2)
+                                            
+                                            Spacer()
+                                            
+                                            // Proposal 018: Session reuse badge
+                                            SessionReuseBadge(disposition: agent.sessionReuseDisposition)
+
+                                            if let lid = agent.sessionLineageID {
+                                                Button {
+                                                    inspectSession(lineageID: lid)
+                                                } label: {
+                                                    Image(systemName: "memorychip")
+                                                        .font(.caption2)
+                                                }
+                                                .buttonStyle(.plain)
+                                                .foregroundStyle(DesignTokens.Action.primary)
+                                                .help("Inspect agent session lineage")
+                                            }
                                         }
                                         .padding(.leading, 4)
                                     }
@@ -329,6 +376,7 @@ struct BlockedRunRecoveryView: View {
                             }
                         }
                         Spacer()
+                        promoteArtifactButton(for: artifact.name)
                         StatusCapsule(
                             text: artifact.format.rawValue.uppercased(),
                             color: DesignTokens.Status.neutral,
@@ -359,6 +407,7 @@ struct BlockedRunRecoveryView: View {
                                     Text(artifact.name)
                                         .font(.caption.monospaced())
                                     Spacer()
+                                    promoteArtifactButton(for: artifact.name)
                                     Text(artifact.stageID)
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
@@ -381,6 +430,7 @@ struct BlockedRunRecoveryView: View {
                                     Text(artifact.name)
                                         .font(.caption.monospaced())
                                     Spacer()
+                                    promoteArtifactButton(for: artifact.name)
                                     Text(artifact.stageID)
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
@@ -432,7 +482,7 @@ struct BlockedRunRecoveryView: View {
                             Spacer()
 
                             Button {
-                                executeRecoveryAction(action)
+                                beginExecuteRecoveryAction(action)
                             } label: {
                                 Text("Execute")
                             }
@@ -464,7 +514,7 @@ struct BlockedRunRecoveryView: View {
                             Spacer()
 
                             Button(role: .destructive) {
-                                cancelRun()
+                                beginCancelRun()
                             } label: {
                                 Text("Cancel")
                             }
@@ -594,6 +644,48 @@ struct BlockedRunRecoveryView: View {
         }
     }
 
+    private func loadPromotedArtifacts() {
+        guard
+            let data = run.promotedHandoffArtifactsJSON,
+            let names = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            promotedArtifacts = []
+            return
+        }
+        promotedArtifacts = names
+    }
+
+    @ViewBuilder
+    private func promoteArtifactButton(for artifactName: String) -> some View {
+        Button {
+            togglePromotedArtifact(named: artifactName)
+        } label: {
+            Text(promotedArtifacts.contains(artifactName) ? "Promoted" : "Promote")
+                .font(.caption2.weight(.semibold))
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(isExecuting)
+    }
+
+    private func togglePromotedArtifact(named artifactName: String) {
+        var names = promotedArtifacts
+        if let index = names.firstIndex(of: artifactName) {
+            names.remove(at: index)
+        } else {
+            names.append(artifactName)
+        }
+        names.sort()
+        promotedArtifacts = names
+        run.promotedHandoffArtifactsJSON = try? JSONEncoder().encode(names)
+        try? modelContext.save()
+    }
+
+    private func nonEmpty(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     private func classifyRecoveryPath() {
         switch run.status {
         case .waitingApproval:
@@ -611,31 +703,69 @@ struct BlockedRunRecoveryView: View {
         }
     }
 
+    private func inspectSession(lineageID: UUID) {
+        let descriptor = FetchDescriptor<AgentSessionLineage>(
+            predicate: #Predicate<AgentSessionLineage> { $0.id == lineageID }
+        )
+        selectedLineage = try? modelContext.fetch(descriptor).first
+        if selectedLineage != nil {
+            showSessionInspector = true
+        }
+    }
+
     // MARK: - Actions
 
-    private func executeRecoveryAction(_ action: RecoveryAction) {
+    @MainActor
+    private func beginExecuteRecoveryAction(_ action: RecoveryAction) {
+        guard !isExecuting else {
+            print("[Recovery] Action blocked: isExecuting=true (action: \(action.label))")
+            return
+        }
         isExecuting = true
         errorMessage = nil
+        print("[Recovery] Starting action: \(action.label)")
 
+        Task { @MainActor in
+            await executeRecoveryAction(action)
+        }
+    }
+
+    @MainActor
+    private func executeRecoveryAction(_ action: RecoveryAction) async {
         let coordinator = RecoveryCoordinator(modelContext: modelContext)
 
         do {
             switch action {
             case .retryAgent(let stageID, let agentID):
+                print("[Recovery] retryAgent: stage=\(stageID) agent=\(agentID) run.status=\(run.status.rawValue)")
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
+                print("[Recovery] retryAgent succeeded, now calling resumeRun")
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
+                print("[Recovery] resumeRun succeeded, dismissing")
                 dismiss()
 
             case .retryAggregateStep(let stageID, let agentID):
                 _ = try coordinator.retryAggregateStep(run: run, stageID: stageID, agentID: agentID)
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
             case .resumeFromApprovalGate(let stageID):
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
                 dismiss()
+
+            case .resetAgentSession(let stageID, let agentID):
+                _ = try await coordinator.resetAgentSession(run: run, stageID: stageID, agentID: agentID)
+                // Just reset, don't dismiss recovery view
+                loadArtifactContext()
+                loadEvidencePacket()
 
             case .cloneRunFrozenSnapshot:
                 guard let idea = run.idea else {
@@ -671,27 +801,29 @@ struct BlockedRunRecoveryView: View {
                 return
             }
         } catch {
+            print("[Recovery] Action failed: \(error)")
             errorMessage = error.localizedDescription
         }
 
         isExecuting = false
+        print("[Recovery] Action complete, isExecuting=false, errorMessage=\(errorMessage ?? "nil")")
     }
 
-    private func cancelRun() {
+    @MainActor
+    private func beginCancelRun() {
+        guard !isExecuting else { return }
         isExecuting = true
         errorMessage = nil
 
-        run.status = .cancelled
-        run.completedAt = Date()
-        run.cancellationRequestedAt = Date()
-        run.cancellationSettledAt = Date()
-
-        do {
-            try modelContext.save()
-            dismiss()
-        } catch {
-            errorMessage = "Failed to cancel run: \(error.localizedDescription)"
+        Task { @MainActor in
+            await cancelRun()
         }
+    }
+
+    @MainActor
+    private func cancelRun() async {
+        await executionService.cancelRun(runID: run.id)
+        dismiss()
 
         isExecuting = false
     }
@@ -730,6 +862,7 @@ struct BlockedRunRecoveryView: View {
         switch action {
         case .resumeFromApprovalGate: return DesignTokens.Action.approve
         case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
+        case .resetAgentSession: return DesignTokens.Status.error
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
         case .cloneRunCurrentConfig: return DesignTokens.Status.neutral
         }
@@ -745,6 +878,8 @@ struct BlockedRunRecoveryView: View {
             return "Retry agent \(agentID) in stage \(stageID) from its last checkpoint."
         case .retryStage(let stageID):
             return "Reset all agents in stage \(stageID) and re-execute from the beginning."
+        case .resetAgentSession(let stageID, let agentID):
+            return "Discard live provider session for \(agentID) and force a fresh session on retry."
         case .cloneRunFrozenSnapshot:
             return "Create a new run using the original frozen workflow and catalog snapshots."
         case .cloneRunCurrentConfig:
