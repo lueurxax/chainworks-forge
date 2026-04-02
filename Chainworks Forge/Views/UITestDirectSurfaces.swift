@@ -1,6 +1,14 @@
 import SwiftUI
 import SwiftData
 
+private enum UITestProofSurfaceSelection {
+    static var requestedProposal: String {
+        ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_PROOF_PROPOSAL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "013"
+    }
+}
+
 struct UITestIdeaArchiveSurface: View {
     @Environment(\.modelContext) private var modelContext
 
@@ -818,6 +826,18 @@ private struct UITestCompletedExportHubHarness: View {
 /// Direct-surface proof for Proposal 013 Section 10.2:
 /// Shows validation failure, evidence panel, narrow retry, and prior inspectability.
 struct UITestProposal013EvidenceSurface: View {
+    var body: some View {
+        Group {
+            if UITestProofSurfaceSelection.requestedProposal == "022" {
+                UITestProposal022EvidenceSurface()
+            } else {
+                UITestProposal013EvidenceSurfaceBody()
+            }
+        }
+    }
+}
+
+private struct UITestProposal013EvidenceSurfaceBody: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
     @State private var proofRun: Run?
@@ -922,6 +942,162 @@ struct UITestProposal013EvidenceSurface: View {
             narrowestActionSummary = result.narrowestActionSummary
             proofRun = run
             evidencePacket = packet
+            proofStatus = result.proofStatus
+            proofCompleted = true
+        } catch {
+            proofStatus = "FAIL — \(error.localizedDescription)"
+            proofSteps.append("Harness error: \(error.localizedDescription)")
+            proofCompleted = true
+        }
+    }
+}
+
+struct UITestProposal022EvidenceSurface: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(ExecutionService.self) private var executionService
+    @State private var proofRun: Run?
+    @State private var proofStatus: String = "Not started"
+    @State private var proofSteps: [String] = []
+    @State private var refineCorpusInputCount = 0
+    @State private var reviewCorpusBundlePresent = false
+    @State private var scoreLiftBacklogPresent = false
+    @State private var scoreLiftMergeProvenancePresent = false
+    @State private var proposalFeedbackCoveragePresent = false
+    @State private var unresolvedBacklogItems: [String] = []
+    @State private var targetedRerunRationale = "Not evaluated"
+    @State private var proofCompleted = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Proposal 022 App-Level Proof")
+                    .font(.headline)
+                    .accessibilityIdentifier("p022-proof-banner")
+
+                Text(proofStatus)
+                    .font(.subheadline)
+                    .foregroundStyle(proofStatus.contains("PASS") ? .green : .orange)
+                    .accessibilityIdentifier("p022-proof-status")
+                    .accessibilityLabel(proofStatus)
+                    .accessibilityValue(proofStatus)
+
+                ForEach(Array(proofSteps.enumerated()), id: \.offset) { _, step in
+                    Text(step)
+                        .font(.caption.monospaced())
+                }
+
+                LabeledContent("Full Review Corpus") {
+                    let label = "\(refineCorpusInputCount)/5"
+                    Text(label)
+                        .accessibilityIdentifier("p022-proof-refine-corpus")
+                        .accessibilityLabel(label)
+                        .accessibilityValue(label)
+                }
+
+                LabeledContent("Review Corpus Bundle") {
+                    Text(reviewCorpusBundlePresent ? "present" : "missing")
+                        .accessibilityIdentifier("p022-review-corpus-bundle-present")
+                        .accessibilityLabel(reviewCorpusBundlePresent ? "present" : "missing")
+                        .accessibilityValue(reviewCorpusBundlePresent ? "present" : "missing")
+                }
+
+                LabeledContent("Score Lift Backlog") {
+                    Text(scoreLiftBacklogPresent ? "present" : "missing")
+                        .accessibilityIdentifier("p022-score-lift-backlog-present")
+                        .accessibilityLabel(scoreLiftBacklogPresent ? "present" : "missing")
+                        .accessibilityValue(scoreLiftBacklogPresent ? "present" : "missing")
+                }
+
+                LabeledContent("Merge Provenance") {
+                    Text(scoreLiftMergeProvenancePresent ? "present" : "missing")
+                        .accessibilityIdentifier("p022-score-lift-merge-provenance-present")
+                        .accessibilityLabel(scoreLiftMergeProvenancePresent ? "present" : "missing")
+                        .accessibilityValue(scoreLiftMergeProvenancePresent ? "present" : "missing")
+                }
+
+                LabeledContent("Feedback Coverage") {
+                    Text(proposalFeedbackCoveragePresent ? "present" : "missing")
+                        .accessibilityIdentifier("p022-feedback-coverage-present")
+                        .accessibilityLabel(proposalFeedbackCoveragePresent ? "present" : "missing")
+                        .accessibilityValue(proposalFeedbackCoveragePresent ? "present" : "missing")
+                }
+
+                LabeledContent("Unresolved Items") {
+                    Text(unresolvedBacklogItems.isEmpty ? "none" : unresolvedBacklogItems.joined(separator: ", "))
+                        .accessibilityIdentifier("p022-unresolved-items")
+                        .accessibilityLabel(unresolvedBacklogItems.isEmpty ? "none" : unresolvedBacklogItems.joined(separator: ", "))
+                        .accessibilityValue(unresolvedBacklogItems.isEmpty ? "none" : unresolvedBacklogItems.joined(separator: ", "))
+                }
+
+                LabeledContent("Targeted Rerun Rationale") {
+                    Text(targetedRerunRationale)
+                        .accessibilityIdentifier("p022-proof-targeted-reviewers")
+                        .accessibilityLabel(targetedRerunRationale)
+                        .accessibilityValue(targetedRerunRationale)
+                }
+
+                if let proofRun {
+                    GroupBox("Proof Run") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Run ID: \(proofRun.id.uuidString)")
+                            Text("Status: \(proofRun.presentationStatusLabel)")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .accessibilityIdentifier("p022-proof-run")
+                }
+
+                Button("Run Proof") {
+                    Task { await runProof() }
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("p022-run-proof")
+
+                if proofCompleted {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier("p022-proof-complete")
+                }
+            }
+            .padding()
+        }
+        .frame(minWidth: 640, minHeight: 480)
+    }
+
+    private func runProof() async {
+        proofSteps = []
+        proofStatus = "Running..."
+        refineCorpusInputCount = 0
+        reviewCorpusBundlePresent = false
+        scoreLiftBacklogPresent = false
+        scoreLiftMergeProvenancePresent = false
+        proposalFeedbackCoveragePresent = false
+        unresolvedBacklogItems = []
+        targetedRerunRationale = "Not evaluated"
+        proofCompleted = false
+
+        let harness = Proposal022AppProofHarness(
+            modelContext: modelContext,
+            executionService: executionService
+        )
+
+        do {
+            proofSteps.append("[1/6] Launching fixture-backed proposal loop")
+            let (run, summary, result) = try await harness.run()
+            proofSteps.append("[2/6] Refine corpus persisted: \(result.refineCorpusInputCount)/5")
+            proofSteps.append("[3/6] Review corpus bundle present: \(result.reviewCorpusBundleExists && result.reviewCorpusBundleConsumed)")
+            proofSteps.append("[4/6] Score-lift backlog present: \(result.scoreLiftBacklogExists)")
+            proofSteps.append("[5/6] Merge provenance present: \(result.scoreLiftBacklogMergeProvenanceExists)")
+            proofSteps.append("[6/6] Targeted rerun rationale: \(summary.targetedReviewerSummary ?? "missing")")
+
+            proofRun = run
+            refineCorpusInputCount = result.refineCorpusInputCount
+            reviewCorpusBundlePresent = result.reviewCorpusBundleExists && result.reviewCorpusBundleConsumed
+            scoreLiftBacklogPresent = result.scoreLiftBacklogExists
+            scoreLiftMergeProvenancePresent = result.scoreLiftBacklogMergeProvenanceExists
+            proposalFeedbackCoveragePresent = result.proposalFeedbackCoverageExists
+            unresolvedBacklogItems = result.unresolvedBacklogItemIDs
+            targetedRerunRationale = result.targetedRerunRationale
             proofStatus = result.proofStatus
             proofCompleted = true
         } catch {

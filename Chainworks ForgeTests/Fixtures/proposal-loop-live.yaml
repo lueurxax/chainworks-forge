@@ -81,24 +81,36 @@ states:
           task: review_proposal_from_product_perspective
           inputs:
             - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
           outputs:
             - proposal_review_po
         - agent: proposal_reviewer_ux
           task: review_proposal_from_ux_perspective
           inputs:
             - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
           outputs:
             - proposal_review_ux
         - agent: proposal_reviewer_ui
           task: review_proposal_from_ui_perspective
           inputs:
             - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
           outputs:
             - proposal_review_ui
         - agent: proposal_reviewer_architect
           task: review_proposal_from_architecture_perspective
           inputs:
             - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
           outputs:
             - proposal_review_architect
       then:
@@ -111,6 +123,10 @@ states:
             - proposal_review_architect
           outputs:
             - proposal_review_summary
+            - review_corpus_bundle
+            - score_lift_backlog
+            - proposal_fact_digest
+            - reviewer_scope_plan
     loop:
       counter: proposal_revision_count
       max: vars.max_proposal_revision_cycles
@@ -129,10 +145,18 @@ states:
           task: refine_proposal_based_on_review
           inputs:
             - proposal_current
+            - proposal_review_po
+            - proposal_review_ux
+            - proposal_review_ui
+            - proposal_review_architect
             - proposal_review_summary
+            - review_corpus_bundle
+            - score_lift_backlog
+            - proposal_fact_digest
           outputs:
             - proposal_current
             - proposal_revision_summary
+            - proposal_feedback_coverage
     transitions:
       - to: state_3_proposal_reviewed
         when: exists('proposal_current')

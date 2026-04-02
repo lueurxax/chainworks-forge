@@ -60,6 +60,46 @@ struct ArtifactInspectorView: View {
 
                 Divider()
 
+                if shouldShowProposalLoopSummary, let summary = proposalLoopSummary {
+                    GroupBox("Proposal-loop feedback summary (Proposal 022)") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            let reviewCorpusLabel = summary.reviewCorpusBundlePresent
+                                ? "present (\(summary.reviewCorpusRawArtifactCount.map(String.init) ?? "unknown") raw)"
+                                : "missing"
+                            LabeledContent("Review corpus bundle", value: reviewCorpusLabel)
+                            LabeledContent("Backlog", value: "\(summary.backlogItemCount)")
+                            LabeledContent("Unresolved", value: "\(summary.unresolvedItemCount)")
+                            LabeledContent("Deferred", value: "\(summary.deferredItemCount)")
+                            LabeledContent("Addressed", value: "\(summary.addressedItemCount)")
+                            LabeledContent("Merge provenance", value: "\(summary.mergeProvenanceItemCount)")
+                            LabeledContent("Coverage", value: summary.coverageStatusSummary)
+                            if let growthRatio = summary.proposalGrowthRatio {
+                                LabeledContent("Proposal growth", value: String(format: "%.2fx", growthRatio))
+                            }
+                            if let scoreDelta = summary.scoreDeltaSinceLastReview {
+                                LabeledContent("Score delta", value: String(format: "%.2f", scoreDelta))
+                            }
+                            if let recommendation = summary.growthGuardRecommendation {
+                                LabeledContent("Growth guard", value: recommendation)
+                            }
+                            if let nextAction = summary.boundedNextAction {
+                                LabeledContent("Bounded next action", value: nextAction)
+                            }
+                            if let rationale = summary.targetedReviewerSummary {
+                                Text("Targeted rereview")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Text(rationale)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.leading, 8)
+                            }
+                        }
+                    }
+
+                    Divider()
+                }
+
                 // §9.1: Format-aware rendering
                 if let content {
                     formatAwareRenderer(content: content, format: artifact.format)
@@ -166,6 +206,19 @@ struct ArtifactInspectorView: View {
         }
     }
 
+    private var proposalLoopSummary: ProposalLoopFeedbackSummary? {
+        let stages = run.stageExecutions
+        let agentExecutions = stages.flatMap(\.agentExecutions)
+        let allArtifacts = agentExecutions.flatMap(\.artifacts)
+        let relevantNames: Set<String> = [
+            "score_lift_backlog",
+            "proposal_feedback_coverage",
+            "proposal_review_summary"
+        ]
+        let relevantArtifacts = allArtifacts.filter { relevantNames.contains($0.name) }
+        return ProposalLoopFeedbackParser.parseSummary(from: relevantArtifacts)
+    }
+
     /// P005-OPS §9.3: Find downstream consumers via inputBindingsJSON (preferred)
     /// with consumedInputArtifactNamesJSON as fallback.
     private var downstreamConsumers: [AgentExecution] {
@@ -244,6 +297,12 @@ struct ArtifactInspectorView: View {
         if line.hasPrefix("+") { return .green.opacity(0.1) }
         if line.hasPrefix("-") { return .red.opacity(0.1) }
         return .clear
+    }
+
+    private var shouldShowProposalLoopSummary: Bool {
+        artifact.name == "proposal_review_summary"
+        || artifact.name == "score_lift_backlog"
+        || artifact.name == "proposal_feedback_coverage"
     }
 
     // MARK: - Open Actions (§9.5)

@@ -77,7 +77,7 @@ final class RunPlanCompiler {
         plan: RunPlan,
         workflowSourcePath: String,
         catalogSourcePath: String,
-        startSnapshot: RunStartSnapshot = .empty
+        startSnapshot: RunStartSnapshot
     ) throws -> (Run, RunWorkspace) {
         // Step 8: Generate run identity
         let runID = UUID()
@@ -97,6 +97,21 @@ final class RunPlanCompiler {
         )
 
         return (run, workspace)
+    }
+
+    func createRun(
+        for idea: Idea,
+        plan: RunPlan,
+        workflowSourcePath: String,
+        catalogSourcePath: String
+    ) throws -> (Run, RunWorkspace) {
+        try createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: workflowSourcePath,
+            catalogSourcePath: catalogSourcePath,
+            startSnapshot: RunStartSnapshot()
+        )
     }
 
     // MARK: - Resume Path

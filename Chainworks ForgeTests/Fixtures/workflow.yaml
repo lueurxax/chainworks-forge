@@ -94,6 +94,9 @@ states:
         inputs:
         - idea_brief
         - proposal_current
+        - proposal_feedback_coverage
+        - reviewer_scope_plan
+        - score_lift_backlog
         outputs:
         - proposal_review_po
       - agent: proposal_reviewer_ux
@@ -101,6 +104,9 @@ states:
         inputs:
         - idea_brief
         - proposal_current
+        - proposal_feedback_coverage
+        - reviewer_scope_plan
+        - score_lift_backlog
         outputs:
         - proposal_review_ux
       - agent: proposal_reviewer_ui
@@ -108,6 +114,9 @@ states:
         inputs:
         - idea_brief
         - proposal_current
+        - proposal_feedback_coverage
+        - reviewer_scope_plan
+        - score_lift_backlog
         outputs:
         - proposal_review_ui
       - agent: proposal_reviewer_architect
@@ -115,6 +124,9 @@ states:
         inputs:
         - idea_brief
         - proposal_current
+        - proposal_feedback_coverage
+        - reviewer_scope_plan
+        - score_lift_backlog
         outputs:
         - proposal_review_architect
       then:
@@ -127,6 +139,10 @@ states:
         - proposal_review_architect
         outputs:
         - proposal_review_summary
+        - review_corpus_bundle
+        - score_lift_backlog
+        - proposal_fact_digest
+        - reviewer_scope_plan
         - orchestrator_summary
         - run_state
     transitions:
@@ -153,9 +169,13 @@ states:
         - proposal_review_ui
         - proposal_review_architect
         - proposal_review_summary
+        - review_corpus_bundle
+        - score_lift_backlog
+        - proposal_fact_digest
         outputs:
         - proposal_current
         - proposal_revision_summary
+        - proposal_feedback_coverage
     transitions:
     - to: state_4_proposal_reviewed
       when: 'true'

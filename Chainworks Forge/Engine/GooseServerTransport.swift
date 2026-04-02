@@ -414,13 +414,11 @@ private struct GooseServerUpdateProvider: Codable {
 
 /// URLSession delegate that trusts self-signed certificates for localhost connections.
 /// goosed uses a self-signed TLS certificate by default (Section 9.6).
-final class LocalhostTrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
-    func urlSession(
-        _ session: URLSession,
-        didReceive challenge: URLAuthenticationChallenge,
+final class LocalhostTrustDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+    private func handleChallenge(
+        _ challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        // Trust self-signed certs for localhost only
         if challenge.protectionSpace.host == "127.0.0.1" || challenge.protectionSpace.host == "localhost" {
             if let serverTrust = challenge.protectionSpace.serverTrust {
                 let credential = URLCredential(trust: serverTrust)
@@ -429,5 +427,22 @@ final class LocalhostTrustDelegate: NSObject, URLSessionDelegate, @unchecked Sen
             }
         }
         completionHandler(.performDefaultHandling, nil)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        handleChallenge(challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        handleChallenge(challenge, completionHandler: completionHandler)
     }
 }

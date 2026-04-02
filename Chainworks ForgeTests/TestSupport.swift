@@ -225,6 +225,15 @@ func loadTestCanonicalCatalog() throws -> AgentCatalog {
     return try YAMLParser.loadAgentCatalog(from: url)
 }
 
+/// Loads the steward config fixture from the test bundle.
+func loadTestStewardConfig() throws -> StewardConfig {
+    let url = try #require(
+        Bundle(for: TestBundleMarker.self).url(forResource: "steward_config", withExtension: "yaml"),
+        "steward_config.yaml fixture must be bundled with tests"
+    )
+    return try YAMLParser.loadStewardConfig(from: url)
+}
+
 /// Loads the live proposal loop workflow fixture from the test bundle.
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
     let url = try #require(

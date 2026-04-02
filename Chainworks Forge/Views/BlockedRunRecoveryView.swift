@@ -782,14 +782,14 @@ struct BlockedRunRecoveryView: View {
                 dismiss()
 
             case .cloneRunCurrentConfig:
-                guard let idea = run.idea else {
+                guard run.idea != nil else {
                     errorMessage = "No idea associated with this run."
                     isExecuting = false
                     return
                 }
-                guard let workflow = try? YAMLParser.loadWorkflow(
+                guard (try? YAMLParser.loadWorkflow(
                     from: URL(fileURLWithPath: run.workflowSourcePath)
-                ) else {
+                )) != nil else {
                     errorMessage = "Cannot load workflow from source path."
                     isExecuting = false
                     return
@@ -878,7 +878,7 @@ struct BlockedRunRecoveryView: View {
             return "Retry agent \(agentID) in stage \(stageID) from its last checkpoint."
         case .retryStage(let stageID):
             return "Reset all agents in stage \(stageID) and re-execute from the beginning."
-        case .resetAgentSession(let stageID, let agentID):
+        case .resetAgentSession(_, let agentID):
             return "Discard live provider session for \(agentID) and force a fresh session on retry."
         case .cloneRunFrozenSnapshot:
             return "Create a new run using the original frozen workflow and catalog snapshots."

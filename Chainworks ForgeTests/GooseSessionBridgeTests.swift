@@ -240,7 +240,17 @@ struct GooseSessionBridgeTests {
         let task = AgentTask(
             agent: "proposal_writer",
             task: "refine_proposal",
-            inputs: ["idea_brief", "proposal_current", "proposal_review_all", "security_audit_raw"],
+            inputs: [
+                "idea_brief",
+                "proposal_current",
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect",
+                "proposal_review_summary",
+                "score_lift_backlog",
+                "security_audit_raw"
+            ],
             outputs: ["proposal_current"]
         )
         let workspace = makeWorkspace()
@@ -255,7 +265,12 @@ struct GooseSessionBridgeTests {
         let inputArtifacts: [String: Data] = [
             "idea_brief": Data("short idea".utf8),
             "proposal_current": Data("full proposal body".utf8),
-            "proposal_review_all": Data(String(repeating: "review ", count: 80).utf8),
+            "proposal_review_po": Data("{}".utf8),
+            "proposal_review_ux": Data("{}".utf8),
+            "proposal_review_ui": Data("{}".utf8),
+            "proposal_review_architect": Data("{}".utf8),
+            "proposal_review_summary": Data(String(repeating: "review ", count: 80).utf8),
+            "score_lift_backlog": Data("{}".utf8),
             "security_audit_raw": Data("sensitive raw audit".utf8)
         ]
         let lazyArtifactPath = workspace.artifactRoot
@@ -300,7 +315,12 @@ struct GooseSessionBridgeTests {
         #expect(packet.taskDirective.contains("Profile: selective_compression_and_escalation"))
         #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "idea_brief" })
         #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_current" })
-        #expect(packet.contextAttachments.contains { $0.type == "text" && $0.name == "summary_proposal_review_all" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_review_po" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_review_ux" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_review_ui" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_review_architect" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "proposal_review_summary" })
+        #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "score_lift_backlog" })
         let lazyTool = try #require(packet.contextAttachments.first { $0.name == "LazyEvidenceTool" })
         #expect(lazyTool.type == "file")
         let lazyToolPath = try #require(lazyTool.path)

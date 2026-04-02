@@ -1169,6 +1169,62 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "P013_App_Proof")
     }
 
+    func testProposal022AppProofSurface() throws {
+        let app = makeApp(
+            liveFixtureMode: "proposal022_feedback_cycle",
+            directSurface: "proposal022_proof"
+        )
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-proposal022_proof")
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "Proposal 022 direct surface must finish bootstrap"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p022-proof-banner").waitForExistence(timeout: 10),
+            "Proposal 022 proof surface must render a proof banner"
+        )
+
+        app.buttons["p022-run-proof"].firstMatch.click()
+
+        let proofStatus = anyElement(app, identifier: "p022-proof-status")
+        XCTAssertTrue(proofStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(
+            anyElement(app, identifier: "p022-proof-complete").waitForExistence(timeout: 20)
+                || waitForLabeledPrefix(app, prefix: "PASS", timeout: 20) != nil
+                || waitForLabeledPrefix(app, prefix: "FAIL", timeout: 20) != nil,
+            "Proposal 022 proof surface must reach a terminal proof state"
+        )
+        XCTAssertEqual(
+            anyElement(app, identifier: "p022-proof-refine-corpus").label,
+            "5/5",
+            "Proposal 022 proof must preserve the full review corpus bundle on refine"
+        )
+        XCTAssertEqual(
+            anyElement(app, identifier: "p022-review-corpus-bundle-present").label,
+            "present",
+            "Proposal 022 proof must persist the canonical review corpus bundle"
+        )
+        XCTAssertEqual(
+            anyElement(app, identifier: "p022-score-lift-merge-provenance-present").label,
+            "present",
+            "Proposal 022 proof must keep merge provenance explicit in the backlog"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p022-proof-targeted-reviewers").label.contains("delta"),
+            "Proposal 022 proof must surface targeted reviewer rerun rationale"
+        )
+        XCTAssertTrue(
+            proofStatus.label.contains("PASS"),
+            "Proposal 022 app proof must finish in PASS state"
+        )
+
+        screenshot(app, name: "P022_App_Proof")
+    }
+
     func testProposal012AppendixAMinWindowOwnersAt1024x768() throws {
         let runsTitle = "P012 Runs Home Owner Proof"
         let runsApp = makeApp(

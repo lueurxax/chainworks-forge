@@ -354,6 +354,10 @@ For proposal-level app-launched proof, also copy back:
 - result JSON,
 - any run-storage artifact directories required by the proof contract.
 
+Current example:
+
+- `proposal-022` uses a remote app-launched proof export and writes a result JSON from the built app process rather than relying on a local UI test loop.
+
 ## Before Any UI Run
 
 Agents should verify the host is clean before starting UI work.
@@ -654,6 +658,13 @@ For Proposal 007-like delivery slices, the final proof should include:
 - one app-launched non-happy-path run
 - exported evidence packs from both runs
 - confirmation that delivery artifacts exist in run storage, not only in exported summaries
+
+For Proposal 022-like proposal-loop slices, the final proof should include:
+
+- focused non-UI proposal tests,
+- one approved-host app-launched proof export,
+- result JSON proving corpus bundle, backlog, merge provenance, and targeted rereview truth,
+- no local fallback when the operator has forbidden local UI/app launches.
 
 ## Related Docs
 

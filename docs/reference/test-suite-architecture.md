@@ -261,6 +261,7 @@ Important:
 - the structure of the suite does not authorize local UI execution
 - repository-enforced remote-only UI policy still applies
 - if an agent needs shell/operator proof, it should use the documented remote path rather than infer one from test-plan names alone
+- some proposal gates now satisfy app-level proof through a remote app-launched export mode, not through a local UI test runner
 
 ## Related Docs
 

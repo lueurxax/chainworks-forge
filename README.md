@@ -61,6 +61,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
+- stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
 
 Active proposal work is currently concentrated in:
 
@@ -178,6 +179,7 @@ Most common gates:
 - `./scripts/test-gate.sh build` — compile-only sanity check
 - `./scripts/test-gate.sh fast` — default inner-loop runtime/unit gate
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"` — remote-only UI smoke gate
+- `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-022"` — remote-only Proposal 022 proof gate
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"` — remote-only full sign-off gate
 
 Important:
@@ -203,6 +205,7 @@ Implemented-system references:
 - [`docs/reference/output-contracts-failure-evidence-and-recovery.md`](docs/reference/output-contracts-failure-evidence-and-recovery.md)
 - [`docs/reference/session-lineage-reuse-and-operator-reset.md`](docs/reference/session-lineage-reuse-and-operator-reset.md)
 - [`docs/reference/context-strategy-and-experiment-framework.md`](docs/reference/context-strategy-and-experiment-framework.md)
+- [`docs/reference/proposal-loop-feedback-fidelity-and-rereview.md`](docs/reference/proposal-loop-feedback-fidelity-and-rereview.md)
 - [`docs/reference/operator-experience.md`](docs/reference/operator-experience.md)
 - [`docs/reference/provider-platform.md`](docs/reference/provider-platform.md)
 - [`docs/reference/ui-quality-and-polish.md`](docs/reference/ui-quality-and-polish.md)

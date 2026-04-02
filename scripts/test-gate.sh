@@ -80,7 +80,13 @@ PROPOSAL_019_TESTS=(
   "Chainworks ForgeTests/OrchestratorTests"
 )
 
+PROPOSAL_022_TESTS=(
+  "Chainworks ForgeTests/Proposal022Tests"
+  "Chainworks ForgeTests/Proposal022ScaffoldingTests"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
+LAST_BUILD_DERIVED_DATA_PATH=""
 
 log() {
   printf '==> %s\n' "$*"
@@ -376,6 +382,7 @@ run_build() {
   local stamp derived_data
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
+  LAST_BUILD_DERIVED_DATA_PATH="$derived_data"
   mkdir -p "$TMP_BASE"
   log "Build gate: $gate_name"
   xcodebuild \
@@ -385,6 +392,98 @@ run_build() {
     -derivedDataPath "$derived_data" \
     "${UNSIGNED_BUILD_ARGS[@]}" \
     build
+}
+
+run_proposal022_app_proof() {
+  local derived_data="$1"
+  local stamp app_binary result_path log_path timeout_seconds pid app_status
+  stamp="$(make_stamp)"
+  app_binary="$derived_data/Build/Products/Debug/Chainworks Forge.app/Contents/MacOS/Chainworks Forge"
+  result_path="$TMP_BASE/proposal-022-app-proof-${stamp}.json"
+  log_path="$TMP_BASE/proposal-022-app-proof-${stamp}.log"
+  timeout_seconds="${CHAINWORKS_P022_APP_PROOF_TIMEOUT_SECONDS:-90}"
+
+  [[ -x "$app_binary" ]] || die "Proposal 022 app proof binary not found: $app_binary"
+
+  log "App proof gate: proposal-022"
+  rm -f "$result_path" "$log_path"
+
+  env \
+    CHAINWORKS_IN_MEMORY_STORE=1 \
+    CHAINWORKS_GOOSE_FIXTURE_MODE=proposal022_feedback_cycle \
+    CHAINWORKS_P022_APP_PROOF_AUTORUN=1 \
+    CHAINWORKS_P022_APP_PROOF_RESULT_PATH="$result_path" \
+    "$app_binary" >"$log_path" 2>&1 &
+  pid=$!
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      printf 'Proposal 022 app proof timed out after %s seconds.\n' "$timeout_seconds" >&2
+      if [[ -f "$log_path" ]]; then
+        printf '--- app proof log ---\n' >&2
+        cat "$log_path" >&2
+      fi
+      exit 1
+    fi
+    sleep 1
+  done
+
+  wait "$pid"
+  app_status=$?
+  if [[ $app_status -ne 0 ]]; then
+    printf 'Proposal 022 app proof process exited with status %s.\n' "$app_status" >&2
+    if [[ -f "$log_path" ]]; then
+      printf '--- app proof log ---\n' >&2
+      cat "$log_path" >&2
+    fi
+    exit 1
+  fi
+
+  [[ -f "$result_path" ]] || {
+    printf 'Proposal 022 app proof did not produce result JSON at %s.\n' "$result_path" >&2
+    if [[ -f "$log_path" ]]; then
+      printf '--- app proof log ---\n' >&2
+      cat "$log_path" >&2
+    fi
+    exit 1
+  }
+
+  python3 - "$result_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result_path = Path(sys.argv[1])
+payload = json.loads(result_path.read_text(encoding="utf-8"))
+result = payload.get("result") or {}
+summary = payload.get("summary") or {}
+
+checks = [
+    (result.get("refineCorpusInputCount") == 5, "refine corpus count must be 5"),
+    (result.get("reviewCorpusBundleExists") is True, "review corpus bundle must exist"),
+    (result.get("reviewCorpusBundleConsumed") is True, "review corpus bundle must be consumed"),
+    (result.get("scoreLiftBacklogExists") is True, "score lift backlog must exist"),
+    (result.get("scoreLiftBacklogMergeProvenanceExists") is True, "merge provenance must exist"),
+    (result.get("proposalFeedbackCoverageExists") is True, "proposal feedback coverage must exist"),
+    (bool(result.get("unresolvedBacklogItemIDs")), "unresolved backlog items must remain visible"),
+    (bool((result.get("targetedRerunRationale") or "").strip()), "targeted rerun rationale must be present"),
+    ("PASS" in (result.get("proofStatus") or ""), "proof status must be PASS"),
+    (summary.get("reviewCorpusBundlePresent") is True, "summary must surface review corpus bundle"),
+    ((summary.get("mergeProvenanceItemCount") or 0) > 0, "summary must surface merge provenance"),
+]
+
+failed = [message for ok, message in checks if not ok]
+if failed:
+    print("Proposal 022 app proof validation failed:", file=sys.stderr)
+    for message in failed:
+        print(f"  - {message}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"Proposal 022 app proof result: {result_path}")
+PY
 }
 
 run_test_plan() {
@@ -451,11 +550,11 @@ run_targeted_tests() {
   fi
 
   log "Test gate: $gate_name"
-  if [[ "$gate_name" == "proposal-013-ui" ]]; then
+  if [[ "$gate_name" == "proposal-013-ui" || "$gate_name" == "proposal-022-ui" ]]; then
     # This lane currently hangs on the approved host after it has already
     # printed a successful XCTest summary. Run it through a narrow watchdog
     # that only accepts success after the canonical pass markers.
-    python3 - "$log_path" "${cmd[@]}" <<'PY'
+    python3 - "$gate_name" "$log_path" "${cmd[@]}" <<'PY'
 import os
 import select
 import signal
@@ -463,13 +562,24 @@ import subprocess
 import sys
 import time
 
-log_path = sys.argv[1]
-cmd = sys.argv[2:]
+gate_name = sys.argv[1]
+log_path = sys.argv[2]
+cmd = sys.argv[3:]
 
-marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal013AppProofSurface]' passed"
-marker_suite_passed = "Executed 1 test, with 0 failures"
-grace_seconds = float(os.environ.get("CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS", "15"))
-hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS", "1800"))
+if gate_name == "proposal-013-ui":
+    marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal013AppProofSurface]' passed"
+    marker_suite_passed = "Executed 1 test, with 0 failures"
+    success_label = "Proposal 013 UI watchdog"
+    grace_seconds = float(os.environ.get("CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS", "15"))
+    hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS", "1800"))
+elif gate_name == "proposal-022-ui":
+    marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal022AppProofSurface]' passed"
+    marker_suite_passed = "** TEST SUCCEEDED **"
+    success_label = "Proposal 022 gate watchdog"
+    grace_seconds = float(os.environ.get("CHAINWORKS_P022_UI_SUCCESS_GRACE_SECONDS", "10"))
+    hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P022_UI_HARD_TIMEOUT_SECONDS", "1800"))
+else:
+    raise SystemExit(f"unsupported watchdog gate: {gate_name}")
 
 test_passed = False
 suite_passed = False
@@ -517,7 +627,7 @@ with open(log_path, "w", encoding="utf-8") as log:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                print("==> Proposal 013 UI watchdog: xcodebuild hung after successful proof; terminating stale process and accepting gate")
+                print(f"==> {success_label}: xcodebuild hung after successful proof; terminating stale process and accepting gate")
                 raise SystemExit(0)
 
             if now - start >= hard_timeout_seconds:
@@ -531,7 +641,7 @@ with open(log_path, "w", encoding="utf-8") as log:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                print("error: Proposal 013 UI watchdog hit hard timeout before success markers", file=sys.stderr)
+                print(f"error: {success_label} hit hard timeout before success markers", file=sys.stderr)
                 raise SystemExit(124)
 
     finally:
@@ -540,7 +650,7 @@ with open(log_path, "w", encoding="utf-8") as log:
         except Exception:
             pass
 PY
-    log "UI log: $log_path"
+    log "Watchdog log: $log_path"
     local derived_result
     derived_result="$(find "$derived_data/Logs/Test" -name '*.xcresult' -print 2>/dev/null | sort | tail -1 || true)"
     if [[ -n "$derived_result" ]]; then
@@ -609,6 +719,7 @@ Available gates:
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
+  proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -747,6 +858,19 @@ case "$GATE" in
     guard_direct_run_insertion
     run_build "proposal-019"
     run_targeted_tests "proposal-019" "${PROPOSAL_019_TESTS[@]}"
+    ;;
+  proposal-022|p022)
+    check_idle_environment strict
+    require_remote_ui_host
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-022"
+    run_split_targeted_gate "proposal-022" "${PROPOSAL_022_TESTS[@]}"
+    run_proposal022_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
     ;;
   full)
     check_idle_environment strict

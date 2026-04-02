@@ -23,6 +23,7 @@ struct RunComparisonView: View {
                         snapshotSection(comparison)
                         trustSection(comparison)
                         bindingsSection(comparison)
+                        proposalFeedbackSection(comparison)
                         timingCostSection(comparison)
                         stageSection(comparison)
                         approvalSection(comparison)
@@ -271,6 +272,69 @@ struct RunComparisonView: View {
         }
     }
 
+    @ViewBuilder
+    private func proposalFeedbackSection(_ c: RunComparison) -> some View {
+        GroupBox("Proposal-loop feedback fidelity (Proposal 022)") {
+            VStack(alignment: .leading, spacing: 6) {
+                comparisonNumberRow(
+                    "Corpus bundle",
+                    valueA: c.proposalLoopComparison.reviewCorpusBundlePresentA.map { $0 ? "present" : "missing" } ?? "—",
+                    valueB: c.proposalLoopComparison.reviewCorpusBundlePresentB.map { $0 ? "present" : "missing" } ?? "—"
+                )
+                comparisonNumberRow(
+                    "Merge provenance",
+                    valueA: c.proposalLoopComparison.mergeProvenanceItemCountA.map { "\($0)" } ?? "—",
+                    valueB: c.proposalLoopComparison.mergeProvenanceItemCountB.map { "\($0)" } ?? "—"
+                )
+                comparisonNumberRow(
+                    "Backlog A",
+                    valueA: c.proposalLoopComparison.backlogItemCountA.map { "\($0)" } ?? "—",
+                    valueB: c.proposalLoopComparison.backlogItemCountB.map { "\($0)" } ?? "—"
+                )
+                comparisonNumberRow(
+                    "Unresolved A",
+                    valueA: c.proposalLoopComparison.unresolvedItemCountA.map { "\($0)" } ?? "—",
+                    valueB: c.proposalLoopComparison.unresolvedItemCountB.map { "\($0)" } ?? "—"
+                )
+                if let unresolvedDelta = c.proposalLoopComparison.unresolvedDelta {
+                    Text("Unresolved delta: \(unresolvedDelta > 0 ? "+" : "")\(unresolvedDelta)")
+                        .font(.caption)
+                        .foregroundStyle(unresolvedDelta == 0 ? Color.secondary : Color.orange)
+                }
+                if let coverageDelta = c.proposalLoopComparison.coverageDelta {
+                    Text("Coverage addressed delta: \(coverageDelta > 0 ? "+" : "")\(coverageDelta)")
+                        .font(.caption)
+                        .foregroundStyle(coverageDelta == 0 ? Color.secondary : Color.blue)
+                }
+                if let growthA = c.proposalLoopComparison.proposalGrowthRatioA,
+                   let growthB = c.proposalLoopComparison.proposalGrowthRatioB {
+                    Text(String(format: "Proposal growth ratio: A %.2fx vs B %.2fx", growthA, growthB))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let scoreDeltaA = c.proposalLoopComparison.scoreDeltaA,
+                   let scoreDeltaB = c.proposalLoopComparison.scoreDeltaB {
+                    Text(String(format: "Score delta: A %.2f vs B %.2f", scoreDeltaA, scoreDeltaB))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let rationaleA = c.proposalLoopComparison.targetedRereviewRationaleA {
+                    Text("Run A targeted rereview: \(rationaleA)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let rationaleB = c.proposalLoopComparison.targetedRereviewRationaleB {
+                    Text("Run B targeted rereview: \(rationaleB)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Text(c.proposalLoopComparison.rationale)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private func bindingSummary(_ binding: RunComparison.AgentBinding?) -> String {
         guard let binding else { return "—" }
         var parts = [binding.provider]
@@ -344,6 +408,25 @@ struct RunComparisonView: View {
             }
         }
         .font(.caption.monospaced())
+    }
+
+    @ViewBuilder
+    private func comparisonNumberRow(_ label: String, valueA: String, valueB: String) -> some View {
+        HStack {
+            Text(label)
+                .frame(width: 100, alignment: .leading)
+                .font(.caption2)
+            Text(valueA)
+                .foregroundStyle(.blue)
+                .frame(width: 70, alignment: .trailing)
+            Text("vs")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(valueB)
+                .foregroundStyle(.purple)
+                .frame(width: 70, alignment: .trailing)
+                .font(.caption2)
+        }
     }
 
     private func formatDuration(_ seconds: Double) -> String {

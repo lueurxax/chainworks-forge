@@ -18,6 +18,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, aggregate summary hardening, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage within one run, immutable generation history, budget-driven compaction, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
+- [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
 
 ## Live Execution
 
@@ -53,6 +54,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [../evidence/output-contracts-failure-evidence-and-recovery-proof.md](../evidence/output-contracts-failure-evidence-and-recovery-proof.md) — consolidated implementation/proof story for output contracts, failure evidence, and narrow recovery
 - [../evidence/session-lineage-reuse-and-operator-reset-proof.md](../evidence/session-lineage-reuse-and-operator-reset-proof.md) — consolidated implementation/proof story for session-lineage reuse, checkpointing, and operator reset
 - [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md) — consolidated implementation/proof story for context strategies, lazy evidence, telemetry, and recommendation output
+- [../evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md](../evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md) — consolidated implementation/proof story for proposal-loop refine fidelity, backlog carry-forward, and targeted rereview
 - [../evidence/design-system-and-brand-application-proof.md](../evidence/design-system-and-brand-application-proof.md) — consolidated implementation/proof story for the design-system and brand-application slice
 
 ## Risk Analysis

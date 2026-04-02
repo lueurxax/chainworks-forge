@@ -25,6 +25,11 @@ artifacts:
   proposal_review_ui: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json
   proposal_review_architect: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/architect.json
   proposal_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json
+  review_corpus_bundle: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/review-corpus-bundle.json
+  score_lift_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json
+  proposal_feedback_coverage: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/feedback-coverage.json
+  proposal_fact_digest: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/fact-digest.json
+  reviewer_scope_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/reviewer-scope-plan.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md
   implementation_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml
@@ -135,6 +140,53 @@ contracts:
       - required_changes
       - recurring_themes
       - decision
+  review_corpus_bundle_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: review_corpus_bundle_raw
+    normalized_artifact_name: review_corpus_bundle
+    required_fields:
+      - review_pass_id
+      - review_iteration_id
+      - source_proposal_artifact
+      - raw_review_artifacts
+      - aggregate_summary_artifact
+  score_lift_backlog_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: score_lift_backlog_raw
+    normalized_artifact_name: score_lift_backlog
+    required_fields:
+      - review_pass_id
+      - source_proposal_artifact
+      - items
+  proposal_feedback_coverage_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_feedback_coverage_raw
+    normalized_artifact_name: proposal_feedback_coverage
+    required_fields:
+      - proposal_revision_id
+      - source_review_pass_id
+      - backlog_items_addressed
+      - backlog_items_unresolved
+      - backlog_items_deferred
+      - backlog_items_disputed
+      - sections_changed
+      - factual_claims_added_or_corrected
+      - notes
+  proposal_fact_digest_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_fact_digest_raw
+    normalized_artifact_name: proposal_fact_digest
+    required_fields:
+      - proposal_revision_id
+      - claims
   implementation_self_assessment_v1:
     format: json
     required_fields:
@@ -745,11 +797,16 @@ agents:
       - idea_brief
       - proposal_current
       - proposal_review_summary
+      - review_corpus_bundle
       - approved_proposal
       - implementation_review_summary
       - run_state
     outputs:
       - proposal_review_summary
+      - review_corpus_bundle
+      - score_lift_backlog
+      - proposal_fact_digest
+      - reviewer_scope_plan
       - approved_proposal
       - implementation_plan
       - implementation_backlog
@@ -779,6 +836,9 @@ agents:
     inputs:
       - idea_brief
       - proposal_current
+      - proposal_feedback_coverage
+      - reviewer_scope_plan
+      - score_lift_backlog
     outputs:
       - proposal_review_po
     output_contract: proposal_review_v1
@@ -799,6 +859,9 @@ agents:
     inputs:
       - idea_brief
       - proposal_current
+      - proposal_feedback_coverage
+      - reviewer_scope_plan
+      - score_lift_backlog
     outputs:
       - proposal_review_ux
     output_contract: proposal_review_v1
@@ -819,6 +882,9 @@ agents:
     inputs:
       - idea_brief
       - proposal_current
+      - proposal_feedback_coverage
+      - reviewer_scope_plan
+      - score_lift_backlog
     outputs:
       - proposal_review_ui
     output_contract: proposal_review_v1
@@ -839,6 +905,9 @@ agents:
     inputs:
       - idea_brief
       - proposal_current
+      - proposal_feedback_coverage
+      - reviewer_scope_plan
+      - score_lift_backlog
     outputs:
       - proposal_review_architect
     output_contract: proposal_review_v1
@@ -910,9 +979,13 @@ agents:
       - proposal_review_ui
       - proposal_review_architect
       - proposal_review_summary
+      - review_corpus_bundle
+      - score_lift_backlog
+      - proposal_fact_digest
     outputs:
       - proposal_current
       - proposal_revision_summary
+      - proposal_feedback_coverage
     requires_human_approval: false
     prompt: |-
       Draft and refine the proposal from the current idea and all reviewer feedback.

@@ -18,6 +18,14 @@ struct OutputContractTemplates {
             return (proposalReview(agentID: agentID), .json)
         case "proposal_review_summary_v1":
             return (proposalReviewSummary(), .json)
+        case "review_corpus_bundle_v1":
+            return (reviewCorpusBundle(), .json)
+        case "score_lift_backlog_v1":
+            return (scoreLiftBacklog(), .json)
+        case "proposal_feedback_coverage_v1":
+            return (proposalFeedbackCoverage(), .json)
+        case "proposal_fact_digest_v1":
+            return (proposalFactDigest(), .json)
         case "implementation_self_assessment_v1":
             return (implementationSelfAssessment(), .json)
         case "audit_report_v1":
@@ -127,6 +135,95 @@ struct OutputContractTemplates {
             "required_changes": [] as [String],
             "recurring_themes": ["Testing coverage", "Error handling"],
             "decision": "proceed"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func reviewCorpusBundle() -> Data {
+        let json: [String: Any] = [
+            "review_pass_id": "review-pass-1",
+            "review_iteration_id": "state_3_proposal_reviewed.1",
+            "source_proposal_artifact": "proposal_current",
+            "raw_review_artifacts": [
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect"
+            ],
+            "aggregate_summary_artifact": "proposal_review_summary"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func scoreLiftBacklog() -> Data {
+        let json: [String: Any] = [
+            "review_pass_id": "review-pass-1",
+            "review_iteration_id": "state_3_proposal_reviewed.1",
+            "source_proposal_artifact": "proposal_current",
+            "proposal_byte_size": 1600,
+            "previous_proposal_byte_size": 1280,
+            "proposal_growth_ratio": 1.25,
+            "score_delta_since_last_review": 0.55,
+            "backlog_items_closed_count": 1,
+            "reopened_item_count": 0,
+            "growth_guard_recommendation": "within_budget",
+            "bounded_next_action": "targeted_rereview",
+            "items": [
+                [
+                    "id": "issue-1",
+                    "source_reviewer": "proposal_reviewer_product_owner",
+                    "severity": "high",
+                    "blocker": true,
+                    "category": "scope",
+                    "score_impact_class": "high_lift",
+                    "description": "Clarify scope boundaries for the first release.",
+                    "evidence_refs": ["proposal_review_po"],
+                    "status": "open",
+                    "merge_provenance": [
+                        "merged_issue_refs": [
+                            "proposal_review_po:first-release-boundary",
+                            "proposal_review_architect:mvp-vs-roadmap-scope"
+                        ],
+                        "rationale": "Merged overlapping scope findings into one score-limiting backlog item."
+                    ] as [String: Any],
+                    "last_touched_iteration": 1
+                ]
+            ]
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func proposalFeedbackCoverage() -> Data {
+        let json: [String: Any] = [
+            "proposal_revision_id": "proposal-revision-2",
+            "source_review_pass_id": "review-pass-1",
+            "backlog_items_addressed": [
+                [
+                    "id": "issue-1",
+                    "resolution": "Clarified the release scope and added a dedicated section on first-release boundaries."
+                ]
+            ],
+            "backlog_items_unresolved": [] as [[String: Any]],
+            "backlog_items_deferred": [] as [[String: Any]],
+            "backlog_items_disputed": [] as [[String: Any]],
+            "sections_changed": ["Scope", "Rollout Plan"],
+            "factual_claims_added_or_corrected": [] as [String],
+            "notes": "Coverage is complete for the current refine pass."
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func proposalFactDigest() -> Data {
+        let json: [String: Any] = [
+            "proposal_revision_id": "proposal-revision-2",
+            "claims": [
+                [
+                    "claim_id": "claim-1",
+                    "statement": "The current workflow already persists proposal review summary as JSON.",
+                    "evidence_refs": ["proposal_review_summary", "workflow.yaml"],
+                    "verification_state": "verified"
+                ]
+            ]
         ]
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }

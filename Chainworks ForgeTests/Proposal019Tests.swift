@@ -49,7 +49,12 @@ struct Proposal019Tests {
             inputArtifacts: [
                 "idea_brief": Data("short idea".utf8),
                 "proposal_current": Data("full proposal body".utf8),
-                "proposal_review_all": Data(String(repeating: "review ", count: 80).utf8),
+                "proposal_review_po": Data("{}".utf8),
+                "proposal_review_ux": Data("{}".utf8),
+                "proposal_review_ui": Data("{}".utf8),
+                "proposal_review_architect": Data("{}".utf8),
+                "proposal_review_summary": Data(String(repeating: "review ", count: 80).utf8),
+                "score_lift_backlog": Data("{}".utf8),
                 "security_audit_raw": Data("sensitive raw audit".utf8)
             ]
         )
@@ -60,7 +65,17 @@ struct Proposal019Tests {
         let task = makeTestTask(
             agent: "proposal_writer",
             task: "refine_proposal",
-            inputs: ["idea_brief", "proposal_current", "proposal_review_all", "security_audit_raw"],
+            inputs: [
+                "idea_brief",
+                "proposal_current",
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect",
+                "proposal_review_summary",
+                "score_lift_backlog",
+                "security_audit_raw"
+            ],
             outputs: ["proposal_current", "proposal_revision_summary"]
         )
 
@@ -74,10 +89,19 @@ struct Proposal019Tests {
 
         #expect(handoff.profileID == "selective_compression_and_escalation")
         #expect(handoff.mode == .selective)
-        #expect(handoff.mandatoryArtifacts.keys.sorted() == ["idea_brief", "proposal_current"])
-        #expect(handoff.summaries.keys.sorted() == ["proposal_review_all"])
+        #expect(handoff.mandatoryArtifacts.keys.sorted() == [
+            "idea_brief",
+            "proposal_current",
+            "proposal_review_architect",
+            "proposal_review_po",
+            "proposal_review_summary",
+            "proposal_review_ui",
+            "proposal_review_ux",
+            "score_lift_backlog"
+        ])
+        #expect(handoff.summaries.keys.isEmpty)
         #expect(handoff.lazyArtifactRefs.keys.sorted() == ["security_audit_raw"])
-        #expect(handoff.summaryMetrics.compactionCount == 1)
+        #expect(handoff.summaryMetrics.compactionCount == 0)
         #expect(handoff.summaryMetrics.lazyArtifactCount == 1)
     }
 
@@ -89,7 +113,12 @@ struct Proposal019Tests {
             inputArtifacts: [
                 "idea_brief": Data("short idea".utf8),
                 "proposal_current": Data("full proposal body".utf8),
-                "proposal_review_all": Data("review summary".utf8),
+                "proposal_review_po": Data("{}".utf8),
+                "proposal_review_ux": Data("{}".utf8),
+                "proposal_review_ui": Data("{}".utf8),
+                "proposal_review_architect": Data("{}".utf8),
+                "proposal_review_summary": Data("review summary".utf8),
+                "score_lift_backlog": Data("{}".utf8),
                 "security_audit_raw": Data("sensitive raw audit".utf8)
             ]
         )
@@ -100,7 +129,17 @@ struct Proposal019Tests {
         let task = makeTestTask(
             agent: "proposal_writer",
             task: "refine_proposal",
-            inputs: ["idea_brief", "proposal_current", "proposal_review_all", "security_audit_raw"],
+            inputs: [
+                "idea_brief",
+                "proposal_current",
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect",
+                "proposal_review_summary",
+                "score_lift_backlog",
+                "security_audit_raw"
+            ],
             outputs: ["proposal_current", "proposal_revision_summary"]
         )
 
@@ -116,6 +155,219 @@ struct Proposal019Tests {
         #expect(handoff.mandatoryArtifacts["security_audit_raw"] != nil)
         #expect(handoff.lazyArtifactRefs["security_audit_raw"] == nil)
         #expect(handoff.promotedArtifacts == ["security_audit_raw"])
+    }
+
+    @Test("Proposal-loop comparison tracks feedback carry-forward and rationale")
+    func proposalLoopComparisonTracksFeedbackCarryForwardAndRationale() throws {
+        let (_, context) = try makeTestModelContainer()
+        let workspaceA = makeTestWorkspace()
+        let workspaceB = makeTestWorkspace()
+        let idea = Idea(title: "Proposal-loop comparison", body: "Test")
+        context.insert(idea)
+
+        let runA = makeTestRun(
+            workspace: workspaceA,
+            context: context,
+            ideaTitle: "Proposal-loop comparison",
+            ideaBody: "Test",
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop"
+        )
+        runA.idea = idea
+        runA.workflowFamily = "proposal_loop_live"
+        runA.contextStrategyProfileID = "current_mixed_baseline"
+        runA.strategyAssignmentMode = "default"
+
+        let runB = makeTestRun(
+            workspace: workspaceB,
+            context: context,
+            ideaTitle: "Proposal-loop comparison",
+            ideaBody: "Test",
+            workflowID: "proposal_loop_live",
+            workflowTitle: "Proposal Loop"
+        )
+        runB.idea = idea
+        runB.workflowFamily = "proposal_loop_live"
+        runB.contextStrategyProfileID = "selective_compression_and_escalation"
+        runB.strategyAssignmentMode = "manual_override"
+
+        context.insert(runA)
+        context.insert(runB)
+
+        let stageA = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            status: .completed,
+            iteration: 5,
+            attemptNumber: 1
+        )
+        stageA.run = runA
+        context.insert(stageA)
+
+        let stageB = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            status: .completed,
+            iteration: 5,
+            attemptNumber: 1
+        )
+        stageB.run = runB
+        context.insert(stageB)
+
+        let agentA = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "aggregate_proposal_reviews",
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agentA.stageExecution = stageA
+        context.insert(agentA)
+
+        let agentB = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "aggregate_proposal_reviews",
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agentB.stageExecution = stageB
+        context.insert(agentB)
+
+        let aBacklogPath = workspaceA.artifactRoot.appendingPathComponent("score_lift_backlog.json").path
+        let aCoveragePath = workspaceA.artifactRoot.appendingPathComponent("proposal_feedback_coverage.json").path
+        let bBacklogPath = workspaceB.artifactRoot.appendingPathComponent("score_lift_backlog.json").path
+        let bCoveragePath = workspaceB.artifactRoot.appendingPathComponent("proposal_feedback_coverage.json").path
+
+        let runABacklogJSON = """
+        {
+          "review_pass_id": "pass-a",
+          "source_proposal_artifact": "proposal_current",
+          "items": [
+            {"id":"ui-1","status":"open"},
+            {"id":"ux-1","status":"open"},
+            {"id":"po-1","status":"deferred"}
+          ],
+          "reviewer_scope_summary": {
+            "full_rerun": ["proposal_reviewer_ui"]
+          }
+        }
+        """
+
+        let runACoverageJSON = """
+        {
+          "proposal_revision_id": "rev-a",
+          "source_review_pass_id": "pass-a",
+          "backlog_items_addressed": ["ui-1"],
+          "backlog_items_unresolved": ["ux-1"],
+          "backlog_items_deferred": ["po-1"],
+          "backlog_items_disputed": [],
+          "sections_changed": ["Initial pass"],
+          "factual_claims_added_or_corrected": ["Added UI backlog handling"]
+        }
+        """
+
+        let runBBacklogJSON = """
+        {
+          "review_pass_id": "pass-b",
+          "source_proposal_artifact": "proposal_current",
+          "items": [
+            {"id":"ui-1","status":"open"},
+            {"id":"ux-1","status":"open"},
+            {"id":"po-1","status":"open"},
+            {"id":"ux-2","status":"deferred"}
+          ],
+          "reviewer_scope_summary": {
+            "full_rerun": ["proposal_reviewer_ui"],
+            "verification_only": ["proposal_reviewer_architect"]
+          }
+        }
+        """
+
+        let runBCoverageJSON = """
+        {
+          "proposal_revision_id": "rev-b",
+          "source_review_pass_id": "pass-b",
+          "backlog_items_addressed": ["ui-1", "ux-2"],
+          "backlog_items_unresolved": ["ux-1"],
+          "backlog_items_deferred": ["po-1"],
+          "backlog_items_disputed": [],
+          "sections_changed": ["Improved architecture review"],
+          "factual_claims_added_or_corrected": ["Addressed verification scope"]
+        }
+        """
+
+        try runABacklogJSON.write(toFile: aBacklogPath, atomically: true, encoding: .utf8)
+        try runACoverageJSON.write(toFile: aCoveragePath, atomically: true, encoding: .utf8)
+        try runBBacklogJSON.write(toFile: bBacklogPath, atomically: true, encoding: .utf8)
+        try runBCoverageJSON.write(toFile: bCoveragePath, atomically: true, encoding: .utf8)
+
+        let artifactA1 = Artifact(
+            name: "score_lift_backlog",
+            contractID: "score_lift_backlog",
+            format: .json,
+            filePath: aBacklogPath,
+            runID: runA.id,
+            stageID: stageA.stageID,
+            agentID: "lead_orchestrator",
+            provider: "system"
+        )
+        artifactA1.agentExecution = agentA
+        context.insert(artifactA1)
+
+        let artifactA2 = Artifact(
+            name: "proposal_feedback_coverage",
+            contractID: "proposal_feedback_coverage",
+            format: .json,
+            filePath: aCoveragePath,
+            runID: runA.id,
+            stageID: stageA.stageID,
+            agentID: "proposal_writer",
+            provider: "system"
+        )
+        artifactA2.agentExecution = agentA
+        context.insert(artifactA2)
+
+        let artifactB1 = Artifact(
+            name: "score_lift_backlog",
+            contractID: "score_lift_backlog",
+            format: .json,
+            filePath: bBacklogPath,
+            runID: runB.id,
+            stageID: stageB.stageID,
+            agentID: "lead_orchestrator",
+            provider: "system"
+        )
+        artifactB1.agentExecution = agentB
+        context.insert(artifactB1)
+
+        let artifactB2 = Artifact(
+            name: "proposal_feedback_coverage",
+            contractID: "proposal_feedback_coverage",
+            format: .json,
+            filePath: bCoveragePath,
+            runID: runB.id,
+            stageID: stageB.stageID,
+            agentID: "proposal_writer",
+            provider: "system"
+        )
+        artifactB2.agentExecution = agentB
+        context.insert(artifactB2)
+
+        let comparison = try #require(RunComparisonService(modelContext: context).compare(runA, runB))
+        let proposalDelta = comparison.proposalLoopComparison
+
+        #expect(proposalDelta.backlogItemCountA == 3)
+        #expect(proposalDelta.backlogItemCountB == 4)
+        #expect(proposalDelta.unresolvedItemCountA == 2)
+        #expect(proposalDelta.unresolvedItemCountB == 3)
+        #expect(proposalDelta.unresolvedDelta == 1)
+        #expect(proposalDelta.coverageDelta == 1)
+        #expect(proposalDelta.targetedRereviewRationaleA?.contains("full: proposal_reviewer_ui") == true)
+        #expect(proposalDelta.targetedRereviewRationaleB?.contains("verification: proposal_reviewer_architect") == true)
+        #expect(proposalDelta.rationale == "Run B has higher unresolved backlog and likely requires narrower rerun than before.")
     }
 
     @Test("Strategy comparison degrades to insufficient evidence without canonical telemetry set")
@@ -358,7 +610,7 @@ struct Proposal019Tests {
             strategyAssignmentMode: selection.assignmentMode,
             strategyRecommendationState: selection.recommendationState,
             contextStrategySnapshotJSON: try JSONEncoder().encode(selection.profile),
-            promotedHandoffArtifactsJSON: try JSONEncoder().encode(["proposal_review_all"])
+            promotedHandoffArtifactsJSON: try JSONEncoder().encode(["proposal_review_summary"])
         )
 
         let clone = try RecoveryCoordinator(modelContext: context).cloneRunCurrentConfig(
@@ -378,7 +630,7 @@ struct Proposal019Tests {
         let restored = try JSONDecoder().decode(ContextStrategyProfile.self, from: try #require(clone.contextStrategySnapshotJSON))
         #expect(restored.profileID == "fresh_control")
         let promoted = try JSONDecoder().decode([String].self, from: try #require(clone.promotedHandoffArtifactsJSON))
-        #expect(promoted == ["proposal_review_all"])
+        #expect(promoted == ["proposal_review_summary"])
     }
 
     @Test("Continuity mode overrides runtime session reuse scope for long continuity and fresh control profiles")

@@ -285,6 +285,45 @@ Important:
 - this gate is the canonical proof path for the implemented strategy slice
 - the stable documentation source of truth for the slice is now [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md), not the old proposal file
 
+### `proposal-022`
+
+Proposal-loop fidelity gate for review-corpus persistence, score-lift backlog truth, and targeted rereview proof.
+
+Scope:
+
+- `Proposal022Tests`
+- `Proposal022ScaffoldingTests`
+- remote app-launched Proposal 022 proof export from the built app
+
+Use when:
+
+- reproving the implemented proposal-loop fidelity slice on the current head
+- validating canonical `review_corpus_bundle`, merge provenance, backlog coverage, and targeted rereview truth
+- collecting the app-launched proof artifact required by Proposal 022 without depending on local UI execution
+
+Host policy:
+
+- remote-only because this gate includes an app-launched proof step on the approved UI host
+- do not run this gate locally after the operator has forbidden local UI/app launches
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-022
+```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-022"
+```
+
+Important:
+
+- the canonical Proposal 022 app-level proof is no longer a local XCUITest assumption
+- the gate builds locally on the remote host, runs the focused non-UI slice, then launches the built app in a deterministic proof-export mode
+- pull back the emitted Proposal 022 result JSON after the run if the audit needs inspectable app-proof evidence
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
@@ -336,6 +375,12 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ```bash
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-006"
+```
+
+### Proposal-loop fidelity work
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-022"
 ```
 
 ### Before sign-off

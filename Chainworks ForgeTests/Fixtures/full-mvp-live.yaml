@@ -89,47 +89,63 @@ states:
     owner: lead_orchestrator
     run:
       parallel:
-      - agent: proposal_reviewer_product_owner
-        task: review_proposal_as_product_owner
-        inputs:
-        - idea_brief
-        - proposal_current
-        outputs:
-        - proposal_review_po
-      - agent: proposal_reviewer_ux
-        task: review_proposal_as_ux_designer
-        inputs:
-        - idea_brief
-        - proposal_current
-        outputs:
-        - proposal_review_ux
-      - agent: proposal_reviewer_ui
-        task: review_proposal_as_ui_designer
-        inputs:
-        - idea_brief
-        - proposal_current
-        outputs:
-        - proposal_review_ui
-      - agent: proposal_reviewer_architect
-        task: review_proposal_as_architect
-        inputs:
-        - idea_brief
-        - proposal_current
-        outputs:
-        - proposal_review_architect
+        - agent: proposal_reviewer_product_owner
+          task: review_proposal_as_product_owner
+          inputs:
+            - idea_brief
+            - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
+          outputs:
+            - proposal_review_po
+        - agent: proposal_reviewer_ux
+          task: review_proposal_as_ux_designer
+          inputs:
+            - idea_brief
+            - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
+          outputs:
+            - proposal_review_ux
+        - agent: proposal_reviewer_ui
+          task: review_proposal_as_ui_designer
+          inputs:
+            - idea_brief
+            - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
+          outputs:
+            - proposal_review_ui
+        - agent: proposal_reviewer_architect
+          task: review_proposal_as_architect
+          inputs:
+            - idea_brief
+            - proposal_current
+            - proposal_feedback_coverage
+            - reviewer_scope_plan
+            - score_lift_backlog
+          outputs:
+            - proposal_review_architect
       then:
-      - agent: lead_orchestrator
-        task: aggregate_proposal_reviews
-        inputs:
-        - proposal_review_po
-        - proposal_review_ux
-        - proposal_review_ui
-        - proposal_review_architect
-        - proposal_current
-        outputs:
-        - proposal_review_summary
-        - orchestrator_summary
-        - run_state
+        - agent: lead_orchestrator
+          task: aggregate_proposal_reviews
+          inputs:
+            - proposal_review_po
+            - proposal_review_ux
+            - proposal_review_ui
+            - proposal_review_architect
+            - proposal_current
+          outputs:
+            - proposal_review_summary
+            - review_corpus_bundle
+            - score_lift_backlog
+            - proposal_fact_digest
+            - reviewer_scope_plan
+            - orchestrator_summary
+            - run_state
     transitions:
     - to: state_5_proposal_refined
       when: proposal_review_summary.average_score <= vars.proposal_score_target or proposal_review_summary.min_individual_score < vars.min_individual_proposal_score or proposal_review_summary.blocker_count > 0
@@ -141,15 +157,24 @@ states:
     owner: proposal_writer
     run:
       sequence:
-      - agent: proposal_writer
-        task: refine_proposal
-        inputs:
-        - proposal_current
-        - proposal_review_summary
-        - run_state
-        outputs:
-        - proposal_current
-        - proposal_revision_summary
+        - agent: proposal_writer
+          task: refine_proposal
+          inputs:
+            - idea_brief
+            - proposal_current
+            - proposal_review_po
+            - proposal_review_ux
+            - proposal_review_ui
+            - proposal_review_architect
+            - proposal_review_summary
+            - review_corpus_bundle
+            - score_lift_backlog
+            - proposal_fact_digest
+            - run_state
+          outputs:
+            - proposal_current
+            - proposal_revision_summary
+            - proposal_feedback_coverage
     loop:
       counter: proposal_revision_count
       max: vars.max_proposal_revision_cycles

@@ -34,6 +34,7 @@ struct ContentView: View {
         case completedExportHub = "completed_export_hub"
         case accessibilityAudit = "accessibility_audit"
         case proposal013Proof = "proposal013_proof"
+        case proposal022Proof = "proposal022_proof"
     }
 
     init() {
@@ -180,6 +181,8 @@ struct ContentView: View {
             UITestAccessibilityAuditSurface()
         case .proposal013Proof:
             UITestProposal013EvidenceSurface()
+        case .proposal022Proof:
+            UITestProposal022EvidenceSurface()
         }
     }
 }

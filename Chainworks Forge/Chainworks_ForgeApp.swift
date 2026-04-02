@@ -316,6 +316,7 @@ struct AppBootstrapView: View {
     @State private var gooseServerManager: GooseServerManager?
     @State private var showFirstRunWizard = false
     @State private var dogfoodHarnessStarted = false
+    @State private var proposal022AppProofStarted = false
     private let forcedUISurface = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
         .flatMap(ContentView.UISurface.init(rawValue:))
 
@@ -353,6 +354,7 @@ struct AppBootstrapView: View {
         let forceLiveRuntimeUnavailable = environment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] == "1"
         let disableEagerUITestBootstrap = isUIAutomationHost && environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1"
         let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled
+        let isProposal022AppProofAutorun = Proposal022AppProofAutorun.isEnabled
 
         let appConfigurationStore = AppConfigurationStore()
         let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
@@ -370,7 +372,11 @@ struct AppBootstrapView: View {
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
-        if !isUnitTestHost && !forceLiveRuntimeUnavailable && !disableEagerUITestBootstrap && !isProposal007DogfoodHarness {
+        if !isUnitTestHost &&
+            !forceLiveRuntimeUnavailable &&
+            !disableEagerUITestBootstrap &&
+            !isProposal007DogfoodHarness &&
+            !isProposal022AppProofAutorun {
             await gooseServerManager.bootstrap()
         }
         let liveRuntimeConfiguration = isUnitTestHost || forceLiveRuntimeUnavailable
@@ -394,7 +400,7 @@ struct AppBootstrapView: View {
         Self.seedWorkflowMapRunIfRequested(modelContext: modelContext)
         Self.seedReleaseGateRunIfRequested(modelContext: modelContext)
 
-        if !isUnitTestHost {
+        if !isUnitTestHost && !isProposal022AppProofAutorun {
             let compiler = RunPlanCompiler(modelContext: modelContext)
             service.resumeInterruptedRuns(compiler: compiler)
 
@@ -402,7 +408,9 @@ struct AppBootstrapView: View {
             service.checkForConfigChange()
         }
 
-        if !isUnitTestHost && !disableEagerUITestBootstrap {
+        if !isUnitTestHost &&
+            !disableEagerUITestBootstrap &&
+            !isProposal022AppProofAutorun {
             Task { @MainActor in
                 await providerRegistry.refreshHealth()
             }
@@ -431,6 +439,28 @@ struct AppBootstrapView: View {
                     print("Proposal 007 dogfood harness completed: \(result.exportPath)")
                 } catch {
                     print("Proposal 007 dogfood harness failed: \(error.localizedDescription)")
+                }
+
+                #if os(macOS)
+                NSApp.terminate(nil)
+                #endif
+            }
+        }
+
+        if isProposal022AppProofAutorun,
+           proposal022AppProofStarted == false {
+            proposal022AppProofStarted = true
+            Task { @MainActor in
+                let autorun = Proposal022AppProofAutorun(
+                    modelContext: modelContext,
+                    executionService: service
+                )
+
+                do {
+                    let export = try await autorun.runFromEnvironment()
+                    print("Proposal 022 app proof completed: \(export.result.proofStatus)")
+                } catch {
+                    print("Proposal 022 app proof failed: \(error.localizedDescription)")
                 }
 
                 #if os(macOS)
@@ -547,6 +577,13 @@ struct AppBootstrapView: View {
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
                                 .environment(gooseServerManager)
+                        case .proposal022Proof:
+                            UITestProposal022EvidenceSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -626,7 +663,8 @@ struct AppBootstrapView: View {
         let environment = ProcessInfo.processInfo.environment
         if environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] != nil
             || environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
-            || Proposal007DogfoodHarness.isEnabled {
+            || Proposal007DogfoodHarness.isEnabled
+            || Proposal022AppProofAutorun.isEnabled {
             return false
         }
 
@@ -699,6 +737,22 @@ struct AppBootstrapView: View {
                 apiKey: nil,
                 override: override,
                 transportMode: .fixtureProposalLoopSuccess,
+                transportAPI: .bespoke
+            )
+        }
+        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal022_feedback_cycle" {
+            let override = LiveExecutionOverride(
+                enabled: true,
+                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
+                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
+                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
+            )
+
+            return LiveRuntimeConfiguration(
+                baseURL: URL(string: "http://fixture.local")!,
+                apiKey: nil,
+                override: override,
+                transportMode: .fixtureProposal022FeedbackCycle,
                 transportAPI: .bespoke
             )
         }

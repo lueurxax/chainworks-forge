@@ -78,7 +78,7 @@ final class Proposal013AppProofHarness {
         guard let reviewStage = blockedRun.stageExecutions.last(where: { $0.stageID == "state_3_proposal_reviewed" }) else {
             throw Proposal013AppProofHarnessError.missingReviewStage
         }
-        guard let aggregateAgent = reviewStage.agentExecutions.first(where: { $0.agentID == "lead_orchestrator" }) else {
+        guard reviewStage.agentExecutions.contains(where: { $0.agentID == "lead_orchestrator" }) else {
             throw Proposal013AppProofHarnessError.missingAggregateAgent
         }
         guard let packetData = reviewStage.evidencePacketJSON,

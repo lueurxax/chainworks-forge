@@ -45,7 +45,7 @@ struct PreflightService {
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
-        startOptions: RunStartOptions = .empty,
+        startOptions: RunStartOptions,
         idea: Idea? = nil
     ) async -> PreflightReport {
         var checks: [PreflightCheck] = []
@@ -211,6 +211,21 @@ struct PreflightService {
             checks: checks,
             warnings: Array(Set(warnings)),
             blockingIssues: Array(Set(blockingIssues))
+        )
+    }
+
+    func runReport(
+        workflowURL: URL,
+        catalogURL: URL,
+        plan: RunPlan?,
+        idea: Idea? = nil
+    ) async -> PreflightReport {
+        await runReport(
+            workflowURL: workflowURL,
+            catalogURL: catalogURL,
+            plan: plan,
+            startOptions: RunStartOptions(),
+            idea: idea
         )
     }
 

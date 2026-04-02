@@ -16,6 +16,10 @@ struct IdeaListView: View {
         ideas.filter { !$0.isArchived }
     }
 
+    private var sidebarIdeas: [Idea] {
+        activeIdeas.sorted(by: compareSidebarIdeas)
+    }
+
     private var archivedIdeas: [Idea] {
         ideas.filter(\.isArchived)
     }
@@ -28,26 +32,8 @@ struct IdeaListView: View {
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                // Summary strip (UI-001)
                 summaryStrip
-
-                HStack(spacing: 12) {
-                    Button(action: presentNewIdeaSheet) {
-                        Label("New Idea", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("ideas-new-idea-inline")
-
-                    Button(action: { showArchivedIdeas = true }) {
-                        Label("Archive", systemImage: "archivebox")
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("ideas-open-archive-inline")
-
-                    Spacer()
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                actionStrip
 
                 Group {
                     if activeIdeas.isEmpty {
@@ -62,29 +48,12 @@ struct IdeaListView: View {
                         }
                     } else {
                         List(selection: $selectedIdeaID) {
-                            ForEach(activeIdeas) { idea in
+                            ForEach(sidebarIdeas) { idea in
                                 NavigationLink(value: idea.id) {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(idea.title).font(.headline)
-                                        HStack(spacing: 8) {
-                                            IdeaLifecycleBadge(idea: idea)
-                                            if idea.isArchived {
-                                                Image(systemName: "archivebox.fill")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                            if let attachPath = idea.attachmentPath {
-                                                // Proposal 008 (REQ-009): Color-code attachment indicator by validation status.
-                                                AttachmentStatusIcon(path: attachPath)
-                                            }
-                                            // Show active run indicator
-                                            if idea.runs.contains(where: { [.running, .waitingApproval, .pending, .ready, .blocked].contains($0.status) }) {
-                                                Image(systemName: "play.circle.fill")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(DesignTokens.Status.success)
-                                            }
-                                        }
-                                    }
+                                    IdeaSidebarRow(
+                                        idea: idea,
+                                        isSelected: selectedIdeaID == idea.id
+                                    )
                                 }
                                 .tag(idea.id)
                                 .contextMenu {
@@ -166,13 +135,31 @@ struct IdeaListView: View {
 
     // MARK: - Summary Strip
 
-    // Proposal 012 (L-03): Redesigned summary strip with pill chips and two-row layout.
     private var summaryStrip: some View {
         let draftCount = activeIdeas.filter { $0.status == .draft }.count
         let activeCount = activeIdeas.filter { $0.status == .active }.count
+        let attentionCount = activeIdeas.filter(\.requiresAttention).count
 
-        return VStack(spacing: DesignTokens.Spacing.compact) {
-            // Row 1: Idea count chips
+        return VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Ideas")
+                        .font(.title3.weight(.semibold))
+                    Text(attentionCount > 0 ? "\(attentionCount) need attention" : "Operator workspace")
+                        .font(.caption)
+                        .foregroundStyle(attentionCount > 0 ? DesignTokens.Status.warning : .secondary)
+                }
+                Spacer()
+                if attentionCount > 0 {
+                    StatusCapsule(
+                        text: "\(attentionCount) attention",
+                        color: DesignTokens.Status.warning,
+                        icon: "exclamationmark.circle.fill",
+                        size: .small
+                    )
+                }
+            }
+
             HStack(spacing: DesignTokens.Spacing.small) {
                 summaryChip(
                     label: "\(activeIdeas.count) ideas",
@@ -206,8 +193,25 @@ struct IdeaListView: View {
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("ideas-summary-open-archive")
                 }
-                Spacer()
             }
+
+            HStack(spacing: 8) {
+                if executionService.hasActiveRuns {
+                    Label("\(executionService.activeOrchestrators.count) run\(executionService.activeOrchestrators.count == 1 ? "" : "s") active", systemImage: "play.circle.fill")
+                        .foregroundStyle(DesignTokens.Status.success)
+                }
+                switch executionService.liveRuntimeReadiness {
+                case .ready(_, let source):
+                    Label("Live ready (\(source))", systemImage: "bolt.horizontal.circle.fill")
+                        .foregroundStyle(DesignTokens.Status.success)
+                        .accessibilityIdentifier("live-runtime-ready")
+                case .unavailable:
+                    Label("Live unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(DesignTokens.Status.warning)
+                        .accessibilityIdentifier("live-runtime-unavailable")
+                }
+            }
+            .font(.caption)
 
             summaryChipAccessibilityProof(
                 totalLabel: "\(activeIdeas.count) ideas",
@@ -215,45 +219,35 @@ struct IdeaListView: View {
                 activeLabel: "\(activeCount) active",
                 archivedLabel: archivedIdeas.isEmpty ? nil : "\(archivedIdeas.count) archived"
             )
-
-            // Row 2: Runtime status
-            HStack(spacing: DesignTokens.Spacing.small) {
-                if executionService.hasActiveRuns {
-                    StatusCapsule(
-                        text: "\(executionService.activeOrchestrators.count) running",
-                        color: DesignTokens.Status.success,
-                        icon: "play.circle.fill",
-                        size: .small
-                    )
-                }
-                switch executionService.liveRuntimeReadiness {
-                case .ready(_, let source):
-                    StatusCapsule(
-                        text: "Live ready (\(source))",
-                        color: DesignTokens.Status.success,
-                        icon: "bolt.horizontal.circle.fill",
-                        size: .small
-                    )
-                    .accessibilityIdentifier("live-runtime-ready")
-                case .unavailable:
-                    StatusCapsule(
-                        text: "Live unavailable",
-                        color: DesignTokens.Status.warning,
-                        icon: "exclamationmark.triangle.fill",
-                        size: .small
-                    )
-                    .accessibilityIdentifier("live-runtime-unavailable")
-                }
-                Spacer()
-            }
         }
-        .padding(.horizontal)
-        .padding(.vertical, DesignTokens.Spacing.small)
-        .background(DesignTokens.Action.primary.opacity(0.06))
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Idea summary")
         .accessibilityValue(summaryStripAccessibilityLabel)
         .accessibilityIdentifier("ideas-summary-strip")
+    }
+
+    private var actionStrip: some View {
+        HStack(spacing: 10) {
+            Button(action: presentNewIdeaSheet) {
+                Label("New Idea", systemImage: "plus")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .accessibilityIdentifier("ideas-new-idea-inline")
+
+            Button(action: { showArchivedIdeas = true }) {
+                Label("Archive", systemImage: "archivebox")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .accessibilityIdentifier("ideas-open-archive-inline")
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 10)
     }
 
     /// Pill-shaped chip for the summary strip.
@@ -389,7 +383,7 @@ struct IdeaListView: View {
 
     private func deleteIdeas(offsets: IndexSet) {
         for index in offsets {
-            modelContext.delete(activeIdeas[index])
+            modelContext.delete(sidebarIdeas[index])
         }
         try? modelContext.save()
     }
@@ -428,6 +422,237 @@ struct IdeaListView: View {
             newIdeaDraft.attachmentPath = url.path
         }
         #endif
+    }
+
+    private func compareSidebarIdeas(_ lhs: Idea, _ rhs: Idea) -> Bool {
+        let leftRank = ideaPriority(lhs)
+        let rightRank = ideaPriority(rhs)
+        if leftRank != rightRank {
+            return leftRank < rightRank
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return lhs.createdAt > rhs.createdAt
+        }
+        return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+    }
+
+    private func ideaPriority(_ idea: Idea) -> Int {
+        if let latestRun = idea.latestRun {
+            switch latestRun.presentationStatus {
+            case .waitingApproval:
+                return 0
+            case .blocked:
+                return 1
+            case .failed:
+                return 2
+            case .running:
+                return 3
+            case .pending, .ready, .cancelling:
+                return 4
+            case .completed, .cancelled:
+                break
+            }
+        }
+
+        switch idea.status {
+        case .active:
+            return 5
+        case .draft:
+            return 6
+        case .failed:
+            return 7
+        case .completed:
+            return 8
+        }
+    }
+}
+
+private struct IdeaSidebarRow: View {
+    let idea: Idea
+    let isSelected: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(idea.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    if !idea.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(idea.body.trimmingCharacters(in: .whitespacesAndNewlines))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 8)
+                StatusCapsule(
+                    text: idea.lifecycleStatusLabel,
+                    color: primaryStatusColor,
+                    icon: primaryStatusIcon,
+                    size: .small
+                )
+            }
+
+            HStack(spacing: 6) {
+                if let attentionLabel {
+                    sidebarMetaTag(attentionLabel, icon: attentionIcon, color: attentionColor)
+                } else if idea.hasActiveRun {
+                    sidebarMetaTag("Run active", icon: "play.circle.fill", color: DesignTokens.Status.running)
+                }
+
+                if idea.attachmentPath?.isEmpty == false {
+                    sidebarMetaTag("Attachment", icon: "paperclip", color: .secondary)
+                }
+
+                if idea.workspaceRootPath?.isEmpty == false {
+                    sidebarMetaTag("Project linked", icon: "folder", color: .secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(rowBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(rowBorder, lineWidth: isSelected ? 1.5 : 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func sidebarMetaTag(_ text: String, icon: String, color: Color) -> some View {
+        Label(text, systemImage: icon)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(color.opacity(0.12), in: Capsule())
+            .foregroundStyle(color)
+    }
+
+    private var primaryStatusColor: Color {
+        if let latestRun = idea.latestRun {
+            switch latestRun.presentationStatus {
+            case .pending, .ready:
+                return DesignTokens.Status.neutral
+            case .running:
+                return DesignTokens.Status.running
+            case .waitingApproval, .blocked, .cancelling:
+                return DesignTokens.Status.warning
+            case .completed:
+                return DesignTokens.Status.success
+            case .failed:
+                return DesignTokens.Status.error
+            case .cancelled:
+                return DesignTokens.Status.cancelled
+            }
+        }
+
+        switch idea.status {
+        case .draft:
+            return .blue
+        case .active:
+            return DesignTokens.Status.success
+        case .completed:
+            return DesignTokens.Status.success
+        case .failed:
+            return DesignTokens.Status.error
+        }
+    }
+
+    private var primaryStatusIcon: String? {
+        guard let latestRun = idea.latestRun else {
+            return idea.status == .draft ? "pencil" : "lightbulb.fill"
+        }
+        switch latestRun.presentationStatus {
+        case .pending, .ready:
+            return "clock"
+        case .running:
+            return "play.circle.fill"
+        case .waitingApproval:
+            return "checkmark.seal"
+        case .blocked:
+            return "pause.circle.fill"
+        case .completed:
+            return "checkmark.circle.fill"
+        case .failed:
+            return "xmark.circle.fill"
+        case .cancelled:
+            return "stop.circle.fill"
+        case .cancelling:
+            return "hourglass"
+        }
+    }
+
+    private var attentionLabel: String? {
+        guard let latestRun = idea.latestRun else { return nil }
+        switch latestRun.presentationStatus {
+        case .waitingApproval:
+            return "Needs approval"
+        case .blocked:
+            return "Needs recovery"
+        case .failed:
+            return "Run failed"
+        default:
+            return nil
+        }
+    }
+
+    private var attentionIcon: String {
+        guard let latestRun = idea.latestRun else { return "exclamationmark.circle.fill" }
+        switch latestRun.presentationStatus {
+        case .waitingApproval:
+            return "checkmark.seal"
+        case .blocked:
+            return "pause.circle.fill"
+        case .failed:
+            return "xmark.octagon.fill"
+        default:
+            return "exclamationmark.circle.fill"
+        }
+    }
+
+    private var attentionColor: Color {
+        guard let latestRun = idea.latestRun else { return DesignTokens.Status.warning }
+        switch latestRun.presentationStatus {
+        case .failed:
+            return DesignTokens.Status.error
+        default:
+            return DesignTokens.Status.warning
+        }
+    }
+
+    private var rowBackground: Color {
+        if isSelected {
+            return DesignTokens.Action.primary.opacity(0.14)
+        }
+        if idea.requiresAttention {
+            return primaryStatusColor.opacity(0.08)
+        }
+        return Color.white.opacity(0.03)
+    }
+
+    private var rowBorder: Color {
+        if isSelected {
+            return DesignTokens.Action.primary.opacity(0.55)
+        }
+        if idea.requiresAttention {
+            return primaryStatusColor.opacity(0.24)
+        }
+        return Color.white.opacity(0.06)
+    }
+}
+
+private extension Idea {
+    var requiresAttention: Bool {
+        guard let latestRun else { return false }
+        switch latestRun.presentationStatus {
+        case .waitingApproval, .blocked, .failed:
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -2046,6 +2271,8 @@ struct WorkflowRunProgressView: View {
         let priority = [
             "proposal_revision_summary",
             "proposal_review_summary",
+            "score_lift_backlog",
+            "proposal_feedback_coverage",
             "proposal_current",
             "proposal_review_po",
             "proposal_review_ux",
@@ -2061,6 +2288,10 @@ struct WorkflowRunProgressView: View {
             .sorted { (lhs, rhs) in
                 (indexed[lhs.name] ?? .max) < (indexed[rhs.name] ?? .max)
             }
+    }
+
+    private var proposalLoopFeedbackSummary: ProposalLoopFeedbackSummary? {
+        ProposalLoopFeedbackParser.parseSummary(from: approvalContextArtifacts)
     }
 
     private var latestDebugArtifacts: [Artifact] {
@@ -2212,6 +2443,27 @@ struct WorkflowRunProgressView: View {
                         }
                         if !approvalContextArtifacts.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
+                                if let summary = proposalLoopFeedbackSummary {
+                                    GroupBox("Proposal-loop feedback (Proposal 022)") {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            LabeledContent("Backlog", value: "\(summary.backlogItemCount)")
+                                            LabeledContent("Unresolved", value: "\(summary.unresolvedItemCount)")
+                                            LabeledContent("Deferred", value: "\(summary.deferredItemCount)")
+                                            LabeledContent("Addressed", value: "\(summary.addressedItemCount)")
+                                            LabeledContent("Coverage", value: summary.coverageStatusSummary)
+                                            if let targeted = summary.targetedReviewerSummary {
+                                                Text("Targeted rereview")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                Text(targeted)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .padding(.leading, 8)
+                                            }
+                                        }
+                                    }
+                                }
+
                                 Text("Decision Context")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)

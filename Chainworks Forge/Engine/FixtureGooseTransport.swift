@@ -6,6 +6,7 @@ import Foundation
 final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     enum Scenario {
         case proposalLoopSuccess
+        case proposal022FeedbackCycle
         case proposal013AggregateFailure
         case fullMVPSuccess
         case fullMVPRefineThenSuccess
@@ -70,6 +71,8 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     ) -> [GooseStreamEvent] {
         switch scenario {
         case .proposalLoopSuccess:
+            return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
+        case .proposal022FeedbackCycle:
             return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
         case .proposal013AggregateFailure:
             return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
@@ -221,14 +224,66 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
     private func makeOutputContent(taskName: String, agentID: String, outputName: String, invocation: Int) -> String {
         switch outputName {
         case "proposal_review_po":
+            if case .proposal022FeedbackCycle = scenario, taskName == "aggregate_proposal_reviews", invocation >= 2 {
+                return reviewerJSON(agentID: agentID, role: "product_owner", score: 9.3)
+            }
             return reviewerJSON(agentID: agentID, role: "product_owner", score: 9.4)
         case "proposal_review_ux":
+            if case .proposal022FeedbackCycle = scenario, taskName == "aggregate_proposal_reviews", invocation >= 2 {
+                return reviewerJSON(agentID: agentID, role: "ux", score: 9.2)
+            }
             return reviewerJSON(agentID: agentID, role: "ux", score: 9.2)
         case "proposal_review_ui":
+            if case .proposal022FeedbackCycle = scenario, taskName == "aggregate_proposal_reviews", invocation >= 2 {
+                return reviewerJSON(agentID: agentID, role: "ui", score: 9.1)
+            }
             return reviewerJSON(agentID: agentID, role: "ui", score: 9.1)
         case "proposal_review_architect":
+            if case .proposal022FeedbackCycle = scenario, taskName == "aggregate_proposal_reviews", invocation >= 2 {
+                return reviewerJSON(agentID: agentID, role: "architect", score: 9.2)
+            }
             return reviewerJSON(agentID: agentID, role: "architect", score: 9.3)
         case "proposal_review_summary":
+            if case .proposal022FeedbackCycle = scenario {
+                if invocation == 1 {
+                    return """
+                    {
+                      "pass": false,
+                      "average_score": 7.3,
+                      "aggregate_score": 7.3,
+                      "min_individual_score": 7.0,
+                      "blocker_count": 2,
+                      "summary": "Proposal still needs a refine pass driven by the full review corpus.",
+                      "required_changes": [
+                        "Narrow MVP scope boundaries",
+                        "Keep unresolved operator rationale explicit"
+                      ],
+                      "recurring_themes": [
+                        "Scope discipline",
+                        "Operator-facing rationale"
+                      ],
+                      "decision": "revise"
+                    }
+                    """
+                }
+
+                return """
+                {
+                  "pass": true,
+                  "average_score": 9.2,
+                  "aggregate_score": 9.2,
+                  "min_individual_score": 9.1,
+                  "blocker_count": 0,
+                  "summary": "Proposal reaches the approval threshold while leaving one bounded follow-up visible.",
+                  "required_changes": [],
+                  "recurring_themes": [
+                    "Scope is bounded",
+                    "Residual operator rationale is explicit"
+                  ],
+                  "decision": "proceed"
+                }
+                """
+            }
             if case .proposal013AggregateFailure = scenario {
                 return """
                 # Proposal Review Summary
@@ -250,6 +305,179 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
               "decision": "proceed"
             }
             """
+        case "score_lift_backlog":
+            if case .proposal022FeedbackCycle = scenario {
+                if invocation == 1 {
+                    return """
+                    {
+                      "review_pass_id": "review-pass-1",
+                      "review_iteration_id": "state_3_proposal_reviewed.1",
+                      "source_proposal_artifact": "proposal_current",
+                      "proposal_byte_size": 1680,
+                      "previous_proposal_byte_size": 1240,
+                      "proposal_growth_ratio": 1.35,
+                      "score_delta_since_last_review": 0.20,
+                      "backlog_items_closed_count": 0,
+                      "reopened_item_count": 0,
+                      "growth_guard_recommendation": "replan_or_split_required",
+                      "bounded_next_action": "targeted_rereview",
+                      "unresolved_high_lift_count": 1,
+                      "reviewer_scope_summary": {
+                        "full_rerun": [],
+                        "delta_rerun": ["proposal_reviewer_product_owner", "proposal_reviewer_architect"],
+                        "verification_only": ["proposal_reviewer_ui", "proposal_reviewer_ux"]
+                      },
+                      "items": [
+                        {
+                          "id": "scope-boundary",
+                          "review_pass_id": "review-pass-1",
+                          "source_reviewer": "proposal_reviewer_product_owner",
+                          "severity": "high",
+                          "blocker": true,
+                          "category": "scope",
+                          "score_impact_class": "high_lift",
+                          "description": "The proposal still mixes MVP and future roadmap work.",
+                          "evidence_refs": ["proposal_review_po"],
+                          "status": "open",
+                          "writer_coverage_ref": null,
+                          "last_touched_iteration": 1
+                        },
+                        {
+                          "id": "operator-rationale",
+                          "review_pass_id": "review-pass-1",
+                          "source_reviewer": "proposal_reviewer_ux",
+                          "severity": "medium",
+                          "blocker": false,
+                          "category": "ux",
+                          "score_impact_class": "medium_lift",
+                          "description": "Operator-facing unresolved rationale must stay visible after reruns.",
+                          "evidence_refs": ["proposal_review_ux"],
+                          "status": "open",
+                          "merge_provenance": {
+                            "merged_issue_refs": ["proposal_review_ux:operator-rationale", "proposal_review_ui:blocked-state-context"],
+                            "rationale": "Collapsed overlapping operator-context findings into one carry-forward backlog item."
+                          },
+                          "writer_coverage_ref": null,
+                          "last_touched_iteration": 1
+                        }
+                      ]
+                    }
+                    """
+                }
+
+                return """
+                {
+                  "review_pass_id": "review-pass-2",
+                  "review_iteration_id": "state_3_proposal_reviewed.2",
+                  "source_proposal_artifact": "proposal_current",
+                  "proposal_byte_size": 1848,
+                  "previous_proposal_byte_size": 1680,
+                  "proposal_growth_ratio": 1.10,
+                  "score_delta_since_last_review": 1.90,
+                  "backlog_items_closed_count": 1,
+                  "reopened_item_count": 0,
+                  "growth_guard_recommendation": "within_budget",
+                  "bounded_next_action": "targeted_architecture_rerun",
+                  "unresolved_high_lift_count": 0,
+                  "reviewer_scope_summary": {
+                    "full_rerun": [],
+                    "delta_rerun": ["proposal_reviewer_architect"],
+                    "verification_only": ["proposal_reviewer_product_owner", "proposal_reviewer_ui", "proposal_reviewer_ux"]
+                  },
+                      "items": [
+                        {
+                          "id": "operator-rationale",
+                          "review_pass_id": "review-pass-2",
+                          "source_reviewer": "proposal_reviewer_architect",
+                      "severity": "low",
+                      "blocker": false,
+                          "category": "operator_context",
+                          "score_impact_class": "low_lift",
+                          "description": "Residual operator rationale remains visible as a bounded follow-up.",
+                          "evidence_refs": ["proposal_review_architect"],
+                          "status": "partially_resolved",
+                          "merge_provenance": {
+                            "merged_issue_refs": ["proposal_review_architect:operator-rationale", "proposal_review_ux:operator-rationale"],
+                            "rationale": "Merged architecture and UX rationale threads into a single bounded follow-up item."
+                          },
+                          "writer_coverage_ref": "proposal_feedback_coverage",
+                          "last_touched_iteration": 2
+                        }
+                      ]
+                    }
+                """
+            }
+        case "review_corpus_bundle":
+            if case .proposal022FeedbackCycle = scenario {
+                return """
+                {
+                  "review_pass_id": "review-pass-\(max(invocation, 1))",
+                  "review_iteration_id": "state_3_proposal_reviewed.\(max(invocation, 1))",
+                  "source_proposal_artifact": "proposal_current",
+                  "raw_review_artifacts": [
+                    "proposal_review_po",
+                    "proposal_review_ux",
+                    "proposal_review_ui",
+                    "proposal_review_architect"
+                  ],
+                  "aggregate_summary_artifact": "proposal_review_summary"
+                }
+                """
+            }
+        case "proposal_fact_digest":
+            if case .proposal022FeedbackCycle = scenario {
+                return """
+                {
+                  "proposal_revision_id": "proposal-revision-\(max(invocation, 1))",
+                  "claims": [
+                    {
+                      "claim_id": "mvp-scope",
+                      "statement": "The MVP excludes future roadmap automation.",
+                      "evidence_refs": ["proposal_current"],
+                      "verification_state": "verified"
+                    }
+                  ]
+                }
+                """
+            }
+        case "reviewer_scope_plan":
+            if case .proposal022FeedbackCycle = scenario {
+                if invocation == 1 {
+                    return """
+                    {
+                      "full_rerun": [],
+                      "delta_rerun": ["proposal_reviewer_product_owner", "proposal_reviewer_architect"],
+                      "verification_only": ["proposal_reviewer_ui", "proposal_reviewer_ux"],
+                      "rationale": "Scope and architecture need focused rereview; UI/UX only need verification."
+                    }
+                    """
+                }
+
+                return """
+                {
+                  "full_rerun": [],
+                  "delta_rerun": ["proposal_reviewer_architect"],
+                  "verification_only": ["proposal_reviewer_product_owner", "proposal_reviewer_ui", "proposal_reviewer_ux"],
+                  "rationale": "Only architecture needs a targeted delta check after the refine pass."
+                }
+                """
+            }
+        case "proposal_feedback_coverage":
+            if case .proposal022FeedbackCycle = scenario {
+                return """
+                {
+                  "proposal_revision_id": "proposal-revision-1",
+                  "source_review_pass_id": "review-pass-1",
+                  "backlog_items_addressed": ["scope-boundary"],
+                  "backlog_items_unresolved": ["operator-rationale"],
+                  "backlog_items_deferred": [],
+                  "backlog_items_disputed": [],
+                  "sections_changed": ["MVP scope", "Operator recovery"],
+                  "factual_claims_added_or_corrected": ["The MVP excludes future roadmap automation."],
+                  "notes": "Scope was tightened; operator rationale remains explicit for targeted rerun."
+                }
+                """
+            }
         case "implementation_self_assessment":
             return """
             {
@@ -412,6 +640,17 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
             The idea is normalized and ready for proposal drafting.
             """
         case "draft_initial_proposal", "refine_proposal_based_on_review":
+            if case .proposal022FeedbackCycle = scenario, outputName == "proposal_current" {
+                return """
+                # Proposal Draft
+
+                ## MVP Scope
+                This revision narrows the MVP to the bounded operator shell and keeps future automation out of scope.
+
+                ## Open Follow-up
+                One residual operator-rationale note remains explicit for the next targeted review pass.
+                """
+            }
             if outputName == "proposal_revision_summary" {
                 return """
                 # Proposal Revision Summary

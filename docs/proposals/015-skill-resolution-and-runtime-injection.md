@@ -95,9 +95,9 @@ Proposal 015 delivers four tightly coupled layers.
 
 | Component | Responsibility |
 |---|---|
-| **ResolvedSkill** | Immutable value type carrying: `id`, `type` (enum: `external`, `inline`, `builtin`), `resolvedContent` (String), `contentHash` (SHA-256), `sourcePath` (optional, for external), `sourceDescription` (optional, for inline) |
+| **ResolvedSkill** | Immutable value type carrying: `id`, `type` (enum: `external`, `inline`, `builtin`), `resolvedContent` (String), `contentHash` (SHA-256), `injectedContentHash` (SHA-256 of exactly what reaches execution), `sourcePath` (optional, for external), `sourceDescription` (optional, for inline), and `bundleManifest` (optional summary of companion files discovered but not injected) |
 | **SkillResolver** | Pure function: `(AgentCatalog.SkillRef, SkillResolverContext) -> ResolvedSkill`. Dispatches on type, loads content, computes hash. |
-| **ExternalSkillLoader** | Loads external skill content from filesystem path. Reads the skill package and returns a normalized instruction string. |
+| **ExternalSkillLoader** | Loads external skill content from filesystem path. Reads a Codex `SKILL.md` bundle and returns the normalized instruction string plus bundle metadata. |
 | **BuiltinSkillRegistry** | Maps builtin agent names to known instruction sets. MVP set: `docs-quality-guardian`. |
 | **SkillResolverContext** | Carries filesystem access, path resolution rules, and environment variable substitution context. |
 
@@ -107,7 +107,7 @@ Proposal 015 delivers four tightly coupled layers.
 |---|---|
 | **RunPlanCompiler extension** | Resolves every agent's `skill_ref` into a `ResolvedSkill` during compilation. Stores `ResolvedSkill` inside `ResolvedAgent`. |
 | **ResolvedAgent extension** | Gains `resolvedSkill: ResolvedSkill?` and `skillRole: String?` fields. |
-| **RunPlanSnapshot extension** | Captures all resolved skill content hashes in the frozen snapshot. Enables content-drift detection between runs. |
+| **RunStartSnapshot extension** | Captures all resolved skill content hashes and injected-content hashes in the frozen start snapshot. The immutable owner is current `Run` frozen fields plus `RunStartSnapshot`, not a parallel `RunPlanSnapshot` substrate. |
 | **DefinitionHasher extension** | Hashes resolved skill content (not just the name) for provenance. |
 
 ### Layer C: Runtime Injection
@@ -115,8 +115,8 @@ Proposal 015 delivers four tightly coupled layers.
 | Component | Responsibility |
 |---|---|
 | **SkillInjector** | Builds the skill-specific portion of the agent execution context. Combines resolved skill content with role customization. |
-| **GooseSessionBridge extension** | Calls `SkillInjector` during `buildExecutionPacket()` to prepend or append skill instructions to the agent's system prompt. |
-| **SkillRoleCustomizer** | For skills that support roles (e.g., `proposal_review_triad`), applies role-specific instructions that modify the base skill content. |
+| **GooseSessionBridge extension** | Calls `SkillInjector` during `buildExecutionPacket()` to feed the canonical `ExecutionPacket`; it does not become a second packet owner. |
+| **SkillRoleCustomizer** | For skills that support specialization (for example `proposal_review_triad`), applies skill-specific mode mapping or role-specific instructions that modify the base skill content. |
 | **SkillInjectionPolicy** | Defines injection strategy per skill type: `prepend_to_system_prompt`, `append_to_system_prompt`, or `structured_context_block`. MVP uses `prepend_to_system_prompt` for all types. |
 
 ### Layer D: Validation, Provenance, and Visibility
@@ -126,7 +126,7 @@ Proposal 015 delivers four tightly coupled layers.
 | **SkillPreflightCheck** | Added to `PreflightService`. Validates: external paths exist, builtin names are registered, inline descriptions are non-empty. |
 | **AgentExecution extension** | `skillSnapshotHash` now stores hash of resolved content (not name). Gains `skillType: String?` and `skillContentSummary: String?` fields. |
 | **AgentCatalogView extension** | Shows resolved skill type, content preview (first 200 chars), role, and content hash. |
-| **AgentInspectorView extension** | Shows full resolved skill content that was active for a specific execution. |
+| **Shell-owned report / comparison / artifact surfaces extension** | Extends existing `RunReportView`, `RunComparisonView`, and `ArtifactInspectorView` to show resolved skill truth for a specific execution. Proposal 015 does not create a parallel operator-inspection lane. |
 
 ---
 
@@ -134,25 +134,32 @@ Proposal 015 delivers four tightly coupled layers.
 
 ### 4.1 External skill resolution
 
-An `external_skill` declares a filesystem path to a skill package.
+An `external_skill` declares a filesystem path to a Codex skill bundle.
 
 Resolution rules:
 
 1. The path must exist on the local filesystem at compilation time.
-2. The skill package is a directory containing at minimum one instruction file.
-3. The loader reads the instruction file and returns its content as a string.
-4. Environment variables in the path are substituted using the same rules as `paths.*` in the catalog.
-5. If the path does not exist, resolution fails with a typed error. Preflight reports this as a blocking failure.
+2. The skill package is a directory rooted by a required `SKILL.md`.
+3. `SKILL.md` is the executable entrypoint. Companion files under `assets/`, `references/`, `evals/`, or `agents/` are not implicitly concatenated into execution content.
+4. The loader records companion bundle metadata for provenance and operator visibility, but the MVP injected content comes from `SKILL.md` plus explicit role/mode customization only.
+5. Environment variables in the path are substituted using the same rules as `paths.*` in the catalog.
+6. If the path does not exist or `SKILL.md` is missing, resolution fails with a typed error. Preflight reports this as a blocking failure.
 
-Instruction file discovery order:
+This rule intentionally matches the repo's actual external skills under `/Users/user/.codex/skills/*`, which are Codex bundles rooted at `SKILL.md` rather than generic markdown directories.
 
-1. `skill.md` (primary)
-2. `README.md` (fallback)
-3. `instructions.md` (fallback)
-4. `prompt.md` (fallback)
-5. Single `.md` file in directory (fallback if only one exists)
+### 4.1.1 External bundle companions
 
-If no instruction file is found, resolution fails with a typed error.
+The resolver may inspect companion markdown files for metadata and specialized routing, but they do not become executable prompt content unless Proposal 015 explicitly names them as such.
+
+MVP companion handling:
+
+- `SKILL.md`: executable root content
+- `references/*.md`: provenance-visible companion context only
+- `assets/*.md`: authoring/review templates only, not execution content
+- `agents/*.yaml`: bundle-local helper config only, not execution content
+- `evals/*`: proof assets only, not execution content
+
+This keeps raw skill truth and executable injected truth aligned.
 
 ### 4.2 Inline skill resolution
 
@@ -221,13 +228,29 @@ You are operating in the "{skill_role}" role for this skill.
 Apply all skill instructions through the lens of this role.
 ```
 
-For `external_skill` types, if the skill package contains a role-specific file (`roles/{skill_role}.md`), that file's content replaces the generic role specialization block.
+For `external_skill` types, generic `roles/{skill_role}.md` discovery is not sufficient for MVP because current repo reality already has a shared mode-based specialist contract.
+
+Proposal 015 therefore requires two specialization paths:
+
+1. **Skill-specific specialization registry**
+   - A skill can declare that `skill_role` maps to a concrete runtime mode instead of a role file.
+   - Canonical MVP case: `proposal_review_triad`
+     - `product_owner` -> `product-only`
+     - `ux_designer` -> `ux-only`
+     - `ui_designer` -> `ui-only`
+     - `architect` -> `architecture-only`
+   - The injected execution content must reflect the selected mode contract, not just a generic "act through this lens" paragraph.
+
+2. **Optional bundle-local role file**
+   - Only when a skill explicitly opts into file-based specialization may `roles/{skill_role}.md` augment the base skill content.
+
+If neither specialization path is declared, the runtime may fall back to the generic role block.
 
 ### 5.4 Injection for each skill type
 
 | Skill Type | Preamble Source | Role Support | Notes |
 |---|---|---|---|
-| `external_skill` | Loaded instruction file content | Yes, from `roles/{role}.md` if exists, otherwise generic | Full filesystem-backed instructions |
+| `external_skill` | Loaded `SKILL.md` content | Yes, via skill-specific mode mapping or explicitly declared role file; otherwise generic | Full filesystem-backed instructions rooted in Codex bundle contract |
 | `inline_skill` | Description string from YAML | Generic role block only | Lightweight, catalog-embedded |
 | `builtin_agent` | Registry instruction set | Generic role block only | Known agent types with canonical instructions |
 
@@ -245,16 +268,20 @@ If an agent has no `skill_ref` (currently all agents have one, but the model mus
 
 ### 6.1 Snapshot integration
 
-`RunPlanSnapshot` currently captures:
+Current immutable run-start authority is:
 
-- `workflowSnapshotJSON`
-- `catalogSnapshotJSON`
-- SHA-256 hashes for drift detection
+- `Run.workflowSnapshotJSON`
+- `Run.catalogSnapshotJSON`
+- `Run` frozen provenance fields
+- `RunStartSnapshot`
 
 Proposal 015 adds:
 
 - `resolvedSkillsJSON`: serialized map of `skillRef -> ResolvedSkill` for all skills used in the run
-- `skillContentHashes`: map of `skillRef -> SHA-256` for all resolved skill content
+- `skillContentHashes`: map of `skillRef -> SHA-256` for all resolved raw skill content
+- `skillInjectedContentHashes`: map of `skillRef -> SHA-256` for the exact injected execution content after role/mode customization
+
+`RunStartSnapshot` is the proposal-owned extension point for this data. The proposal must not introduce a second frozen snapshot authority parallel to current immutable `Run` fields.
 
 ### 6.2 Drift detection
 
@@ -267,11 +294,31 @@ When a new run is created using the same catalog:
 
 ### 6.3 Per-execution provenance
 
-`AgentExecution.skillSnapshotHash` changes from hashing the skill name to hashing the resolved content. This means:
+`AgentExecution.skillSnapshotHash` changes from hashing the skill name to hashing the exact injected execution content. Proposal 015 also preserves the raw resolved-content hash separately in frozen snapshot truth.
 
-- Same skill name + different content = different hash.
+This means:
+
+- Same skill name + different injected content = different execution hash.
+- Same raw bundle + different role/mode specialization = different execution hash.
 - Provenance can detect when an external skill was modified between executions.
-- Reports can show whether two executions used the same skill content.
+- Reports can show whether two executions used the same raw skill content and whether they injected the same executable specialization.
+
+### 6.4 Size-limit and truncation policy
+
+Proposal 015 must not hash one thing and execute another.
+
+Therefore MVP uses a fail-closed rule:
+
+1. If size limits would require truncating executable skill content before injection, the run does not start.
+2. Preflight reports an oversized-skill failure with the affected `skill_ref`.
+3. The raw resolved-content hash and injected-content hash remain equal for every successful execution in MVP.
+
+Future lazy or partial injection is allowed only if the runtime persists both:
+
+- raw resolved skill hash
+- exact injected content hash
+
+and operator surfaces make the distinction visible.
 
 ---
 
@@ -286,7 +333,7 @@ When a new run is created using the same catalog:
 | External skill content is non-empty | All agents with `external_skill` type | Yes |
 | Builtin agent name is registered | All agents with `builtin_agent` type | Yes |
 | Inline skill description is non-empty | All agents with `inline_skill` type | Yes |
-| Role-specific file exists (when `skill_role` is set on `external_skill`) | Agents with both `skill_ref` -> `external_skill` and `skill_role` | No (warning; falls back to generic role block) |
+| Declared specialization path exists (mode mapping or explicit role file, when required by the skill) | Agents with both `skill_ref` -> `external_skill` and `skill_role` | No for optional specialization; Yes when the skill contract requires specialist mapping |
 
 All blocking failures prevent run start and are reported in `PilotReadinessView`.
 
@@ -309,9 +356,9 @@ After Proposal 015:
 | Content Hash | `resolvedSkill.contentHash` (truncated) | Disclosure toggle |
 | Source Path | `resolvedSkill.sourcePath` | External only |
 
-### 8.2 AgentInspectorView changes
+### 8.2 Shell-owned execution visibility changes
 
-For a completed or running agent execution:
+For a completed or running agent execution, existing shell-owned surfaces gain:
 
 | Field | Source |
 |---|---|
@@ -319,6 +366,14 @@ For a completed or running agent execution:
 | Injection Strategy | `prepend_to_system_prompt` |
 | Role Specialization | Full role block if applied |
 | Content Hash at Execution | `agentExecution.skillSnapshotHash` |
+
+Canonical owners:
+
+- run-centric inspection in existing report surfaces
+- comparison in `RunComparisonView`
+- artifact-level drilldown in `ArtifactInspectorView`
+
+Proposal 015 does not create a standalone `AgentInspectorView` product lane with separate truth semantics.
 
 ### 8.3 PilotReadinessView changes
 
@@ -336,7 +391,7 @@ Skill preflight results are shown as a dedicated section:
 
 1. Define `ResolvedSkill` value type.
 2. Define `SkillType` enum (`external`, `inline`, `builtin`).
-3. Implement `ExternalSkillLoader` with instruction file discovery.
+3. Implement `ExternalSkillLoader` with `SKILL.md` bundle discovery.
 4. Implement `BuiltinSkillRegistry` with `docs-quality-guardian` entry.
 5. Implement `SkillResolver` with type dispatch.
 6. Add `resolvedSkill` to `ResolvedAgent`.
@@ -347,7 +402,7 @@ Skill preflight results are shown as a dedicated section:
 ### Phase 2: Runtime injection
 
 8. Implement `SkillInjector` with preamble generation.
-9. Implement `SkillRoleCustomizer` for generic and file-based role specialization.
+9. Implement `SkillRoleCustomizer` for generic specialization plus skill-specific mode mapping.
 10. Extend `GooseSessionBridge.buildExecutionPacket()` to call `SkillInjector`.
 11. Extend `SimulatedAgentExecutor` to verify skill content reaches the execution context.
 
@@ -355,8 +410,8 @@ Skill preflight results are shown as a dedicated section:
 
 ### Phase 3: Provenance and validation
 
-12. Extend `RunPlanSnapshot` with `resolvedSkillsJSON` and `skillContentHashes`.
-13. Change `AgentExecution.skillSnapshotHash` to hash resolved content.
+12. Extend `RunStartSnapshot` plus immutable `Run` frozen fields with `resolvedSkillsJSON`, `skillContentHashes`, and `skillInjectedContentHashes`.
+13. Change `AgentExecution.skillSnapshotHash` to hash injected execution content.
 14. Implement `SkillPreflightCheck` in `PreflightService`.
 15. Extend `DefinitionHasher` for skill content hashing.
 
@@ -365,7 +420,7 @@ Skill preflight results are shown as a dedicated section:
 ### Phase 4: Operator visibility
 
 16. Extend `AgentCatalogView` with skill type badge, content preview, and metadata.
-17. Extend `AgentInspectorView` with full resolved skill content display.
+17. Extend existing shell-owned report / comparison / artifact surfaces with full resolved skill content display.
 18. Extend `PilotReadinessView` with skill preflight section.
 
 **Verification:** UI smoke test showing skill information in all three surfaces.
@@ -379,13 +434,13 @@ Skill preflight results are shown as a dedicated section:
 | A1 | Every `external_skill` in the catalog is loaded from its filesystem path and its content appears in the agent's execution prompt | Integration test with fixture skill package |
 | A2 | Every `inline_skill` description is injected into the agent's execution prompt | Integration test comparing prompt with and without skill |
 | A3 | Every `builtin_agent` skill resolves to a known instruction set | Unit test with `docs-quality-guardian` |
-| A4 | Agents sharing the same `skill_ref` with different `skill_role` receive different execution prompts | Integration test with `proposal_review_triad` agents |
+| A4 | Agents sharing the same `skill_ref` with different `skill_role` receive different execution prompts | Integration test with `proposal_review_triad` agents proving current mode mapping (`product-only`, `ux-only`, `ui-only`, `architecture-only`) |
 | A5 | Missing external skill path blocks run start via preflight | Preflight test |
 | A6 | Unknown builtin name blocks run start via preflight | Preflight test |
-| A7 | `RunPlanSnapshot` captures resolved skill content hashes | Snapshot round-trip test |
-| A8 | `AgentExecution.skillSnapshotHash` reflects resolved content, not just skill name | Provenance test comparing hash before and after skill content change |
+| A7 | `RunStartSnapshot` plus immutable `Run` frozen fields capture resolved raw and injected skill content hashes | Snapshot round-trip test |
+| A8 | `AgentExecution.skillSnapshotHash` reflects injected execution content, not just skill name | Provenance test comparing hash before and after skill content or specialization change |
 | A9 | Operator can see skill type, content preview, and role in `AgentCatalogView` | UI smoke test |
-| A10 | Operator can see full resolved skill content for a completed execution in `AgentInspectorView` | UI smoke test |
+| A10 | Operator can see full resolved skill content for a completed execution in current shell-owned report / comparison / artifact surfaces | UI smoke test |
 | A11 | Skill preflight results are visible in `PilotReadinessView` | UI smoke test |
 | A12 | All three skill types have end-to-end test coverage: YAML -> resolution -> injection -> execution -> provenance | Three integration tests (one per type) |
 
@@ -397,7 +452,7 @@ Skill preflight results are shown as a dedicated section:
 |---|---|
 | Skill authoring UI | MVP resolves and injects existing skills; authoring is editor / CLI work |
 | Skill versioning or dependency management | Skills are identified by content hash, not by version number |
-| Skill hot-reload during a running execution | RunPlanSnapshot freezes skills at run creation time |
+| Skill hot-reload during a running execution | Immutable `Run` frozen fields plus `RunStartSnapshot` freeze skills at run creation time |
 | Skill marketplace or sharing mechanism | Local-first single-engineer tool; sharing is filesystem copy |
 | Permission profile enforcement at transport level | Remains Tier 3 per the output-contract tier classification; separate from skill resolution |
 | `required_tools` enforcement at transport level | Remains Tier 3 per the output-contract tier classification; separate from skill resolution |
@@ -410,7 +465,7 @@ Skill preflight results are shown as a dedicated section:
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | External skill packages have inconsistent structure | Medium | Medium | Strict instruction file discovery order with clear error messages |
-| Skill content is large and inflates system prompts | Low | Medium | Content size limit (configurable, default 8000 chars) with truncation + warning |
+| Skill content is large and inflates system prompts | Low | Medium | Content size limit with fail-closed preflight; no truncation of executable content in MVP |
 | Role-specific files in external skill packages are missing | Medium | Low | Graceful fallback to generic role block with preflight warning |
 | Injection order conflicts with existing prompt engineering | Low | High | Skill preamble is always first; agent prompt always last; no interleaving |
 | Resolved skill hashes change frequently for external skills | Medium | Low | This is correct behavior — provenance should detect external changes |
@@ -461,7 +516,7 @@ This moves skills from Tier 3 to **Tier 1 (mandatory, runtime-enforced)**.
 |---|---|
 | `Engine/RunPlan.swift` | Add `resolvedSkill` to `ResolvedAgent` |
 | `Engine/RunPlanCompiler.swift` | Call `SkillResolver` during compilation |
-| `Engine/GooseSessionBridge.swift` | Call `SkillInjector` in `buildExecutionPacket()` |
+| `Engine/GooseSessionBridge.swift` | Feed `SkillInjector` output into the canonical `ExecutionPacket` path |
 | `Engine/GooseAgentExecutor.swift` | Pass skill-augmented prompt to transport |
 | `Engine/SimulatedAgentExecutor.swift` | Verify skill content in execution context |
 | `Engine/WorkflowOrchestrator.swift` | Pass `ResolvedSkill` through to execution |
@@ -470,7 +525,9 @@ This moves skills from Tier 3 to **Tier 1 (mandatory, runtime-enforced)**.
 | `DSL/AgentCatalog.swift` | No model changes needed (SkillRef already parsed) |
 | `DSL/YAMLValidator.swift` | Extend validation for skill type-specific rules |
 | `Views/AgentCatalogView.swift` | Skill type badge, content preview, metadata |
-| `Views/AgentInspectorView.swift` | Full resolved skill content display |
+| `Views/RunReportView.swift` | Show skill truth in shell-owned execution reporting |
+| `Views/RunComparisonView.swift` | Show skill truth drift across runs |
+| `Views/ArtifactInspectorView.swift` | Show skill truth for specific execution artifacts |
 | `Views/PilotReadinessView.swift` | Skill preflight section |
 | `Support/MVPBoundaryPolicy.swift` | Add skill resolution to MVP boundary contract |
 
@@ -478,21 +535,27 @@ This moves skills from Tier 3 to **Tier 1 (mandatory, runtime-enforced)**.
 
 ## Appendix A: External skill package structure (MVP)
 
-MVP external skill package is a directory with this minimal structure:
+MVP external skill package is a Codex bundle with this minimal structure:
 
 ```
 proposal-review-triad/
-  skill.md              # Primary instruction file (required or one of fallbacks)
-  roles/                # Optional role-specific overrides
-    product_owner.md
-    ux_designer.md
-    ui_designer.md
-    architect.md
+  SKILL.md              # Required executable entrypoint
+  references/           # Optional non-executable companion docs
+  assets/               # Optional non-executable templates and media
+  evals/                # Optional proof assets
+  agents/               # Optional bundle-local helper config
 ```
 
-The `skill.md` file contains the base instructions shared by all role variants. Each `roles/*.md` file contains role-specific instructions that are appended after the base instructions when the matching `skill_role` is active.
+The `SKILL.md` file contains the executable base instructions.
 
-If the `roles/` directory is absent or does not contain a file for the active role, the generic role specialization block from Section 5.3 is used instead.
+For current repo reality, `proposal_review_triad` specialization is mode-based, not role-file-based:
+
+- `product_owner` -> `product-only`
+- `ux_designer` -> `ux-only`
+- `ui_designer` -> `ui-only`
+- `architect` -> `architecture-only`
+
+If a future skill explicitly opts into file-based role specialization, that must be declared as an extension to the base bundle contract. It is not the generic MVP default.
 
 ---
 
@@ -504,8 +567,8 @@ Given agent `proposal_reviewer_product_owner` with:
 - `prompt: "Review the proposal as a product owner..."`
 
 And external skill package at `/Users/user/.codex/skills/proposal-review-triad/`:
-- `skill.md` contains: "You are a proposal reviewer. Evaluate proposals across dimensions..."
-- `roles/product_owner.md` contains: "As the product owner lens, focus on business value, user problem clarity..."
+- `SKILL.md` contains: "You are a proposal reviewer. Evaluate proposals across dimensions..."
+- the skill-specific specialization registry maps `product_owner` -> `product-only`
 
 Assembled system prompt:
 
@@ -516,6 +579,8 @@ Type: external
 You are a proposal reviewer. Evaluate proposals across dimensions...
 
 ## Active Role: product_owner
+
+Mode: product-only
 
 As the product owner lens, focus on business value, user problem clarity...
 

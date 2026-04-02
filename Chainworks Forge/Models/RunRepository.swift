@@ -101,7 +101,7 @@ struct RunRepository {
         workspace: RunWorkspace,
         workflowSourcePath: String,
         catalogSourcePath: String,
-        startSnapshot: RunStartSnapshot = .empty
+        startSnapshot: RunStartSnapshot
     ) throws -> Run {
         let activeStatuses: [RunStatus] = [.pending, .ready, .running, .waitingApproval, .blocked]
         if let existing = idea.runs.first(where: { activeStatuses.contains($0.status) }) {
@@ -137,6 +137,23 @@ struct RunRepository {
 
         context.insert(run)
         return run
+    }
+
+    func createRunFromPlan(
+        for idea: Idea,
+        plan: RunPlan,
+        workspace: RunWorkspace,
+        workflowSourcePath: String,
+        catalogSourcePath: String
+    ) throws -> Run {
+        try createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: workflowSourcePath,
+            catalogSourcePath: catalogSourcePath,
+            startSnapshot: RunStartSnapshot()
+        )
     }
 
     /// Returns the current active run for the idea, or nil.

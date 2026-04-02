@@ -199,6 +199,8 @@ final class RunReportBuilder {
             )
         }
 
+        let proposalLoopSummary = ProposalLoopFeedbackParser.parseSummary(from: allArtifacts)
+
         // §6.5: Retry/recovery narrative
         let retriesPerformed = historicalStages.reduce(0) { $0 + max(0, $1.attemptNumber - 1) }
         let recoveryActionsTaken: [String] = historicalStages
@@ -269,7 +271,8 @@ final class RunReportBuilder {
             driftDecision: run.driftDecision?.rawValue,
             retriesPerformed: retriesPerformed,
             recoveryActionsTaken: recoveryActionsTaken,
-            failureEvidenceSummaries: failureEvidenceSummaries
+            failureEvidenceSummaries: failureEvidenceSummaries,
+            proposalLoopSummary: proposalLoopSummary
         )
     }
 
@@ -554,7 +557,48 @@ final class RunReportBuilder {
             }
         }
         lines.append("")
-        lines.append("## 11. Outcome")
+        if let summary = payload.proposalLoopSummary {
+            lines.append("## 11. Proposal-loop Feedback (Proposal 022)")
+            if summary.reviewCorpusBundlePresent {
+                let rawCount = summary.reviewCorpusRawArtifactCount.map(String.init) ?? "unknown"
+                lines.append("- Review corpus bundle: present (\(rawCount) raw reviews)")
+            } else {
+                lines.append("- Review corpus bundle: missing")
+            }
+            lines.append("- Backlog items: \(summary.backlogItemCount)")
+            lines.append("- Unresolved items: \(summary.unresolvedItemCount)")
+            lines.append("- Deferred items: \(summary.deferredItemCount)")
+            lines.append("- Disputed items: \(summary.disputedItemCount)")
+            if summary.partiallyResolvedItemCount > 0 {
+                lines.append("- Partially resolved items: \(summary.partiallyResolvedItemCount)")
+            }
+            lines.append("- Merge provenance items: \(summary.mergeProvenanceItemCount)")
+            lines.append("- Coverage: \(summary.coverageStatusSummary)")
+            if let targeted = summary.targetedReviewerSummary {
+                lines.append("- Targeted rereview: \(targeted)")
+            }
+            if let growthRatio = summary.proposalGrowthRatio {
+                lines.append(String(format: "- Proposal growth ratio: %.2fx", growthRatio))
+            }
+            if let scoreDelta = summary.scoreDeltaSinceLastReview {
+                lines.append(String(format: "- Score delta since last review: %.2f", scoreDelta))
+            }
+            if let closed = summary.backlogItemsClosedCount {
+                lines.append("- Backlog items closed: \(closed)")
+            }
+            if let reopened = summary.reopenedItemCount, reopened > 0 {
+                lines.append("- Backlog items reopened: \(reopened)")
+            }
+            if let recommendation = summary.growthGuardRecommendation {
+                lines.append("- Growth guard: \(recommendation)")
+            }
+            if let nextAction = summary.boundedNextAction {
+                lines.append("- Bounded next action: \(nextAction)")
+            }
+            lines.append("")
+        }
+
+        lines.append("## 12. Outcome")
         lines.append("- \(payload.runStatus)")
         lines.append("")
         return lines.joined(separator: "\n")
@@ -581,6 +625,33 @@ final class RunReportBuilder {
         if let profile = payload.contextStrategyProfileID { lines.append("Strategy: \(profile)") }
         if let mode = payload.strategyAssignmentMode { lines.append("Strategy mode: \(mode)") }
         if let state = payload.strategyRecommendationState { lines.append("Strategy recommendation state: \(state)") }
+        if let feedback = payload.proposalLoopSummary {
+            if feedback.reviewCorpusBundlePresent {
+                let rawCount = feedback.reviewCorpusRawArtifactCount.map(String.init) ?? "unknown"
+                lines.append("Proposal-loop review corpus bundle: present (\(rawCount) raw reviews)")
+            } else {
+                lines.append("Proposal-loop review corpus bundle: missing")
+            }
+            lines.append("Proposal-loop backlog items: \(feedback.backlogItemCount)")
+            lines.append("Proposal-loop unresolved items: \(feedback.unresolvedItemCount)")
+            lines.append("Proposal-loop merge provenance items: \(feedback.mergeProvenanceItemCount)")
+            if let targeted = feedback.targetedReviewerSummary {
+                lines.append("Proposal-loop targeted rereview: \(targeted)")
+            }
+            lines.append("Proposal-loop coverage: \(feedback.coverageStatusSummary)")
+            if let growthRatio = feedback.proposalGrowthRatio {
+                lines.append(String(format: "Proposal-loop growth ratio: %.2fx", growthRatio))
+            }
+            if let scoreDelta = feedback.scoreDeltaSinceLastReview {
+                lines.append(String(format: "Proposal-loop score delta: %.2f", scoreDelta))
+            }
+            if let recommendation = feedback.growthGuardRecommendation {
+                lines.append("Proposal-loop growth guard: \(recommendation)")
+            }
+            if let nextAction = feedback.boundedNextAction {
+                lines.append("Proposal-loop bounded next action: \(nextAction)")
+            }
+        }
         lines.append("")
         return lines.joined(separator: "\n")
     }
@@ -595,6 +666,28 @@ final class RunReportBuilder {
             "completedStages": payload.completedStages,
             "failedStages": payload.failedStages,
             "elapsedSeconds": payload.elapsedSeconds,
+            "proposalLoopSummary": payload.proposalLoopSummary.map { $0.backlogItemCount > -1 ? [
+                "reviewCorpusBundlePresent": $0.reviewCorpusBundlePresent,
+                "reviewCorpusRawArtifactCount": $0.reviewCorpusRawArtifactCount as Any,
+                "backlogItemCount": $0.backlogItemCount,
+                "unresolvedItemCount": $0.unresolvedItemCount,
+                "deferredItemCount": $0.deferredItemCount,
+                "disputedItemCount": $0.disputedItemCount,
+                "partiallyResolvedItemCount": $0.partiallyResolvedItemCount,
+                "addressedItemCount": $0.addressedItemCount,
+                "mergeProvenanceItemCount": $0.mergeProvenanceItemCount,
+                "coverageStatusSummary": $0.coverageStatusSummary,
+                "targetedReviewerSummary": $0.targetedReviewerSummary as Any,
+                "proposalByteSize": $0.proposalByteSize as Any,
+                "previousProposalByteSize": $0.previousProposalByteSize as Any,
+                "proposalGrowthRatio": $0.proposalGrowthRatio as Any,
+                "scoreDeltaSinceLastReview": $0.scoreDeltaSinceLastReview as Any,
+                "backlogItemsClosedCount": $0.backlogItemsClosedCount as Any,
+                "reopenedItemCount": $0.reopenedItemCount as Any,
+                "growthGuardRecommendation": $0.growthGuardRecommendation as Any,
+                "boundedNextAction": $0.boundedNextAction as Any
+            ] as [String: Any] : [:]
+            } as Any,
             "contextStrategyProfileID": payload.contextStrategyProfileID as Any,
             "strategyAssignmentMode": payload.strategyAssignmentMode as Any,
             "strategyRecommendationState": payload.strategyRecommendationState as Any,
@@ -737,6 +830,9 @@ struct RunReportPayload: Codable, Sendable {
 
     // Proposal 013: Failure evidence from canonical packet
     let failureEvidenceSummaries: [FailureEvidenceSummary]
+
+    // Proposal 022: Feedback fidelity / review carry-forward summary
+    let proposalLoopSummary: ProposalLoopFeedbackSummary?
 
     struct FailureEvidenceSummary: Codable, Sendable {
         let stageID: String

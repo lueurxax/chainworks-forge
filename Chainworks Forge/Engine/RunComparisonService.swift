@@ -80,6 +80,7 @@ struct RunComparisonService {
 
         // Pinned artifact diff
         let pinnedDiff = computePinnedArtifactDiff(runA: runA, runB: runB)
+        let proposalLoopComparison = proposalLoopFeedbackComparison(for: runA, forAgainst: runB)
 
         let strategyComparison = strategyComparison(for: runA, against: runB)
 
@@ -108,7 +109,8 @@ struct RunComparisonService {
             approvalDelta: approvalDelta,
             pinnedArtifactDiff: pinnedDiff,
             strategyComparison: strategyComparison.comparison,
-            strategyRecommendation: strategyComparison.recommendation
+            strategyRecommendation: strategyComparison.recommendation,
+            proposalLoopComparison: proposalLoopComparison
         )
     }
 
@@ -429,6 +431,98 @@ struct RunComparisonService {
             return "Shell comparison is currently inconclusive: scoreA=\(String(format: "%.2f", scoreA)), scoreB=\(String(format: "%.2f", scoreB))."
         }
     }
+
+    private func proposalLoopFeedbackComparison(for runA: Run, forAgainst runB: Run) -> RunComparison.ProposalLoopComparison {
+        let summaryA = proposalLoopFeedbackSummary(for: runA)
+        let summaryB = proposalLoopFeedbackSummary(for: runB)
+
+        guard summaryA != nil || summaryB != nil else {
+            return RunComparison.ProposalLoopComparison(
+                reviewCorpusBundlePresentA: nil,
+                reviewCorpusBundlePresentB: nil,
+                mergeProvenanceItemCountA: nil,
+                mergeProvenanceItemCountB: nil,
+                backlogItemCountA: nil,
+                backlogItemCountB: nil,
+                unresolvedItemCountA: nil,
+                unresolvedItemCountB: nil,
+                deferredItemCountA: nil,
+                deferredItemCountB: nil,
+                addressedItemCountA: nil,
+                addressedItemCountB: nil,
+                proposalGrowthRatioA: nil,
+                proposalGrowthRatioB: nil,
+                scoreDeltaA: nil,
+                scoreDeltaB: nil,
+                targetedRereviewRationaleA: nil,
+                targetedRereviewRationaleB: nil,
+                unresolvedDelta: nil,
+                coverageDelta: nil,
+                rationale: "Feedback fidelity summaries are not available for both runs."
+            )
+        }
+
+        let unresolvedDelta = resolveDelta(summaryA?.unresolvedItemCount, summaryB?.unresolvedItemCount)
+        let addressedDelta = resolveDelta(summaryA?.addressedItemCount, summaryB?.addressedItemCount)
+        let rationale = proposalLoopRationale(
+            summaryA: summaryA,
+            summaryB: summaryB,
+            unresolvedDelta: unresolvedDelta
+        )
+
+        return RunComparison.ProposalLoopComparison(
+            reviewCorpusBundlePresentA: summaryA?.reviewCorpusBundlePresent,
+            reviewCorpusBundlePresentB: summaryB?.reviewCorpusBundlePresent,
+            mergeProvenanceItemCountA: summaryA?.mergeProvenanceItemCount,
+            mergeProvenanceItemCountB: summaryB?.mergeProvenanceItemCount,
+            backlogItemCountA: summaryA?.backlogItemCount,
+            backlogItemCountB: summaryB?.backlogItemCount,
+            unresolvedItemCountA: summaryA?.unresolvedItemCount,
+            unresolvedItemCountB: summaryB?.unresolvedItemCount,
+            deferredItemCountA: summaryA?.deferredItemCount,
+            deferredItemCountB: summaryB?.deferredItemCount,
+            addressedItemCountA: summaryA?.addressedItemCount,
+            addressedItemCountB: summaryB?.addressedItemCount,
+            proposalGrowthRatioA: summaryA?.proposalGrowthRatio,
+            proposalGrowthRatioB: summaryB?.proposalGrowthRatio,
+            scoreDeltaA: summaryA?.scoreDeltaSinceLastReview,
+            scoreDeltaB: summaryB?.scoreDeltaSinceLastReview,
+            targetedRereviewRationaleA: summaryA?.targetedReviewerSummary,
+            targetedRereviewRationaleB: summaryB?.targetedReviewerSummary,
+            unresolvedDelta: unresolvedDelta,
+            coverageDelta: addressedDelta,
+            rationale: rationale
+        )
+    }
+
+    private func proposalLoopFeedbackSummary(for run: Run) -> ProposalLoopFeedbackSummary? {
+        let allArtifacts = run.stageExecutions.flatMap { $0.agentExecutions }.flatMap { $0.artifacts }
+        return ProposalLoopFeedbackParser.parseSummary(from: allArtifacts)
+    }
+
+    private func proposalLoopRationale(
+        summaryA: ProposalLoopFeedbackSummary?,
+        summaryB: ProposalLoopFeedbackSummary?,
+        unresolvedDelta: Int?
+    ) -> String {
+        if summaryA == nil && summaryB == nil { return "No feedback fidelity summaries were produced for either run." }
+        if summaryA == nil { return "Run A has no proposal-loop feedback summary; unable to compare carry-forward fidelity." }
+        if summaryB == nil { return "Run B has no proposal-loop feedback summary; unable to compare carry-forward fidelity." }
+
+        guard let unresolvedDelta else { return "Insufficient data to compute unresolved delta." }
+        if unresolvedDelta == 0 {
+            return "Unresolved score-limiting backlog did not increase between runs."
+        }
+        if unresolvedDelta > 0 {
+            return "Run B has higher unresolved backlog and likely requires narrower rerun than before."
+        }
+        return "Run B reduced unresolved backlog versus Run A."
+    }
+
+    private func resolveDelta(_ valueA: Int?, _ valueB: Int?) -> Int? {
+        guard let valueA, let valueB else { return nil }
+        return valueB - valueA
+    }
 }
 
 // MARK: - Comparison Types
@@ -480,6 +574,7 @@ struct RunComparison: Identifiable {
     // Strategy comparison
     let strategyComparison: StrategyComparison
     let strategyRecommendation: StrategyRecommendation
+    let proposalLoopComparison: ProposalLoopComparison
 
     struct StrategyComparison {
         let profileA: String?
@@ -546,5 +641,29 @@ struct RunComparison: Identifiable {
         let presentInA: Bool
         let presentInB: Bool
         let contentMatch: Bool?
+    }
+
+    struct ProposalLoopComparison {
+        let reviewCorpusBundlePresentA: Bool?
+        let reviewCorpusBundlePresentB: Bool?
+        let mergeProvenanceItemCountA: Int?
+        let mergeProvenanceItemCountB: Int?
+        let backlogItemCountA: Int?
+        let backlogItemCountB: Int?
+        let unresolvedItemCountA: Int?
+        let unresolvedItemCountB: Int?
+        let deferredItemCountA: Int?
+        let deferredItemCountB: Int?
+        let addressedItemCountA: Int?
+        let addressedItemCountB: Int?
+        let proposalGrowthRatioA: Double?
+        let proposalGrowthRatioB: Double?
+        let scoreDeltaA: Double?
+        let scoreDeltaB: Double?
+        let targetedRereviewRationaleA: String?
+        let targetedRereviewRationaleB: String?
+        let unresolvedDelta: Int?
+        let coverageDelta: Int?
+        let rationale: String
     }
 }

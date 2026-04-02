@@ -286,7 +286,7 @@ final class RecoveryCoordinator {
         compiler: RunPlanCompiler,
         workflowSourcePath: String,
         catalogSourcePath: String,
-        startSnapshot: RunStartSnapshot = .empty
+        startSnapshot: RunStartSnapshot
     ) throws -> Run {
         guard isProposalLoopReadOnly(original) else {
             throw RecoveryError.notProposalLoopRun
@@ -308,6 +308,27 @@ final class RecoveryCoordinator {
 
         try modelContext.save()
         return clone
+    }
+
+    func cloneRunCurrentConfig(
+        original: Run,
+        idea: Idea,
+        workflow: WorkflowDefinition,
+        catalog: AgentCatalog,
+        compiler: RunPlanCompiler,
+        workflowSourcePath: String,
+        catalogSourcePath: String
+    ) throws -> Run {
+        try cloneRunCurrentConfig(
+            original: original,
+            idea: idea,
+            workflow: workflow,
+            catalog: catalog,
+            compiler: compiler,
+            workflowSourcePath: workflowSourcePath,
+            catalogSourcePath: catalogSourcePath,
+            startSnapshot: RunStartSnapshot()
+        )
     }
 
     // MARK: - Recovery Context (§7.4) — Proposal 013: Evidence-aware

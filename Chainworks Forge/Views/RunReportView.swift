@@ -229,6 +229,40 @@ struct RunReportView: View {
     @ViewBuilder
     private var strategySummaryContent: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if let feedback = proposalLoopSummary {
+                GroupBox("Proposal-loop feedback summary (Proposal 022)") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        let reviewCorpusLabel = feedback.reviewCorpusBundlePresent
+                            ? "present (\(feedback.reviewCorpusRawArtifactCount.map(String.init) ?? "unknown") raw)"
+                            : "missing"
+                        LabeledContent("Review corpus bundle", value: reviewCorpusLabel)
+                        LabeledContent("Backlog items", value: "\(feedback.backlogItemCount)")
+                        LabeledContent("Unresolved items", value: "\(feedback.unresolvedItemCount)")
+                        LabeledContent("Deferred items", value: "\(feedback.deferredItemCount)")
+                        LabeledContent("Addressed items", value: "\(feedback.addressedItemCount)")
+                        LabeledContent("Merge provenance", value: "\(feedback.mergeProvenanceItemCount)")
+                        LabeledContent("Coverage", value: feedback.coverageStatusSummary)
+                        if let growthRatio = feedback.proposalGrowthRatio {
+                            LabeledContent("Proposal growth", value: String(format: "%.2fx", growthRatio))
+                        }
+                        if let scoreDelta = feedback.scoreDeltaSinceLastReview {
+                            LabeledContent("Score delta", value: String(format: "%.2f", scoreDelta))
+                        }
+                        if let recommendation = feedback.growthGuardRecommendation {
+                            LabeledContent("Growth guard", value: recommendation)
+                        }
+                        if let nextAction = feedback.boundedNextAction {
+                            LabeledContent("Bounded next action", value: nextAction)
+                        }
+                        if let targeted = feedback.targetedReviewerSummary {
+                            Text("Targeted rereview: \(targeted)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
             GroupBox("Strategy context") {
                 VStack(alignment: .leading, spacing: 6) {
                     StrategyBadge(
@@ -331,6 +365,13 @@ struct RunReportView: View {
             }
         }
         .padding()
+    }
+
+    private var proposalLoopSummary: ProposalLoopFeedbackSummary? {
+        let artifacts = run.stageExecutions
+            .flatMap { $0.agentExecutions }
+            .flatMap { $0.artifacts }
+        return ProposalLoopFeedbackParser.parseSummary(from: artifacts)
     }
 
     // MARK: - Data Loading

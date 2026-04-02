@@ -24,11 +24,9 @@ artifacts:
   proposal_review_ui: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json
   proposal_review_architect: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/architect.json
   proposal_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json
-  review_corpus_bundle: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/review-corpus-bundle.json
   score_lift_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json
-  proposal_feedback_coverage: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/feedback-coverage.json
   proposal_fact_digest: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/fact-digest.json
-  reviewer_scope_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/reviewer-scope-plan.json
+  proposal_feedback_coverage: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/feedback-coverage.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md
   implementation_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml
@@ -50,7 +48,6 @@ artifacts:
   release_bundle_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/bundle.json
   connect_upload_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/connect-upload.json
   final_feature_report: ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/final-feature-report.json
-  # Steward artifacts (Proposal 003)
   metrics_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/metrics-window.json
   baseline_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/baseline-window.json
   implicated_run_dossiers: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/dossiers/
@@ -100,13 +97,16 @@ skills:
   connect_publisher:
     type: inline_skill
     description: Build release archive, compute checksum, and upload to Connect through deterministic tools.
-  # Steward skill (Proposal 003)
   steward_core:
     type: inline_skill
     description: System-level SDLC health analysis, anomaly detection, and change proposal generation.
 contracts:
   proposal_review_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_raw
+    normalized_artifact_name: proposal_review_normalized
     required_fields:
     - agent_id
     - role
@@ -121,6 +121,10 @@ contracts:
     - assumptions
   proposal_review_summary_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_summary_raw
+    normalized_artifact_name: proposal_review_summary
     required_fields:
     - pass
     - average_score
@@ -131,22 +135,26 @@ contracts:
     - required_changes
     - recurring_themes
     - decision
-  review_corpus_bundle_v1:
-    format: json
-    required_fields:
-    - review_pass_id
-    - review_iteration_id
-    - source_proposal_artifact
-    - raw_review_artifacts
-    - aggregate_summary_artifact
   score_lift_backlog_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: score_lift_backlog_raw
+    normalized_artifact_name: score_lift_backlog
     required_fields:
     - review_pass_id
     - source_proposal_artifact
     - items
+    - open_count
+    - unresolved_high_lift_count
+    - blocker_count
+    - generated_at
   proposal_feedback_coverage_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_feedback_coverage_raw
+    normalized_artifact_name: proposal_feedback_coverage
     required_fields:
     - proposal_revision_id
     - source_review_pass_id
@@ -159,9 +167,17 @@ contracts:
     - notes
   proposal_fact_digest_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_fact_digest_raw
+    normalized_artifact_name: proposal_fact_digest
     required_fields:
-    - proposal_revision_id
-    - claims
+    - review_pass_id
+    - claims_checked
+    - unresolved_facts
+    - assumptions_requiring_validation
+    - platform_constraints
+    - evidence_refs
   implementation_self_assessment_v1:
     format: json
     required_fields:
@@ -235,7 +251,6 @@ contracts:
     - duration_seconds
     - total_cost
     - cost_currency
-  # Steward contracts (Proposal 003)
   sdlc_health_report_v1:
     format: json
     required_fields:
@@ -277,99 +292,98 @@ contracts:
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: high
     temperature: 0.1
     max_turns: 20
     structured_output: required
   claude_writer_high:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: high
     temperature: 0.2
     max_turns: 18
     structured_output: preferred
   claude_product_high:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: high
     temperature: 0.1
     max_turns: 14
     structured_output: required
   claude_design_medium:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: medium
     temperature: 0.2
     max_turns: 12
     structured_output: required
   codex_architect_high:
     provider: codex
-    model: default
+    model: GPT-5.4
     effort: high
     temperature: 0.1
     max_turns: 16
     structured_output: required
   codex_builder_high:
     provider: codex
-    model: default
+    model: GPT-5.4
     effort: high
     temperature: 0.1
     max_turns: 24
     structured_output: required
   codex_audit_high:
     provider: codex
-    model: default
+    model: GPT-5.4
     effort: high
     temperature: 0.0
     max_turns: 18
     structured_output: required
   claude_security_high:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: high
     temperature: 0.0
     max_turns: 16
     structured_output: required
   claude_prepush_medium:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: medium
     temperature: 0.1
     max_turns: 12
     structured_output: required
   codex_ops_low:
     provider: codex
-    model: default
+    model: GPT-5.4
     effort: low
     temperature: 0.0
     max_turns: 8
     structured_output: required
   claude_docs_medium:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: medium
     temperature: 0.2
     max_turns: 12
     structured_output: required
-  # Steward backend profiles (Proposal 003)
   claude_steward_high:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: high
     temperature: 0.1
     max_turns: 16
     structured_output: required
   claude_auditor_medium:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: medium
     temperature: 0.0
     max_turns: 14
     structured_output: required
   claude_retrospective_medium:
     provider: claude_code
-    model: default
+    model: claude-opus-4.6
     effort: medium
     temperature: 0.1
     max_turns: 12
@@ -715,20 +729,23 @@ agents:
   backend_profile: claude_orchestrator_high
   permission_profile: ORCH
   skill_ref: orchestrator_core
+  session_reuse_scope: same_agent_family_within_run
+  session_family_id: orchestration_loop
   inputs:
   - idea_brief
   - proposal_current
+  - proposal_review_po
+  - proposal_review_ux
+  - proposal_review_ui
+  - proposal_review_architect
   - proposal_review_summary
-  - review_corpus_bundle
   - approved_proposal
   - implementation_review_summary
   - run_state
   outputs:
   - proposal_review_summary
-  - review_corpus_bundle
   - score_lift_backlog
   - proposal_fact_digest
-  - reviewer_scope_plan
   - approved_proposal
   - implementation_plan
   - implementation_backlog
@@ -739,13 +756,23 @@ agents:
   - final_feature_report
   requires_human_approval: false
   notes: Owns fan-out/fan-in, loop control, and approval gates.
-  prompt: |-
-    You are the lead orchestrator for the full proposal -> implementation -> release lifecycle.
+  prompt: 'You are the lead orchestrator for the full proposal -> implementation -> release lifecycle.
+
     Move the workflow forward one safe state at a time.
+
     Delegate all authoring, review, implementation, audit, docs, and release work to specialized agents.
+
     Aggregate only structured outputs, track loop counters, enforce gates, and stop on contradictions.
+
+    For proposal review/refinement loops, preserve reviewer-specific signal instead of collapsing everything into one verdict:
+
+    produce `proposal_review_summary` as the aggregate decision artifact, produce `score_lift_backlog` as the normalized actionable backlog of score-limiting issues, and produce `proposal_fact_digest` when factual or platform-grounding gaps need explicit follow-up.
+
     Never edit product code, never commit, never push, and never publish artifacts yourself.
+
     Escalate only for the three workflow approval checkpoints, or when loop budgets are exhausted.
+
+    '
 - id: proposal_reviewer_product_owner
   title: Proposal Reviewer / Product Owner
   mode: proposal_review.product_owner
@@ -753,22 +780,23 @@ agents:
   permission_profile: RO_REVIEW
   skill_ref: proposal_review_triad
   skill_role: product_owner
+  session_reuse_scope: same_invocation_owner
   inputs:
   - idea_brief
   - proposal_current
-  - proposal_feedback_coverage
-  - reviewer_scope_plan
-  - score_lift_backlog
   outputs:
   - proposal_review_po
   output_contract: proposal_review_v1
   requires_human_approval: false
-  prompt: |-
-    Review the proposal as a product owner.
+  prompt: 'Review the proposal as a product owner.
+
     Focus on user problem clarity, business value, scope discipline, acceptance criteria, rollout risk, metrics, and dependency realism.
+
     Be strict about missing assumptions, hidden scope, and ambiguous success criteria.
+
     Output only the structured review contract with a numeric score from 0 to 10.
-    Mark blocking issues only when they would materially reduce the chance of shipping the right thing.
+
+    Mark blocking issues only when they would materially reduce the chance of shipping the right thing.'
 - id: proposal_reviewer_ux
   title: Proposal Reviewer / UX
   mode: proposal_review.ux
@@ -779,19 +807,19 @@ agents:
   inputs:
   - idea_brief
   - proposal_current
-  - proposal_feedback_coverage
-  - reviewer_scope_plan
-  - score_lift_backlog
   outputs:
   - proposal_review_ux
   output_contract: proposal_review_v1
   requires_human_approval: false
-  prompt: |-
-    Review the proposal as a UX designer.
+  prompt: 'Review the proposal as a UX designer.
+
     Focus on task flow, user friction, discoverability, error states, accessibility implications, onboarding, and edge cases across the journey.
+
     Be concrete: call out where the proposal skips transitions, recovery paths, or mental model mismatches.
+
     Output only the structured review contract with a numeric score from 0 to 10.
-    Prefer actionable suggestions over abstract taste.
+
+    Prefer actionable suggestions over abstract taste.'
 - id: proposal_reviewer_ui
   title: Proposal Reviewer / UI
   mode: proposal_review.ui
@@ -802,19 +830,19 @@ agents:
   inputs:
   - idea_brief
   - proposal_current
-  - proposal_feedback_coverage
-  - reviewer_scope_plan
-  - score_lift_backlog
   outputs:
   - proposal_review_ui
   output_contract: proposal_review_v1
   requires_human_approval: false
-  prompt: |-
-    Review the proposal as a UI designer.
+  prompt: 'Review the proposal as a UI designer.
+
     Focus on component consistency, screen states, empty/loading/error states, visual hierarchy, density, and cross-screen coherence.
+
     Flag places where the proposal is too vague to build a consistent interface.
+
     Output only the structured review contract with a numeric score from 0 to 10.
-    Keep suggestions specific enough that the proposal writer can apply them directly.
+
+    Keep suggestions specific enough that the proposal writer can apply them directly.'
 - id: proposal_reviewer_architect
   title: Proposal Reviewer / Architect
   mode: proposal_review.architect
@@ -825,19 +853,19 @@ agents:
   inputs:
   - idea_brief
   - proposal_current
-  - proposal_feedback_coverage
-  - reviewer_scope_plan
-  - score_lift_backlog
   outputs:
   - proposal_review_architect
   output_contract: proposal_review_v1
   requires_human_approval: false
-  prompt: |-
-    Review the proposal as a software architect.
+  prompt: 'Review the proposal as a software architect.
+
     Focus on architecture fit, component boundaries, data flow, operational risk, migration cost, testability, failure modes, and implementation sequencing.
+
     Flag over-engineering, missing interfaces, unsafe coupling, and vague runtime assumptions.
+
     Output only the structured review contract with a numeric score from 0 to 10.
-    Prefer practical implementation concerns over theoretical purity.
+
+    Prefer practical implementation concerns over theoretical purity.'
 - id: code_writer
   title: Code Writer
   mode: implementation
@@ -872,18 +900,23 @@ agents:
   - tests_result
   output_contract: implementation_self_assessment_v1
   requires_human_approval: false
-  prompt: |-
-    Implement the approved proposal incrementally in the dedicated implementation worktree.
+  prompt: 'Implement the approved proposal incrementally in the dedicated implementation worktree.
+
     Prefer small, reversible changes that keep the project buildable.
+
     Keep a running progress artifact, write or update tests with the code, and record a self-assessment after each pass.
+
     Do not commit, do not push, and do not edit repository docs unless the docs agent is invoked.
-    When in doubt, choose the simplest implementation that satisfies the approved proposal and current review findings.
+
+    When in doubt, choose the simplest implementation that satisfies the approved proposal and current review findings.'
 - id: proposal_writer
   title: Proposal Writer
   mode: proposal_authoring
   backend_profile: claude_writer_high
   permission_profile: PROPOSAL_WRITE
   skill_ref: proposal_writer_core
+  session_reuse_scope: same_agent_family_within_run
+  session_family_id: proposal_authoring_loop
   worktree_policy:
     strategy: meta_only
     path: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals
@@ -896,20 +929,28 @@ agents:
   - proposal_review_ui
   - proposal_review_architect
   - proposal_review_summary
-  - review_corpus_bundle
-  - score_lift_backlog
   - proposal_fact_digest
+  - score_lift_backlog
   outputs:
   - proposal_current
   - proposal_revision_summary
   - proposal_feedback_coverage
   requires_human_approval: false
-  prompt: |-
-    Draft and refine the proposal from the current idea and all reviewer feedback.
+  prompt: 'Draft and refine the proposal from the current idea and all reviewer feedback.
+
     Produce one clear proposal document that is easy to review and easy to implement.
+
     Cover problem, goals, non-goals, UX/UI notes, architecture, rollout, metrics, risks, and open questions.
-    Resolve reviewer feedback explicitly; do not silently ignore disagreements.
+
+    Treat the full raw review quartet as first-class evidence, use `proposal_review_summary` as the aggregate verdict, use `score_lift_backlog` as the normalized list of score-limiting items that must be carried forward, and use `proposal_fact_digest` to ground claims that need explicit factual or platform verification.
+
+    Resolve reviewer feedback explicitly; do not silently ignore disagreements or collapse non-blocking score-limiters into prose.
+
+    Emit `proposal_feedback_coverage` showing which backlog items were addressed, which remain unresolved, which were deferred, and why.
+
     Optimize for a proposal that can reach an aggregate score above 9 without hiding trade-offs.
+
+    '
 - id: proposal_implementation_auditor
   title: Proposal vs Implementation Auditor
   mode: audit
@@ -934,11 +975,13 @@ agents:
   - audit_report
   output_contract: audit_report_v1
   requires_human_approval: false
-  prompt: |-
-    Compare the approved proposal against the implementation in the implementation worktree.
+  prompt: 'Compare the approved proposal against the implementation in the implementation worktree.
+
     Identify missing work, extra work, mismatches in behavior, broken acceptance criteria, and signs that the proposal was interpreted incorrectly.
+
     Be exact and evidence-based.
-    Output only the audit contract and set status to Implemented only when the implementation truly matches the approved proposal.
+
+    Output only the audit contract and set status to Implemented only when the implementation truly matches the approved proposal.'
 - id: security_checker
   title: Security Checker
   mode: security
@@ -959,11 +1002,13 @@ agents:
   - security_report
   output_contract: security_report_v1
   requires_human_approval: false
-  prompt: |-
-    Review the current implementation for security and privacy risks.
+  prompt: 'Review the current implementation for security and privacy risks.
+
     Focus on auth/authz, secrets handling, unsafe defaults, injection, serialization, filesystem access, network boundaries, data leakage, and dependency risk.
+
     Use readonly scanners when available, but do not rely on scanners alone.
-    Output only the structured security report and mark status as pass only when no blocking issue remains.
+
+    Output only the structured security report and mark status as pass only when no blocking issue remains.'
 - id: commit_and_push_to_github
   title: Commit and Push to GitHub
   mode: release_git
@@ -988,11 +1033,13 @@ agents:
   - git_push_receipt
   output_contract: git_push_receipt_v1
   requires_human_approval: true
-  prompt: |-
-    Commit and push the already approved implementation.
+  prompt: 'Commit and push the already approved implementation.
+
     This agent is for release mechanics only, not for code changes.
+
     Use deterministic git/github tools, record the resulting commit SHA and branch, and write a release manifest.
-    Never modify source files, never bypass approval, and never run before the final release approval gate is green.
+
+    Never modify source files, never bypass approval, and never run before the final release approval gate is green.'
 - id: prepush_code_reviewer
   title: Pre-push Code Reviewer
   mode: prepush_review
@@ -1018,11 +1065,13 @@ agents:
   - prepush_review_report
   output_contract: prepush_review_v1
   requires_human_approval: false
-  prompt: |-
-    Perform the last human-like code review before commit and push.
+  prompt: 'Perform the last human-like code review before commit and push.
+
     Focus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.
+
     Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
-    Output only the structured pre-push review contract.
+
+    Output only the structured pre-push review contract.'
 - id: build_archive_and_push_connect
   title: Build Archive and Push to Connect
   mode: release_publish
@@ -1044,11 +1093,13 @@ agents:
   - connect_upload_receipt
   output_contract: connect_upload_receipt_v1
   requires_human_approval: true
-  prompt: |-
-    Build the release archive from the approved implementation, compute checksums, and upload the artifact to Connect.
+  prompt: 'Build the release archive from the approved implementation, compute checksums, and upload the artifact to Connect.
+
     Use deterministic build and upload tools only.
+
     Record the artifact id, checksum, destination, and any release metadata required for traceability.
-    Never edit source code and never run before final release approval and commit/push have succeeded.
+
+    Never edit source code and never run before final release approval and commit/push have succeeded.'
 - id: docs_guardian
   title: Docs Guardian
   mode: docs
@@ -1069,12 +1120,13 @@ agents:
   - docs_delta
   output_contract: docs_report_v1
   requires_human_approval: false
-  prompt: |-
-    Keep documentation consistent with the approved proposal and the implemented behavior.
+  prompt: 'Keep documentation consistent with the approved proposal and the implemented behavior.
+
     Update only the docs that are genuinely impacted: README, docs pages, changelog, runbooks, or usage notes.
+
     Prefer small exact edits over broad rewrites.
-    When docs are already aligned, output that no doc change is needed and explain why.
-# Steward agents (Proposal 003)
+
+    When docs are already aligned, output that no doc change is needed and explain why.'
 - id: system_steward
   title: Forge Steward
   mode: meta_analysis
@@ -1097,12 +1149,15 @@ agents:
   - workflow_tuning_proposal
   - experiment_plan
   requires_human_approval: false
-  prompt: |-
-    You are Forge Steward, the system-level SDLC health analyst for Chainworks.
+  prompt: 'You are Forge Steward, the system-level SDLC health analyst for Chainworks.
+
     Your job is to observe the performance of the agent workflow across many runs,
+
     identify meaningful degradations or improvements, separate symptoms from likely causes,
+
     and produce concrete, testable change proposals.
-    Stay evidence-first, precise, and practical. If evidence is weak, say so plainly.
+
+    Stay evidence-first, precise, and practical. If evidence is weak, say so plainly.'
 - id: steward_auditor
   title: Steward Auditor
   mode: meta_audit
@@ -1119,11 +1174,13 @@ agents:
   outputs:
   - stewardship_audit_report
   requires_human_approval: false
-  prompt: |-
-    You are Steward Auditor, an independent critic of the Forge Steward analysis.
+  prompt: 'You are Steward Auditor, an independent critic of the Forge Steward analysis.
+
     Challenge the current explanation and test whether the evidence really supports it.
+
     Be adversarial toward weak reasoning, not toward people.
-    Keep criticism concrete and evidence-linked.
+
+    Keep criticism concrete and evidence-linked.'
 - id: agent_retrospective_interviewer
   title: Agent Retrospective Interviewer
   mode: retrospective
@@ -1140,7 +1197,8 @@ agents:
   outputs:
   - agent_retrospective_report
   requires_human_approval: false
-  prompt: |-
-    You are Agent Retrospective Interviewer.
+  prompt: 'You are Agent Retrospective Interviewer.
+
     Reconstruct why a specific agent execution produced a weak or degraded outcome.
-    Reason only from the dossier you are given. No imaginary memory. No vague psychologizing.
+
+    Reason only from the dossier you are given. No imaginary memory. No vague psychologizing.'

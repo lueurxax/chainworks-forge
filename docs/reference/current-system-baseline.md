@@ -27,6 +27,7 @@ At the current baseline, the product includes:
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
 - an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
+- a proposal-loop feedback-fidelity layer with review-corpus bundling, backlog carry-forward, writer coverage, and targeted rereview,
 - an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
@@ -46,6 +47,7 @@ Use these reference docs as the current source of truth:
 | Execution engine | [workflow-execution-engine.md](workflow-execution-engine.md) |
 | Frozen runtime and resume truth | [runtime-contract.md](runtime-contract.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
+| Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Goose server transport | [goose-server-transport.md](goose-server-transport.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |

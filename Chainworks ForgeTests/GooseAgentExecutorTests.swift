@@ -517,7 +517,7 @@ struct GooseAgentExecutorTests {
         let inputArtifacts = [
             "idea_brief": Data("short idea".utf8),
             "proposal_current": Data("full proposal body".utf8),
-            "proposal_review_all": Data(String(repeating: "review ", count: 80).utf8),
+            "proposal_review_summary": Data(String(repeating: "review ", count: 80).utf8),
             "security_audit_raw": Data("sensitive raw audit".utf8)
         ]
         let stewardProfile = try #require(
@@ -569,7 +569,7 @@ struct GooseAgentExecutorTests {
         #expect(prompt?.content.contains("Profile: selective_compression_and_escalation") == true)
         #expect(prompt?.content.contains("Mode: selective") == true)
         #expect(contextAttachments.contains { $0.name == "idea_brief" && $0.type == "artifact" })
-        #expect(contextAttachments.contains { $0.name == "summary_proposal_review_all" && $0.type == "text" })
+        #expect(contextAttachments.contains { $0.name == "summary_proposal_review_summary" && $0.type == "text" })
         #expect(contextAttachments.contains { $0.name == "lazy_security_audit_raw" && $0.type == "text" })
     }
 
