@@ -1,12 +1,37 @@
 import SwiftUI
 import SwiftData
 
+enum WorkflowMapVisibleSection: String, CaseIterable, Sendable, Hashable, Identifiable {
+    case topology
+    case handoffs
+    case agents
+    case telemetry
+    case timeline
+
+    var id: String { rawValue }
+}
+
 struct WorkflowMapView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
     @Environment(ExecutionService.self) private var executionService
 
     let run: Run
+    let showsSummaryStrip: Bool
+    let visibleSections: Set<WorkflowMapVisibleSection>
+    let onOpenTimelineInspector: (() -> Void)?
+
+    init(
+        run: Run,
+        showsSummaryStrip: Bool = true,
+        visibleSections: Set<WorkflowMapVisibleSection> = Set(WorkflowMapVisibleSection.allCases),
+        onOpenTimelineInspector: (() -> Void)? = nil
+    ) {
+        self.run = run
+        self.showsSummaryStrip = showsSummaryStrip
+        self.visibleSections = visibleSections
+        self.onOpenTimelineInspector = onOpenTimelineInspector
+    }
 
     private var projection: WorkflowMapProjection? {
         let service = WorkflowMapProjectionService(
@@ -19,18 +44,14 @@ struct WorkflowMapView: View {
     var body: some View {
         if let projection {
             VStack(alignment: .leading, spacing: 14) {
-                WorkflowMapSummaryStrip(projection: projection)
-                    .accessibilityIdentifier("workflow-map-summary")
-                WorkflowMapTopologyView(projection: projection)
-                    .accessibilityIdentifier("workflow-map-topology")
-                WorkflowMapHandoffLedger(projection: projection)
-                    .accessibilityIdentifier("workflow-map-handoffs")
-                WorkflowMapAgentPanels(projection: projection)
-                    .accessibilityIdentifier("workflow-map-agents")
-                WorkflowMapLoopTelemetryView(projection: projection)
-                    .accessibilityIdentifier("workflow-map-loops")
-                WorkflowMapTimelineView(projection: projection)
-                    .accessibilityIdentifier("workflow-map-timeline")
+                if showsSummaryStrip {
+                    WorkflowMapSummaryStrip(projection: projection)
+                        .accessibilityIdentifier("workflow-map-summary")
+                }
+
+                ForEach(orderedVisibleSections) { section in
+                    sectionView(section, projection: projection)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .contain)
@@ -47,6 +68,33 @@ struct WorkflowMapView: View {
                 description: Text("This run snapshot could not be rebuilt into a frozen workflow topology.")
             )
             .accessibilityIdentifier("workflow-map-view")
+        }
+    }
+
+    private var orderedVisibleSections: [WorkflowMapVisibleSection] {
+        WorkflowMapVisibleSection.allCases.filter { visibleSections.contains($0) }
+    }
+
+    @ViewBuilder
+    private func sectionView(_ section: WorkflowMapVisibleSection, projection: WorkflowMapProjection) -> some View {
+        switch section {
+        case .topology:
+            WorkflowMapTopologyView(projection: projection)
+                .accessibilityIdentifier("workflow-map-topology")
+        case .handoffs:
+            WorkflowMapHandoffLedger(projection: projection)
+                .accessibilityIdentifier("workflow-map-handoffs")
+        case .agents:
+            WorkflowMapAgentPanels(projection: projection)
+                .accessibilityIdentifier("workflow-map-agents")
+        case .telemetry:
+            WorkflowMapLoopTelemetryView(projection: projection)
+                .accessibilityIdentifier("workflow-map-loops")
+        case .timeline:
+            WorkflowMapTimelineView(
+                projection: projection,
+                onOpenInspector: onOpenTimelineInspector
+            )
         }
     }
 
@@ -591,63 +639,33 @@ private struct WorkflowMapLoopTelemetryView: View {
 
 private struct WorkflowMapTimelineView: View {
     let projection: WorkflowMapProjection
+    var onOpenInspector: (() -> Void)?
 
     var body: some View {
-        GroupBox("Live Timeline") {
-            if projection.liveTimeline.isEmpty, projection.persistedTimeline.isEmpty {
-                Text("No live timeline events are available for this run.")
-                    .foregroundStyle(.secondary)
-            } else if projection.liveTimeline.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("No in-memory live stream is attached. Showing persisted checkpoints.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ForEach(Array(projection.persistedTimeline.prefix(8))) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(entry.title)
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text(entry.timestamp, format: .dateTime.hour().minute().second())
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(entry.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(projection.liveTimeline.prefix(8))) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(entry.agentTitle)
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text(entry.event.type.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(entry.event.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            HStack(spacing: 8) {
-                                Text(entry.stageID)
-                                if let sessionID = entry.event.sessionID {
-                                    Text(sessionID)
-                                }
-                                Text(entry.event.timestamp, format: .dateTime.hour().minute().second())
-                            }
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        }
-                        .padding(.vertical, 2)
-                    }
+        VStack(alignment: .leading, spacing: 12) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel("Workflow map timeline section")
+                .accessibilityIdentifier("workflow-map-timeline")
+
+            HStack {
+                Text("Live Timeline")
+                    .font(.headline)
+                Spacer()
+                if let onOpenInspector {
+                    Button("Open Focused Timeline", action: onOpenInspector)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("workflow-map-open-focused-timeline")
                 }
             }
+
+            RunTimelineInspectorView(
+                projection: projection,
+                showsTitle: false
+            )
+            .frame(minHeight: 280)
         }
     }
 }

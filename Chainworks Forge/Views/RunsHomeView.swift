@@ -239,19 +239,27 @@ struct RunsHomeView: View {
     // MARK: - Grouped Runs (§5.2)
 
     private var waitingApprovalRuns: [Run] {
-        allRuns.filter { $0.status == .waitingApproval }
+        allRuns.filter { $0.presentationStatus == .waitingApproval }
     }
 
     private var blockedRuns: [Run] {
-        allRuns.filter { $0.status == .blocked }
+        allRuns.filter { $0.presentationStatus == .blocked }
     }
 
     private var runningRuns: [Run] {
-        allRuns.filter { $0.status == .running || $0.status == .ready || $0.status == .pending }
+        allRuns.filter {
+            $0.presentationStatus == .running
+                || $0.presentationStatus == .ready
+                || $0.presentationStatus == .pending
+        }
     }
 
     private var recentlyCompletedRuns: [Run] {
-        allRuns.filter { $0.status == .completed || $0.status == .failed || $0.status == .cancelled }
+        allRuns.filter {
+            $0.presentationStatus == .completed
+                || $0.presentationStatus == .failed
+                || $0.presentationStatus == .cancelled
+        }
     }
 
     private var runsHomeAccessibilitySummary: String {
@@ -617,6 +625,8 @@ struct ParentIdeaArchiveBadge: View {
 // MARK: - Run Detail Panel
 
 struct RunDetailPanel: View {
+    @Environment(ExecutionService.self) private var executionService
+    @Environment(\.modelContext) private var modelContext
     let run: Run
     let onRecover: () -> Void
     let onCompare: () -> Void
@@ -625,32 +635,281 @@ struct RunDetailPanel: View {
     var onBlockedRecovery: (() -> Void)?
     let compatibilityChecker: CompatibilityChecker
 
-    @Environment(\.modelContext) private var modelContext
+    @State private var selectedPane: RunsHomePane = .summary
+    @State private var selectedFlowSection: WorkflowMapVisibleSection = .topology
+    @State private var selectedArtifactLeaf: RunArtifactLeaf?
+    @State private var showTimelineInspector = false
     @State private var evidenceExportMessage: String?
+    @State private var showStopConfirmation = false
+
+    private var artifactHierarchy: RunArtifactHierarchy {
+        RunArtifactHierarchyBuilder().build(for: run)
+    }
+
+    private var workflowMapProjection: WorkflowMapProjection? {
+        WorkflowMapProjectionService(modelContext: modelContext, executionService: executionService)
+            .projection(for: run)
+    }
+
+    private var nextActionText: String {
+        switch run.presentationStatus {
+        case .waitingApproval:
+            return "Review approval context and decide whether this run should proceed."
+        case .blocked:
+            return run.driftDetails ?? "Inspect the blocked stage and choose recovery or comparison."
+        case .failed:
+            return "Inspect recovery evidence, compare against a compatible run, or reopen the report."
+        case .completed:
+            return "Review the report, exported evidence, and promoted artifacts."
+        case .running, .pending, .ready:
+            return "Watch flow progress, open the live timeline when needed, and inspect stage artifacts."
+        case .cancelled:
+            return "This run has settled after cancellation. Reports and artifacts remain available."
+        case .cancelling:
+            return "Cancellation is in progress. Operator evidence remains available while agents settle."
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: DesignTokens.Spacing.large) {
-                    VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
-                        Text(run.idea?.title ?? "Unknown Idea")
-                            .font(.title2.bold())
-                        Text(run.workflowTitle)
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                        HStack {
-                            StatusCapsule(
-                                text: run.presentationStatusLabel,
-                                color: statusColor,
-                                size: .regular
-                            )
-                            RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
-                        }
-                        ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
+                    headerBlock
+
+                    if hasAnyAction {
+                        actionRow
                     }
 
-                    Divider()
+                    Picker("Run Surface", selection: $selectedPane) {
+                        ForEach(RunsHomePane.allCases, id: \.self) { pane in
+                            Text(pane.title).tag(pane)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("runs-home-pane-picker")
 
+                    switch selectedPane {
+                    case .summary:
+                        summaryPane
+                    case .flow:
+                        flowPane
+                    case .artifacts:
+                        artifactsPane
+                    case .diagnostics:
+                        diagnosticsPane
+                    }
+                }
+                .padding()
+            }
+        }
+        .navigationTitle("Run Details")
+        .accessibilityIdentifier("run-detail-panel")
+        .task(id: run.id) {
+            selectedPane = defaultRunsHomePane(for: run.presentationStatus)
+        }
+        .sheet(isPresented: $showTimelineInspector) {
+            NavigationStack {
+                if let projection = workflowMapProjection {
+                    RunTimelineInspectorView(projection: projection)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { showTimelineInspector = false }
+                            }
+                        }
+                } else {
+                    ContentUnavailableView(
+                        "Live Timeline Unavailable",
+                        systemImage: "waveform.path.ecg",
+                        description: Text("The run could not be rebuilt into a workflow-map projection.")
+                    )
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showTimelineInspector = false }
+                        }
+                    }
+                }
+            }
+            .frame(minWidth: 620, minHeight: 520)
+        }
+        .sheet(item: $selectedArtifactLeaf) { leaf in
+            RunArtifactLeafInspectorSheet(run: run, leaf: leaf)
+        }
+        .alert("Stop Run?", isPresented: $showStopConfirmation) {
+            Button("Stop", role: .destructive) {
+                Task {
+                    await executionService.cancelRun(runID: run.id)
+                }
+            }
+            Button("Keep Running", role: .cancel) { }
+        } message: {
+            Text("This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history.")
+        }
+    }
+
+    @ViewBuilder
+    private var headerBlock: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+            Text(run.idea?.title ?? "Unknown Idea")
+                .font(.title2.bold())
+            Text(run.workflowTitle)
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: DesignTokens.Spacing.small) {
+                StatusCapsule(
+                    text: run.presentationStatusLabel,
+                    color: statusColor,
+                    size: .regular
+                )
+                RuntimeProvenanceBadge(trustLevel: run.runtimeTrustLevel)
+            }
+            ParentIdeaArchiveBadge(title: "Parent idea", idea: run.idea)
+
+            Text(nextActionText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("runs-home-next-action-text")
+        }
+    }
+
+    @ViewBuilder
+    private var actionRow: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+            HStack(alignment: .center, spacing: DesignTokens.Spacing.small) {
+                if run.canBeCancelledByOperator {
+                    Button(
+                        run.cancellationRequestedAt != nil ? "Cancelling\u{2026}" : "Stop Run",
+                        systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
+                    ) {
+                        showStopConfirmation = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(DesignTokens.Status.error)
+                    .disabled(run.cancellationRequestedAt != nil)
+                    .accessibilityIdentifier("runs-home-stop-run-button")
+                }
+
+                if run.status == .blocked || run.status == .failed {
+                    Button("Recover", systemImage: "arrow.counterclockwise") {
+                        onRecover()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(DesignTokens.Action.caution)
+
+                    if let onBlockedRecovery {
+                        Button("Detailed Recovery", systemImage: "wrench.and.screwdriver") {
+                            onBlockedRecovery()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                if compatibilityChecker.hasCompatibleTargets(for: run) {
+                    Button("Compare", systemImage: "arrow.left.arrow.right") {
+                        onCompare()
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if run.latestImmutableReportArtifactID != nil {
+                    Button("View Report", systemImage: "doc.text") {
+                        onViewReport()
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if (run.status == .completed || run.status == .failed),
+                   run.deliveryConfigurationJSON != nil {
+                    Button("Export Evidence Pack", systemImage: "shippingbox") {
+                        exportEvidencePack()
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("export-evidence-pack-button")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let evidenceExportMessage {
+                Text(evidenceExportMessage)
+                    .font(DesignTokens.Typography.supporting)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var summaryPane: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.large) {
+            GroupBox("Summary") {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                    LabeledContent("Status", value: run.presentationStatusLabel)
+                    LabeledContent("Current Stage", value: run.currentStageID ?? "None")
+                    LabeledContent("Next Action", value: nextActionText)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            GroupBox("Run Snapshot") {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                    LabeledContent("Workflow", value: run.workflowTitle)
+                    if let idea = run.idea {
+                        LabeledContent("Idea", value: idea.title)
+                    }
+                    LabeledContent("Current Stage", value: run.currentStageID ?? "None")
+                    LabeledContent("Status", value: run.presentationStatusLabel)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var flowPane: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
+            Picker("Workflow Map Focus", selection: $selectedFlowSection) {
+                ForEach(flowSections, id: \.self) { section in
+                    Text(flowSectionTitle(section)).tag(section)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("runs-home-flow-section-picker")
+
+            WorkflowMapView(
+                run: run,
+                showsSummaryStrip: true,
+                visibleSections: [selectedFlowSection],
+                onOpenTimelineInspector: { showTimelineInspector = true }
+            )
+
+            Button("Open Live Timeline", systemImage: "waveform.path.ecg") {
+                showTimelineInspector = true
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("runs-home-open-timeline-button")
+        }
+    }
+
+    @ViewBuilder
+    private var artifactsPane: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
+            GroupBox("Artifact Hierarchy") {
+                RunArtifactHierarchyView(
+                    hierarchy: artifactHierarchy,
+                    onOpenArtifact: { artifact in
+                        selectedArtifactLeaf = resolvedLeaf(for: artifact)
+                    },
+                    artifactResolver: resolveArtifact(withID:)
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var diagnosticsPane: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.large) {
+            GroupBox("Execution Details") {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
                     LabeledContent("Started", value: run.startedAt.formatted())
                     if let completed = run.completedAt {
                         LabeledContent("Completed", value: completed.formatted())
@@ -659,98 +918,163 @@ struct RunDetailPanel: View {
                     if let cost = run.totalCostCents {
                         LabeledContent("Total Cost", value: "\(cost) cents")
                     }
-
-                    Divider()
-
-                    Text("Stages")
-                        .font(DesignTokens.Typography.sectionHeader)
-                    ForEach(run.stageExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { stage in
-                        HStack {
-                            Image(systemName: stageIcon(stage.status))
-                                .foregroundStyle(stageColor(stage.status))
-                            Text(stage.label)
-                            Spacer()
-                            Text(stage.status.rawValue)
-                                .font(DesignTokens.Typography.supporting)
-                                .foregroundStyle(.secondary)
-                        }
+                    if let runtimeTrustLevel = run.runtimeTrustLevel {
+                        LabeledContent("Runtime Trust", value: runtimeTrustLevel)
                     }
-
-                    Divider()
-
-                    Text("Workflow Map")
-                        .font(DesignTokens.Typography.sectionHeader)
-                    WorkflowMapView(run: run)
                 }
-                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            // Proposal 012 (L-10): Sticky action footer — always visible above the fold
-            if hasAnyAction {
-                Divider()
-                VStack(spacing: DesignTokens.Spacing.small) {
-                    HStack(spacing: DesignTokens.Spacing.medium) {
-                        if run.status == .blocked || run.status == .failed {
-                            Button("Recover", systemImage: "arrow.counterclockwise") {
-                                onRecover()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(DesignTokens.Action.caution)
-
-                            // Proposal 008 (§7.2): Detailed blocked-run recovery surface
-                            if let onBlockedRecovery {
-                                Button("Detailed Recovery", systemImage: "wrench.and.screwdriver") {
-                                    onBlockedRecovery()
-                                }
-                                .buttonStyle(.bordered)
-                            }
-                        }
-
-                        if compatibilityChecker.hasCompatibleTargets(for: run) {
-                            Button("Compare", systemImage: "arrow.left.arrow.right") {
-                                onCompare()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        if run.latestImmutableReportArtifactID != nil {
-                            Button("View Report", systemImage: "doc.text") {
-                                onViewReport()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        // Gap 2 (Proposal 007): Export Evidence Pack for completed delivery runs
-                        if (run.status == .completed || run.status == .failed),
-                           run.deliveryConfigurationJSON != nil {
-                            Button("Export Evidence Pack", systemImage: "shippingbox") {
-                                exportEvidencePack()
-                            }
-                            .buttonStyle(.bordered)
-                            .accessibilityIdentifier("export-evidence-pack-button")
-                        }
+            GroupBox("Repository & Delivery") {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                    if let worktreeRoot = run.worktreeRoot {
+                        LabeledContent("Worktree", value: worktreeRoot)
                     }
-
-                    if let evidenceExportMessage {
-                        Text(evidenceExportMessage)
-                            .font(DesignTokens.Typography.supporting)
-                            .foregroundStyle(.secondary)
-                            .transition(.opacity)
+                    if let repoIdentifier = run.repoIdentifier {
+                        LabeledContent("Repository", value: repoIdentifier)
+                    }
+                    if let baseBranch = run.baseBranch {
+                        LabeledContent("Base Branch", value: baseBranch)
+                    }
+                    if let targetBranch = run.targetBranch {
+                        LabeledContent("Target Branch", value: targetBranch)
+                    }
+                    if let releaseTargetID = run.releaseTargetID {
+                        LabeledContent("Release Target", value: releaseTargetID)
+                    }
+                    if let releaseMode = run.releaseMode {
+                        LabeledContent("Release Mode", value: releaseMode)
                     }
                 }
-                .padding()
-                .background(.bar)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            GroupBox("Receipts & Evidence") {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(diagnosticArtifacts) { artifact in
+                        Button {
+                            selectedArtifactLeaf = artifact
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(artifact.name)
+                                    Text("\(artifact.stageLabel) · \(artifact.agentTitle)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(artifact.format.rawValue)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Open \(artifact.name)")
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("artifact-button-\(artifact.name)")
+                    }
+
+                    Button("Open Live Timeline", systemImage: "waveform.path.ecg") {
+                        showTimelineInspector = true
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
         }
-        .navigationTitle("Run Details")
-        .accessibilityIdentifier("run-detail-panel")
     }
 
     private var hasAnyAction: Bool {
-        run.status == .blocked || run.status == .failed
+        run.canBeCancelledByOperator
+            || run.status == .blocked || run.status == .failed
             || compatibilityChecker.hasCompatibleTargets(for: run)
             || run.latestImmutableReportArtifactID != nil
             || (run.deliveryConfigurationJSON != nil && (run.status == .completed || run.status == .failed))
+    }
+
+    private var flowSections: [WorkflowMapVisibleSection] {
+        WorkflowMapVisibleSection.allCases.filter { $0 != .timeline }
+    }
+
+    private func flowSectionTitle(_ section: WorkflowMapVisibleSection) -> String {
+        switch section {
+        case .topology:
+            return "Topology"
+        case .handoffs:
+            return "Handoffs"
+        case .agents:
+            return "Agents"
+        case .telemetry:
+            return "Telemetry"
+        case .timeline:
+            return "Timeline"
+        }
+    }
+
+    private var diagnosticArtifacts: [RunArtifactLeaf] {
+        let relevantKinds: Set<RunArtifactBucketKind> = [.receipt, .transcript, .review, .diagnostic, .report, .release, .delivery]
+        return artifactHierarchy.allArtifacts.filter { leaf in
+            relevantKinds.contains(classify(leaf: leaf))
+                || leaf.isLatestSummaryReport
+                || leaf.isLatestImmutableReport
+                || leaf.name.contains("evidence")
+                || leaf.name.contains("recovery")
+        }
+    }
+
+    private func classify(leaf: RunArtifactLeaf) -> RunArtifactBucketKind {
+        let name = leaf.name.lowercased()
+        let contractID = leaf.contractID.lowercased()
+        let displayRole = leaf.artifactLineageKind?.lowercased() ?? ""
+
+        if leaf.reportKind == "latest_summary" || name.contains("summary") || displayRole.contains("summary") {
+            return .summary
+        }
+        if leaf.reportKind != nil || contractID.contains("run_report") {
+            return .report
+        }
+        if name.contains("diff") || name.contains("patch") {
+            return .diff
+        }
+        if name.contains("receipt") || contractID.contains("receipt") {
+            return .receipt
+        }
+        if name.contains("transcript") {
+            return .transcript
+        }
+        if name.contains("approval") {
+            return .approvalContext
+        }
+        if name.contains("review") {
+            return .review
+        }
+        if name.contains("release") || name.contains("manifest") || contractID.contains("release") {
+            return .release
+        }
+        if name.contains("delivery") || name.contains("publish") || name.contains("upload") {
+            return .delivery
+        }
+        if name.contains("test") || contractID.contains("test") {
+            return .test
+        }
+        if name.contains("diagnostic") || name.contains("trace") || name.contains("debug") || name.contains("log") {
+            return .diagnostic
+        }
+        return .other
+    }
+
+    private func resolveArtifact(withID artifactID: UUID) -> Artifact? {
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.id == artifactID
+            }
+        )
+        return try? modelContext.fetch(descriptor).first
+    }
+
+    private func resolvedLeaf(for artifact: Artifact) -> RunArtifactLeaf? {
+        artifactHierarchy.allArtifacts.first { $0.artifactID == artifact.id }
     }
 
     private func exportEvidencePack() {
@@ -829,6 +1153,63 @@ struct RunDetailPanel: View {
         case .blocked: return DesignTokens.Status.error
         case .skipped: return DesignTokens.Status.neutral
         case .pending, .ready: return DesignTokens.Status.neutral
+        }
+    }
+}
+
+private struct RunArtifactLeafInspectorSheet: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+
+    let run: Run
+    let leaf: RunArtifactLeaf
+
+    var body: some View {
+        NavigationStack {
+            if let artifact = artifact {
+                ArtifactInspectorView(artifact: artifact, run: run)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { dismiss() }
+                        }
+                    }
+            } else {
+                ContentUnavailableView(
+                    "Artifact Unavailable",
+                    systemImage: "doc.questionmark",
+                    description: Text("The selected artifact could not be loaded from the current run.")
+                )
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 640, minHeight: 480)
+    }
+
+    private var artifact: Artifact? {
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.id == leaf.artifactID
+            }
+        )
+        return try? modelContext.fetch(descriptor).first
+    }
+}
+
+private extension RunsHomePane {
+    var title: String {
+        switch self {
+        case .summary:
+            return "Summary"
+        case .flow:
+            return "Flow"
+        case .artifacts:
+            return "Artifacts"
+        case .diagnostics:
+            return "Diagnostics"
         }
     }
 }

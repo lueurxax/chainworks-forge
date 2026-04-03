@@ -19,6 +19,7 @@ struct CompletedRunExportHub: View {
     @State private var exportMessage: String?
     @State private var isExporting = false
     @State private var signOffSnapshot: MVPSignOffDecisionSnapshot?
+    @State private var selectedArtifact: Artifact?
 
     /// Evidence-pack lifecycle status per §7.5.
     enum EvidencePackStatus: String {
@@ -63,6 +64,11 @@ struct CompletedRunExportHub: View {
                 // Final report link
                 finalReportSection
 
+                // Repo-backed continuity affordances
+                repoBackedContinuitySection
+
+                Divider()
+
                 // Provider and delivery receipts
                 receiptOverviewSection
 
@@ -97,6 +103,11 @@ struct CompletedRunExportHub: View {
         }
         .navigationTitle("Export Hub")
         .accessibilityIdentifier("completed-run-export-hub")
+        .sheet(item: $selectedArtifact) { artifact in
+            NavigationStack {
+                ArtifactInspectorView(artifact: artifact, run: run)
+            }
+        }
         .task {
             loadRunData()
         }
@@ -281,6 +292,110 @@ struct CompletedRunExportHub: View {
             }
         } label: {
             Label("Report", systemImage: "doc.text")
+        }
+    }
+
+    // MARK: - Repo-Backed Continuity
+
+    private var repoBackedContinuitySection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                continuityWorktreeRow
+
+                Divider()
+
+                continuityArtifactRow(
+                    title: "Open Release Manifest",
+                    subtitle: releaseManifestArtifact.map { artifactContinuitySubtitle(for: $0) }
+                        ?? "Release manifest not captured",
+                    systemImage: "doc.text",
+                    artifact: releaseManifestArtifact,
+                    accessibilityIdentifier: "completed-run-open-release_manifest"
+                )
+
+                Divider()
+
+                continuityArtifactRow(
+                    title: "Open Git Push Receipt",
+                    subtitle: gitPushReceiptArtifact.map { artifactContinuitySubtitle(for: $0) }
+                        ?? "Git push receipt not captured",
+                    systemImage: "arrow.up.right.circle",
+                    artifact: gitPushReceiptArtifact,
+                    accessibilityIdentifier: "completed-run-open-git_push_receipt"
+                )
+
+                Divider()
+
+                continuityArtifactRow(
+                    title: "Open Upload Receipt",
+                    subtitle: uploadReceiptArtifact.map { artifactContinuitySubtitle(for: $0) }
+                        ?? "Upload receipt not captured",
+                    systemImage: "square.and.arrow.up.circle",
+                    artifact: uploadReceiptArtifact,
+                    accessibilityIdentifier: "completed-run-open-connect_upload_receipt"
+                )
+            }
+        } label: {
+            Label("Repo-Backed Continuity", systemImage: "arrow.triangle.branch")
+        }
+    }
+
+    private var continuityWorktreeRow: some View {
+        HStack(spacing: 12) {
+            let worktreeRoot = run.worktreeRoot ?? ""
+            Image(systemName: "folder")
+                .font(.title3)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Reveal Worktree")
+                    .font(.subheadline.bold())
+                Text(worktreeRoot.isEmpty ? "No worktree captured for this run." : worktreeRoot)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button {
+                revealWorktree()
+            } label: {
+                Label("Reveal", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+            .disabled(worktreeRoot.isEmpty)
+            .accessibilityIdentifier("completed-run-open-worktree")
+        }
+    }
+
+    private func continuityArtifactRow(
+        title: String,
+        subtitle: String,
+        systemImage: String,
+        artifact: Artifact?,
+        accessibilityIdentifier: String
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .font(.title3)
+                .foregroundStyle(artifact == nil ? Color.secondary : Color.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.bold())
+                Text(subtitle)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button {
+                if let artifact {
+                    selectedArtifact = artifact
+                }
+            } label: {
+                Label("Open", systemImage: "doc.text.magnifyingglass")
+            }
+            .buttonStyle(.bordered)
+            .disabled(artifact == nil)
+            .accessibilityIdentifier(accessibilityIdentifier)
         }
     }
 
@@ -620,14 +735,27 @@ struct CompletedRunExportHub: View {
         signOffSnapshot = try? modelContext.fetch(descriptor).first
     }
 
+    private func preferredExportDirectory() -> URL {
+        let environment = ProcessInfo.processInfo.environment
+        if let overridePath = environment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           overridePath.isEmpty == false {
+            let overrideURL = URL(fileURLWithPath: overridePath, isDirectory: true)
+            try? FileManager.default.createDirectory(at: overrideURL, withIntermediateDirectories: true)
+            return overrideURL
+        }
+
+        return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+    }
+
     // MARK: - Export Operations
 
     private func exportEvidencePack() {
         isExporting = true
         exportMessage = nil
 
-        let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
+        let exportDirectory = preferredExportDirectory()
         let workspace = RunWorkspace(
             runID: run.id,
             workspaceRoot: FileManager.default.temporaryDirectory
@@ -641,9 +769,9 @@ struct CompletedRunExportHub: View {
             let pack = try EvidencePackBuilder.export(
                 run: run,
                 workspace: workspace,
-                exportDirectory: desktopURL
+                exportDirectory: exportDirectory
             )
-            exportMessage = "Exported \(pack.itemCount) items to Desktop."
+            exportMessage = "Exported \(pack.itemCount) items to \(exportDirectory.lastPathComponent)."
             evidencePackStatus = .exported
             // Proposal 008 (REQ-020): Mark the linked benchmark record as exported
             // so the GO/HOLD gate can verify complete exported review packets.
@@ -674,11 +802,10 @@ struct CompletedRunExportHub: View {
         isExporting = true
         exportMessage = nil
 
-        let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
+        let exportDirectory = preferredExportDirectory()
 
         do {
-            let packetDir = desktopURL
+            let packetDir = exportDirectory
                 .appendingPathComponent("signoff-packet-\(snapshot.id.uuidString.prefix(8))", isDirectory: true)
             try FileManager.default.createDirectory(at: packetDir, withIntermediateDirectories: true)
 
@@ -714,6 +841,19 @@ struct CompletedRunExportHub: View {
         }
 
         isExporting = false
+    }
+
+    private var releaseManifestArtifact: Artifact? {
+        artifact(named: "release_manifest")
+    }
+
+    private var gitPushReceiptArtifact: Artifact? {
+        artifact(named: "git_push_receipt")
+    }
+
+    private var uploadReceiptArtifact: Artifact? {
+        artifact(named: "connect_upload_receipt")
+            ?? artifact(named: "delivery_receipt")
     }
 
     // MARK: - Computed Properties
@@ -783,6 +923,22 @@ struct CompletedRunExportHub: View {
 
     private func stageArtifactCount(_ stage: StageExecution) -> Int {
         allArtifacts.filter { $0.stageID == stage.stageID }.count
+    }
+
+    private func artifact(named name: String) -> Artifact? {
+        allArtifacts.first { $0.name == name || $0.contractID == name }
+    }
+
+    private func artifactContinuitySubtitle(for artifact: Artifact) -> String {
+        let fileName = URL(fileURLWithPath: artifact.filePath).lastPathComponent
+        return "\(fileName) · \(artifact.stageID)"
+    }
+
+    private func revealWorktree() {
+        guard let worktreeRoot = run.worktreeRoot, worktreeRoot.isEmpty == false else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(
+            [URL(fileURLWithPath: worktreeRoot)]
+        )
     }
 
     private func stageIcon(_ status: StageStatus) -> String {

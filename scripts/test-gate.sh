@@ -85,6 +85,15 @@ PROPOSAL_022_TESTS=(
   "Chainworks ForgeTests/Proposal022ScaffoldingTests"
 )
 
+PROPOSAL_024_TESTS=(
+  "Chainworks ForgeTests/Proposal024RunSurfaceTests"
+  "Chainworks ForgeTests/RunArtifactHierarchyBuilderTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testCompletedRunExportHubSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal024FocusedTimelineInspectorSurface"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 LAST_BUILD_DERIVED_DATA_PATH=""
 
@@ -720,6 +729,7 @@ Available gates:
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
+  proposal-024    Proposal 024 run-surface information architecture gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -871,6 +881,19 @@ case "$GATE" in
     run_build "proposal-022"
     run_split_targeted_gate "proposal-022" "${PROPOSAL_022_TESTS[@]}"
     run_proposal022_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
+    ;;
+  proposal-024|p024)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-024"
+    run_split_targeted_gate "proposal-024" "${PROPOSAL_024_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

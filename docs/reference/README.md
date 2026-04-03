@@ -25,6 +25,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
 - [goose-server-transport.md](goose-server-transport.md) — GooseServerTransport adapter: goosed API contract, SSE event mapping, session lifecycle, executor pipeline, proven real Goose connection
 - [operator-experience.md](operator-experience.md) — Stable operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
+- [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [provider-platform.md](provider-platform.md) — Stable provider/settings baseline: registry, adapters, settings, preflight, receipts, first-run and pilot surfaces
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) — Stable Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — Stable UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
@@ -55,6 +56,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [../evidence/session-lineage-reuse-and-operator-reset-proof.md](../evidence/session-lineage-reuse-and-operator-reset-proof.md) — consolidated implementation/proof story for session-lineage reuse, checkpointing, and operator reset
 - [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md) — consolidated implementation/proof story for context strategies, lazy evidence, telemetry, and recommendation output
 - [../evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md](../evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md) — consolidated implementation/proof story for proposal-loop refine fidelity, backlog carry-forward, and targeted rereview
+- [../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md) — consolidated implementation/proof story for segmented run surfaces, focused timeline, and hierarchical artifact browsing
 - [../evidence/design-system-and-brand-application-proof.md](../evidence/design-system-and-brand-application-proof.md) — consolidated implementation/proof story for the design-system and brand-application slice
 
 ## Risk Analysis

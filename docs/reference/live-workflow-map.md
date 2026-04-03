@@ -25,6 +25,7 @@ This reference covers:
 - agent activity grouping,
 - handoff counters,
 - loop visibility,
+- focused timeline ownership under the run-detail spine,
 - fallback behavior when a map cannot be derived.
 
 It does not define repo-backed delivery or release topology.
@@ -40,6 +41,8 @@ Canonical operator path:
 3. workflow-map pane.
 
 The map extends the existing run-detail owner path.
+
+The segmented-pane destinations and detached focused-timeline shell contract that consume this map are documented in [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md).
 
 ## Data model
 

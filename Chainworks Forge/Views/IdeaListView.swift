@@ -784,8 +784,10 @@ struct IdeaDetailView: View {
         switch activeRun.presentationStatus {
         case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
             return activeRun
-        case .completed, .failed, .cancelled:
+        case .completed, .cancelled:
             return nil
+        case .failed:
+            return activeRun
         }
     }
 
@@ -1009,7 +1011,7 @@ struct IdeaDetailView: View {
                                             HStack(spacing: 8) {
                                                 Text(run.presentationStatusLabel)
                                                     .font(.caption)
-                                                    .foregroundStyle(statusColor(run.presentationStatus))
+                                                    .foregroundStyle(self.statusColor(run.presentationStatus))
                                                 Text(run.startedAt, format: .dateTime)
                                                     .font(.caption2)
                                                     .foregroundStyle(.tertiary)
@@ -2220,9 +2222,12 @@ struct WorkflowRunProgressView: View {
 
     let run: Run
 
+    @State private var selectedPane: IdeaRunPane = .summary
     @State private var selectedStage: StageExecution?
     @State private var selectedArtifact: Artifact?
     @State private var approvalComment = ""
+    @State private var showStopConfirmation = false
+    @State private var showTimelineInspector = false
 
     private var sortedStages: [StageExecution] {
         run.stageExecutions.sorted {
@@ -2233,8 +2238,8 @@ struct WorkflowRunProgressView: View {
         }
     }
 
-    private var activeAgents: [AgentExecution] {
-        sortedStages.flatMap(\.agentExecutions).filter { $0.status == .running }
+    private var artifactHierarchy: RunArtifactHierarchy {
+        RunArtifactHierarchyBuilder().build(for: run)
     }
 
     private var latestArtifacts: [Artifact] {
@@ -2248,7 +2253,11 @@ struct WorkflowRunProgressView: View {
                 if lhs.name == "final_feature_report" { return true }
                 if rhs.name == "final_feature_report" { return false }
                 return lhs.createdAt > rhs.createdAt
-            }
+        }
+    }
+
+    private var activeAgents: [AgentExecution] {
+        sortedStages.flatMap(\.agentExecutions).filter { $0.status == .running }
     }
 
     private var orchestrator: WorkflowOrchestrator? {
@@ -2257,6 +2266,14 @@ struct WorkflowRunProgressView: View {
 
     private var liveTimeline: [LiveExecutionTimelineEntry] {
         orchestrator?.liveTimeline.reversed() ?? []
+    }
+
+    private var workflowMapProjection: WorkflowMapProjection? {
+        let service = WorkflowMapProjectionService(
+            modelContext: modelContext,
+            executionService: executionService
+        )
+        return service.projection(for: run)
     }
 
     private var pendingApprovalRequest: ApprovalRequest? {
@@ -2290,6 +2307,10 @@ struct WorkflowRunProgressView: View {
             }
     }
 
+    private var pendingApprovalTitle: String {
+        pendingApprovalRequest.map { "Run is waiting at \($0.stageLabel)." } ?? "No active approval gate."
+    }
+
     private var proposalLoopFeedbackSummary: ProposalLoopFeedbackSummary? {
         ProposalLoopFeedbackParser.parseSummary(from: approvalContextArtifacts)
     }
@@ -2307,8 +2328,8 @@ struct WorkflowRunProgressView: View {
             .map { $0 }
     }
 
-    private var latestMeaningfulEvent: LiveExecutionTimelineEntry? {
-        liveTimeline.first(where: { $0.event.type != .textChunk }) ?? liveTimeline.first
+    private var preferredPane: IdeaRunPane {
+        defaultIdeaRunPane(for: run.presentationStatus)
     }
 
     private var latestPersistedCheckpointText: String? {
@@ -2355,25 +2376,149 @@ struct WorkflowRunProgressView: View {
         }
     }
 
+    private func statusColor(_ status: RunStatus) -> Color {
+        switch status {
+        case .pending, .ready:
+            return DesignTokens.Status.neutral
+        case .running:
+            return DesignTokens.Status.running
+        case .waitingApproval, .cancelling, .blocked:
+            return DesignTokens.Status.warning
+        case .completed:
+            return DesignTokens.Status.success
+        case .failed:
+            return DesignTokens.Status.error
+        case .cancelled:
+            return DesignTokens.Status.cancelled
+        }
+    }
+
     var body: some View {
-        List {
-            Section("Overview") {
-                LabeledContent("Workflow", value: run.workflowTitle)
-                LabeledContent("Status", value: run.presentationStatusLabel)
-                    .accessibilityIdentifier("run-status-\(run.presentationStatus.rawValue)")
-                LabeledContent("Current Stage", value: run.currentStageID ?? "None")
-                LabeledContent("Elapsed", value: elapsedText)
-                LabeledContent("Total Cost", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                segmentedSwitcher
+                paneBody
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityIdentifier("run-progress-view")
+        .sheet(item: $selectedStage) { stage in
+            WorkflowStageDetailView(stageExecution: stage, run: run)
+        }
+        .sheet(item: $selectedArtifact) { artifact in
+            ArtifactInspectorView(artifact: artifact, run: run)
+        }
+        .sheet(isPresented: $showTimelineInspector) {
+            NavigationStack {
+                if let projection = workflowMapProjection {
+                    RunTimelineInspectorView(projection: projection)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { showTimelineInspector = false }
+                            }
+                        }
+                } else {
+                    ContentUnavailableView(
+                        "Live Timeline Unavailable",
+                        systemImage: "waveform.path.ecg",
+                        description: Text("This run snapshot could not be projected into timeline state.")
+                    )
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showTimelineInspector = false }
+                        }
+                    }
+                }
+            }
+            .frame(minWidth: 520, minHeight: 440)
+        }
+        .alert("Stop Run?", isPresented: $showStopConfirmation) {
+            Button("Stop", role: .destructive) {
+                Task {
+                    await executionService.cancelRun(runID: run.id)
+                }
+            }
+            Button("Keep Running", role: .cancel) { }
+        } message: {
+            Text("This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history.")
+        }
+        .task(id: run.presentationStatus.rawValue) {
+            selectedPane = preferredPane
+        }
+    }
+
+    private var elapsedText: String {
+        durationString(from: run.startedAt, to: run.completedAt ?? Date())
+    }
+
+    private var runStatusColor: Color {
+        switch run.presentationStatus {
+        case .pending, .ready:
+            return DesignTokens.Status.neutral
+        case .running:
+            return DesignTokens.Status.running
+        case .waitingApproval, .blocked:
+            return DesignTokens.Status.warning
+        case .completed:
+            return DesignTokens.Status.success
+        case .failed:
+            return DesignTokens.Status.error
+        case .cancelled, .cancelling:
+            return DesignTokens.Status.neutral
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                    Text(run.workflowTitle)
+                        .font(.title2.bold())
+                HStack(spacing: 8) {
+                    StatusCapsule(
+                        text: run.presentationStatusLabel,
+                        color: runStatusColor,
+                        size: .regular
+                    )
+                    if let stage = currentStageExecution {
+                        Label(stage.label, systemImage: "square.stack.3d.up")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if let currentStageID = run.currentStageID {
+                        Label(currentStageID, systemImage: "square.stack.3d.up")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
-            Section("Current Phase") {
-                LabeledContent("Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
-                LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
-                LabeledContent("Latest Event", value: latestMeaningfulEvent?.event.detail ?? latestPersistedCheckpointText ?? "Waiting for the next execution event")
-                if let sessionID = latestMeaningfulEvent?.event.sessionID {
-                    LabeledContent("Session ID", value: sessionID)
+            HStack(spacing: 10) {
+                Label("Elapsed \(elapsedText)", systemImage: "clock")
+                Label(run.totalCostCents.map { "\($0) cents" } ?? "Pending cost", systemImage: "dollarsign.circle")
+                if let sessionID = latestLiveSessionID {
+                    Label(sessionID, systemImage: "lanyardcard")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                LabeledContent("Next Action", value: nextActionText)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                if run.canBeCancelledByOperator {
+                    Button(role: .destructive) {
+                        showStopConfirmation = true
+                    } label: {
+                        Label(
+                            run.cancellationRequestedAt != nil ? "Cancelling\u{2026}" : "Stop Run",
+                            systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
+                        )
+                    }
+                    .disabled(run.cancellationRequestedAt != nil)
+                    .accessibilityIdentifier("run-progress-stop-run-button")
+                }
+
                 if run.presentationStatus == .completed || run.presentationStatus == .blocked || run.presentationStatus == .failed || run.presentationStatus == .cancelled {
                     Button("Open in Runs Home") {
                         NotificationCenter.default.post(
@@ -2385,362 +2530,265 @@ struct WorkflowRunProgressView: View {
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("open-run-in-runs-home-button")
                 }
-            }
 
-            if let pendingApprovalRequest {
-                // Proposal 007 §11.1: Show ReleaseGateView when approvalPolicy is manual_release
-                if run.deliveryConfigurationJSON != nil,
-                   pendingApprovalRequest.approvalPolicy == "manual_release" {
-                    Section("Release Gate") {
-                        ReleaseGateView(
-                            run: run,
-                            onApprove: {
-                                executionService.resolveApproval(
-                                    approvalID: pendingApprovalRequest.id,
-                                    granted: true,
-                                    comment: blankToNil(approvalComment)
-                                )
-                                approvalComment = ""
-                            },
-                            onReject: {
-                                executionService.resolveApproval(
-                                    approvalID: pendingApprovalRequest.id,
-                                    granted: false,
-                                    comment: blankToNil(approvalComment)
-                                )
-                                approvalComment = ""
-                            }
-                        )
+                if workflowMapProjection != nil {
+                    Button("Live Timeline", systemImage: "waveform.path.ecg") {
+                        showTimelineInspector = true
                     }
-                } else {
-                    Section("Approval Gate") {
-                        Text("Run is waiting at \(pendingApprovalRequest.stageLabel).")
-                            .font(.subheadline)
-                        LabeledContent("Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
-                        TextField("Comment", text: $approvalComment, axis: .vertical)
-                            .textFieldStyle(.roundedBorder)
-                        HStack {
-                            Button("Reject", role: .destructive) {
-                                executionService.resolveApproval(
-                                    approvalID: pendingApprovalRequest.id,
-                                    granted: false,
-                                    comment: blankToNil(approvalComment)
-                                )
-                                approvalComment = ""
-                            }
-                            .accessibilityIdentifier("approval-reject-button")
-                            Spacer()
-                            Button("Approve") {
-                                executionService.resolveApproval(
-                                    approvalID: pendingApprovalRequest.id,
-                                    granted: true,
-                                    comment: blankToNil(approvalComment)
-                                )
-                                approvalComment = ""
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .accessibilityIdentifier("approval-approve-button")
-                        }
-                        if !approvalContextArtifacts.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                if let summary = proposalLoopFeedbackSummary {
-                                    GroupBox("Proposal-loop feedback (Proposal 022)") {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            LabeledContent("Backlog", value: "\(summary.backlogItemCount)")
-                                            LabeledContent("Unresolved", value: "\(summary.unresolvedItemCount)")
-                                            LabeledContent("Deferred", value: "\(summary.deferredItemCount)")
-                                            LabeledContent("Addressed", value: "\(summary.addressedItemCount)")
-                                            LabeledContent("Coverage", value: summary.coverageStatusSummary)
-                                            if let targeted = summary.targetedReviewerSummary {
-                                                Text("Targeted rereview")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                                Text(targeted)
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                                    .padding(.leading, 8)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Text("Decision Context")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                ForEach(approvalContextArtifacts) { artifact in
-                                    Button {
-                                        selectedArtifact = artifact
-                                    } label: {
-                                        HStack {
-                                            Text(artifact.name)
-                                            Spacer()
-                                            Text(artifact.format.rawValue)
-                                                .font(.caption2)
-                                                .foregroundStyle(.tertiary)
-                                        }
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel("Open \(artifact.name)")
-                                    .accessibilityElement(children: .combine)
-                                    .accessibilityIdentifier("artifact-button-\(artifact.name)")
-                                }
-                            }
-                        }
-                        if !latestDebugArtifacts.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("Receipts & Traces")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                ForEach(latestDebugArtifacts) { artifact in
-                                    Button {
-                                        selectedArtifact = artifact
-                                    } label: {
-                                        HStack {
-                                            Text(artifact.name)
-                                            Spacer()
-                                            Text(artifact.format.rawValue)
-                                                .font(.caption2)
-                                                .foregroundStyle(.tertiary)
-                                        }
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel("Open \(artifact.name)")
-                                    .accessibilityElement(children: .combine)
-                                    .accessibilityIdentifier("artifact-button-\(artifact.name)")
-                                }
-                            }
-                        }
-                    }
+                    .buttonStyle(.bordered)
                 }
             }
-
-            // MARK: Delivery Progress (Proposal 007 §10.2)
-            if run.deliveryConfigurationJSON != nil {
-                Section("Delivery Progress") {
-                    if let worktreeRoot = run.worktreeRoot {
-                        LabeledContent("Worktree", value: worktreeRoot)
-                            .accessibilityIdentifier("delivery-worktree-path")
-                    }
-                    if let repoId = run.repoIdentifier {
-                        LabeledContent("Repository", value: repoId)
-                    }
-                    if let baseBranch = run.baseBranch {
-                        LabeledContent("Base Branch", value: baseBranch)
-                    }
-                    if let targetBranch = run.targetBranch {
-                        LabeledContent("Target Branch", value: targetBranch)
-                    }
-                    if let baseRevision = run.baseRevision {
-                        LabeledContent("Base Revision", value: String(baseRevision.prefix(8)))
-                    }
-                    if let releaseMode = run.releaseMode {
-                        LabeledContent("Release Target", value: "\(run.releaseTargetID ?? "unknown") (\(releaseMode))")
-                            .accessibilityIdentifier("delivery-release-target")
-                    }
-
-                    // Implementation loop status
-                    if let implLoopCount = run.loopCounters["implementation_progress_count"] {
-                        LabeledContent("Implementation Iterations", value: "\(implLoopCount)")
-                            .accessibilityIdentifier("delivery-impl-iterations")
-                    }
-                    if let revisionCount = run.loopCounters["implementation_revision_count"] {
-                        LabeledContent("Refinement Cycles", value: "\(revisionCount)")
-                            .accessibilityIdentifier("delivery-refinement-cycles")
-                    }
-
-                    // Latest review status from artifacts
-                    if let reviewSummary = latestArtifacts.first(where: { $0.name == "implementation_review_summary" }) {
-                        Button {
-                            selectedArtifact = reviewSummary
-                        } label: {
-                            HStack {
-                                Label("Implementation Review Summary", systemImage: "checkmark.rectangle.stack")
-                                Spacer()
-                                Text(reviewSummary.format.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    // Changed files
-                    if let changedFiles = latestArtifacts.first(where: { $0.name == "changed_files_manifest" }) {
-                        Button {
-                            selectedArtifact = changedFiles
-                        } label: {
-                            HStack {
-                                Label("Changed Files Manifest", systemImage: "doc.text.magnifyingglass")
-                                Spacer()
-                                Text(changedFiles.format.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    // Tests result
-                    if let testsResult = latestArtifacts.first(where: { $0.name == "tests_result" }) {
-                        Button {
-                            selectedArtifact = testsResult
-                        } label: {
-                            HStack {
-                                Label("Tests Result", systemImage: "checkmark.circle")
-                                Spacer()
-                                Text(testsResult.format.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .accessibilityIdentifier("delivery-progress-section")
-
-                // Worktree / Repo Affordances (§10.4)
-                Section("Worktree & Repo") {
-                    if let worktreeRoot = run.worktreeRoot {
-                        Button {
-                            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: worktreeRoot)
-                        } label: {
-                            Label("Open Worktree in Finder", systemImage: "folder")
-                        }
-                        .accessibilityIdentifier("open-worktree-finder")
-                    }
-
-                    if let diffSummary = latestArtifacts.first(where: { $0.name == "diff_summary" || $0.name == "changed_files_manifest" }) {
-                        Button {
-                            selectedArtifact = diffSummary
-                        } label: {
-                            Label("Reveal Diff Summary", systemImage: "doc.text")
-                        }
-                    }
-
-                    if let releaseManifest = latestArtifacts.first(where: { $0.name == "release_manifest" }) {
-                        Button {
-                            selectedArtifact = releaseManifest
-                        } label: {
-                            Label("Reveal Release Manifest", systemImage: "shippingbox")
-                        }
-                    }
-
-                    if let gitReceipt = latestArtifacts.first(where: { $0.name == "git_push_receipt" }) {
-                        Button {
-                            selectedArtifact = gitReceipt
-                        } label: {
-                            Label("Git Push Receipt", systemImage: "arrow.up.doc")
-                        }
-                    }
-
-                    if let connectReceipt = latestArtifacts.first(where: { $0.name == "connect_upload_receipt" }) {
-                        Button {
-                            selectedArtifact = connectReceipt
-                        } label: {
-                            Label("Connect Upload Receipt", systemImage: "icloud.and.arrow.up")
-                        }
-                    }
-                }
-                .accessibilityIdentifier("worktree-repo-section")
-            }
-
-            Section("Stages") {
-                if sortedStages.isEmpty {
-                    Text("No stages have run yet.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(sortedStages) { stage in
-                        Button {
-                            selectedStage = stage
-                        } label: {
-                            HStack(alignment: .top, spacing: 12) {
-                                Image(systemName: stageStatusIcon(stage.status))
-                                    .foregroundStyle(stageStatusColor(stage.status))
-                                    .frame(width: 18)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text(stage.label)
-                                            .font(.headline)
-                                        Spacer()
-                                        Text(stage.status.rawValue)
-                                            .font(.caption)
-                                            .foregroundStyle(stageStatusColor(stage.status))
-                                    }
-                                    Text(stage.stageID)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                    HStack(spacing: 10) {
-                                        Text("Iteration \(stage.iteration)")
-                                        Text("\(stage.agentExecutions.count) agent runs")
-                                        if let completedAt = stage.completedAt {
-                                            Text(durationString(from: stage.startedAt, to: completedAt))
-                                        }
-                                    }
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            Section("Workflow Map") {
-                WorkflowMapView(run: run)
-                    .accessibilityIdentifier("workflow-map-section")
-            }
-
-            Section(run.status == .completed ? "Completed Feature Report" : "Artifacts") {
-                if latestArtifacts.isEmpty {
-                    Text("Artifacts will appear here as agent executions finish.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(latestArtifacts) { artifact in
-                        Button {
-                            selectedArtifact = artifact
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(artifact.name)
-                                        .font(.headline)
-                                    Text("\(artifact.stageID) · \(artifact.agentID)")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Text(artifact.format.rawValue)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Open \(artifact.name)")
-                        .accessibilityElement(children: .combine)
-                        .accessibilityIdentifier("artifact-button-\(artifact.name)")
-                    }
-                }
-            }
-        }
-        .navigationTitle(run.workflowTitle)
-        .accessibilityIdentifier("run-progress-view")
-        .sheet(item: $selectedStage) { stage in
-            WorkflowStageDetailView(stageExecution: stage, run: run)
-        }
-        .sheet(item: $selectedArtifact) { artifact in
-            ArtifactInspectorView(artifact: artifact, run: run)
         }
     }
 
-    private var elapsedText: String {
-        durationString(from: run.startedAt, to: run.completedAt ?? Date())
+    private var segmentedSwitcher: some View {
+        Picker("Run Surface", selection: $selectedPane) {
+            ForEach(IdeaRunPane.allCases, id: \.self) { pane in
+                Text(pane.rawValue.capitalized).tag(pane)
+            }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("run-progress-pane-picker")
+    }
+
+    @ViewBuilder
+    private var paneBody: some View {
+        switch selectedPane {
+        case .summary:
+            summaryPane
+        case .progress:
+            progressPane
+        case .artifacts:
+            artifactsPane
+        case .approvals:
+            approvalsPane
+        }
+    }
+
+    private var summaryPane: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("Summary") {
+                VStack(alignment: .leading, spacing: 8) {
+                    LabeledContent("Workflow", value: run.workflowTitle)
+                    LabeledContent("Status", value: run.presentationStatusLabel)
+                        .accessibilityIdentifier("run-status-\(run.presentationStatus.rawValue)")
+                    LabeledContent("Current Stage", value: run.currentStageID ?? "None")
+                    LabeledContent("Latest Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                    LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
+                    LabeledContent("Latest Event", value: latestMeaningfulEventText)
+                    LabeledContent("Next Action", value: nextActionText)
+                    if let liveSession = latestLiveSessionID {
+                        LabeledContent("Session ID", value: liveSession)
+                    }
+                }
+            }
+
+            if run.canBeCancelledByOperator {
+                GroupBox("Run Control") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(
+                            run.cancellationRequestedAt != nil
+                                ? "Cancellation in progress. Waiting for agents to settle."
+                                : "Stop the active run. All run history and artifacts remain intact."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private var progressPane: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("Progress") {
+                VStack(alignment: .leading, spacing: 8) {
+                    LabeledContent("Current Stage", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                    LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
+                    LabeledContent("Active Agents", value: "\(activeAgents.count)")
+                    if activeAgents.isEmpty == false {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(activeAgents) { agent in
+                                HStack {
+                                    Text(agent.agentTitle)
+                                    Spacer()
+                                    Text(agent.status.rawValue)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .font(.caption)
+                            }
+                        }
+                    }
+                    LabeledContent("Latest Event", value: latestMeaningfulEventText)
+                }
+            }
+
+            GroupBox("Workflow Map") {
+                WorkflowMapView(
+                    run: run,
+                    showsSummaryStrip: false,
+                    visibleSections: [.topology, .handoffs, .agents, .telemetry],
+                    onOpenTimelineInspector: { showTimelineInspector = true }
+                )
+                .accessibilityIdentifier("workflow-map-section")
+            }
+        }
+    }
+
+    private var artifactsPane: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("Artifacts") {
+                RunArtifactHierarchyView(
+                    hierarchy: artifactHierarchy,
+                    onOpenArtifact: { selectedArtifact = $0 },
+                    artifactResolver: resolveArtifact(withID:)
+                )
+            }
+        }
+    }
+
+    private var approvalsPane: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("Approvals") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(pendingApprovalTitle)
+                        .font(.subheadline)
+
+                    if let pendingApprovalRequest {
+                        if run.deliveryConfigurationJSON != nil,
+                           pendingApprovalRequest.approvalPolicy == "manual_release" {
+                            ReleaseGateView(
+                                run: run,
+                                onApprove: {
+                                    executionService.resolveApproval(
+                                        approvalID: pendingApprovalRequest.id,
+                                        granted: true,
+                                        comment: blankToNil(approvalComment)
+                                    )
+                                    approvalComment = ""
+                                },
+                                onReject: {
+                                    executionService.resolveApproval(
+                                        approvalID: pendingApprovalRequest.id,
+                                        granted: false,
+                                        comment: blankToNil(approvalComment)
+                                    )
+                                    approvalComment = ""
+                                }
+                            )
+                        } else {
+                            LabeledContent("Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+                            TextField("Comment", text: $approvalComment, axis: .vertical)
+                                .textFieldStyle(.roundedBorder)
+                            HStack {
+                                Button("Reject", role: .destructive) {
+                                    executionService.resolveApproval(
+                                        approvalID: pendingApprovalRequest.id,
+                                        granted: false,
+                                        comment: blankToNil(approvalComment)
+                                    )
+                                    approvalComment = ""
+                                }
+                                .accessibilityIdentifier("approval-reject-button")
+                                Spacer()
+                                Button("Approve") {
+                                    executionService.resolveApproval(
+                                        approvalID: pendingApprovalRequest.id,
+                                        granted: true,
+                                        comment: blankToNil(approvalComment)
+                                    )
+                                    approvalComment = ""
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .accessibilityIdentifier("approval-approve-button")
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !approvalContextArtifacts.isEmpty {
+                GroupBox("Decision Context") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let summary = proposalLoopFeedbackSummary {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Proposal-loop feedback (Proposal 022)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                LabeledContent("Backlog", value: "\(summary.backlogItemCount)")
+                                LabeledContent("Unresolved", value: "\(summary.unresolvedItemCount)")
+                                LabeledContent("Deferred", value: "\(summary.deferredItemCount)")
+                                LabeledContent("Addressed", value: "\(summary.addressedItemCount)")
+                                LabeledContent("Coverage", value: summary.coverageStatusSummary)
+                                if let targeted = summary.targetedReviewerSummary {
+                                    Text(targeted)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        ForEach(approvalContextArtifacts) { artifact in
+                            artifactButton(artifact)
+                        }
+                    }
+                }
+            }
+
+            if !latestDebugArtifacts.isEmpty {
+                GroupBox("Receipts & Traces") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(latestDebugArtifacts) { artifact in
+                            artifactButton(artifact)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var latestMeaningfulEventText: String {
+        latestLiveEvent?.event.detail ?? latestPersistedCheckpointText ?? "Waiting for the next execution event"
+    }
+
+    private var latestLiveEvent: LiveExecutionTimelineEntry? {
+        liveTimeline.first(where: { $0.event.type != .textChunk }) ?? liveTimeline.first
+    }
+
+    private var latestLiveSessionID: String? {
+        latestLiveEvent?.event.sessionID
+    }
+
+    @ViewBuilder
+    private func artifactButton(_ artifact: Artifact) -> some View {
+        Button {
+            selectedArtifact = artifact
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(artifact.name)
+                        .font(.headline)
+                    Text("\(artifact.stageID) · \(artifact.agentID)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(artifact.format.rawValue)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open \(artifact.name)")
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("artifact-button-\(artifact.name)")
+    }
+
+    private func resolveArtifact(withID artifactID: UUID) -> Artifact? {
+        latestArtifacts.first { $0.id == artifactID }
     }
 
     private func durationString(from start: Date, to end: Date) -> String {

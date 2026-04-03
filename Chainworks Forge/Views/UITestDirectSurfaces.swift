@@ -52,6 +52,7 @@ struct UITestIdeaArchiveSurface: View {
 struct UITestWorkflowMapSurface: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
+    @State private var showTimelineInspector = false
 
     private var seededIdeaTitle: String? {
         ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_SEED_IDEA_TITLE"]
@@ -193,7 +194,10 @@ struct UITestWorkflowMapSurface: View {
                             }
                         }
 
-                        WorkflowMapView(run: targetRun)
+                        WorkflowMapView(
+                            run: targetRun,
+                            onOpenTimelineInspector: { showTimelineInspector = true }
+                        )
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(20)
@@ -207,6 +211,13 @@ struct UITestWorkflowMapSurface: View {
             }
         }
         .accessibilityIdentifier("ui-test-workflow-map-surface")
+        .sheet(isPresented: $showTimelineInspector) {
+            if let targetRun, let projection = projection(for: targetRun) {
+                NavigationStack {
+                    RunTimelineInspectorView(projection: projection)
+                }
+            }
+        }
     }
 }
 
@@ -402,35 +413,74 @@ struct UITestDeliveryPreflightReportSurface: View {
 }
 
 struct UITestCompletedExportHubSurface: View {
+    @Environment(\.modelContext) private var modelContext
     private let seededRun: Run?
-    private let seedErrorMessage: String?
+    @State private var seedErrorMessage: String?
+    @State private var didSeed = false
 
     init() {
         let result = Self.makeFallbackRun()
         self.seededRun = result.run
-        self.seedErrorMessage = result.errorMessage
+        self._seedErrorMessage = State(initialValue: result.errorMessage)
     }
 
     var body: some View {
-        Group {
-            if let seededRun {
-                UITestCompletedExportHubHarness(run: seededRun)
-            } else if let seedErrorMessage {
-                ContentUnavailableView(
-                    "Completed export hub unavailable",
-                    systemImage: "exclamationmark.triangle",
-                    description: Text(seedErrorMessage)
-                )
-                .accessibilityIdentifier("ui-test-completed-export-hub-error")
-            } else {
-                ContentUnavailableView(
-                    "Completed export hub unavailable",
-                    systemImage: "shippingbox",
-                    description: Text("The UI test completed export hub surface requires a seeded completed run.")
-                )
+        VStack(alignment: .leading, spacing: 12) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel("Completed export hub seeded")
+                .accessibilityIdentifier("ui-test-completed-export-hub-ready")
+
+            Group {
+                if let seededRun, didSeed {
+                    CompletedRunExportHub(run: seededRun)
+                } else if let seedErrorMessage {
+                    ContentUnavailableView(
+                        "Completed export hub unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(seedErrorMessage)
+                    )
+                    .accessibilityIdentifier("ui-test-completed-export-hub-error")
+                } else {
+                    ContentUnavailableView(
+                        "Completed export hub preparing",
+                        systemImage: "shippingbox",
+                        description: Text("The UI test completed export hub surface is seeding a completed run.")
+                    )
+                }
             }
         }
-        .accessibilityIdentifier("ui-test-completed-export-hub-surface")
+        .accessibilityElement(children: .contain)
+        .task {
+            seedModelContextIfNeeded()
+        }
+    }
+
+    @MainActor
+    private func seedModelContextIfNeeded() {
+        guard didSeed == false, let seededRun else { return }
+        didSeed = true
+
+        modelContext.insert(seededRun)
+        if let idea = seededRun.idea {
+            modelContext.insert(idea)
+        }
+        for stage in seededRun.stageExecutions {
+            modelContext.insert(stage)
+            for agent in stage.agentExecutions {
+                modelContext.insert(agent)
+                for artifact in agent.artifacts {
+                    modelContext.insert(artifact)
+                }
+            }
+        }
+
+        do {
+            try modelContext.save()
+        } catch {
+            seedErrorMessage = "Unable to seed completed export hub model context: \(error.localizedDescription)"
+        }
     }
 
     @MainActor
@@ -718,106 +768,6 @@ struct UITestAccessibilityAuditSurface: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(identifier)
-    }
-}
-
-private struct UITestCompletedExportHubHarness: View {
-    let run: Run
-    @State private var exportMessage: String?
-    @State private var isExporting = false
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Button("Completed export hub seeded") {}
-                    .buttonStyle(.plain)
-                    .font(.headline)
-                    .accessibilityIdentifier("ui-test-completed-export-hub-ready")
-
-                GroupBox("Run Result") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(run.idea?.title ?? "Completed Export Hub Proof")
-                            .font(.title3.bold())
-                        Text(run.workflowTitle)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 12) {
-                            Label(run.presentationStatusLabel, systemImage: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                            if let worktreeRoot = run.worktreeRoot {
-                                Text(worktreeRoot)
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
-                    }
-                }
-
-                GroupBox("Export Actions") {
-                    HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Export Evidence Pack")
-                                .font(.headline)
-                            Text("Exports repo-backed delivery artifacts and screenshot checklist to Desktop.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button {
-                            exportEvidencePack()
-                        } label: {
-                            Label("Export", systemImage: "square.and.arrow.up")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isExporting)
-                        .accessibilityIdentifier("completed-run-export-evidence-pack")
-                    }
-                }
-
-                if let exportMessage {
-                    Text(exportMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("completed-run-export-message")
-                }
-            }
-            .padding()
-        }
-        .accessibilityIdentifier("completed-run-export-hub")
-    }
-
-    private func exportEvidencePack() {
-        isExporting = true
-        defer { isExporting = false }
-
-        let exportDirectory = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"]
-            .map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("ChainworksUITestExports", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
-        } catch {
-            exportMessage = "Export failed: \(error.localizedDescription)"
-            return
-        }
-        let workspace = RunWorkspace(
-            runID: run.id,
-            workspaceRoot: URL(fileURLWithPath: run.workspaceRoot),
-            artifactRoot: URL(fileURLWithPath: run.artifactRoot),
-            worktreeRoot: run.worktreeRoot.map { URL(fileURLWithPath: $0) }
-        )
-
-        do {
-            let pack = try EvidencePackBuilder.export(
-                run: run,
-                workspace: workspace,
-                exportDirectory: exportDirectory
-            )
-            exportMessage = "Exported \(pack.itemCount) items."
-        } catch {
-            exportMessage = "Export failed: \(error.localizedDescription)"
-        }
     }
 }
 

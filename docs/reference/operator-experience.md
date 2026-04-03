@@ -17,6 +17,7 @@ Related stable docs:
 
 - [idea-lifecycle.md](idea-lifecycle.md)
 - [live-workflow-map.md](live-workflow-map.md)
+- [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
 
@@ -153,6 +154,8 @@ That surface follows the stable contract in [live-workflow-map.md](live-workflow
 - primary and fallback states are both first-class,
 - agent activity grouping is explicit,
 - loop direction and handoff counts are visible.
+
+The exact segmented-pane placement, focused timeline inspector, and hierarchical artifact browsing rules for current run surfaces belong to [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md).
 
 ## Run comparison
 

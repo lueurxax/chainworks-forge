@@ -27,6 +27,7 @@ At the current baseline, the product includes:
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
 - an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
+- segmented run surfaces with deterministic pane routing, a focused timeline inspector, and shared hierarchical artifact browsing,
 - a proposal-loop feedback-fidelity layer with review-corpus bundling, backlog carry-forward, writer coverage, and targeted rereview,
 - an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
 - idea archive/restore lifecycle,
@@ -51,6 +52,7 @@ Use these reference docs as the current source of truth:
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Goose server transport | [goose-server-transport.md](goose-server-transport.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
+| Run surface IA and artifact hierarchy | [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) |
 | Provider/settings platform | [provider-platform.md](provider-platform.md) |
 | Provider/model provenance | [provider-binding-truth.md](provider-binding-truth.md) |
 | Stop/cancel truth | [run-control.md](run-control.md) |
@@ -166,5 +168,6 @@ Use it to orient review and planning work quickly, then jump to the subsystem re
 For current proof status rather than system-contract truth, use:
 
 - [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md)
+- [../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md)
 - [../evidence/mvp-sign-off-proof.md](../evidence/mvp-sign-off-proof.md)
 - [../evidence/goose-server-transport-verification.md](../evidence/goose-server-transport-verification.md)

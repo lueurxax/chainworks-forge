@@ -416,6 +416,30 @@ final class Chainworks_ForgeUITests: XCTestCase {
             .appendingPathComponent("ChainworksUITestExports", isDirectory: true)
     }
 
+    private func scrollToMakeElementHittable(
+        _ element: XCUIElement,
+        in scrollView: XCUIElement,
+        attempts: Int = 6
+    ) -> Bool {
+        guard element.waitForExistence(timeout: 2), scrollView.waitForExistence(timeout: 2) else {
+            return false
+        }
+
+        if element.isHittable {
+            return true
+        }
+
+        for _ in 0..<attempts {
+            scrollView.swipeUp()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+            if element.isHittable {
+                return true
+            }
+        }
+
+        return element.isHittable
+    }
+
     @discardableResult
     private func waitForRunTerminalState(
         _ app: XCUIApplication,
@@ -1080,6 +1104,10 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let seededReady = anyElement(app, identifier: "ui-test-completed-export-hub-ready")
         let exportHub = anyElement(app, identifier: "completed-run-export-hub")
         let exportButton = app.buttons["completed-run-export-evidence-pack"].firstMatch
+        let worktreeButton = app.buttons["completed-run-open-worktree"].firstMatch
+        let releaseManifestButton = app.buttons["completed-run-open-release_manifest"].firstMatch
+        let gitPushReceiptButton = app.buttons["completed-run-open-git_push_receipt"].firstMatch
+        let uploadReceiptButton = app.buttons["completed-run-open-connect_upload_receipt"].firstMatch
         XCTAssertTrue(
             seededReady.waitForExistence(timeout: 20)
                 || exportHub.waitForExistence(timeout: 20),
@@ -1089,9 +1117,30 @@ final class Chainworks_ForgeUITests: XCTestCase {
             exportButton.waitForExistence(timeout: 10) && exportButton.isEnabled,
             "Completed export hub must expose an enabled evidence-pack export action"
         )
+        XCTAssertTrue(
+            worktreeButton.waitForExistence(timeout: 10) && worktreeButton.isEnabled,
+            "Completed export hub must preserve an explicit worktree reveal affordance on the surviving run-owned path"
+        )
+        XCTAssertTrue(
+            releaseManifestButton.waitForExistence(timeout: 10) && releaseManifestButton.isEnabled,
+            "Completed export hub must preserve release manifest access on the surviving run-owned path"
+        )
+        XCTAssertTrue(
+            gitPushReceiptButton.waitForExistence(timeout: 10) && gitPushReceiptButton.isEnabled,
+            "Completed export hub must preserve git push receipt access on the surviving run-owned path"
+        )
+        XCTAssertTrue(
+            uploadReceiptButton.waitForExistence(timeout: 10) && uploadReceiptButton.isEnabled,
+            "Completed export hub must preserve upload receipt access on the surviving run-owned path"
+        )
         screenshot(app, name: "REQ016_ExportHub_Ready")
 
         let before = Set(desktopEvidencePacks().map(\.path))
+        let exportHubScrollView = anyElement(app, identifier: "completed-run-export-hub")
+        XCTAssertTrue(
+            scrollToMakeElementHittable(exportButton, in: exportHubScrollView),
+            "Completed export hub must keep the evidence-pack export action reachable on the surviving run-owned path"
+        )
         exportButton.click()
 
         let exportMessage = anyElement(app, identifier: "completed-run-export-message")
@@ -1112,6 +1161,32 @@ final class Chainworks_ForgeUITests: XCTestCase {
             "Completed export hub must surface export feedback after a successful export"
         )
         screenshot(app, name: "REQ016_ExportHub_Exported")
+    }
+
+    func testProposal024FocusedTimelineInspectorSurface() throws {
+        let app = makeApp(directSurface: "workflow_map")
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-workflow_map")
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "Workflow map direct surface must finish bootstrap for focused timeline proof"
+        )
+
+        let openFocusedTimelineButton = app.buttons["workflow-map-open-focused-timeline"].firstMatch
+        XCTAssertTrue(
+            openFocusedTimelineButton.waitForExistence(timeout: 10) && openFocusedTimelineButton.isEnabled,
+            "Workflow map must expose an explicit focused timeline affordance on the owner path"
+        )
+        openFocusedTimelineButton.click()
+
+        let timelineInspector = anyElement(app, identifier: "run-timeline-inspector-view")
+        XCTAssertTrue(
+            timelineInspector.waitForExistence(timeout: 10),
+            "Focused timeline proof must open the detached timeline inspector from the workflow-map owner path"
+        )
+        screenshot(app, name: "P024_FocusedTimelineInspector")
     }
 
     func testProposal013AppProofSurface() throws {

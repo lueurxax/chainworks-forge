@@ -16,7 +16,7 @@ If you are new to the repo, read these in order:
 ## Status
 
 - Owner: single-engineer working repo
-- Last updated: 2026-04-02
+- Last updated: 2026-04-03
 - State: active — foundation, execution engine, execution-truth baseline, output-contract and failure-evidence slice, session-lineage reuse slice, context-strategy framework slice, proposal-loop feedback-fidelity slice, live Goose transport, UI quality slice, design-system adoption slice, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
 
 ## Implemented Reference Docs
@@ -32,6 +32,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Stable proposal-loop review-corpus fidelity, backlog carry-forward, writer coverage, and targeted-rereview contract
 - [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
 - [reference/operator-experience.md](reference/operator-experience.md) — Stable operator shell baseline and contracts
+- [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Stable segmented run-shell IA, pane routing, focused timeline, and shared artifact browsing contract
 - [reference/provider-platform.md](reference/provider-platform.md) — Stable multi-provider/settings/diagnostics baseline
 - [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — Stable UI readability, accessibility, and bounded design-system hardening baseline
 - [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — Stable Forge token lane, brand assets, and bounded visual rollout
@@ -58,6 +59,9 @@ Active work that is not yet fully promoted into `reference/` lives under [`propo
 - [proposals/015-skill-resolution-and-runtime-injection.md](proposals/015-skill-resolution-and-runtime-injection.md)
 - [proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [proposals/020-dynamic-cycle-addition.md](proposals/020-dynamic-cycle-addition.md)
+- [proposals/021-run-transition-notifications-and-attention-routing.md](proposals/021-run-transition-notifications-and-attention-routing.md)
+- [proposals/023-loop-improvement-analytics-and-iteration-progression.md](proposals/023-loop-improvement-analytics-and-iteration-progression.md)
+- [proposals/025-per-agent-mcp-policy-and-runtime-validation.md](proposals/025-per-agent-mcp-policy-and-runtime-validation.md)
 
 ## Examples
 
@@ -78,6 +82,7 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 - [evidence/session-lineage-reuse-and-operator-reset-proof.md](evidence/session-lineage-reuse-and-operator-reset-proof.md) -- consolidated implementation/proof status for session-lineage reuse, checkpointing, and operator reset
 - [evidence/context-strategy-and-experiment-framework-proof.md](evidence/context-strategy-and-experiment-framework-proof.md) -- consolidated implementation/proof status for context strategies, lazy evidence, normalized telemetry, and strategy recommendation output
 - [evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md](evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md) -- consolidated implementation/proof status for proposal-loop review fidelity, score-lift backlog, writer coverage, and targeted rereview
+- [evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md) -- consolidated implementation/proof status for segmented run surfaces, focused timeline, and hierarchical artifact browsing
 - [evidence/ui-quality-and-polish-proof.md](evidence/ui-quality-and-polish-proof.md) -- consolidated implementation/proof status for the UI quality and visual polish slice
 - [evidence/design-system-and-brand-application-proof.md](evidence/design-system-and-brand-application-proof.md) -- consolidated implementation/proof status for the design-system and brand-application slice
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice

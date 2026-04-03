@@ -324,6 +324,44 @@ Important:
 - the gate builds locally on the remote host, runs the focused non-UI slice, then launches the built app in a deterministic proof-export mode
 - pull back the emitted Proposal 022 result JSON after the run if the audit needs inspectable app-proof evidence
 
+### `proposal-024`
+
+Run-surface information architecture gate for segmented shells, focused timeline ownership, and hierarchical artifact browsing proof.
+
+Scope:
+
+- `Proposal024RunSurfaceTests`
+- `RunArtifactHierarchyBuilderTests`
+- approved-host UI proof for focused timeline and completed-run export continuity owners
+
+Use when:
+
+- reproving the implemented segmented run-surface slice on the current head
+- validating deterministic pane routing, shared artifact hierarchy, and repo-backed continuity after metadata demotion
+- collecting approved-host UI proof for the subordinate focused-timeline owner path
+
+Host policy:
+
+- remote-only because this gate includes the UI target
+- same-head proof should be treated as canonical only when the approved-host workspace matches the tree under review
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-024
+```
+
+Canonical remote form:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-024"
+```
+
+Important:
+
+- the gate keeps its historical proposal label for reproducibility
+- the stable documentation source of truth for the slice is now [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md), not the old proposal file
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
