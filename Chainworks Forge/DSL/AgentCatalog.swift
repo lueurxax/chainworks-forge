@@ -8,6 +8,9 @@ struct AgentCatalog: Codable, Sendable {
     let paths: [String: String]
     let artifacts: [String: String]
     let skills: [String: SkillRef]
+    let mcpPolicy: MCPPolicyConfig
+    let mcpServerRegistry: [String: MCPServerRegistryEntry]
+    let mcpProfiles: [String: MCPProfile]
     let contracts: [String: ArtifactContract]
     let backendProfiles: [String: BackendProfile]
     let permissionProfiles: [String: PermissionProfile]
@@ -16,8 +19,55 @@ struct AgentCatalog: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case app, paths, artifacts, skills, contracts, agents
         case schemaVersion = "schema_version"
+        case mcpPolicy = "mcp_policy"
+        case mcpServerRegistry = "mcp_server_registry"
+        case mcpProfiles = "mcp_profiles"
         case backendProfiles = "backend_profiles"
         case permissionProfiles = "permission_profiles"
+    }
+
+    init(
+        schemaVersion: Int,
+        app: AppConfig,
+        paths: [String: String],
+        artifacts: [String: String],
+        skills: [String: SkillRef],
+        mcpPolicy: MCPPolicyConfig = .defaultDeny,
+        mcpServerRegistry: [String: MCPServerRegistryEntry] = [:],
+        mcpProfiles: [String: MCPProfile] = [:],
+        contracts: [String: ArtifactContract],
+        backendProfiles: [String: BackendProfile],
+        permissionProfiles: [String: PermissionProfile],
+        agents: [AgentDefinition]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.app = app
+        self.paths = paths
+        self.artifacts = artifacts
+        self.skills = skills
+        self.mcpPolicy = mcpPolicy
+        self.mcpServerRegistry = mcpServerRegistry
+        self.mcpProfiles = mcpProfiles
+        self.contracts = contracts
+        self.backendProfiles = backendProfiles
+        self.permissionProfiles = permissionProfiles
+        self.agents = agents
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        app = try container.decode(AppConfig.self, forKey: .app)
+        paths = try container.decode([String: String].self, forKey: .paths)
+        artifacts = try container.decode([String: String].self, forKey: .artifacts)
+        skills = try container.decode([String: SkillRef].self, forKey: .skills)
+        mcpPolicy = try container.decodeIfPresent(MCPPolicyConfig.self, forKey: .mcpPolicy) ?? .defaultDeny
+        mcpServerRegistry = try container.decodeIfPresent([String: MCPServerRegistryEntry].self, forKey: .mcpServerRegistry) ?? [:]
+        mcpProfiles = try container.decodeIfPresent([String: MCPProfile].self, forKey: .mcpProfiles) ?? [:]
+        contracts = try container.decode([String: ArtifactContract].self, forKey: .contracts)
+        backendProfiles = try container.decode([String: BackendProfile].self, forKey: .backendProfiles)
+        permissionProfiles = try container.decode([String: PermissionProfile].self, forKey: .permissionProfiles)
+        agents = try container.decode([AgentDefinition].self, forKey: .agents)
     }
 }
 
@@ -46,6 +96,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let mode: String
     let backendProfile: String
     let permissionProfile: String
+    let mcpProfile: String?
     let skillRef: String
     let skillRole: String?
     let worktreePolicy: WorktreePolicy?
@@ -65,6 +116,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         case id, title, mode, prompt, notes, inputs, outputs
         case backendProfile = "backend_profile"
         case permissionProfile = "permission_profile"
+        case mcpProfile = "mcp_profile"
         case skillRef = "skill_ref"
         case skillRole = "skill_role"
         case worktreePolicy = "worktree_policy"
@@ -73,6 +125,46 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         case requiresHumanApproval = "requires_human_approval"
         case sessionReuseScope = "session_reuse_scope"
         case sessionFamilyID = "session_family_id"
+    }
+
+    init(
+        id: String,
+        title: String,
+        mode: String,
+        backendProfile: String,
+        permissionProfile: String,
+        mcpProfile: String? = nil,
+        skillRef: String,
+        skillRole: String? = nil,
+        worktreePolicy: WorktreePolicy? = nil,
+        requiredTools: [String]? = nil,
+        inputs: [String],
+        outputs: [String],
+        outputContract: String? = nil,
+        requiresHumanApproval: Bool,
+        prompt: String,
+        notes: String? = nil,
+        sessionReuseScope: String? = nil,
+        sessionFamilyID: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.mode = mode
+        self.backendProfile = backendProfile
+        self.permissionProfile = permissionProfile
+        self.mcpProfile = mcpProfile
+        self.skillRef = skillRef
+        self.skillRole = skillRole
+        self.worktreePolicy = worktreePolicy
+        self.requiredTools = requiredTools
+        self.inputs = inputs
+        self.outputs = outputs
+        self.outputContract = outputContract
+        self.requiresHumanApproval = requiresHumanApproval
+        self.prompt = prompt
+        self.notes = notes
+        self.sessionReuseScope = sessionReuseScope
+        self.sessionFamilyID = sessionFamilyID
     }
 }
 
@@ -97,6 +189,20 @@ struct PermissionProfile: Codable, Sendable {
     let shell: ShellPermissions
     let network: NetworkPermissions
     let mcp: MCPPermissions
+
+    init(
+        filesystem: FilesystemPermissions,
+        git: GitPermissions,
+        shell: ShellPermissions,
+        network: NetworkPermissions,
+        mcp: MCPPermissions
+    ) {
+        self.filesystem = filesystem
+        self.git = git
+        self.shell = shell
+        self.network = network
+        self.mcp = mcp
+    }
 }
 
 struct ArtifactContract: Codable, Sendable {
@@ -183,5 +289,104 @@ struct NetworkPermissions: Codable, Sendable {
 }
 
 struct MCPPermissions: Codable, Sendable {
-    let allow: [String]?
+    let legacyAllow: [String]?
+    let runtimeAuthority: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case allow
+        case legacyAllow = "legacy_allow"
+        case runtimeAuthority = "runtime_authority"
+    }
+
+    init(
+        allow: [String]? = nil,
+        legacyAllow: [String]? = nil,
+        runtimeAuthority: Bool = false
+    ) {
+        self.legacyAllow = legacyAllow ?? allow
+        self.runtimeAuthority = runtimeAuthority
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let legacyAllow = try container.decodeIfPresent([String].self, forKey: .legacyAllow)
+        let allow = try container.decodeIfPresent([String].self, forKey: .allow)
+        self.legacyAllow = legacyAllow ?? allow
+        self.runtimeAuthority = try container.decodeIfPresent(Bool.self, forKey: .runtimeAuthority) ?? false
+    }
+}
+
+struct MCPPolicyConfig: Codable, Sendable, Equatable {
+    let defaultProfile: String
+    let runtimeAuthority: String
+    let permissionProfileMCPMode: String
+    let zeroMCPIsPreferredBaseline: Bool
+    let unsupportedRequiredExtensionBehavior: String
+    let unsupportedOptionalExtensionBehavior: String
+
+    enum CodingKeys: String, CodingKey {
+        case defaultProfile = "default_profile"
+        case runtimeAuthority = "runtime_authority"
+        case permissionProfileMCPMode = "permission_profile_mcp_mode"
+        case zeroMCPIsPreferredBaseline = "zero_mcp_is_preferred_baseline"
+        case unsupportedRequiredExtensionBehavior = "unsupported_required_extension_behavior"
+        case unsupportedOptionalExtensionBehavior = "unsupported_optional_extension_behavior"
+    }
+
+    static let defaultDeny = MCPPolicyConfig(
+        defaultProfile: "none",
+        runtimeAuthority: "agent.mcp_profile",
+        permissionProfileMCPMode: "legacy_ceiling_only",
+        zeroMCPIsPreferredBaseline: true,
+        unsupportedRequiredExtensionBehavior: "fail_preflight",
+        unsupportedOptionalExtensionBehavior: "drop_and_record"
+    )
+}
+
+struct MCPServerRegistryEntry: Codable, Sendable, Equatable {
+    let runtimeIDs: [String: String]
+    let sessionScoped: Bool
+    let assignmentPolicy: String
+    let riskClass: String
+    let notes: String?
+
+    enum CodingKeys: String, CodingKey {
+        case runtimeIDs = "runtime_ids"
+        case sessionScoped = "session_scoped"
+        case assignmentPolicy = "assignment_policy"
+        case riskClass = "risk_class"
+        case notes
+    }
+}
+
+struct MCPProfile: Codable, Sendable, Equatable {
+    let requiredExtensions: [String]
+    let optionalExtensions: [String]
+    let fallbackPolicy: String
+
+    enum CodingKeys: String, CodingKey {
+        case requiredExtensions = "required_extensions"
+        case optionalExtensions = "optional_extensions"
+        case fallbackPolicy = "fallback_policy"
+    }
+
+    var allRequestedExtensions: [String] {
+        Array(Set(requiredExtensions + optionalExtensions)).sorted()
+    }
+}
+
+struct ResolvedMCPProfile: Codable, Sendable, Equatable {
+    let profileID: String
+    let requiredExtensions: [String]
+    let optionalExtensions: [String]
+    let requestedExtensions: [String]
+    let fallbackPolicy: String
+
+    static let none = ResolvedMCPProfile(
+        profileID: "none",
+        requiredExtensions: [],
+        optionalExtensions: [],
+        requestedExtensions: [],
+        fallbackPolicy: "allow_without_extensions"
+    )
 }

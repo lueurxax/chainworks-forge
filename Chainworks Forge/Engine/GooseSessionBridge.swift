@@ -36,9 +36,11 @@ final class GooseSessionBridge: Sendable {
         // Step 1: Build the structured execution packet
         let packet = Self.buildExecutionPacket(agent: agent, task: task, context: context)
 
-        // Step 2: Resolve provider/model (use override if present)
-        let provider = override?.provider ?? agent.provider
-        let model = override?.model ?? agent.model
+        // Step 2: Resolve provider/model.
+        // Frozen per-agent provider bindings are the canonical runtime authority for live runs.
+        // App-scoped overrides are only a fallback when no frozen binding exists.
+        let provider = context.providerBinding?.providerIdentifier ?? override?.provider ?? agent.provider
+        let model = context.providerBinding?.model ?? override?.model ?? agent.model
 
         // Proposal 007 §7.7: Validate path boundaries before write-capable execution
         if agent.worktreeWriteEnabled, let worktreeRoot = context.workspace.worktreeRoot {
@@ -54,6 +56,10 @@ final class GooseSessionBridge: Sendable {
         let workingDirectory = useWorktree
             ? context.workspace.worktreeRoot!.path
             : readOnlyRoot
+        let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
+        if !mcpResolution.blockingIssues.isEmpty {
+            throw GooseSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
+        }
 
         let sessionRequest = GooseSessionRequest(
             systemPrompt: packet.systemPrompt,
@@ -73,7 +79,8 @@ final class GooseSessionBridge: Sendable {
                 "agent_id": agent.id,
                 "iteration": String(context.iteration),
                 "attempt": String(context.attemptNumber)
-            ]
+            ],
+            requestedExtensions: mcpResolution.predictedEffectiveRuntimeExtensionIDs
         )
 
         let sessionResponse = try await transport.createSession(request: sessionRequest)
@@ -96,6 +103,35 @@ final class GooseSessionBridge: Sendable {
             sessionID: sessionResponse.sessionId,
             eventStream: eventStream,
             transport: transport
+        )
+    }
+
+    private func resolveMCPPolicy(
+        agent: ResolvedAgent,
+        context: ExecutionContext
+    ) -> MCPPolicyResolutionReport {
+        guard let catalog = context.catalog else {
+            return agent.mcpProfileID == nil ? .none : MCPPolicyResolutionReport(
+                profileID: agent.mcpProfileID ?? "none",
+                requiredExtensions: [],
+                optionalExtensions: [],
+                requestedExtensions: [],
+                requiredRuntimeExtensionIDs: [],
+                optionalRuntimeExtensionIDs: [],
+                predictedEffectiveExtensions: [],
+                predictedEffectiveRuntimeExtensionIDs: [],
+                deniedExtensions: [],
+                warnings: [],
+                blockingIssues: ["Catalog is unavailable; cannot resolve MCP profile for agent '\(agent.id)'."]
+            )
+        }
+
+        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        return MCPPolicyResolver().resolve(
+            agent: agent,
+            catalog: catalog,
+            providerBinding: context.providerBinding,
+            gooseRegistry: gooseRegistry
         )
     }
 
@@ -298,19 +334,19 @@ final class GooseSessionBridge: Sendable {
         }
 
         // Output contract
-        if let contract = agent.outputContract {
+        if !structuredHints.isEmpty {
+            parts.append("")
+            parts.append("## Output Contracts")
+            let contractList = Array(Set(structuredHints.map(\.contractID))).sorted().joined(separator: ", ")
+            parts.append("You must produce outputs conforming to the structured contract(s): \(contractList)")
+            parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
+        } else if let contract = agent.outputContract {
             parts.append("")
             parts.append("## Output Contract")
             parts.append("You must produce outputs conforming to contract: \(contract)")
             if !expectedOutputs.isEmpty {
                 parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
             }
-        } else if !structuredHints.isEmpty {
-            parts.append("")
-            parts.append("## Output Contracts")
-            let contractList = Array(Set(structuredHints.map(\.contractID))).sorted().joined(separator: ", ")
-            parts.append("You must produce outputs conforming to the structured contract(s): \(contractList)")
-            parts.append("Required outputs for this task: \(expectedOutputs.joined(separator: ", "))")
         }
 
         // Boundaries
@@ -322,11 +358,6 @@ final class GooseSessionBridge: Sendable {
         parts.append("- For read-only repo-backed stages, read source only from the Project Root provided in workspace_context.")
         parts.append("- If a writable worktree is provided, do not modify files outside that worktree root.")
         parts.append("- If the server cwd appears inconsistent with workspace_context, trust workspace_context and continue with explicit paths only.")
-        if ProcessInfo.processInfo.environment["CHAINWORKS_DISABLE_XCODE_MCP"] == "1" {
-            parts.append("- Do not call xcode_mcp or any IDE/editor MCP tools.")
-            parts.append("- In tests, respond directly and complete the task without MCP tool discovery.")
-        }
-
         return parts.joined(separator: "\n")
     }
 
@@ -393,6 +424,17 @@ final class GooseSessionBridge: Sendable {
             parts.append("If any required output file is missing or empty, continue working and fix that before you stop.")
         }
 
+        if task.task == "normalize_idea_and_open_run" {
+            parts.append("")
+            parts.append("### Task-Specific Guidance")
+            parts.append("Use the `idea_body` attachment as the primary source of truth for normalization.")
+            parts.append("Do not stop after analysis or narration alone. The task is incomplete until all three required files exist on disk.")
+            parts.append("`idea_brief` must be a concise, structured normalized brief that captures the problem, desired outcome, scope, risks, and next workflow step.")
+            parts.append("`run_state` must be machine-readable workflow state for the new run. Initialize loop counters, register approval checkpoints if needed, and point to the next stage.")
+            parts.append("`orchestrator_summary` must be a human-readable summary of what was normalized, which decisions were made, and why the run should proceed.")
+            parts.append("Prefer clear English output unless the source artifact explicitly requires another language.")
+        }
+
         if !structuredHints.isEmpty {
             parts.append("")
             parts.append("### Structured Output Requirements")
@@ -402,7 +444,7 @@ final class GooseSessionBridge: Sendable {
             parts.append("If you want to explain the review, put that explanation inside JSON fields required by the contract.")
             for hint in structuredHints {
                 parts.append("")
-                parts.append("#### Required Fields for \(hint.contractID):")
+                parts.append("#### \(hint.outputName) -> \(hint.contractID)")
                 for field in hint.requiredFields {
                     parts.append("- \(field)")
                 }
@@ -724,6 +766,7 @@ enum GooseSessionBridgeError: Error, LocalizedError {
     case workspaceRootMissing
     case sessionCreationFailed(reason: String)
     case policyAcknowledgementMissing
+    case mcpPolicyResolutionFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -735,6 +778,8 @@ enum GooseSessionBridgeError: Error, LocalizedError {
             return "Goose session creation failed: \(reason)"
         case .policyAcknowledgementMissing:
             return "Live execution blocked: backend did not acknowledge the required read-only execution policy"
+        case .mcpPolicyResolutionFailed(let reason):
+            return "Live execution blocked: MCP policy could not be honored. \(reason)"
         }
     }
 }

@@ -520,9 +520,10 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
             """
         case "docs_delta":
             return """
-            # Docs Delta
-
-            Updated documentation to match the implementation changes.
+            {
+              "files": ["README.md"],
+              "summary": "Updated documentation to match the implementation changes."
+            }
             """
         case "audit_report":
             if case .fullMVPRefineThenSuccess = scenario,

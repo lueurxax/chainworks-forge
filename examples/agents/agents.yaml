@@ -189,12 +189,37 @@ contracts:
       - claims
   implementation_self_assessment_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
     required_fields:
       - seemingly_complete
       - remaining_tasks
       - known_risks
       - tests_run
       - docs_impacted
+  implementation_progress:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - status
+      - current_phase
+      - completed_items
+      - deferred_items
+      - notes
+  changed_files_manifest:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - files
+  tests_result:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - green
+      - summary
   audit_report_v1:
     format: json
     required_fields:
@@ -236,6 +261,26 @@ contracts:
       - changed_docs
       - missing_docs
       - followups
+  docs_delta:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - files
+      - summary
+  release_manifest:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - commitSHA
+      - branch
+      - remote
+      - commitMessage
+      - filesChanged
+      - insertions
+      - deletions
+      - timestamp
   git_push_receipt_v1:
     format: json
     required_fields:
@@ -243,6 +288,18 @@ contracts:
       - branch
       - commit_sha
       - remote
+  release_bundle_manifest:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - bundleIdentifier
+      - bundleVersion
+      - buildNumber
+      - archivePath
+      - checksumSHA256
+      - sizeBytes
+      - timestamp
   connect_upload_receipt_v1:
     format: json
     required_fields:
@@ -276,6 +333,58 @@ contracts:
       - improvements
       - executive_summary
       - confidence
+  degradation_alert:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - analysis_id
+      - metric_name
+      - metric_family
+      - observed_value
+      - baseline_value
+      - delta_percentage
+      - threshold_used
+      - implicated_run_ids
+      - severity
+      - likely_causes
+      - confidence
+  agent_tuning_proposal:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - analysis_id
+      - category
+      - summary
+      - target_metric
+      - proposed_patch_path
+      - confidence_level
+      - status
+  workflow_tuning_proposal:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - analysis_id
+      - category
+      - summary
+      - target_metric
+      - proposed_patch_path
+      - confidence_level
+      - status
+  experiment_plan:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - analysis_id
+      - experiment_type
+      - control_config_hash
+      - treatment_config_hash
+      - minimum_sample_size
+      - rollback_condition
+      - status
   stewardship_audit_report_v1:
     format: json
     required_fields:
@@ -302,14 +411,14 @@ contracts:
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.1
     max_turns: 20
     structured_output: required
   claude_writer_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.15
     max_turns: 18
@@ -323,14 +432,14 @@ backend_profiles:
     structured_output: preferred
   claude_product_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.1
     max_turns: 14
     structured_output: required
   claude_design_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.2
     max_turns: 12
@@ -338,7 +447,7 @@ backend_profiles:
   codex_architect_high:
     provider: codex
     model: GPT-5.4
-    effort: high
+    effort: extra high
     temperature: 0.1
     max_turns: 16
     structured_output: required
@@ -352,20 +461,20 @@ backend_profiles:
   codex_audit_high:
     provider: codex
     model: GPT-5.4
-    effort: high
+    effort: extra high
     temperature: 0.0
     max_turns: 18
     structured_output: required
   claude_security_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.0
     max_turns: 16
     structured_output: required
   claude_prepush_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.1
     max_turns: 12
@@ -379,7 +488,7 @@ backend_profiles:
     structured_output: required
   claude_docs_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.2
     max_turns: 12
@@ -387,21 +496,21 @@ backend_profiles:
   # Steward backend profiles (Proposal 003)
   claude_steward_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.1
     max_turns: 16
     structured_output: required
   claude_auditor_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.0
     max_turns: 14
     structured_output: required
   claude_retrospective_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.1
     max_turns: 12
@@ -430,7 +539,7 @@ backend_profiles:
     structured_output: required
   gemini_review_flash:
     provider: gemini
-    model: gemini-2.5-flash
+    model: gemini-2.5-pro
     effort: medium
     temperature: 0.2
     max_turns: 12
@@ -444,7 +553,7 @@ backend_profiles:
     structured_output: required
   gemini_ops_flash_lite:
     provider: gemini
-    model: gemini-2.5-flash-lite
+    model: gemini-2.5-flash
     effort: low
     temperature: 0.0
     max_turns: 8

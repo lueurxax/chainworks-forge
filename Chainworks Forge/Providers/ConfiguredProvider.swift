@@ -40,10 +40,39 @@ enum ProviderDefaults {
         case .codex:
             return "gpt-5-codex"
         case .claude:
-            return "claude-sonnet-4"
+            return "sonnet"
         case .gemini:
             return "gemini-2.5-pro"
         }
+    }
+
+    static func canonicalModel(
+        _ model: String?,
+        for family: ProviderFamily,
+        transport: ProviderTransport? = nil
+    ) -> String? {
+        guard let model else { return nil }
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let lower = trimmed.lowercased()
+        switch family {
+        case .claude:
+            // Goose-backed claude-code currently responds reliably to short aliases only.
+            if lower.hasPrefix("claude-opus") || lower.hasPrefix("anthropic/claude-opus") || lower.hasPrefix("anthropic.claude-opus") {
+                return "opus"
+            }
+            if lower.hasPrefix("claude-sonnet") || lower.hasPrefix("anthropic/claude-sonnet") || lower.hasPrefix("anthropic.claude-sonnet") {
+                return "sonnet"
+            }
+            if transport?.isGooseBacked == true, ["opus", "sonnet", "default"].contains(lower) {
+                return lower
+            }
+        case .codex, .gemini:
+            break
+        }
+
+        return trimmed
     }
 
     static func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {
@@ -62,7 +91,7 @@ enum ProviderDefaults {
         case .codex:
             expectedPrefixes = ["gpt", "o1", "o3", "chatgpt"]
         case .claude:
-            expectedPrefixes = ["claude", "anthropic"]
+            expectedPrefixes = ["claude", "anthropic", "sonnet", "opus", "default"]
         case .gemini:
             expectedPrefixes = ["gemini", "palm"]
         }

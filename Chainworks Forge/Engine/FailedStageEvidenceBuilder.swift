@@ -34,6 +34,11 @@ struct FailedStageEvidenceBuilder {
         let failureSummary: String
         if let vf = validationFailure {
             failureSummary = vf.failureSummary
+        } else if let agent = failedAgent,
+                  let envelope = decodeOutcomeEnvelope(from: agent),
+                  let rawErrorMessage = envelope.rawErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawErrorMessage.isEmpty {
+            failureSummary = rawErrorMessage
         } else if let agent = failedAgent, let msg = agent.logSnippet {
             failureSummary = msg
         } else {
@@ -68,6 +73,11 @@ struct FailedStageEvidenceBuilder {
             timing: timing,
             recoverySnapshot: recoverySnapshot
         )
+    }
+
+    private static func decodeOutcomeEnvelope(from agent: AgentExecution) -> OutcomeEnvelope? {
+        guard let data = agent.outcomeEnvelopeJSON else { return nil }
+        return try? JSONDecoder().decode(OutcomeEnvelope.self, from: data)
     }
 }
 

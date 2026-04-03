@@ -52,7 +52,7 @@ enum PreviewSupport {
             transport: .gooseServer,
             endpoint: "https://127.0.0.1:51200",
             authMode: .apiKey,
-            defaultModel: "claude-opus-4"
+            defaultModel: "opus"
         )
         let codexProvider = ConfiguredProvider(
             family: .codex,
@@ -140,7 +140,7 @@ enum PreviewSupport {
             stageLabel: "Initial proposal approval",
             agentTitle: "Lead / Orchestrator",
             provider: "claude_code",
-            model: "claude-opus-4"
+            model: "opus"
         )
 
         let blockedIdea = Idea(
@@ -192,7 +192,7 @@ enum PreviewSupport {
             stageLabel: "Archived deliverable",
             agentTitle: "Release Coordinator",
             provider: "claude_code",
-            model: "claude-opus-4"
+            model: "opus"
         )
 
         [draftIdea, activeIdea, blockedIdea, completedIdea, archivedIdea].forEach { context.insert($0) }
@@ -476,7 +476,7 @@ enum PreviewSupport {
             provider: "claude_code",
             effort: "high"
         )
-        lead.resolvedModel = "claude-opus-4"
+        lead.resolvedModel = "opus"
         lead.logSnippet = "Normalized idea and prepared the proposal brief."
         lead.stageExecution = stage1
         lead.completedAt = now.addingTimeInterval(-4900)
@@ -527,7 +527,7 @@ enum PreviewSupport {
             provider: "claude_code",
             effort: "medium"
         )
-        reviewerPO.resolvedModel = "claude-opus-4"
+        reviewerPO.resolvedModel = "opus"
         reviewerPO.logSnippet = "Product-owner review completed with approval."
         reviewerPO.stageExecution = stage3
         reviewerPO.completedAt = now.addingTimeInterval(-4200)
@@ -556,7 +556,7 @@ enum PreviewSupport {
             provider: "claude_code",
             effort: "medium"
         )
-        reviewerUI.resolvedModel = "claude-opus-4"
+        reviewerUI.resolvedModel = "opus"
         reviewerUI.stageExecution = stage3
         stage3.agentExecutions.append(reviewerUI)
 
@@ -569,7 +569,7 @@ enum PreviewSupport {
             provider: "claude_code",
             effort: "high"
         )
-        reviewerArchitect.resolvedModel = "claude-opus-4"
+        reviewerArchitect.resolvedModel = "opus"
         reviewerArchitect.logSnippet = "Confirmed runtime-derived workflow topology."
         reviewerArchitect.stageExecution = stage3
         reviewerArchitect.completedAt = now.addingTimeInterval(-4170)
@@ -584,7 +584,7 @@ enum PreviewSupport {
             provider: "claude_code",
             effort: "high"
         )
-        orchestrator.resolvedModel = "claude-opus-4"
+        orchestrator.resolvedModel = "opus"
         orchestrator.stageExecution = stage3
         stage3.agentExecutions.append(orchestrator)
 

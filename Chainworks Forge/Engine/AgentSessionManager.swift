@@ -1,6 +1,16 @@
 import Foundation
 import SwiftData
 
+struct ProviderSessionConflict: Sendable, Equatable {
+    let lineageID: UUID
+    let generationID: UUID
+    let agentID: String
+    let invocationOwnerKey: String
+    let runtimeProvider: String
+    let runtimeModel: String
+    let status: AgentSessionStatus
+}
+
 actor AgentSessionManager {
     private let container: ModelContainer
     
@@ -50,6 +60,35 @@ actor AgentSessionManager {
         let predicate = #Predicate<AgentSessionLineage> { $0.id == id }
         let descriptor = FetchDescriptor<AgentSessionLineage>(predicate: predicate)
         return try fetchContext.fetch(descriptor).first
+    }
+
+    func providerSessionConflicts(
+        runID: UUID,
+        providerSessionID: String,
+        excludingLineageID: UUID? = nil
+    ) async throws -> [ProviderSessionConflict] {
+        let fetchContext = ModelContext(container)
+        let predicate = #Predicate<AgentSessionLineage> { $0.runID == runID }
+        let descriptor = FetchDescriptor<AgentSessionLineage>(predicate: predicate)
+        let lineages = try fetchContext.fetch(descriptor)
+
+        return lineages.compactMap { lineage in
+            guard lineage.id != excludingLineageID else { return nil }
+            guard let generation = lineage.generations.first(where: {
+                $0.providerSessionID == providerSessionID && $0.status == .active
+            }) else {
+                return nil
+            }
+            return ProviderSessionConflict(
+                lineageID: lineage.id,
+                generationID: generation.id,
+                agentID: lineage.agentID,
+                invocationOwnerKey: generation.invocationOwnerKey,
+                runtimeProvider: generation.runtimeProvider,
+                runtimeModel: generation.runtimeModel,
+                status: generation.status
+            )
+        }
     }
 
     func recordEvent(lineageID: UUID, generationID: UUID, type: AgentSessionEventType, detailsJSON: Data? = nil) async throws {
@@ -131,6 +170,28 @@ actor AgentSessionManager {
         }
 
         generation.status = .invalidated
+        generation.endedAt = Date()
+        generation.endReason = reason
+        generation.lineage?.activeGenerationID = nil
+        try updateContext.save()
+    }
+
+    func closeGeneration(generationID: UUID, reason: String) async throws {
+        let updateContext = ModelContext(container)
+        let predicate = #Predicate<AgentSessionGeneration> { $0.id == generationID }
+        guard let generation = try updateContext.fetch(FetchDescriptor<AgentSessionGeneration>(predicate: predicate)).first else {
+            return
+        }
+
+        guard generation.status == .active else {
+            if generation.lineage?.activeGenerationID == generation.id {
+                generation.lineage?.activeGenerationID = nil
+                try updateContext.save()
+            }
+            return
+        }
+
+        generation.status = .closed
         generation.endedAt = Date()
         generation.endReason = reason
         generation.lineage?.activeGenerationID = nil

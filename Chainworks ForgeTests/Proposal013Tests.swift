@@ -78,6 +78,31 @@ struct Proposal013Tests {
         #expect(contractID == "audit_report_v1")
     }
 
+    @Test("ResolverV2 prefers exact output contract over agent-level fallback")
+    func resolverV2PrefersExactOutputContractOverAgentFallback() {
+        let catalog = makeTestCatalog(withContracts: [
+            "implementation_self_assessment_v1": ArtifactContract(
+                format: "json",
+                requiredFields: ["seemingly_complete"]
+            ),
+            "tests_result": ArtifactContract(
+                format: "json",
+                requiredFields: ["green", "summary"],
+                machineFormat: "json",
+                validationMode: "strict_structured"
+            )
+        ])
+        let agent = makeTestResolvedAgent(outputContract: "implementation_self_assessment_v1")
+
+        let contractID = OutputContractResolverV2.resolveContractID(
+            for: "tests_result",
+            agent: agent,
+            catalog: catalog
+        )
+
+        #expect(contractID == "tests_result")
+    }
+
     @Test("ResolverV2 returns nil when no contract matches")
     func resolverV2NilWhenNoMatch() {
         let catalog = makeTestCatalog(withContracts: [:])
@@ -177,7 +202,7 @@ struct Proposal013Tests {
         let agent = ResolvedAgent(
             id: "auditor", title: "Auditor", mode: "audit",
             backendProfileID: "test_profile", provider: "claude_code",
-            model: "claude-opus-4.6", effort: "high", maxTurns: 18,
+            model: "opus", effort: "high", maxTurns: 18,
             temperature: 0, permissionProfile: "RO_VERIFY",
             skillRef: "audit", skillRole: nil, prompt: "Audit",
             outputContract: "audit_report_v1",
@@ -739,7 +764,7 @@ struct Proposal013Tests {
         let catalog = makeTestCatalog(withContracts: [:], backendProfiles: [
             "claude_high": BackendProfile(
                 provider: "claude_code",
-                model: "claude-opus-4.6",
+                model: "opus",
                 effort: "high",
                 temperature: 0.1,
                 maxTurns: 20,
@@ -915,7 +940,7 @@ struct Proposal013Tests {
             mode: "audit",
             backendProfileID: "test_profile",
             provider: "claude_code",
-            model: "claude-opus-4.6",
+            model: "opus",
             effort: "high",
             maxTurns: 18,
             temperature: 0.0,
@@ -1656,6 +1681,69 @@ struct Proposal013Tests {
         #expect(!hasFailedReviewArtifact)
     }
 
+    @MainActor
+    @Test("RunReportBuilder excludes completed stages from failure evidence summaries")
+    func runReportExcludesCompletedStagesFromFailureEvidence() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let completedStage = StageExecution(
+            stageID: "state_1_idea_received",
+            label: "Idea received",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        completedStage.run = run
+        context.insert(completedStage)
+
+        let completedAgent = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "normalize_idea",
+            startedAt: Date(timeIntervalSince1970: 11),
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        completedAgent.completedAt = Date(timeIntervalSince1970: 12)
+        completedAgent.stageExecution = completedStage
+        context.insert(completedAgent)
+
+        let failedStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedAgent.completedAt = Date(timeIntervalSince1970: 22)
+        failedAgent.stageExecution = failedStage
+        context.insert(failedAgent)
+
+        let builder = RunReportBuilder(modelContext: context)
+        let payload = builder.buildReportPayload(for: run, version: 10)
+
+        #expect(payload.failureEvidenceSummaries.count == 1)
+        #expect(payload.failureEvidenceSummaries.first?.stageID == failedStage.stageID)
+        #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == completedStage.stageID })
+    }
+
     @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
     func proposal013AppProofCanonicalPassRule() {
         let packet = FailedStageEvidencePacket(
@@ -1699,7 +1787,7 @@ struct Proposal013Tests {
 
 private func makeTestCatalog(
     withContracts contracts: [String: ArtifactContract],
-    backendProfiles: [String: BackendProfile] = ["test_profile": BackendProfile(provider: "claude_code", model: "claude-opus-4.6", effort: "high", temperature: 0.1, maxTurns: 20, structuredOutput: "required")],
+    backendProfiles: [String: BackendProfile] = ["test_profile": BackendProfile(provider: "claude_code", model: "opus", effort: "high", temperature: 0.1, maxTurns: 20, structuredOutput: "required")],
     agents: [AgentDefinition] = []
 ) -> AgentCatalog {
     AgentCatalog(
@@ -1734,7 +1822,7 @@ private func makeTestResolvedAgent(
         mode: "proposal_review.product_owner",
         backendProfileID: "test_profile",
         provider: "claude_code",
-        model: "claude-opus-4.6",
+        model: "opus",
         effort: "high",
         maxTurns: 14,
         temperature: 0.1,

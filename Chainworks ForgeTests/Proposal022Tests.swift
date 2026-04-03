@@ -206,6 +206,35 @@ struct Proposal022Tests {
         #expect(policy.lazy.contains("proposal_review_all") == false)
     }
 
+    @Test("Selective writer handoff keeps canonical reviewer-derived refine inputs in both example and fallback configs")
+    func selectiveWriterHandoffKeepsCanonicalReviewerTruth() throws {
+        let workflow = try loadTestFullMVPLiveWorkflow()
+        let refineState = try #require(workflow.states["state_5_proposal_refined"])
+        let writerTask = try #require(refineState.run?.sequence?.first(where: { $0.agent == "proposal_writer" }))
+        let requiredReviewerInputs: Set<String> = [
+            "proposal_review_po",
+            "proposal_review_ux",
+            "proposal_review_ui",
+            "proposal_review_architect",
+            "proposal_review_summary",
+            "review_corpus_bundle",
+            "score_lift_backlog",
+            "proposal_fact_digest"
+        ]
+        let writerInputs = Set(writerTask.inputs ?? [])
+        #expect(requiredReviewerInputs.isSubset(of: writerInputs))
+
+        for config in [StewardConfig.defaultConfig, try loadExampleStewardConfig()] {
+            let profile = try #require(config.contextStrategyProfiles["selective_compression_and_escalation"])
+            let policy = try #require(profile.agents["proposal_writer"]?.handoffPolicy)
+            let mandatory = Set(policy.mandatory)
+
+            #expect(requiredReviewerInputs.isSubset(of: mandatory))
+            #expect(policy.summarized.contains("proposal_review_all") == false)
+            #expect(policy.lazy.contains("proposal_review_all") == false)
+        }
+    }
+
     @Test("Proposal writer consumes backlog and emits feedback coverage")
     func proposalWriterConsumesBacklogAndEmitsCoverage() throws {
         let catalog = try loadExampleCatalog()

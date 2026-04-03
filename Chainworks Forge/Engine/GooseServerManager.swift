@@ -1,5 +1,9 @@
 import Foundation
 import Observation
+#if os(macOS)
+import Darwin
+import AppKit
+#endif
 
 enum GooseServerLaunchState: Equatable, Sendable {
     case idle
@@ -40,16 +44,44 @@ final class ProcessGooseServerHandle: GooseServerProcessHandle {
     }
 }
 
+final class PIDGooseServerHandle: GooseServerProcessHandle {
+    private let pid: Int32
+
+    init(pid: Int32) {
+        self.pid = pid
+    }
+
+    var isRunning: Bool {
+#if os(macOS)
+        kill(pid, 0) == 0
+#else
+        false
+#endif
+    }
+
+    func terminate() {
+#if os(macOS)
+        guard isRunning else { return }
+        kill(pid, SIGTERM)
+#endif
+    }
+}
+
 @MainActor
 @Observable
-final class GooseServerManager {
+final class GooseServerManager: ManagedGooseServerControlling {
     typealias ReachabilityProbe = @Sendable (URL) async -> GooseServerReachability
     typealias Launcher = @MainActor @Sendable (GooseManagedServerLaunchPlan) throws -> GooseServerProcessHandle
+    typealias ManagedProcessPIDResolver = @Sendable (AppConfiguration) -> Int32?
+    typealias AdoptedHandleFactory = @Sendable (Int32) -> GooseServerProcessHandle
 
     private let appConfigurationStore: AppConfigurationStore
     @ObservationIgnored private let probe: ReachabilityProbe
     @ObservationIgnored private let launcher: Launcher
+    @ObservationIgnored private let managedProcessPIDResolver: ManagedProcessPIDResolver
+    @ObservationIgnored private let adoptedHandleFactory: AdoptedHandleFactory
     @ObservationIgnored private var processHandle: GooseServerProcessHandle?
+    @ObservationIgnored private var terminationObserver: NSObjectProtocol?
 
     private(set) var launchState: GooseServerLaunchState = .idle
     private(set) var lastCheckedAt: Date?
@@ -58,11 +90,24 @@ final class GooseServerManager {
     init(
         appConfigurationStore: AppConfigurationStore,
         probe: @escaping ReachabilityProbe = ProviderAdapterSupport.probeGooseServerStatus,
-        launcher: @escaping Launcher = GooseServerManager.defaultLauncher(plan:)
+        launcher: @escaping Launcher = GooseServerManager.defaultLauncher(plan:),
+        managedProcessPIDResolver: @escaping ManagedProcessPIDResolver = GooseServerManager.findManagedGooseServerPID(configuration:),
+        adoptedHandleFactory: @escaping AdoptedHandleFactory = { PIDGooseServerHandle(pid: $0) }
     ) {
         self.appConfigurationStore = appConfigurationStore
         self.probe = probe
         self.launcher = launcher
+        self.managedProcessPIDResolver = managedProcessPIDResolver
+        self.adoptedHandleFactory = adoptedHandleFactory
+        registerTerminationObserverIfNeeded()
+    }
+
+    deinit {
+#if os(macOS)
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+        }
+#endif
     }
 
     var configuration: AppConfiguration {
@@ -117,6 +162,7 @@ final class GooseServerManager {
 
         switch await probe(baseURL) {
         case .reachable:
+            attachManagedHandleIfNeeded()
             launchState = configuration.gooseServerAutostart ? .running : .external
         case .unreachable(let reason):
             launchState = configuration.gooseServerAutostart ? .failed(reason) : .idle
@@ -137,6 +183,7 @@ final class GooseServerManager {
 
         switch await probe(baseURL) {
         case .reachable:
+            attachManagedHandleIfNeeded()
             launchState = .running
             lastCheckedAt = Date()
             return
@@ -173,6 +220,7 @@ final class GooseServerManager {
         let failedReason: String
         switch await probe(baseURL) {
         case .reachable:
+            attachManagedHandleIfNeeded()
             launchState = .running
             lastCheckedAt = Date()
             return
@@ -188,6 +236,26 @@ final class GooseServerManager {
         processHandle = nil
         launchState = .idle
         lastCheckedAt = Date()
+    }
+
+    private func registerTerminationObserverIfNeeded() {
+#if os(macOS)
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.stopManagedServer()
+            }
+        }
+#endif
+    }
+
+    private func attachManagedHandleIfNeeded() {
+        guard configuration.gooseServerAutostart, processHandle == nil else { return }
+        guard let pid = managedProcessPIDResolver(configuration) else { return }
+        processHandle = adoptedHandleFactory(pid)
     }
 
     private func makeLaunchPlan() -> GooseManagedServerLaunchPlan? {
@@ -231,12 +299,12 @@ final class GooseServerManager {
         }
     }
 
-    private static func generateSecretKey() -> String {
+    nonisolated private static func generateSecretKey() -> String {
         let bytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func managedPATH(base: String?) -> String {
+    nonisolated private static func managedPATH(base: String?) -> String {
         let preferred = [
             "\(NSHomeDirectory())/.local/bin",
             "/opt/homebrew/bin",
@@ -257,7 +325,7 @@ final class GooseServerManager {
         return unique.joined(separator: ":")
     }
 
-    private static func defaultLauncher(plan: GooseManagedServerLaunchPlan) throws -> GooseServerProcessHandle {
+    nonisolated private static func defaultLauncher(plan: GooseManagedServerLaunchPlan) throws -> GooseServerProcessHandle {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: plan.executablePath)
         process.arguments = plan.arguments
@@ -266,5 +334,62 @@ final class GooseServerManager {
         process.standardError = Pipe()
         try process.run()
         return ProcessGooseServerHandle(process: process)
+    }
+
+    nonisolated private static func findManagedGooseServerPID(configuration: AppConfiguration) -> Int32? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = [
+            "-nP",
+            "-iTCP:\(configuration.gooseServerPort)",
+            "-sTCP:LISTEN",
+            "-Fpc"
+        ]
+
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+
+        guard let data = try? output.fileHandleForReading.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        var candidatePID: Int32?
+        var candidateCommand: String?
+        for line in text.split(whereSeparator: { $0.isNewline }) {
+            guard let prefix = line.first else { continue }
+            let value = String(line.dropFirst())
+            switch prefix {
+            case "p":
+                if let pid = Int32(value) {
+                    candidatePID = pid
+                }
+            case "c":
+                candidateCommand = value
+            default:
+                break
+            }
+        }
+
+        guard let pid = candidatePID else { return nil }
+
+        if let configuredBinaryPath = configuration.gooseServerBinaryPath,
+           !configuredBinaryPath.isEmpty,
+           let command = candidateCommand,
+           command != URL(fileURLWithPath: configuredBinaryPath).lastPathComponent {
+            return nil
+        }
+
+        return pid
     }
 }

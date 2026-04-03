@@ -568,11 +568,17 @@ struct ProviderDraft {
             return "\(family.displayName) \(transport.displayName)"
         }()
         let normalizedDefaultModel: String? = {
-            guard !defaultModel.isEmpty else { return nil }
-            guard ProviderDefaults.model(defaultModel, isCompatibleWith: family) else {
+            guard let canonicalModel = ProviderDefaults.canonicalModel(
+                defaultModel,
+                for: family,
+                transport: transport
+            ) else {
+                return nil
+            }
+            guard ProviderDefaults.model(canonicalModel, isCompatibleWith: family) else {
                 return ProviderDefaults.defaultModel(for: family)
             }
-            return defaultModel
+            return canonicalModel
         }()
         return ConfiguredProvider(
             family: family,
@@ -588,7 +594,11 @@ struct ProviderDraft {
     mutating func applyFamilyDefaults(_ family: ProviderFamily, configuration: AppConfiguration) {
         let previousFamily = self.family
         let previousGeneratedName = generatedDisplayName(for: previousFamily, transport: transport)
-        let previousDefaultModel = defaultModel
+        let previousDefaultModel = ProviderDefaults.canonicalModel(
+            defaultModel,
+            for: previousFamily,
+            transport: transport
+        ) ?? defaultModel
         let resolvedTransport: ProviderTransport
         switch family {
         case .codex, .claude:
@@ -627,6 +637,11 @@ struct ProviderDraft {
     }
 
     mutating func normalizeForSave() {
+        defaultModel = ProviderDefaults.canonicalModel(
+            defaultModel,
+            for: family,
+            transport: transport
+        ) ?? ""
         if !defaultModel.isEmpty, !ProviderDefaults.model(defaultModel, isCompatibleWith: family) {
             defaultModel = ProviderDefaults.defaultModel(for: family)
         }

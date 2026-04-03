@@ -131,7 +131,7 @@ struct FullMVPWorkflowTests {
             configuredProviderID: UUID(),
             providerFamily: "claude",
             providerIdentifier: "claude_code",
-            model: "claude-sonnet-4",
+            model: "sonnet",
             effort: "high",
             transport: "goose_server",
             adapterVersion: "v1"

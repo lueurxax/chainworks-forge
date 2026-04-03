@@ -10,6 +10,7 @@ app:
   required_providers:
   - codex
   - claude_code
+  - gemini
 paths:
   repo_root: ${CHAINWORKS_REPO_ROOT:-.}
   meta_root: ${CHAINWORKS_META_ROOT:-.chainworks}
@@ -24,9 +25,11 @@ artifacts:
   proposal_review_ui: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json
   proposal_review_architect: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/architect.json
   proposal_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json
+  review_corpus_bundle: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/review-corpus-bundle.json
   score_lift_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json
+  proposal_feedback_coverage: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/feedback-coverage.json
   proposal_fact_digest: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/fact-digest.json
-  proposal_feedback_coverage: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/feedback-coverage.json
+  reviewer_scope_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/reviewer-scope-plan.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md
   implementation_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml
@@ -100,6 +103,140 @@ skills:
   steward_core:
     type: inline_skill
     description: System-level SDLC health analysis, anomaly detection, and change proposal generation.
+mcp_policy:
+  default_profile: none
+  runtime_authority: agent.mcp_profile
+  permission_profile_mcp_mode: legacy_ceiling_only
+  zero_mcp_is_preferred_baseline: true
+  unsupported_required_extension_behavior: fail_preflight
+  unsupported_optional_extension_behavior: drop_and_record
+mcp_server_registry:
+  developer:
+    runtime_ids:
+      goose: developer
+    session_scoped: true
+    assignment_policy: explicit_opt_in
+    risk_class: normal
+    notes: Code-oriented MCP lane for developer workflows.
+  analyze:
+    runtime_ids:
+      goose: analyze
+    session_scoped: true
+    assignment_policy: explicit_opt_in
+    risk_class: normal
+    notes: Bounded analysis lane for steward and audit-style work.
+  todo:
+    runtime_ids:
+      goose: todo
+    session_scoped: true
+    assignment_policy: explicit_opt_in
+    risk_class: normal
+    notes: Narrow task-structuring aid.
+  xcode:
+    runtime_ids:
+      goose: xcode
+    session_scoped: true
+    assignment_policy: explicit_opt_in
+    risk_class: normal
+    notes: High-value visual/build/reference lane for Apple-platform work.
+  context7:
+    runtime_ids:
+      goose: context7
+    session_scoped: true
+    assignment_policy: explicit_opt_in
+    risk_class: normal
+    notes: Documentation/reference lane.
+  summarize:
+    runtime_ids:
+      goose: summarize
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Broad summarization lane; disabled by default.
+  summon:
+    runtime_ids:
+      goose: summon
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Parallelization/coordination helper with burn risk if overused.
+  autovisualiser:
+    runtime_ids:
+      goose: autovisualiser
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Visual interpretation aid; useful but expensive and easy to over-assign.
+  tom:
+    runtime_ids:
+      goose: tom
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Broad platform extension, not assigned by default.
+  extensionmanager:
+    runtime_ids:
+      goose: extensionmanager
+    session_scoped: true
+    assignment_policy: control_plane_only
+    risk_class: high_risk
+    notes: Control-plane extension; not assigned to normal workflow agents.
+  apps:
+    runtime_ids:
+      goose: apps
+    session_scoped: true
+    assignment_policy: opt_in_high_risk
+    risk_class: high_risk
+    notes: Broad side-effect surface.
+  chatrecall:
+    runtime_ids:
+      goose: chatrecall
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Hidden-context inflation risk.
+  code_execution:
+    runtime_ids:
+      goose: code_execution
+    session_scoped: true
+    assignment_policy: opt_in_high_risk
+    risk_class: high_risk
+    notes: Extra execution lane; not part of default workflow.
+  computercontroller:
+    runtime_ids:
+      goose: computercontroller
+    session_scoped: true
+    assignment_policy: opt_in_high_risk
+    risk_class: high_risk
+    notes: Wide side-effect surface.
+  memory:
+    runtime_ids:
+      goose: memory
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Hidden persistent context.
+  tutorial:
+    runtime_ids:
+      goose: tutorial
+    session_scoped: true
+    assignment_policy: opt_in_high_burn
+    risk_class: broad
+    notes: Broad helper lane with unclear ROI for normal workflow agents.
+  chromedevtools:
+    runtime_ids:
+      goose: chromedevtools
+    session_scoped: true
+    assignment_policy: opt_in_high_risk
+    risk_class: high_risk
+    notes: Browser-control lane; keep off unless explicitly justified.
+  orchestrator:
+    runtime_ids:
+      goose: orchestrator
+    session_scoped: true
+    assignment_policy: control_plane_only
+    risk_class: high_risk
+    notes: Internal orchestration/control-plane extension, not for normal workflow assignment.
 contracts:
   proposal_review_v1:
     format: json
@@ -135,6 +272,18 @@ contracts:
     - required_changes
     - recurring_themes
     - decision
+  review_corpus_bundle_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: review_corpus_bundle_raw
+    normalized_artifact_name: review_corpus_bundle
+    required_fields:
+    - review_pass_id
+    - review_iteration_id
+    - source_proposal_artifact
+    - raw_review_artifacts
+    - aggregate_summary_artifact
   score_lift_backlog_v1:
     format: json
     machine_format: json
@@ -145,10 +294,6 @@ contracts:
     - review_pass_id
     - source_proposal_artifact
     - items
-    - open_count
-    - unresolved_high_lift_count
-    - blocker_count
-    - generated_at
   proposal_feedback_coverage_v1:
     format: json
     machine_format: json
@@ -172,20 +317,41 @@ contracts:
     raw_artifact_name: proposal_fact_digest_raw
     normalized_artifact_name: proposal_fact_digest
     required_fields:
-    - review_pass_id
-    - claims_checked
-    - unresolved_facts
-    - assumptions_requiring_validation
-    - platform_constraints
-    - evidence_refs
+    - proposal_revision_id
+    - claims
   implementation_self_assessment_v1:
     format: json
+    machine_format: json
+    validation_mode: strict_structured
     required_fields:
     - seemingly_complete
     - remaining_tasks
     - known_risks
     - tests_run
     - docs_impacted
+  implementation_progress:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - status
+    - current_phase
+    - completed_items
+    - deferred_items
+    - notes
+  changed_files_manifest:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - files
+  tests_result:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - green
+    - summary
   audit_report_v1:
     format: json
     required_fields:
@@ -227,6 +393,26 @@ contracts:
     - changed_docs
     - missing_docs
     - followups
+  docs_delta:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - files
+    - summary
+  release_manifest:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - commitSHA
+    - branch
+    - remote
+    - commitMessage
+    - filesChanged
+    - insertions
+    - deletions
+    - timestamp
   git_push_receipt_v1:
     format: json
     required_fields:
@@ -234,6 +420,18 @@ contracts:
     - branch
     - commit_sha
     - remote
+  release_bundle_manifest:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - bundleIdentifier
+    - bundleVersion
+    - buildNumber
+    - archivePath
+    - checksumSHA256
+    - sizeBytes
+    - timestamp
   connect_upload_receipt_v1:
     format: json
     required_fields:
@@ -266,6 +464,58 @@ contracts:
     - improvements
     - executive_summary
     - confidence
+  degradation_alert:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - analysis_id
+    - metric_name
+    - metric_family
+    - observed_value
+    - baseline_value
+    - delta_percentage
+    - threshold_used
+    - implicated_run_ids
+    - severity
+    - likely_causes
+    - confidence
+  agent_tuning_proposal:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - analysis_id
+    - category
+    - summary
+    - target_metric
+    - proposed_patch_path
+    - confidence_level
+    - status
+  workflow_tuning_proposal:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - analysis_id
+    - category
+    - summary
+    - target_metric
+    - proposed_patch_path
+    - confidence_level
+    - status
+  experiment_plan:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - analysis_id
+    - experiment_type
+    - control_config_hash
+    - treatment_config_hash
+    - minimum_sample_size
+    - rollback_condition
+    - status
   stewardship_audit_report_v1:
     format: json
     required_fields:
@@ -292,28 +542,35 @@ contracts:
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.1
     max_turns: 20
     structured_output: required
   claude_writer_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
-    temperature: 0.2
+    temperature: 0.15
+    max_turns: 18
+    structured_output: preferred
+  codex_writer_high:
+    provider: codex
+    model: GPT-5.4
+    effort: high
+    temperature: 0.12
     max_turns: 18
     structured_output: preferred
   claude_product_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.1
     max_turns: 14
     structured_output: required
   claude_design_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.2
     max_turns: 12
@@ -321,7 +578,7 @@ backend_profiles:
   codex_architect_high:
     provider: codex
     model: GPT-5.4
-    effort: high
+    effort: extra high
     temperature: 0.1
     max_turns: 16
     structured_output: required
@@ -335,20 +592,20 @@ backend_profiles:
   codex_audit_high:
     provider: codex
     model: GPT-5.4
-    effort: high
+    effort: extra high
     temperature: 0.0
     max_turns: 18
     structured_output: required
   claude_security_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.0
     max_turns: 16
     structured_output: required
   claude_prepush_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.1
     max_turns: 12
@@ -362,31 +619,73 @@ backend_profiles:
     structured_output: required
   claude_docs_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.2
     max_turns: 12
     structured_output: required
   claude_steward_high:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: high
     temperature: 0.1
     max_turns: 16
     structured_output: required
   claude_auditor_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.0
     max_turns: 14
     structured_output: required
   claude_retrospective_medium:
     provider: claude_code
-    model: claude-opus-4.6
+    model: opus
     effort: medium
     temperature: 0.1
     max_turns: 12
+    structured_output: required
+  gemini_3_1_pro_preview_high:
+    provider: gemini
+    model: gemini-3.1-pro-preview
+    effort: high
+    temperature: 0.1
+    max_turns: 16
+    structured_output: required
+  gemini_3_flash_preview_medium:
+    provider: gemini
+    model: gemini-3-flash-preview
+    effort: medium
+    temperature: 0.2
+    max_turns: 12
+    structured_output: required
+  gemini_reasoning_pro_high:
+    provider: gemini
+    model: gemini-2.5-pro
+    effort: high
+    temperature: 0.1
+    max_turns: 16
+    structured_output: required
+  gemini_review_flash:
+    provider: gemini
+    model: gemini-2.5-pro
+    effort: medium
+    temperature: 0.2
+    max_turns: 12
+    structured_output: required
+  gemini_docs_flash:
+    provider: gemini
+    model: gemini-2.5-flash
+    effort: medium
+    temperature: 0.2
+    max_turns: 12
+    structured_output: required
+  gemini_ops_flash_lite:
+    provider: gemini
+    model: gemini-2.5-flash
+    effort: low
+    temperature: 0.0
+    max_turns: 8
     structured_output: required
 permission_profiles:
   ORCH:
@@ -430,9 +729,10 @@ permission_profiles:
     network:
       allow: []
     mcp:
-      allow:
+      legacy_allow:
       - github.read
       - connect.read
+      runtime_authority: false
   RO_REVIEW:
     filesystem:
       read:
@@ -469,7 +769,8 @@ permission_profiles:
     network:
       allow: []
     mcp:
-      allow: []
+      legacy_allow: []
+      runtime_authority: false
   RO_VERIFY:
     filesystem:
       read:
@@ -519,10 +820,11 @@ permission_profiles:
     network:
       allow: []
     mcp:
-      allow:
+      legacy_allow:
       - scanner.readonly
       - dependency_scan.readonly
       - secrets_scan.readonly
+      runtime_authority: false
   PROPOSAL_WRITE:
     filesystem:
       read:
@@ -556,7 +858,8 @@ permission_profiles:
     network:
       allow: []
     mcp:
-      allow: []
+      legacy_allow: []
+      runtime_authority: false
   CODE_WRITE:
     filesystem:
       read:
@@ -626,7 +929,8 @@ permission_profiles:
     network:
       allow: []
     mcp:
-      allow: []
+      legacy_allow: []
+      runtime_authority: false
   DOC_WRITE:
     filesystem:
       read:
@@ -663,7 +967,8 @@ permission_profiles:
     network:
       allow: []
     mcp:
-      allow: []
+      legacy_allow: []
+      runtime_authority: false
   RELEASE_GIT:
     filesystem:
       read:
@@ -692,10 +997,11 @@ permission_profiles:
       allow:
       - github
     mcp:
-      allow:
+      legacy_allow:
       - git.commit
       - git.push
       - github.read
+      runtime_authority: false
   RELEASE_PUBLISH:
     filesystem:
       read:
@@ -719,9 +1025,10 @@ permission_profiles:
       allow:
       - connect
     mcp:
-      allow:
+      legacy_allow:
       - build.archive
       - connect.upload
+      runtime_authority: false
 agents:
 - id: lead_orchestrator
   title: Lead / Orchestrator
@@ -734,18 +1041,17 @@ agents:
   inputs:
   - idea_brief
   - proposal_current
-  - proposal_review_po
-  - proposal_review_ux
-  - proposal_review_ui
-  - proposal_review_architect
   - proposal_review_summary
+  - review_corpus_bundle
   - approved_proposal
   - implementation_review_summary
   - run_state
   outputs:
   - proposal_review_summary
+  - review_corpus_bundle
   - score_lift_backlog
   - proposal_fact_digest
+  - reviewer_scope_plan
   - approved_proposal
   - implementation_plan
   - implementation_backlog
@@ -764,15 +1070,10 @@ agents:
 
     Aggregate only structured outputs, track loop counters, enforce gates, and stop on contradictions.
 
-    For proposal review/refinement loops, preserve reviewer-specific signal instead of collapsing everything into one verdict:
-
-    produce `proposal_review_summary` as the aggregate decision artifact, produce `score_lift_backlog` as the normalized actionable backlog of score-limiting issues, and produce `proposal_fact_digest` when factual or platform-grounding gaps need explicit follow-up.
-
     Never edit product code, never commit, never push, and never publish artifacts yourself.
 
-    Escalate only for the three workflow approval checkpoints, or when loop budgets are exhausted.
-
-    '
+    Escalate only for the three workflow approval checkpoints, or when loop budgets are exhausted.'
+  mcp_profile: orchestrator_coordination
 - id: proposal_reviewer_product_owner
   title: Proposal Reviewer / Product Owner
   mode: proposal_review.product_owner
@@ -784,6 +1085,9 @@ agents:
   inputs:
   - idea_brief
   - proposal_current
+  - proposal_feedback_coverage
+  - reviewer_scope_plan
+  - score_lift_backlog
   outputs:
   - proposal_review_po
   output_contract: proposal_review_v1
@@ -797,16 +1101,20 @@ agents:
     Output only the structured review contract with a numeric score from 0 to 10.
 
     Mark blocking issues only when they would materially reduce the chance of shipping the right thing.'
+  mcp_profile: proposal_product_visual
 - id: proposal_reviewer_ux
   title: Proposal Reviewer / UX
   mode: proposal_review.ux
-  backend_profile: claude_design_medium
+  backend_profile: gemini_review_flash
   permission_profile: RO_REVIEW
   skill_ref: proposal_review_triad
   skill_role: ux_designer
   inputs:
   - idea_brief
   - proposal_current
+  - proposal_feedback_coverage
+  - reviewer_scope_plan
+  - score_lift_backlog
   outputs:
   - proposal_review_ux
   output_contract: proposal_review_v1
@@ -820,16 +1128,20 @@ agents:
     Output only the structured review contract with a numeric score from 0 to 10.
 
     Prefer actionable suggestions over abstract taste.'
+  mcp_profile: review_visual
 - id: proposal_reviewer_ui
   title: Proposal Reviewer / UI
   mode: proposal_review.ui
-  backend_profile: claude_design_medium
+  backend_profile: gemini_review_flash
   permission_profile: RO_REVIEW
   skill_ref: proposal_review_triad
   skill_role: ui_designer
   inputs:
   - idea_brief
   - proposal_current
+  - proposal_feedback_coverage
+  - reviewer_scope_plan
+  - score_lift_backlog
   outputs:
   - proposal_review_ui
   output_contract: proposal_review_v1
@@ -843,6 +1155,7 @@ agents:
     Output only the structured review contract with a numeric score from 0 to 10.
 
     Keep suggestions specific enough that the proposal writer can apply them directly.'
+  mcp_profile: review_visual
 - id: proposal_reviewer_architect
   title: Proposal Reviewer / Architect
   mode: proposal_review.architect
@@ -853,6 +1166,9 @@ agents:
   inputs:
   - idea_brief
   - proposal_current
+  - proposal_feedback_coverage
+  - reviewer_scope_plan
+  - score_lift_backlog
   outputs:
   - proposal_review_architect
   output_contract: proposal_review_v1
@@ -866,6 +1182,7 @@ agents:
     Output only the structured review contract with a numeric score from 0 to 10.
 
     Prefer practical implementation concerns over theoretical purity.'
+  mcp_profile: review_architecture
 - id: code_writer
   title: Code Writer
   mode: implementation
@@ -909,10 +1226,11 @@ agents:
     Do not commit, do not push, and do not edit repository docs unless the docs agent is invoked.
 
     When in doubt, choose the simplest implementation that satisfies the approved proposal and current review findings.'
+  mcp_profile: code_build_rich
 - id: proposal_writer
   title: Proposal Writer
   mode: proposal_authoring
-  backend_profile: claude_writer_high
+  backend_profile: codex_writer_high
   permission_profile: PROPOSAL_WRITE
   skill_ref: proposal_writer_core
   session_reuse_scope: same_agent_family_within_run
@@ -929,8 +1247,9 @@ agents:
   - proposal_review_ui
   - proposal_review_architect
   - proposal_review_summary
-  - proposal_fact_digest
+  - review_corpus_bundle
   - score_lift_backlog
+  - proposal_fact_digest
   outputs:
   - proposal_current
   - proposal_revision_summary
@@ -942,15 +1261,10 @@ agents:
 
     Cover problem, goals, non-goals, UX/UI notes, architecture, rollout, metrics, risks, and open questions.
 
-    Treat the full raw review quartet as first-class evidence, use `proposal_review_summary` as the aggregate verdict, use `score_lift_backlog` as the normalized list of score-limiting items that must be carried forward, and use `proposal_fact_digest` to ground claims that need explicit factual or platform verification.
+    Resolve reviewer feedback explicitly; do not silently ignore disagreements.
 
-    Resolve reviewer feedback explicitly; do not silently ignore disagreements or collapse non-blocking score-limiters into prose.
-
-    Emit `proposal_feedback_coverage` showing which backlog items were addressed, which remain unresolved, which were deferred, and why.
-
-    Optimize for a proposal that can reach an aggregate score above 9 without hiding trade-offs.
-
-    '
+    Optimize for a proposal that can reach an aggregate score above 9 without hiding trade-offs.'
+  mcp_profile: proposal_authoring_visual
 - id: proposal_implementation_auditor
   title: Proposal vs Implementation Auditor
   mode: audit
@@ -982,6 +1296,7 @@ agents:
     Be exact and evidence-based.
 
     Output only the audit contract and set status to Implemented only when the implementation truly matches the approved proposal.'
+  mcp_profile: audit_rich
 - id: security_checker
   title: Security Checker
   mode: security
@@ -1009,10 +1324,11 @@ agents:
     Use readonly scanners when available, but do not rely on scanners alone.
 
     Output only the structured security report and mark status as pass only when no blocking issue remains.'
+  mcp_profile: security_rich
 - id: commit_and_push_to_github
   title: Commit and Push to GitHub
   mode: release_git
-  backend_profile: codex_ops_low
+  backend_profile: gemini_ops_flash_lite
   permission_profile: RELEASE_GIT
   skill_ref: github_commit_push
   worktree_policy:
@@ -1040,6 +1356,7 @@ agents:
     Use deterministic git/github tools, record the resulting commit SHA and branch, and write a release manifest.
 
     Never modify source files, never bypass approval, and never run before the final release approval gate is green.'
+  mcp_profile: none
 - id: prepush_code_reviewer
   title: Pre-push Code Reviewer
   mode: prepush_review
@@ -1072,10 +1389,11 @@ agents:
     Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
 
     Output only the structured pre-push review contract.'
+  mcp_profile: prepush_rich
 - id: build_archive_and_push_connect
   title: Build Archive and Push to Connect
   mode: release_publish
-  backend_profile: codex_ops_low
+  backend_profile: gemini_ops_flash_lite
   permission_profile: RELEASE_PUBLISH
   skill_ref: connect_publisher
   worktree_policy:
@@ -1100,10 +1418,11 @@ agents:
     Record the artifact id, checksum, destination, and any release metadata required for traceability.
 
     Never edit source code and never run before final release approval and commit/push have succeeded.'
+  mcp_profile: none
 - id: docs_guardian
   title: Docs Guardian
   mode: docs
-  backend_profile: claude_docs_medium
+  backend_profile: gemini_docs_flash
   permission_profile: DOC_WRITE
   skill_ref: docs_quality_guardian
   worktree_policy:
@@ -1127,6 +1446,7 @@ agents:
     Prefer small exact edits over broad rewrites.
 
     When docs are already aligned, output that no doc change is needed and explain why.'
+  mcp_profile: none
 - id: system_steward
   title: Forge Steward
   mode: meta_analysis
@@ -1158,6 +1478,7 @@ agents:
     and produce concrete, testable change proposals.
 
     Stay evidence-first, precise, and practical. If evidence is weak, say so plainly.'
+  mcp_profile: steward_analysis
 - id: steward_auditor
   title: Steward Auditor
   mode: meta_audit
@@ -1181,6 +1502,7 @@ agents:
     Be adversarial toward weak reasoning, not toward people.
 
     Keep criticism concrete and evidence-linked.'
+  mcp_profile: steward_analysis
 - id: agent_retrospective_interviewer
   title: Agent Retrospective Interviewer
   mode: retrospective
@@ -1202,3 +1524,77 @@ agents:
     Reconstruct why a specific agent execution produced a weak or degraded outcome.
 
     Reason only from the dossier you are given. No imaginary memory. No vague psychologizing.'
+  mcp_profile: retrospective_analysis
+mcp_profiles:
+  none:
+    required_extensions: []
+    optional_extensions: []
+    fallback_policy: allow_without_extensions
+  orchestrator_coordination:
+    required_extensions:
+    - todo
+    optional_extensions:
+    - summon
+    fallback_policy: fail_if_required_missing
+  proposal_product_visual:
+    required_extensions:
+    - xcode
+    optional_extensions: []
+    fallback_policy: fail_if_required_missing
+  review_visual:
+    required_extensions:
+    - xcode
+    optional_extensions:
+    - autovisualiser
+    fallback_policy: fail_if_required_missing
+  review_architecture:
+    required_extensions:
+    - xcode
+    optional_extensions:
+    - context7
+    fallback_policy: fail_if_required_missing
+  proposal_authoring_visual:
+    required_extensions:
+    - xcode
+    optional_extensions:
+    - context7
+    fallback_policy: fail_if_required_missing
+  code_build_rich:
+    required_extensions:
+    - xcode
+    - developer
+    optional_extensions:
+    - context7
+    - todo
+    - summon
+    fallback_policy: fail_if_required_missing
+  audit_rich:
+    required_extensions:
+    - developer
+    optional_extensions:
+    - xcode
+    - analyze
+    fallback_policy: fail_if_required_missing
+  security_rich:
+    required_extensions:
+    - developer
+    optional_extensions:
+    - analyze
+    - context7
+    fallback_policy: fail_if_required_missing
+  prepush_rich:
+    required_extensions:
+    - developer
+    optional_extensions:
+    - xcode
+    fallback_policy: fail_if_required_missing
+  steward_analysis:
+    required_extensions:
+    - analyze
+    optional_extensions: []
+    fallback_policy: fail_if_required_missing
+  retrospective_analysis:
+    required_extensions:
+    - analyze
+    optional_extensions: []
+    fallback_policy: fail_if_required_missing

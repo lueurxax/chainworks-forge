@@ -99,8 +99,8 @@ final class ExecutionEventBridge: @unchecked Sendable {
                         _toolCalls[idx].succeeded = true
                     }
                 }
-            case .error:
-                break
+            case .error(let message):
+                throw ExecutionEventBridgeError.streamFailed(message: message)
             default:
                 break
             }
@@ -207,6 +207,17 @@ final class ExecutionEventBridge: @unchecked Sendable {
         _lock.lock()
         defer { _lock.unlock() }
         return body()
+    }
+}
+
+enum ExecutionEventBridgeError: LocalizedError {
+    case streamFailed(message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .streamFailed(let message):
+            return message
+        }
     }
 }
 

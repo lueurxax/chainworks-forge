@@ -59,6 +59,7 @@
   - none live after the current proposal edits
   - previous blockers around `SKILL.md`, role-to-mode mapping, frozen owner, shell-owned visibility, and raw-vs-injected provenance are now explicitly closed in text
 - Runtime evidence used: `None`
+- Repeat freshness note: `No-delta repeat on 2026-04-03; proposal hash unchanged from the prior green pass.`
 - Provenance of key evidence: `/Users/user/Documents/Chainworks Forge/docs/reviews/015-skill-resolution-and-runtime-injection-evidence-pack.md`
 - Remaining assumptions:
   - MVP intentionally imports executable skill truth from `SKILL.md` plus declared specialization, not the full Codex skill runtime

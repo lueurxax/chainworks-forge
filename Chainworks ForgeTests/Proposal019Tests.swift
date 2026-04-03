@@ -995,7 +995,7 @@ private func attachStrategyProofData(
         workingDirectory: "/tmp",
         workspaceMode: "read_only",
         runtimeProvider: "claude",
-        runtimeModel: "claude-opus-4.6"
+        runtimeModel: "opus"
     )
     generation.turnCount = 1
     generation.estimatedInputTokens = Int64(payloadBefore / 4)

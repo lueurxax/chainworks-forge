@@ -27,7 +27,7 @@ import SwiftData
 final class RunCancellationCoordinator {
 
     private let run: Run
-    private let orchestrator: WorkflowOrchestrator
+    private let orchestrator: WorkflowOrchestrator?
 
     /// Session IDs that need async cleanup (collected during Phase 1).
     private(set) var pendingSessionIDs: [String] = []
@@ -35,7 +35,7 @@ final class RunCancellationCoordinator {
     /// Maps session ID → agent execution ID for settlement log updates in Phase 2.
     private var sessionToAgentExecutionID: [String: UUID] = [:]
 
-    init(run: Run, orchestrator: WorkflowOrchestrator, modelContext: ModelContext) {
+    init(run: Run, orchestrator: WorkflowOrchestrator?) {
         self.run = run
         self.orchestrator = orchestrator
     }
@@ -52,10 +52,10 @@ final class RunCancellationCoordinator {
     /// after session cleanup to complete the settlement contract.
     func beginSettlement() {
         // Criterion 1: Record the cancellation request.
-        run.cancellationRequestedAt = Date()
+        run.cancellationRequestedAt = run.cancellationRequestedAt ?? Date()
 
         // Criterion 1 (cont.): Signal the orchestrator to stop advancing stages.
-        orchestrator.signalCancellation()
+        orchestrator?.signalCancellation()
 
         // Criterion 2: Transition all active agents to .cancelled.
         let activeAgentExecutions = run.stageExecutions

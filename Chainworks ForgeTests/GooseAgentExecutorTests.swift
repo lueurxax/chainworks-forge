@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import os
+import SwiftData
 @testable import Chainworks_Forge
 
 // MARK: - GooseAgentExecutorTests (Proposal 004, Section 12.1)
@@ -114,6 +115,312 @@ struct GooseAgentExecutorTests {
 
         var closeSessionCalled: Bool {
             get async { state.withLock { $0.closeSessionCalled } }
+        }
+    }
+
+    private final class StaleReuseTransport: GooseTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+            var sessionUseCounts: [String: Int] = [:]
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            let sessionID = callCount == 1 ? "session-reused" : "session-fresh-\(callCount)"
+            return GooseSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: GoosePromptRequest
+        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            let useCount = state.withLock { state -> Int in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+                state.sessionUseCounts[sessionID, default: 0] += 1
+                return state.sessionUseCounts[sessionID] ?? 0
+            }
+
+            return AsyncThrowingStream { continuation in
+                Task {
+                    if sessionID == "session-reused" && useCount == 2 {
+                        continuation.yield(.sessionStarted(raw: #"{"session_id":"session-reused"}"#))
+                        continuation.yield(.promptSubmitted(raw: #"{"session_id":"session-reused"}"#))
+                        continuation.finish(throwing: NSError(
+                            domain: "GooseTest",
+                            code: 404,
+                            userInfo: [NSLocalizedDescriptionKey: "Failed to read session: Session not found"]
+                        ))
+                        return
+                    }
+
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.finalOutput(content: sessionID == "session-reused" ? "first pass output" : "fresh fallback output"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
+    private final class StaleReuseSSEErrorTransport: GooseTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+            var sessionUseCounts: [String: Int] = [:]
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            let sessionID = callCount == 1 ? "session-reused" : "session-fresh-\(callCount)"
+            return GooseSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: GoosePromptRequest
+        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            let useCount = state.withLock { state -> Int in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+                state.sessionUseCounts[sessionID, default: 0] += 1
+                return state.sessionUseCounts[sessionID] ?? 0
+            }
+
+            return AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if sessionID == "session-reused" && useCount == 2 {
+                        continuation.yield(.error(message: "Failed to read session: Session not found"))
+                        continuation.finish()
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: sessionID == "session-reused" ? "first pass output" : "fresh fallback output"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
+    private final class PersistentSessionUnavailableTransport: GooseTransportProtocol, @unchecked Sendable {
+        private let counter = OSAllocatedUnfairLock(initialState: 0)
+
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            let sessionNumber = counter.withLock { value -> Int in
+                value += 1
+                return value
+            }
+            return GooseSessionResponse(
+                sessionId: "session-\(sessionNumber)",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: GoosePromptRequest
+        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish(throwing: NSError(
+                        domain: "GooseTest",
+                        code: 404,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to read session: Session not found"]
+                    ))
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
+
+    private final class DuplicateFreshSessionTransport: GooseTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submittedSessionIDs: [String] = []
+            var closedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            let sessionID: String
+            switch callCount {
+            case 1, 2:
+                sessionID = "dup-session"
+            default:
+                sessionID = "fresh-\(callCount)"
+            }
+
+            return GooseSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: GoosePromptRequest
+        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            state.withLock { $0.submittedSessionIDs.append(sessionID) }
+            return AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.finalOutput(content: "output from \(sessionID)"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {
+            state.withLock { $0.closedSessionIDs.append(sessionID) }
+        }
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+
+        var closedSessionIDs: [String] {
+            get async { state.withLock { $0.closedSessionIDs } }
+        }
+    }
+
+    private final class RecycledCompletedSessionTransport: GooseTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            let sessionID = state.withLock { state -> String in
+                state.createSessionCallCount += 1
+                return "recycled-session"
+            }
+
+            return GooseSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: GoosePromptRequest
+        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            state.withLock { $0.submittedSessionIDs.append(sessionID) }
+            return AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.finalOutput(content: "output from \(sessionID)"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
         }
     }
 
@@ -282,6 +589,104 @@ struct GooseAgentExecutorTests {
             #expect(receipt.succeeded)
             #expect(receipt.receiptVersion == "1.1")
         }
+    }
+
+    @MainActor
+    @Test("Executor runtime truth prefers frozen provider binding over live override")
+    func gooseExecutorPrefersFrozenProviderBindingForRuntimeTruth() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "session-bound-truth",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-read-only",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .finalOutput(content: "# UI Review\n\nLooks good."),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let override = LiveExecutionOverride(enabled: true, provider: "claude-code", model: "default", effort: "medium")
+        let executor = GooseAgentExecutor(transport: transport, override: override)
+        let configuredProviderID = UUID()
+        let binding = ResolvedProviderBinding(
+            agentID: "proposal_reviewer_ui",
+            backendProfileID: "gemini_review_flash",
+            configuredProviderID: configuredProviderID,
+            providerFamily: "gemini",
+            providerIdentifier: "gemini",
+            model: "gemini-2.5-pro",
+            effort: "medium",
+            transport: "gooseServer",
+            adapterVersion: "v1"
+        )
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ui",
+            title: "Proposal Reviewer / UI",
+            mode: "review",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Review the proposal from a UI perspective.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_ui"]
+        )
+        let task = AgentTask(
+            agent: "proposal_reviewer_ui",
+            task: "review_proposal_as_ui_designer",
+            inputs: nil,
+            outputs: ["proposal_review_ui"]
+        )
+        let base = makeContext()
+        let context = ExecutionContext(
+            workspace: base.workspace,
+            stageID: base.stageID,
+            stageLineageID: base.stageLineageID,
+            ownerExecutionLineageID: base.ownerExecutionLineageID,
+            iteration: base.iteration,
+            attemptNumber: base.attemptNumber,
+            inputArtifacts: base.inputArtifacts,
+            inputArtifactPaths: base.inputArtifactPaths,
+            variables: base.variables,
+            ideaBody: base.ideaBody,
+            providerBinding: binding
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        let lastSessionRequest = await transport.lastSessionRequest
+        #expect(lastSessionRequest?.provider == "gemini")
+        #expect(lastSessionRequest?.model == "gemini-2.5-pro")
+
+        #expect(result.runtimeProvider == "gemini")
+        #expect(result.runtimeModel == "gemini-2.5-pro")
+        #expect(result.resolvedModel == "gemini-2.5-pro")
+        #expect(result.providerReceipt?.providerFamily == "gemini")
+        #expect(result.providerReceipt?.model == "gemini-2.5-pro")
+        #expect(result.configuredProviderID == configuredProviderID)
+
+        let receiptKey = try #require(result.outputs.keys.first { $0.hasSuffix("_receipt.json") })
+        let receiptData = try #require(result.outputs[receiptKey])
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(ExecutionReceipt.self, from: receiptData)
+        #expect(receipt.provider == "gemini")
+        #expect(receipt.model == "gemini-2.5-pro")
+        #expect(receipt.effort == "medium")
     }
 
     /// testGooseExecutorFailsWhenRequiredOutputsMissing — Section 12.1
@@ -569,7 +974,7 @@ struct GooseAgentExecutorTests {
         #expect(prompt?.content.contains("Profile: selective_compression_and_escalation") == true)
         #expect(prompt?.content.contains("Mode: selective") == true)
         #expect(contextAttachments.contains { $0.name == "idea_brief" && $0.type == "artifact" })
-        #expect(contextAttachments.contains { $0.name == "summary_proposal_review_summary" && $0.type == "text" })
+        #expect(contextAttachments.contains { $0.name == "proposal_review_summary" && $0.type == "artifact" })
         #expect(contextAttachments.contains { $0.name == "lazy_security_audit_raw" && $0.type == "text" })
     }
 
@@ -726,5 +1131,374 @@ struct GooseAgentExecutorTests {
 
         #expect(result.succeeded)
         #expect(result.lazyEvidenceArtifactHits == ["security_audit_raw"])
+    }
+
+    @MainActor
+    @Test("Executor starts a fresh session after a prior successful generation settles")
+    func gooseExecutorFallsBackWhenReusedSessionDisappearsMidStream() async throws {
+        let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
+        let config = ModelConfiguration("GooseAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let sessionManager = AgentSessionManager(container: container)
+        let transport = StaleReuseTransport()
+        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+
+        let runID = UUID()
+        let firstContext = makeContext(runID: runID)
+        let secondContext = ExecutionContext(
+            workspace: firstContext.workspace,
+            stageID: firstContext.stageID,
+            stageLineageID: firstContext.stageLineageID,
+            ownerExecutionLineageID: UUID(),
+            iteration: firstContext.iteration,
+            attemptNumber: firstContext.attemptNumber,
+            inputArtifacts: firstContext.inputArtifacts,
+            inputArtifactPaths: firstContext.inputArtifactPaths,
+            variables: firstContext.variables,
+            ideaBody: firstContext.ideaBody,
+            providerBinding: firstContext.providerBinding
+        )
+        let agent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Aggregate proposal reviews.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_summary"],
+            sessionReuseScope: .same_agent_family_within_run,
+            sessionFamilyID: "orchestration_loop"
+        )
+        let task = AgentTask(
+            agent: "lead_orchestrator",
+            task: "aggregate_proposal_reviews",
+            inputs: nil,
+            outputs: ["proposal_review_summary"]
+        )
+
+        let firstResult = try await executor.execute(task: task, agent: agent, context: firstContext)
+        #expect(firstResult.succeeded)
+        #expect(firstResult.sessionReuseDisposition == SessionReuseDisposition.fresh)
+
+        let secondResult = try await executor.execute(task: task, agent: agent, context: secondContext)
+
+        #expect(secondResult.succeeded)
+        #expect(secondResult.sessionReuseDisposition == SessionReuseDisposition.fresh)
+        #expect(secondResult.outputs["proposal_review_summary"] != nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
+    }
+
+    @MainActor
+    @Test("Executor rejects duplicate fresh provider session IDs when another lineage is still active")
+    func gooseExecutorRejectsDuplicateFreshProviderSessionIDsAcrossLineages() async throws {
+        let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
+        let config = ModelConfiguration("GooseAgentExecutorCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let sessionManager = AgentSessionManager(container: container)
+        let transport = DuplicateFreshSessionTransport()
+        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+
+        let runID = UUID()
+        let leadContext = makeContext(runID: runID)
+
+        let reviewerLineageID = try await sessionManager.getOrCreateLineage(
+            runID: runID,
+            agentID: "proposal_reviewer_ui",
+            scope: .same_invocation_owner,
+            familyID: nil
+        )
+        _ = try await sessionManager.createGeneration(
+            lineageID: reviewerLineageID,
+            invocationOwnerKey: "review-owner",
+            providerSessionID: "dup-session",
+            bindingFingerprint: "review-fp",
+            workingDirectory: leadContext.workspace.workspaceRoot.path,
+            workspaceMode: "read_only",
+            runtimeProvider: "gemini",
+            runtimeModel: "gemini-2.5-pro"
+        )
+
+        let leadContextRetry = ExecutionContext(
+            workspace: leadContext.workspace,
+            stageID: leadContext.stageID,
+            stageLineageID: leadContext.stageLineageID,
+            ownerExecutionLineageID: UUID(),
+            iteration: leadContext.iteration,
+            attemptNumber: leadContext.attemptNumber,
+            inputArtifacts: leadContext.inputArtifacts,
+            inputArtifactPaths: leadContext.inputArtifactPaths,
+            variables: leadContext.variables,
+            ideaBody: leadContext.ideaBody,
+            providerBinding: leadContext.providerBinding
+        )
+        let leadAgent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Aggregate proposal reviews.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_summary"],
+            sessionReuseScope: .same_agent_family_within_run,
+            sessionFamilyID: "orchestration_loop"
+        )
+
+        let leadTask = AgentTask(
+            agent: "lead_orchestrator",
+            task: "aggregate_proposal_reviews",
+            inputs: nil,
+            outputs: ["proposal_review_summary"]
+        )
+
+        let leadResult = try await executor.execute(task: leadTask, agent: leadAgent, context: leadContextRetry)
+        #expect(leadResult.succeeded)
+        #expect(leadResult.sessionID == "fresh-3")
+        #expect(await transport.createSessionCallCount == 3)
+        let submittedSessionIDs = await transport.submittedSessionIDs
+        #expect(submittedSessionIDs.contains("fresh-3"))
+        let closedSessionIDs = await transport.closedSessionIDs
+        #expect(closedSessionIDs.contains("dup-session"))
+    }
+
+    @MainActor
+    @Test("Executor does not treat a completed generation as an active provider-session collision")
+    func gooseExecutorIgnoresCompletedGenerationDuringFreshCollisionCheck() async throws {
+        let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
+        let config = ModelConfiguration("GooseAgentExecutorCompletedCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let sessionManager = AgentSessionManager(container: container)
+        let transport = RecycledCompletedSessionTransport()
+        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+
+        let runID = UUID()
+        let writerContext = makeContext(runID: runID)
+        let architectContext = ExecutionContext(
+            workspace: writerContext.workspace,
+            stageID: "state_4_proposal_reviewed",
+            stageLineageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: writerContext.inputArtifacts,
+            inputArtifactPaths: writerContext.inputArtifactPaths,
+            variables: writerContext.variables,
+            ideaBody: writerContext.ideaBody,
+            providerBinding: writerContext.providerBinding
+        )
+
+        let writerAgent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "write",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Draft proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_current"],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let architectAgent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Proposal Reviewer / Architect",
+            mode: "review",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Review proposal architecture.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_architect"],
+            sessionReuseScope: .same_invocation_owner
+        )
+
+        let writerTask = AgentTask(
+            agent: "proposal_writer",
+            task: "draft_initial_proposal",
+            inputs: nil,
+            outputs: ["proposal_current"]
+        )
+        let architectTask = AgentTask(
+            agent: "proposal_reviewer_architect",
+            task: "review_proposal_as_architect",
+            inputs: nil,
+            outputs: ["proposal_review_architect"]
+        )
+
+        let writerResult = try await executor.execute(task: writerTask, agent: writerAgent, context: writerContext)
+        #expect(writerResult.succeeded)
+        #expect(writerResult.sessionID == "recycled-session")
+
+        let architectResult = try await executor.execute(task: architectTask, agent: architectAgent, context: architectContext)
+        #expect(architectResult.succeeded)
+        #expect(architectResult.sessionID == "recycled-session")
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["recycled-session", "recycled-session"])
+    }
+
+    @MainActor
+    @Test("Executor starts a fresh session after prior generation settles even if transport used SSE errors before")
+    func gooseExecutorFallsBackWhenReusedSessionEndsWithSSEError() async throws {
+        let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
+        let config = ModelConfiguration("GooseAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let sessionManager = AgentSessionManager(container: container)
+        let transport = StaleReuseSSEErrorTransport()
+        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+
+        let runID = UUID()
+        let firstContext = makeContext(runID: runID)
+        let secondContext = ExecutionContext(
+            workspace: firstContext.workspace,
+            stageID: firstContext.stageID,
+            stageLineageID: firstContext.stageLineageID,
+            ownerExecutionLineageID: UUID(),
+            iteration: firstContext.iteration,
+            attemptNumber: firstContext.attemptNumber,
+            inputArtifacts: firstContext.inputArtifacts,
+            inputArtifactPaths: firstContext.inputArtifactPaths,
+            variables: firstContext.variables,
+            ideaBody: firstContext.ideaBody,
+            providerBinding: firstContext.providerBinding
+        )
+        let agent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Aggregate proposal reviews.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_summary"],
+            sessionReuseScope: .same_agent_family_within_run,
+            sessionFamilyID: "orchestration_loop"
+        )
+        let task = AgentTask(
+            agent: "lead_orchestrator",
+            task: "aggregate_proposal_reviews",
+            inputs: nil,
+            outputs: ["proposal_review_summary"]
+        )
+
+        let firstResult = try await executor.execute(task: task, agent: agent, context: firstContext)
+        #expect(firstResult.succeeded)
+        #expect(firstResult.sessionReuseDisposition == SessionReuseDisposition.fresh)
+
+        let secondResult = try await executor.execute(task: task, agent: agent, context: secondContext)
+
+        #expect(secondResult.succeeded)
+        #expect(secondResult.sessionReuseDisposition == SessionReuseDisposition.fresh)
+        #expect(secondResult.outputs["proposal_review_summary"] != nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
+    }
+
+    @MainActor
+    @Test("Executor maps quota stream errors to canonical limit exhaustion")
+    func gooseExecutorMapsQuotaErrorToLimitExhaustion() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .error(message: "Claude monthly quota exhausted; rate limit exceeded")
+            ]
+        )
+
+        let executor = GooseAgentExecutor(transport: transport)
+        let result = try await executor.execute(task: makeTask(), agent: makeAgent(), context: makeContext())
+
+        #expect(!result.succeeded)
+        #expect(result.canonicalOutcome == .limitExhaustedBeforeOutput)
+        #expect(result.errorMessage == "Provider or app limit exhausted")
+    }
+
+    @MainActor
+    @Test("Executor maps Gemini capacity exhaustion to retryable limit failure after durable output")
+    func gooseExecutorMapsGeminiCapacityErrorAfterOutput() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .error(message: "Gemini CLI command failed: Attempt 1 failed with status 429. No capacity available for model gemini-2.5-pro on the server. MODEL_CAPACITY_EXHAUSTED")
+            ]
+        )
+
+        let context = makeContext()
+        let agent = makeAgent(outputs: ["test_output.md"])
+        let outputDir = context.workspace.artifactRoot
+            .appendingPathComponent("\(context.stageID).\(context.iteration)", isDirectory: true)
+            .appendingPathComponent(agent.id, isDirectory: true)
+            .appendingPathComponent("\(context.attemptNumber)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        try "durable output".data(using: .utf8)?.write(to: outputDir.appendingPathComponent("test_output.md"))
+
+        let executor = GooseAgentExecutor(transport: transport)
+        let result = try await executor.execute(task: makeTask(), agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.canonicalOutcome == .limitExhaustedAfterOutput)
+        #expect(result.transportErrorKind == .provider)
+        #expect(result.errorMessage == "Provider capacity exhausted; retry the agent")
+    }
+
+    @MainActor
+    @Test("Executor surfaces session loss as provider-session unavailable instead of raw not-found text")
+    func gooseExecutorSurfacesBoundedSessionUnavailableMessage() async throws {
+        let transport = PersistentSessionUnavailableTransport()
+        let executor = GooseAgentExecutor(transport: transport)
+
+        let result = try await executor.execute(task: makeTask(), agent: makeAgent(), context: makeContext())
+
+        #expect(!result.succeeded)
+        #expect(result.errorMessage == "Provider session became unavailable during execution")
+        #expect(result.errorMessage?.contains("Session not found") == false)
     }
 }

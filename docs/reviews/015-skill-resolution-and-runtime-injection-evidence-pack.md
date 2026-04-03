@@ -37,6 +37,8 @@
 - Assumptions:
   - current `.codex/skills/*` bundle shape is the intended external skill MVP source of truth
   - current examples under `/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml` are valid grounding for real role/mode usage
+- Repeat freshness note:
+  - no-delta repeat on 2026-04-03; proposal hash remained `162789b1c6a3b41439c7e4d6d72b436c`
 - Open questions:
   - if future proposals promote companion bundle files into executable truth, should flattening happen at compile time or through typed runtime references?
 - Blockers:

@@ -310,13 +310,25 @@ final class ExecutionService {
     /// **Phase 2** (synchronous): `finalizeSettlement()` — settlement log updated with real outcomes,
     /// `cancellationSettledAt` written, `run.status = .cancelled`.
     func cancelRun(runID: UUID) async {
-        guard let orchestrator = activeOrchestrators[runID] else { return }
+        guard let run = fetchRun(id: runID) else { return }
+
+        guard ![RunStatus.completed, .failed, .cancelled].contains(run.status) else { return }
+
+        guard let orchestrator = activeOrchestrators[runID] else {
+            let coordinator = RunCancellationCoordinator(run: run, orchestrator: nil)
+            coordinator.beginSettlement()
+            coordinator.finalizeSettlement(sessionOutcomes: [])
+
+            pendingApprovals = pendingApprovals.filter { $0.value.runID != runID }
+            synchronizeIdeaStatus(for: run)
+            refreshDockBadge()
+            return
+        }
 
         // Phase 1: Synchronous settlement — agents cancelled, preliminary log written.
         let coordinator = RunCancellationCoordinator(
-            run: orchestrator.run,
-            orchestrator: orchestrator,
-            modelContext: modelContext
+            run: run,
+            orchestrator: orchestrator
         )
         coordinator.beginSettlement()
 
@@ -369,6 +381,11 @@ final class ExecutionService {
     /// Get the orchestrator for a specific run.
     func orchestrator(for runID: UUID) -> WorkflowOrchestrator? {
         activeOrchestrators[runID]
+    }
+
+    private func fetchRun(id: UUID) -> Run? {
+        let descriptor = FetchDescriptor<Run>()
+        return (try? modelContext.fetch(descriptor))?.first(where: { $0.id == id })
     }
 
     @discardableResult

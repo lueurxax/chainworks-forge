@@ -310,6 +310,101 @@ struct RunTests {
         #expect(run.currentStageID == "s2")
     }
 
+    @Test func currentStageIDPrefersMostRecentBlockedStageOverOlderRunningStage() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+
+        let staleRunningStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .running
+        )
+        staleRunningStage.run = run
+        context.insert(staleRunningStage)
+
+        let latestBlockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        latestBlockedStage.run = run
+        context.insert(latestBlockedStage)
+
+        #expect(run.currentStageID == "state_4_proposal_reviewed")
+    }
+
+    @Test func presentationStatusPrefersLatestBlockedStageWhenRunStatusIsStaleRunning() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+        run.status = .running
+
+        let staleRunningStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .running
+        )
+        staleRunningStage.run = run
+        context.insert(staleRunningStage)
+
+        let latestBlockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        latestBlockedStage.run = run
+        context.insert(latestBlockedStage)
+
+        #expect(run.presentationStatus == .blocked)
+        #expect(run.presentationStatusLabel == "blocked")
+    }
+
+    @Test func operatorStopAvailabilityMatchesNonTerminalRunTruth() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+
+        run.status = .running
+        #expect(run.canBeCancelledByOperator)
+
+        run.status = .blocked
+        #expect(run.canBeCancelledByOperator)
+
+        run.status = .waitingApproval
+        #expect(run.canBeCancelledByOperator)
+
+        run.status = .completed
+        #expect(!run.canBeCancelledByOperator)
+
+        run.status = .failed
+        #expect(!run.canBeCancelledByOperator)
+
+        run.status = .cancelled
+        #expect(!run.canBeCancelledByOperator)
+    }
+
+    @Test func operatorStopAvailabilityStaysTrueWhileCancellationIsSettling() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+
+        run.status = .running
+        run.cancellationRequestedAt = Date()
+        run.cancellationSettledAt = nil
+
+        #expect(run.presentationStatus == .cancelling)
+        #expect(run.canBeCancelledByOperator)
+    }
+
     @Test func blockedStateForDrift() throws {
         let context = try makeContext()
         let idea = Idea(title: "Test", body: "Body")
@@ -547,7 +642,7 @@ struct YAMLParserTests {
             #expect(catalog.agents.count == 16)  // 13 original + 3 Steward agents (Proposal 003)
             #expect(catalog.backendProfiles.count == 14)  // 11 original + 3 Steward profiles
             #expect(catalog.permissionProfiles.count == 8)
-            #expect(catalog.contracts.count == 14)  // 11 original + 3 Steward contracts
+            #expect(catalog.contracts.count == 18)  // Canonical catalog now includes proposal-loop and strategy contracts
         } catch {
             Issue.record("Parse failed: \(error)")
         }
@@ -600,6 +695,15 @@ struct YAMLParserTests {
         #expect(catalog.backendProfiles["codex_builder_high"]?.provider == "codex")
     }
 
+    @Test func exampleCatalogKeepsProposalWriterOnCurrentWriterProfile() throws {
+        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let catalog = try YAMLParser.loadAgentCatalog(
+            from: repoRoot.appendingPathComponent("examples/agents/agents.yaml")
+        )
+        let writer = try #require(catalog.agents.first(where: { $0.id == "proposal_writer" }))
+        #expect(writer.backendProfile == "codex_writer_high")
+    }
+
     @Test func parseWorkflowStates() throws {
         let workflow = try YAMLParser.loadWorkflow(
             from: fixtureURL("workflow.yaml")
@@ -634,7 +738,7 @@ struct YAMLParserTests {
 
     @Test func testParseArtifactContracts() throws {
         let catalog = try YAMLParser.loadAgentCatalog(from: fixtureURL("agents.yaml"))
-        #expect(catalog.contracts.count == 14)  // 11 original + 3 Steward contracts (Proposal 003)
+        #expect(catalog.contracts.count == 18)  // Canonical catalog now includes proposal-loop and strategy contracts
     }
 
     // MARK: - REQ-011: Transitions
@@ -877,6 +981,53 @@ struct YAMLValidatorTests {
         )
         let issues = YAMLValidator.validateOutputContractRefs(catalog)
         #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("nonexistent_contract") }))
+    }
+
+    @Test func sharedOutputContractCannotSilentlyCoverHeterogeneousOutputs() {
+        let catalog = makeCatalog(
+            skills: ["sk1": dummySkillRef],
+            contracts: [
+                "implementation_self_assessment_v1": ArtifactContract(format: "json", requiredFields: ["seemingly_complete"])
+            ],
+            backendProfiles: ["bp1": dummyBackendProfile],
+            permissionProfiles: ["pp1": dummyPermissionProfile],
+            agents: [
+                makeAgent(
+                    id: "code_writer",
+                    outputs: ["implementation_progress", "implementation_self_assessment", "changed_files_manifest", "tests_result"],
+                    outputContract: "implementation_self_assessment_v1"
+                )
+            ]
+        )
+
+        let issues = YAMLValidator.validateOutputContractRefs(catalog)
+        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("implementation_progress") && $0.message.contains("falls back to shared output_contract") }))
+        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("changed_files_manifest") && $0.message.contains("falls back to shared output_contract") }))
+        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("tests_result") && $0.message.contains("falls back to shared output_contract") }))
+    }
+
+    @Test func dedicatedOutputContractsMakeSharedContractSafe() {
+        let catalog = makeCatalog(
+            skills: ["sk1": dummySkillRef],
+            contracts: [
+                "implementation_self_assessment_v1": ArtifactContract(format: "json", requiredFields: ["seemingly_complete"]),
+                "implementation_progress": ArtifactContract(format: "json", requiredFields: ["status"]),
+                "changed_files_manifest": ArtifactContract(format: "json", requiredFields: ["files"]),
+                "tests_result": ArtifactContract(format: "json", requiredFields: ["green"])
+            ],
+            backendProfiles: ["bp1": dummyBackendProfile],
+            permissionProfiles: ["pp1": dummyPermissionProfile],
+            agents: [
+                makeAgent(
+                    id: "code_writer",
+                    outputs: ["implementation_progress", "implementation_self_assessment", "changed_files_manifest", "tests_result"],
+                    outputContract: "implementation_self_assessment_v1"
+                )
+            ]
+        )
+
+        let issues = YAMLValidator.validateOutputContractRefs(catalog)
+        #expect(issues.filter { $0.severity == .error }.isEmpty)
     }
 
     @Test func brokenArtifactRef() {

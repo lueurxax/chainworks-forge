@@ -138,12 +138,55 @@ struct YAMLValidator: Sendable {
     }
 
     static func validateOutputContractRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
-        catalog.agents.compactMap { agent in
+        var issues: [ValidationIssue] = catalog.agents.compactMap { agent in
             guard let contract = agent.outputContract else { return nil }
             return catalog.contracts[contract] == nil
                 ? ValidationIssue(severity: .error, message: "Agent '\(agent.id)' references non-existent contract '\(contract)'", location: "agents.\(agent.id).output_contract")
                 : nil
         }
+
+        for agent in catalog.agents {
+            guard let explicit = agent.outputContract,
+                  catalog.contracts[explicit] != nil,
+                  agent.outputs.count > 1 else { continue }
+
+            for output in agent.outputs where output != explicit {
+                guard !hasDedicatedContractBinding(for: output, in: catalog) else { continue }
+                issues.append(
+                    ValidationIssue(
+                        severity: .error,
+                        message: "Agent '\(agent.id)' output '\(output)' falls back to shared output_contract '\(explicit)'. Declare an exact or versioned contract for this output instead of relying on the agent-level fallback.",
+                        location: "agents.\(agent.id).outputs"
+                    )
+                )
+            }
+        }
+
+        return issues
+    }
+
+    private static func hasDedicatedContractBinding(for outputName: String, in catalog: AgentCatalog) -> Bool {
+        if catalog.contracts[outputName] != nil {
+            return true
+        }
+
+        if catalog.contracts["\(outputName)_v1"] != nil {
+            return true
+        }
+
+        for contractID in catalog.contracts.keys where contractStemMatches(contractID: contractID, outputName: outputName) {
+            return true
+        }
+
+        return false
+    }
+
+    private static func contractStemMatches(contractID: String, outputName: String) -> Bool {
+        guard let stemRange = contractID.range(of: #"_v\d+$"#, options: .regularExpression) else {
+            return false
+        }
+        let stem = String(contractID[..<stemRange.lowerBound])
+        return outputName.hasPrefix(stem) && outputName != contractID
     }
 
     static func validateArtifactRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {

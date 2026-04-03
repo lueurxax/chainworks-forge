@@ -92,6 +92,12 @@ final class ProviderSettingsStore {
 
     private static func sanitized(_ provider: ConfiguredProvider) -> ConfiguredProvider {
         var provider = provider
+        provider.defaultModel = ProviderDefaults.canonicalModel(
+            provider.defaultModel,
+            for: provider.family,
+            transport: provider.transport
+        )
+
         if let defaultModel = provider.defaultModel,
            !ProviderDefaults.model(defaultModel, isCompatibleWith: provider.family) {
             provider.defaultModel = ProviderDefaults.defaultModel(for: provider.family)
@@ -131,7 +137,7 @@ final class ProviderSettingsStore {
                 transport: .gooseServer,
                 endpoint: gooseBaseURL,
                 authMode: gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
-                defaultModel: "claude-sonnet-4"
+                defaultModel: "sonnet"
             ),
             ConfiguredProvider(
                 family: .gemini,

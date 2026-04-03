@@ -140,6 +140,7 @@ final class WorkflowOrchestrator {
             currentStateID = resumeState
         }
 
+        reconcileLateMaterializedOutputsIfNeeded()
         loadPersistedArtifacts()
 
         if restorePendingApprovalIfNeeded(for: currentStateID) {
@@ -342,17 +343,25 @@ final class WorkflowOrchestrator {
     /// Execute a single state: run block, then check approval.
     private func executeState(_ state: ExecutableState) async -> StateResult {
         RuntimeDiagnostics.log("executeState begin stateID=\(state.id)")
-        // Create StageExecution lazily (ARCH-027)
-        let iteration = currentIteration(for: state.id)
-        let stageExec = StageExecution(
-            stageID: state.id,
-            label: state.label,
-            status: .running,
-            iteration: iteration,
-            attemptNumber: 1
-        )
-        stageExec.run = run
-        modelContext.insert(stageExec)
+        let stageExec: StageExecution
+        if let resumableStage = resumableStageExecution(for: state.id) {
+            stageExec = resumableStage
+            stageExec.status = .running
+            stageExec.completedAt = nil
+        } else {
+            // Create StageExecution lazily (ARCH-027)
+            let iteration = currentIteration(for: state.id)
+            let freshStage = StageExecution(
+                stageID: state.id,
+                label: state.label,
+                status: .running,
+                iteration: iteration,
+                attemptNumber: 1
+            )
+            freshStage.run = run
+            modelContext.insert(freshStage)
+            stageExec = freshStage
+        }
 
         // Proposal 007: Provision worktree before executing implementation states
         do {
@@ -472,21 +481,45 @@ final class WorkflowOrchestrator {
         }
         let agent = effectiveAgent(from: resolvedAgent)
 
-        // Create AgentExecution lazily (ARCH-027)
-        let agentExec = AgentExecution(
-            agentID: agent.id,
-            agentTitle: agent.title,
-            taskName: task.task,
-            status: .running,
-            provider: agent.provider,
-            effort: agent.effort
-        )
+        let agentExec: AgentExecution
+        if let resumableAgent = resumableAgentExecution(for: task, agent: agent, in: stageExec) {
+            switch resumableAgent.status {
+            case .completed:
+                return true
+            case .pending, .ready, .running:
+                agentExec = resumableAgent
+                agentExec.status = .running
+                agentExec.completedAt = nil
+            case .failed, .cancelled, .skipped:
+                let freshExecution = AgentExecution(
+                    agentID: agent.id,
+                    agentTitle: agent.title,
+                    taskName: task.task,
+                    status: .running,
+                    provider: agent.provider,
+                    effort: agent.effort
+                )
+                freshExecution.stageExecution = stageExec
+                modelContext.insert(freshExecution)
+                agentExec = freshExecution
+            }
+        } else {
+            // Create AgentExecution lazily (ARCH-027)
+            let freshExecution = AgentExecution(
+                agentID: agent.id,
+                agentTitle: agent.title,
+                taskName: task.task,
+                status: .running,
+                provider: agent.provider,
+                effort: agent.effort
+            )
+            freshExecution.stageExecution = stageExec
+            modelContext.insert(freshExecution)
+            agentExec = freshExecution
+        }
         // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
         agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
         agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
-
-        agentExec.stageExecution = stageExec
-        modelContext.insert(agentExec)
         registerLiveExecution(agentExec, for: agent.id)
 
         // Gather input artifacts
@@ -560,7 +593,7 @@ final class WorkflowOrchestrator {
             stageID: state.id,
             stageLineageID: stageExec.lineageID,
             ownerExecutionLineageID: agentExec.id,
-            iteration: currentIteration(for: state.id),
+            iteration: stageExec.iteration,
             attemptNumber: stageExec.attemptNumber,
             inputArtifacts: inputData,
             inputArtifactPaths: inputArtifactPaths,
@@ -617,7 +650,7 @@ final class WorkflowOrchestrator {
                     stageID: state.id,
                     stageLineageID: stageExec.lineageID,
                     ownerExecutionLineageID: agentExec.id,
-                    iteration: currentIteration(for: state.id),
+                    iteration: stageExec.iteration,
                     attemptNumber: stageExec.attemptNumber,
                     inputArtifacts: inputData,
                     inputArtifactPaths: inputArtifactPaths,
@@ -720,7 +753,7 @@ final class WorkflowOrchestrator {
                     agentExecution: agentExec,
                     workspace: currentWorkspace,
                     stageID: state.id,
-                    iteration: currentIteration(for: state.id),
+                    iteration: stageExec.iteration,
                     attemptNumber: stageExec.attemptNumber,
                     artifactManager: artifactManager,
                     catalog: catalog
@@ -729,8 +762,13 @@ final class WorkflowOrchestrator {
 
                 // Step 2: Validate structured outputs AFTER raw persistence (§6.2 Rule 3)
                 var envelopes = rawEnvelopes
+                let contractOutputs = filteredContractOutputs(
+                    from: result.outputs,
+                    task: task,
+                    agent: agent
+                )
                 let validationResults = ArtifactPersistenceOrderingPolicy.validatePersistedOutputs(
-                    outputs: result.outputs,
+                    outputs: contractOutputs,
                     agent: agent,
                     catalog: catalog,
                     envelopes: &envelopes
@@ -745,7 +783,7 @@ final class WorkflowOrchestrator {
                 if let checkpoint = result.sessionCheckpoint {
                     try persistEnrichedCheckpoint(
                         checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
-                        stageID: state.id, iteration: currentIteration(for: state.id), attemptNumber: stageExec.attemptNumber
+                        stageID: state.id, iteration: stageExec.iteration, attemptNumber: stageExec.attemptNumber
                     )
                 }
 
@@ -873,7 +911,7 @@ final class WorkflowOrchestrator {
                         agentExecution: agentExec,
                         workspace: currentWorkspace,
                         stageID: state.id,
-                        iteration: currentIteration(for: state.id),
+                        iteration: stageExec.iteration,
                         attemptNumber: stageExec.attemptNumber,
                         artifactManager: artifactManager,
                         catalog: catalog
@@ -885,8 +923,64 @@ final class WorkflowOrchestrator {
                     if let checkpoint = result.sessionCheckpoint {
                         try? persistEnrichedCheckpoint(
                             checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
-                            stageID: state.id, iteration: currentIteration(for: state.id), attemptNumber: stageExec.attemptNumber
+                            stageID: state.id, iteration: stageExec.iteration, attemptNumber: stageExec.attemptNumber
                         )
+                    }
+
+                    if shouldTreatAfterOutputFailureAsRecoveredSuccess(result) {
+                        var recoveredEnvelopes = envelopes
+                        let contractOutputs = filteredContractOutputs(
+                            from: result.outputs,
+                            task: task,
+                            agent: agent
+                        )
+                        let validationResults = ArtifactPersistenceOrderingPolicy.validatePersistedOutputs(
+                            outputs: contractOutputs,
+                            agent: agent,
+                            catalog: catalog,
+                            envelopes: &recoveredEnvelopes
+                        )
+                        let failedResults = validationResults.values.filter { $0.status == OutputValidationStatus.failed }
+
+                        if failedResults.isEmpty {
+                            agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(recoveredEnvelopes)
+                            let validatedFields = try validateStructuredOutputs(
+                                result.outputs,
+                                for: task,
+                                agent: agent
+                            )
+
+                            for artifact in artifacts {
+                                producedArtifactNames.insert(artifact.name)
+
+                                if let fields = validatedFields[artifact.name] {
+                                    artifactFields[artifact.name] = fields
+                                } else if artifact.format == .json,
+                                          let data = result.outputs[artifact.name],
+                                          let fields = tryExtractScalarFields(from: data) {
+                                    artifactFields[artifact.name] = fields
+                                }
+
+                                if artifact.name.hasSuffix("_transcript.md") {
+                                    agentExec.transcriptArtifactPath = artifact.filePath
+                                    agentExec.transcriptPath = artifact.filePath
+                                }
+                            }
+
+                            if let cost = result.costCents {
+                                run.totalCostCents = (run.totalCostCents ?? 0) + cost
+                            }
+
+                            agentExec.status = .completed
+                            agentExec.retryReason = nil
+                            agentExec.logSnippet = mergedLogSnippet(
+                                existing: agentExec.logSnippet,
+                                result: "Recovered after transport failure because durable outputs validated"
+                            )
+                            updateCompactionOutcome(agentExec: agentExec, succeeded: true)
+                            unregisterLiveExecution(agentExec, for: agent.id)
+                            return true
+                        }
                     }
 
                     persistStageFailureEvidence(
@@ -922,6 +1016,17 @@ final class WorkflowOrchestrator {
         for artifact in artifacts where artifact.name.hasSuffix("_transcript.md") {
             agentExec.transcriptArtifactPath = artifact.filePath
             agentExec.transcriptPath = artifact.filePath
+        }
+    }
+
+    private func shouldTreatAfterOutputFailureAsRecoveredSuccess(_ result: AgentResult) -> Bool {
+        guard result.outputPresence == .durableOutput else { return false }
+        let canonicalOutcome = result.canonicalOutcome ?? (result.succeeded ? .completed : .failedBeforeOutput)
+        switch canonicalOutcome {
+        case .timedOutAfterOutput, .completedWithTransportError, .limitExhaustedAfterOutput:
+            return true
+        default:
+            return false
         }
     }
 
@@ -1100,7 +1205,7 @@ final class WorkflowOrchestrator {
                     agentExecution: agentExec,
                     workspace: currentWorkspace,
                     stageID: state.id,
-                    iteration: currentIteration(for: state.id),
+                    iteration: stageExec.iteration,
                     attemptNumber: stageExec.attemptNumber,
                     catalog: catalog
                 )
@@ -1189,7 +1294,7 @@ final class WorkflowOrchestrator {
                     agentExecution: agentExec,
                     workspace: currentWorkspace,
                     stageID: state.id,
-                    iteration: currentIteration(for: state.id),
+                    iteration: stageExec.iteration,
                     attemptNumber: 1,
                     catalog: catalog
                 )
@@ -1270,20 +1375,44 @@ final class WorkflowOrchestrator {
             guard let resolvedAgent = plan.agentBindings[task.agent] else { continue }
             let agent = effectiveAgent(from: resolvedAgent)
 
-            let agentExec = AgentExecution(
-                agentID: agent.id,
-                agentTitle: agent.title,
-                taskName: task.task,
-                status: .running,
-                provider: agent.provider,
-                effort: agent.effort
-            )
+            let agentExec: AgentExecution
+            if let resumableAgent = resumableAgentExecution(for: task, agent: agent, in: stageExec) {
+                switch resumableAgent.status {
+                case .completed:
+                    continue
+                case .pending, .ready, .running:
+                    agentExec = resumableAgent
+                    agentExec.status = .running
+                    agentExec.completedAt = nil
+                case .failed, .cancelled, .skipped:
+                    let freshExecution = AgentExecution(
+                        agentID: agent.id,
+                        agentTitle: agent.title,
+                        taskName: task.task,
+                        status: .running,
+                        provider: agent.provider,
+                        effort: agent.effort
+                    )
+                    freshExecution.stageExecution = stageExec
+                    modelContext.insert(freshExecution)
+                    agentExec = freshExecution
+                }
+            } else {
+                let freshExecution = AgentExecution(
+                    agentID: agent.id,
+                    agentTitle: agent.title,
+                    taskName: task.task,
+                    status: .running,
+                    provider: agent.provider,
+                    effort: agent.effort
+                )
+                freshExecution.stageExecution = stageExec
+                modelContext.insert(freshExecution)
+                agentExec = freshExecution
+            }
             // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
             agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
             agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
-
-            agentExec.stageExecution = stageExec
-            modelContext.insert(agentExec)
             registerLiveExecution(agentExec, for: agent.id)
 
             taskAgentPairs.append((task, agent, agentExec))
@@ -1366,7 +1495,7 @@ final class WorkflowOrchestrator {
                     stageID: state.id,
                     stageLineageID: stageExec.lineageID,
                     ownerExecutionLineageID: pair.agentExec.id,
-                    iteration: currentIteration(for: state.id),
+                    iteration: stageExec.iteration,
                     attemptNumber: stageExec.attemptNumber,
                     inputArtifacts: gatheredInputs,
                     inputArtifactPaths: inputArtifactPaths,
@@ -1415,73 +1544,270 @@ final class WorkflowOrchestrator {
 
             agentExec.completedAt = Date()
 
-            guard let result = optResult, result.succeeded else {
-                agentExec.status = .failed
-                agentExec.logSnippet = optResult?.errorMessage ?? "Execution failed"
-                if let result = optResult {
-                    applyExecutionTruth(from: result, to: agentExec)
-                } else {
-                    applyTerminalExecutionTruth(
-                        to: agentExec,
-                        canonicalOutcome: .failedBeforeOutput,
-                        transportErrorKind: .unknown,
-                        providerStopReason: nil,
-                        outputPresence: .none,
-                        runtimeProvider: nil,
-                        runtimeModel: nil,
-                        rawErrorMessage: agentExec.logSnippet,
-                        rawFinishEvent: nil
-                    )
+            if let result = optResult {
+                agentExec.costCents = result.costCents
+                agentExec.resolvedModel = result.resolvedModel
+                agentExec.configuredProviderID = result.configuredProviderID
+                agentExec.adapterVersion = result.adapterVersion
+                agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
+                agentExec.sessionLineageID = result.sessionLineageID
+                agentExec.sessionGenerationID = result.sessionGenerationID
+                agentExec.sessionReuseDisposition = result.sessionReuseDisposition
+
+                applyExecutionTruth(from: result, to: agentExec)
+                if let sessionID = result.sessionID {
+                    agentExec.providerSessionID = sessionID
+                    agentExec.gooseSessionID = sessionID
                 }
+                agentExec.logSnippet = mergedLogSnippet(
+                    existing: agentExec.logSnippet,
+                    result: result.logSnippet
+                )
+                finalizeStrategyExecutionMetadata(
+                    on: agentExec,
+                    modelTierUsed: agentExec.modelTierUsed ?? self.contextStrategyProfile?.defaultModelTier ?? "bound_runtime",
+                    escalationCount: 0,
+                    retryableEscalationCount: 0,
+                    lazyEvidenceHitCount: result.lazyEvidenceArtifactHits.count
+                )
+            }
+
+            guard let result = optResult else {
+                agentExec.status = .failed
+                agentExec.logSnippet = "Execution failed"
+                applyTerminalExecutionTruth(
+                    to: agentExec,
+                    canonicalOutcome: .failedBeforeOutput,
+                    transportErrorKind: .unknown,
+                    providerStopReason: nil,
+                    outputPresence: .none,
+                    runtimeProvider: nil,
+                    runtimeModel: nil,
+                    rawErrorMessage: agentExec.logSnippet,
+                    rawFinishEvent: nil
+                )
+                persistStageFailureEvidence(
+                    stageExec: stageExec,
+                    failedAgentExec: agentExec,
+                    validationFailure: nil,
+                    additionalEnvelopes: []
+                )
+                updateCompactionOutcome(agentExec: agentExec, succeeded: false)
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
             }
 
-            agentExec.costCents = result.costCents
-            agentExec.resolvedModel = result.resolvedModel
-            agentExec.configuredProviderID = result.configuredProviderID
-            agentExec.adapterVersion = result.adapterVersion
-            agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
-            
-            // Proposal 018: Record session lineage and disposition
-            agentExec.sessionLineageID = result.sessionLineageID
-            agentExec.sessionGenerationID = result.sessionGenerationID
-            agentExec.sessionReuseDisposition = result.sessionReuseDisposition
+            guard result.succeeded else {
+                if !result.outputs.isEmpty {
+                    do {
+                        let (artifacts, envelopes) = try ArtifactPersistenceOrderingPolicy.persistRawOutputs(
+                            result: result,
+                            agent: agent,
+                            agentExecution: agentExec,
+                            workspace: currentWorkspace,
+                            stageID: state.id,
+                            iteration: stageExec.iteration,
+                            attemptNumber: stageExec.attemptNumber,
+                            artifactManager: artifactManager,
+                            catalog: catalog
+                        )
+                        capturePersistedExecutionEvidence(from: artifacts, for: agentExec)
+                        agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
 
-            applyExecutionTruth(from: result, to: agentExec)
-            if let sessionID = result.sessionID {
-                agentExec.providerSessionID = sessionID
-                agentExec.gooseSessionID = sessionID
+                        if let checkpoint = result.sessionCheckpoint {
+                            try? persistEnrichedCheckpoint(
+                                checkpoint: checkpoint,
+                                artifacts: artifacts,
+                                agentExec: agentExec,
+                                stageID: state.id,
+                                iteration: stageExec.iteration,
+                                attemptNumber: stageExec.attemptNumber
+                            )
+                        }
+
+                        if shouldTreatAfterOutputFailureAsRecoveredSuccess(result) {
+                            var recoveredEnvelopes = envelopes
+                            let contractOutputs = filteredContractOutputs(
+                                from: result.outputs,
+                                task: pair.task,
+                                agent: agent
+                            )
+                            let validationResults = ArtifactPersistenceOrderingPolicy.validatePersistedOutputs(
+                                outputs: contractOutputs,
+                                agent: agent,
+                                catalog: catalog,
+                                envelopes: &recoveredEnvelopes
+                            )
+                            let failedResults = validationResults.values.filter { $0.status == OutputValidationStatus.failed }
+
+                            if failedResults.isEmpty {
+                                agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(recoveredEnvelopes)
+                                let validatedFields = try validateStructuredOutputs(
+                                    result.outputs,
+                                    for: pair.task,
+                                    agent: agent
+                                )
+
+                                for artifact in artifacts {
+                                    producedArtifactNames.insert(artifact.name)
+
+                                    if let fields = validatedFields[artifact.name] {
+                                        artifactFields[artifact.name] = fields
+                                    } else if artifact.format == .json,
+                                              let data = result.outputs[artifact.name],
+                                              let fields = tryExtractScalarFields(from: data) {
+                                        artifactFields[artifact.name] = fields
+                                    }
+
+                                    if artifact.name.hasSuffix("_transcript.md") {
+                                        agentExec.transcriptArtifactPath = artifact.filePath
+                                        agentExec.transcriptPath = artifact.filePath
+                                    }
+                                }
+
+                                if let cost = result.costCents {
+                                    run.totalCostCents = (run.totalCostCents ?? 0) + cost
+                                }
+
+                                agentExec.status = .completed
+                                agentExec.retryReason = nil
+                                agentExec.logSnippet = mergedLogSnippet(
+                                    existing: agentExec.logSnippet,
+                                    result: "Recovered after transport failure because durable outputs validated"
+                                )
+                                updateCompactionOutcome(agentExec: agentExec, succeeded: true)
+                                unregisterLiveExecution(agentExec, for: agent.id)
+                                continue
+                            }
+                        }
+
+                        persistStageFailureEvidence(
+                            stageExec: stageExec,
+                            failedAgentExec: agentExec,
+                            validationFailure: nil,
+                            additionalEnvelopes: envelopes
+                        )
+                    } catch {
+                        agentExec.logSnippet = mergedLogSnippet(
+                            existing: agentExec.logSnippet,
+                            result: "Raw failure outputs could not be persisted: \(error.localizedDescription)"
+                        )
+                    }
+                } else {
+                    persistStageFailureEvidence(
+                        stageExec: stageExec,
+                        failedAgentExec: agentExec,
+                        validationFailure: nil,
+                        additionalEnvelopes: []
+                    )
+                }
+
+                agentExec.status = .failed
+                agentExec.logSnippet = result.errorMessage
+                updateCompactionOutcome(agentExec: agentExec, succeeded: false)
+                unregisterLiveExecution(agentExec, for: agent.id)
+                allSucceeded = false
+                continue
             }
-            agentExec.logSnippet = mergedLogSnippet(
-                existing: agentExec.logSnippet,
-                result: result.logSnippet
-            )
-            finalizeStrategyExecutionMetadata(
-                on: agentExec,
-                modelTierUsed: agentExec.modelTierUsed ?? self.contextStrategyProfile?.defaultModelTier ?? "bound_runtime",
-                escalationCount: 0,
-                retryableEscalationCount: 0,
-                lazyEvidenceHitCount: result.lazyEvidenceArtifactHits.count
-            )
 
             do {
-                let validatedFields = try validateStructuredOutputs(
-                    result.outputs,
-                    for: pair.task,
-                    agent: agent
-                )
-                // Proposal 013: use actual stage attempt number
-                let artifacts = try artifactManager.persistOutputs(
-                    outputs: result.outputs,
+                let (artifacts, rawEnvelopes) = try ArtifactPersistenceOrderingPolicy.persistRawOutputs(
+                    result: result,
                     agent: agent,
                     agentExecution: agentExec,
                     workspace: currentWorkspace,
                     stageID: state.id,
-                    iteration: currentIteration(for: state.id),
+                    iteration: stageExec.iteration,
                     attemptNumber: stageExec.attemptNumber,
+                    artifactManager: artifactManager,
                     catalog: catalog
+                )
+                capturePersistedExecutionEvidence(from: artifacts, for: agentExec)
+
+                var envelopes = rawEnvelopes
+                let contractOutputs = filteredContractOutputs(
+                    from: result.outputs,
+                    task: pair.task,
+                    agent: agent
+                )
+                let validationResults = ArtifactPersistenceOrderingPolicy.validatePersistedOutputs(
+                    outputs: contractOutputs,
+                    agent: agent,
+                    catalog: catalog,
+                    envelopes: &envelopes
+                )
+                agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
+
+                if let checkpoint = result.sessionCheckpoint {
+                    try persistEnrichedCheckpoint(
+                        checkpoint: checkpoint,
+                        artifacts: artifacts,
+                        agentExec: agentExec,
+                        stageID: state.id,
+                        iteration: stageExec.iteration,
+                        attemptNumber: stageExec.attemptNumber
+                    )
+                }
+
+                let failedResults = validationResults.values.filter { $0.status == OutputValidationStatus.failed }
+                if !failedResults.isEmpty {
+                    let failureRecord = ArtifactPersistenceOrderingPolicy.buildFailureRecord(
+                        validationResults: validationResults,
+                        agent: agent,
+                        stageID: state.id,
+                        runID: run.id,
+                        rawOutputExists: true,
+                        receiptExists: agentExec.providerReceiptJSON != nil,
+                        transcriptExists: hasPersistedTranscriptEvidence(for: agentExec),
+                        catalog: catalog
+                    )
+
+                    if let failureRecord {
+                        agentExec.validationFailureJSON = try? JSONEncoder().encode(failureRecord)
+                        incrementContractFailureCount(on: agentExec)
+                        _ = try ArtifactPersistenceOrderingPolicy.persistFailureEvidence(
+                            failureRecord: failureRecord,
+                            workspace: currentWorkspace,
+                            stageID: state.id,
+                            agentID: agent.id,
+                            attemptNumber: stageExec.attemptNumber,
+                            artifactManager: artifactManager
+                        )
+                    }
+
+                    agentExec.status = .failed
+                    applyTerminalExecutionTruth(
+                        to: agentExec,
+                        canonicalOutcome: .failedAfterOutputValidation,
+                        transportErrorKind: agentExec.transportErrorKind,
+                        providerStopReason: agentExec.providerStopReason,
+                        outputPresence: .durableOutput,
+                        runtimeProvider: agentExec.runtimeProvider,
+                        runtimeModel: agentExec.runtimeModel,
+                        rawErrorMessage: failedResults.compactMap(\.validationError).joined(separator: "; "),
+                        rawFinishEvent: nil
+                    )
+                    let validationMessages = failedResults.compactMap { $0.validationError }
+                    agentExec.logSnippet = "Output contract validation failed: \(validationMessages.joined(separator: "; "))"
+
+                    persistStageFailureEvidence(
+                        stageExec: stageExec,
+                        failedAgentExec: agentExec,
+                        validationFailure: failureRecord,
+                        additionalEnvelopes: envelopes
+                    )
+
+                    updateCompactionOutcome(agentExec: agentExec, succeeded: false)
+                    unregisterLiveExecution(agentExec, for: agent.id)
+                    allSucceeded = false
+                    continue
+                }
+
+                let validatedFields = try validateStructuredOutputs(
+                    result.outputs,
+                    for: pair.task,
+                    agent: agent
                 )
 
                 for artifact in artifacts {
@@ -1500,18 +1826,11 @@ final class WorkflowOrchestrator {
                     }
                 }
 
-                // Proposal 018 REQ-010: Persist enriched session checkpoint (parallel agent path).
-                if let checkpoint = result.sessionCheckpoint {
-                    try persistEnrichedCheckpoint(
-                        checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
-                        stageID: state.id, iteration: currentIteration(for: state.id), attemptNumber: stageExec.attemptNumber
-                    )
-                }
-
                 if let cost = result.costCents {
                     run.totalCostCents = (run.totalCostCents ?? 0) + cost
                 }
                 agentExec.status = .completed
+                updateCompactionOutcome(agentExec: agentExec, succeeded: true)
             } catch {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Output validation or persistence error: \(error.localizedDescription)"
@@ -1526,6 +1845,13 @@ final class WorkflowOrchestrator {
                     rawErrorMessage: error.localizedDescription,
                     rawFinishEvent: result.outcomeEnvelope?.rawFinishEvent
                 )
+                persistStageFailureEvidence(
+                    stageExec: stageExec,
+                    failedAgentExec: agentExec,
+                    validationFailure: nil,
+                    additionalEnvelopes: []
+                )
+                updateCompactionOutcome(agentExec: agentExec, succeeded: false)
                 unregisterLiveExecution(agentExec, for: agent.id)
                 allSucceeded = false
                 continue
@@ -1579,6 +1905,33 @@ final class WorkflowOrchestrator {
         guard !run.isDeleted, run.modelContext != nil else { return 1 }
         let existing = run.stageExecutions.filter { $0.stageID == stageID }
         return existing.count + 1
+    }
+
+    private func resumableStageExecution(for stageID: String) -> StageExecution? {
+        run.stageExecutions
+            .filter { $0.stageID == stageID && ($0.status == .running || $0.status == .ready) }
+            .sorted {
+                if $0.iteration != $1.iteration { return $0.iteration < $1.iteration }
+                if $0.attemptNumber != $1.attemptNumber { return $0.attemptNumber < $1.attemptNumber }
+                return $0.startedAt < $1.startedAt
+            }
+            .last
+    }
+
+    private func resumableAgentExecution(
+        for task: AgentTask,
+        agent: ResolvedAgent,
+        in stageExec: StageExecution
+    ) -> AgentExecution? {
+        stageExec.agentExecutions
+            .filter { $0.agentID == agent.id && $0.taskName == task.task }
+            .sorted {
+                let lhsAttempt = $0.agentAttemptNumber ?? 1
+                let rhsAttempt = $1.agentAttemptNumber ?? 1
+                if lhsAttempt != rhsAttempt { return lhsAttempt < rhsAttempt }
+                return $0.startedAt < $1.startedAt
+            }
+            .last
     }
 
     private var currentWorkspace: RunWorkspace {
@@ -1712,6 +2065,235 @@ final class WorkflowOrchestrator {
             }
             artifactFields[artifact.name] = fields
         }
+    }
+
+    private func reconcileLateMaterializedOutputsIfNeeded() {
+        guard let state = plan.states[currentStateID],
+              let stageExec = resumableStageExecution(for: currentStateID) else {
+            return
+        }
+
+        for task in tasks(in: state) {
+            guard let resolvedAgent = plan.agentBindings[task.agent] else { continue }
+            let agent = effectiveAgent(from: resolvedAgent)
+            let matchingExecutions = stageExec.agentExecutions
+                .filter { $0.agentID == agent.id && $0.taskName == task.task }
+                .sorted {
+                    let lhsAttempt = $0.agentAttemptNumber ?? 1
+                    let rhsAttempt = $1.agentAttemptNumber ?? 1
+                    if lhsAttempt != rhsAttempt { return lhsAttempt < rhsAttempt }
+                    return $0.startedAt < $1.startedAt
+                }
+
+            guard let latestExec = matchingExecutions.last,
+                  latestExec.status != .completed else {
+                continue
+            }
+
+            for candidateExec in matchingExecutions.reversed() {
+                guard let recovered = recoverLatePersistedContractOutputs(
+                    for: candidateExec,
+                    latestExecution: latestExec,
+                    task: task,
+                    agent: agent,
+                    stageExec: stageExec,
+                    state: state
+                ), recovered else {
+                    continue
+                }
+                break
+            }
+        }
+    }
+
+    private func tasks(in state: ExecutableState) -> [AgentTask] {
+        var collected: [AgentTask] = []
+        if let runBlock = state.runBlock {
+            for phase in runBlock.phases {
+                switch phase {
+                case .sequential(let tasks):
+                    collected.append(contentsOf: tasks)
+                case .parallel(let tasks):
+                    collected.append(contentsOf: tasks)
+                }
+            }
+        }
+        if let runAfterApproval = state.runAfterApproval {
+            for phase in runAfterApproval.phases {
+                switch phase {
+                case .sequential(let tasks):
+                    collected.append(contentsOf: tasks)
+                case .parallel(let tasks):
+                    collected.append(contentsOf: tasks)
+                }
+            }
+        }
+        return collected
+    }
+
+    private func recoverLatePersistedContractOutputs(
+        for candidateExec: AgentExecution,
+        latestExecution: AgentExecution,
+        task: AgentTask,
+        agent: ResolvedAgent,
+        stageExec: StageExecution,
+        state: ExecutableState
+    ) -> Bool? {
+        let expectedOutputNames = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
+        guard !expectedOutputNames.isEmpty else { return false }
+
+        var recoveredOutputs: [String: Data] = [:]
+        for outputName in expectedOutputNames {
+            if let existingArtifact = candidateExec.artifacts.last(where: { $0.name == outputName }),
+               ArtifactStorage.exists(filePath: existingArtifact.filePath),
+               let data = try? artifactManager.readArtifact(existingArtifact, workspace: currentWorkspace) {
+                recoveredOutputs[outputName] = data
+                continue
+            }
+
+            let expectedPath = expectedArtifactPath(
+                for: outputName,
+                agentID: agent.id,
+                stageID: state.id,
+                iteration: stageExec.iteration,
+                attemptNumber: stageExec.attemptNumber,
+                agentAttemptNumber: candidateExec.agentAttemptNumber
+            )
+
+            guard ArtifactStorage.exists(filePath: expectedPath),
+                  let data = try? ArtifactStorage.read(
+                    filePath: expectedPath,
+                    workspaceRoot: currentWorkspace.workspaceRoot
+                  ) else {
+                return false
+            }
+
+            recoveredOutputs[outputName] = data
+        }
+
+        guard recoveredOutputs.count == expectedOutputNames.count else { return false }
+
+        var envelopes: [StructuredOutputEnvelope] = []
+        let validationResults = ArtifactPersistenceOrderingPolicy.validatePersistedOutputs(
+            outputs: recoveredOutputs,
+            agent: agent,
+            catalog: catalog,
+            envelopes: &envelopes
+        )
+        let failedResults = validationResults.values.filter { $0.status == .failed }
+        guard failedResults.isEmpty else { return false }
+
+        let validatedFields: [String: [String: AnyCodableValue]]
+        do {
+            validatedFields = try validateStructuredOutputs(
+                recoveredOutputs,
+                for: task,
+                agent: agent
+            )
+        } catch {
+            return false
+        }
+
+        let missingPersistedOutputs = recoveredOutputs.filter { outputName, _ in
+            !candidateExec.artifacts.contains(where: { $0.name == outputName })
+        }
+        if !missingPersistedOutputs.isEmpty {
+            guard let importedArtifacts = try? artifactManager.persistOutputs(
+                outputs: missingPersistedOutputs,
+                agent: agent,
+                agentExecution: candidateExec,
+                workspace: currentWorkspace,
+                stageID: state.id,
+                iteration: stageExec.iteration,
+                attemptNumber: stageExec.attemptNumber,
+                catalog: catalog
+            ) else {
+                return false
+            }
+            capturePersistedExecutionEvidence(from: importedArtifacts, for: candidateExec)
+        }
+
+        candidateExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
+        candidateExec.validationFailureJSON = nil
+        candidateExec.status = .completed
+        candidateExec.completedAt = candidateExec.completedAt ?? Date()
+        candidateExec.retryReason = nil
+        candidateExec.logSnippet = mergedLogSnippet(
+            existing: candidateExec.logSnippet,
+            result: "Recovered from late materialized contract outputs on disk"
+        )
+        applyTerminalExecutionTruth(
+            to: candidateExec,
+            canonicalOutcome: .completedWithTransportError,
+            transportErrorKind: candidateExec.transportErrorKind,
+            providerStopReason: candidateExec.providerStopReason,
+            outputPresence: .durableOutput,
+            runtimeProvider: candidateExec.runtimeProvider,
+            runtimeModel: candidateExec.runtimeModel,
+            rawErrorMessage: candidateExec.logSnippet,
+            rawFinishEvent: nil
+        )
+        updateCompactionOutcome(agentExec: candidateExec, succeeded: true)
+
+        if latestExecution.id != candidateExec.id {
+            latestExecution.status = .completed
+            latestExecution.completedAt = latestExecution.completedAt ?? Date()
+            latestExecution.validationFailureJSON = nil
+            latestExecution.retryReason = nil
+            latestExecution.logSnippet = mergedLogSnippet(
+                existing: latestExecution.logSnippet,
+                result: "Skipped because a prior attempt recovered valid contract outputs"
+            )
+            applyTerminalExecutionTruth(
+                to: latestExecution,
+                canonicalOutcome: .completedWithTransportError,
+                transportErrorKind: latestExecution.transportErrorKind,
+                providerStopReason: latestExecution.providerStopReason,
+                outputPresence: .durableOutput,
+                runtimeProvider: latestExecution.runtimeProvider,
+                runtimeModel: latestExecution.runtimeModel,
+                rawErrorMessage: latestExecution.logSnippet,
+                rawFinishEvent: nil
+            )
+            updateCompactionOutcome(agentExec: latestExecution, succeeded: true)
+        }
+
+        stageExec.validationFailureJSON = nil
+        stageExec.evidencePacketJSON = nil
+        stageExec.recoverySnapshotJSON = nil
+
+        for artifact in candidateExec.artifacts {
+            producedArtifactNames.insert(artifact.name)
+            if let fields = validatedFields[artifact.name] {
+                artifactFields[artifact.name] = fields
+            } else if artifact.format == .json,
+                      let data = try? artifactManager.readArtifact(artifact, workspace: currentWorkspace),
+                      let fields = tryExtractScalarFields(from: data) {
+                artifactFields[artifact.name] = fields
+            }
+        }
+
+        return true
+    }
+
+    private func expectedArtifactPath(
+        for name: String,
+        agentID: String,
+        stageID: String,
+        iteration: Int,
+        attemptNumber: Int,
+        agentAttemptNumber: Int?
+    ) -> String {
+        var directory = currentWorkspace.artifactRoot
+            .appendingPathComponent("\(stageID).\(iteration)", isDirectory: true)
+            .appendingPathComponent(agentID, isDirectory: true)
+            .appendingPathComponent("\(attemptNumber)", isDirectory: true)
+
+        if let agentAttemptNumber, agentAttemptNumber > 1 {
+            directory = directory.appendingPathComponent("agent-retry-\(agentAttemptNumber)", isDirectory: true)
+        }
+
+        return directory.appendingPathComponent(name).path
     }
 
     private func restorePendingApprovalIfNeeded(for stateID: String) -> Bool {
@@ -1909,6 +2491,15 @@ final class WorkflowOrchestrator {
         }
 
         return validated
+    }
+
+    private func filteredContractOutputs(
+        from outputs: [String: Data],
+        task: AgentTask,
+        agent: ResolvedAgent
+    ) -> [String: Data] {
+        let expected = Set(OutputContractResolverV2.expectedOutputs(for: task, agent: agent))
+        return outputs.filter { expected.contains($0.key) }
     }
 
     private func parseJSONObject(
@@ -2342,6 +2933,7 @@ final class WorkflowOrchestrator {
             runtimeModel: runtimeModel,
             envelope: envelope
         )
+        agentExec.retryReason = suggestedRetryReason(from: result)
     }
 
     private func applyTerminalExecutionTruth(
@@ -2373,6 +2965,32 @@ final class WorkflowOrchestrator {
             rawFinishEvent: rawFinishEvent
         )
         agentExec.outcomeEnvelopeJSON = encodeOutcomeEnvelope(resolvedEnvelope)
+    }
+
+    private func suggestedRetryReason(from result: AgentResult) -> String? {
+        let canonicalOutcome = result.canonicalOutcome ?? (result.succeeded ? .completed : .failedBeforeOutput)
+        let lowercasedError = result.errorMessage?.lowercased() ?? ""
+
+        switch canonicalOutcome {
+        case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput:
+            if lowercasedError.contains("capacity") || lowercasedError.contains("resource_exhausted") {
+                return "Provider capacity exhausted; retry this agent"
+            }
+            return "Provider limit exhausted; retry this agent"
+        case .timedOutBeforeOutput, .timedOutAfterOutput:
+            return "Execution timed out; retry this agent"
+        case .completedWithTransportError:
+            return "Transport failed after output; retry this agent"
+        default:
+            break
+        }
+
+        if lowercasedError.contains("session not found")
+            || lowercasedError.contains("failed to read session") {
+            return "Provider session became unavailable; retry this agent"
+        }
+
+        return nil
     }
 
     private static func decodeProviderBindings(from data: Data?) -> [String: ResolvedProviderBinding] {
@@ -2483,9 +3101,9 @@ final class WorkflowOrchestrator {
         case (.codex?, "frontier"):
             return "GPT-5.4"
         case (.claude?, "fast"):
-            return "claude-sonnet-4"
+            return "sonnet"
         case (.claude?, "frontier"):
-            return "claude-opus-4.6"
+            return "opus"
         case (.gemini?, "fast"):
             return "gemini-2.5-flash"
         case (.gemini?, "frontier"):

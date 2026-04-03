@@ -28,6 +28,12 @@ struct OutputContractTemplates {
             return (proposalFactDigest(), .json)
         case "implementation_self_assessment_v1":
             return (implementationSelfAssessment(), .json)
+        case "implementation_progress":
+            return (implementationProgress(), .json)
+        case "changed_files_manifest":
+            return (changedFilesManifest(), .json)
+        case "tests_result":
+            return (testsResult(), .json)
         case "audit_report_v1":
             return (auditReport(), .json)
         case "security_report_v1":
@@ -38,13 +44,27 @@ struct OutputContractTemplates {
             return (implementationReviewSummary(), .json)
         case "docs_report_v1":
             return (docsReport(), .json)
+        case "docs_delta":
+            return (docsDelta(), .json)
+        case "release_manifest":
+            return (releaseManifest(), .json)
         case "git_push_receipt_v1":
             return (gitPushReceipt(), .json)
+        case "release_bundle_manifest":
+            return (releaseBundleManifest(), .json)
         case "connect_upload_receipt_v1":
             return (connectUploadReceipt(), .json)
         // Steward contracts (Proposal 003)
         case "sdlc_health_report_v1":
             return (sdlcHealthReport(), .json)
+        case "degradation_alert":
+            return (degradationAlert(), .json)
+        case "agent_tuning_proposal":
+            return (agentTuningProposal(), .json)
+        case "workflow_tuning_proposal":
+            return (workflowTuningProposal(), .json)
+        case "experiment_plan":
+            return (experimentPlan(), .json)
         case "stewardship_audit_report_v1":
             return (stewardshipAuditReport(), .json)
         case "agent_retrospective_report_v1":
@@ -239,6 +259,35 @@ struct OutputContractTemplates {
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }
 
+    private static func implementationProgress() -> Data {
+        let json: [String: Any] = [
+            "status": "partial",
+            "current_phase": "phase_1",
+            "completed_items": ["Provisioned the worktree and landed the first implementation slice."],
+            "deferred_items": ["Broader cleanup remains for a later pass."],
+            "notes": ["Keep the repository buildable after each implementation loop."]
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func changedFilesManifest() -> Data {
+        let json: [String: Any] = [
+            "files": ["Chainworks Forge/App.swift"],
+            "summary": "Implementation changed one tracked file in the worktree."
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func testsResult() -> Data {
+        let json: [String: Any] = [
+            "green": true,
+            "summary": "Targeted verification passed for this implementation slice.",
+            "commands": ["swift test"],
+            "blocking_failures": [] as [String]
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
     private static func auditReport() -> Data {
         let json: [String: Any] = [
             "status": "pass",
@@ -295,12 +344,47 @@ struct OutputContractTemplates {
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }
 
+    private static func docsDelta() -> Data {
+        let json: [String: Any] = [
+            "files": ["README.md", "docs/reference/full-mvp-delivery.md"],
+            "summary": "Documentation updated to match the current implementation and release flow."
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func releaseManifest() -> Data {
+        let json: [String: Any] = [
+            "commitSHA": "abc123def456",
+            "branch": "feature/simulated-run",
+            "remote": "origin",
+            "commitMessage": "Apply approved proposal via Chainworks Forge",
+            "filesChanged": 3,
+            "insertions": 42,
+            "deletions": 5,
+            "timestamp": ISO8601DateFormatter().string(from: Date())
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
     private static func gitPushReceipt() -> Data {
         let json: [String: Any] = [
             "status": "success",
             "branch": "feature/simulated-run",
             "commit_sha": "abc123def456",
             "remote": "origin"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func releaseBundleManifest() -> Data {
+        let json: [String: Any] = [
+            "bundleIdentifier": "com.chainworks.forge.sandbox",
+            "bundleVersion": "1.0.0",
+            "buildNumber": "abc123de",
+            "archivePath": "Build/Fixture/ChainworksForge.xcarchive",
+            "checksumSHA256": "deadbeef",
+            "sizeBytes": 1024,
+            "timestamp": ISO8601DateFormatter().string(from: Date())
         ]
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }
@@ -367,6 +451,62 @@ struct OutputContractTemplates {
             "improvements": [] as [[String: Any]],
             "executive_summary": "No significant degradations detected in the current observation window.",
             "confidence": "high"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func degradationAlert() -> Data {
+        let json: [String: Any] = [
+            "analysis_id": UUID().uuidString,
+            "metric_name": "proposal_loop_mean",
+            "metric_family": "quality",
+            "observed_value": 2.4,
+            "baseline_value": 1.6,
+            "delta_percentage": 50.0,
+            "threshold_used": 25.0,
+            "implicated_run_ids": [UUID().uuidString],
+            "severity": "medium",
+            "likely_causes": ["Recent catalog changes increased review iteration count."],
+            "confidence": "medium"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func agentTuningProposal() -> Data {
+        let json: [String: Any] = [
+            "analysis_id": UUID().uuidString,
+            "category": "agentTuning",
+            "summary": "Increase architect reviewer reasoning depth for proposal review loops.",
+            "target_metric": "proposal_loop_mean",
+            "proposed_patch_path": "examples/agents/agents.yaml",
+            "confidence_level": "medium",
+            "status": "proposed"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func workflowTuningProposal() -> Data {
+        let json: [String: Any] = [
+            "analysis_id": UUID().uuidString,
+            "category": "workflowTuning",
+            "summary": "Relax the proposal approval threshold when all reviewers approve and blockers are zero.",
+            "target_metric": "proposal_approval_rate",
+            "proposed_patch_path": "examples/workflows/full-mvp-live.yaml",
+            "confidence_level": "medium",
+            "status": "proposed"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func experimentPlan() -> Data {
+        let json: [String: Any] = [
+            "analysis_id": UUID().uuidString,
+            "experiment_type": "limitedRollout",
+            "control_config_hash": "control-hash",
+            "treatment_config_hash": "treatment-hash",
+            "minimum_sample_size": 10,
+            "rollback_condition": "Rollback if approval rate drops by more than 10%.",
+            "status": "planned"
         ]
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }

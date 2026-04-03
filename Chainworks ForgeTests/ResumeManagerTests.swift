@@ -71,6 +71,170 @@ struct ResumeManagerTests {
         return (run, plan, workspace)
     }
 
+    private func makeRetryableRunFromPlan() throws -> (Run, RunPlan, RunWorkspace, AgentCatalog) {
+        let workflow = WorkflowDefinition(
+            schemaVersion: 1,
+            workflow: WorkflowMeta(
+                id: "retryable_test",
+                name: "Retryable Test",
+                usesAgentCatalog: nil,
+                description: "Minimal retryable workflow",
+                ideaInput: nil,
+                execution: ExecutionConfig(singleActiveRunPerIdea: true, resumePolicy: "automatic_on_launch"),
+                requiredProviders: []
+            ),
+            variables: nil,
+            failurePolicy: nil,
+            scoring: nil,
+            initialState: "state_1",
+            states: [
+                "state_1": WorkflowState(
+                    label: "Draft",
+                    type: "start",
+                    owner: "test_agent",
+                    approval: nil,
+                    run: RunBlock(
+                        sequence: [AgentTask(agent: "test_agent", task: "draft", inputs: nil, outputs: ["output_1"])],
+                        parallel: nil,
+                        then: nil
+                    ),
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: [Transition(to: "state_2", when: "exists('output_1')")]
+                ),
+                "state_2": WorkflowState(
+                    label: "Done",
+                    type: "end",
+                    owner: "test_agent",
+                    approval: nil,
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: []
+                )
+            ]
+        )
+
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Retryable resume test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: "Test Skill", description: "Test")],
+            contracts: [:],
+            backendProfiles: [
+                "test_profile": BackendProfile(
+                    provider: "claude_code",
+                    model: "test-model",
+                    effort: "high",
+                    temperature: 0,
+                    maxTurns: 4,
+                    structuredOutput: "none"
+                )
+            ],
+            permissionProfiles: [
+                "TEST": PermissionProfile(
+                    filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                    git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                    shell: ShellPermissions(allow: nil, deny: nil),
+                    network: NetworkPermissions(allow: nil),
+                    mcp: MCPPermissions(allow: nil)
+                )
+            ],
+            agents: [
+                AgentDefinition(
+                    id: "test_agent",
+                    title: "Test Agent",
+                    mode: "tool_use",
+                    backendProfile: "test_profile",
+                    permissionProfile: "TEST",
+                    skillRef: "test_skill",
+                    skillRole: nil,
+                    worktreePolicy: nil,
+                    requiredTools: nil,
+                    inputs: [],
+                    outputs: ["output_1"],
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    prompt: "Write output_1",
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
+                )
+            ]
+        )
+
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let idea = Idea(title: "Retryable", body: "Retryable workflow")
+        context.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeRetryable-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = Run(
+            id: runID,
+            workflowID: plan.workflowID,
+            workflowTitle: plan.workflowTitle,
+            workflowSnapshotHash: plan.workflowSnapshotHash,
+            catalogSnapshotHash: plan.catalogSnapshotHash,
+            workflowSourcePath: "test/retryable-workflow.yaml",
+            catalogSourcePath: "test/retryable-agents.yaml",
+            workflowSnapshotJSON: plan.workflowSnapshotJSON,
+            catalogSnapshotJSON: plan.catalogSnapshotJSON,
+            workspaceRoot: workspace.workspaceRoot.path,
+            artifactRoot: workspace.artifactRoot.path,
+            planCompilerVersion: plan.planCompilerVersion
+        )
+        run.idea = idea
+        context.insert(run)
+        try context.save()
+
+        return (run, plan, workspace, catalog)
+    }
+
+    private struct FailingExecutor: AgentExecutor {
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            AgentResult(
+                outputs: [:],
+                logSnippet: "executor should not have been called",
+                costCents: nil,
+                succeeded: false,
+                errorMessage: "unexpected rerun",
+                sessionID: nil,
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: agent.model,
+                configuredProviderID: nil,
+                adapterVersion: nil,
+                canonicalOutcome: .failedBeforeOutput,
+                outputPresence: .none
+            )
+        }
+    }
+
     // MARK: - Find Interrupted Runs (parameterized — Proposal 009 REQ-005)
 
     struct InterruptedRunCase: CustomStringConvertible, Sendable {
@@ -197,6 +361,40 @@ struct ResumeManagerTests {
         #expect(run.status == .cancelled)
     }
 
+    @Test("ExecutionService cancel blocked run without active orchestrator")
+    func executionServiceCancelBlockedRunWithoutActiveOrchestrator() async throws {
+        let (run, _, _) = try makeRunFromPlan()
+
+        let blockedStage = StageExecution(stageID: "proposal_review", label: "Proposal Review", status: .blocked)
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        let blockedAgent = AgentExecution(
+            agentID: "reviewer",
+            agentTitle: "Reviewer",
+            taskName: "Review proposal",
+            status: .running,
+            provider: "codex",
+            effort: "high"
+        )
+        blockedAgent.stageExecution = blockedStage
+        context.insert(blockedAgent)
+
+        run.status = .blocked
+        try context.save()
+
+        let service = ExecutionService(modelContext: context, executor: SimulatedAgentExecutor())
+
+        #expect(service.orchestrator(for: run.id) == nil)
+
+        await service.cancelRun(runID: run.id)
+
+        #expect(run.status == .cancelled)
+        #expect(run.cancellationRequestedAt != nil)
+        #expect(run.cancellationSettledAt != nil)
+        #expect(blockedAgent.status == AgentStatus.cancelled)
+    }
+
     @Test("ExecutionService duplicate start prevented")
     func executionServiceDuplicateStartPrevented() async throws {
         let (run, plan, workspace) = try makeRunFromPlan()
@@ -301,6 +499,193 @@ struct ResumeManagerTests {
         #expect(run.status == .running)
 
         await service.cancelRun(runID: run.id)
+    }
+
+    @Test("ExecutionService resumes agent retry without creating a new stage iteration")
+    func executionServiceResumeRunAfterAgentRetryReusesExistingStageExecution() async throws {
+        let (run, plan, _, catalog) = try makeRetryableRunFromPlan()
+        run.status = .failed
+
+        let failedStage = StageExecution(
+            stageID: plan.initialStateID,
+            label: "Draft",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "test_agent",
+            agentTitle: "Test Agent",
+            taskName: "draft",
+            startedAt: Date(timeIntervalSince1970: 11),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        failedAgent.stageExecution = failedStage
+        context.insert(failedAgent)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryAgent(run: run, stageID: plan.initialStateID, agentID: "test_agent")
+
+        #expect(run.status == .running)
+        #expect(failedStage.status == .running)
+        let pendingRetryExec = failedStage.agentExecutions
+            .filter { $0.agentID == "test_agent" && $0.status == .pending }
+            .sorted { ($0.agentAttemptNumber ?? 1) < ($1.agentAttemptNumber ?? 1) }
+            .last
+        #expect(pendingRetryExec?.agentAttemptNumber == 2)
+        #expect(run.currentStageID == plan.initialStateID)
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(simulatedDelay: 0, catalog: catalog),
+            catalog: catalog
+        )
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        await awaitCondition("Recovery-created running run should complete without creating a new stage iteration", timeout: 3.0) {
+            run.status == .completed
+        }
+
+        let stages = run.stageExecutions.filter { $0.stageID == plan.initialStateID }
+        #expect(stages.count == 1)
+        let resumedStage = try #require(stages.first)
+        #expect(resumedStage.iteration == 1)
+        #expect(resumedStage.attemptNumber == 1)
+        #expect(resumedStage.status == .completed)
+
+        let latestAgentAttempt = resumedStage.agentExecutions
+            .filter { $0.agentID == "test_agent" }
+            .sorted { ($0.agentAttemptNumber ?? 1) < ($1.agentAttemptNumber ?? 1) }
+            .last
+        #expect(latestAgentAttempt?.status == .completed)
+        #expect(latestAgentAttempt?.agentAttemptNumber == 2)
+        #expect(latestAgentAttempt?.artifacts.contains { $0.filePath.contains("\(plan.initialStateID).1/test_agent/1/agent-retry-2/output_1") } == true)
+    }
+
+    @Test("ExecutionService reconciles late contract output from prior failed attempt before rerunning retry")
+    func executionServiceResumeRunReconcilesLateOutputBeforeRetryExecutes() async throws {
+        let (run, plan, workspace, catalog) = try makeRetryableRunFromPlan()
+        run.status = .failed
+
+        let stage = StageExecution(
+            stageID: plan.initialStateID,
+            label: "Draft",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let failedAgent = AgentExecution(
+            agentID: "test_agent",
+            agentTitle: "Test Agent",
+            taskName: "draft",
+            startedAt: Date(timeIntervalSince1970: 11),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        failedAgent.stageExecution = stage
+        failedAgent.logSnippet = "Required outputs missing: output_1"
+        context.insert(failedAgent)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryAgent(run: run, stageID: plan.initialStateID, agentID: "test_agent")
+
+        let retryExec = try #require(
+            stage.agentExecutions
+                .filter { $0.agentID == "test_agent" && ($0.agentAttemptNumber ?? 1) == 2 }
+                .last
+        )
+        #expect(retryExec.status == .pending)
+
+        _ = try ArtifactStorage.write(
+            data: Data("late-output".utf8),
+            name: "output_1",
+            stageID: plan.initialStateID,
+            iteration: stage.iteration,
+            agentID: "test_agent",
+            attemptNumber: stage.attemptNumber,
+            artifactRoot: workspace.artifactRoot,
+            workspaceRoot: workspace.workspaceRoot
+        )
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: FailingExecutor(),
+            catalog: catalog
+        )
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        await awaitCondition("Late output should complete the run without rerunning the retry attempt", timeout: 3.0) {
+            run.status == .completed
+        }
+
+        #expect(run.status == .completed)
+        #expect(stage.status == .completed)
+        #expect(stage.agentExecutions.count == 2)
+        #expect(failedAgent.status == .completed)
+        #expect(retryExec.status == .completed)
+        #expect(
+            failedAgent.artifacts.contains { $0.name == "output_1" }
+        )
+    }
+
+    @Test("ExecutionService resumes stage retry without creating a fresh stage execution")
+    func executionServiceResumeRunAfterStageRetryReusesReadyStageAttempt() async throws {
+        let (run, plan, _, catalog) = try makeRetryableRunFromPlan()
+        run.status = .failed
+
+        let failedStage = StageExecution(
+            stageID: plan.initialStateID,
+            label: "Draft",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: plan.initialStateID)
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(simulatedDelay: 0, catalog: catalog),
+            catalog: catalog
+        )
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        await awaitCondition("Recovery-created ready stage retry should complete without extra stage creation", timeout: 3.0) {
+            run.status == .completed
+        }
+
+        let stages = run.stageExecutions.filter { $0.stageID == plan.initialStateID }
+            .sorted {
+                if $0.iteration != $1.iteration { return $0.iteration < $1.iteration }
+                return $0.attemptNumber < $1.attemptNumber
+            }
+        #expect(stages.count == 2)
+        #expect(stages.first?.attemptNumber == 1)
+        #expect(stages.last?.attemptNumber == 2)
+        #expect(stages.last?.iteration == 1)
+        #expect(stages.last?.status == .completed)
+        #expect(stages.last?.agentExecutions.count == 1)
     }
 
     // MARK: - Live Executor Routing

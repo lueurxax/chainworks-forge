@@ -190,18 +190,26 @@ enum ProviderAdapterSupport {
     }
 
     static func availableModels(for provider: ConfiguredProvider) -> [String] {
-        if let defaultModel = provider.defaultModel, !defaultModel.isEmpty {
-            return [defaultModel]
-        }
-
+        let familyModels: [String]
         switch provider.family {
         case .codex:
-            return ["gpt-5-codex", "gpt-5.4"]
+            familyModels = ["gpt-5-codex", "gpt-5.4"]
         case .claude:
-            return ["claude-sonnet-4", "claude-opus-4"]
+            familyModels = ["sonnet", "opus"]
         case .gemini:
-            return ["gemini-2.5-pro", "gemini-2.5-flash"]
+            familyModels = ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
         }
+
+        guard let defaultModel = provider.defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !defaultModel.isEmpty else {
+            return familyModels
+        }
+
+        if familyModels.contains(where: { $0.caseInsensitiveCompare(defaultModel) == .orderedSame }) {
+            return familyModels
+        }
+
+        return [defaultModel] + familyModels
     }
 
     private static func hasRequiredCredential(

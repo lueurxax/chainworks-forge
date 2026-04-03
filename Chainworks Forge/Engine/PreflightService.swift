@@ -51,6 +51,7 @@ struct PreflightService {
         var checks: [PreflightCheck] = []
         var warnings: [String] = []
         var blockingIssues: [String] = []
+        var loadedCatalog: AgentCatalog?
 
         let config = appConfigurationStore.configuration
         checks.append(checkFile(category: "Catalog", title: "Workflow YAML", url: workflowURL))
@@ -59,6 +60,7 @@ struct PreflightService {
         do {
             let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
             let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+            loadedCatalog = catalog
             let issues = YAMLValidator.validateAll(workflow: workflow, catalog: catalog)
             let errors = issues.filter { $0.severity == .error }
             checks.append(PreflightCheck(
@@ -161,6 +163,17 @@ struct PreflightService {
                 checks.append(warning)
                 warnings.append(warning.message)
             }
+        }
+
+        if let plan, let loadedCatalog {
+            appendMCPChecks(
+                plan: plan,
+                catalog: loadedCatalog,
+                bindings: providerBindings,
+                checks: &checks,
+                warnings: &warnings,
+                blockingIssues: &blockingIssues
+            )
         }
 
         let requiredFamilies = Set(plan?.agentBindings.values.compactMap { ProviderFamily.from(runtimeIdentifier: $0.provider) } ?? [])
@@ -430,8 +443,14 @@ struct PreflightService {
         guard !boundModels.isEmpty else { return }
 
         let availableModels = await providerRegistry.availableModels(for: provider)
+        let normalizedAvailableModels = Set(
+            availableModels.map { model in
+                model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+        )
         for model in boundModels.sorted() {
-            let isAvailable = availableModels.isEmpty || availableModels.contains(model)
+            let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let isAvailable = normalizedAvailableModels.isEmpty || normalizedAvailableModels.contains(normalizedModel)
             let message = isAvailable
                 ? "Model \(model) is available for \(provider.displayName)"
                 : "Model \(model) is not available for \(provider.displayName)"
@@ -445,6 +464,88 @@ struct PreflightService {
             if status == .fail {
                 blockingIssues.append(message)
             }
+        }
+    }
+
+    private func appendMCPChecks(
+        plan: RunPlan,
+        catalog: AgentCatalog,
+        bindings: [String: ResolvedProviderBinding],
+        checks: inout [PreflightCheck],
+        warnings: inout [String],
+        blockingIssues: inout [String]
+    ) {
+        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let resolver = MCPPolicyResolver()
+        let activeAgents = plan.agentBindings.values.sorted { $0.id < $1.id }
+
+        let anyRequestedMCP = activeAgents.contains { agent in
+            let resolution = resolver.resolve(
+                agent: agent,
+                catalog: catalog,
+                providerBinding: bindings[agent.id],
+                gooseRegistry: gooseRegistry
+            )
+            return !resolution.requestedExtensions.isEmpty
+        }
+
+        let registryStatus: PreflightCheckStatus
+        let registryMessage: String
+        if let gooseRegistry {
+            registryStatus = .pass
+            registryMessage = "Loaded Goose extension registry from \(gooseRegistry.configURL.path) (\(gooseRegistry.installedExtensionIDs.count) installed)"
+        } else if anyRequestedMCP {
+            registryStatus = .fail
+            registryMessage = "Goose extension registry is unavailable, but one or more agents request MCP extensions."
+            blockingIssues.append(registryMessage)
+        } else {
+            registryStatus = .warn
+            registryMessage = "Goose extension registry is unavailable; zero-MCP sessions remain valid."
+            warnings.append(registryMessage)
+        }
+
+        checks.append(PreflightCheck(
+            category: "MCP",
+            title: "Goose Extension Registry",
+            status: registryStatus,
+            message: registryMessage
+        ))
+
+        for agent in activeAgents {
+            let resolution = resolver.resolve(
+                agent: agent,
+                catalog: catalog,
+                providerBinding: bindings[agent.id],
+                gooseRegistry: gooseRegistry
+            )
+            let summary = [
+                "profile=\(resolution.profileID)",
+                "requested=\(resolution.requestedExtensions.joined(separator: ","))",
+                "effective=\(resolution.predictedEffectiveExtensions.joined(separator: ","))",
+                "denied=\(resolution.deniedExtensions.joined(separator: ","))"
+            ].joined(separator: " • ")
+
+            let status: PreflightCheckStatus
+            let message: String
+            if !resolution.blockingIssues.isEmpty {
+                status = .fail
+                message = resolution.blockingIssues.joined(separator: "; ")
+                blockingIssues.append(contentsOf: resolution.blockingIssues)
+            } else if !resolution.warnings.isEmpty {
+                status = .warn
+                message = "\(summary); \(resolution.warnings.joined(separator: "; "))"
+                warnings.append(contentsOf: resolution.warnings)
+            } else {
+                status = .pass
+                message = summary
+            }
+
+            checks.append(PreflightCheck(
+                category: "MCP",
+                title: "MCP Profile — \(agent.id)",
+                status: status,
+                message: message
+            ))
         }
     }
 

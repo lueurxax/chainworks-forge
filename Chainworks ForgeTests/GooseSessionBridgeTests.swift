@@ -234,6 +234,57 @@ struct GooseSessionBridgeTests {
         #expect(packet.contextAttachments.contains { $0.name == "idea_body" })
     }
 
+    @Test("Initial orchestrator task includes explicit artifact guidance")
+    func initialOrchestratorTaskIncludesExplicitArtifactGuidance() {
+        let agent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "ORCH",
+            skillRef: "orchestrator_core",
+            skillRole: nil,
+            prompt: "You are the lead orchestrator for the full proposal -> implementation -> release lifecycle.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["idea_brief", "run_state"],
+            outputs: ["idea_brief", "run_state", "orchestrator_summary"]
+        )
+        let task = AgentTask(
+            agent: "lead_orchestrator",
+            task: "normalize_idea_and_open_run",
+            inputs: [],
+            outputs: ["idea_brief", "run_state", "orchestrator_summary"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: URL(fileURLWithPath: "/tmp/project-root", isDirectory: true),
+            stageID: "state_1_idea_received",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Сделать полный UX аудит приложения и исправить основные проблемы.",
+            providerBinding: nil
+        )
+
+        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("Use the `idea_body` attachment as the primary source of truth for normalization."))
+        #expect(packet.taskDirective.contains("`idea_brief` must be a concise, structured normalized brief"))
+        #expect(packet.taskDirective.contains("`run_state` must be machine-readable workflow state"))
+        #expect(packet.taskDirective.contains("`orchestrator_summary` must be a human-readable summary"))
+        #expect(packet.taskDirective.contains("Do not stop after analysis or narration alone"))
+    }
+
     @Test("Packet includes strategy handoff artifacts and lazy references")
     func packetIncludesStrategyHandoffArtifactsAndLazyRefs() throws {
         let agent = makeAgent(id: "proposal_writer")
@@ -409,7 +460,7 @@ struct GooseSessionBridgeTests {
             title: "Lead / Orchestrator",
             mode: "orchestration",
             provider: "claude",
-            model: "claude-opus-4.6",
+            model: "opus",
             effort: "high",
             maxTurns: 16,
             temperature: 0,
@@ -473,7 +524,7 @@ struct GooseSessionBridgeTests {
             title: "Proposal Writer",
             mode: "authoring",
             provider: "claude",
-            model: "claude-opus-4.6",
+            model: "opus",
             effort: "high",
             maxTurns: 16,
             temperature: 0,
@@ -701,12 +752,101 @@ struct GooseSessionBridgeTests {
 
     // MARK: - LiveExecutionOverride Tests
 
+    @Test("Frozen provider binding wins over live override during session creation")
+    func frozenProviderBindingWinsOverLiveOverrideDuringSessionCreation() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: GooseSessionResponse(
+                sessionId: "bridge-frozen-binding",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-frozen-binding",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            sessionError: nil,
+            events: []
+        )
+
+        let bridge = GooseSessionBridge(transport: transport)
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ui",
+            title: "Proposal Reviewer / UI",
+            mode: "proposal_review.ui",
+            provider: "gemini",
+            model: "gemini-2.5-flash",
+            effort: "medium",
+            maxTurns: 8,
+            temperature: 0,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: "ui_designer",
+            prompt: "Review the proposal as a UI designer.",
+            outputContract: "proposal_review_v1",
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_ui"]
+        )
+
+        let task = AgentTask(
+            agent: agent.id,
+            task: "review_proposal",
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_ui"]
+        )
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: URL(fileURLWithPath: "/Users/user/Documents/CryptoSavingsTracker", isDirectory: true),
+            stageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: ["proposal_current": Data("proposal".utf8)],
+            variables: [:],
+            ideaBody: "Improve UX",
+            providerBinding: ResolvedProviderBinding(
+                agentID: agent.id,
+                backendProfileID: "gemini_review_flash",
+                configuredProviderID: UUID(),
+                providerFamily: "gemini",
+                providerIdentifier: "gemini",
+                model: "gemini-2.5-pro",
+                effort: "medium",
+                transport: "goose_server",
+                adapterVersion: "test"
+            )
+        )
+
+        let liveOverride = LiveExecutionOverride(
+            enabled: true,
+            provider: "claude-code",
+            model: "default",
+            effort: "high"
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: task,
+            context: context,
+            override: liveOverride
+        )
+
+        let lastRequest = try #require(await transport.lastSessionRequest)
+        #expect(lastRequest.provider == "gemini")
+        #expect(lastRequest.model == "gemini-2.5-pro")
+    }
+
     @Test("LiveExecutionOverride encoding round-trips")
     func liveExecutionOverrideEncoding() throws {
         let override = LiveExecutionOverride(
             enabled: true,
             provider: "claude_code",
-            model: "claude-sonnet-4-20250514",
+            model: "sonnet",
             effort: "high"
         )
 
@@ -715,7 +855,7 @@ struct GooseSessionBridgeTests {
 
         #expect(decoded.enabled == true)
         #expect(decoded.provider == "claude_code")
-        #expect(decoded.model == "claude-sonnet-4-20250514")
+        #expect(decoded.model == "sonnet")
         #expect(decoded.effort == "high")
     }
 }

@@ -102,7 +102,7 @@ struct FirstRunSetupWizard: View {
                         providerSettingsStore.upsert(provider: gooseFirstProvider(
                             family: .claude,
                             displayName: "Claude Goose",
-                            defaultModel: "claude-sonnet-4"
+                            defaultModel: "sonnet"
                         ))
                     }
                     .accessibilityIdentifier("first-run-add-claude")

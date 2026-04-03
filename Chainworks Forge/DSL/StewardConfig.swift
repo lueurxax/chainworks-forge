@@ -203,12 +203,14 @@ extension StewardConfig {
                             mandatory: [
                                 "idea_brief",
                                 "proposal_current",
+                                "review_corpus_bundle",
                                 "proposal_review_po",
                                 "proposal_review_ux",
                                 "proposal_review_ui",
                                 "proposal_review_architect",
                                 "proposal_review_summary",
-                                "score_lift_backlog"
+                                "score_lift_backlog",
+                                "proposal_fact_digest"
                             ],
                             summarized: [],
                             lazy: ["security_audit_raw"]

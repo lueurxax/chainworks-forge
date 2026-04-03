@@ -86,7 +86,8 @@ struct GooseServerTransportTests {
     private func makeMockTransport(
         secretKey: String? = "test-secret",
         provider: String? = "claude-code",
-        model: String? = "default"
+        model: String? = "default",
+        diagnosticsSink: @escaping @Sendable (GooseServerTransportDiagnosticEvent) -> Void = { _ in }
     ) -> GooseServerTransport {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]
@@ -99,7 +100,8 @@ struct GooseServerTransportTests {
             provider: provider,
             model: model,
             requestTimeout: 10,
-            sessionConfiguration: config
+            sessionConfiguration: config,
+            diagnosticsSink: diagnosticsSink
         )
     }
 
@@ -137,7 +139,149 @@ struct GooseServerTransportTests {
         #expect(transport.secretKey == "test-secret")
         #expect(transport.provider == "claude-code")
         #expect(transport.model == "default")
-        #expect(transport.requestTimeout == 300)
+        #expect(transport.requestTimeout == 900)
+    }
+
+    @Test("GooseServerTransport normalizes internal claude_code identifier for goosed provider binding")
+    func serverTransportNormalizesClaudeProviderForGoosed() async throws {
+        let transport = makeMockTransport(provider: "claude_code", model: "opus")
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            if url.hasSuffix("/agent/start") {
+                let body = #"{"id":"mock-session-claude","working_dir":"/tmp/test-workspace"}"#
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
+            if url.hasSuffix("/agent/update_provider") {
+                return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+            }
+            return (404, [:], Data())
+        }
+
+        _ = try await transport.createSession(
+            request: GooseSessionRequest(
+                systemPrompt: "You are a test agent.",
+                workingDirectory: "/tmp/test-workspace",
+                model: nil,
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil
+            )
+        )
+
+        let requests = MockURLProtocol.recordedRequests()
+        let providerRequest = try #require(
+            requests.first { $0.url.contains("/agent/update_provider") },
+            "Should call /agent/update_provider"
+        )
+        let providerBody = try #require(providerRequest.body, "Provider request should have a body")
+        let providerJSON = try #require(
+            try JSONSerialization.jsonObject(with: providerBody) as? [String: Any],
+            "Provider request should contain JSON"
+        )
+        #expect(providerJSON["provider"] as? String == "claude-code")
+        #expect(providerJSON["model"] as? String == "opus")
+    }
+
+    @Test("GooseServerTransport normalizes internal gemini identifier for goosed provider binding")
+    func serverTransportNormalizesGeminiProviderForGoosed() async throws {
+        let transport = makeMockTransport(provider: "gemini", model: "gemini-2.5-pro")
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            if url.hasSuffix("/agent/start") {
+                let body = #"{"id":"mock-session-gemini","working_dir":"/tmp/test-workspace"}"#
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
+            if url.hasSuffix("/agent/update_provider") {
+                return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+            }
+            return (404, [:], Data())
+        }
+
+        _ = try await transport.createSession(
+            request: GooseSessionRequest(
+                systemPrompt: "You are a test agent.",
+                workingDirectory: "/tmp/test-workspace",
+                model: nil,
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil
+            )
+        )
+
+        let requests = MockURLProtocol.recordedRequests()
+        let providerRequest = try #require(
+            requests.first { $0.url.contains("/agent/update_provider") },
+            "Should call /agent/update_provider"
+        )
+        let providerBody = try #require(providerRequest.body, "Provider request should have a body")
+        let providerJSON = try #require(
+            try JSONSerialization.jsonObject(with: providerBody) as? [String: Any],
+            "Provider request should contain JSON"
+        )
+        #expect(providerJSON["provider"] as? String == "gemini-cli")
+        #expect(providerJSON["model"] as? String == "gemini-2.5-pro")
+    }
+
+    @Test("GooseServerTransport removes all session extensions after session creation")
+    func serverTransportRemovesAllSessionExtensionsAfterCreation() async throws {
+        let transport = makeMockTransport(provider: "claude_code", model: "opus")
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            if url.hasSuffix("/agent/start") {
+                let body = """
+                {
+                  "id": "mock-session-exts",
+                  "working_dir": "/tmp/test-workspace",
+                  "extension_data": {
+                    "enabled_extensions.v0": {
+                      "extensions": [
+                        { "type": "stdio", "name": "xcode", "description": "xcode mcp server" },
+                        { "type": "platform", "name": "developer", "description": "Write and edit files" },
+                        { "type": "platform", "name": "Extension Manager", "description": "Enable and disable extensions" }
+                      ]
+                    }
+                  }
+                }
+                """
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
+            if url.hasSuffix("/agent/update_provider") {
+                return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+            }
+            if url.hasSuffix("/agent/remove_extension") {
+                return (200, ["Content-Type": "text/plain"], Data("ok".utf8))
+            }
+            return (404, [:], Data())
+        }
+
+        _ = try await transport.createSession(
+            request: GooseSessionRequest(
+                systemPrompt: "You are a test agent.",
+                workingDirectory: "/tmp/test-workspace",
+                model: nil,
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil
+            )
+        )
+
+        let requests = MockURLProtocol.recordedRequests()
+        let removeRequests = requests.filter { $0.url.contains("/agent/remove_extension") }
+        #expect(removeRequests.count == 3)
+
+        let removedNames = try removeRequests.map { request in
+            let body = try #require(request.body, "Remove extension request should have a body")
+            let json = try #require(
+                try JSONSerialization.jsonObject(with: body) as? [String: Any],
+                "Remove extension request should contain JSON"
+            )
+            return try #require(json["name"] as? String, "Remove extension request should contain name")
+        }
+
+        #expect(Set(removedNames) == Set(["xcode", "developer", "Extension Manager"]))
     }
 
     @Test("GooseServerTransport accepts custom timeout")
@@ -504,8 +648,9 @@ struct GooseServerTransportTests {
             events.append(event)
         }
 
-        // Verify events: should have sessionStarted, promptSubmitted, textChunk, finalOutput, sessionClosed
-        // (Ping is ignored by mapper)
+        // Verify events: should have sessionStarted, promptSubmitted, textChunk, finish, sessionClosed.
+        // Some mocked Finish payloads do not carry a separate finalOutput event.
+        // (Ping is ignored by mapper.)
         let eventTypes = events.map { event -> String in
             switch event {
             case .sessionStarted: return "sessionStarted"
@@ -524,7 +669,10 @@ struct GooseServerTransportTests {
         #expect(eventTypes.contains("sessionStarted"), "Should emit sessionStarted")
         #expect(eventTypes.contains("promptSubmitted"), "Should emit promptSubmitted")
         #expect(eventTypes.contains("textChunk"), "Should emit textChunk from Message event")
-        #expect(eventTypes.contains("finalOutput"), "Should emit finalOutput from Finish event")
+        #expect(
+            eventTypes.contains("finalOutput") || eventTypes.contains("finish"),
+            "Should emit terminal output or finish event"
+        )
         #expect(eventTypes.contains("sessionClosed"), "Should emit sessionClosed after Finish")
 
         // Verify the text content
@@ -573,6 +721,66 @@ struct GooseServerTransportTests {
             }
             return code == 500
         }
+    }
+
+    @Test("createSession emits transport diagnostics for start and provider binding")
+    func createSessionEmitsTransportDiagnostics() async throws {
+        let recorder = LockedDiagnosticsRecorder()
+        let transport = makeMockTransport(
+            secretKey: "diagnostic-secret",
+            provider: "codex",
+            model: "GPT-5.4",
+            diagnosticsSink: { event in
+                recorder.record(event)
+            }
+        )
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.path ?? ""
+            if url.hasSuffix("/agent/start") {
+                let response = """
+                {"id":"diagnostic-session-7","working_dir":"/tmp/diagnostic","name":"New Session"}
+                """
+                return (200, ["Content-Type": "application/json"], Data(response.utf8))
+            }
+
+            if url.hasSuffix("/agent/update_provider") {
+                return (200, ["Content-Type": "application/json"], Data(#"{"status":"ok"}"#.utf8))
+            }
+
+            return (404, [:], Data("Not Found".utf8))
+        }
+
+        _ = try await transport.createSession(request: GooseSessionRequest(
+            systemPrompt: "Diagnostic test agent",
+            workingDirectory: "/tmp/diagnostic",
+            model: nil,
+            provider: nil,
+            executionPolicy: nil,
+            metadata: [
+                "run_id": "run-123",
+                "stage_id": "state_4_proposal_reviewed",
+                "agent_id": "proposal_reviewer_architect"
+            ]
+        ))
+
+        let events = recorder.events
+        #expect(events.count == 2)
+
+        let startEvent = try #require(events.first(where: { $0.kind == .agentStart }))
+        #expect(startEvent.sessionID == "diagnostic-session-7")
+        #expect(startEvent.httpStatus == 200)
+        #expect(startEvent.runID == "run-123")
+        #expect(startEvent.stageID == "state_4_proposal_reviewed")
+        #expect(startEvent.agentID == "proposal_reviewer_architect")
+        #expect(startEvent.workingDirectory == "/tmp/diagnostic")
+
+        let providerEvent = try #require(events.first(where: { $0.kind == .updateProvider }))
+        #expect(providerEvent.sessionID == "diagnostic-session-7")
+        #expect(providerEvent.provider == "codex")
+        #expect(providerEvent.model == "GPT-5.4")
+        #expect(providerEvent.httpStatus == 200)
+        #expect(providerEvent.agentID == "proposal_reviewer_architect")
     }
 
     /// Tests that SSE error events are properly mapped.
@@ -660,5 +868,22 @@ struct GooseServerTransportTests {
     func fixtureTransportCloseSession() async throws {
         let transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
         try await transport.closeSession(sessionID: "fixture-test")
+    }
+}
+
+private final class LockedDiagnosticsRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [GooseServerTransportDiagnosticEvent] = []
+
+    var events: [GooseServerTransportDiagnosticEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func record(_ event: GooseServerTransportDiagnosticEvent) {
+        lock.lock()
+        storage.append(event)
+        lock.unlock()
     }
 }

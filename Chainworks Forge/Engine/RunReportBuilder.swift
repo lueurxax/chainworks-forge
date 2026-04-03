@@ -207,7 +207,11 @@ final class RunReportBuilder {
             .flatMap(\.agentExecutions)
             .compactMap { $0.retryReason }
 
-        let failureEvidenceSummaries: [RunReportPayload.FailureEvidenceSummary] = historicalStages.compactMap { stage in
+        let failureEvidenceSummaries: [RunReportPayload.FailureEvidenceSummary] = historicalStages
+            .filter { stage in
+                stage.status == .failed || stage.status == .blocked || stage.status == .waitingApproval
+            }
+            .compactMap { stage in
             guard let packet = failureEvidencePacket(for: stage, run: run) else { return nil }
             return RunReportPayload.FailureEvidenceSummary(
                 stageID: packet.stageID,

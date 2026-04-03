@@ -275,6 +275,26 @@ struct GooseSessionRequest: Codable, Sendable {
     let executionPolicy: GooseExecutionPolicy?
     /// Additional session metadata.
     let metadata: [String: String]?
+    /// Requested session-scoped MCP / extension set for runtimes that support reconciliation.
+    let requestedExtensions: [String]?
+
+    init(
+        systemPrompt: String,
+        workingDirectory: String?,
+        model: String?,
+        provider: String?,
+        executionPolicy: GooseExecutionPolicy?,
+        metadata: [String: String]?,
+        requestedExtensions: [String]? = nil
+    ) {
+        self.systemPrompt = systemPrompt
+        self.workingDirectory = workingDirectory
+        self.model = model
+        self.provider = provider
+        self.executionPolicy = executionPolicy
+        self.metadata = metadata
+        self.requestedExtensions = requestedExtensions
+    }
 }
 
 /// Response from session creation.

@@ -1,4 +1,23 @@
 import Foundation
+import OSLog
+
+enum GooseServerTransportDiagnosticKind: String, Sendable {
+    case agentStart = "agent_start"
+    case updateProvider = "update_provider"
+}
+
+struct GooseServerTransportDiagnosticEvent: Sendable {
+    let kind: GooseServerTransportDiagnosticKind
+    let runID: String?
+    let stageID: String?
+    let agentID: String?
+    let workingDirectory: String?
+    let sessionID: String?
+    let provider: String?
+    let model: String?
+    let httpStatus: Int?
+    let responseBodySnippet: String?
+}
 
 // MARK: - GooseServerTransport (Proposal 005, Section 5.3)
 
@@ -20,7 +39,6 @@ import Foundation
 /// LOCKED-002: Single-turn execution per session.
 /// LOCKED-003: System prompt is embedded in the user message.
 final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
-
     // MARK: - Configuration
 
     /// Base URL for the goosed server (e.g., https://127.0.0.1:51200).
@@ -47,6 +65,11 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
     /// Request timeout in seconds (300s for cold-start tolerance).
     let requestTimeout: TimeInterval
 
+    /// Runtime-only diagnostics sink for transport lifecycle logging.
+    private let diagnosticsSink: @Sendable (GooseServerTransportDiagnosticEvent) -> Void
+    /// Local Goose extension registry provider used for session-scoped reconciliation.
+    private let gooseExtensionRegistrySnapshotProvider: @Sendable () throws -> GooseExtensionRegistrySnapshot
+
     // MARK: - Lifecycle
 
     deinit {
@@ -60,13 +83,17 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         secretKey: String? = nil,
         provider: String? = nil,
         model: String? = nil,
-        requestTimeout: TimeInterval = 900
+        requestTimeout: TimeInterval = 900,
+        gooseExtensionRegistrySnapshotProvider: @escaping @Sendable () throws -> GooseExtensionRegistrySnapshot = { try GooseExtensionRegistryReader().snapshot() },
+        diagnosticsSink: @escaping @Sendable (GooseServerTransportDiagnosticEvent) -> Void = GooseServerTransport.logDiagnostic(_:)
     ) {
         self.baseURL = baseURL
         self.secretKey = secretKey
         self.provider = provider
         self.model = model
         self.requestTimeout = requestTimeout
+        self.gooseExtensionRegistrySnapshotProvider = gooseExtensionRegistrySnapshotProvider
+        self.diagnosticsSink = diagnosticsSink
 
         let config = URLSessionConfiguration.default
         // Proposal 013: Increased from 300s to 900s to handle parallel agent execution
@@ -89,13 +116,17 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         provider: String? = nil,
         model: String? = nil,
         requestTimeout: TimeInterval = 300,
-        sessionConfiguration: URLSessionConfiguration
+        sessionConfiguration: URLSessionConfiguration,
+        gooseExtensionRegistrySnapshotProvider: @escaping @Sendable () throws -> GooseExtensionRegistrySnapshot = { try GooseExtensionRegistryReader().snapshot() },
+        diagnosticsSink: @escaping @Sendable (GooseServerTransportDiagnosticEvent) -> Void = GooseServerTransport.logDiagnostic(_:)
     ) {
         self.baseURL = baseURL
         self.secretKey = secretKey
         self.provider = provider
         self.model = model
         self.requestTimeout = requestTimeout
+        self.gooseExtensionRegistrySnapshotProvider = gooseExtensionRegistrySnapshotProvider
+        self.diagnosticsSink = diagnosticsSink
         self.session = URLSession(configuration: sessionConfiguration)
     }
 
@@ -118,11 +149,27 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         startHTTPRequest.httpBody = try encoder.encode(startBody)
 
         let (startData, startResponse) = try await session.data(for: startHTTPRequest)
+        let startJSON = try? JSONSerialization.jsonObject(with: startData) as? [String: Any]
+        let sessionID = startJSON?["id"] as? String
+        let enabledExtensionNames = extractEnabledExtensionNames(from: startJSON)
+        emitDiagnostic(
+            GooseServerTransportDiagnosticEvent(
+                kind: .agentStart,
+                runID: request.metadata?["run_id"],
+                stageID: request.metadata?["stage_id"],
+                agentID: request.metadata?["agent_id"],
+                workingDirectory: workingDir,
+                sessionID: sessionID,
+                provider: nil,
+                model: nil,
+                httpStatus: (startResponse as? HTTPURLResponse)?.statusCode,
+                responseBodySnippet: makeResponseBodySnippet(startData)
+            )
+        )
         try validateHTTPResponse(startResponse, data: startData)
 
         // Parse session response — goosed returns a full Session object
-        let startJSON = try JSONSerialization.jsonObject(with: startData) as? [String: Any]
-        guard let sessionID = startJSON?["id"] as? String, !sessionID.isEmpty else {
+        guard let sessionID, !sessionID.isEmpty else {
             throw GooseTransportError.sessionCreationFailed(
                 reason: "goosed /agent/start did not return a session ID"
             )
@@ -135,6 +182,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         let resolvedModel = request.model ?? model
 
         if let resolvedProvider {
+            let transportProvider = normalizeProviderIdentifierForGoose(resolvedProvider)
             let providerURL = baseURL.appendingPathComponent("agent/update_provider")
             var providerHTTPRequest = URLRequest(url: providerURL)
             providerHTTPRequest.httpMethod = "POST"
@@ -143,7 +191,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
 
             let providerBody = GooseServerUpdateProvider(
                 sessionID: sessionID,
-                provider: resolvedProvider,
+                provider: transportProvider,
                 model: resolvedModel ?? "default"
             )
             let providerEncoder = JSONEncoder()
@@ -151,8 +199,28 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
             providerHTTPRequest.httpBody = try providerEncoder.encode(providerBody)
 
             let (providerData, providerResponse) = try await session.data(for: providerHTTPRequest)
+            emitDiagnostic(
+                GooseServerTransportDiagnosticEvent(
+                    kind: .updateProvider,
+                    runID: request.metadata?["run_id"],
+                    stageID: request.metadata?["stage_id"],
+                    agentID: request.metadata?["agent_id"],
+                    workingDirectory: workingDir,
+                    sessionID: sessionID,
+                    provider: transportProvider,
+                    model: resolvedModel ?? "default",
+                    httpStatus: (providerResponse as? HTTPURLResponse)?.statusCode,
+                    responseBodySnippet: makeResponseBodySnippet(providerData)
+                )
+            )
             try validateHTTPResponse(providerResponse, data: providerData)
         }
+
+        try await reconcileExtensions(
+            currentExtensions: enabledExtensionNames,
+            desiredExtensions: Array(Set(request.requestedExtensions ?? [])).sorted(),
+            sessionID: sessionID
+        )
 
         // Return response in our canonical format.
         // goosed does not have policy acknowledgement — we synthesize one for compatibility.
@@ -310,6 +378,132 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         }
     }
 
+    private func emitDiagnostic(_ event: GooseServerTransportDiagnosticEvent) {
+        diagnosticsSink(event)
+    }
+
+    private func makeResponseBodySnippet(_ data: Data) -> String? {
+        guard let raw = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !raw.isEmpty else {
+            return nil
+        }
+
+        if raw.count <= 240 {
+            return raw
+        }
+        let prefix = raw.prefix(240)
+        return "\(prefix)…"
+    }
+
+    private func normalizeProviderIdentifierForGoose(_ provider: String) -> String {
+        switch provider {
+        case "claude_code":
+            return "claude-code"
+        case "gemini":
+            return "gemini-cli"
+        default:
+            return provider
+        }
+    }
+
+    private func extractEnabledExtensionNames(from startJSON: [String: Any]?) -> [String] {
+        guard
+            let startJSON,
+            let extensionData = startJSON["extension_data"] as? [String: Any],
+            let enabledExtensions = extensionData["enabled_extensions.v0"] as? [String: Any],
+            let extensions = enabledExtensions["extensions"] as? [[String: Any]]
+        else {
+            return []
+        }
+
+        var seen = Set<String>()
+        var names: [String] = []
+        for extensionConfig in extensions {
+            guard let name = extensionConfig["name"] as? String, !name.isEmpty else { continue }
+            if seen.insert(name).inserted {
+                names.append(name)
+            }
+        }
+        return names
+    }
+
+    private func removeExtension(named extensionName: String, from sessionID: String) async throws {
+        let url = baseURL.appendingPathComponent("agent/remove_extension")
+        var httpRequest = URLRequest(url: url)
+        httpRequest.httpMethod = "POST"
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(&httpRequest)
+
+        let body = GooseServerRemoveExtension(sessionID: sessionID, name: extensionName)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        httpRequest.httpBody = try encoder.encode(body)
+
+        let (data, response) = try await session.data(for: httpRequest)
+        try validateHTTPResponse(response, data: data)
+    }
+
+    private func addExtension(
+        _ extensionConfig: GooseExtensionDefinition,
+        to sessionID: String
+    ) async throws {
+        let url = baseURL.appendingPathComponent("agent/add_extension")
+        var httpRequest = URLRequest(url: url)
+        httpRequest.httpMethod = "POST"
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(&httpRequest)
+
+        let body = GooseServerAddExtension(sessionID: sessionID, config: extensionConfig)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        httpRequest.httpBody = try encoder.encode(body)
+
+        let (data, response) = try await session.data(for: httpRequest)
+        try validateHTTPResponse(response, data: data)
+    }
+
+    private func reconcileExtensions(
+        currentExtensions: [String],
+        desiredExtensions: [String],
+        sessionID: String
+    ) async throws {
+        let currentSet = Set(currentExtensions)
+        let desiredSet = Set(desiredExtensions)
+
+        for extensionName in currentSet.subtracting(desiredSet).sorted() {
+            try await removeExtension(named: extensionName, from: sessionID)
+        }
+
+        guard !desiredSet.subtracting(currentSet).isEmpty else { return }
+        let registry = try gooseExtensionRegistrySnapshotProvider()
+        for extensionName in desiredSet.subtracting(currentSet).sorted() {
+            guard let config = registry.configsByRuntimeID[extensionName] else {
+                throw GooseTransportError.sessionCreationFailed(
+                    reason: "Requested MCP extension '\(extensionName)' is not installed in Goose."
+                )
+            }
+            try await addExtension(config, to: sessionID)
+        }
+    }
+
+    nonisolated private static func logDiagnostic(_ event: GooseServerTransportDiagnosticEvent) {
+        Logger(subsystem: "xax.Chainworks-Forge", category: "goose.transport").debug(
+            """
+            kind=\(event.kind.rawValue, privacy: .public) \
+            run_id=\(event.runID ?? "-", privacy: .public) \
+            stage_id=\(event.stageID ?? "-", privacy: .public) \
+            agent_id=\(event.agentID ?? "-", privacy: .public) \
+            working_dir=\(event.workingDirectory ?? "-", privacy: .public) \
+            session_id=\(event.sessionID ?? "-", privacy: .public) \
+            provider=\(event.provider ?? "-", privacy: .public) \
+            model=\(event.model ?? "-", privacy: .public) \
+            http_status=\(event.httpStatus.map(String.init) ?? "-", privacy: .public) \
+            response=\(event.responseBodySnippet ?? "-", privacy: .public)
+            """
+        )
+    }
+
     // MARK: - Private: ChatRequest Construction
 
     /// Build a goosed `ChatRequest` JSON body.
@@ -407,6 +601,26 @@ private struct GooseServerUpdateProvider: Codable {
         case sessionID = "session_id"
         case provider
         case model
+    }
+}
+
+private struct GooseServerRemoveExtension: Codable {
+    let sessionID: String
+    let name: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case name
+    }
+}
+
+private struct GooseServerAddExtension: Codable {
+    let sessionID: String
+    let config: GooseExtensionDefinition
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case config
     }
 }
 

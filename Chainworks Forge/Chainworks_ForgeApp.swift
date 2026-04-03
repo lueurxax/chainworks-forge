@@ -184,7 +184,7 @@ struct Chainworks_ForgeApp: App {
 
 }
 
-final class AutomationFallbackAppDelegate: NSObject, NSApplicationDelegate {
+final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
     private var fallbackWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -365,6 +365,9 @@ struct AppBootstrapView: View {
         self.providerSettingsStore = providerSettingsStore
         self.providerRegistry = providerRegistry
         self.gooseServerManager = gooseServerManager
+        #if os(macOS)
+        (NSApp.delegate as? AppTerminationCoordinator)?.gooseServerManager = gooseServerManager
+        #endif
         UIAutomationDiagnostics.log(
             "bootstrapService.config directSurface=\(environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] ?? "nil") " +
             "inMemory=\(environment["CHAINWORKS_IN_MEMORY_STORE"] ?? "nil")"
@@ -1178,7 +1181,7 @@ struct AppBootstrapView: View {
                     {"title":"Seeded proposal","decision":"approved"}
                     """.utf8),
                     "changed_files_manifest": Data("Chainworks Forge/App.swift\nChainworks Forge/Views/ReleaseGateView.swift\n".utf8),
-                    "docs_delta": Data("{\"summary\":\"Docs updated\"}".utf8),
+                    "docs_delta": Data("{\"files\":[\"README.md\"],\"summary\":\"Docs updated\"}".utf8),
                     "implementation_review_summary": Data("{\"decision\":\"implemented\"}".utf8),
                     "security_report": Data("{\"status\":\"pass\"}".utf8),
                     "audit_report": Data("{\"status\":\"pass\"}".utf8),

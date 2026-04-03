@@ -94,10 +94,13 @@ import SwiftData
     // Derived current stage (ARCH-PA-002)
     var currentStageID: String? {
         let sorted = stageExecutions.sorted { $0.startedAt < $1.startedAt }
-        return sorted.last(where: { $0.status == .running })?.stageID
-            ?? sorted.last(where: { $0.status == .waitingApproval })?.stageID
-            ?? sorted.last(where: { $0.status == .blocked })?.stageID
-            ?? sorted.last(where: { $0.status == .ready })?.stageID
+        return sorted.last(where: {
+            $0.status == .running
+                || $0.status == .waitingApproval
+                || $0.status == .blocked
+                || $0.status == .failed
+                || $0.status == .ready
+        })?.stageID
             ?? sorted.last(where: { $0.status == .completed })?.stageID
     }
 
@@ -161,11 +164,36 @@ enum RunStatus: String, Codable {
 // MARK: - Run Presentation Status (Proposal 011 — REQ-002)
 
 extension Run {
+    /// Whether operator surfaces should expose a stop/cancel action for this run.
+    var canBeCancelledByOperator: Bool {
+        switch presentationStatus {
+        case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
+            return true
+        case .completed, .failed, .cancelled:
+            return false
+        }
+    }
+
     /// Truthful presentation status: shows `.cancelling` when a cancellation has been
     /// requested but not yet settled, and `.cancelled` only after full settlement.
     var presentationStatus: RunStatus {
         if cancellationRequestedAt != nil && cancellationSettledAt == nil {
             return .cancelling
+        }
+        if status == .pending || status == .ready || status == .running {
+            let sorted = stageExecutions.sorted { $0.startedAt < $1.startedAt }
+            if let latestStage = sorted.last {
+                switch latestStage.status {
+                case .waitingApproval:
+                    return .waitingApproval
+                case .blocked:
+                    return .blocked
+                case .failed:
+                    return .failed
+                default:
+                    break
+                }
+            }
         }
         return status
     }

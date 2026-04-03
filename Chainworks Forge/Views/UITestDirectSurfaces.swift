@@ -340,7 +340,7 @@ struct UITestReleaseGateSurface: View {
         let artifactSpecs: [(String, ArtifactFormat)] = [
             ("approved_proposal", .json),
             ("changed_files_manifest", .json),
-            ("docs_delta", .markdown),
+            ("docs_delta", .json),
             ("implementation_review_summary", .json),
             ("security_report", .json),
             ("audit_report", .json),

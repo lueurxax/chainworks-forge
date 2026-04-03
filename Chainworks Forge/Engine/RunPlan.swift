@@ -158,6 +158,7 @@ struct ResolvedAgent: Sendable {
     let maxTurns: Int
     let temperature: Double
     let permissionProfile: String
+    let mcpProfileID: String?
     let skillRef: String
     let skillRole: String?
     let prompt: String
@@ -183,6 +184,7 @@ struct ResolvedAgent: Sendable {
         maxTurns: Int,
         temperature: Double,
         permissionProfile: String,
+        mcpProfileID: String? = nil,
         skillRef: String,
         skillRole: String?,
         prompt: String,
@@ -204,6 +206,7 @@ struct ResolvedAgent: Sendable {
         self.maxTurns = maxTurns
         self.temperature = temperature
         self.permissionProfile = permissionProfile
+        self.mcpProfileID = mcpProfileID
         self.skillRef = skillRef
         self.skillRole = skillRole
         self.prompt = prompt

@@ -30,6 +30,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
     // MARK: - AgentExecutor Protocol
 
     private static let maxTransportRetries = 2
+    private static let maxFreshSessionCollisionRetries = 2
 
     /// Maximum wall-clock time for a single agent execution attempt before the watchdog
     /// forcibly cancels it. Prevents runs from hanging for hours on stale sessions.
@@ -100,6 +101,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         guard let error = result.errorMessage else { return false }
         let isTransportError = error.contains("timed out") || error.contains("-1001") || error.contains("timeout")
             || error.contains("Session not found") || error.contains("session not found")
+            || error.contains("session became unavailable")
         let isContractViolation = error.contains("Required outputs missing") || error.contains("output contract")
             || error.contains("not valid JSON") || error.contains("Missing required field")
         let isWatchdogTimeout = error.contains("Execution watchdog")
@@ -197,7 +199,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         )
 
         // 4. Extract Outputs & Finalize
-        return finalizeSuccessResult(
+        let result = finalizeSuccessResult(
             streamResult: streamResult,
             sessionInfo: sessionInfo,
             checkpoint: checkpoint,
@@ -208,6 +210,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             startedAt: startedAt,
             completedAt: completedAt
         )
+        await settleCompletedGenerationIfNeeded(sessionInfo: sessionInfo, result: result)
+        return result
     }
 
     // MARK: - Internal Steps
@@ -263,6 +267,39 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         switch decision {
         case .reuse(let generation):
             print("[Session:Resolve][\(lid)][Reuse] ID: \(generation.providerSessionID ?? "unknown") (Owner: \(ownerKey))")
+            if let providerSessionID = generation.providerSessionID {
+                let conflicts = try await sessionManager.providerSessionConflicts(
+                    runID: context.workspace.runID,
+                    providerSessionID: providerSessionID,
+                    excludingLineageID: lid
+                )
+                if !conflicts.isEmpty {
+                    let details = Self.describeProviderSessionConflicts(conflicts)
+                    print("[Session:Resolve][\(lid)][Collision] Reuse denied for \(providerSessionID): \(details)")
+                    let freshExecution = try await createFreshExecutionWithCollisionGuard(
+                        agent: agent,
+                        task: task,
+                        context: context,
+                        lineageID: lid,
+                        ownerKey: ownerKey,
+                        fingerprint: fingerprint,
+                        workingDirectory: workingDirectory,
+                        workspaceMode: workspaceMode
+                    )
+                    let gid = try await sessionManager.createGeneration(
+                        lineageID: lid,
+                        invocationOwnerKey: ownerKey,
+                        providerSessionID: freshExecution.sessionID,
+                        bindingFingerprint: fingerprint,
+                        workingDirectory: workingDirectory,
+                        workspaceMode: workspaceMode,
+                        runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context),
+                        runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
+                    )
+                    try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
+                    return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_session_required, ownerKey: ownerKey, fingerprint: fingerprint)
+                }
+            }
             // Attempt to reuse the existing provider session.
             // If the session has expired on the backend (e.g. idle timeout, server restart),
             // catch the "Session not found" error and fall back to a fresh session instead of failing.
@@ -278,7 +315,16 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                     try? await sessionManager.invalidateGeneration(generationID: generation.id, reason: "Stale session: \(errorDesc)")
                     try? await sessionManager.recordEvent(lineageID: lid, generationID: generation.id, type: .invalidated)
 
-                    let freshExecution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+                    let freshExecution = try await createFreshExecutionWithCollisionGuard(
+                        agent: agent,
+                        task: task,
+                        context: context,
+                        lineageID: lid,
+                        ownerKey: ownerKey,
+                        fingerprint: fingerprint,
+                        workingDirectory: workingDirectory,
+                        workspaceMode: workspaceMode
+                    )
                     let gid = try await sessionManager.createGeneration(
                         lineageID: lid,
                         invocationOwnerKey: ownerKey,
@@ -286,8 +332,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                         bindingFingerprint: fingerprint,
                         workingDirectory: workingDirectory,
                         workspaceMode: workspaceMode,
-                        runtimeProvider: context.providerBinding?.providerFamily ?? override?.provider ?? agent.provider,
-                        runtimeModel: context.providerBinding?.model ?? override?.model ?? agent.model
+                        runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context),
+                        runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
                     )
                     try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
                     return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_transport_error, ownerKey: ownerKey, fingerprint: fingerprint)
@@ -296,7 +342,16 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             }
 
         case .createFresh(let disposition, _):
-            let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            let execution = try await createFreshExecutionWithCollisionGuard(
+                agent: agent,
+                task: task,
+                context: context,
+                lineageID: lid,
+                ownerKey: ownerKey,
+                fingerprint: fingerprint,
+                workingDirectory: workingDirectory,
+                workspaceMode: workspaceMode
+            )
             let gid = try await sessionManager.createGeneration(
                 lineageID: lid,
                 invocationOwnerKey: ownerKey,
@@ -304,14 +359,23 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 bindingFingerprint: fingerprint,
                 workingDirectory: workingDirectory,
                 workspaceMode: workspaceMode,
-                runtimeProvider: context.providerBinding?.providerFamily ?? override?.provider ?? agent.provider,
-                runtimeModel: context.providerBinding?.model ?? override?.model ?? agent.model
+                runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context),
+                runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
             )
             try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
             return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: disposition, ownerKey: ownerKey, fingerprint: fingerprint)
             
         case .requireReset:
-            let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            let execution = try await createFreshExecutionWithCollisionGuard(
+                agent: agent,
+                task: task,
+                context: context,
+                lineageID: lid,
+                ownerKey: ownerKey,
+                fingerprint: fingerprint,
+                workingDirectory: workingDirectory,
+                workspaceMode: workspaceMode
+            )
             let gid = try await sessionManager.createGeneration(
                 lineageID: lid,
                 invocationOwnerKey: ownerKey,
@@ -319,12 +383,64 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 bindingFingerprint: fingerprint,
                 workingDirectory: workingDirectory,
                 workspaceMode: workspaceMode,
-                runtimeProvider: context.providerBinding?.providerFamily ?? override?.provider ?? agent.provider,
-                runtimeModel: context.providerBinding?.model ?? override?.model ?? agent.model
+                runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context),
+                runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
             )
             try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .operator_reset)
             return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_reset, ownerKey: ownerKey, fingerprint: fingerprint)
         }
+    }
+
+    private func createFreshExecutionWithCollisionGuard(
+        agent: ResolvedAgent,
+        task: AgentTask,
+        context: ExecutionContext,
+        lineageID: UUID,
+        ownerKey: String,
+        fingerprint: String,
+        workingDirectory: String,
+        workspaceMode: String
+    ) async throws -> GooseSessionExecution {
+        guard let sessionManager else {
+            return try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+        }
+
+        var lastCollisionDetails = ""
+
+        for attempt in 0...Self.maxFreshSessionCollisionRetries {
+            let execution = try await sessionBridge.executeInIsolatedSession(
+                agent: agent,
+                task: task,
+                context: context,
+                override: override
+            )
+
+            let conflicts = try await sessionManager.providerSessionConflicts(
+                runID: context.workspace.runID,
+                providerSessionID: execution.sessionID,
+                excludingLineageID: lineageID
+            )
+
+            if conflicts.isEmpty {
+                return execution
+            }
+
+            lastCollisionDetails = Self.describeProviderSessionConflicts(conflicts)
+            print("[Session:Resolve][\(lineageID)][Collision] Fresh session \(execution.sessionID) already belongs to another lineage. Owner=\(ownerKey) Fingerprint=\(fingerprint) WorkingDir=\(workingDirectory) Mode=\(workspaceMode) Details=\(lastCollisionDetails)")
+            await execution.closeSession()
+
+            if attempt == Self.maxFreshSessionCollisionRetries {
+                break
+            }
+        }
+
+        throw NSError(
+            domain: "GooseAgentExecutor",
+            code: 409,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Provider session ID collision detected; refusing to attach session to the wrong lineage. \(lastCollisionDetails)"
+            ]
+        )
     }
 
     private func handleStreamFailure(
@@ -338,15 +454,32 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
     ) async -> AgentResult {
         await sessionInfo.execution.closeSession()
         let completedAt = Date()
-        
+
         var salvaged = salvageOutputs(expectedOutputs: expectedOutputs, context: context, agent: agent)
         let outputPresence: OutputPresence = salvaged.isEmpty ? .none : .durableOutput
-        let transportKind = classifyTransportErrorKind(error.localizedDescription)
-        let canonicalOutcome = classifyStreamFailureOutcome(errorMessage: error.localizedDescription, outputPresence: outputPresence)
-        
+        let rawErrorMessage = error.localizedDescription
+        let surfacedErrorMessage = surfacedStreamFailureMessage(
+            rawErrorMessage: rawErrorMessage,
+            reuseDisposition: sessionInfo.reuseDisposition
+        )
+        let transportKind = classifyTransportErrorKind(rawErrorMessage)
+        let canonicalOutcome = classifyStreamFailureOutcome(errorMessage: rawErrorMessage, outputPresence: outputPresence)
+        let staleReusedSessionFailedMidStream = isSessionMissingError(rawErrorMessage)
+            && (sessionInfo.reuseDisposition == .reused || sessionInfo.reuseDisposition == .reused_after_resume)
+
         var checkpoint: AgentSessionCheckpoint?
         if let gid = sessionInfo.generationID, let sessionManager = sessionManager {
-            if canonicalOutcome == .completedWithTransportError || canonicalOutcome == .timedOutAfterOutput {
+            if staleReusedSessionFailedMidStream {
+                try? await sessionManager.invalidateGeneration(
+                    generationID: gid,
+                    reason: "transport stream failure: \(rawErrorMessage)"
+                )
+                try? await sessionManager.recordEvent(
+                    lineageID: sessionInfo.lineageID!,
+                    generationID: gid,
+                    type: .invalidated
+                )
+            } else if canonicalOutcome == .completedWithTransportError || canonicalOutcome == .timedOutAfterOutput {
                 checkpoint = AgentSessionCheckpointBuilder.build(
                     executionResult: AgentResult.minimal(canonicalOutcome, sessionID: sessionInfo.execution.sessionID, duration: completedAt.timeIntervalSince(startedAt)),
                     eventLog: eventBridge.eventLog,
@@ -357,16 +490,16 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 // DATA-001: Record checkpoint_created BEFORE invalidation (§6.4 rule 2)
                 let checkpointData = try? JSONEncoder().encode(checkpoint)
                 try? await sessionManager.recordCheckpointCreated(lineageID: sessionInfo.lineageID!, generationID: gid, checkpointData: checkpointData)
-                try? await sessionManager.invalidateGeneration(generationID: gid, reason: "Stream failure: \(error.localizedDescription)")
+                try? await sessionManager.invalidateGeneration(generationID: gid, reason: "Stream failure: \(rawErrorMessage)")
                 try? await sessionManager.recordEvent(lineageID: sessionInfo.lineageID!, generationID: gid, type: .invalidated)
             }
         }
 
-        let failureMsg = failureMessage(for: canonicalOutcome, fallback: "Stream processing failed: \(error.localizedDescription)")
+        let failureMsg = failureMessage(for: canonicalOutcome, fallback: surfacedErrorMessage)
         let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: nil,
-            succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, provider: agent.provider, model: agent.model, effort: agent.effort,
+            succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, provider: resolvedRuntimeProvider(agent: agent, context: context), model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context),
             sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue, sessionReuseScope: agent.sessionReuseScope.rawValue, sessionFamilyID: agent.sessionFamilyID
         )
         for (name, data) in receiptArtifacts { salvaged[name] = data }
@@ -376,11 +509,11 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         )
 
         return AgentResult(
-            outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(error.localizedDescription)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
-            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: agent.provider, configuredProviderID: context.providerBinding?.configuredProviderID, model: agent.model, effort: agent.effort, transport: "goose", costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
-            resolvedModel: agent.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: outputPresence, runtimeProvider: agent.provider, runtimeModel: agent.model,
-            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: outputPresence, rawErrorMessage: error.localizedDescription, rawFinishEvent: nil),
+            outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(failureMsg)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: "goose", costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
+            resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: outputPresence, rawErrorMessage: rawErrorMessage, rawFinishEvent: nil),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
     }
@@ -513,7 +646,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: streamResult.finalContent,
-            succeeded: finalOutcome == .completed, errorMessage: finalError, provider: agent.provider, model: agent.model, effort: agent.effort,
+            succeeded: finalOutcome == .completed, errorMessage: finalError, provider: resolvedRuntimeProvider(agent: agent, context: context), model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context),
             sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue, sessionReuseScope: agent.sessionReuseScope.rawValue, sessionFamilyID: agent.sessionFamilyID
         )
         for (name, data) in receiptArtifacts { outputs[name] = data }
@@ -526,12 +659,33 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         return AgentResult(
             outputs: outputs, logSnippet: buildLogSnippet(agent: agent, sessionID: sessionInfo.execution.sessionID, streamResult: streamResult, startedAt: startedAt, completedAt: completedAt),
             costCents: cost, succeeded: finalOutcome == .completed, errorMessage: finalOutcome == .completed ? nil : finalError, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
-            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: agent.provider, configuredProviderID: context.providerBinding?.configuredProviderID, model: agent.model, effort: agent.effort, transport: "goose", costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
-            resolvedModel: agent.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, runtimeProvider: agent.provider, runtimeModel: agent.model,
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: "goose", costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
+            resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
             outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: finalOutcome, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, rawErrorMessage: finalError, rawFinishEvent: streamResult.finishRaw),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
+    }
+
+    private func settleCompletedGenerationIfNeeded(
+        sessionInfo: SessionResolutionInfo,
+        result: AgentResult
+    ) async {
+        guard let sessionManager, let generationID = sessionInfo.generationID else { return }
+
+        let reason: String
+        if result.succeeded {
+            reason = "completed"
+        } else if let errorMessage = result.errorMessage, !errorMessage.isEmpty {
+            reason = errorMessage
+        } else {
+            reason = "execution_finished"
+        }
+
+        try? await sessionManager.closeGeneration(generationID: generationID, reason: reason)
+        if let lineageID = sessionInfo.lineageID {
+            try? await sessionManager.recordEvent(lineageID: lineageID, generationID: generationID, type: .closed)
+        }
     }
 
     // MARK: - Private Helpers
@@ -580,12 +734,16 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
     private func classifyTransportErrorKind(_ errorMessage: String) -> TransportErrorKind {
         let lowercased = errorMessage.lowercased()
         if lowercased.contains("timed out") || lowercased.contains("timeout") || lowercased.contains("-1001") { return .timeout }
+        if isLimitExhaustionError(errorMessage) { return .provider }
         if lowercased.contains("provider") { return .provider }
         if lowercased.contains("stream") { return .stream }
         return .unknown
     }
 
     private func classifyStreamFailureOutcome(errorMessage: String, outputPresence: OutputPresence) -> AgentCanonicalOutcome {
+        if isLimitExhaustionError(errorMessage) {
+            return outputPresence == .durableOutput ? .limitExhaustedAfterOutput : .limitExhaustedBeforeOutput
+        }
         switch (classifyTransportErrorKind(errorMessage), outputPresence) {
         case (.timeout, .durableOutput): return .timedOutAfterOutput
         case (.timeout, .none): return .timedOutBeforeOutput
@@ -594,10 +752,43 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         }
     }
 
+    private func surfacedStreamFailureMessage(
+        rawErrorMessage: String,
+        reuseDisposition: SessionReuseDisposition
+    ) -> String {
+        if isCapacityExhaustionError(rawErrorMessage) {
+            return "Provider capacity exhausted; retry the agent"
+        }
+        if isLimitExhaustionError(rawErrorMessage) {
+            return "Provider or app limit exhausted"
+        }
+        if isSessionMissingError(rawErrorMessage) {
+            if reuseDisposition == .reused || reuseDisposition == .reused_after_resume {
+                return "Reused provider session became unavailable during execution"
+            }
+            return "Provider session became unavailable during execution"
+        }
+        return "Stream processing failed: \(rawErrorMessage)"
+    }
+
+    private static func describeProviderSessionConflicts(_ conflicts: [ProviderSessionConflict]) -> String {
+        conflicts.map {
+            "\($0.agentID) provider=\($0.runtimeProvider) model=\($0.runtimeModel) status=\($0.status.rawValue)"
+        }
+        .joined(separator: "; ")
+    }
+
     private func classifyCompletedStreamOutcome(outputPresence: OutputPresence, finishReason: String?, hadExplicitFinalOutput: Bool) -> AgentCanonicalOutcome {
         guard let finishReason else { return outputPresence == .durableOutput ? .completed : .failedBeforeOutput }
         if isLimitExhaustionReason(finishReason) { return outputPresence == .durableOutput ? .limitExhaustedAfterOutput : .limitExhaustedBeforeOutput }
         return (hadExplicitFinalOutput || outputPresence == .durableOutput) ? .completed : .failedBeforeOutput
+    }
+
+    private func isSessionMissingError(_ errorMessage: String) -> Bool {
+        let lowercased = errorMessage.lowercased()
+        return lowercased.contains("session not found")
+            || lowercased.contains("failed to read session")
+            || lowercased.contains("404")
     }
 
     private func isLimitExhaustionReason(_ reason: String) -> Bool {
@@ -605,9 +796,32 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         return r.contains("limit") || r.contains("quota") || r.contains("budget") || r.contains("max_tokens")
     }
 
+    private func isCapacityExhaustionError(_ errorMessage: String) -> Bool {
+        let lowercased = errorMessage.lowercased()
+        return lowercased.contains("resource_exhausted")
+            || lowercased.contains("model_capacity_exhausted")
+            || lowercased.contains("capacity exhausted")
+            || lowercased.contains("no capacity available")
+    }
+
+    private func isLimitExhaustionError(_ errorMessage: String) -> Bool {
+        let lowercased = errorMessage.lowercased()
+        return isCapacityExhaustionError(errorMessage)
+            || lowercased.contains("rate limit")
+            || lowercased.contains("quota")
+            || lowercased.contains("credits")
+            || lowercased.contains("credit balance")
+            || lowercased.contains("usage limit")
+            || lowercased.contains("limit exceeded")
+            || lowercased.contains("budget exhausted")
+            || lowercased.contains("max_tokens")
+            || lowercased.contains("too many requests")
+    }
+
     private func failureMessage(for outcome: AgentCanonicalOutcome, fallback: String) -> String {
         switch outcome {
-        case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput: return "Provider or app limit exhausted"
+        case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput:
+            return fallback.isEmpty ? "Provider or app limit exhausted" : fallback
         case .timedOutBeforeOutput, .timedOutAfterOutput: return "Execution timed out"
         case .completedWithTransportError: return "Execution produced output but transport errored afterward"
         case .failedAfterOutputValidation: return "Output validation failed"
@@ -625,20 +839,42 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
     private func calculateFingerprint(agent: ResolvedAgent, context: ExecutionContext, systemPrompt: String, workingDirectory: String, workspaceMode: String) -> String {
         BindingFingerprintBuilder.build(
             agent: agent,
-            provider: agent.provider,
-            model: agent.model,
-            effort: agent.effort,
+            provider: resolvedRuntimeProvider(agent: agent, context: context),
+            model: resolvedRuntimeModel(agent: agent, context: context),
+            effort: resolvedRuntimeEffort(agent: agent, context: context),
             systemPrompt: systemPrompt,
             workingDirectory: workingDirectory,
             workspaceMode: workspaceMode,
             strategyFingerprintMaterial: context.handoffPacket?.fingerprintMaterial
         )
     }
+
+    private func resolvedRuntimeProvider(agent: ResolvedAgent, context: ExecutionContext) -> String {
+        context.providerBinding?.providerIdentifier ?? override?.provider ?? agent.provider
+    }
+
+    private func resolvedRuntimeModel(agent: ResolvedAgent, context: ExecutionContext) -> String {
+        context.providerBinding?.model ?? override?.model ?? agent.model
+    }
+
+    private func resolvedRuntimeEffort(agent: ResolvedAgent, context: ExecutionContext) -> String {
+        context.providerBinding?.effort ?? override?.effort ?? agent.effort
+    }
+
+    private func resolvedProviderFamily(agent: ResolvedAgent, context: ExecutionContext) -> String {
+        if let family = context.providerBinding?.providerFamily {
+            return family
+        }
+        if let provider = override?.provider, let family = ProviderFamily.from(runtimeIdentifier: provider) {
+            return family.rawValue
+        }
+        return ProviderFamily.from(runtimeIdentifier: agent.provider)?.rawValue ?? agent.provider
+    }
 }
 
 extension AgentResult {
     static func failure(_ msg: String, context: ExecutionContext, override: LiveExecutionOverride?, startedAt: Date) -> AgentResult {
-        AgentResult(outputs: [:], logSnippet: msg, costCents: nil, succeeded: false, errorMessage: msg, sessionID: nil, durationSeconds: Date().timeIntervalSince(startedAt), providerReceipt: nil, resolvedModel: override?.model ?? context.providerBinding?.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion)
+        AgentResult(outputs: [:], logSnippet: msg, costCents: nil, succeeded: false, errorMessage: msg, sessionID: nil, durationSeconds: Date().timeIntervalSince(startedAt), providerReceipt: nil, resolvedModel: context.providerBinding?.model ?? override?.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion)
     }
     
     static func minimal(_ outcome: AgentCanonicalOutcome, sessionID: String, duration: Double) -> AgentResult {

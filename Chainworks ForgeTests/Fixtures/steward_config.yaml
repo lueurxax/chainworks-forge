@@ -64,6 +64,7 @@ context_strategy_profiles:
             - proposal_review_architect
             - proposal_review_summary
             - score_lift_backlog
+            - proposal_fact_digest
           lazy:
             - security_audit_raw
       "*":

@@ -375,6 +375,96 @@ struct AgentSessionTests {
         #expect(lid2 != lid3)
     }
 
+    @Test("AgentSessionManager reports cross-lineage provider session collisions within a run")
+    func managerReportsProviderSessionConflicts() async throws {
+        let manager = AgentSessionManager(container: container)
+        let runID = UUID()
+
+        let leadLineageID = try await manager.getOrCreateLineage(
+            runID: runID,
+            agentID: "lead_orchestrator",
+            scope: .same_agent_family_within_run,
+            familyID: "orchestration_loop"
+        )
+        let reviewerLineageID = try await manager.getOrCreateLineage(
+            runID: runID,
+            agentID: "proposal_reviewer_ui",
+            scope: .same_invocation_owner,
+            familyID: nil
+        )
+
+        _ = try await manager.createGeneration(
+            lineageID: leadLineageID,
+            invocationOwnerKey: "lead-owner",
+            providerSessionID: "dup-session",
+            bindingFingerprint: "lead-fp",
+            workingDirectory: "/tmp/lead",
+            workspaceMode: "ro",
+            runtimeProvider: "claude_code",
+            runtimeModel: "opus"
+        )
+        _ = try await manager.createGeneration(
+            lineageID: reviewerLineageID,
+            invocationOwnerKey: "review-owner",
+            providerSessionID: "dup-session",
+            bindingFingerprint: "review-fp",
+            workingDirectory: "/tmp/review",
+            workspaceMode: "ro",
+            runtimeProvider: "gemini",
+            runtimeModel: "gemini-2.5-pro"
+        )
+
+        let conflicts = try await manager.providerSessionConflicts(
+            runID: runID,
+            providerSessionID: "dup-session",
+            excludingLineageID: leadLineageID
+        )
+
+        #expect(conflicts.count == 1)
+        #expect(conflicts.first?.agentID == "proposal_reviewer_ui")
+        #expect(conflicts.first?.runtimeProvider == "gemini")
+        #expect(conflicts.first?.runtimeModel == "gemini-2.5-pro")
+    }
+
+    @Test("AgentSessionManager ignores closed generations when checking provider session collisions")
+    func managerIgnoresClosedGenerationsInProviderSessionConflicts() async throws {
+        let manager = AgentSessionManager(container: container)
+        let runID = UUID()
+
+        let leadLineageID = try await manager.getOrCreateLineage(
+            runID: runID,
+            agentID: "lead_orchestrator",
+            scope: .same_agent_family_within_run,
+            familyID: "orchestration_loop"
+        )
+        let writerLineageID = try await manager.getOrCreateLineage(
+            runID: runID,
+            agentID: "proposal_writer",
+            scope: .same_invocation_owner,
+            familyID: nil
+        )
+
+        let generationID = try await manager.createGeneration(
+            lineageID: writerLineageID,
+            invocationOwnerKey: "writer-owner",
+            providerSessionID: "recycled-session",
+            bindingFingerprint: "writer-fp",
+            workingDirectory: "/tmp/writer",
+            workspaceMode: "ro",
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+        try await manager.closeGeneration(generationID: generationID, reason: "completed")
+
+        let conflicts = try await manager.providerSessionConflicts(
+            runID: runID,
+            providerSessionID: "recycled-session",
+            excludingLineageID: leadLineageID
+        )
+
+        #expect(conflicts.isEmpty)
+    }
+
     @Test("AgentSessionGeneration preserves checkpoint traceability")
     func checkpointTraceability() async throws {
         let manager = AgentSessionManager(container: container)

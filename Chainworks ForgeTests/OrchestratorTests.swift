@@ -159,6 +159,45 @@ struct OrchestratorTests {
         }
     }
 
+    private actor AgentResultBox {
+        private let resultsByAgentID: [String: AgentResult]
+
+        init(resultsByAgentID: [String: AgentResult]) {
+            self.resultsByAgentID = resultsByAgentID
+        }
+
+        func result(for agentID: String) -> AgentResult {
+            resultsByAgentID[agentID] ?? AgentResult(
+                outputs: [:],
+                logSnippet: "missing fixture result",
+                costCents: nil,
+                succeeded: false,
+                errorMessage: "missing fixture result",
+                sessionID: nil,
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: nil,
+                configuredProviderID: nil,
+                adapterVersion: nil,
+                canonicalOutcome: .failedBeforeOutput,
+                sessionReuseDisposition: .fresh,
+                outputPresence: .none
+            )
+        }
+    }
+
+    private struct AgentResultExecutor: AgentExecutor {
+        let box: AgentResultBox
+
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            await box.result(for: agent.id)
+        }
+    }
+
     private func runGit(_ arguments: [String], in directory: URL) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -301,7 +340,7 @@ struct OrchestratorTests {
                 configuredProviderID: UUID(),
                 providerFamily: ProviderFamily.claude.rawValue,
                 providerIdentifier: ProviderFamily.claude.runtimeProviderIdentifier,
-                model: "claude-sonnet-4",
+                model: "sonnet",
                 effort: "high",
                 transport: "goose_server",
                 adapterVersion: "v1"
@@ -366,7 +405,7 @@ struct OrchestratorTests {
             sessionID: nil,
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "claude-sonnet-4",
+            resolvedModel: "sonnet",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .timedOutBeforeOutput,
@@ -374,7 +413,7 @@ struct OrchestratorTests {
             transportErrorKind: .timeout,
             outputPresence: .none,
             runtimeProvider: "claude_code",
-            runtimeModel: "claude-sonnet-4"
+            runtimeModel: "sonnet"
         )
         let secondSuccess = AgentResult(
             outputs: ["output_1": Data("ok".utf8)],
@@ -385,14 +424,14 @@ struct OrchestratorTests {
             sessionID: nil,
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "claude-opus-4.6",
+            resolvedModel: "opus",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .completed,
             sessionReuseDisposition: .fresh,
             outputPresence: .durableOutput,
             runtimeProvider: "claude_code",
-            runtimeModel: "claude-opus-4.6"
+            runtimeModel: "opus"
         )
         let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
 
@@ -407,7 +446,7 @@ struct OrchestratorTests {
         await orchestrator.start()
 
         let models = await box.models
-        #expect(models == ["claude-sonnet-4", "claude-opus-4.6"])
+        #expect(models == ["sonnet", "opus"])
         #expect(run.status == .completed)
 
         let agentExec = try #require(run.stageExecutions.first?.agentExecutions.first)
@@ -538,6 +577,383 @@ struct OrchestratorTests {
         #expect(executor.executedTasks.count == 3)
         let executedAgentIDs = Set(executor.executedTasks.map(\.agentID))
         #expect(executedAgentIDs == Set(["a1", "a2", "a3"]))
+    }
+
+    @Test("Parallel reviewer failures persist receipt and transcript evidence")
+    func parallelFailurePersistsFailureEvidence() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let architectAgent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Architect",
+            mode: "tool_use",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 8,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            skillRef: "sk-architect",
+            skillRole: nil,
+            prompt: "Review the proposal as an architect.",
+            outputContract: "proposal_review_v1",
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_architect"]
+        )
+        let poAgent = makeAgent(id: "proposal_reviewer_product_owner", outputs: ["proposal_review_po"])
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "proposal_reviewer_architect",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .parallel([
+                            AgentTask(agent: "proposal_reviewer_architect", task: "review_architecture", inputs: nil, outputs: ["proposal_review_architect"]),
+                            AgentTask(agent: "proposal_reviewer_product_owner", task: "review_scope", inputs: nil, outputs: ["proposal_review_po"])
+                        ])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "proposal_reviewer_architect", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "proposal_reviewer_architect": architectAgent,
+                "proposal_reviewer_product_owner": poAgent
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let failedArchitect = AgentResult(
+            outputs: [
+                "proposal_reviewer_architect_receipt.json": Data("{\"receipt\":true}".utf8),
+                "proposal_reviewer_architect_transcript.md": Data("# transcript".utf8)
+            ],
+            logSnippet: "Architect stream ended without the required artifact",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "Required outputs missing: proposal_review_architect",
+            sessionID: "session-architect",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "opus",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .failedBeforeOutput,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .none,
+            runtimeProvider: "claude_code",
+            runtimeModel: "opus"
+        )
+        let successfulPO = AgentResult(
+            outputs: ["proposal_review_po": Data("{\"decision\":\"approve\"}".utf8)],
+            logSnippet: "ok",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-po",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "opus",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: "claude_code",
+            runtimeModel: "opus"
+        )
+        let executor = AgentResultExecutor(
+            box: AgentResultBox(
+                resultsByAgentID: [
+                    "proposal_reviewer_architect": failedArchitect,
+                    "proposal_reviewer_product_owner": successfulPO
+                ]
+            )
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run, plan: plan, workspace: workspace,
+            executor: executor, modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let failedStage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let failedAgentExec = try #require(failedStage.agentExecutions.first(where: { $0.agentID == "proposal_reviewer_architect" }))
+        let evidence = try #require(
+            failedStage.evidencePacketJSON.flatMap {
+                try? JSONDecoder().decode(FailedStageEvidencePacket.self, from: $0)
+            }
+        )
+
+        #expect(failedAgentExec.status == .failed)
+        #expect(failedAgentExec.artifacts.contains(where: { $0.name == "proposal_reviewer_architect_receipt.json" }))
+        #expect(failedAgentExec.artifacts.contains(where: { $0.name == "proposal_reviewer_architect_transcript.md" }))
+        #expect(evidence.failureSummary == "Required outputs missing: proposal_review_architect")
+        #expect(evidence.receiptExists)
+        #expect(evidence.transcriptExists)
+    }
+
+    @Test("Parallel success-path validation failures preserve raw evidence")
+    func parallelSuccessPathValidationFailurePreservesRawEvidence() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let architectAgent = makeAgent(id: "proposal_reviewer_architect", outputs: ["proposal_review_architect"])
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "proposal_reviewer_architect",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .parallel([
+                            AgentTask(agent: "proposal_reviewer_architect", task: "review_architecture", inputs: nil, outputs: ["proposal_review_architect"])
+                        ])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "proposal_reviewer_architect", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "proposal_reviewer_architect": architectAgent
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let malformedArchitect = AgentResult(
+            outputs: [
+                "proposal_review_architect": Data("{\"agent_id\":\"proposal_reviewer_architect\"}".utf8),
+                "proposal_reviewer_architect_receipt.json": Data("{\"receipt\":true}".utf8),
+                "proposal_reviewer_architect_transcript.md": Data("# transcript".utf8)
+            ],
+            logSnippet: "Architect returned malformed review output",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-architect",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: malformedArchitect),
+            modelContext: context,
+            catalog: makeReviewCatalog()
+        )
+
+        await orchestrator.start()
+
+        let failedStage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let failedAgentExec = try #require(failedStage.agentExecutions.first(where: { $0.agentID == "proposal_reviewer_architect" }))
+        #expect(failedAgentExec.status == .failed)
+        #expect(failedAgentExec.artifacts.contains(where: { $0.name == "proposal_review_architect" }))
+        #expect(failedAgentExec.artifacts.contains(where: { $0.name == "proposal_reviewer_architect_receipt.json" }))
+        #expect(failedAgentExec.artifacts.contains(where: { $0.name == "proposal_reviewer_architect_transcript.md" }))
+        #expect((failedAgentExec.logSnippet ?? "").contains("Output contract validation failed"))
+    }
+
+    @Test("Parallel success-path ignores auxiliary receipt and transcript artifacts during contract validation")
+    func parallelSuccessPathIgnoresAuxiliaryArtifactsDuringValidation() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let architectAgent = makeAgent(id: "proposal_reviewer_architect", outputs: ["proposal_review_architect"])
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "proposal_reviewer_architect",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .parallel([
+                            AgentTask(agent: "proposal_reviewer_architect", task: "review_architecture", inputs: nil, outputs: ["proposal_review_architect"])
+                        ])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "proposal_reviewer_architect", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "proposal_reviewer_architect": architectAgent
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let validArchitect = AgentResult(
+            outputs: [
+                "proposal_review_architect": Data("""
+                {"agent_id":"proposal_reviewer_architect","role":"architect","score":5,"decision":"revise","verdict":"Needs revision","summary":"Architectural gaps remain.","issues":[],"blocking_issues":[],"non_blocking_issues":[],"suggestions":[],"assumptions":[]}
+                """.utf8),
+                "proposal_reviewer_architect_receipt.json": Data("{\"receipt\":true}".utf8),
+                "proposal_reviewer_architect_transcript.md": Data("# transcript".utf8)
+            ],
+            logSnippet: "Architect returned valid review output",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-architect",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: validArchitect),
+            modelContext: context,
+            catalog: makeReviewCatalog()
+        )
+
+        await orchestrator.start()
+
+        let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let agentExecution = try #require(stage.agentExecutions.first(where: { $0.agentID == "proposal_reviewer_architect" }))
+        #expect(stage.status == .completed)
+        #expect(agentExecution.status == .completed)
+        #expect(agentExecution.validationFailureJSON == nil)
+        #expect(agentExecution.artifacts.contains(where: { $0.name == "proposal_review_architect" }))
+        #expect(agentExecution.artifacts.contains(where: { $0.name == "proposal_reviewer_architect_receipt.json" }))
+        #expect(agentExecution.artifacts.contains(where: { $0.name == "proposal_reviewer_architect_transcript.md" }))
+    }
+
+    @Test("Parallel transport timeout after durable output still completes when contract output validates")
+    func parallelTimeoutAfterOutputWithValidContractOutputCompletesStage() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let architectAgent = makeAgent(id: "proposal_reviewer_architect", outputs: ["proposal_review_architect"])
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "proposal_reviewer_architect",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .parallel([
+                            AgentTask(agent: "proposal_reviewer_architect", task: "review_architecture", inputs: nil, outputs: ["proposal_review_architect"])
+                        ])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "proposal_reviewer_architect", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "proposal_reviewer_architect": architectAgent
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let timedOutAfterOutput = AgentResult(
+            outputs: [
+                "proposal_review_architect": Data("""
+                {"agent_id":"proposal_reviewer_architect","role":"architect","score":8,"decision":"approve","verdict":"Looks good","summary":"Contract output is valid.","issues":[],"blocking_issues":[],"non_blocking_issues":[],"suggestions":[],"assumptions":[]}
+                """.utf8)
+            ],
+            logSnippet: "Execution produced output before timing out",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "The request timed out.",
+            sessionID: "session-architect",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .timedOutAfterOutput,
+            sessionReuseDisposition: .fresh,
+            transportErrorKind: .timeout,
+            outputPresence: .durableOutput,
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: timedOutAfterOutput),
+            modelContext: context,
+            catalog: makeReviewCatalog()
+        )
+
+        await orchestrator.start()
+
+        let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let agentExecution = try #require(stage.agentExecutions.first(where: { $0.agentID == "proposal_reviewer_architect" }))
+        #expect(run.status == .completed)
+        #expect(stage.status == .completed)
+        #expect(agentExecution.status == .completed)
+        #expect(agentExecution.canonicalOutcome == .timedOutAfterOutput)
+        #expect(agentExecution.artifacts.contains(where: { $0.name == "proposal_review_architect" }))
     }
 
     @Test("Live executor publishes timeline events")

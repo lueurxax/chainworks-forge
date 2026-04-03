@@ -40,7 +40,7 @@ struct RecoveryCoordinatorTests {
         )
         agent.stageExecution = stage
         agent.resolvedBackendProfileID = "writer_profile"
-        agent.resolvedModel = "claude-opus-4.6"
+        agent.resolvedModel = "opus"
         stage.agentExecutions.append(agent)
         context.insert(agent)
 
@@ -320,7 +320,7 @@ private func makeRecoveryCatalog() -> AgentCatalog {
         backendProfiles: [
             "writer_profile": BackendProfile(
                 provider: "claude_code",
-                model: "claude-opus-4.6",
+                model: "opus",
                 effort: "high",
                 temperature: 0,
                 maxTurns: 20,

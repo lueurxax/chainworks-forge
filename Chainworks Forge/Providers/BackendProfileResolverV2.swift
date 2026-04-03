@@ -82,7 +82,7 @@ struct BackendProfileResolverV2 {
                 throw BackendProfileResolverError.noConfiguredProvider(family)
             }
 
-            let resolvedModel = override?.model ?? configuredProvider.defaultModel ?? agent.model
+            let resolvedModel = override?.model ?? agent.model.ifNotEmpty ?? configuredProvider.defaultModel ?? ""
             guard !resolvedModel.isEmpty else {
                 throw BackendProfileResolverError.missingModel(agentID: agentID)
             }
@@ -131,12 +131,12 @@ struct BackendProfileResolverV2 {
             if let explicitOverride = overrideModel, !explicitOverride.isEmpty {
                 source = .runOverride
                 resolvedModel = explicitOverride
-            } else if let provDefault = providerDefaultModel, !provDefault.isEmpty {
-                source = .configuredProviderDefault
-                resolvedModel = provDefault
             } else if !backendProfileModel.isEmpty {
                 source = .backendProfileDefault
                 resolvedModel = backendProfileModel
+            } else if let provDefault = providerDefaultModel, !provDefault.isEmpty {
+                source = .configuredProviderDefault
+                resolvedModel = provDefault
             } else {
                 // Contract: this should not happen because resolveBindings() already
                 // validates model presence. Record as unverifiable — never a false source.
@@ -157,5 +157,12 @@ struct BackendProfileResolverV2 {
         }
 
         return provenances
+    }
+}
+
+private extension String {
+    var ifNotEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : self
     }
 }
