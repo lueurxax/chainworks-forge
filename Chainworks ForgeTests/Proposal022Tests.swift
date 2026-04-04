@@ -4,7 +4,7 @@ import SwiftData
 @testable import Chainworks_Forge
 
 @MainActor
-@Suite("Proposal 022")
+@Suite("Proposal 022", .serialized)
 struct Proposal022Tests {
 
     private func loadExampleCatalog() throws -> AgentCatalog {
@@ -35,10 +35,12 @@ struct Proposal022Tests {
         )
     }
 
-    private func makeFixtureExecutionService(context: ModelContext) -> ExecutionService {
+    private func makeFixtureExecutionService(context: ModelContext) throws -> ExecutionService {
         ExecutionService(
             modelContext: context,
             executor: SimulatedAgentExecutor(),
+            catalog: try loadExampleCatalog(),
+            stewardConfig: try loadExampleStewardConfig(),
             liveRuntimeConfiguration: LiveRuntimeConfiguration(
                 baseURL: URL(string: "https://127.0.0.1:51200")!,
                 apiKey: "proposal-022-proof",
@@ -111,7 +113,7 @@ struct Proposal022Tests {
     @Test("Proposal 022 app harness proves corpus fidelity, backlog persistence, and targeted rereview")
     func proposal022AppHarnessProducesCanonicalProof() async throws {
         let (_, context) = try makeTestModelContainer()
-        let executionService = makeFixtureExecutionService(context: context)
+        let executionService = try makeFixtureExecutionService(context: context)
         let harness = Proposal022AppProofHarness(modelContext: context, executionService: executionService)
 
         let (run, _, result) = try await harness.run()
@@ -131,7 +133,7 @@ struct Proposal022Tests {
     @Test("Proposal 022 app harness can persist canonical app-proof export for gate consumption")
     func proposal022AppHarnessPersistsCanonicalProofExport() async throws {
         let (_, context) = try makeTestModelContainer()
-        let executionService = makeFixtureExecutionService(context: context)
+        let executionService = try makeFixtureExecutionService(context: context)
         let harness = Proposal022AppProofHarness(modelContext: context, executionService: executionService)
         let exportURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("proposal022-app-proof-\(UUID().uuidString).json")
@@ -154,7 +156,7 @@ struct Proposal022Tests {
     @Test("Motivating failure-class replay preserves backlog fidelity and bounds proposal growth")
     func motivatingFailureClassReplayProvesBoundedLoopTruth() async throws {
         let (_, context) = try makeTestModelContainer()
-        let executionService = makeFixtureExecutionService(context: context)
+        let executionService = try makeFixtureExecutionService(context: context)
         let harness = Proposal022AppProofHarness(modelContext: context, executionService: executionService)
 
         let (run, summary, result) = try await harness.run()

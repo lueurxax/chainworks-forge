@@ -475,9 +475,9 @@ private func makePreviewReleaseGateRun(in container: ModelContainer) -> Run {
         profileLabel: "Self (Dogfood)",
         sampleProfileID: nil,
         repoIdentifier: "user/chainworks-forge",
-        repoRoot: "/Users/user/Documents/Chainworks Forge",
+        repoRoot: PreviewSupport.previewWorkspaceRootURL.path,
         baseBranch: "main",
-        worktreeBasePath: "/Users/user/Library/Application Support/Chainworks Forge/worktrees",
+        worktreeBasePath: PreviewSupport.previewApplicationSupportURL("worktrees").path,
         targetBranch: "release/proposal-007",
         releaseTargetID: "sandbox_local",
         releaseTargetLabel: "Local Sandbox",
@@ -485,7 +485,7 @@ private func makePreviewReleaseGateRun(in container: ModelContainer) -> Run {
     )
     run.deliveryConfigurationJSON = try? JSONEncoder().encode(config)
     run.baseRevision = "e1655a6b"
-    run.worktreeRoot = "/Users/user/Library/Application Support/Chainworks Forge/worktrees/run-abc123"
+    run.worktreeRoot = PreviewSupport.previewApplicationSupportURL("worktrees/run-abc123").path
     return run
 }
 

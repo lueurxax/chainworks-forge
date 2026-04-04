@@ -135,6 +135,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
     /// Create a new session on goosed.
     /// Two-phase: POST /agent/start → POST /agent/update_provider.
     func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        let startupStartedAt = Date()
         // Phase 1: POST /agent/start
         let startURL = baseURL.appendingPathComponent("agent/start")
         var startHTTPRequest = URLRequest(url: startURL)
@@ -221,6 +222,7 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
             desiredExtensions: Array(Set(request.requestedExtensions ?? [])).sorted(),
             sessionID: sessionID
         )
+        let actualEnabledExtensions = try await readSessionRuntimeState(sessionID: sessionID)?.enabledExtensions
 
         // Return response in our canonical format.
         // goosed does not have policy acknowledgement — we synthesize one for compatibility.
@@ -231,7 +233,9 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
                 accepted: true,
                 capabilityToken: "goose-server-session",
                 backendPolicyVersion: "goosed-v1"
-            )
+            ),
+            actualEnabledExtensions: actualEnabledExtensions,
+            startupLatencyMilliseconds: max(0, Int(Date().timeIntervalSince(startupStartedAt) * 1000.0))
         )
     }
 
@@ -352,6 +356,21 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         let (data, response) = try await session.data(for: httpRequest)
         try validateHTTPResponse(response, data: data)
         await systemPromptStore.remove(sessionID)
+    }
+
+    func readSessionRuntimeState(sessionID: String) async throws -> GooseSessionRuntimeState? {
+        let url = baseURL.appendingPathComponent("sessions/\(sessionID)")
+        var httpRequest = URLRequest(url: url)
+        httpRequest.httpMethod = "GET"
+        applyAuth(&httpRequest)
+
+        let (data, response) = try await session.data(for: httpRequest)
+        try validateHTTPResponse(response, data: data)
+
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return GooseSessionRuntimeState(
+            enabledExtensions: extractEnabledExtensionNames(from: json).sorted()
+        )
     }
 
     // MARK: - Private: Auth

@@ -85,17 +85,27 @@ struct AppConfiguration: Codable, Equatable, Sendable {
     }
 
     static func defaultRepositoryRoot() -> URL {
-        let fileManager = FileManager.default
-        var candidates = [
-            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
-        ]
+        defaultRepositoryRoot(
+            currentDirectoryPath: FileManager.default.currentDirectoryPath,
+            bundleURL: Bundle.main.bundleURL,
+            allowsDocumentsFallback: allowsDocumentsFallbackForCurrentProcess,
+            sourceFilePath: #filePath
+        )
+    }
 
-        if allowsDocumentsFallbackForCurrentProcess {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-                    .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
-            )
-        }
+    static func defaultRepositoryRoot(
+        currentDirectoryPath: String,
+        bundleURL: URL?,
+        allowsDocumentsFallback: Bool,
+        sourceFilePath: String
+    ) -> URL {
+        let fileManager = FileManager.default
+        let candidates = candidateRepositoryRoots(
+            currentDirectoryPath: currentDirectoryPath,
+            bundleURL: bundleURL,
+            allowsDocumentsFallback: allowsDocumentsFallback,
+            sourceFilePath: sourceFilePath
+        )
 
         if let repoRoot = candidates.first(where: {
             fileManager.fileExists(atPath: $0.appendingPathComponent("examples/agents/agents.yaml").path)
@@ -104,6 +114,98 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         }
 
         return candidates[0]
+    }
+
+    static func candidateRepositoryRoots(
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
+        bundleURL: URL? = Bundle.main.bundleURL,
+        allowsDocumentsFallback: Bool = AppConfiguration.allowsDocumentsFallbackForCurrentProcess,
+        sourceFilePath: String = #filePath
+    ) -> [URL] {
+        let fileManager = FileManager.default
+        var candidates: [URL] = []
+
+        func append(_ url: URL?) {
+            guard let url else { return }
+            let standardized = url.standardizedFileURL
+            if candidates.contains(where: { $0.standardizedFileURL == standardized }) {
+                return
+            }
+            candidates.append(standardized)
+        }
+
+        if let override = ProcessInfo.processInfo.environment["CHAINWORKS_REPOSITORY_ROOT"],
+           !override.isEmpty {
+            append(URL(fileURLWithPath: override, isDirectory: true))
+        }
+
+        append(URL(fileURLWithPath: currentDirectoryPath, isDirectory: true))
+        append(repositoryRootDerivedFromSourcePath(sourceFilePath))
+
+        if let bundleURL {
+            append(bundleURL)
+            append(bundleURL.deletingLastPathComponent())
+            append(bundleURL.deletingLastPathComponent().deletingLastPathComponent())
+        }
+
+        if allowsDocumentsFallback {
+            append(
+                URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                    .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
+            )
+        }
+
+        if candidates.isEmpty {
+            append(URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true))
+        }
+
+        return candidates
+    }
+
+    static func repositoryRootDerivedFromSourcePath(_ sourceFilePath: String = #filePath) -> URL {
+        URL(fileURLWithPath: sourceFilePath, isDirectory: false)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    static func preferredExampleURL(
+        configuredURL: URL? = nil,
+        repoRelativePath: String,
+        bundledURL: URL? = nil,
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
+        allowsDocumentsFallback: Bool = AppConfiguration.allowsDocumentsFallbackForCurrentProcess,
+        sourceFilePath: String = #filePath
+    ) -> URL? {
+        let fileManager = FileManager.default
+        let trimmedRelativePath = repoRelativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        var candidates: [URL?] = [
+            configuredURL,
+            URL(fileURLWithPath: currentDirectoryPath, isDirectory: true).appendingPathComponent(trimmedRelativePath),
+            repositoryRootDerivedFromSourcePath(sourceFilePath).appendingPathComponent(trimmedRelativePath),
+            defaultRepositoryRoot(
+                currentDirectoryPath: currentDirectoryPath,
+                bundleURL: Bundle.main.bundleURL,
+                allowsDocumentsFallback: allowsDocumentsFallback,
+                sourceFilePath: sourceFilePath
+            ).appendingPathComponent(trimmedRelativePath)
+        ]
+
+        if allowsDocumentsFallback {
+            candidates.append(
+                URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                    .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
+                    .appendingPathComponent(trimmedRelativePath)
+            )
+        }
+
+        candidates.append(bundledURL)
+
+        return candidates.first { candidate in
+            guard let candidate else { return false }
+            return fileManager.isReadableFile(atPath: candidate.path)
+        } ?? nil
     }
 
     static func defaultSupportRoot() -> URL {

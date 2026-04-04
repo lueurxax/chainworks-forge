@@ -39,16 +39,23 @@ enum OutputContractResolverV2 {
 
     /// Resolve contract ID purely from catalog declarations.
     /// Priority:
-    /// 1. Agent's explicit outputContract field matches the output
-    /// 2. Catalog contains a contract named exactly as the output
-    /// 3. Catalog contains a versioned contract (outputName + "_v1")
-    /// 4. Agent's explicit outputContract (fallback for all outputs of this agent)
+    /// 1. Catalog contains a contract named exactly as the output
+    /// 2. Catalog contains a versioned contract (outputName + "_v1")
+    /// 3. Agent's explicit outputContract only when it actually matches this output
+    /// 4. Infer via catalog contract stems
     static func resolveContractID(
         for outputName: String,
         agent: ResolvedAgent,
         catalog: AgentCatalog?
     ) -> String? {
-        guard let catalog else { return agent.outputContract }
+        if catalog == nil {
+            return matchingExplicitContractID(
+                for: outputName,
+                explicitContractID: agent.outputContract
+            )
+        }
+
+        guard let catalog else { return nil }
 
         // 1. Exact match: catalog has a contract named exactly as the output
         if catalog.contracts[outputName] != nil {
@@ -61,12 +68,12 @@ enum OutputContractResolverV2 {
             return versioned
         }
 
-        // 3. Agent-level explicit contract
-        if let explicit = agent.outputContract {
-            // Check the explicit contract exists in catalog
-            if catalog.contracts[explicit] != nil {
-                return explicit
-            }
+        // 3. Agent-level explicit contract, but only for matching outputs
+        if let explicit = matchingExplicitContractID(
+            for: outputName,
+            explicitContractID: agent.outputContract
+        ), catalog.contracts[explicit] != nil {
+            return explicit
         }
 
         // 4. Infer from output name patterns using catalog contract stems
@@ -257,6 +264,23 @@ enum OutputContractResolverV2 {
         }
         let stem = String(contractID[..<stemRange.lowerBound])
         return outputName.hasPrefix(stem) && outputName != contractID
+    }
+
+    private static func matchingExplicitContractID(
+        for outputName: String,
+        explicitContractID: String?
+    ) -> String? {
+        guard let explicitContractID else { return nil }
+        if explicitContractID == outputName {
+            return explicitContractID
+        }
+        if explicitContractID == "\(outputName)_v1" {
+            return explicitContractID
+        }
+        if contractStemMatches(contractID: explicitContractID, outputName: outputName) {
+            return explicitContractID
+        }
+        return nil
     }
 
     // MARK: - Validation Mode Inference

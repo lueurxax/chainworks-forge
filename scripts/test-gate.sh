@@ -68,6 +68,12 @@ PROPOSAL_014_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AdopterSliceAccessibilityProof"
 )
 
+PROPOSAL_015_TESTS=(
+  "Chainworks ForgeTests/Proposal015Tests"
+  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal015SkillVisibilityProofSurface"
+)
+
 PROPOSAL_018_TESTS=(
   "Chainworks ForgeTests/AgentSessionTests"
   "Chainworks ForgeTests/GooseAgentExecutorTests"
@@ -92,6 +98,13 @@ PROPOSAL_024_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testCompletedRunExportHubSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal024FocusedTimelineInspectorSurface"
+)
+
+PROPOSAL_025_TESTS=(
+  "Chainworks ForgeTests/Proposal025Tests"
+  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeTests/GooseServerTransportTests"
+  "Chainworks ForgeTests/Chainworks_ForgeTests"
 )
 
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
@@ -147,6 +160,10 @@ default_codesign_keychain() {
 }
 
 prepare_codesign_keychain() {
+  if [[ "${CHAINWORKS_USE_UNSIGNED_UI_TESTS:-1}" == "1" ]]; then
+    return 0
+  fi
+
   local keychain password
   local login_keychain system_keychain
   local -a search_list
@@ -512,7 +529,8 @@ run_test_plan() {
     -destination "$DESTINATION" \
     -testPlan "$plan_name" \
     -derivedDataPath "$derived_data" \
-    -resultBundlePath "$result_bundle"
+    -resultBundlePath "$result_bundle" \
+    "${UNSIGNED_BUILD_ARGS[@]}"
   log "Result bundle: $result_bundle"
 }
 
@@ -551,6 +569,7 @@ run_targeted_tests() {
     cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
     cmd+=("-skip-testing:Chainworks ForgeUITests")
   else
+    cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
     cmd+=("-parallel-testing-enabled" "NO")
     cmd+=("-maximum-parallel-testing-workers" "1")
     if [[ "$gate_name" != "proposal-013-ui" ]]; then
@@ -559,7 +578,7 @@ run_targeted_tests() {
   fi
 
   log "Test gate: $gate_name"
-  if [[ "$gate_name" == "proposal-013-ui" || "$gate_name" == "proposal-022-ui" ]]; then
+  if [[ "$gate_name" == "proposal-013-ui" || "$gate_name" == "proposal-015-ui" || "$gate_name" == "proposal-022-ui" ]]; then
     # This lane currently hangs on the approved host after it has already
     # printed a successful XCTest summary. Run it through a narrow watchdog
     # that only accepts success after the canonical pass markers.
@@ -587,6 +606,12 @@ elif gate_name == "proposal-022-ui":
     success_label = "Proposal 022 gate watchdog"
     grace_seconds = float(os.environ.get("CHAINWORKS_P022_UI_SUCCESS_GRACE_SECONDS", "10"))
     hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P022_UI_HARD_TIMEOUT_SECONDS", "1800"))
+elif gate_name == "proposal-015-ui":
+    marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal015SkillVisibilityProofSurface]' passed"
+    marker_suite_passed = "Executed 1 test, with 0 failures"
+    success_label = "Proposal 015 UI watchdog"
+    grace_seconds = float(os.environ.get("CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS", "15"))
+    hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P015_UI_HARD_TIMEOUT_SECONDS", "1800"))
 else:
     raise SystemExit(f"unsupported watchdog gate: {gate_name}")
 
@@ -709,7 +734,8 @@ run_full_suite() {
     -scheme "$SCHEME_NAME" \
     -destination "$DESTINATION" \
     -derivedDataPath "$derived_data" \
-    -resultBundlePath "$result_bundle"
+    -resultBundlePath "$result_bundle" \
+    "${UNSIGNED_BUILD_ARGS[@]}"
   log "Result bundle: $result_bundle"
 }
 
@@ -726,10 +752,12 @@ Available gates:
   proposal-006    Proposal 006 settings/provider/readiness gate
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
+  proposal-015    Proposal 015 skill resolution and runtime injection gate
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
   proposal-024    Proposal 024 run-surface information architecture gate
+  proposal-025    Proposal 025 per-agent MCP policy and runtime validation gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -847,6 +875,19 @@ case "$GATE" in
     fi
     run_targeted_tests "proposal-014" "${PROPOSAL_014_TESTS[@]}"
     ;;
+  proposal-015|p015)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-015"
+    run_split_targeted_gate "proposal-015" "${PROPOSAL_015_TESTS[@]}"
+    ;;
   proposal-018|p018)
     check_idle_environment allow_app
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
@@ -894,6 +935,17 @@ case "$GATE" in
     guard_direct_run_insertion
     run_build "proposal-024"
     run_split_targeted_gate "proposal-024" "${PROPOSAL_024_TESTS[@]}"
+    ;;
+  proposal-025|p025)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-025"
+    run_targeted_tests "proposal-025" "${PROPOSAL_025_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

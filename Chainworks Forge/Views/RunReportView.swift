@@ -11,6 +11,7 @@ import SwiftData
 /// - Sign-Off Summary tab (§7.4): cohort/pair comparison, GO/HOLD result
 struct RunReportView: View {
     let run: Run
+    private let autoSelectLatestImmutableReport: Bool
     @Environment(\.modelContext) private var modelContext
     @State private var selectedTab: ReportTab = .latestSummary
     @State private var reportArtifacts: [Artifact] = []
@@ -31,6 +32,16 @@ struct RunReportView: View {
         case exportHub = "Export Hub"
         case signOffSummary = "Sign-Off"
         case strategySummary = "Strategy"
+    }
+
+    init(
+        run: Run,
+        initialTab: ReportTab = .latestSummary,
+        autoSelectLatestImmutableReport: Bool = false
+    ) {
+        self.run = run
+        self.autoSelectLatestImmutableReport = autoSelectLatestImmutableReport
+        self._selectedTab = State(initialValue: initialTab)
     }
 
     var body: some View {
@@ -392,6 +403,11 @@ struct RunReportView: View {
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         reportArtifacts = (try? modelContext.fetch(descriptor)) ?? []
+        if autoSelectLatestImmutableReport,
+           selectedReportContent == nil,
+           let latestReport = reportArtifacts.first {
+            loadReportContent(latestReport)
+        }
 
         // Proposal 008 (PERF-080): Measure summary retrieval latency via SLO probe.
         if let summaryID = run.latestSummaryArtifactID {

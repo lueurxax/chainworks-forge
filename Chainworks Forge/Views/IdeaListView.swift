@@ -676,75 +676,190 @@ struct NewIdeaSheetView: View {
     let onCancel: () -> Void
     let onSave: () -> Void
     private let environment = ProcessInfo.processInfo.environment
+    @FocusState private var focusedField: Field?
 
-    // Proposal 012 (L-07): Converted to Form for macOS consistency
+    private enum Field: Hashable {
+        case title
+        case body
+        case attachment
+    }
+
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Text("Capture the idea first. Project directory and run configuration come after the idea exists.")
-                        .font(DesignTokens.Typography.supporting)
-                        .foregroundStyle(.secondary)
-                }
+        VStack(spacing: 0) {
+            header
 
-                Section("Details") {
-                    TextField("Title", text: $draft.title)
-                        .accessibilityIdentifier("new-idea-title-field")
-                        .onPasteCommand(of: [UTType.plainText]) { providers in
-                            guard let provider = providers.first else { return }
-                            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                                let resolvedText: String?
-                                switch item {
-                                case let data as Data:
-                                    resolvedText = String(data: data, encoding: .utf8)
-                                case let string as String:
-                                    resolvedText = string
-                                case let string as NSString:
-                                    resolvedText = string as String
-                                default:
-                                    resolvedText = nil
-                                }
-                                guard let resolvedText else { return }
-                                Task { @MainActor in
-                                    draft.title = resolvedText
-                                }
-                            }
-                        }
+            Divider()
 
-                    TextEditor(text: $draft.body)
-                        .frame(minHeight: 100)
-                        .accessibilityIdentifier("new-idea-body-field")
+            ScrollView {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.section) {
+                    detailsPanel
+                    attachmentPanel
                 }
-
-                Section("Attachment") {
-                    HStack(spacing: DesignTokens.Spacing.small) {
-                        TextField("Path (optional)", text: $draft.attachmentPath)
-                            .accessibilityIdentifier("new-idea-attachment-field")
-                        Button("Browse...", action: onBrowseAttachment)
-                            .accessibilityIdentifier("new-idea-browse-button")
-                    }
-                }
+                .padding(DesignTokens.Spacing.large)
             }
-            .navigationTitle("New Idea")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: onCancel)
-                        .keyboardShortcut(.escape, modifiers: [])
-                        .accessibilityIdentifier("new-idea-cancel-button")
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save Idea", action: onSave)
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!draft.canSave)
-                        .keyboardShortcut(.return, modifiers: [.command])
-                        .accessibilityIdentifier("new-idea-save-button")
-                }
-            }
+
+            Divider()
+
+            footer
         }
-        .frame(minWidth: 460, minHeight: 340)
+        .background(ForgeColor.Surface.appBackground)
+        .frame(minWidth: 560, minHeight: 460)
         .accessibilityIdentifier("new-idea-sheet")
         .task {
             prefillFromUITestEnvironmentIfNeeded()
+            if draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                focusedField = .title
+            }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+            Text("New Idea")
+                .font(DesignTokens.Typography.screenTitle)
+
+            Text("Capture the idea first. Project directory and run configuration come after the idea exists.")
+                .font(DesignTokens.Typography.supporting)
+                .foregroundStyle(ForgeColor.Text.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, DesignTokens.Spacing.large)
+        .padding(.vertical, DesignTokens.Spacing.medium)
+        .background(ForgeColor.Surface.appBackground)
+    }
+
+    private var detailsPanel: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
+            panelHeader(
+                title: "Details",
+                subtitle: "Give the idea a clear name and enough context to make the first run legible."
+            )
+
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                fieldLabel("Title", hint: "Short, action-oriented, and easy to scan in the sidebar.")
+
+                TextField("Example: Harden provider bootstrap flow", text: $draft.title)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .title)
+                    .accessibilityIdentifier("new-idea-title-field")
+                    .onPasteCommand(of: [UTType.plainText]) { providers in
+                        guard let provider = providers.first else { return }
+                        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                            let resolvedText: String?
+                            switch item {
+                            case let data as Data:
+                                resolvedText = String(data: data, encoding: .utf8)
+                            case let string as String:
+                                resolvedText = string
+                            case let string as NSString:
+                                resolvedText = string as String
+                            default:
+                                resolvedText = nil
+                            }
+                            guard let resolvedText else { return }
+                            Task { @MainActor in
+                                draft.title = resolvedText
+                            }
+                        }
+                    }
+            }
+
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+                fieldLabel("Body", hint: "What problem are you trying to solve, and what does a good result look like?")
+
+                ZStack(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.card, style: .continuous)
+                        .fill(ForgeColor.Surface.appBackground)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.card, style: .continuous)
+                                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+                        )
+
+                    if draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Describe the idea, the user or operator pain, and any constraints that matter.")
+                            .font(DesignTokens.Typography.supporting)
+                            .foregroundStyle(ForgeColor.Text.tertiary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .allowsHitTesting(false)
+                    }
+
+                    TextEditor(text: $draft.body)
+                        .scrollContentBackground(.hidden)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(minHeight: 190, alignment: .topLeading)
+                        .focused($focusedField, equals: .body)
+                        .accessibilityIdentifier("new-idea-body-field")
+                }
+                .frame(minHeight: 190)
+            }
+        }
+        .forgePanel()
+    }
+
+    private var attachmentPanel: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
+            panelHeader(
+                title: "Attachment",
+                subtitle: "Optional reference material. The path is stored with the idea and validated later."
+            )
+
+            HStack(alignment: .center, spacing: DesignTokens.Spacing.small) {
+                TextField("Path (optional)", text: $draft.attachmentPath)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .attachment)
+                    .accessibilityIdentifier("new-idea-attachment-field")
+
+                Button("Browse...", action: onBrowseAttachment)
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("new-idea-browse-button")
+            }
+        }
+        .forgePanel(tint: ForgeColor.Surface.border, fill: ForgeColor.Surface.elevated)
+    }
+
+    private var footer: some View {
+        HStack(spacing: DesignTokens.Spacing.small) {
+            Spacer()
+
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.escape, modifiers: [])
+                .accessibilityIdentifier("new-idea-cancel-button")
+
+            Button("Save Idea", action: onSave)
+                .buttonStyle(.borderedProminent)
+                .disabled(!draft.canSave)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .accessibilityIdentifier("new-idea-save-button")
+        }
+        .padding(.horizontal, DesignTokens.Spacing.large)
+        .padding(.vertical, DesignTokens.Spacing.medium)
+        .background(ForgeColor.Surface.appBackground)
+    }
+
+    private func panelHeader(title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+            Text(title)
+                .font(DesignTokens.Typography.sectionHeader)
+
+            Text(subtitle)
+                .font(DesignTokens.Typography.supporting)
+                .foregroundStyle(ForgeColor.Text.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func fieldLabel(_ title: String, hint: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(DesignTokens.Typography.cardTitle)
+
+            Text(hint)
+                .font(DesignTokens.Typography.micro)
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1939,35 +2054,24 @@ struct WorkflowStartRunSheet: View {
                     return configuredWorkflowRepositoryRoot?.appendingPathComponent(preset.relativePath)
                 }
             }()
-            var candidates: [URL?] = [
-                configuredWorkflowURL,
-                URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(preset.relativePath)
-            ]
-            if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-                candidates.append(
-                    URL(fileURLWithPath: NSHomeDirectory())
-                        .appendingPathComponent("Documents/Chainworks Forge/\(preset.relativePath)")
-                )
-            }
-            candidates.append(bundleURL)
-            guard let url = resolveExistingFile(at: candidates) else {
+            guard let url = AppConfiguration.preferredExampleURL(
+                configuredURL: configuredWorkflowURL,
+                repoRelativePath: preset.relativePath,
+                bundledURL: bundleURL
+            ) ?? resolveExistingFile(at: [configuredWorkflowURL, bundleURL]) else {
                 return nil
             }
             return (preset, url)
         })
 
-        var catalogCandidates: [URL?] = [
+        catalogURL = AppConfiguration.preferredExampleURL(
+            configuredURL: URL(fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
+            repoRelativePath: "examples/agents/agents.yaml",
+            bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml")
+        ) ?? resolveExistingFile(at: [
             URL(fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("examples/agents/agents.yaml")
-        ]
-        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-            catalogCandidates.append(
-                URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml")
-            )
-        }
-        catalogCandidates.append(Bundle.main.url(forResource: "agents", withExtension: "yaml"))
-        catalogURL = resolveExistingFile(at: catalogCandidates)
+            Bundle.main.url(forResource: "agents", withExtension: "yaml")
+        ])
     }
 
     private func resolveExistingFile(at candidates: [URL?]) -> URL? {
@@ -2005,7 +2109,11 @@ struct WorkflowStartRunSheet: View {
             let compiler = RunPlanCompiler(modelContext: modelContext)
             let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
             let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
-            let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+            let plan = try compiler.previewCompile(
+                workflow: workflow,
+                catalog: catalog,
+                catalogSourcePath: catalogURL.path
+            )
 
             compiledPlan = plan
             compileState = .success(stateCount: plan.states.count, agentCount: plan.agentBindings.count)
@@ -2044,11 +2152,13 @@ struct WorkflowStartRunSheet: View {
         isStarting = true
 
         do {
+            let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
             let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
             let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions)
             let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
             let startSnapshot = try buildRunStartSnapshot(
                 resolver: resolver,
+                catalog: catalog,
                 adjustedPlan: adjustedPlan,
                 providerBindings: providerBindings
             )
@@ -2140,12 +2250,46 @@ struct WorkflowStartRunSheet: View {
         return try? encoder.encode(options)
     }
 
+    private func encodeResolvedSkills(_ skills: [String: ResolvedSkill]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(skills)
+    }
+
+    private func encodeSkillHashes(_ hashes: [String: String]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(hashes)
+    }
+
+    private func encodeMCPPolicies(_ policies: [String: MCPPolicyResolutionReport]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(policies)
+    }
+
     private func buildRunStartSnapshot(
         resolver: BackendProfileResolverV2,
+        catalog: AgentCatalog,
         adjustedPlan: RunPlan,
         providerBindings: [String: ResolvedProviderBinding]
     ) throws -> RunStartSnapshot {
         let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
+        let resolvedSkills: [String: ResolvedSkill] = adjustedPlan.agentBindings.values.reduce(into: [:]) { partialResult, agent in
+            guard let skill = agent.resolvedSkill else { return }
+            partialResult[agent.skillRef] = skill
+        }
+        let skillContentHashes = resolvedSkills.mapValues { $0.contentHash }
+        let skillInjectedContentHashes = resolvedSkills.mapValues { $0.injectedContentHash }
+        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let resolvedMCPPolicies: [String: MCPPolicyResolutionReport] = adjustedPlan.agentBindings.reduce(into: [:]) { partialResult, entry in
+            partialResult[entry.key] = MCPPolicyResolver().resolve(
+                agent: entry.value,
+                catalog: catalog,
+                providerBinding: providerBindings[entry.key],
+                gooseRegistry: gooseRegistry
+            )
+        }
         let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
             .resolveSelection(
                 selectedProfileID: selectedContextStrategyProfileID,
@@ -2180,6 +2324,10 @@ struct WorkflowStartRunSheet: View {
         return RunStartSnapshot(
             providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
             bindingProvenanceJSON: encodeProvenances(provenances),
+            resolvedSkillsJSON: encodeResolvedSkills(resolvedSkills),
+            skillContentHashesJSON: encodeSkillHashes(skillContentHashes),
+            skillInjectedContentHashesJSON: encodeSkillHashes(skillInjectedContentHashes),
+            resolvedMCPPoliciesJSON: encodeMCPPolicies(resolvedMCPPolicies),
             startOptionsJSON: encodeStartOptions(startOptions),
             frozenWorkspaceRootPath: normalizedWorkspaceRoot,
             deliveryConfiguration: deliveryConfig,
@@ -2221,6 +2369,7 @@ struct WorkflowRunProgressView: View {
     @Environment(ExecutionService.self) private var executionService
 
     let run: Run
+    private let forcedInitialPane: IdeaRunPane?
 
     @State private var selectedPane: IdeaRunPane = .summary
     @State private var selectedStage: StageExecution?
@@ -2228,6 +2377,12 @@ struct WorkflowRunProgressView: View {
     @State private var approvalComment = ""
     @State private var showStopConfirmation = false
     @State private var showTimelineInspector = false
+
+    init(run: Run, initialPane: IdeaRunPane? = nil) {
+        self.run = run
+        self.forcedInitialPane = initialPane
+        _selectedPane = State(initialValue: initialPane ?? .summary)
+    }
 
     private var sortedStages: [StageExecution] {
         run.stageExecutions.sorted {
@@ -2445,7 +2600,7 @@ struct WorkflowRunProgressView: View {
             Text("This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history.")
         }
         .task(id: run.presentationStatus.rawValue) {
-            selectedPane = preferredPane
+            selectedPane = forcedInitialPane ?? preferredPane
         }
     }
 
@@ -2560,41 +2715,138 @@ struct WorkflowRunProgressView: View {
             progressPane
         case .artifacts:
             artifactsPane
-        case .approvals:
-            approvalsPane
         }
     }
 
     private var summaryPane: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            GroupBox("Summary") {
-                VStack(alignment: .leading, spacing: 8) {
-                    LabeledContent("Workflow", value: run.workflowTitle)
-                    LabeledContent("Status", value: run.presentationStatusLabel)
-                        .accessibilityIdentifier("run-status-\(run.presentationStatus.rawValue)")
-                    LabeledContent("Current Stage", value: run.currentStageID ?? "None")
-                    LabeledContent("Latest Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
-                    LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
-                    LabeledContent("Latest Event", value: latestMeaningfulEventText)
-                    LabeledContent("Next Action", value: nextActionText)
-                    if let liveSession = latestLiveSessionID {
-                        LabeledContent("Session ID", value: liveSession)
-                    }
+        ScrollView {
+            VStack(alignment: .leading, spacing: ForgeSpacing.section) {
+                summaryOverviewPanel
+                summaryMetricsGrid
+                if pendingApprovalRequest != nil || !approvalContextArtifacts.isEmpty || !latestDebugArtifacts.isEmpty {
+                    summaryDecisionContextSection
+                }
+                if run.canBeCancelledByOperator {
+                    summaryRunControlPanel
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, ForgeSpacing.compact)
+        }
+    }
 
-            if run.canBeCancelledByOperator {
-                GroupBox("Run Control") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(
-                            run.cancellationRequestedAt != nil
-                                ? "Cancellation in progress. Waiting for agents to settle."
-                                : "Stop the active run. All run history and artifacts remain intact."
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    private var summaryOverviewPanel: some View {
+        VStack(alignment: .leading, spacing: ForgeSpacing.large) {
+            HStack(alignment: .top, spacing: ForgeSpacing.large) {
+                VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                    Text("Run Overview")
+                        .font(ForgeTypography.sectionHeader)
+                    Text(currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                        .font(.title3.weight(.semibold))
+                    Text(nextActionText)
+                        .font(ForgeTypography.body)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: ForgeSpacing.large)
+                StatusCapsule(
+                    text: run.presentationStatusLabel,
+                    color: runStatusColor,
+                    size: .regular
+                )
+                .accessibilityIdentifier("run-status-\(run.presentationStatus.rawValue)")
+            }
+
+            VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                summaryRow(label: "Workflow", value: run.workflowTitle)
+                summaryRow(label: "Current Stage", value: run.currentStageID ?? "None")
+                summaryRow(label: "Latest Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                summaryRow(label: "Latest Event", value: latestMeaningfulEventText)
+            }
+        }
+        .forgePanel(
+            tint: runStatusColor.opacity(0.55),
+            fill: ForgeColor.Brand.accentMuted.opacity(0.55)
+        )
+    }
+
+    private var summaryMetricsGrid: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: ForgeSpacing.large)],
+            alignment: .leading,
+            spacing: ForgeSpacing.large
+        ) {
+            summaryMetricCard(
+                title: "Loop Iteration",
+                value: currentStageExecution.map { "\($0.iteration)" } ?? "0",
+                detail: "Current refinement/review cycle",
+                symbol: "repeat.circle"
+            )
+            summaryMetricCard(
+                title: "Elapsed",
+                value: elapsedText,
+                detail: "Wall-clock run duration",
+                symbol: "clock"
+            )
+            summaryMetricCard(
+                title: "Spend",
+                value: run.totalCostCents.map { "\($0) cents" } ?? "Pending",
+                detail: "Accumulated execution cost",
+                symbol: "dollarsign.circle"
+            )
+            summaryMetricCard(
+                title: "Session",
+                value: latestLiveSessionID ?? "No live session",
+                detail: latestLiveSessionID == nil ? "Waiting for the next session to start" : "Most recent active Goose session",
+                symbol: "lanyardcard"
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var summaryDecisionContextSection: some View {
+        VStack(alignment: .leading, spacing: ForgeSpacing.large) {
+            HStack {
+                VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                    Text("Decision Context")
+                        .font(ForgeTypography.sectionHeader)
+                    Text(pendingApprovalTitle)
+                        .font(ForgeTypography.supporting)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+                Spacer()
+            }
+
+            if let pendingApprovalRequest {
+                summaryApprovalPanel(for: pendingApprovalRequest)
+            }
+
+            if !approvalContextArtifacts.isEmpty {
+                VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
+                    if let summary = proposalLoopFeedbackSummary {
+                        proposalFeedbackPanel(summary)
+                    }
+
+                    VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                        Text("Summary Documents")
+                            .font(ForgeTypography.cardTitle)
+                        ForEach(approvalContextArtifacts) { artifact in
+                            artifactButton(artifact)
+                        }
                     }
                 }
+                .forgePanel()
+            }
+
+            if !latestDebugArtifacts.isEmpty {
+                VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                    Text("Receipts & Traces")
+                        .font(ForgeTypography.cardTitle)
+                    ForEach(latestDebugArtifacts) { artifact in
+                        artifactButton(artifact)
+                    }
+                }
+                .forgePanel(tint: ForgeColor.Surface.border, fill: ForgeColor.Surface.muted)
             }
         }
     }
@@ -2648,103 +2900,167 @@ struct WorkflowRunProgressView: View {
         }
     }
 
-    private var approvalsPane: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            GroupBox("Approvals") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(pendingApprovalTitle)
-                        .font(.subheadline)
+    private var summaryRunControlPanel: some View {
+        HStack(alignment: .center, spacing: ForgeSpacing.large) {
+            VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                Text("Run Control")
+                    .font(ForgeTypography.cardTitle)
+                Text(
+                    run.cancellationRequestedAt != nil
+                        ? "Cancellation in progress. Waiting for agents to settle."
+                        : "Stop the active run. All run history and artifacts remain intact."
+                )
+                .font(ForgeTypography.supporting)
+                .foregroundStyle(ForgeColor.Text.secondary)
+            }
+            Spacer()
+            if run.canBeCancelledByOperator {
+                Button(role: .destructive) {
+                    showStopConfirmation = true
+                } label: {
+                    Label(
+                        run.cancellationRequestedAt != nil ? "Cancelling…" : "Stop Run",
+                        systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
+                    )
+                }
+                .disabled(run.cancellationRequestedAt != nil)
+                .accessibilityIdentifier("run-progress-stop-run-button")
+            }
+        }
+        .forgePanel(
+            tint: DesignTokens.Status.warning.opacity(0.45),
+            fill: ForgeColor.Surface.elevated
+        )
+    }
 
-                    if let pendingApprovalRequest {
-                        if run.deliveryConfigurationJSON != nil,
-                           pendingApprovalRequest.approvalPolicy == "manual_release" {
-                            ReleaseGateView(
-                                run: run,
-                                onApprove: {
-                                    executionService.resolveApproval(
-                                        approvalID: pendingApprovalRequest.id,
-                                        granted: true,
-                                        comment: blankToNil(approvalComment)
-                                    )
-                                    approvalComment = ""
-                                },
-                                onReject: {
-                                    executionService.resolveApproval(
-                                        approvalID: pendingApprovalRequest.id,
-                                        granted: false,
-                                        comment: blankToNil(approvalComment)
-                                    )
-                                    approvalComment = ""
-                                }
-                            )
-                        } else {
-                            LabeledContent("Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
-                            TextField("Comment", text: $approvalComment, axis: .vertical)
-                                .textFieldStyle(.roundedBorder)
-                            HStack {
-                                Button("Reject", role: .destructive) {
-                                    executionService.resolveApproval(
-                                        approvalID: pendingApprovalRequest.id,
-                                        granted: false,
-                                        comment: blankToNil(approvalComment)
-                                    )
-                                    approvalComment = ""
-                                }
-                                .accessibilityIdentifier("approval-reject-button")
-                                Spacer()
-                                Button("Approve") {
-                                    executionService.resolveApproval(
-                                        approvalID: pendingApprovalRequest.id,
-                                        granted: true,
-                                        comment: blankToNil(approvalComment)
-                                    )
-                                    approvalComment = ""
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .accessibilityIdentifier("approval-approve-button")
-                            }
-                        }
+    @ViewBuilder
+    private func summaryApprovalPanel(for request: ApprovalRequest) -> some View {
+        if run.deliveryConfigurationJSON != nil,
+           request.approvalPolicy == "manual_release" {
+            ReleaseGateView(
+                run: run,
+                onApprove: {
+                    executionService.resolveApproval(
+                        approvalID: request.id,
+                        granted: true,
+                        comment: blankToNil(approvalComment)
+                    )
+                    approvalComment = ""
+                },
+                onReject: {
+                    executionService.resolveApproval(
+                        approvalID: request.id,
+                        granted: false,
+                        comment: blankToNil(approvalComment)
+                    )
+                    approvalComment = ""
+                }
+            )
+        } else {
+            VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
+                HStack {
+                    Text("Approval Gate")
+                        .font(ForgeTypography.cardTitle)
+                    Spacer()
+                    Text(request.stageLabel)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+                summaryRow(label: "Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+                TextField("Comment", text: $approvalComment, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Reject", role: .destructive) {
+                        executionService.resolveApproval(
+                            approvalID: request.id,
+                            granted: false,
+                            comment: blankToNil(approvalComment)
+                        )
+                        approvalComment = ""
                     }
+                    .accessibilityIdentifier("approval-reject-button")
+                    Spacer()
+                    Button("Approve") {
+                        executionService.resolveApproval(
+                            approvalID: request.id,
+                            granted: true,
+                            comment: blankToNil(approvalComment)
+                        )
+                        approvalComment = ""
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("approval-approve-button")
                 }
             }
+            .forgePanel(
+                tint: DesignTokens.Status.warning.opacity(0.45),
+                fill: ForgeColor.Surface.elevated
+            )
+        }
+    }
 
-            if !approvalContextArtifacts.isEmpty {
-                GroupBox("Decision Context") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let summary = proposalLoopFeedbackSummary {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Proposal-loop feedback (Proposal 022)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                LabeledContent("Backlog", value: "\(summary.backlogItemCount)")
-                                LabeledContent("Unresolved", value: "\(summary.unresolvedItemCount)")
-                                LabeledContent("Deferred", value: "\(summary.deferredItemCount)")
-                                LabeledContent("Addressed", value: "\(summary.addressedItemCount)")
-                                LabeledContent("Coverage", value: summary.coverageStatusSummary)
-                                if let targeted = summary.targetedReviewerSummary {
-                                    Text(targeted)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        ForEach(approvalContextArtifacts) { artifact in
-                            artifactButton(artifact)
-                        }
-                    }
-                }
+    private func proposalFeedbackPanel(_ summary: ProposalLoopFeedbackSummary) -> some View {
+        VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+            Text("Proposal-Loop Feedback")
+                .font(ForgeTypography.cardTitle)
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 120), spacing: ForgeSpacing.medium)],
+                alignment: .leading,
+                spacing: ForgeSpacing.medium
+            ) {
+                feedbackMetric(title: "Backlog", value: "\(summary.backlogItemCount)")
+                feedbackMetric(title: "Unresolved", value: "\(summary.unresolvedItemCount)")
+                feedbackMetric(title: "Deferred", value: "\(summary.deferredItemCount)")
+                feedbackMetric(title: "Addressed", value: "\(summary.addressedItemCount)")
+                feedbackMetric(title: "Coverage", value: summary.coverageStatusSummary)
             }
-
-            if !latestDebugArtifacts.isEmpty {
-                GroupBox("Receipts & Traces") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(latestDebugArtifacts) { artifact in
-                            artifactButton(artifact)
-                        }
-                    }
-                }
+            if let targeted = summary.targetedReviewerSummary {
+                Text(targeted)
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.secondary)
             }
+        }
+        .padding(ForgeSpacing.large)
+        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: ForgeRadius.card, style: .continuous))
+    }
+
+    private func summaryMetricCard(title: String, value: String, detail: String, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+            Label(title, systemImage: symbol)
+                .font(ForgeTypography.supporting)
+                .foregroundStyle(ForgeColor.Text.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .lineLimit(2)
+                .truncationMode(.middle)
+            Text(detail)
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
+        .forgePanel()
+    }
+
+    private func feedbackMetric(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+            Text(title)
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.secondary)
+            Text(value)
+                .font(ForgeTypography.cardTitle)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func summaryRow(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.secondary)
+            Text(value)
+                .font(ForgeTypography.body)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -3131,7 +3447,7 @@ private extension String {
     let idea = Idea(
         title: "Investigate provider setup",
         body: "Make Codex and Claude configuration legible and Goose-backed.",
-        attachmentPath: "/Users/user/Documents/specs/provider-setup.md"
+        attachmentPath: PreviewSupport.previewDocumentsURL("specs/provider-setup.md").path
     )
 
     return WorkflowStartRunSheet(idea: idea)
@@ -3159,7 +3475,7 @@ private extension String {
             NewIdeaDraft(
                 title: "Canonical delivery dogfood",
                 body: "Use the real repo-backed flow to validate the delivery path end to end.",
-                attachmentPath: "/Users/user/Documents/Chainworks Forge/docs/reference/provider-platform.md"
+                attachmentPath: PreviewSupport.previewWorkspaceURL("docs/reference/provider-platform.md").path
             )
         ),
         onBrowseAttachment: {},

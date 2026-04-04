@@ -462,6 +462,14 @@ final class ExecutionService {
             )
         }
 
+        if let liveRuntimeConfiguration,
+           liveRuntimeConfiguration.transportMode != .network {
+            return .ready(
+                summary: liveRuntimeConfiguration.summary,
+                source: liveRuntimeConfiguration.sourceDescription
+            )
+        }
+
         if let gooseServerManager, let liveRuntimeConfiguration {
             switch gooseServerManager.launchState {
             case .running, .external:

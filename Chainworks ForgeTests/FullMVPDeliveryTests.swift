@@ -28,6 +28,7 @@ struct FullMVPWorkflowTests {
             isStoredInMemoryOnly: true
         )
         container = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(container)
         context = container.mainContext
         compiler = RunPlanCompiler(modelContext: context)
     }
@@ -806,10 +807,11 @@ struct FullMVPIntegrationTests {
 
     @Test("Sample RepositoryProfile produces valid delivery configuration")
     func sampleRepoProfile() {
-        let profile = RepositoryProfile.chainworksForge(repoRoot: "/Users/user/test-repo")
+        let repoRoot = "/tmp/test-repo"
+        let profile = RepositoryProfile.chainworksForge(repoRoot: repoRoot)
 
         let config = profile.toDeliveryConfiguration()
-        #expect(config.repoRoot == "/Users/user/test-repo")
+        #expect(config.repoRoot == repoRoot)
         #expect(config.baseBranch == "main")
         #expect(config.releaseMode == .sandbox)
         #expect(config.profileID == "chainworks_forge_self")

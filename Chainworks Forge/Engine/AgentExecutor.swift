@@ -147,6 +147,18 @@ struct AgentResult: Sendable {
     let runtimeProvider: String?
     /// Actual runtime model identity when known.
     let runtimeModel: String?
+    /// Resolved MCP profile used for this execution attempt.
+    let mcpProfileID: String?
+    /// Requested conceptual MCP extensions for this execution attempt.
+    let requestedMCPExtensions: [String]
+    /// Effective runtime extension IDs expected/enabled for this execution attempt.
+    let effectiveMCPRuntimeExtensionIDs: [String]
+    /// Requested conceptual MCP extensions denied during resolution/reconciliation.
+    let deniedMCPExtensions: [String]
+    /// Measured latency for fresh session startup plus MCP reconciliation.
+    let mcpSessionStartupLatencyMilliseconds: Int?
+    /// Per-server MCP usage measured during this execution.
+    let mcpServerMetrics: [MCPServerExecutionMetric]
     /// Supporting diagnostic envelope for later readers.
     let outcomeEnvelope: OutcomeEnvelope?
     /// Unique lazy-evidence artifacts actually fetched during execution.
@@ -174,6 +186,12 @@ struct AgentResult: Sendable {
         outputPresence: OutputPresence = .none,
         runtimeProvider: String? = nil,
         runtimeModel: String? = nil,
+        mcpProfileID: String? = nil,
+        requestedMCPExtensions: [String] = [],
+        effectiveMCPRuntimeExtensionIDs: [String] = [],
+        deniedMCPExtensions: [String] = [],
+        mcpSessionStartupLatencyMilliseconds: Int? = nil,
+        mcpServerMetrics: [MCPServerExecutionMetric] = [],
         outcomeEnvelope: OutcomeEnvelope? = nil,
         lazyEvidenceArtifactHits: [String] = []
     ) {
@@ -198,9 +216,23 @@ struct AgentResult: Sendable {
         self.outputPresence = outputPresence
         self.runtimeProvider = runtimeProvider
         self.runtimeModel = runtimeModel
+        self.mcpProfileID = mcpProfileID
+        self.requestedMCPExtensions = requestedMCPExtensions
+        self.effectiveMCPRuntimeExtensionIDs = effectiveMCPRuntimeExtensionIDs
+        self.deniedMCPExtensions = deniedMCPExtensions
+        self.mcpSessionStartupLatencyMilliseconds = mcpSessionStartupLatencyMilliseconds
+        self.mcpServerMetrics = mcpServerMetrics
         self.outcomeEnvelope = outcomeEnvelope
         self.lazyEvidenceArtifactHits = lazyEvidenceArtifactHits
     }
+}
+
+struct MCPServerExecutionMetric: Codable, Sendable, Equatable {
+    let serverID: String
+    let toolCallCount: Int
+    let requestBytes: Int64
+    let responseBytes: Int64
+    let promptContextDeltaBytes: Int64
 }
 
 // MARK: - Output Contract Resolution

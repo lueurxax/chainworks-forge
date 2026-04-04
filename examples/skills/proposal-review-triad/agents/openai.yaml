@@ -1,0 +1,10 @@
+interface:
+  display_name: "Proposal Review Triad"
+  short_description: "Proposal-first review with reusable baseline intake and optional research packs"
+  default_prompt: "Use $proposal-review-triad for a consumer finance iOS Xcode proposal. Default to `proposal-readiness` unless the user explicitly asks for `research` or a specialist mode. First extract local context from the proposal, adjacent docs, the latest `.review-baselines/current-system-baseline.md` if present, any proposal-specific `.review/integration-context.md`, any existing evidence pack or research pack, current code/module mapping, and current repo reality. Reuse a fresh baseline instead of rebuilding it; if a narrow slice is stale, refresh only that slice, preferably with `integration_mapper`, or point to $integration-context-baseline when the reusable baseline itself needs broader refresh. In `proposal-readiness`, return UI, UX, iOS architecture, and optional product findings without requiring build/run evidence. In `research`, start only after the local evidence pack is built, never use Xcode tools, and write a targeted `research-pack.md` beside the proposal with source-backed findings, applicability, reused/refreshed sources, and modern-practice deltas."
+  brand_color: "#3B82A6"
+  icon_large: "./assets/image.png"
+  icon_small: "./assets/image.png"
+
+policy:
+  allow_implicit_invocation: false

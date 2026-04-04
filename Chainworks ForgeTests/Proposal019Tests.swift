@@ -906,7 +906,25 @@ private func makeCanonicalStrategyKPIJSON(
         totalForcedBudgetResets: 0,
         totalTokenSavingsVersusFreshBaseline: totalCostCents,
         perAgentKPIs: [],
-    strategyTelemetry: SessionReuseKPIExporter.StrategyTelemetrySummary(
+        mcpTelemetry: SessionReuseKPIExporter.MCPTelemetrySummary(
+            totalExecutionsWithMCPProfile: 0,
+            totalZeroMCPExecutions: 0,
+            totalRequestedExtensionCount: 0,
+            totalPredictedExtensionCount: 0,
+            totalActualExtensionCount: 0,
+            totalDeniedExtensionCount: 0,
+            totalPolicyReductionExecutions: 0,
+            totalPredictionDriftExecutions: 0,
+            averageRequestedExtensionsPerExecution: 0,
+            averageActualExtensionsPerExecution: 0,
+            totalStartupLatencyMilliseconds: 0,
+            averageStartupLatencyMilliseconds: 0,
+            startupLatencyByExtensionSet: [],
+            serverUsage: [],
+            totalPromptContextDeltaBytes: 0,
+            totalMCPPreflightBlockedRuns: 0
+        ),
+        strategyTelemetry: SessionReuseKPIExporter.StrategyTelemetrySummary(
             totalPayloadBytesBeforeStrategy: 4096,
             totalPayloadBytesAfterStrategy: 4096 - payloadReductionBytes,
             totalPayloadReductionBytes: payloadReductionBytes,

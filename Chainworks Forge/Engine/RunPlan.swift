@@ -161,6 +161,7 @@ struct ResolvedAgent: Sendable {
     let mcpProfileID: String?
     let skillRef: String
     let skillRole: String?
+    let resolvedSkill: ResolvedSkill?
     let prompt: String
     let outputContract: String?
     let requiresHumanApproval: Bool
@@ -187,6 +188,7 @@ struct ResolvedAgent: Sendable {
         mcpProfileID: String? = nil,
         skillRef: String,
         skillRole: String?,
+        resolvedSkill: ResolvedSkill? = nil,
         prompt: String,
         outputContract: String?,
         requiresHumanApproval: Bool,
@@ -209,6 +211,7 @@ struct ResolvedAgent: Sendable {
         self.mcpProfileID = mcpProfileID
         self.skillRef = skillRef
         self.skillRole = skillRole
+        self.resolvedSkill = resolvedSkill
         self.prompt = prompt
         self.outputContract = outputContract
         self.requiresHumanApproval = requiresHumanApproval
@@ -233,6 +236,7 @@ enum CompilationError: Error, LocalizedError {
     case duplicateStateIDs([String])
     case variableNotFound(name: String, context: String)
     case invalidLoopMax(value: String, counter: String)
+    case skillResolutionFailed(agentID: String, skillRef: String, reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -257,6 +261,8 @@ enum CompilationError: Error, LocalizedError {
             return "Variable '\(name)' not found (\(context))"
         case .invalidLoopMax(let value, let counter):
             return "Invalid loop max '\(value)' for counter '\(counter)' — must resolve to an integer"
+        case .skillResolutionFailed(let agentID, let skillRef, let reason):
+            return "Failed to resolve skill '\(skillRef)' for agent '\(agentID)': \(reason)"
         }
     }
 }

@@ -348,6 +348,7 @@ final class StewardAnalysisService {
             maxTurns: backend.maxTurns,
             temperature: backend.temperature,
             permissionProfile: agentDef.permissionProfile,
+            mcpProfileID: agentDef.mcpProfile,
             skillRef: agentDef.skillRef,
             skillRole: agentDef.skillRole,
             prompt: agentDef.prompt,

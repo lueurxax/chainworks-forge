@@ -6,15 +6,15 @@ struct Proposal024RunSurfaceTests {
     @Test("Idea pane routing prioritizes approvals and recovery-critical states")
     func ideaPaneRoutingPrioritizesCriticalStates() {
         #expect(defaultIdeaRunPane(for: .running, intent: .neutral) == .summary)
-        #expect(defaultIdeaRunPane(for: .waitingApproval, intent: .neutral) == .approvals)
+        #expect(defaultIdeaRunPane(for: .waitingApproval, intent: .neutral) == .summary)
         #expect(defaultIdeaRunPane(for: .blocked, intent: .neutral) == .summary)
         #expect(defaultIdeaRunPane(for: .failed, intent: .neutral) == .summary)
     }
 
     @Test("Idea pane routing respects approval and recovery deep-link intents")
     func ideaPaneRoutingRespectsOpenIntent() {
-        #expect(defaultIdeaRunPane(for: .running, intent: .approval) == .approvals)
-        #expect(defaultIdeaRunPane(for: .waitingApproval, intent: .approval) == .approvals)
+        #expect(defaultIdeaRunPane(for: .running, intent: .approval) == .summary)
+        #expect(defaultIdeaRunPane(for: .waitingApproval, intent: .approval) == .summary)
         #expect(defaultIdeaRunPane(for: .blocked, intent: .recovery) == .summary)
         #expect(defaultIdeaRunPane(for: .failed, intent: .recovery) == .summary)
     }

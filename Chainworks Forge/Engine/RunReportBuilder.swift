@@ -146,11 +146,18 @@ final class RunReportBuilder {
         // Proposal 011 (REQ-008): Read model truth from frozen binding snapshot first.
         let frozenBindings = decodeFrozenBindings(from: run)
         let frozenProvenances = decodeFrozenProvenances(from: run)
+        let resolvedSkills = decodeResolvedSkills(from: run)
+        let catalogSkillRefs = decodeCatalogSkillRefs(from: run)
+        let frozenMCPPolicies = decodeFrozenMCPPolicies(from: run)
+        let kpiSummary = SessionReuseKPIExporter.decodeSummary(from: run.sessionKPIExportJSON)
 
         // Agents used
         let agentsUsed: [RunReportPayload.AgentEntry] = allAgents.map { agent in
             let frozenModel = frozenBindings[agent.agentID]?.model
             let provenanceLabel = frozenProvenances[agent.agentID].map { " (\($0.source.rawValue))" } ?? ""
+            let skillRef = agent.skillRef ?? catalogSkillRefs[agent.agentID]
+            let resolvedSkill = skillRef.flatMap { resolvedSkills[$0] }
+            let mcpResolution = frozenMCPPolicies[agent.agentID]
             return RunReportPayload.AgentEntry(
                 agentID: agent.agentID,
                 provider: agent.provider,
@@ -158,7 +165,18 @@ final class RunReportBuilder {
                 effort: agent.effort,
                 costCents: agent.costCents,
                 duration: agentDuration(agent),
-                finalStatus: agent.status.rawValue
+                finalStatus: agent.status.rawValue,
+                skillRef: skillRef,
+                skillType: agent.skillType,
+                skillRole: agent.skillRole,
+                skillContentSummary: agent.skillContentSummary,
+                skillSnapshotHash: agent.skillSnapshotHash,
+                resolvedSkillContent: resolvedSkill?.resolvedContent,
+                mcpProfileID: agent.mcpProfileID,
+                requestedMCPExtensions: decodeStringArray(from: agent.requestedMCPExtensionsJSON),
+                predictedMCPExtensions: mcpResolution?.predictedEffectiveRuntimeExtensionIDs ?? [],
+                actualMCPExtensions: decodeStringArray(from: agent.effectiveMCPRuntimeExtensionIDsJSON),
+                deniedMCPExtensions: decodeStringArray(from: agent.deniedMCPExtensionsJSON)
             )
         }
 
@@ -276,7 +294,8 @@ final class RunReportBuilder {
             retriesPerformed: retriesPerformed,
             recoveryActionsTaken: recoveryActionsTaken,
             failureEvidenceSummaries: failureEvidenceSummaries,
-            proposalLoopSummary: proposalLoopSummary
+            proposalLoopSummary: proposalLoopSummary,
+            mcpTelemetry: kpiSummary?.mcpTelemetry
         )
     }
 
@@ -499,6 +518,36 @@ final class RunReportBuilder {
             lines.append("- **\(stage.label)** — \(stage.status) (iter \(stage.iteration), attempt \(stage.attempt), \(formattedDuration(stage.duration)))")
         }
         lines.append("")
+        if let mcpTelemetry = payload.mcpTelemetry {
+            lines.append("## 5A. MCP Telemetry")
+            lines.append("- Executions with MCP profile: \(mcpTelemetry.totalExecutionsWithMCPProfile)")
+            lines.append("- Zero-MCP executions: \(mcpTelemetry.totalZeroMCPExecutions)")
+            lines.append("- Requested runtime extensions: \(mcpTelemetry.totalRequestedExtensionCount)")
+            lines.append("- Predicted runtime extensions: \(mcpTelemetry.totalPredictedExtensionCount)")
+            lines.append("- Actual runtime extensions: \(mcpTelemetry.totalActualExtensionCount)")
+            lines.append("- Denied runtime extensions: \(mcpTelemetry.totalDeniedExtensionCount)")
+            lines.append("- Policy reduction executions: \(mcpTelemetry.totalPolicyReductionExecutions)")
+            lines.append("- Prediction drift executions: \(mcpTelemetry.totalPredictionDriftExecutions)")
+            lines.append("- Avg requested per execution: \(String(format: "%.2f", mcpTelemetry.averageRequestedExtensionsPerExecution))")
+            lines.append("- Avg actual per execution: \(String(format: "%.2f", mcpTelemetry.averageActualExtensionsPerExecution))")
+            lines.append("- Total startup latency (ms): \(mcpTelemetry.totalStartupLatencyMilliseconds)")
+            lines.append("- Avg startup latency (ms): \(String(format: "%.2f", mcpTelemetry.averageStartupLatencyMilliseconds))")
+            lines.append("- Prompt/context delta from MCP (bytes): \(mcpTelemetry.totalPromptContextDeltaBytes)")
+            lines.append("- MCP-preflight blocked runs: \(mcpTelemetry.totalMCPPreflightBlockedRuns)")
+            if !mcpTelemetry.startupLatencyByExtensionSet.isEmpty {
+                lines.append("- Startup latency by extension set:")
+                for bucket in mcpTelemetry.startupLatencyByExtensionSet {
+                    lines.append("  - \(bucket.extensionSet): count=\(bucket.executionCount), total_ms=\(bucket.totalStartupLatencyMilliseconds), avg_ms=\(String(format: "%.2f", bucket.averageStartupLatencyMilliseconds))")
+                }
+            }
+            if !mcpTelemetry.serverUsage.isEmpty {
+                lines.append("- MCP server usage:")
+                for usage in mcpTelemetry.serverUsage {
+                    lines.append("  - \(usage.serverID): calls=\(usage.toolCallCount), request_bytes=\(usage.requestBytes), response_bytes=\(usage.responseBytes), prompt_delta_bytes=\(usage.promptContextDeltaBytes)")
+                }
+            }
+            lines.append("")
+        }
         lines.append("## 5. Agents Used")
         for agent in payload.agentsUsed {
             var line = "- **\(agent.agentID)** — \(agent.provider)"
@@ -507,6 +556,35 @@ final class RunReportBuilder {
             if let cost = agent.costCents { line += " (\(cost)c)" }
             line += " — \(agent.finalStatus)"
             lines.append(line)
+            if let skillRef = agent.skillRef {
+                var skillLine = "  - Skill: \(skillRef)"
+                if let skillType = agent.skillType { skillLine += " [\(skillType)]" }
+                if let skillRole = agent.skillRole { skillLine += " role=\(skillRole)" }
+                lines.append(skillLine)
+            }
+            if let summary = agent.skillContentSummary, !summary.isEmpty {
+                lines.append("  - Skill summary: \(summary)")
+            }
+            if let hash = agent.skillSnapshotHash {
+                lines.append("  - Skill hash: \(hash)")
+            }
+            if let content = agent.resolvedSkillContent, !content.isEmpty {
+                lines.append("  - Resolved skill content:")
+                for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+                    lines.append("    \(line)")
+                }
+            }
+            if agent.mcpProfileID != nil
+                || !agent.requestedMCPExtensions.isEmpty
+                || !agent.predictedMCPExtensions.isEmpty
+                || !agent.actualMCPExtensions.isEmpty
+                || !agent.deniedMCPExtensions.isEmpty {
+                lines.append("  - MCP profile: \(agent.mcpProfileID ?? "none")")
+                lines.append("  - MCP requested: \(joinedList(agent.requestedMCPExtensions))")
+                lines.append("  - MCP predicted: \(joinedList(agent.predictedMCPExtensions))")
+                lines.append("  - MCP actual: \(joinedList(agent.actualMCPExtensions))")
+                lines.append("  - MCP denied: \(joinedList(agent.deniedMCPExtensions))")
+            }
         }
         lines.append("")
         lines.append("## 6. Approvals")
@@ -732,6 +810,30 @@ final class RunReportBuilder {
         return (try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data)) ?? [:]
     }
 
+    private func decodeResolvedSkills(from run: Run) -> [String: ResolvedSkill] {
+        guard let data = run.resolvedSkillsJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: ResolvedSkill].self, from: data)) ?? [:]
+    }
+
+    private func decodeCatalogSkillRefs(from run: Run) -> [String: String] {
+        guard let catalog = try? JSONDecoder().decode(AgentCatalog.self, from: run.catalogSnapshotJSON) else {
+            return [:]
+        }
+        return Dictionary(uniqueKeysWithValues: catalog.agents.map { ($0.id, $0.skillRef) })
+    }
+
+    private func decodeFrozenMCPPolicies(from run: Run) -> [String: MCPPolicyResolutionReport] {
+        guard let data = run.resolvedMCPPoliciesJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: MCPPolicyResolutionReport].self, from: data)) ?? [:]
+    }
+
+    private func decodeStringArray(from data: Data?) -> [String] {
+        guard let data, let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return decoded
+    }
+
     private func strategyProfileID(for run: Run) -> String? {
         let value = run.contextStrategyProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
@@ -758,6 +860,10 @@ final class RunReportBuilder {
         let secs = Int(seconds) % 60
         if mins > 0 { return "\(mins)m \(secs)s" }
         return "\(secs)s"
+    }
+
+    private func joinedList(_ values: [String]) -> String {
+        values.isEmpty ? "none" : values.joined(separator: ", ")
     }
 
     private func reportFilePath(run: Run, name: String) -> String {
@@ -837,6 +943,7 @@ struct RunReportPayload: Codable, Sendable {
 
     // Proposal 022: Feedback fidelity / review carry-forward summary
     let proposalLoopSummary: ProposalLoopFeedbackSummary?
+    let mcpTelemetry: SessionReuseKPIExporter.MCPTelemetrySummary?
 
     struct FailureEvidenceSummary: Codable, Sendable {
         let stageID: String
@@ -864,6 +971,17 @@ struct RunReportPayload: Codable, Sendable {
         let costCents: Int64?
         let duration: Double
         let finalStatus: String
+        let skillRef: String?
+        let skillType: String?
+        let skillRole: String?
+        let skillContentSummary: String?
+        let skillSnapshotHash: String?
+        let resolvedSkillContent: String?
+        let mcpProfileID: String?
+        let requestedMCPExtensions: [String]
+        let predictedMCPExtensions: [String]
+        let actualMCPExtensions: [String]
+        let deniedMCPExtensions: [String]
     }
 
     struct ApprovalEntry: Codable, Sendable {

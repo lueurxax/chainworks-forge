@@ -535,12 +535,21 @@ final class Proposal022AppProofHarness {
         let catalogURL = try resolveCatalogURL()
         let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
         let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
-        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
 
         let idea = Idea(
             title: "Proposal 022 App Proof",
             body: "Fixture-backed review-corpus fidelity proof for Proposal 022.",
-            workspaceRootPath: AppConfiguration.defaultRepositoryRoot().path
+            workspaceRootPath: AppConfiguration.defaultRepositoryRoot(
+                currentDirectoryPath: FileManager.default.currentDirectoryPath,
+                bundleURL: Bundle.main.bundleURL,
+                allowsDocumentsFallback: false,
+                sourceFilePath: #filePath
+            ).path
         )
         modelContext.insert(idea)
 
@@ -666,24 +675,24 @@ final class Proposal022AppProofHarness {
     }
 
     private func resolveWorkflowURL() throws -> URL {
-        if let bundled = Bundle.main.url(forResource: "proposal-loop-live", withExtension: "yaml") {
-            return bundled
-        }
-        let fallback = AppConfiguration.defaultRepositoryRoot()
-            .appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
-        guard FileManager.default.fileExists(atPath: fallback.path) else {
+        guard let fallback = AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/workflows/proposal-loop-live.yaml",
+            bundledURL: Bundle.main.url(forResource: "proposal-loop-live", withExtension: "yaml"),
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        ) else {
             throw Proposal022AppProofHarnessError.missingWorkflow
         }
         return fallback
     }
 
     private func resolveCatalogURL() throws -> URL {
-        if let bundled = Bundle.main.url(forResource: "agents", withExtension: "yaml") {
-            return bundled
-        }
-        let fallback = AppConfiguration.defaultRepositoryRoot()
-            .appendingPathComponent("examples/agents/agents.yaml")
-        guard FileManager.default.fileExists(atPath: fallback.path) else {
+        guard let fallback = AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/agents/agents.yaml",
+            bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml"),
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        ) else {
             throw Proposal022AppProofHarnessError.missingCatalog
         }
         return fallback
@@ -704,7 +713,7 @@ final class Proposal022AppProofHarness {
             }
 
             switch run.status {
-            case .failed, .cancelled:
+            case .blocked, .failed, .cancelled:
                 throw Proposal022AppProofHarnessError.terminalFailure(
                     "Proposal 022 proof run ended as \(run.status.rawValue) before persisting the required review/refine checkpoint."
                 )

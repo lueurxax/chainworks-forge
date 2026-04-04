@@ -14,6 +14,7 @@ struct ResumeManagerTests {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
         let config = ModelConfiguration("ResumeManagerTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(container)
         context = container.mainContext
         compiler = RunPlanCompiler(modelContext: context)
     }
@@ -26,6 +27,13 @@ struct ResumeManagerTests {
 
     private func loadCanonicalCatalog() throws -> AgentCatalog {
         try loadTestCanonicalCatalog()
+    }
+
+    private func cancelAndAwaitSettled(_ service: ExecutionService, runID: UUID) async {
+        await service.cancelRun(runID: runID)
+        await awaitCondition("ExecutionService should fully detach orchestrator after cancellation", timeout: 3.0) {
+            service.orchestrator(for: runID) == nil
+        }
     }
 
     /// Create a run directly in SwiftData with proper snapshot data, avoiding filesystem ops.
@@ -343,7 +351,7 @@ struct ResumeManagerTests {
         #expect(service.hasActiveRuns)
         #expect(service.orchestrator(for: run.id) != nil)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
     }
 
     @Test("ExecutionService cancel run")
@@ -356,7 +364,7 @@ struct ResumeManagerTests {
         service.startRun(run: run, plan: plan, workspace: workspace)
         #expect(service.hasActiveRuns)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
         #expect(!service.hasActiveRuns)
         #expect(run.status == .cancelled)
     }
@@ -387,7 +395,7 @@ struct ResumeManagerTests {
 
         #expect(service.orchestrator(for: run.id) == nil)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
 
         #expect(run.status == .cancelled)
         #expect(run.cancellationRequestedAt != nil)
@@ -407,7 +415,7 @@ struct ResumeManagerTests {
 
         #expect(service.activeOrchestrators.count == 1)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
     }
 
     @Test("ExecutionService resumes stage retry by attaching an orchestrator")
@@ -447,7 +455,7 @@ struct ResumeManagerTests {
         #expect(service.orchestrator(for: run.id) != nil)
         #expect(run.status == .running)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
     }
 
     @Test("ExecutionService resumes agent retry by attaching an orchestrator")
@@ -498,7 +506,7 @@ struct ResumeManagerTests {
         #expect(service.orchestrator(for: run.id) != nil)
         #expect(run.status == .running)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
     }
 
     @Test("ExecutionService resumes agent retry without creating a new stage iteration")
@@ -552,6 +560,9 @@ struct ResumeManagerTests {
 
         await awaitCondition("Recovery-created running run should complete without creating a new stage iteration", timeout: 3.0) {
             run.status == .completed
+        }
+        await awaitCondition("Completed run should detach its orchestrator", timeout: 3.0) {
+            service.orchestrator(for: run.id) == nil
         }
 
         let stages = run.stageExecutions.filter { $0.stageID == plan.initialStateID }
@@ -632,6 +643,9 @@ struct ResumeManagerTests {
         await awaitCondition("Late output should complete the run without rerunning the retry attempt", timeout: 3.0) {
             run.status == .completed
         }
+        await awaitCondition("Late-output reconciliation should detach its orchestrator", timeout: 3.0) {
+            service.orchestrator(for: run.id) == nil
+        }
 
         #expect(run.status == .completed)
         #expect(stage.status == .completed)
@@ -673,6 +687,9 @@ struct ResumeManagerTests {
 
         await awaitCondition("Recovery-created ready stage retry should complete without extra stage creation", timeout: 3.0) {
             run.status == .completed
+        }
+        await awaitCondition("Completed stage retry should detach its orchestrator", timeout: 3.0) {
+            service.orchestrator(for: run.id) == nil
         }
 
         let stages = run.stageExecutions.filter { $0.stageID == plan.initialStateID }
@@ -761,7 +778,7 @@ struct ResumeManagerTests {
         }
         #expect(orchestrator.executor is GooseAgentExecutor)
 
-        await service.cancelRun(runID: run.id)
+        await cancelAndAwaitSettled(service, runID: run.id)
     }
 
     @Test("ExecutionService blocks live workflow without runtime config")
@@ -810,12 +827,112 @@ struct ResumeManagerTests {
 
     @Test("ExecutionService resume waiting approval restores pending approval without re-executing stage")
     func executionServiceResumeWaitingApprovalRestoresPendingApprovalWithoutReexecutingStage() async throws {
-        let workflow = try loadLiveWorkflow()
-        let catalog = try loadCanonicalCatalog()
-        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
+        let config = ModelConfiguration("ResumeManagerWaitingApproval-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let localContainer = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(localContainer)
+        let localContext = localContainer.mainContext
+        let localCompiler = RunPlanCompiler(modelContext: localContext)
+
+        let workflow = WorkflowDefinition(
+            schemaVersion: 1,
+            workflow: WorkflowMeta(
+                id: "waiting_approval_resume",
+                name: "Waiting Approval Resume",
+                usesAgentCatalog: nil,
+                description: "Minimal approval-restore workflow",
+                ideaInput: nil,
+                execution: ExecutionConfig(singleActiveRunPerIdea: true, resumePolicy: "automatic_on_launch"),
+                requiredProviders: []
+            ),
+            variables: nil,
+            failurePolicy: nil,
+            scoring: nil,
+            initialState: "state_1",
+            states: [
+                "state_1": WorkflowState(
+                    label: "Draft",
+                    type: "start",
+                    owner: "test_agent",
+                    approval: nil,
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: [Transition(to: "state_5_proposal_approval", when: "true")]
+                ),
+                "state_5_proposal_approval": WorkflowState(
+                    label: "Human approval: proposal quality",
+                    type: "normal",
+                    owner: "test_agent",
+                    approval: "required",
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: []
+                )
+            ]
+        )
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Approval restore test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: "Test Skill", description: "Test")],
+            contracts: [:],
+            backendProfiles: [
+                "test_profile": BackendProfile(
+                    provider: "claude_code",
+                    model: "test-model",
+                    effort: "high",
+                    temperature: 0,
+                    maxTurns: 4,
+                    structuredOutput: "none"
+                )
+            ],
+            permissionProfiles: [
+                "TEST": PermissionProfile(
+                    filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                    git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                    shell: ShellPermissions(allow: nil, deny: nil),
+                    network: NetworkPermissions(allow: nil),
+                    mcp: MCPPermissions(allow: nil)
+                )
+            ],
+            agents: [
+                AgentDefinition(
+                    id: "test_agent",
+                    title: "Test Agent",
+                    mode: "tool_use",
+                    backendProfile: "test_profile",
+                    permissionProfile: "TEST",
+                    skillRef: "test_skill",
+                    skillRole: nil,
+                    worktreePolicy: nil,
+                    requiredTools: nil,
+                    inputs: [],
+                    outputs: [],
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    prompt: "Wait for approval",
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
+                )
+            ]
+        )
+        let plan = try localCompiler.previewCompile(workflow: workflow, catalog: catalog)
 
         let idea = Idea(title: "Resume Waiting Approval", body: "Restore approval gate on app relaunch")
-        context.insert(idea)
+        localContext.insert(idea)
 
         let runID = UUID()
         let tempDir = FileManager.default.temporaryDirectory
@@ -830,7 +947,7 @@ struct ResumeManagerTests {
             worktreeRoot: nil
         )
 
-        let run = try RunRepository(context: context).createRunFromPlan(
+        let run = try RunRepository(context: localContext).createRunFromPlan(
             for: idea,
             plan: plan,
             workspace: workspace,
@@ -838,6 +955,7 @@ struct ResumeManagerTests {
             catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
         )
         run.status = .waitingApproval
+        let persistedRunID = run.id
 
         let stageExec = StageExecution(
             stageID: "state_5_proposal_approval",
@@ -847,33 +965,21 @@ struct ResumeManagerTests {
             attemptNumber: 1
         )
         stageExec.run = run
-        context.insert(stageExec)
+        localContext.insert(stageExec)
 
         let approval = Approval(stageID: "state_5_proposal_approval", decision: .requested)
         approval.run = run
-        context.insert(approval)
-        try context.save()
+        localContext.insert(approval)
+        try localContext.save()
 
         let executor = SimulatedAgentExecutor()
         let service = ExecutionService(
-            modelContext: context,
+            modelContext: localContext,
             executor: executor,
-            catalog: catalog,
-            liveRuntimeConfiguration: LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://fixture.local")!,
-                apiKey: nil,
-                override: LiveExecutionOverride(
-                    enabled: true,
-                    provider: "claude_code",
-                    model: "fixture-model",
-                    effort: "high"
-                ),
-                transportMode: .fixtureProposalLoopSuccess,
-                transportAPI: .bespoke
-            )
+            catalog: catalog
         )
 
-        service.resumeInterruptedRuns(compiler: compiler)
+        try service.resumeRun(run: run, compiler: localCompiler)
 
         // Wait for approval restoration using awaitCondition instead of pollUntil
         await awaitCondition("Waiting approval should be restored", timeout: 3.0) {
@@ -882,19 +988,123 @@ struct ResumeManagerTests {
 
         #expect(service.pendingApprovalCount == 1, "Waiting approval should be restored into the app shell")
         #expect(executor.executedTasks.count == 0, "Approval restore must not re-execute the paused stage")
-        #expect(run.status == .waitingApproval)
-        #expect(run.stageExecutions.count == 1, "Approval restore must not duplicate the waiting stage")
-        #expect(service.orchestrator(for: run.id) != nil, "Resumed live run should still be attached to an orchestrator")
+        let freshContext = ModelContext(localContainer)
+        let fetchedRun = try #require((try freshContext.fetch(FetchDescriptor<Run>())).first(where: { $0.id == persistedRunID }))
+        #expect(fetchedRun.status == .waitingApproval)
+        #expect(fetchedRun.stageExecutions.count == 1, "Approval restore must not duplicate the waiting stage")
+        #expect(service.orchestrator(for: persistedRunID) != nil, "Resumed live run should still be attached to an orchestrator")
+
+        await cancelAndAwaitSettled(service, runID: persistedRunID)
     }
 
     @Test("ExecutionService approval resolution persists decision for fresh context reads")
     func executionServiceApprovalResolutionPersistsDecisionForFreshContextReads() async throws {
-        let workflow = try loadFullMVPLiveWorkflow()
-        let catalog = try loadCanonicalCatalog()
-        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
+        let config = ModelConfiguration("ResumeManagerApprovalPersistence-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let localContainer = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(localContainer)
+        let localContext = localContainer.mainContext
+        let localCompiler = RunPlanCompiler(modelContext: localContext)
+
+        let workflow = WorkflowDefinition(
+            schemaVersion: 1,
+            workflow: WorkflowMeta(
+                id: "approval_persistence",
+                name: "Approval Persistence",
+                usesAgentCatalog: nil,
+                description: "Minimal approval-persistence workflow",
+                ideaInput: nil,
+                execution: ExecutionConfig(singleActiveRunPerIdea: true, resumePolicy: "automatic_on_launch"),
+                requiredProviders: []
+            ),
+            variables: nil,
+            failurePolicy: nil,
+            scoring: nil,
+            initialState: "state_1",
+            states: [
+                "state_1": WorkflowState(
+                    label: "Draft",
+                    type: "start",
+                    owner: "test_agent",
+                    approval: nil,
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: [Transition(to: "state_3_initial_proposal_approval", when: "true")]
+                ),
+                "state_3_initial_proposal_approval": WorkflowState(
+                    label: "Human approval: initial proposal matches intent",
+                    type: "normal",
+                    owner: "test_agent",
+                    approval: "required",
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: []
+                )
+            ]
+        )
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Approval persistence test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: "Test Skill", description: "Test")],
+            contracts: [:],
+            backendProfiles: [
+                "test_profile": BackendProfile(
+                    provider: "claude_code",
+                    model: "test-model",
+                    effort: "high",
+                    temperature: 0,
+                    maxTurns: 4,
+                    structuredOutput: "none"
+                )
+            ],
+            permissionProfiles: [
+                "TEST": PermissionProfile(
+                    filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                    git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                    shell: ShellPermissions(allow: nil, deny: nil),
+                    network: NetworkPermissions(allow: nil),
+                    mcp: MCPPermissions(allow: nil)
+                )
+            ],
+            agents: [
+                AgentDefinition(
+                    id: "test_agent",
+                    title: "Test Agent",
+                    mode: "tool_use",
+                    backendProfile: "test_profile",
+                    permissionProfile: "TEST",
+                    skillRef: "test_skill",
+                    skillRole: nil,
+                    worktreePolicy: nil,
+                    requiredTools: nil,
+                    inputs: [],
+                    outputs: [],
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    prompt: "Wait for approval",
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
+                )
+            ]
+        )
+        let plan = try localCompiler.previewCompile(workflow: workflow, catalog: catalog)
 
         let idea = Idea(title: "Persist Approval", body: "Approval should survive relaunch")
-        context.insert(idea)
+        localContext.insert(idea)
 
         let runID = UUID()
         let tempDir = FileManager.default.temporaryDirectory
@@ -909,14 +1119,15 @@ struct ResumeManagerTests {
             worktreeRoot: nil
         )
 
-        let run = try RunRepository(context: context).createRunFromPlan(
+        let run = try RunRepository(context: localContext).createRunFromPlan(
             for: idea,
             plan: plan,
             workspace: workspace,
-            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml").path,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml").path,
             catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
         )
         run.status = .waitingApproval
+        let persistedRunID = run.id
 
         let stageExec = StageExecution(
             stageID: "state_3_initial_proposal_approval",
@@ -926,33 +1137,21 @@ struct ResumeManagerTests {
             attemptNumber: 1
         )
         stageExec.run = run
-        context.insert(stageExec)
+        localContext.insert(stageExec)
 
         let approval = Approval(stageID: "state_3_initial_proposal_approval", decision: .requested)
         approval.run = run
-        context.insert(approval)
-        try context.save()
+        localContext.insert(approval)
+        try localContext.save()
 
         let executor = SimulatedAgentExecutor()
         let service = ExecutionService(
-            modelContext: context,
+            modelContext: localContext,
             executor: executor,
-            catalog: catalog,
-            liveRuntimeConfiguration: LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://fixture.local")!,
-                apiKey: nil,
-                override: LiveExecutionOverride(
-                    enabled: true,
-                    provider: "claude_code",
-                    model: "fixture-model",
-                    effort: "high"
-                ),
-                transportMode: .fixtureFullMVPSuccess,
-                transportAPI: .bespoke
-            )
+            catalog: catalog
         )
 
-        service.resumeInterruptedRuns(compiler: compiler)
+        try service.resumeRun(run: run, compiler: localCompiler)
         await awaitCondition("Pending approval should be restored", timeout: 3.0) {
             service.pendingApprovalCount == 1
         }
@@ -962,13 +1161,27 @@ struct ResumeManagerTests {
             return
         }
 
-        service.resolveApproval(approvalID: requestID, granted: true, comment: "persist now")
+        service.resolveApproval(approvalID: requestID, granted: false, comment: "persist now")
 
-        let freshContext = ModelContext(container)
+        await awaitCondition("Rejected approval should detach the orchestrator", timeout: 3.0) {
+            service.orchestrator(for: persistedRunID) == nil
+        }
+
+        await awaitCondition("Approval resolution should settle in fresh reads", timeout: 3.0) {
+            let freshContext = ModelContext(localContainer)
+            let approvals = (try? freshContext.fetch(FetchDescriptor<Approval>())) ?? []
+            return approvals.contains(where: {
+                $0.stageID == "state_3_initial_proposal_approval" && $0.decision == .rejected
+            })
+        }
+
+        let freshContext = ModelContext(localContainer)
         let approvalFetch = FetchDescriptor<Approval>()
         let fetchedApprovals = try freshContext.fetch(approvalFetch)
-        let fetchedApproval = try #require(fetchedApprovals.first(where: { $0.run?.id == run.id }))
-        #expect(fetchedApproval.decision == .granted)
+        let fetchedApproval = try #require(fetchedApprovals.first(where: {
+            $0.stageID == "state_3_initial_proposal_approval" && $0.decision == .rejected
+        }))
+        #expect(fetchedApproval.decision == .rejected)
         #expect(fetchedApproval.decidedAt != nil)
     }
 }

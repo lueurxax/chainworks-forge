@@ -15,6 +15,7 @@ struct ArtifactManagerTests {
         let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
         let config = ModelConfiguration("ArtifactManagerTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(container)
         context = container.mainContext
         manager = ArtifactManager(modelContext: context)
 

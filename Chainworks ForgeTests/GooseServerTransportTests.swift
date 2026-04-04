@@ -87,6 +87,14 @@ struct GooseServerTransportTests {
         secretKey: String? = "test-secret",
         provider: String? = "claude-code",
         model: String? = "default",
+        gooseRegistryProvider: @escaping @Sendable () throws -> GooseExtensionRegistrySnapshot = {
+            GooseExtensionRegistrySnapshot(
+                configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+                installedExtensionIDs: [],
+                enabledExtensionIDs: [],
+                configsByRuntimeID: [:]
+            )
+        },
         diagnosticsSink: @escaping @Sendable (GooseServerTransportDiagnosticEvent) -> Void = { _ in }
     ) -> GooseServerTransport {
         let config = URLSessionConfiguration.ephemeral
@@ -101,6 +109,7 @@ struct GooseServerTransportTests {
             model: model,
             requestTimeout: 10,
             sessionConfiguration: config,
+            gooseExtensionRegistrySnapshotProvider: gooseRegistryProvider,
             diagnosticsSink: diagnosticsSink
         )
     }
@@ -155,6 +164,10 @@ struct GooseServerTransportTests {
             if url.hasSuffix("/agent/update_provider") {
                 return (200, ["Content-Type": "application/json"], Data("{}".utf8))
             }
+            if url.contains("/sessions/mock-session-claude") {
+                let body = #"{"id":"mock-session-claude","working_dir":"/tmp/test-workspace","extension_data":{"enabled_extensions":{"v0":[]}}}"#
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
             return (404, [:], Data())
         }
 
@@ -195,6 +208,10 @@ struct GooseServerTransportTests {
             }
             if url.hasSuffix("/agent/update_provider") {
                 return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+            }
+            if url.contains("/sessions/mock-session-gemini") {
+                let body = #"{"id":"mock-session-gemini","working_dir":"/tmp/test-workspace","extension_data":{"enabled_extensions":{"v0":[]}}}"#
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
             }
             return (404, [:], Data())
         }
@@ -254,10 +271,23 @@ struct GooseServerTransportTests {
             if url.hasSuffix("/agent/remove_extension") {
                 return (200, ["Content-Type": "text/plain"], Data("ok".utf8))
             }
+            if url.contains("/sessions/mock-session-exts") {
+                let body = """
+                {
+                  "id": "mock-session-exts",
+                  "extension_data": {
+                    "enabled_extensions.v0": {
+                      "extensions": []
+                    }
+                  }
+                }
+                """
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
             return (404, [:], Data())
         }
 
-        _ = try await transport.createSession(
+        let response = try await transport.createSession(
             request: GooseSessionRequest(
                 systemPrompt: "You are a test agent.",
                 workingDirectory: "/tmp/test-workspace",
@@ -271,6 +301,7 @@ struct GooseServerTransportTests {
         let requests = MockURLProtocol.recordedRequests()
         let removeRequests = requests.filter { $0.url.contains("/agent/remove_extension") }
         #expect(removeRequests.count == 3)
+        #expect(response.actualEnabledExtensions == [])
 
         let removedNames = try removeRequests.map { request in
             let body = try #require(request.body, "Remove extension request should have a body")
@@ -282,6 +313,106 @@ struct GooseServerTransportTests {
         }
 
         #expect(Set(removedNames) == Set(["xcode", "developer", "Extension Manager"]))
+    }
+
+    @Test("GooseServerTransport reconciles session extensions to requested MCP set")
+    func serverTransportReconcilesExtensionsToRequestedSet() async throws {
+        let transport = makeMockTransport(
+            provider: "claude_code",
+            model: "opus",
+            gooseRegistryProvider: {
+                GooseExtensionRegistrySnapshot(
+                    configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+                    installedExtensionIDs: ["developer", "xcode", "context7"],
+                    enabledExtensionIDs: ["developer"],
+                    configsByRuntimeID: [
+                        "context7": GooseExtensionDefinition(
+                            enabled: false,
+                            type: "stdio",
+                            name: "context7",
+                            description: "Docs",
+                            displayName: "Context7",
+                            cmd: "npx",
+                            args: ["-y", "@upstash/context7-mcp"],
+                            envs: [:],
+                            envKeys: [],
+                            timeout: 300,
+                            bundled: nil,
+                            availableTools: []
+                        )
+                    ]
+                )
+            }
+        )
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            if url.hasSuffix("/agent/start") {
+                let body = """
+                {
+                  "id": "mock-session-reconcile",
+                  "working_dir": "/tmp/test-workspace",
+                  "extension_data": {
+                    "enabled_extensions.v0": {
+                      "extensions": [
+                        { "type": "platform", "name": "developer", "description": "Write and edit files" }
+                      ]
+                    }
+                  }
+                }
+                """
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
+            if url.hasSuffix("/agent/update_provider") {
+                return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+            }
+            if url.hasSuffix("/agent/remove_extension") || url.hasSuffix("/agent/add_extension") {
+                return (200, ["Content-Type": "application/json"], Data("{}".utf8))
+            }
+            if url.contains("/sessions/mock-session-reconcile") {
+                let body = """
+                {
+                  "id": "mock-session-reconcile",
+                  "extension_data": {
+                    "enabled_extensions.v0": {
+                      "extensions": [
+                        { "type": "stdio", "name": "context7", "description": "Docs" }
+                      ]
+                    }
+                  }
+                }
+                """
+                return (200, ["Content-Type": "application/json"], Data(body.utf8))
+            }
+            return (404, [:], Data())
+        }
+
+        let response = try await transport.createSession(
+            request: GooseSessionRequest(
+                systemPrompt: "You are a test agent.",
+                workingDirectory: "/tmp/test-workspace",
+                model: nil,
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil,
+                requestedExtensions: ["context7"]
+            )
+        )
+
+        let requests = MockURLProtocol.recordedRequests()
+        let removeRequests = requests.filter { $0.url.contains("/agent/remove_extension") }
+        #expect(removeRequests.count == 1)
+
+        let addRequests = requests.filter { $0.url.contains("/agent/add_extension") }
+        #expect(addRequests.count == 1)
+        let addBody = try #require(addRequests.first?.body, "Add extension request should have a body")
+        let addJSON = try #require(
+            try JSONSerialization.jsonObject(with: addBody) as? [String: Any],
+            "Add extension request should contain JSON"
+        )
+        let config = try #require(addJSON["config"] as? [String: Any], "Add extension request should include config")
+        #expect(config["name"] as? String == "context7")
+        #expect(response.actualEnabledExtensions == ["context7"])
     }
 
     @Test("GooseServerTransport accepts custom timeout")
@@ -584,6 +715,13 @@ struct GooseServerTransportTests {
                 return (200, ["Content-Type": "text/event-stream"], Data(sseBody.utf8))
             }
 
+            if url.contains("/sessions/mock-session-42") && request.httpMethod == "GET" {
+                let response = """
+                {"id":"mock-session-42","working_dir":"/tmp/test","extension_data":{"enabled_extensions":{"v0":[]}}}
+                """
+                return (200, ["Content-Type": "application/json"], Data(response.utf8))
+            }
+
             if url.contains("/sessions/") && request.httpMethod == "DELETE" {
                 return (200, ["Content-Type": "application/json"], Data("{}".utf8))
             }
@@ -746,6 +884,13 @@ struct GooseServerTransportTests {
 
             if url.hasSuffix("/agent/update_provider") {
                 return (200, ["Content-Type": "application/json"], Data(#"{"status":"ok"}"#.utf8))
+            }
+
+            if url.contains("/sessions/diagnostic-session-7") {
+                let response = """
+                {"id":"diagnostic-session-7","working_dir":"/tmp/diagnostic","extension_data":{"enabled_extensions":{"v0":[]}}}
+                """
+                return (200, ["Content-Type": "application/json"], Data(response.utf8))
             }
 
             return (404, [:], Data("Not Found".utf8))

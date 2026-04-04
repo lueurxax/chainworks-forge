@@ -1,0 +1,63 @@
+scenarios:
+  - id: locked-architecture-violation
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/LOCKED_ARCHITECTURE.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Keep the violating behavior in the `REQ-*` audit if the locked decision was explicit.
+      - Add at least one `ARCH-*` finding explaining the architectural consequence.
+      - Avoid turning the whole report into a generic architecture review.
+
+  - id: product-flow-incomplete
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/INCOMPLETE_CORE_FLOW.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Identify the primary user flow and evaluate whether it is actually achievable.
+      - Surface a `PROD-*` finding when code exists but the main user job is incomplete.
+      - Keep `REQ-*` statuses tied to the proposal, not to generic product opinions.
+
+  - id: ui-not-runtime-verified
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/UI_PRESENT_NO_RUNTIME_PROOF.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Lower readiness or confidence when a critical screen/flow is not runtime-validated.
+      - Preserve `Not Verifiable` when proof depends only on code inspection, previews, or screenshots.
+      - Add a `UI-*` or `READY-*` finding that explains why runtime proof is missing.
+
+  - id: partial-ui-ux-commitments
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/PARTIAL_UI_UX.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Extract UI commitments and UX commitments separately.
+      - Distinguish between a partially implemented proposal requirement and an expert UX concern.
+      - Include at least one `UI-*` and one `UX-*` finding.
+
+  - id: universal-platform-conventions
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/UNIVERSAL_APP_FLOW.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Record platform scope as `Universal`.
+      - Evaluate iOS and macOS conventions separately instead of applying one platform's heuristic to both.
+      - Surface macOS-specific or iOS-specific findings when one platform fit is weaker.
+
+  - id: divergence-even-when-code-works
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/DIVERGENCE_WITH_WORKING_CODE.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Include a `Proposal Fidelity / Divergence` section with Matches, Divergences, and Ambiguities / Evidence Gaps.
+      - Surface explicit proposal divergence even if the code appears functional.
+      - Avoid silently converting every divergence into a failed `REQ-*` item unless the proposal explicitly committed to it.
+
+  - id: not-verifiable-preserved
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/NOT_VERIFIABLE.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Mark at least one requirement `Not Verifiable`.
+      - Keep `Not Verifiable` explicit in the requirement summary.
+      - Avoid upgrading inference-only evidence to `Implemented`.
+
+  - id: implemented-but-not-ready
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/IMPLEMENTED_BUT_NOT_READY.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Allow `Overall Conformance = Implemented` while keeping `Overall Readiness` below `Ready` when the expert findings justify it.
+      - Include at least one meaningful `READY-*` finding.
+      - Show that missing runtime proof or ship risk does not automatically rewrite `REQ-*` outcomes.
+
+  - id: no-unrelated-review-drift
+    prompt: "Use $proposal-implementation-audit to audit docs/proposals/SCOPED_SLICE.md against the current repository implementation and write the versioned report beside the proposal."
+    must_pass:
+      - Stay focused on proposal-relevant surfaces and primary user flows.
+      - Avoid broad repo sweeps for unrelated bugs.
+      - Keep findings anchored to the proposal scope or explicitly recorded ambiguities.

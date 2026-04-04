@@ -205,7 +205,8 @@ struct LiveProposalWorkflowTests {
                     rawPayload: "{}",
                     startedAt: Date(),
                     completedAt: Date(),
-                    succeeded: true
+                    succeeded: true,
+                    responseRawPayload: "{}"
                 )
             ],
             finalContent: "Test output",

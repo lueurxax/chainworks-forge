@@ -40,6 +40,18 @@ struct ProviderPlatformTests {
         return url
     }
 
+    private func makeCanonicalYAMLCopies(in tempDirectory: URL) throws -> (workflowURL: URL, catalogURL: URL) {
+        let fileManager = FileManager.default
+        let repoRoot = testRepositoryRootURL()
+        let workflowSourceURL = repoRoot.appendingPathComponent("examples/workflows/workflow.yaml")
+        let catalogSourceURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml")
+        let workflowCopyURL = tempDirectory.appendingPathComponent("workflow.yaml")
+        let catalogCopyURL = tempDirectory.appendingPathComponent("agents.yaml")
+        try fileManager.copyItem(at: workflowSourceURL, to: workflowCopyURL)
+        try writePortableCatalogCopy(from: catalogSourceURL, to: catalogCopyURL)
+        return (workflowCopyURL, catalogCopyURL)
+    }
+
     private func makeAdapters(
         gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = { _ in .reachable(statusCode: 200) }
     ) -> [ProviderFamily: any ProviderAdapter] {
@@ -192,6 +204,56 @@ struct ProviderPlatformTests {
         )
         #expect(overridden.workflowSourcePath == "/tmp/override-workflow.yaml")
         #expect(overridden.activeConfigurationSource == .developmentEnvOverride)
+    }
+
+    @Test("Fixture live runtime is ready even when managed Goose server is idle")
+    mutating func fixtureLiveRuntimeIsReadyWhenServerManagerIsIdle() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let (_, context) = try makeTestModelContainer()
+        let store = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: AppConfiguration(
+                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+                activeConfigurationSource: .persistedSettings
+            )
+        ))
+        let gooseServerManager = GooseServerManager(appConfigurationStore: store)
+        let configuration = LiveRuntimeConfiguration(
+            baseURL: URL(string: "http://fixture.local")!,
+            apiKey: nil,
+            override: LiveExecutionOverride(
+                enabled: true,
+                provider: "claude_code",
+                model: "fixture-model",
+                effort: "high"
+            ),
+            transportMode: .fixtureFullMVPSuccess,
+            transportAPI: .bespoke
+        )
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(simulatedDelay: 0),
+            catalog: nil,
+            stewardConfig: nil,
+            liveRuntimeConfiguration: configuration,
+            gooseServerManager: gooseServerManager
+        )
+
+        #expect(service.supportsLiveExecution)
+        switch service.liveRuntimeReadiness {
+        case .ready(let summary, let source):
+            #expect(summary.contains("fixture-model"))
+            #expect(source == "Fixture backend")
+        case .unavailable(let reason, let recovery):
+            Issue.record("Fixture runtime should be ready, got unavailable: \(reason) / \(recovery)")
+        }
     }
 
     @Test("Managed Goose server launches on bootstrap when autostart is enabled")
@@ -1164,12 +1226,12 @@ struct ProviderPlatformTests {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1200,12 +1262,12 @@ struct ProviderPlatformTests {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1252,12 +1314,12 @@ struct ProviderPlatformTests {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1311,12 +1373,12 @@ struct ProviderPlatformTests {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1370,12 +1432,12 @@ struct ProviderPlatformTests {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1426,12 +1488,12 @@ struct ProviderPlatformTests {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1515,12 +1577,12 @@ struct ProviderPlatformTests {
         let (container, context) = try makeTestModelContainer()
         _ = container
 
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
         let configuration = AppConfiguration(
             runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
             worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml").path,
-            agentCatalogSourcePath: repoRoot.appendingPathComponent("examples/agents/agents.yaml").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
             supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
             activeConfigurationSource: .persistedSettings
         )
@@ -1534,24 +1596,27 @@ struct ProviderPlatformTests {
                 configuredProviders: [
                     ConfiguredProvider(
                         family: .codex,
-                        displayName: "Codex API",
-                        transport: .httpAPI,
-                        endpoint: "https://codex.test.local",
-                        authMode: .none
+                        displayName: "Codex Goose",
+                        transport: .gooseServer,
+                        endpoint: "https://127.0.0.1:51200",
+                        authMode: .none,
+                        defaultModel: "gpt-5.4"
                     ),
                     ConfiguredProvider(
                         family: .claude,
-                        displayName: "Claude API",
-                        transport: .httpAPI,
-                        endpoint: "https://claude.test.local",
-                        authMode: .none
+                        displayName: "Claude Goose",
+                        transport: .gooseServer,
+                        endpoint: "https://127.0.0.1:51200",
+                        authMode: .none,
+                        defaultModel: "opus"
                     ),
                     ConfiguredProvider(
                         family: .gemini,
-                        displayName: "Gemini API",
-                        transport: .httpAPI,
-                        endpoint: "https://gemini.test.local",
-                        authMode: .none
+                        displayName: "Gemini Goose",
+                        transport: .gooseServer,
+                        endpoint: "https://127.0.0.1:51200",
+                        authMode: .none,
+                        defaultModel: "gemini-2.5-pro"
                     )
                 ],
                 preferredProviderIDsByFamily: [:],
@@ -1561,7 +1626,8 @@ struct ProviderPlatformTests {
         ))
         let registry = retain(ProviderRegistry(
             settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.sample-run")
+            secretStore: makeTestSecretStore("com.chainworks.tests.sample-run"),
+            adapters: makeAdapters()
         ))
         let executor = SimulatedAgentExecutor()
         let executionService = ExecutionService(

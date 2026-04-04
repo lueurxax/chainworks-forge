@@ -15,24 +15,33 @@ struct RunProgressScreen {
     func openIfNeeded(workflowTitle: String, timeout: TimeInterval = 15) -> Bool {
         if hasProgressSurface(timeout: 3) { return true }
 
-        let candidates = [
-            app.windows[workflowTitle].firstMatch,
-            app.buttons["run-row-\(workflowTitle)"].firstMatch,
-            app.links["run-row-\(workflowTitle)"].firstMatch,
-            app.otherElements["run-row-\(workflowTitle)"].firstMatch,
-            app.buttons[workflowTitle].firstMatch,
-            app.links[workflowTitle].firstMatch,
-            app.staticTexts[workflowTitle].firstMatch
-        ]
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let candidates = [
+                app.buttons["run-row-\(workflowTitle)"].firstMatch,
+                app.links["run-row-\(workflowTitle)"].firstMatch,
+                app.otherElements["run-row-\(workflowTitle)"].firstMatch,
+                app.buttons[workflowTitle].firstMatch,
+                app.links[workflowTitle].firstMatch,
+                app.staticTexts[workflowTitle].firstMatch
+            ]
 
-        for candidate in candidates {
-            if candidate.waitForExistence(timeout: 2) {
-                candidate.click()
-                if hasProgressSurface(timeout: 3) { return true }
+            for candidate in candidates {
+                if candidate.waitForExistence(timeout: 1) {
+                    candidate.click()
+                    if hasProgressSurface(timeout: 3) { return true }
+                }
             }
+
+            if hasProgressSurface(timeout: 1) {
+                return true
+            }
+
+            app.typeKey(.pageDown, modifierFlags: [])
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
         }
 
-        return hasProgressSurface(timeout: timeout)
+        return hasProgressSurface(timeout: 2)
     }
 
     /// The Approve button in the run progress view.
@@ -83,6 +92,43 @@ struct RunProgressScreen {
     @discardableResult
     func isVisible(timeout: TimeInterval = 3) -> Bool {
         hasProgressSurface(timeout: timeout)
+    }
+
+    @discardableResult
+    func selectPane(_ title: String, timeout: TimeInterval = 5) -> Bool {
+        let segmentedCandidates = [
+            app.segmentedControls["run-progress-pane-picker"].firstMatch,
+            app.otherElements["run-progress-pane-picker"].firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "run-progress-pane-picker"))
+                .firstMatch
+        ]
+
+        let buttonCandidates = [
+            app.segmentedControls.buttons[title].firstMatch,
+            app.buttons[title].firstMatch,
+            app.radioButtons[title].firstMatch,
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "label == %@ OR value == %@", title, title))
+                .firstMatch
+        ]
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if buttonCandidates.contains(where: { $0.exists && $0.isHittable }) {
+                buttonCandidates.first(where: { $0.exists && $0.isHittable })?.click()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                return true
+            }
+
+            if segmentedCandidates.contains(where: \.exists) {
+                app.typeKey(.tab, modifierFlags: [])
+                RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+
+        return buttonCandidates.contains(where: { $0.exists && $0.isHittable })
     }
 
     /// Whether any run status label is visible in the current progress surface.
@@ -149,7 +195,7 @@ struct RunProgressScreen {
         let statusLabel = app.descendants(matching: .staticText)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", "run-status-"))
             .firstMatch
-        let sectionTitles = ["Overview", "Current Phase", "Stages", "Workflow Map", "Artifacts", "Approval Gate"]
+        let sectionTitles = ["Summary", "Progress", "Artifacts", "Approvals", "Workflow Map", "Approval Gate"]
         let sections = sectionTitles.map { sectionLabel($0) }
 
         let predicate = NSPredicate { _, _ in

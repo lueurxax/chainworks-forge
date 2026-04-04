@@ -28,11 +28,11 @@ enum PreviewSupport {
         AppConfigurationStore(
             fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("preview-app-configuration.json"),
             initialConfiguration: AppConfiguration(
-                runStorageBasePath: "/Users/user/Library/Application Support/Chainworks Forge/runs",
-                worktreeBasePath: "/Users/user/Library/Application Support/Chainworks Forge/worktrees",
+                runStorageBasePath: previewApplicationSupportURL("runs").path,
+                worktreeBasePath: previewApplicationSupportURL("worktrees").path,
                 workflowSourcePath: repoExampleURL("workflows/workflow.yaml").path,
                 agentCatalogSourcePath: repoExampleURL("agents/agents.yaml").path,
-                supportBundleExportPath: "/Users/user/Library/Application Support/Chainworks Forge/exports",
+                supportBundleExportPath: previewApplicationSupportURL("exports").path,
                 gooseServerHost: "127.0.0.1",
                 gooseServerPort: 51200,
                 gooseServerTLS: true,
@@ -128,7 +128,7 @@ enum PreviewSupport {
         let activeIdea = Idea(
             title: "Provider troubleshooting",
             body: "Show why Codex and Claude fail in-app even when Goose is reachable.",
-            attachmentPath: "/Users/user/Documents/specs/provider-troubleshooting.md",
+            attachmentPath: previewDocumentsURL("specs/provider-troubleshooting.md").path,
             status: .active
         )
 
@@ -408,7 +408,11 @@ enum PreviewSupport {
         let workflow = try! YAMLParser.loadWorkflow(from: workflowURL)
         let catalog = try! YAMLParser.loadAgentCatalog(from: catalogURL)
         let compiler = RunPlanCompiler(modelContext: context)
-        let plan = try! compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let plan = try! compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
 
         let providerSettingsStore = makeProviderSettingsStore()
         let providerRegistry = makeProviderRegistry(settingsStore: providerSettingsStore)
@@ -614,13 +618,9 @@ enum PreviewSupport {
     private static func repoExampleURL(_ relativePath: String) -> URL {
         let trimmedPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let fileManager = FileManager.default
-        let sourceRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+        let sourceRoot = previewWorkspaceRootURL
 
         let candidateRoots: [URL] = [
-            URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true),
             URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true),
             Bundle.main.bundleURL,
             Bundle.main.bundleURL.deletingLastPathComponent(),
@@ -641,8 +641,37 @@ enum PreviewSupport {
             }
         }
 
-        return URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/examples", isDirectory: true)
-            .appendingPathComponent(trimmedPath)
+        return previewWorkspaceURL("examples/\(trimmedPath)")
+    }
+
+    static var previewWorkspaceRootURL: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    static var previewDocumentsRootURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+    }
+
+    static var previewApplicationSupportRootURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+    }
+
+    static func previewWorkspaceURL(_ relativePath: String) -> URL {
+        URL(fileURLWithPath: relativePath, relativeTo: previewWorkspaceRootURL)
+    }
+
+    static func previewDocumentsURL(_ relativePath: String) -> URL {
+        URL(fileURLWithPath: relativePath, relativeTo: previewDocumentsRootURL)
+    }
+
+    static func previewApplicationSupportURL(_ relativePath: String) -> URL {
+        let appRoot = previewApplicationSupportRootURL.appendingPathComponent("Chainworks Forge", isDirectory: true)
+        return URL(fileURLWithPath: relativePath, relativeTo: appRoot)
     }
 
     private static func mapStageStatus(from status: RunStatus) -> StageStatus {

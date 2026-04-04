@@ -5,6 +5,10 @@ import Foundation
 struct RunStartSnapshot: Sendable {
     let providerBindingSnapshotJSON: Data?
     let bindingProvenanceJSON: Data?
+    let resolvedSkillsJSON: Data?
+    let skillContentHashesJSON: Data?
+    let skillInjectedContentHashesJSON: Data?
+    let resolvedMCPPoliciesJSON: Data?
     let startOptionsJSON: Data?
     let frozenWorkspaceRootPath: String?
     let deliveryConfiguration: DeliveryConfiguration?
@@ -18,6 +22,10 @@ struct RunStartSnapshot: Sendable {
     init(
         providerBindingSnapshotJSON: Data? = nil,
         bindingProvenanceJSON: Data? = nil,
+        resolvedSkillsJSON: Data? = nil,
+        skillContentHashesJSON: Data? = nil,
+        skillInjectedContentHashesJSON: Data? = nil,
+        resolvedMCPPoliciesJSON: Data? = nil,
         startOptionsJSON: Data? = nil,
         frozenWorkspaceRootPath: String? = nil,
         deliveryConfiguration: DeliveryConfiguration? = nil,
@@ -30,6 +38,10 @@ struct RunStartSnapshot: Sendable {
     ) {
         self.providerBindingSnapshotJSON = providerBindingSnapshotJSON
         self.bindingProvenanceJSON = bindingProvenanceJSON
+        self.resolvedSkillsJSON = resolvedSkillsJSON
+        self.skillContentHashesJSON = skillContentHashesJSON
+        self.skillInjectedContentHashesJSON = skillInjectedContentHashesJSON
+        self.resolvedMCPPoliciesJSON = resolvedMCPPoliciesJSON
         self.startOptionsJSON = startOptionsJSON
         self.frozenWorkspaceRootPath = frozenWorkspaceRootPath
         self.deliveryConfiguration = deliveryConfiguration
@@ -44,6 +56,10 @@ struct RunStartSnapshot: Sendable {
     static let empty = RunStartSnapshot(
         providerBindingSnapshotJSON: nil,
         bindingProvenanceJSON: nil,
+        resolvedSkillsJSON: nil,
+        skillContentHashesJSON: nil,
+        skillInjectedContentHashesJSON: nil,
+        resolvedMCPPoliciesJSON: nil,
         startOptionsJSON: nil,
         frozenWorkspaceRootPath: nil,
         deliveryConfiguration: nil,
@@ -58,6 +74,10 @@ struct RunStartSnapshot: Sendable {
     func apply(to run: Run) {
         run.providerBindingSnapshotJSON = providerBindingSnapshotJSON
         run.bindingProvenanceJSON = bindingProvenanceJSON
+        run.resolvedSkillsJSON = resolvedSkillsJSON
+        run.skillContentHashesJSON = skillContentHashesJSON
+        run.skillInjectedContentHashesJSON = skillInjectedContentHashesJSON
+        run.resolvedMCPPoliciesJSON = resolvedMCPPoliciesJSON
         run.startOptionsJSON = startOptionsJSON
         run.frozenWorkspaceRootPath = frozenWorkspaceRootPath
         run.deliveryPreflightJSON = deliveryPreflightJSON
@@ -89,6 +109,10 @@ struct RunStartSnapshot: Sendable {
         return RunStartSnapshot(
             providerBindingSnapshotJSON: run.providerBindingSnapshotJSON,
             bindingProvenanceJSON: run.bindingProvenanceJSON,
+            resolvedSkillsJSON: run.resolvedSkillsJSON,
+            skillContentHashesJSON: run.skillContentHashesJSON,
+            skillInjectedContentHashesJSON: run.skillInjectedContentHashesJSON,
+            resolvedMCPPoliciesJSON: run.resolvedMCPPoliciesJSON,
             startOptionsJSON: run.startOptionsJSON,
             frozenWorkspaceRootPath: run.frozenWorkspaceRootPath,
             deliveryConfiguration: deliveryConfiguration,

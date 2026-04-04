@@ -3,15 +3,11 @@ import Foundation
 import SwiftData
 @testable import Chainworks_Forge
 
-@MainActor
-private enum TestModelContainerRetainer {
+enum TestModelContainerRetainer {
     static var containers: [ModelContainer] = []
 
     static func retain(_ container: ModelContainer) {
         containers.append(container)
-        if containers.count > 64 {
-            containers.removeFirst(containers.count - 64)
-        }
     }
 }
 
@@ -207,6 +203,38 @@ func makeTestRun(
 /// Marker class to locate the test bundle.
 final class TestBundleMarker: NSObject {}
 
+func testRepositoryRootURL(file: StaticString = #filePath) -> URL {
+    URL(fileURLWithPath: "\(file)", isDirectory: false)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private func portableExternalSkillRewrites(file: StaticString = #filePath) -> [(String, String)] {
+    let repoRoot = testRepositoryRootURL(file: file)
+    let triadPath = repoRoot.appendingPathComponent("examples/skills/proposal-review-triad").path
+    let auditPath = repoRoot.appendingPathComponent("examples/skills/proposal-implementation-audit").path
+    let legacyRoot = ["", "Users", "user", ".codex", "skills"].joined(separator: "/")
+
+    return [
+        ("\(legacyRoot)/proposal-review-triad", triadPath),
+        ("\(legacyRoot)/proposal-implementation-audit", auditPath),
+        ("../skills/proposal-review-triad", triadPath),
+        ("../skills/proposal-implementation-audit", auditPath),
+        ("../../examples/skills/proposal-review-triad", triadPath),
+        ("../../examples/skills/proposal-implementation-audit", auditPath)
+    ]
+}
+
+@discardableResult
+func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    let rewritten = portableExternalSkillRewrites().reduce(source) { partial, mapping in
+        partial.replacingOccurrences(of: mapping.0, with: mapping.1)
+    }
+    try rewritten.write(to: destinationURL, atomically: true, encoding: .utf8)
+    return destinationURL
+}
+
 /// Loads the canonical workflow fixture from the test bundle.
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
     let url = try #require(
@@ -222,7 +250,10 @@ func loadTestCanonicalCatalog() throws -> AgentCatalog {
         Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml"),
         "agents.yaml fixture must be bundled with tests"
     )
-    return try YAMLParser.loadAgentCatalog(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("chainworks-test-catalog-\(UUID().uuidString).yaml")
+    try writePortableCatalogCopy(from: url, to: portableURL)
+    return try YAMLParser.loadAgentCatalog(from: portableURL)
 }
 
 /// Loads the steward config fixture from the test bundle.

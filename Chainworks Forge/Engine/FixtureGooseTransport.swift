@@ -35,7 +35,9 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
                 accepted: true,
                 capabilityToken: "fixture-read-only",
                 backendPolicyVersion: "fixture-v1"
-            )
+            ),
+            actualEnabledExtensions: request.requestedExtensions,
+            startupLatencyMilliseconds: 0
         )
     }
 
@@ -424,6 +426,20 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
                 }
                 """
             }
+            return """
+            {
+              "review_pass_id": "review-pass-\(max(invocation, 1))",
+              "review_iteration_id": "state_4_proposal_reviewed.\(max(invocation, 1))",
+              "source_proposal_artifact": "proposal_current",
+              "raw_review_artifacts": [
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect"
+              ],
+              "aggregate_summary_artifact": "proposal_review_summary"
+            }
+            """
         case "proposal_fact_digest":
             if case .proposal022FeedbackCycle = scenario {
                 return """
@@ -440,6 +456,19 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
                 }
                 """
             }
+            return """
+            {
+              "proposal_revision_id": "proposal-revision-\(max(invocation, 1))",
+              "claims": [
+                {
+                  "claim_id": "proposal-ready-\(max(invocation, 1))",
+                  "statement": "The proposal is specific enough to proceed into implementation planning.",
+                  "evidence_refs": ["proposal_current", "proposal_review_summary"],
+                  "verification_state": "verified"
+                }
+              ]
+            }
+            """
         case "reviewer_scope_plan":
             if case .proposal022FeedbackCycle = scenario {
                 if invocation == 1 {
@@ -459,9 +488,22 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
                   "delta_rerun": ["proposal_reviewer_architect"],
                   "verification_only": ["proposal_reviewer_product_owner", "proposal_reviewer_ui", "proposal_reviewer_ux"],
                   "rationale": "Only architecture needs a targeted delta check after the refine pass."
-                }
+                    }
                 """
             }
+            return """
+            {
+              "full_rerun": [
+                "proposal_reviewer_product_owner",
+                "proposal_reviewer_ux",
+                "proposal_reviewer_ui",
+                "proposal_reviewer_architect"
+              ],
+              "delta_rerun": [],
+              "verification_only": [],
+              "rationale": "All proposal reviewers participated in the current aggregate pass."
+            }
+            """
         case "proposal_feedback_coverage":
             if case .proposal022FeedbackCycle = scenario {
                 return """
@@ -474,10 +516,35 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
                   "backlog_items_disputed": [],
                   "sections_changed": ["MVP scope", "Operator recovery"],
                   "factual_claims_added_or_corrected": ["The MVP excludes future roadmap automation."],
-                  "notes": "Scope was tightened; operator rationale remains explicit for targeted rerun."
+                      "notes": "Scope was tightened; operator rationale remains explicit for targeted rerun."
                 }
                 """
             }
+            return """
+            {
+              "proposal_revision_id": "proposal-revision-\(max(invocation, 1))",
+              "source_review_pass_id": "review-pass-\(max(invocation, 1))",
+              "backlog_items_addressed": [],
+              "backlog_items_unresolved": [],
+              "backlog_items_deferred": [],
+              "backlog_items_disputed": [],
+              "sections_changed": ["Summary"],
+              "factual_claims_added_or_corrected": [],
+              "notes": "Fixture revision completed without unresolved review backlog."
+            }
+            """
+        case "implementation_progress":
+            return """
+            {
+              "status": "on_track",
+              "current_phase": "implementation",
+              "completed_items": [
+                "Applied the approved proposal to the implementation worktree"
+              ],
+              "deferred_items": [],
+              "notes": "Fixture implementation pass completed with deterministic repo-backed outputs."
+            }
+            """
         case "implementation_self_assessment":
             return """
             {
@@ -584,11 +651,11 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         case "release_manifest":
             return """
             {
-              "commit_sha": "fixture-commit-sha",
+              "commitSHA": "fixture-commit-sha",
               "branch": "chainworks/cw-fixture-release",
               "remote": "origin",
-              "commit_message": "Fixture delivery commit",
-              "files_changed": 1,
+              "commitMessage": "Fixture delivery commit",
+              "filesChanged": 1,
               "insertions": 12,
               "deletions": 0,
               "timestamp": "\(ISO8601DateFormatter().string(from: Date()))"
@@ -606,9 +673,12 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         case "release_bundle_manifest":
             return """
             {
-              "status": "success",
-              "bundle_path": "Build/Fixture/ChainworksForge.xcarchive",
-              "distribution_target": "sandbox",
+              "bundleIdentifier": "xax.chainworks-forge.fixture",
+              "bundleVersion": "1.0",
+              "buildNumber": "1",
+              "archivePath": "Build/Fixture/ChainworksForge.xcarchive",
+              "checksumSHA256": "fixture-archive-checksum",
+              "sizeBytes": 1024,
               "timestamp": "\(ISO8601DateFormatter().string(from: Date()))"
             }
             """
@@ -617,7 +687,18 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
             {
               "status": "success",
               "artifact_id": "fixture-upload-artifact",
-              "channel": "sandbox"
+              "checksum": "fixture-upload-checksum",
+              "destination": "sandbox"
+            }
+            """
+        case "delivery_receipt":
+            return """
+            {
+              "status": "success",
+              "release_manifest": "release_manifest",
+              "git_push_receipt": "git_push_receipt",
+              "release_bundle_manifest": "release_bundle_manifest",
+              "connect_upload_receipt": "connect_upload_receipt"
             }
             """
         case "changed_files_manifest":
@@ -673,22 +754,93 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         case "review_proposal_from_architecture_perspective":
             return reviewerJSON(agentID: agentID, role: "architect", score: 9.3)
         case "aggregate_proposal_reviews":
-            return """
-            {
-              "pass": true,
-              "average_score": 9.25,
-              "aggregate_score": 9.25,
-              "min_individual_score": 9.1,
-              "blocker_count": 0,
-              "summary": "Proposal passes the review target.",
-              "required_changes": [],
-              "recurring_themes": [
-                "Scope is clear",
-                "Approval context is strong"
-              ],
-              "decision": "proceed"
+            switch outputName {
+            case "proposal_review_summary":
+                return """
+                {
+                  "pass": true,
+                  "average_score": 9.25,
+                  "aggregate_score": 9.25,
+                  "min_individual_score": 9.1,
+                  "blocker_count": 0,
+                  "summary": "Proposal passes the review target.",
+                  "required_changes": [],
+                  "recurring_themes": [
+                    "Scope is clear",
+                    "Approval context is strong"
+                  ],
+                  "decision": "proceed"
+                }
+                """
+            case "review_corpus_bundle":
+                return """
+                {
+                  "review_pass_id": "review-pass-\(max(invocation, 1))",
+                  "review_iteration_id": "state_4_proposal_reviewed.\(max(invocation, 1))",
+                  "source_proposal_artifact": "proposal_current",
+                  "raw_review_artifacts": [
+                    "proposal_review_po",
+                    "proposal_review_ux",
+                    "proposal_review_ui",
+                    "proposal_review_architect"
+                  ],
+                  "aggregate_summary_artifact": "proposal_review_summary"
+                }
+                """
+            case "score_lift_backlog":
+                return """
+                {
+                  "review_pass_id": "review-pass-\(max(invocation, 1))",
+                  "source_proposal_artifact": "proposal_current",
+                  "items": []
+                }
+                """
+            case "proposal_fact_digest":
+                return """
+                {
+                  "proposal_revision_id": "proposal-revision-\(max(invocation, 1))",
+                  "claims": [
+                    {
+                      "claim_id": "proposal-ready-\(max(invocation, 1))",
+                      "statement": "The proposal meets the aggregate review threshold.",
+                      "evidence_refs": ["proposal_review_summary"],
+                      "verification_state": "verified"
+                    }
+                  ]
+                }
+                """
+            case "reviewer_scope_plan":
+                return """
+                {
+                  "full_rerun": [
+                    "proposal_reviewer_product_owner",
+                    "proposal_reviewer_ux",
+                    "proposal_reviewer_ui",
+                    "proposal_reviewer_architect"
+                  ],
+                  "delta_rerun": [],
+                  "verification_only": [],
+                  "rationale": "All reviewers ran in the current proposal review pass."
+                }
+                """
+            default:
+                return """
+                {
+                  "pass": true,
+                  "average_score": 9.25,
+                  "aggregate_score": 9.25,
+                  "min_individual_score": 9.1,
+                  "blocker_count": 0,
+                  "summary": "Proposal passes the review target.",
+                  "required_changes": [],
+                  "recurring_themes": [
+                    "Scope is clear",
+                    "Approval context is strong"
+                  ],
+                  "decision": "proceed"
+                }
+                """
             }
-            """
         default:
             return """
             # Fixture Output

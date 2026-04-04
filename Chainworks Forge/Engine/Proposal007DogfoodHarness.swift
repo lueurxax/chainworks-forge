@@ -79,7 +79,11 @@ final class Proposal007DogfoodHarness {
         let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
         let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
         let compiler = RunPlanCompiler(modelContext: modelContext)
-        let compiledPlan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let compiledPlan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
 
         let startOptions = RunStartOptions.empty
         let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
@@ -178,28 +182,33 @@ final class Proposal007DogfoodHarness {
     }
 
     private func bundledWorkflowURL() -> URL? {
-        if let bundled = Bundle.main.url(forResource: "full-mvp-live", withExtension: "yaml") {
-            return bundled
-        }
-        let fallback = AppConfiguration.defaultRepositoryRoot()
-            .appendingPathComponent("examples/workflows/full-mvp-live.yaml")
-        return FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil
+        AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/workflows/full-mvp-live.yaml",
+            bundledURL: Bundle.main.url(forResource: "full-mvp-live", withExtension: "yaml"),
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        )
     }
 
     private func bundledCatalogURL() -> URL? {
-        if let bundled = Bundle.main.url(forResource: "agents", withExtension: "yaml") {
-            return bundled
-        }
-        let fallback = AppConfiguration.defaultRepositoryRoot()
-            .appendingPathComponent("examples/agents/agents.yaml")
-        return FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil
+        AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/agents/agents.yaml",
+            bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml"),
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        )
     }
 
     private func makeDeliveryConfiguration(
         for idea: Idea,
         mode: Proposal007DogfoodMode
     ) -> DeliveryConfiguration {
-        let repoRoot = idea.workspaceRootPath ?? AppConfiguration.defaultRepositoryRoot().path
+        let repoRoot = idea.workspaceRootPath ?? AppConfiguration.defaultRepositoryRoot(
+            currentDirectoryPath: FileManager.default.currentDirectoryPath,
+            bundleURL: Bundle.main.bundleURL,
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        ).path
         let repoIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
             configuredIdentifier: nil,
             repoRoot: repoRoot

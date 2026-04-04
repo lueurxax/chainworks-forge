@@ -89,14 +89,19 @@ final class ExecutionEventBridge: @unchecked Sendable {
                         rawPayload: raw,
                         startedAt: Date(),
                         completedAt: nil,
-                        succeeded: nil
+                        succeeded: nil,
+                        responseRawPayload: nil
                     ))
                 }
-            case .toolCallFinished(let toolName, _):
+            case .toolCallFinished(let toolName, let raw):
                 withLock {
-                    if let idx = _toolCalls.lastIndex(where: { $0.toolName == toolName && $0.completedAt == nil }) {
+                    let idx =
+                        _toolCalls.lastIndex(where: { $0.toolName == toolName && $0.completedAt == nil })
+                        ?? _toolCalls.lastIndex(where: { $0.completedAt == nil })
+                    if let idx {
                         _toolCalls[idx].completedAt = Date()
                         _toolCalls[idx].succeeded = true
+                        _toolCalls[idx].responseRawPayload = raw
                     }
                 }
             case .error(let message):
@@ -272,6 +277,7 @@ struct ToolCallRecord: Sendable {
     let startedAt: Date
     var completedAt: Date?
     var succeeded: Bool?
+    var responseRawPayload: String?
 }
 
 // MARK: - ExecutionStreamResult

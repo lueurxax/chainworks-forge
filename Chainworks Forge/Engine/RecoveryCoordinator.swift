@@ -292,7 +292,11 @@ final class RecoveryCoordinator {
             throw RecoveryError.notProposalLoopRun
         }
 
-        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogSourcePath
+        )
         settleSourceRunForCloneIfNeeded(original)
         let (clone, _) = try compiler.createRun(
             for: idea,

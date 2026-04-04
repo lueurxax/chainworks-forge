@@ -30,6 +30,7 @@ struct YAMLValidator: Sendable {
         issues += validateAgentReferences(workflow: workflow, catalog: catalog)
         issues += validateBackendProfileRefs(catalog)
         issues += validatePermissionProfileRefs(catalog)
+        issues += validateMCPRefs(catalog)
         issues += validateSkillRefs(catalog)
         issues += validateOutputContractRefs(catalog)
         issues += validateArtifactRefs(catalog)
@@ -135,6 +136,82 @@ struct YAMLValidator: Sendable {
                 ? ValidationIssue(severity: .error, message: "Agent '\(agent.id)' references non-existent skill '\(agent.skillRef)'", location: "agents.\(agent.id).skill_ref")
                 : nil
         }
+    }
+
+    static func validateMCPRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
+        var issues: [ValidationIssue] = []
+        let registryIDs = Set(catalog.mcpServerRegistry.keys)
+        let profileIDs = Set(catalog.mcpProfiles.keys)
+        let defaultProfile = catalog.mcpPolicy.defaultProfile
+
+        if defaultProfile != "none" && !profileIDs.contains(defaultProfile) {
+            issues.append(ValidationIssue(
+                severity: .error,
+                message: "mcp_policy.default_profile '\(defaultProfile)' does not exist in mcp_profiles",
+                location: "mcp_policy.default_profile"
+            ))
+        }
+
+        for agent in catalog.agents {
+            guard let profileID = agent.mcpProfile, !profileID.isEmpty else { continue }
+            if profileID != "none" && !profileIDs.contains(profileID) {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "Agent '\(agent.id)' references non-existent MCP profile '\(profileID)'",
+                    location: "agents.\(agent.id).mcp_profile"
+                ))
+            }
+        }
+
+        for (profileID, profile) in catalog.mcpProfiles {
+            let fallback = MCPFallbackPolicy(rawValue: profile.fallbackPolicy)
+            if fallback == nil {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "MCP profile '\(profileID)' has unsupported fallback_policy '\(profile.fallbackPolicy)'",
+                    location: "mcp_profiles.\(profileID).fallback_policy"
+                ))
+            }
+
+            let overlap = Set(profile.requiredExtensions).intersection(profile.optionalExtensions)
+            if !overlap.isEmpty {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "MCP profile '\(profileID)' declares the same extension as required and optional: \(overlap.sorted().joined(separator: ", "))",
+                    location: "mcp_profiles.\(profileID)"
+                ))
+            }
+
+            for serverID in profile.allRequestedExtensions where !registryIDs.contains(serverID) {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "MCP profile '\(profileID)' references unknown server '\(serverID)'",
+                    location: "mcp_profiles.\(profileID)"
+                ))
+            }
+        }
+
+        for (serverID, entry) in catalog.mcpServerRegistry {
+            if entry.runtimeIDs.isEmpty {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "MCP server '\(serverID)' must declare at least one runtime_ids mapping",
+                    location: "mcp_server_registry.\(serverID).runtime_ids"
+                ))
+            }
+        }
+
+        for (profileID, permissionProfile) in catalog.permissionProfiles {
+            for legacyName in permissionProfile.mcp.legacyAllow ?? [] where !registryIDs.contains(legacyName) {
+                issues.append(ValidationIssue(
+                    severity: .warning,
+                    message: "Permission profile '\(profileID)' contains legacy MCP allowance '\(legacyName)' that does not map to mcp_server_registry. Treat it as non-runtime metadata or add an explicit registry mapping.",
+                    location: "permission_profiles.\(profileID).mcp"
+                ))
+            }
+        }
+
+        return issues
     }
 
     static func validateOutputContractRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {

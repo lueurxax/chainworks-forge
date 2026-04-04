@@ -130,6 +130,15 @@ struct PilotReadinessView: View {
                             readinessCheckRow(check)
                         }
 
+                        if !readinessChecks(category: "Skills").isEmpty {
+                            Color.clear
+                                .frame(width: 1, height: 1)
+                                .accessibilityIdentifier("pilot-readiness-skills-section")
+                        }
+                        ForEach(readinessChecks(category: "Skills")) { check in
+                            readinessCheckRow(check)
+                        }
+
                         ForEach(readinessChecks(category: "Workspace")) { check in
                             readinessCheckRow(check)
                         }

@@ -19,7 +19,6 @@ enum IdeaRunPane: String, CaseIterable, Hashable, Sendable {
     case summary
     case progress
     case artifacts
-    case approvals
 }
 
 func defaultRunsHomePane(
@@ -42,7 +41,7 @@ func defaultIdeaRunPane(
 ) -> IdeaRunPane {
     switch intent {
     case .approval:
-        return .approvals
+        return .summary
     case .artifact:
         return .artifacts
     case .report, .recovery, .neutral:
@@ -51,7 +50,7 @@ func defaultIdeaRunPane(
 
     switch status {
     case .waitingApproval:
-        return .approvals
+        return .summary
     case .blocked, .failed:
         return .summary
     case .pending, .ready, .running, .completed, .cancelled, .cancelling:

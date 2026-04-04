@@ -247,6 +247,7 @@ private func makeRecoveryContext() throws -> ModelContext {
         AgentExecution.self, Approval.self, Artifact.self,
         configurations: config
     )
+    TestModelContainerRetainer.retain(container)
     return ModelContext(container)
 }
 

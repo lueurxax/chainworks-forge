@@ -519,7 +519,7 @@ final class WorkflowOrchestrator {
         }
         // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
         agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
-        agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
+        Self.applySkillMetadata(to: agentExec, from: agent)
         registerLiveExecution(agentExec, for: agent.id)
 
         // Gather input artifacts
@@ -1412,7 +1412,7 @@ final class WorkflowOrchestrator {
             }
             // Proposal 003 — REQ-002: Populate Steward metadata on AgentExecution.
             agentExec.agentConfigHash = Self.computeAgentConfigHash(agent: agent)
-            agentExec.skillSnapshotHash = DefinitionHasher.hashString(agent.skillRef)
+            Self.applySkillMetadata(to: agentExec, from: agent)
             registerLiveExecution(agentExec, for: agent.id)
 
             taskAgentPairs.append((task, agent, agentExec))
@@ -2002,8 +2002,10 @@ final class WorkflowOrchestrator {
             maxTurns: agent.maxTurns,
             temperature: agent.temperature,
             permissionProfile: agent.permissionProfile,
+            mcpProfileID: agent.mcpProfileID,
             skillRef: agent.skillRef,
             skillRole: agent.skillRole,
+            resolvedSkill: agent.resolvedSkill,
             prompt: agent.prompt,
             outputContract: agent.outputContract,
             requiresHumanApproval: agent.requiresHumanApproval,
@@ -2740,9 +2742,28 @@ final class WorkflowOrchestrator {
             agent.id, agent.provider, agent.model, agent.effort,
             String(agent.maxTurns), String(agent.temperature),
             agent.permissionProfile, agent.skillRef,
+            agent.skillRole ?? "",
+            agent.resolvedSkill?.injectedContentHash ?? "",
             agent.outputContract ?? ""
         ].joined(separator: "|")
         return DefinitionHasher.hashString(canonical)
+    }
+
+    private static func applySkillMetadata(to agentExecution: AgentExecution, from agent: ResolvedAgent) {
+        guard let resolvedSkill = agent.resolvedSkill else {
+            agentExecution.skillRef = agent.skillRef
+            agentExecution.skillSnapshotHash = nil
+            agentExecution.skillType = nil
+            agentExecution.skillRole = agent.skillRole
+            agentExecution.skillContentSummary = nil
+            return
+        }
+
+        agentExecution.skillRef = agent.skillRef
+        agentExecution.skillSnapshotHash = resolvedSkill.injectedContentHash
+        agentExecution.skillType = resolvedSkill.type.rawValue
+        agentExecution.skillRole = resolvedSkill.role ?? agent.skillRole
+        agentExecution.skillContentSummary = resolvedSkill.contentSummary
     }
 
     // MARK: - Live Event Routing
@@ -2910,6 +2931,18 @@ final class WorkflowOrchestrator {
         return try? encoder.encode(envelope)
     }
 
+    private func encodeStringArray(_ values: [String]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(values)
+    }
+
+    private func encodeMCPServerMetrics(_ metrics: [MCPServerExecutionMetric]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(metrics)
+    }
+
     private func applyExecutionTruth(from result: AgentResult, to agentExec: AgentExecution) {
         let canonicalOutcome = result.canonicalOutcome ?? (result.succeeded ? .completed : .failedBeforeOutput)
         let runtimeProvider = result.runtimeProvider ?? result.providerReceipt?.providerFamily
@@ -2933,6 +2966,12 @@ final class WorkflowOrchestrator {
             runtimeModel: runtimeModel,
             envelope: envelope
         )
+        agentExec.mcpProfileID = result.mcpProfileID
+        agentExec.requestedMCPExtensionsJSON = encodeStringArray(result.requestedMCPExtensions)
+        agentExec.effectiveMCPRuntimeExtensionIDsJSON = encodeStringArray(result.effectiveMCPRuntimeExtensionIDs)
+        agentExec.deniedMCPExtensionsJSON = encodeStringArray(result.deniedMCPExtensions)
+        agentExec.mcpSessionStartupLatencyMilliseconds = result.mcpSessionStartupLatencyMilliseconds
+        agentExec.mcpServerTelemetryJSON = encodeMCPServerMetrics(result.mcpServerMetrics)
         agentExec.retryReason = suggestedRetryReason(from: result)
     }
 
@@ -3069,8 +3108,10 @@ final class WorkflowOrchestrator {
             maxTurns: agent.maxTurns,
             temperature: agent.temperature,
             permissionProfile: agent.permissionProfile,
+            mcpProfileID: agent.mcpProfileID,
             skillRef: agent.skillRef,
             skillRole: agent.skillRole,
+            resolvedSkill: agent.resolvedSkill,
             prompt: agent.prompt,
             outputContract: agent.outputContract,
             requiresHumanApproval: agent.requiresHumanApproval,

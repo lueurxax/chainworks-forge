@@ -103,6 +103,25 @@ struct Proposal013Tests {
         #expect(contractID == "tests_result")
     }
 
+    @Test("ResolverV2 does not leak explicit contract to non-matching output")
+    func resolverV2DoesNotLeakExplicitContractToNonMatchingOutput() {
+        let catalog = makeTestCatalog(withContracts: [
+            "implementation_self_assessment_v1": ArtifactContract(
+                format: "json",
+                requiredFields: ["seemingly_complete"]
+            )
+        ])
+        let agent = makeTestResolvedAgent(outputContract: "implementation_self_assessment_v1")
+
+        let contractID = OutputContractResolverV2.resolveContractID(
+            for: "implementation_progress",
+            agent: agent,
+            catalog: catalog
+        )
+
+        #expect(contractID == nil)
+    }
+
     @Test("ResolverV2 returns nil when no contract matches")
     func resolverV2NilWhenNoMatch() {
         let catalog = makeTestCatalog(withContracts: [:])
@@ -1302,14 +1321,14 @@ struct Proposal013Tests {
         let idea = Idea(
             title: "P013 Fixture Aggregate Failure",
             body: "Drive the live proposal loop until aggregate contract failure.",
-            workspaceRootPath: AppConfiguration.defaultRepositoryRoot().path
+            workspaceRootPath: testRepositoryRootURL().path
         )
         context.insert(idea)
 
-        let workflowPath = AppConfiguration.defaultRepositoryRoot()
+        let workflowPath = testRepositoryRootURL()
             .appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
             .path
-        let catalogPath = AppConfiguration.defaultRepositoryRoot()
+        let catalogPath = testRepositoryRootURL()
             .appendingPathComponent("examples/agents/agents.yaml")
             .path
         let (run, workspace) = try compiler.createRun(
@@ -1845,6 +1864,7 @@ private func makeP013TestContext() throws -> ModelContext {
         AgentExecution.self, Approval.self, Artifact.self,
         configurations: config
     )
+    TestModelContainerRetainer.retain(container)
     return ModelContext(container)
 }
 

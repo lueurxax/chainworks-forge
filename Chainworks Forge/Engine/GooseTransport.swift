@@ -17,6 +17,15 @@ protocol GooseTransportProtocol: Sendable {
 
     /// Close a Goose session explicitly.
     func closeSession(sessionID: String) async throws
+
+    /// Read settled runtime state for an existing session when the transport supports it.
+    func readSessionRuntimeState(sessionID: String) async throws -> GooseSessionRuntimeState?
+}
+
+extension GooseTransportProtocol {
+    func readSessionRuntimeState(sessionID: String) async throws -> GooseSessionRuntimeState? {
+        nil
+    }
 }
 
 // MARK: - GooseTransport (HTTP/SSE client for bespoke Goose API — ARCH-028)
@@ -302,6 +311,26 @@ struct GooseSessionResponse: Codable, Sendable {
     let sessionId: String
     let status: String?
     let policyAcknowledgement: GoosePolicyAcknowledgement?
+    let actualEnabledExtensions: [String]?
+    let startupLatencyMilliseconds: Int?
+
+    init(
+        sessionId: String,
+        status: String?,
+        policyAcknowledgement: GoosePolicyAcknowledgement?,
+        actualEnabledExtensions: [String]? = nil,
+        startupLatencyMilliseconds: Int? = nil
+    ) {
+        self.sessionId = sessionId
+        self.status = status
+        self.policyAcknowledgement = policyAcknowledgement
+        self.actualEnabledExtensions = actualEnabledExtensions
+        self.startupLatencyMilliseconds = startupLatencyMilliseconds
+    }
+}
+
+struct GooseSessionRuntimeState: Codable, Sendable {
+    let enabledExtensions: [String]
 }
 
 struct GooseExecutionPolicy: Codable, Sendable {

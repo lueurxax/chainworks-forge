@@ -30,14 +30,18 @@ enum RunStartOverrideResolver {
                 maxTurns: agent.maxTurns,
                 temperature: agent.temperature,
                 permissionProfile: agent.permissionProfile,
+                mcpProfileID: agent.mcpProfileID,
                 skillRef: agent.skillRef,
                 skillRole: agent.skillRole,
+                resolvedSkill: agent.resolvedSkill,
                 prompt: agent.prompt,
                 outputContract: agent.outputContract,
                 requiresHumanApproval: agent.requiresHumanApproval,
                 inputs: agent.inputs,
                 outputs: agent.outputs,
-                worktreeWriteEnabled: agent.worktreeWriteEnabled
+                worktreeWriteEnabled: agent.worktreeWriteEnabled,
+                sessionReuseScope: agent.sessionReuseScope,
+                sessionFamilyID: agent.sessionFamilyID
             ))
         })
 

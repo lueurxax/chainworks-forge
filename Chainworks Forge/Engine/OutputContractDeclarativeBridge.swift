@@ -104,6 +104,7 @@ enum OutputContractDeclarativeBridge {
             maxTurns: profile?.maxTurns ?? 10,
             temperature: profile?.temperature ?? 0.1,
             permissionProfile: definition.permissionProfile,
+            mcpProfileID: definition.mcpProfile,
             skillRef: definition.skillRef,
             skillRole: definition.skillRole,
             prompt: definition.prompt,

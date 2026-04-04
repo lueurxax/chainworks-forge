@@ -60,6 +60,14 @@ struct ArtifactInspectorView: View {
 
                 Divider()
 
+                if artifact.agentExecution?.skillRef != nil
+                    || artifact.agentExecution?.skillType != nil
+                    || artifact.agentExecution?.skillRole != nil
+                    || artifact.agentExecution?.skillSnapshotHash != nil {
+                    skillTruthSection
+                    Divider()
+                }
+
                 if shouldShowProposalLoopSummary, let summary = proposalLoopSummary {
                     GroupBox("Proposal-loop feedback summary (Proposal 022)") {
                         VStack(alignment: .leading, spacing: 4) {
@@ -206,6 +214,51 @@ struct ArtifactInspectorView: View {
         }
     }
 
+    @ViewBuilder
+    private var skillTruthSection: some View {
+        if let agentExecution = artifact.agentExecution {
+            let resolvedSkills = decodeResolvedSkills(from: run)
+            let resolvedSkill = agentExecution.skillRef.flatMap { resolvedSkills[$0] }
+
+            GroupBox("Skill Truth") {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let skillRef = agentExecution.skillRef {
+                        LabeledContent("Skill Ref", value: skillRef)
+                    }
+                    if let skillType = agentExecution.skillType {
+                        LabeledContent("Skill Type", value: skillType)
+                    }
+                    if let skillRole = agentExecution.skillRole {
+                        LabeledContent("Skill Role", value: skillRole)
+                    }
+                    if let summary = agentExecution.skillContentSummary {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Skill Summary")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(summary)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                    if let hash = agentExecution.skillSnapshotHash {
+                        LabeledContent("Injected Skill Hash", value: hash)
+                    }
+                    if let resolvedSkill {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Resolved Skill Content")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(resolvedSkill.resolvedContent)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private var proposalLoopSummary: ProposalLoopFeedbackSummary? {
         let stages = run.stageExecutions
         let agentExecutions = stages.flatMap(\.agentExecutions)
@@ -303,6 +356,11 @@ struct ArtifactInspectorView: View {
         artifact.name == "proposal_review_summary"
         || artifact.name == "score_lift_backlog"
         || artifact.name == "proposal_feedback_coverage"
+    }
+
+    private func decodeResolvedSkills(from run: Run) -> [String: ResolvedSkill] {
+        guard let data = run.resolvedSkillsJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: ResolvedSkill].self, from: data)) ?? [:]
     }
 
     // MARK: - Open Actions (§9.5)

@@ -32,7 +32,11 @@ import SwiftData
 
     // Steward data model additions (Proposal 003 — optional, lightweight migration)
     var agentConfigHash: String?
+    var skillRef: String?
     var skillSnapshotHash: String?
+    var skillType: String?
+    var skillRole: String?
+    var skillContentSummary: String?
     var transcriptPath: String?
     var toolTracePath: String?
     var retryReason: String?
@@ -54,6 +58,12 @@ import SwiftData
     var runtimeProvider: String?
     var runtimeModel: String?
     var outcomeEnvelopeJSON: Data?
+    var mcpProfileID: String?
+    var requestedMCPExtensionsJSON: Data?
+    var effectiveMCPRuntimeExtensionIDsJSON: Data?
+    var deniedMCPExtensionsJSON: Data?
+    var mcpSessionStartupLatencyMilliseconds: Int?
+    var mcpServerTelemetryJSON: Data?
 
     // Proposal 007: Repo-backed execution tracking
     var repoRevisionBefore: String?

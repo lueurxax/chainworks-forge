@@ -19,15 +19,19 @@ struct SkillResolverContext: Sendable {
         let expanded = try expandEnvironmentPlaceholders(in: rawPath, skillID: skillID)
         let tildeExpanded = NSString(string: expanded).expandingTildeInPath
         if tildeExpanded.hasPrefix("/") {
-            return URL(fileURLWithPath: tildeExpanded, isDirectory: true)
+            return URL(fileURLWithPath: tildeExpanded, isDirectory: true).standardizedFileURL
         }
 
         if let catalogBaseURL {
-            return catalogBaseURL.deletingLastPathComponent().appendingPathComponent(tildeExpanded, isDirectory: true)
+            return catalogBaseURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(tildeExpanded, isDirectory: true)
+                .standardizedFileURL
         }
 
         return URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
             .appendingPathComponent(tildeExpanded, isDirectory: true)
+            .standardizedFileURL
     }
 
     private func expandEnvironmentPlaceholders(in rawPath: String, skillID: String) throws -> String {

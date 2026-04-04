@@ -223,6 +223,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         let reuseDisposition: SessionReuseDisposition
         let ownerKey: String
         let fingerprint: String
+        let mcpResolution: MCPPolicyResolutionReport
     }
 
     private func resolveSession(
@@ -233,6 +234,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
         let (workingDirectory, workspaceMode) = resolveWorkingDirectoryAndMode(agent: agent, context: context)
         let fingerprint = calculateFingerprint(agent: agent, context: context, systemPrompt: packet.systemPrompt, workingDirectory: workingDirectory, workspaceMode: workspaceMode)
+        let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
         
         let ownerKey = InvocationOwnerKeyBuilder.build(
             runID: context.workspace.runID,
@@ -244,7 +246,15 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
 
         guard let sessionManager = sessionManager else {
             let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
-            return SessionResolutionInfo(execution: execution, lineageID: nil, generationID: nil, reuseDisposition: .fresh, ownerKey: ownerKey, fingerprint: fingerprint)
+            return SessionResolutionInfo(
+                execution: execution,
+                lineageID: nil,
+                generationID: nil,
+                reuseDisposition: .fresh,
+                ownerKey: ownerKey,
+                fingerprint: fingerprint,
+                mcpResolution: mcpResolution
+            )
         }
 
         let lid = try await sessionManager.getOrCreateLineage(
@@ -297,7 +307,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                         runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
                     )
                     try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
-                    return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_session_required, ownerKey: ownerKey, fingerprint: fingerprint)
+                    return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_session_required, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
                 }
             }
             // Attempt to reuse the existing provider session.
@@ -306,7 +316,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             do {
                 try await sessionManager.recordEvent(lineageID: lid, generationID: generation.id, type: .reused)
                 let execution = try await sessionBridge.executeInExistingSession(sessionID: generation.providerSessionID!, packet: packet)
-                return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: generation.id, reuseDisposition: .reused, ownerKey: ownerKey, fingerprint: fingerprint)
+                return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: generation.id, reuseDisposition: .reused, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
             } catch {
                 let errorDesc = error.localizedDescription
                 if errorDesc.contains("Session not found") || errorDesc.contains("session not found") || errorDesc.contains("404") {
@@ -336,7 +346,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                         runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
                     )
                     try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
-                    return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_transport_error, ownerKey: ownerKey, fingerprint: fingerprint)
+                    return SessionResolutionInfo(execution: freshExecution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_transport_error, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
                 }
                 throw error // Re-throw non-session errors
             }
@@ -363,7 +373,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
             )
             try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
-            return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: disposition, ownerKey: ownerKey, fingerprint: fingerprint)
+            return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: disposition, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
             
         case .requireReset:
             let execution = try await createFreshExecutionWithCollisionGuard(
@@ -387,8 +397,34 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
             )
             try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .operator_reset)
-            return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_reset, ownerKey: ownerKey, fingerprint: fingerprint)
+            return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: gid, reuseDisposition: .fresh_after_reset, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
         }
+    }
+
+    private func resolveMCPPolicy(agent: ResolvedAgent, context: ExecutionContext) -> MCPPolicyResolutionReport {
+        guard let catalog = context.catalog else {
+            return agent.mcpProfileID == nil ? .none : MCPPolicyResolutionReport(
+                profileID: agent.mcpProfileID ?? "none",
+                requiredExtensions: [],
+                optionalExtensions: [],
+                requestedExtensions: [],
+                requiredRuntimeExtensionIDs: [],
+                optionalRuntimeExtensionIDs: [],
+                predictedEffectiveExtensions: [],
+                predictedEffectiveRuntimeExtensionIDs: [],
+                deniedExtensions: [],
+                warnings: [],
+                blockingIssues: ["Catalog is unavailable; cannot resolve MCP profile for agent '\(agent.id)'."]
+            )
+        }
+
+        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        return MCPPolicyResolver().resolve(
+            agent: agent,
+            catalog: catalog,
+            providerBinding: context.providerBinding,
+            gooseRegistry: gooseRegistry
+        )
     }
 
     private func createFreshExecutionWithCollisionGuard(
@@ -507,12 +543,22 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             toolCalls: eventBridge.toolCalls,
             handoffPacket: context.handoffPacket
         )
+        let mcpServerMetrics = buildMCPServerMetrics(
+            toolCalls: eventBridge.toolCalls,
+            runtimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? sessionInfo.mcpResolution.predictedEffectiveRuntimeExtensionIDs
+        )
 
         return AgentResult(
             outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(failureMsg)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
             providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: "goose", costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
             resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
             canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            mcpProfileID: sessionInfo.mcpResolution.profileID,
+            requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
+            effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
+            deniedMCPExtensions: sessionInfo.mcpResolution.deniedExtensions,
+            mcpSessionStartupLatencyMilliseconds: sessionInfo.execution.startupLatencyMilliseconds,
+            mcpServerMetrics: mcpServerMetrics,
             outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: outputPresence, rawErrorMessage: rawErrorMessage, rawFinishEvent: nil),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
@@ -654,6 +700,10 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             toolCalls: eventBridge.toolCalls,
             handoffPacket: context.handoffPacket
         )
+        let mcpServerMetrics = buildMCPServerMetrics(
+            toolCalls: eventBridge.toolCalls,
+            runtimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? sessionInfo.mcpResolution.predictedEffectiveRuntimeExtensionIDs
+        )
 
         let cost = estimateCost(streamResult: streamResult)
         return AgentResult(
@@ -662,6 +712,12 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: "goose", costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
             resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
             canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            mcpProfileID: sessionInfo.mcpResolution.profileID,
+            requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
+            effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
+            deniedMCPExtensions: sessionInfo.mcpResolution.deniedExtensions,
+            mcpSessionStartupLatencyMilliseconds: sessionInfo.execution.startupLatencyMilliseconds,
+            mcpServerMetrics: mcpServerMetrics,
             outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: finalOutcome, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, rawErrorMessage: finalError, rawFinishEvent: streamResult.finishRaw),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
@@ -709,6 +765,53 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
     private func buildLogSnippet(agent: ResolvedAgent, sessionID: String, streamResult: ExecutionStreamResult, startedAt: Date, completedAt: Date) -> String {
         let duration = String(format: "%.1f", completedAt.timeIntervalSince(startedAt))
         return "Live execution of '\(agent.id)' completed in \(duration)s. Session: \(sessionID). Tool calls: \(streamResult.toolCalls.count)."
+    }
+
+    private func buildMCPServerMetrics(
+        toolCalls: [ToolCallRecord],
+        runtimeExtensionIDs: [String]
+    ) -> [MCPServerExecutionMetric] {
+        let allowedServerIDs = Set(runtimeExtensionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        guard !allowedServerIDs.isEmpty else { return [] }
+
+        var aggregate: [String: (count: Int, requestBytes: Int64, responseBytes: Int64, promptDeltaBytes: Int64)] = [:]
+
+        for toolCall in toolCalls {
+            guard let serverID = resolveMCPServerID(for: toolCall.toolName, allowedServerIDs: allowedServerIDs) else {
+                continue
+            }
+            let requestBytes = Int64(toolCall.rawPayload.lengthOfBytes(using: .utf8))
+            let responseBytes = Int64((toolCall.responseRawPayload ?? "").lengthOfBytes(using: .utf8))
+            var current = aggregate[serverID] ?? (count: 0, requestBytes: 0, responseBytes: 0, promptDeltaBytes: 0)
+            current.count += 1
+            current.requestBytes += requestBytes
+            current.responseBytes += responseBytes
+            current.promptDeltaBytes += responseBytes
+            aggregate[serverID] = current
+        }
+
+        return aggregate.keys.sorted().map { serverID in
+            let current = aggregate[serverID] ?? (count: 0, requestBytes: 0, responseBytes: 0, promptDeltaBytes: 0)
+            return MCPServerExecutionMetric(
+                serverID: serverID,
+                toolCallCount: current.count,
+                requestBytes: current.requestBytes,
+                responseBytes: current.responseBytes,
+                promptContextDeltaBytes: current.promptDeltaBytes
+            )
+        }
+    }
+
+    private func resolveMCPServerID(for toolName: String, allowedServerIDs: Set<String>) -> String? {
+        let normalized = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        if let prefix = normalized.components(separatedBy: "__").first, allowedServerIDs.contains(prefix) {
+            return prefix
+        }
+        if allowedServerIDs.contains(normalized) {
+            return normalized
+        }
+        return nil
     }
 
     private func estimateCost(streamResult: ExecutionStreamResult) -> Int64? {

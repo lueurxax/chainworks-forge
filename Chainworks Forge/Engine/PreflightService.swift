@@ -176,6 +176,16 @@ struct PreflightService {
             )
         }
 
+        if let loadedCatalog {
+            appendSkillChecks(
+                catalog: loadedCatalog,
+                catalogURL: catalogURL,
+                checks: &checks,
+                warnings: &warnings,
+                blockingIssues: &blockingIssues
+            )
+        }
+
         let requiredFamilies = Set(plan?.agentBindings.values.compactMap { ProviderFamily.from(runtimeIdentifier: $0.provider) } ?? [])
         for family in requiredFamilies.sorted(by: { $0.rawValue < $1.rawValue }) {
             guard let provider = providerRegistry.preferredProvider(for: family) else {
@@ -225,6 +235,66 @@ struct PreflightService {
             warnings: Array(Set(warnings)),
             blockingIssues: Array(Set(blockingIssues))
         )
+    }
+
+    private func appendSkillChecks(
+        catalog: AgentCatalog,
+        catalogURL: URL,
+        checks: inout [PreflightCheck],
+        warnings: inout [String],
+        blockingIssues: inout [String]
+    ) {
+        let resolverContext = SkillResolverContext(catalogBaseURL: catalogURL)
+        let uniqueAgentSkills = Dictionary(uniqueKeysWithValues: catalog.agents.map { ($0.id, $0) })
+        var successfulResolutions = 0
+
+        for (_, agent) in uniqueAgentSkills.sorted(by: { $0.key < $1.key }) {
+            guard let skillRef = catalog.skills[agent.skillRef] else {
+                let message = "Agent '\(agent.id)' references non-existent skill '\(agent.skillRef)'."
+                checks.append(PreflightCheck(
+                    category: "Skills",
+                    title: "Skill resolution: \(agent.id)",
+                    status: .fail,
+                    message: message
+                ))
+                blockingIssues.append(message)
+                continue
+            }
+
+            do {
+                let resolved = try SkillResolver.resolve(
+                    skillID: agent.skillRef,
+                    skillRef: skillRef,
+                    skillRole: agent.skillRole,
+                    context: resolverContext
+                )
+                successfulResolutions += 1
+
+                let sourceLabel = resolved.sourcePath ?? resolved.sourceDescription ?? resolved.type.catalogType
+                checks.append(PreflightCheck(
+                    category: "Skills",
+                    title: "Skill resolution: \(agent.id)",
+                    status: .pass,
+                    message: "Resolved \(resolved.type.catalogType) '\(agent.skillRef)' from \(sourceLabel)"
+                ))
+            } catch {
+                let message = "Agent '\(agent.id)' skill '\(agent.skillRef)' failed resolution: \(error.localizedDescription)"
+                checks.append(PreflightCheck(
+                    category: "Skills",
+                    title: "Skill resolution: \(agent.id)",
+                    status: .fail,
+                    message: message
+                ))
+                blockingIssues.append(message)
+            }
+        }
+
+        checks.append(PreflightCheck(
+            category: "Skills",
+            title: "Skill summary",
+            status: blockingIssues.contains(where: { $0.contains("skill '") || $0.contains("references non-existent skill") }) ? .fail : .pass,
+            message: "Resolved \(successfulResolutions) skill binding(s) across \(uniqueAgentSkills.count) agent(s)"
+        ))
     }
 
     func runReport(

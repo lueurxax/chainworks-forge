@@ -8,6 +8,7 @@ extension Notification.Name {
 
 struct ContentView: View {
     @Environment(ExecutionService.self) private var executionService
+    @Environment(AppConfigurationStore.self) private var appConfigurationStore
     @State private var selectedTab: Tab = .ideas
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
@@ -32,7 +33,9 @@ struct ContentView: View {
         case releaseGate = "release_gate"
         case deliveryPreflightReport = "delivery_preflight_report"
         case completedExportHub = "completed_export_hub"
+        case waitingApprovalRunProgress = "waiting_approval_run_progress"
         case accessibilityAudit = "accessibility_audit"
+        case proposal015Proof = "proposal015_proof"
         case proposal013Proof = "proposal013_proof"
         case proposal022Proof = "proposal022_proof"
     }
@@ -48,24 +51,21 @@ struct ContentView: View {
         _selectedTab = State(initialValue: initialTab ?? .runsHome)
     }
 
-    private func exampleFileURL(bundleName: String, bundledExtension: String = "yaml", repoRelativePath: String) -> URL? {
-        if let bundled = Bundle.main.url(forResource: bundleName, withExtension: bundledExtension) {
-            return bundled
-        }
+    private func exampleFileURL(
+        configuredPath: String? = nil,
+        bundleName: String,
+        bundledExtension: String = "yaml",
+        repoRelativePath: String
+    ) -> URL? {
+        let configuredURL = configuredPath
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
 
-        var candidates = [
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(repoRelativePath)
-        ]
-        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Documents/Chainworks Forge")
-                    .appendingPathComponent(repoRelativePath)
-            )
-        }
-
-        return candidates.first { FileManager.default.isReadableFile(atPath: $0.path) }
+        return AppConfiguration.preferredExampleURL(
+            configuredURL: configuredURL,
+            repoRelativePath: repoRelativePath,
+            bundledURL: Bundle.main.url(forResource: bundleName, withExtension: bundledExtension)
+        )
     }
 
     var body: some View {
@@ -101,16 +101,28 @@ struct ContentView: View {
                     .accessibilityIdentifier("tab-approvals")
 
                 AgentCatalogView(
-                    catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
+                    catalogURL: exampleFileURL(
+                        configuredPath: appConfigurationStore.configuration.agentCatalogSourcePath,
+                        bundleName: "agents",
+                        repoRelativePath: "examples/agents/agents.yaml"
+                    )
                 )
                 .tabItem { Label("Agent Catalog", systemImage: "person.3") }
                 .tag(Tab.agentCatalog)
                 .accessibilityIdentifier("tab-agent-catalog")
 
                 WorkflowInspectorView(
-                    workflowURL: exampleFileURL(bundleName: "workflow", repoRelativePath: "examples/workflows/workflow.yaml"),
+                    workflowURL: exampleFileURL(
+                        configuredPath: appConfigurationStore.configuration.workflowSourcePath,
+                        bundleName: "workflow",
+                        repoRelativePath: "examples/workflows/workflow.yaml"
+                    ),
                     compactWorkflowURL: exampleFileURL(bundleName: "proposal-to-release", repoRelativePath: "examples/workflows/proposal-to-release.yaml"),
-                    catalogURL: exampleFileURL(bundleName: "agents", repoRelativePath: "examples/agents/agents.yaml")
+                    catalogURL: exampleFileURL(
+                        configuredPath: appConfigurationStore.configuration.agentCatalogSourcePath,
+                        bundleName: "agents",
+                        repoRelativePath: "examples/agents/agents.yaml"
+                    )
                 )
                 .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
                 .tag(Tab.workflowInspector)
@@ -177,8 +189,12 @@ struct ContentView: View {
             UITestDeliveryPreflightReportSurface()
         case .completedExportHub:
             UITestCompletedExportHubSurface()
+        case .waitingApprovalRunProgress:
+            UITestWaitingApprovalRunProgressSurface()
         case .accessibilityAudit:
             UITestAccessibilityAuditSurface()
+        case .proposal015Proof:
+            UITestProposal015ProofSurface()
         case .proposal013Proof:
             UITestProposal013EvidenceSurface()
         case .proposal022Proof:

@@ -46,6 +46,7 @@ struct RunComparisonView: View {
             }
         }
         .frame(minWidth: 600, minHeight: 500)
+        .accessibilityIdentifier("run-comparison-view")
         .task {
             let service = RunComparisonService(modelContext: modelContext)
             comparison = service.compare(runA, runB)
@@ -220,7 +221,7 @@ struct RunComparisonView: View {
     @ViewBuilder
     private func bindingsSection(_ c: RunComparison) -> some View {
         if !c.bindingsA.isEmpty || !c.bindingsB.isEmpty {
-            GroupBox("Provider / Model / Effort Bindings") {
+            GroupBox("Provider / Model / Effort / MCP Bindings") {
                 let allAgentIDs = Set(c.bindingsA.map(\.agentID)).union(c.bindingsB.map(\.agentID)).sorted()
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(allAgentIDs, id: \.self) { agentID in
@@ -229,13 +230,17 @@ struct RunComparisonView: View {
                         let changed = bindingA?.provider != bindingB?.provider
                             || bindingA?.model != bindingB?.model
                             || bindingA?.effort != bindingB?.effort
+                            || bindingA?.mcpProfileID != bindingB?.mcpProfileID
+                            || bindingA?.requestedMCPExtensions != bindingB?.requestedMCPExtensions
+                            || bindingA?.predictedMCPExtensions != bindingB?.predictedMCPExtensions
+                            || bindingA?.actualMCPExtensions != bindingB?.actualMCPExtensions
+                            || bindingA?.deniedMCPExtensions != bindingB?.deniedMCPExtensions
                         HStack {
                             Image(systemName: changed ? "arrow.triangle.2.circlepath" : "equal.circle")
                                 .foregroundStyle(changed ? .orange : .green)
-                            Text(agentID)
-                                .font(.caption.monospaced().bold())
-                                .frame(width: 100, alignment: .leading)
-                            VStack(alignment: .leading, spacing: 1) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(agentID)
+                                    .font(.caption.monospaced().bold())
                                 HStack(spacing: 4) {
                                     Text("A:")
                                         .font(.caption2)
@@ -250,6 +255,10 @@ struct RunComparisonView: View {
                                             .help("Cross-family binding mismatch")
                                     }
                                 }
+                                if let bindingA {
+                                    skillBindingDetails(bindingA, tint: .blue)
+                                    mcpBindingDetails(bindingA, tint: .blue)
+                                }
                                 HStack(spacing: 4) {
                                     Text("B:")
                                         .font(.caption2)
@@ -263,6 +272,10 @@ struct RunComparisonView: View {
                                             .foregroundStyle(.yellow)
                                             .help("Cross-family binding mismatch")
                                     }
+                                }
+                                if let bindingB {
+                                    skillBindingDetails(bindingB, tint: .purple)
+                                    mcpBindingDetails(bindingB, tint: .purple)
                                 }
                             }
                         }
@@ -345,6 +358,80 @@ struct RunComparisonView: View {
             parts.append("[\(source)]")
         }
         return parts.joined(separator: " / ")
+    }
+
+    @ViewBuilder
+    private func mcpBindingDetails(_ binding: RunComparison.AgentBinding, tint: Color) -> some View {
+        if binding.mcpProfileID != nil
+            || !binding.requestedMCPExtensions.isEmpty
+            || !binding.predictedMCPExtensions.isEmpty
+            || !binding.actualMCPExtensions.isEmpty
+            || !binding.deniedMCPExtensions.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("MCP profile: \(binding.mcpProfileID ?? "none")")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(tint)
+                Text("Requested: \(joinedList(binding.requestedMCPExtensions))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Predicted: \(joinedList(binding.predictedMCPExtensions))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Actual: \(joinedList(binding.actualMCPExtensions))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Denied: \(joinedList(binding.deniedMCPExtensions))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func joinedList(_ values: [String]) -> String {
+        values.isEmpty ? "none" : values.joined(separator: ", ")
+    }
+
+    @ViewBuilder
+    private func skillBindingDetails(_ binding: RunComparison.AgentBinding, tint: Color) -> some View {
+        if binding.skillRef != nil || binding.skillType != nil || binding.skillRole != nil || binding.resolvedSkillContent != nil {
+            VStack(alignment: .leading, spacing: 2) {
+                if let skillRef = binding.skillRef {
+                    Text("Skill: \(skillRef)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(tint)
+                }
+                if let skillType = binding.skillType {
+                    Text("Type: \(skillType)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let skillRole = binding.skillRole {
+                    Text("Role: \(skillRole)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let summary = binding.skillContentSummary {
+                    Text("Summary: \(summary)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let hash = binding.skillSnapshotHash {
+                    Text("Hash: \(hash)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                if let content = binding.resolvedSkillContent, !content.isEmpty {
+                    DisclosureGroup("Resolved Skill Content") {
+                        Text(content)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .padding(.top, 2)
+                    }
+                    .font(.caption2)
+                }
+            }
+            .padding(.leading, 16)
+        }
     }
 
     @ViewBuilder

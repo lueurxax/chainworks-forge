@@ -62,7 +62,7 @@ struct DeliveryServicesTests {
             profileLabel: "Chainworks Forge (Self)",
             sampleProfileID: nil,
             repoIdentifier: "Chainworks Forge",
-            repoRoot: "/Users/test/Chainworks Forge",
+            repoRoot: "/tmp/Chainworks Forge",
             baseBranch: "main",
             worktreeBasePath: "/tmp/worktrees",
             targetBranch: "dogfood/full-mvp",

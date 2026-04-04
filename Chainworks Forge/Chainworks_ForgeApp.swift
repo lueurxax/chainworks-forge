@@ -566,8 +566,22 @@ struct AppBootstrapView: View {
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
                                 .environment(gooseServerManager)
+                        case .waitingApprovalRunProgress:
+                            UITestWaitingApprovalRunProgressSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
                         case .accessibilityAudit:
                             UITestAccessibilityAuditSurface()
+                                .environment(service)
+                                .environment(appConfigurationStore)
+                                .environment(providerSettingsStore)
+                                .environment(providerRegistry)
+                                .environment(gooseServerManager)
+                        case .proposal015Proof:
+                            UITestProposal015ProofSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
@@ -641,16 +655,14 @@ struct AppBootstrapView: View {
     }
 
     private static func loadBundledCatalog(appConfiguration: AppConfiguration) -> AgentCatalog? {
-        var candidates: [URL?] = [
-            URL(fileURLWithPath: appConfiguration.agentCatalogSourcePath),
+        let candidates: [URL?] = [
+            AppConfiguration.preferredExampleURL(
+                configuredURL: URL(fileURLWithPath: appConfiguration.agentCatalogSourcePath),
+                repoRelativePath: "examples/agents/agents.yaml",
+                bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml")
+            ),
             Bundle.main.url(forResource: "agents", withExtension: "yaml")
         ]
-        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Documents/Chainworks Forge/examples/agents/agents.yaml")
-            )
-        }
         for case let url? in candidates {
             if let catalog = try? YAMLParser.loadAgentCatalog(from: url) {
                 return catalog
@@ -683,44 +695,28 @@ struct AppBootstrapView: View {
     }
 
     private static func loadBundledWorkflow(named resourceName: String, repoRelativePath: String) -> WorkflowDefinition? {
-        var candidates: [URL?] = [
-            Bundle.main.url(forResource: resourceName, withExtension: "yaml")
-        ]
-        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Documents/Chainworks Forge/\(repoRelativePath)")
-            )
-        }
-        for case let url? in candidates {
-            if let workflow = try? YAMLParser.loadWorkflow(from: url) {
-                return workflow
-            }
+        if let url = AppConfiguration.preferredExampleURL(
+            repoRelativePath: repoRelativePath,
+            bundledURL: Bundle.main.url(forResource: resourceName, withExtension: "yaml")
+        ), let workflow = try? YAMLParser.loadWorkflow(from: url) {
+            return workflow
         }
         return nil
     }
 
     private static func loadStewardConfig() -> StewardConfig? {
-        var candidates: [URL?] = [
-            Bundle.main.url(forResource: "steward_config", withExtension: "yaml")
-        ]
-        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Documents/Chainworks Forge/examples/steward/steward_config.yaml")
-            )
-        }
-        for case let url? in candidates {
-            if let config = try? YAMLParser.loadStewardConfig(from: url) {
-                // REQ-003: Enforce validation at load time.
-                let issues = YAMLValidator.validateStewardConfig(config)
-                let errors = issues.filter { $0.severity == .error }
-                if !errors.isEmpty {
-                    print("[Steward] steward_config.yaml validation failed: \(errors.map(\.message).joined(separator: "; ")). Using defaults.")
-                    return StewardConfig.defaultConfig
-                }
-                return config
+        if let url = AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/steward/steward_config.yaml",
+            bundledURL: Bundle.main.url(forResource: "steward_config", withExtension: "yaml")
+        ), let config = try? YAMLParser.loadStewardConfig(from: url) {
+            // REQ-003: Enforce validation at load time.
+            let issues = YAMLValidator.validateStewardConfig(config)
+            let errors = issues.filter { $0.severity == .error }
+            if !errors.isEmpty {
+                print("[Steward] steward_config.yaml validation failed: \(errors.map(\.message).joined(separator: "; ")). Using defaults.")
+                return StewardConfig.defaultConfig
             }
+            return config
         }
         return nil
     }
@@ -889,7 +885,11 @@ struct AppBootstrapView: View {
 
         do {
             let compiler = RunPlanCompiler(modelContext: modelContext)
-            let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+            let plan = try compiler.previewCompile(
+                workflow: workflow,
+                catalog: catalog,
+                catalogSourcePath: resolvedExamplePath("examples/agents/agents.yaml")
+            )
             let workspace = try makeSeedWorkspace(runID: UUID(), prefix: "UITestWaitingApproval")
             let run = try RunRepository(context: modelContext).createRunFromPlan(
                 for: idea,
@@ -997,7 +997,7 @@ struct AppBootstrapView: View {
             modelContext.insert(reviewExecution)
 
             let artifactManager = ArtifactManager(modelContext: modelContext)
-            _ = try artifactManager.persistOutputs(
+            let writerArtifacts = try artifactManager.persistOutputs(
                 outputs: [
                     "proposal_current": Data("""
                     # Seeded Proposal
@@ -1026,7 +1026,7 @@ struct AppBootstrapView: View {
                 attemptNumber: refinedStage.attemptNumber,
                 catalog: catalog
             )
-            _ = try artifactManager.persistOutputs(
+            let reviewArtifacts = try artifactManager.persistOutputs(
                 outputs: [
                     "proposal_review_summary": Data("""
                     {
@@ -1050,6 +1050,16 @@ struct AppBootstrapView: View {
                 attemptNumber: refinedStage.attemptNumber,
                 catalog: catalog
             )
+
+            writerExecution.artifacts = writerArtifacts
+            reviewExecution.artifacts = reviewArtifacts
+            refinedStage.agentExecutions = [writerExecution, reviewExecution]
+            if run.stageExecutions.contains(where: { $0.id == refinedStage.id }) == false {
+                run.stageExecutions.append(refinedStage)
+            }
+            if run.stageExecutions.contains(where: { $0.id == approvalStage.id }) == false {
+                run.stageExecutions.append(approvalStage)
+            }
 
             let approval = Approval(
                 stageID: approvalStage.stageID,
@@ -1097,6 +1107,8 @@ struct AppBootstrapView: View {
             return
         }
 
+        let repositoryRoot = AppConfiguration.defaultRepositoryRoot().path
+
         do {
             let workspace = try makeSeedWorkspace(runID: UUID(), prefix: "UITestReleaseGate")
             let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
@@ -1125,9 +1137,9 @@ struct AppBootstrapView: View {
             run.baseRevision = "seededbase"
             run.repoIdentifier = RepositoryIdentityNormalizer.canonicalIdentifier(
                 configuredIdentifier: "Chainworks Forge",
-                repoRoot: FileManager.default.currentDirectoryPath
+                repoRoot: repositoryRoot
             )
-            run.repoRoot = FileManager.default.currentDirectoryPath
+            run.repoRoot = repositoryRoot
             run.baseBranch = "main"
             run.targetBranch = "dogfood/full-mvp"
             run.releaseTargetID = "sandbox_local"
@@ -1139,7 +1151,7 @@ struct AppBootstrapView: View {
                 profileLabel: "Chainworks Forge (Self)",
                 sampleProfileID: nil,
                 repoIdentifier: "Chainworks Forge",
-                repoRoot: FileManager.default.currentDirectoryPath,
+                repoRoot: repositoryRoot,
                 baseBranch: "main",
                 worktreeBasePath: worktreeRoot.deletingLastPathComponent().path,
                 targetBranch: "dogfood/full-mvp",
@@ -1237,16 +1249,9 @@ struct AppBootstrapView: View {
     }
 
     private static func resolvedExamplePath(_ relativePath: String) -> String {
-        var candidates = [
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(relativePath)
-        ]
-        if AppConfiguration.allowsDocumentsFallbackForCurrentProcess {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Documents/Chainworks Forge/\(relativePath)")
-            )
-        }
-        return candidates.first(where: { FileManager.default.isReadableFile(atPath: $0.path) })?.path
-            ?? candidates[0].path
+        AppConfiguration.preferredExampleURL(repoRelativePath: relativePath)?.path
+            ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(relativePath)
+            .path
     }
 }

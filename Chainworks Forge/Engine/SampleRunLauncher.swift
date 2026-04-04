@@ -15,7 +15,11 @@ struct SampleRunLauncher {
         let compiler = RunPlanCompiler(modelContext: modelContext)
         let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
         let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
-        let compiledPlan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let compiledPlan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
 
         let preflight = PreflightService(
             appConfigurationStore: appConfigurationStore,
@@ -114,8 +118,8 @@ struct SampleRunLauncher {
     ) -> URL? {
         let candidates: [URL?] = [
             configuredPath.map { URL(fileURLWithPath: $0) },
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(repoRelativePath),
             AppConfiguration.defaultRepositoryRoot().appendingPathComponent(repoRelativePath),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(repoRelativePath),
             Bundle.main.url(forResource: bundleResourceName, withExtension: "yaml")
         ]
 

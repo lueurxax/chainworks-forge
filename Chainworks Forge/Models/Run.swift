@@ -46,6 +46,11 @@ import SwiftData
 
     // Proposal 011 (REQ-009): Frozen binding provenance per agent, keyed by agent ID.
     var bindingProvenanceJSON: Data?
+    // Proposal 015: Frozen skill truth per run, keyed by skill ID.
+    var resolvedSkillsJSON: Data?
+    var skillContentHashesJSON: Data?
+    var skillInjectedContentHashesJSON: Data?
+    var resolvedMCPPoliciesJSON: Data?
 
     // Proposal 011 (REQ-007): Frozen idea workspace root path at run creation time.
     // Set once during startRun, not mutated afterward.

@@ -12,6 +12,7 @@ private func makeContext() throws -> ModelContext {
         AgentExecution.self, Approval.self, Artifact.self,
         configurations: config
     )
+    TestModelContainerRetainer.retain(container)
     return ModelContext(container)
 }
 
@@ -60,7 +61,10 @@ private nonisolated func fixtureURL(_ filename: String) -> URL {
     if let url = bundle.url(forResource: filename, withExtension: nil) {
         return url
     }
-    return URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge/Chainworks ForgeTests/Fixtures/\(filename)")
+    let sourceRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("Fixtures", isDirectory: true)
+    return sourceRoot.appendingPathComponent(filename, isDirectory: false)
 }
 
 private final class _TestBundleMarker: NSObject {}
@@ -90,6 +94,9 @@ private func makeCatalog(
     paths: [String: String] = [:],
     artifacts: [String: String] = [:],
     skills: [String: SkillRef] = [:],
+    mcpPolicy: MCPPolicyConfig = .defaultDeny,
+    mcpServerRegistry: [String: MCPServerRegistryEntry] = [:],
+    mcpProfiles: [String: MCPProfile] = [:],
     contracts: [String: ArtifactContract] = [:],
     backendProfiles: [String: BackendProfile] = [:],
     permissionProfiles: [String: PermissionProfile] = [:],
@@ -103,7 +110,8 @@ private func makeCatalog(
             singleActiveRunPerIdea: true, runResumePolicy: "automatic_on_launch",
             requiredProviders: []
         ),
-        paths: paths, artifacts: artifacts, skills: skills, contracts: contracts,
+        paths: paths, artifacts: artifacts, skills: skills,
+        mcpPolicy: mcpPolicy, mcpServerRegistry: mcpServerRegistry, mcpProfiles: mcpProfiles, contracts: contracts,
         backendProfiles: backendProfiles, permissionProfiles: permissionProfiles, agents: agents
     )
 }
@@ -112,6 +120,7 @@ private func makeAgent(
     id: String = "test_agent",
     backendProfile: String = "bp1",
     permissionProfile: String = "pp1",
+    mcpProfile: String? = nil,
     skillRef: String = "sk1",
     inputs: [String] = [],
     outputs: [String] = [],
@@ -120,6 +129,7 @@ private func makeAgent(
     AgentDefinition(
         id: id, title: "Test Agent", mode: "tool_use",
         backendProfile: backendProfile, permissionProfile: permissionProfile,
+        mcpProfile: mcpProfile,
         skillRef: skillRef, skillRole: nil, worktreePolicy: nil,
         requiredTools: nil, inputs: inputs, outputs: outputs,
         outputContract: outputContract, requiresHumanApproval: false,
@@ -642,10 +652,23 @@ struct YAMLParserTests {
             #expect(catalog.agents.count == 16)  // 13 original + 3 Steward agents (Proposal 003)
             #expect(catalog.backendProfiles.count == 14)  // 11 original + 3 Steward profiles
             #expect(catalog.permissionProfiles.count == 8)
-            #expect(catalog.contracts.count == 18)  // Canonical catalog now includes proposal-loop and strategy contracts
+            #expect(catalog.contracts.count == 28)  // Canonical catalog now includes proposal-loop, strategy, and exact output contracts
         } catch {
             Issue.record("Parse failed: \(error)")
         }
+    }
+
+    @Test func parseAgentCatalogWithMCPProfilesV2() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let url = repoRoot.appendingPathComponent("examples/agents/agents_mcp_profiles_v2.yaml")
+        let catalog = try YAMLParser.loadAgentCatalog(from: url)
+        #expect(catalog.mcpPolicy.defaultProfile == "none")
+        #expect(catalog.mcpServerRegistry["xcode"]?.runtimeIDs["goose"] == "xcode")
+        #expect(catalog.mcpProfiles["code_build_rich"] != nil)
+        let codeWriter = try #require(catalog.agents.first(where: { $0.id == "code_writer" }))
+        #expect(codeWriter.mcpProfile == "code_build_rich")
     }
 
     @Test func parseFullWorkflow() throws {
@@ -696,7 +719,7 @@ struct YAMLParserTests {
     }
 
     @Test func exampleCatalogKeepsProposalWriterOnCurrentWriterProfile() throws {
-        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let repoRoot = testRepositoryRootURL()
         let catalog = try YAMLParser.loadAgentCatalog(
             from: repoRoot.appendingPathComponent("examples/agents/agents.yaml")
         )
@@ -738,7 +761,7 @@ struct YAMLParserTests {
 
     @Test func testParseArtifactContracts() throws {
         let catalog = try YAMLParser.loadAgentCatalog(from: fixtureURL("agents.yaml"))
-        #expect(catalog.contracts.count == 18)  // Canonical catalog now includes proposal-loop and strategy contracts
+        #expect(catalog.contracts.count == 28)  // Canonical catalog now includes proposal-loop, strategy, and exact output contracts
     }
 
     // MARK: - REQ-011: Transitions
@@ -1028,6 +1051,18 @@ struct YAMLValidatorTests {
 
         let issues = YAMLValidator.validateOutputContractRefs(catalog)
         #expect(issues.filter { $0.severity == .error }.isEmpty)
+    }
+
+    @Test func brokenMCPProfileRef() {
+        let catalog = makeCatalog(
+            skills: ["sk1": dummySkillRef],
+            backendProfiles: ["bp1": dummyBackendProfile],
+            permissionProfiles: ["pp1": dummyPermissionProfile],
+            agents: [makeAgent(id: "reviewer", mcpProfile: "nonexistent_profile")]
+        )
+
+        let issues = YAMLValidator.validateMCPRefs(catalog)
+        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("non-existent MCP profile") }))
     }
 
     @Test func brokenArtifactRef() {

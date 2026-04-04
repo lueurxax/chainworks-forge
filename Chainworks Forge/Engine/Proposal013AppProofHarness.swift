@@ -56,12 +56,21 @@ final class Proposal013AppProofHarness {
         let catalogURL = try resolveCatalogURL()
         let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
         let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
-        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
 
         let idea = Idea(
             title: "Proposal 013 App Proof",
             body: "Fixture-backed aggregate contract mismatch proof for Proposal 013.",
-            workspaceRootPath: AppConfiguration.defaultRepositoryRoot().path
+            workspaceRootPath: AppConfiguration.defaultRepositoryRoot(
+                currentDirectoryPath: FileManager.default.currentDirectoryPath,
+                bundleURL: Bundle.main.bundleURL,
+                allowsDocumentsFallback: false,
+                sourceFilePath: #filePath
+            ).path
         )
         modelContext.insert(idea)
 
@@ -152,24 +161,24 @@ final class Proposal013AppProofHarness {
     }
 
     private func resolveWorkflowURL() throws -> URL {
-        if let bundled = Bundle.main.url(forResource: "proposal-loop-live", withExtension: "yaml") {
-            return bundled
-        }
-        let fallback = AppConfiguration.defaultRepositoryRoot()
-            .appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
-        guard FileManager.default.fileExists(atPath: fallback.path) else {
+        guard let fallback = AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/workflows/proposal-loop-live.yaml",
+            bundledURL: Bundle.main.url(forResource: "proposal-loop-live", withExtension: "yaml"),
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        ) else {
             throw Proposal013AppProofHarnessError.missingWorkflow
         }
         return fallback
     }
 
     private func resolveCatalogURL() throws -> URL {
-        if let bundled = Bundle.main.url(forResource: "agents", withExtension: "yaml") {
-            return bundled
-        }
-        let fallback = AppConfiguration.defaultRepositoryRoot()
-            .appendingPathComponent("examples/agents/agents.yaml")
-        guard FileManager.default.fileExists(atPath: fallback.path) else {
+        guard let fallback = AppConfiguration.preferredExampleURL(
+            repoRelativePath: "examples/agents/agents.yaml",
+            bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml"),
+            allowsDocumentsFallback: false,
+            sourceFilePath: #filePath
+        ) else {
             throw Proposal013AppProofHarnessError.missingCatalog
         }
         return fallback

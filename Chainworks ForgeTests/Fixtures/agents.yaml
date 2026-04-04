@@ -71,11 +71,11 @@ artifacts:
 skills:
   proposal_review_triad:
     type: external_skill
-    path: /Users/user/.codex/skills/proposal-review-triad
+    path: ../../examples/skills/proposal-review-triad
     notes: Shared skill for PO / UX / UI / Architect proposal review lenses.
   proposal_implementation_audit:
     type: external_skill
-    path: /Users/user/.codex/skills/proposal-implementation-audit
+    path: ../../examples/skills/proposal-implementation-audit
   docs_quality_guardian:
     type: builtin_agent
     name: docs-quality-guardian

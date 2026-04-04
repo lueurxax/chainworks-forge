@@ -314,6 +314,12 @@ struct MCPPermissions: Codable, Sendable {
         self.legacyAllow = legacyAllow ?? allow
         self.runtimeAuthority = try container.decodeIfPresent(Bool.self, forKey: .runtimeAuthority) ?? false
     }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(legacyAllow, forKey: .legacyAllow)
+        try container.encode(runtimeAuthority, forKey: .runtimeAuthority)
+    }
 }
 
 struct MCPPolicyConfig: Codable, Sendable, Equatable {

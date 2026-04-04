@@ -111,6 +111,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
         deliveryProofMode: String? = nil,
         initialTab: String = "Ideas",
         seedWaitingApprovalRun: Bool = false,
+        runProgressPane: String? = nil,
         directSurface: String? = nil,
         disableEagerBootstrap: Bool = false,
         uiTestWindowSize: String? = nil,
@@ -140,6 +141,9 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"] = uiTestExportDirectory().path
         if let directSurface {
             app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
+        }
+        if let runProgressPane {
+            app.launchEnvironment["CHAINWORKS_UI_TEST_RUN_PROGRESS_PANE"] = runProgressPane
         }
         if let uiTestWindowSize {
             app.launchEnvironment["CHAINWORKS_UI_TEST_WINDOW_SIZE"] = uiTestWindowSize
@@ -412,7 +416,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     }
 
     private func uiTestExportDirectory() -> URL {
-        URL(fileURLWithPath: NSHomeDirectory())
+        FileManager.default.temporaryDirectory
             .appendingPathComponent("ChainworksUITestExports", isDirectory: true)
     }
 
@@ -438,6 +442,30 @@ final class Chainworks_ForgeUITests: XCTestCase {
         }
 
         return element.isHittable
+    }
+
+    private func scrollToRevealElement(
+        _ element: XCUIElement,
+        in scrollView: XCUIElement,
+        attempts: Int = 8
+    ) -> Bool {
+        guard scrollView.waitForExistence(timeout: 2) else {
+            return false
+        }
+
+        if element.exists {
+            return true
+        }
+
+        for _ in 0..<attempts {
+            scrollView.swipeUp()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+            if element.exists {
+                return true
+            }
+        }
+
+        return element.exists
     }
 
     @discardableResult
@@ -1163,6 +1191,88 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "REQ016_ExportHub_Exported")
     }
 
+    func testProposal015SkillVisibilityProofSurface() throws {
+        let app = makeApp(directSurface: "proposal015_proof")
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-proposal015_proof")
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "Proposal 015 proof surface must finish bootstrap"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "ui-test-proposal015-proof-ready").waitForExistence(timeout: 20),
+            "Proposal 015 proof surface must expose a ready marker"
+        )
+        let proofError = anyElement(app, identifier: "ui-test-proposal015-proof-error")
+        XCTAssertFalse(
+            proofError.waitForExistence(timeout: 1),
+            "Proposal 015 proof surface entered an error state: \(proofError.label)"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "proposal015-skill-proof-card-proposal_reviewer_product_owner").waitForExistence(timeout: 20),
+            "Proof surface must render the proposal-owned skill proof card"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "agent-catalog-agent-proposal_reviewer_product_owner").waitForExistence(timeout: 20),
+            "Proof surface must expose the agent catalog skill owner path"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "agent-catalog-skill-section-proposal_reviewer_product_owner").waitForExistence(timeout: 10),
+            "Agent catalog must render resolved skill truth for the selected agent"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "agent-catalog-skill-preview-proposal_reviewer_product_owner").waitForExistence(timeout: 10),
+            "Agent catalog must render a skill content preview"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p015-proof-panel-readiness").waitForExistence(timeout: 20),
+            "Pilot readiness proof panel must render"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "pilot-readiness-skills-section").waitForExistence(timeout: 20),
+            "Pilot readiness must surface skill preflight results"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p015-proof-panel-report").waitForExistence(timeout: 20),
+            "Run report proof panel must render"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "run-report-view").waitForExistence(timeout: 20),
+            "Run report proof panel must render"
+        )
+        let reportSkillText = anyElement(app, identifier: "p015-proof-report-skill-line")
+        XCTAssertTrue(
+            reportSkillText.waitForExistence(timeout: 20),
+            "Run report must render persisted resolved skill truth"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p015-proof-panel-comparison").waitForExistence(timeout: 20),
+            "Run comparison proof panel must render"
+        )
+        let comparisonSkillText = anyElement(app, identifier: "p015-proof-comparison-skill-line")
+        XCTAssertTrue(
+            comparisonSkillText.waitForExistence(timeout: 20),
+            "Run comparison must render skill binding truth"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p015-proof-panel-artifact").waitForExistence(timeout: 20),
+            "Artifact inspector proof panel must render"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p015-proof-artifact-line").waitForExistence(timeout: 20),
+            "Artifact proof summary must render"
+        )
+        screenshot(app, name: "P015_Skill_Truth_Proof")
+    }
+
     func testProposal024FocusedTimelineInspectorSurface() throws {
         let app = makeApp(directSurface: "workflow_map")
         defer { terminateIfRunning(app) }
@@ -1816,25 +1926,18 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let app = makeApp(
             seededIdeaTitle: "Artifact Inspector Proof",
             liveFixture: true,
-            seedWaitingApprovalRun: true
+            seedWaitingApprovalRun: true,
+            runProgressPane: "approvals",
+            directSurface: "waiting_approval_run_progress"
         )
         launchClean(app)
 
-        let screen = AppScreen(app: app)
-        let ideas = IdeasScreen(app: app)
         let progress = RunProgressScreen(app: app)
 
-        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
-                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
-
-        XCTAssertTrue(screen.selectTab("Ideas"))
-        let ideaRow = ideas.findRow("Artifact Inspector Proof")
-        XCTAssertTrue(ideaRow.waitForExistence(timeout: 15))
-        ideaRow.click()
-
         XCTAssertTrue(
-            progress.openIfNeeded(workflowTitle: "Proposal Loop (Live)", timeout: 15),
-            "Run progress should open for the seeded waiting-approval run"
+            anyElement(app, identifier: "ui-test-waiting-approval-run-progress-surface").waitForExistence(timeout: 15)
+                || progress.isVisible(timeout: 15),
+            "Seeded waiting-approval run progress surface must render directly for artifact inspection"
         )
 
         let reviewSummaryButton = app.descendants(matching: .any)
@@ -1920,53 +2023,45 @@ final class Chainworks_ForgeUITests: XCTestCase {
 
     /// Verifies the Artifact Inspector view is reachable from Run Progress artifacts list.
     func testArtifactInspectorViewSurface() throws {
-        let app = makeApp()
+        let app = makeApp(
+            seededIdeaTitle: "Artifact Inspector Surface",
+            liveFixture: true,
+            seedWaitingApprovalRun: true,
+            runProgressPane: "artifacts",
+            directSurface: "waiting_approval_run_progress"
+        )
         launchClean(app)
 
-        let screen = AppScreen(app: app)
-        let ideas = IdeasScreen(app: app)
-        let startRun = StartRunScreen(app: app)
+        let progress = RunProgressScreen(app: app)
 
-        try XCTSkipUnless(screen.waitForTabs(timeout: 30),
-                           "Skipping: macOS SwiftUI tabs not discoverable in this environment")
+        XCTAssertTrue(
+            anyElement(app, identifier: "ui-test-waiting-approval-run-progress-surface").waitForExistence(timeout: 15)
+                || progress.isVisible(timeout: 15),
+            "Seeded waiting-approval run progress surface must render directly for artifact inspection"
+        )
 
-        try XCTSkipUnless(ideas.createIdea(title: "ArtifactTest"), "Skipping: cannot create idea in headless xcodebuild (toolbar not accessible)")
-        try XCTSkipUnless(ideas.openStartRunSheet(for: "ArtifactTest"), "Sheet opened")
+        let artifactButtonCandidates = [
+            app.buttons["artifact-button-proposal_current"].firstMatch,
+            app.buttons["artifact-button-proposal_review_summary"].firstMatch,
+            app.buttons["artifact-button-proposal_writer_transcript.md"].firstMatch
+        ]
+        let artifactButton = artifactButtonCandidates.first { $0.waitForExistence(timeout: 3) } ?? artifactButtonCandidates[0]
+        XCTAssertTrue(
+            artifactButton.exists,
+            "At least one seeded proposal artifact must be reachable from the artifact hierarchy view"
+        )
+        artifactButton.click()
 
-        let startRunBtn = startRun.startRunButton
-        _ = startRunBtn.waitForExistence(timeout: 15)
-
-        if startRunBtn.exists && startRunBtn.isEnabled {
-            startRunBtn.click()
-
-            let artifactsSection = app.staticTexts["Artifacts"]
-            let reportSection = app.staticTexts["Completed Feature Report"]
-            let hasArtifacts = artifactsSection.waitForExistence(timeout: 15) || reportSection.exists
-
-            if hasArtifacts {
-                let artifactButtons = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] '·'"))
-                if artifactButtons.count > 0 {
-                    artifactButtons.firstMatch.click()
-
-                    let inspectorView = app.otherElements["artifact-inspector-view"]
-                    let filePathText = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'artifacts/'")).firstMatch
-
-                    let inspectorRendered = inspectorView.waitForExistence(timeout: 5) || filePathText.exists
-                    if inspectorRendered {
-                        screenshot(app, name: "REQ011_ArtifactInspector")
-                    }
-
-                    app.typeKey(.escape, modifierFlags: [])
-                } else {
-                    screenshot(app, name: "REQ011_ArtifactInspector_NoArtifacts")
-                }
-            } else {
-                screenshot(app, name: "REQ011_ArtifactInspector_WaitingArtifacts")
-            }
-        } else {
-            startRun.dismiss()
-            try XCTSkipIf(true, "Cannot start run: workflow compilation not available in test environment")
-        }
+        let inspectorView = app.otherElements["artifact-inspector-view"].firstMatch
+        let inspectorTitle = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "artifact-inspector-title"))
+            .firstMatch
+        XCTAssertTrue(
+            inspectorView.waitForExistence(timeout: 5) || inspectorTitle.waitForExistence(timeout: 5),
+            "Artifact inspector must open from the run artifact hierarchy"
+        )
+        screenshot(app, name: "REQ011_ArtifactInspector")
+        app.typeKey(.escape, modifierFlags: [])
     }
 
     // MARK: - REQ-012: Full Product Checkpoint Flow

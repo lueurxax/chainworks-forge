@@ -1,0 +1,125 @@
+scenarios:
+  - id: eval-001
+    title: Pure proposal review should not require build or run
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    fixture: fixtures/manual-prompts.md#proposal-readiness
+    success_signals:
+      - Review completes from proposal, adjacent docs, reusable baseline when present, and code mapping.
+      - No simulator, build, or runtime gate is demanded.
+    regressions_to_watch:
+      - Review downgraded only because the app was not run.
+
+  - id: eval-002
+    title: Fresh baseline should be reused instead of rebuilt
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    check_type: review-output
+    success_signals:
+      - Review consumes a fresh `.review-baselines/current-system-baseline.md` first.
+      - No unnecessary baseline rebuild is requested when the affected surfaces are already covered.
+      - Evidence summary makes reused baseline slices explicit.
+
+  - id: eval-003
+    title: Stale or missing baseline should trigger only targeted context refresh
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    check_type: review-output
+    success_signals:
+      - Review uses the latest reusable baseline when present.
+      - Missing or stale baseline coverage is called out narrowly for affected surfaces.
+      - Review does not escalate into a full runtime workflow by default.
+      - If a narrow refresh is feasible, `integration_mapper` is preferred over broad baseline rebuild.
+
+  - id: eval-004
+    title: Baseline refresh should not pretend to validate a new feature
+    skill: integration-context-baseline
+    mode: baseline-refresh
+    check_type: review-output
+    success_signals:
+      - Output stays focused on host-system mapping and provenance-labeled facts.
+      - Runtime observation, if any, is described as ambiguity reduction rather than feature validation.
+      - The resulting artifact does not claim that a newly proposed or newly changed feature works.
+
+  - id: eval-005
+    title: Missing rollout plan should be caught
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    check_type: review-output
+    success_signals:
+      - Missing rollout or rollback detail is flagged in proposal completeness or findings.
+      - Evidence gap is tied to rollout risk, not generic criticism.
+
+  - id: eval-006
+    title: Missing analytics or instrumentation should be caught
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    check_type: review-output
+    success_signals:
+      - Metrics or instrumentation gap is called out when proposal scope implies it.
+      - Product findings keep the required metric fields when product overlay is used.
+
+  - id: eval-007
+    title: Missing non-happy-path state coverage should be caught
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    check_type: review-output
+    success_signals:
+      - Loading, empty, error, recovery, or auth-expiry gaps are called out explicitly.
+      - State coverage matrix drives the critique.
+
+  - id: eval-008
+    title: Proposal contradicts current repo structure
+    skill: proposal-review-triad
+    mode: proposal-readiness
+    check_type: review-output
+    success_signals:
+      - Current repo contradictions are surfaced as concrete divergence.
+      - Repo reality is not overwritten by proposal intent.
+
+  - id: eval-009
+    title: Research mode should produce a bounded source-backed research pack
+    skill: proposal-review-triad
+    mode: research
+    fixture: fixtures/manual-prompts.md#research
+    success_signals:
+      - Research starts only after proposal, docs, baseline inputs, current code mapping, and the local evidence pack are consumed.
+      - `<proposal>.review/research-pack.md` is created or refreshed.
+      - Findings trace back to local triggers and external sources, not generic web dumping.
+      - Sources reused versus refreshed are explicit when prior research exists.
+    regressions_to_watch:
+      - Research starts before the local evidence gate.
+      - Research pack omits applicability decisions or freshness risks.
+
+  - id: eval-010
+    title: Product metric fields should appear in the final template
+    skill: proposal-review-triad
+    mode: static-check
+    file_check:
+      path: /Users/user/.codex/skills/proposal-review-triad/assets/final-review-template.md
+      required_strings:
+        - "Leading metric:"
+        - "Guardrail metric:"
+        - "Decision checkpoint:"
+
+  - id: eval-011
+    title: Xcode tools should be isolated to baseline refresh workflows
+    skill: suite-static-check
+    mode: static-check
+    success_signals:
+      - Repo-local reviewer agents are read-only and do not claim Xcode or simulator ownership.
+      - `xcode_operator` is the only repo-local agent that owns Xcode MCP, simulator, or build/run workflows.
+      - Proposal-review-triad does not auto-trigger runtime evidence collection.
+      - Research mode does not depend on Xcode tools.
+
+  - id: eval-012
+    title: Round-2 review should reuse only fresh-enough evidence and re-check volatile research
+    skill: integration-context-baseline
+    mode: targeted-context-refresh
+    check_type: artifact-output
+    success_signals:
+      - Existing reusable baseline is read first.
+      - Only affected slices are refreshed.
+      - Refreshed versus unchanged sections are explicit in the resulting artifact.
+      - Proposal-review-triad research mode can distinguish reused versus refreshed external sources when a prior research pack exists.
+      - Time-sensitive or volatile external guidance is explicitly re-checked rather than silently reused.

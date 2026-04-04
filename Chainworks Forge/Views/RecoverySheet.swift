@@ -328,7 +328,11 @@ struct RecoverySheet: View {
                     catalogSourcePath: run.catalogSourcePath,
                     startSnapshot: startSnapshot
                 )
-                let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
+                let plan = try compiler.previewCompile(
+                    workflow: workflow,
+                    catalog: catalog,
+                    catalogSourcePath: run.catalogSourcePath
+                )
                 let (_, workspace) = try compiler.createRun(
                     for: idea,
                     plan: plan,

@@ -9,6 +9,31 @@ import Foundation
 @MainActor
 @Suite("GooseSessionBridge")
 struct GooseSessionBridgeTests {
+    final class CapturingTransport: GooseTransportProtocol, @unchecked Sendable {
+        var lastCreateRequest: GooseSessionRequest?
+
+        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+            lastCreateRequest = request
+            return GooseSessionResponse(
+                sessionId: "session-1",
+                status: "active",
+                policyAcknowledgement: GoosePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "token",
+                    backendPolicyVersion: "v1"
+                ),
+                actualEnabledExtensions: request.requestedExtensions
+            )
+        }
+
+        func submitPrompt(sessionID: String, prompt: GoosePromptRequest) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                continuation.finish()
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
 
     // MARK: - Helpers
 
@@ -70,6 +95,46 @@ struct GooseSessionBridgeTests {
             workspaceRoot: tempDir,
             artifactRoot: artifactRoot,
             worktreeRoot: nil
+        )
+    }
+
+    private func makeCatalog() -> AgentCatalog {
+        AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Test",
+                runtime: "goose",
+                transport: "rest_sse",
+                description: "Test",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic",
+                requiredProviders: ["claude_code"]
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: nil, description: nil)],
+            mcpPolicy: .defaultDeny,
+            mcpServerRegistry: [
+                "context7": MCPServerRegistryEntry(
+                    runtimeIDs: ["goose": "context7"],
+                    sessionScoped: true,
+                    assignmentPolicy: "explicit_opt_in",
+                    riskClass: "normal",
+                    notes: nil
+                )
+            ],
+            mcpProfiles: [
+                "docs_reference": MCPProfile(
+                    requiredExtensions: ["context7"],
+                    optionalExtensions: [],
+                    fallbackPolicy: "fail_if_required_missing"
+                )
+            ],
+            contracts: [:],
+            backendProfiles: [:],
+            permissionProfiles: [:],
+            agents: []
         )
     }
 
@@ -165,13 +230,54 @@ struct GooseSessionBridgeTests {
         #expect(packet.systemPrompt.contains("Do not rely on implicit working directory"))
     }
 
-    @Test("Packet can disable Xcode MCP via environment")
-    func packetCanDisableXcodeMCPViaEnvironment() {
-        setenv("CHAINWORKS_DISABLE_XCODE_MCP", "1", 1)
-        defer { unsetenv("CHAINWORKS_DISABLE_XCODE_MCP") }
-
-        let agent = makeAgent()
-        let task = makeTask()
+    @Test("Session bridge resolves requested MCP extensions from per-agent profile")
+    func sessionBridgeResolvesRequestedMCPExtensions() async throws {
+        let transport = CapturingTransport()
+        let bridge = GooseSessionBridge(
+            transport: transport,
+            gooseExtensionRegistrySnapshotProvider: {
+                GooseExtensionRegistrySnapshot(
+                    configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+                    installedExtensionIDs: ["context7"],
+                    enabledExtensionIDs: ["context7"],
+                    configsByRuntimeID: [
+                        "context7": GooseExtensionDefinition(
+                            enabled: true,
+                            type: "stdio",
+                            name: "Context7",
+                            description: nil,
+                            displayName: nil,
+                            cmd: "context7",
+                            args: [],
+                            envs: nil,
+                            envKeys: nil,
+                            timeout: nil,
+                            bundled: nil,
+                            availableTools: nil
+                        )
+                    ]
+                )
+            }
+        )
+        let agent = ResolvedAgent(
+            id: "test_agent",
+            title: "Test Agent",
+            mode: "autonomous",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            mcpProfileID: "docs_reference",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a test agent.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["input_artifact"],
+            outputs: ["output_artifact"]
+        )
         let workspace = makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
 
@@ -184,13 +290,28 @@ struct GooseSessionBridgeTests {
             inputArtifacts: [:],
             variables: [:],
             ideaBody: "Test idea",
-            providerBinding: nil
+            providerBinding: ResolvedProviderBinding(
+                agentID: "test_agent",
+                backendProfileID: nil,
+                configuredProviderID: UUID(),
+                providerFamily: "claude",
+                providerIdentifier: "claude_code",
+                model: "opus",
+                effort: "high",
+                transport: ProviderTransport.gooseServer.rawValue,
+                adapterVersion: "v1"
+            ),
+            catalog: makeCatalog()
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: makeTask(),
+            context: context,
+            override: nil
+        )
 
-        #expect(packet.systemPrompt.contains("Do not call xcode_mcp"),
-                "Test env should append explicit xcode_mcp suppression to the system prompt")
+        #expect(transport.lastCreateRequest?.requestedExtensions == ["context7"])
     }
 
     @Test("Packet contains task directive")
@@ -448,7 +569,7 @@ struct GooseSessionBridgeTests {
         #expect(packet.taskDirective.contains("Do not add file extensions"))
         #expect(packet.taskDirective.contains("top-level JSON object"))
         #expect(packet.taskDirective.contains("Do not write markdown"))
-        #expect(packet.taskDirective.contains("Required Fields for proposal_review_v1:"))
+        #expect(packet.taskDirective.contains("#### proposal_review_architect -> proposal_review_v1"))
         #expect(packet.taskDirective.contains("agent_id: String (use 'proposal_reviewer_architect')"))
         #expect(packet.taskDirective.contains("score: Number (0-10)"))
     }
@@ -511,7 +632,7 @@ struct GooseSessionBridgeTests {
         #expect(packet.taskDirective.contains("Do not add file extensions"))
         #expect(packet.taskDirective.contains("top-level JSON object"))
         #expect(packet.taskDirective.contains("Do not write markdown"))
-        #expect(packet.taskDirective.contains("Required Fields for proposal_review_summary_v1:"))
+        #expect(packet.taskDirective.contains("#### proposal_review_summary -> proposal_review_summary_v1"))
         #expect(packet.taskDirective.contains("pass: Boolean"))
         #expect(packet.taskDirective.contains("average_score: Number"))
         #expect(packet.taskDirective.contains("decision: String"))
@@ -772,6 +893,10 @@ struct GooseSessionBridgeTests {
         let bridge = GooseSessionBridge(transport: transport)
         let workspace = makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+        let projectRoot = AppConfiguration.defaultRepositoryRoot().appendingPathComponent(
+            "CryptoSavingsTracker",
+            isDirectory: true
+        )
 
         let agent = ResolvedAgent(
             id: "proposal_reviewer_ui",
@@ -801,7 +926,7 @@ struct GooseSessionBridgeTests {
 
         let context = ExecutionContext(
             workspace: workspace,
-            projectRoot: URL(fileURLWithPath: "/Users/user/Documents/CryptoSavingsTracker", isDirectory: true),
+            projectRoot: projectRoot,
             stageID: "state_4_proposal_reviewed",
             ownerExecutionLineageID: UUID(),
             iteration: 1,

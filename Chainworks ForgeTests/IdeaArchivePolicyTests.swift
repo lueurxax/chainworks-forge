@@ -10,6 +10,7 @@ private func makeArchiveContext() throws -> ModelContext {
         AgentExecution.self, Approval.self, Artifact.self,
         configurations: config
     )
+    TestModelContainerRetainer.retain(container)
     return ModelContext(container)
 }
 

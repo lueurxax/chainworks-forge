@@ -16,7 +16,8 @@ final class RunPlanCompiler {
     /// Safe to call from the Start Run sheet for preview/validation.
     func previewCompile(
         workflow: WorkflowDefinition,
-        catalog: AgentCatalog
+        catalog: AgentCatalog,
+        catalogSourcePath: String? = nil
     ) throws -> RunPlan {
         // Step 1: Validate
         let issues = YAMLValidator.validateAll(workflow: workflow, catalog: catalog)
@@ -26,7 +27,11 @@ final class RunPlanCompiler {
         }
 
         // Step 2: Resolve agents
-        let agentBindings = try resolveAgents(workflow: workflow, catalog: catalog)
+        let agentBindings = try resolveAgents(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogSourcePath
+        )
 
         // Step 3: Parse transitions
         // Step 4: Resolve loop budgets (compile-time vars.* for loop.max only)
@@ -62,10 +67,15 @@ final class RunPlanCompiler {
     /// Phase 1 variant: normalize compact to full, then preview-compile.
     func previewCompileCompact(
         compact: CompactWorkflowDefinition,
-        catalog: AgentCatalog
+        catalog: AgentCatalog,
+        catalogSourcePath: String? = nil
     ) throws -> RunPlan {
         let normalized = try CompactNormalizer.normalize(compact, catalog: catalog)
-        return try previewCompile(workflow: normalized, catalog: catalog)
+        return try previewCompile(
+            workflow: normalized,
+            catalog: catalog,
+            catalogSourcePath: catalogSourcePath
+        )
     }
 
     // MARK: - Phase 2: Create Run (irreversible persistence)
@@ -134,7 +144,11 @@ final class RunPlanCompiler {
         let catalog = try decoder.decode(AgentCatalog.self, from: run.catalogSnapshotJSON)
 
         // Rebuild plan via previewCompile (no persistence)
-        let plan = try previewCompile(workflow: workflow, catalog: catalog)
+        let plan = try previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: run.catalogSourcePath
+        )
 
         // Reconstruct workspace from persisted paths
         // Proposal 007: restore worktreeRoot from persisted delivery config
@@ -153,10 +167,14 @@ final class RunPlanCompiler {
 
     private func resolveAgents(
         workflow: WorkflowDefinition,
-        catalog: AgentCatalog
+        catalog: AgentCatalog,
+        catalogSourcePath: String?
     ) throws -> [String: ResolvedAgent] {
         let agentMap = Dictionary(uniqueKeysWithValues: catalog.agents.map { ($0.id, $0) })
         var bindings: [String: ResolvedAgent] = [:]
+        let resolverContext = SkillResolverContext(
+            catalogBaseURL: catalogSourcePath.map { URL(fileURLWithPath: $0) }
+        )
 
         // Collect all agent IDs referenced in run blocks
         var referencedAgentIDs: Set<String> = []
@@ -184,6 +202,30 @@ final class RunPlanCompiler {
                 )
             }
 
+            guard let skillRef = catalog.skills[agentDef.skillRef] else {
+                throw CompilationError.skillResolutionFailed(
+                    agentID: agentID,
+                    skillRef: agentDef.skillRef,
+                    reason: SkillResolutionError.skillNotFound(agentDef.skillRef).localizedDescription
+                )
+            }
+
+            let resolvedSkill: ResolvedSkill
+            do {
+                resolvedSkill = try SkillResolver.resolve(
+                    skillID: agentDef.skillRef,
+                    skillRef: skillRef,
+                    skillRole: agentDef.skillRole,
+                    context: resolverContext
+                )
+            } catch {
+                throw CompilationError.skillResolutionFailed(
+                    agentID: agentID,
+                    skillRef: agentDef.skillRef,
+                    reason: error.localizedDescription
+                )
+            }
+
             bindings[agentID] = ResolvedAgent(
                 id: agentDef.id,
                 title: agentDef.title,
@@ -198,6 +240,7 @@ final class RunPlanCompiler {
                 mcpProfileID: agentDef.mcpProfile,
                 skillRef: agentDef.skillRef,
                 skillRole: agentDef.skillRole,
+                resolvedSkill: resolvedSkill,
                 prompt: agentDef.prompt,
                 outputContract: agentDef.outputContract,
                 requiresHumanApproval: agentDef.requiresHumanApproval,

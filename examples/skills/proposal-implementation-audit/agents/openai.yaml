@@ -1,0 +1,6 @@
+interface:
+  display_name: "Proposal Multi-Lens Audit"
+  short_description: "Conformance + architecture/product/UI/UX review"
+  default_prompt: "Use $proposal-implementation-audit to run a proposal-vs-implementation audit for an iOS/macOS proposal or spec. Produce an evidence-based versioned report beside the proposal with atomic REQ-* classifications plus architecture, product, UI, UX, and readiness findings, and state overall conformance, readiness, and confidence."
+policy:
+  allow_implicit_invocation: false

@@ -16,11 +16,18 @@ final class GooseSessionBridge: Sendable {
 
     /// Proposal 005: depends on `GooseTransportProtocol`, not concrete `GooseTransport`.
     let transport: any GooseTransportProtocol
+    private let gooseExtensionRegistrySnapshotProvider: @Sendable () throws -> GooseExtensionRegistrySnapshot
 
     // MARK: - Init
 
-    nonisolated init(transport: any GooseTransportProtocol) {
+    nonisolated init(
+        transport: any GooseTransportProtocol,
+        gooseExtensionRegistrySnapshotProvider: @escaping @Sendable () throws -> GooseExtensionRegistrySnapshot = {
+            try GooseExtensionRegistryReader().snapshot()
+        }
+    ) {
         self.transport = transport
+        self.gooseExtensionRegistrySnapshotProvider = gooseExtensionRegistrySnapshotProvider
     }
 
     // MARK: - Session Lifecycle
@@ -101,6 +108,8 @@ final class GooseSessionBridge: Sendable {
 
         return GooseSessionExecution(
             sessionID: sessionResponse.sessionId,
+            actualEnabledExtensions: sessionResponse.actualEnabledExtensions,
+            startupLatencyMilliseconds: sessionResponse.startupLatencyMilliseconds,
             eventStream: eventStream,
             transport: transport
         )
@@ -126,7 +135,7 @@ final class GooseSessionBridge: Sendable {
             )
         }
 
-        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let gooseRegistry = try? gooseExtensionRegistrySnapshotProvider()
         return MCPPolicyResolver().resolve(
             agent: agent,
             catalog: catalog,
@@ -149,9 +158,12 @@ final class GooseSessionBridge: Sendable {
             sessionID: sessionID,
             prompt: promptRequest
         )
+        let runtimeState = try await transport.readSessionRuntimeState(sessionID: sessionID)
 
         return GooseSessionExecution(
             sessionID: sessionID,
+            actualEnabledExtensions: runtimeState?.enabledExtensions,
+            startupLatencyMilliseconds: nil,
             eventStream: eventStream,
             transport: transport
         )
@@ -325,6 +337,12 @@ final class GooseSessionBridge: Sendable {
         // Agent role
         parts.append("You are \(agent.title) (ID: \(agent.id)).")
         parts.append("Mode: \(agent.mode)")
+
+        if let resolvedSkill = agent.resolvedSkill,
+           !resolvedSkill.injectedContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append("")
+            parts.append(resolvedSkill.injectedContent)
+        }
 
         // Agent-specific prompt
         if !agent.prompt.isEmpty {
@@ -721,6 +739,8 @@ struct ExecutionPacket: Sendable {
 /// Proposal 005: uses `GooseTransportProtocol` instead of concrete `GooseTransport`.
 struct GooseSessionExecution: Sendable {
     let sessionID: String
+    let actualEnabledExtensions: [String]?
+    let startupLatencyMilliseconds: Int?
     let eventStream: AsyncThrowingStream<GooseStreamEvent, Error>
     let transport: any GooseTransportProtocol
 

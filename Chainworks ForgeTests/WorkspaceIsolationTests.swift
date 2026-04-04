@@ -21,6 +21,7 @@ struct WorkspaceIsolationTests {
         ])
         let config = ModelConfiguration("WorkspaceIsolationTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         container = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(container)
         context = container.mainContext
 
         tempDir = FileManager.default.temporaryDirectory

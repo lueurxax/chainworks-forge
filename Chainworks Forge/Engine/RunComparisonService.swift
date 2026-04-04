@@ -139,6 +139,9 @@ struct RunComparisonService {
         } else {
             frozenProvenances = [:]
         }
+        let resolvedSkills = decodeResolvedSkills(from: run)
+        let catalogSkillRefs = decodeCatalogSkillRefs(from: run)
+        let frozenMCPPolicies = decodeFrozenMCPPolicies(from: run)
 
         let allAgents = run.stageExecutions.flatMap { $0.agentExecutions }
         var seen = Set<String>()
@@ -148,16 +151,54 @@ struct RunComparisonService {
             seen.insert(agent.agentID)
             let frozenModel = frozenBindings[agent.agentID]?.model
             let provenanceSource = frozenProvenances[agent.agentID]?.source.rawValue
+            let skillRef = agent.skillRef ?? catalogSkillRefs[agent.agentID]
+            let resolvedSkill = skillRef.flatMap { resolvedSkills[$0] }
+            let mcpResolution = frozenMCPPolicies[agent.agentID]
             bindings.append(RunComparison.AgentBinding(
                 agentID: agent.agentID,
                 provider: agent.provider,
                 model: frozenModel ?? agent.resolvedModel ?? agent.resolvedBackendProfileID,
                 effort: agent.effort,
                 provenanceSource: provenanceSource,
-                providerFamily: frozenBindings[agent.agentID]?.providerFamily
+                providerFamily: frozenBindings[agent.agentID]?.providerFamily,
+                skillRef: skillRef,
+                skillType: agent.skillType,
+                skillRole: agent.skillRole,
+                skillContentSummary: agent.skillContentSummary,
+                skillSnapshotHash: agent.skillSnapshotHash,
+                resolvedSkillContent: resolvedSkill?.resolvedContent,
+                mcpProfileID: agent.mcpProfileID,
+                requestedMCPExtensions: decodeStringArray(from: agent.requestedMCPExtensionsJSON),
+                predictedMCPExtensions: mcpResolution?.predictedEffectiveRuntimeExtensionIDs ?? [],
+                actualMCPExtensions: decodeStringArray(from: agent.effectiveMCPRuntimeExtensionIDsJSON),
+                deniedMCPExtensions: decodeStringArray(from: agent.deniedMCPExtensionsJSON)
             ))
         }
         return bindings
+    }
+
+    private func decodeResolvedSkills(from run: Run) -> [String: ResolvedSkill] {
+        guard let data = run.resolvedSkillsJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: ResolvedSkill].self, from: data)) ?? [:]
+    }
+
+    private func decodeCatalogSkillRefs(from run: Run) -> [String: String] {
+        guard let catalog = try? JSONDecoder().decode(AgentCatalog.self, from: run.catalogSnapshotJSON) else {
+            return [:]
+        }
+        return Dictionary(uniqueKeysWithValues: catalog.agents.map { ($0.id, $0.skillRef) })
+    }
+
+    private func decodeFrozenMCPPolicies(from run: Run) -> [String: MCPPolicyResolutionReport] {
+        guard let data = run.resolvedMCPPoliciesJSON else { return [:] }
+        return (try? JSONDecoder().decode([String: MCPPolicyResolutionReport].self, from: data)) ?? [:]
+    }
+
+    private func decodeStringArray(from data: Data?) -> [String] {
+        guard let data, let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return decoded
     }
 
     private func computeStageDelta(runA: Run, runB: Run) -> [RunComparison.StageDelta] {
@@ -596,6 +637,17 @@ struct RunComparison: Identifiable {
         let provenanceSource: String?
         /// Proposal 011 (REQ-010): Provider family for cross-family mismatch detection.
         let providerFamily: String?
+        let skillRef: String?
+        let skillType: String?
+        let skillRole: String?
+        let skillContentSummary: String?
+        let skillSnapshotHash: String?
+        let resolvedSkillContent: String?
+        let mcpProfileID: String?
+        let requestedMCPExtensions: [String]
+        let predictedMCPExtensions: [String]
+        let actualMCPExtensions: [String]
+        let deniedMCPExtensions: [String]
 
         /// Heuristic cross-family mismatch check, consistent with `ResolvedProviderBinding.hasCrossFamilyMismatch`.
         var hasCrossFamilyMismatch: Bool {

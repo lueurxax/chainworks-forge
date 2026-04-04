@@ -10,9 +10,22 @@ enum LoadState<T: Sendable>: Sendable {
 struct AgentCatalogView: View {
     @State private var state: LoadState<AgentCatalog> = .loading
     @State private var overrideURL: URL?
+    @State private var selectedAgentID: String?
     let catalogURL: URL?
+    let initialSelectedAgentID: String?
+    let selectionState: Binding<String?>?
 
     private var effectiveURL: URL? { overrideURL ?? catalogURL }
+
+    init(
+        catalogURL: URL?,
+        initialSelectedAgentID: String? = nil,
+        selectionState: Binding<String?>? = nil
+    ) {
+        self.catalogURL = catalogURL
+        self.initialSelectedAgentID = initialSelectedAgentID
+        self.selectionState = selectionState
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -23,24 +36,27 @@ struct AgentCatalogView: View {
 
             case .loaded(let catalog, let issues):
                 VStack(spacing: 0) {
+                    if let selectedAgent = resolvedSelectedAgent(in: catalog) {
+                        Color.clear
+                            .frame(width: 1, height: 1)
+                            .accessibilityIdentifier("agent-catalog-selected-\(selectedAgent.id)")
+                    }
                     summaryStrip(catalog: catalog, issues: issues)
-                    List {
+                    List(selection: $selectedAgentID) {
                         // Agent list
                         ForEach(catalog.agents) { agent in
-                            NavigationLink {
-                                agentDetail(agent, catalog: catalog)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(agent.title).font(.headline)
-                                    Text(agent.id).font(.caption).foregroundStyle(.secondary)
-                                    HStack(spacing: 8) {
-                                        Label(agent.backendProfile, systemImage: "server.rack")
-                                        Label(agent.permissionProfile, systemImage: "lock.shield")
-                                    }
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(agent.title).font(.headline)
+                                Text(agent.id).font(.caption).foregroundStyle(.secondary)
+                                HStack(spacing: 8) {
+                                    Label(agent.backendProfile, systemImage: "server.rack")
+                                    Label(agent.permissionProfile, systemImage: "lock.shield")
                                 }
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                             }
+                            .accessibilityIdentifier("agent-catalog-agent-\(agent.id)")
+                            .tag(Optional(agent.id))
                         }
 
                         // Validation issues section
@@ -102,10 +118,32 @@ struct AgentCatalogView: View {
                 .padding()
             }
         } detail: {
-            Text("Select an agent")
-                .foregroundStyle(.secondary)
+            switch state {
+            case .loaded(let catalog, _):
+                if let selectedAgent = resolvedSelectedAgent(in: catalog) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Color.clear
+                            .frame(width: 1, height: 1)
+                            .accessibilityIdentifier("agent-catalog-selected-\(selectedAgent.id)")
+                        agentDetail(selectedAgent, catalog: catalog)
+                    }
+                } else {
+                    Text("Select an agent")
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("agent-catalog-detail-placeholder")
+                }
+
+            case .loading, .fileNotFound, .decodeError:
+                Text("Select an agent")
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("agent-catalog-detail-placeholder")
+            }
         }
         .navigationSplitViewColumnWidth(min: 200, ideal: 250)
+        .accessibilityIdentifier("agent-catalog-view")
+        .onChange(of: selectedAgentID) { _, newValue in
+            selectionState?.wrappedValue = newValue
+        }
         .task { loadCatalog() }
     }
 
@@ -156,6 +194,41 @@ struct AgentCatalogView: View {
                 if let role = agent.skillRole {
                     LabeledContent("Role", value: role)
                 }
+                if let resolvedSkill = resolveSkill(for: agent, catalog: catalog) {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier("agent-catalog-skill-section-\(agent.id)")
+                    LabeledContent("Type", value: resolvedSkill.type.catalogType)
+                    if let sourcePath = resolvedSkill.sourcePath {
+                        LabeledContent("Source Path", value: sourcePath)
+                    } else if let sourceDescription = resolvedSkill.sourceDescription {
+                        LabeledContent("Source", value: sourceDescription)
+                    }
+                    LabeledContent("Content Hash", value: resolvedSkill.contentHash)
+                    LabeledContent("Injected Hash", value: resolvedSkill.injectedContentHash)
+                    if let summary = resolvedSkill.specializationSummary {
+                        LabeledContent("Specialization", value: summary)
+                    }
+                    if let manifest = resolvedSkill.bundleManifest, manifest.hasCompanions {
+                        LabeledContent(
+                            "Bundle Companions",
+                            value: "\(manifest.references.count) refs, \(manifest.assets.count) assets, \(manifest.evals.count) evals, \(manifest.agents.count) agents"
+                        )
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Content Preview")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(resolvedSkill.contentSummary)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                            .accessibilityIdentifier("agent-catalog-skill-preview-\(agent.id)")
+                    }
+                } else if let error = resolveSkillError(for: agent, catalog: catalog) {
+                    Text(error.localizedDescription)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
             Section("Inputs") {
                 if agent.inputs.isEmpty {
@@ -204,6 +277,8 @@ struct AgentCatalogView: View {
                 + YAMLValidator.validateArtifactRefs(catalog)
                 + YAMLValidator.validateEnvPlaceholders(catalog)
             state = .loaded(catalog, issues)
+            selectedAgentID = resolvedInitialSelection(in: catalog)
+            selectionState?.wrappedValue = selectedAgentID
         } catch let error as YAMLParserError {
             switch error {
             case .fileNotFound(let path):
@@ -235,5 +310,49 @@ struct AgentCatalogView: View {
         }
         let lines = content.components(separatedBy: .newlines)
         return lines.prefix(50).joined(separator: "\n")
+    }
+
+    private func resolvedInitialSelection(in catalog: AgentCatalog) -> String? {
+        if let selectedAgentID,
+           catalog.agents.contains(where: { $0.id == selectedAgentID }) {
+            return selectedAgentID
+        }
+        if let initialSelectedAgentID,
+           catalog.agents.contains(where: { $0.id == initialSelectedAgentID }) {
+            return initialSelectedAgentID
+        }
+        return catalog.agents.first?.id
+    }
+
+    private func resolvedSelectedAgent(in catalog: AgentCatalog) -> AgentDefinition? {
+        guard let selectedAgentID else { return nil }
+        return catalog.agents.first(where: { $0.id == selectedAgentID })
+    }
+
+    private func resolveSkill(for agent: AgentDefinition, catalog: AgentCatalog) -> ResolvedSkill? {
+        guard let skillRef = catalog.skills[agent.skillRef] else { return nil }
+        let context = SkillResolverContext(catalogBaseURL: effectiveURL)
+        return try? SkillResolver.resolve(
+            skillID: agent.skillRef,
+            skillRef: skillRef,
+            skillRole: agent.skillRole,
+            context: context
+        )
+    }
+
+    private func resolveSkillError(for agent: AgentDefinition, catalog: AgentCatalog) -> Error? {
+        guard let skillRef = catalog.skills[agent.skillRef] else { return nil }
+        let context = SkillResolverContext(catalogBaseURL: effectiveURL)
+        do {
+            _ = try SkillResolver.resolve(
+                skillID: agent.skillRef,
+                skillRef: skillRef,
+                skillRole: agent.skillRole,
+                context: context
+            )
+            return nil
+        } catch {
+            return error
+        }
     }
 }

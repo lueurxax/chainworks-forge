@@ -117,10 +117,10 @@ struct DeliveryPreflightReportView: View {
     DeliveryPreflightReportView(
         result: DeliveryPreflightService.PreflightResult(
             checks: [
-                .init(id: "repo_root", label: "Repository root exists", passed: true, detail: "/Users/user/Documents/Chainworks Forge"),
+                .init(id: "repo_root", label: "Repository root exists", passed: true, detail: PreviewSupport.previewWorkspaceRootURL.path),
                 .init(id: "git_repo", label: "Valid git repository", passed: true, detail: nil),
                 .init(id: "base_branch", label: "Base branch 'main' exists", passed: true, detail: nil),
-                .init(id: "worktree_writable", label: "Worktree base path is writable", passed: true, detail: "/Users/user/Library/Application Support/Chainworks Forge/worktrees"),
+                .init(id: "worktree_writable", label: "Worktree base path is writable", passed: true, detail: PreviewSupport.previewApplicationSupportURL("worktrees").path),
                 .init(id: "release_target", label: "Release target configured", passed: true, detail: "Local Sandbox (sandbox)"),
                 .init(id: "repo_identifier", label: "Repository identifier set", passed: true, detail: "user/chainworks-forge"),
             ],
@@ -135,7 +135,7 @@ struct DeliveryPreflightReportView: View {
     DeliveryPreflightReportView(
         result: DeliveryPreflightService.PreflightResult(
             checks: [
-                .init(id: "repo_root", label: "Repository root exists", passed: true, detail: "/Users/user/Documents/Chainworks Forge"),
+                .init(id: "repo_root", label: "Repository root exists", passed: true, detail: PreviewSupport.previewWorkspaceRootURL.path),
                 .init(id: "git_repo", label: "Valid git repository", passed: true, detail: nil),
                 .init(id: "base_branch", label: "Base branch 'release/v2' exists", passed: false, detail: "Branch 'release/v2' not found"),
                 .init(id: "worktree_writable", label: "Worktree base path is writable", passed: true, detail: nil),
