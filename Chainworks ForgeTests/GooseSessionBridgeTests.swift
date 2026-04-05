@@ -11,6 +11,7 @@ import Foundation
 struct GooseSessionBridgeTests {
     final class CapturingTransport: GooseTransportProtocol, @unchecked Sendable {
         var lastCreateRequest: GooseSessionRequest?
+        var mcpRuntimeNamespace: String? { "goose" }
 
         func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
             lastCreateRequest = request
@@ -301,6 +302,80 @@ struct GooseSessionBridgeTests {
                 transport: ProviderTransport.gooseServer.rawValue,
                 adapterVersion: "v1"
             ),
+            catalog: makeCatalog()
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: makeTask(),
+            context: context,
+            override: nil
+        )
+
+        #expect(transport.lastCreateRequest?.requestedExtensions == ["context7"])
+    }
+
+    @Test("Session bridge resolves requested MCP extensions from transport runtime when frozen binding is absent")
+    func sessionBridgeResolvesRequestedMCPExtensionsWithoutFrozenBinding() async throws {
+        let transport = CapturingTransport()
+        let bridge = GooseSessionBridge(
+            transport: transport,
+            gooseExtensionRegistrySnapshotProvider: {
+                GooseExtensionRegistrySnapshot(
+                    configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+                    installedExtensionIDs: ["context7"],
+                    enabledExtensionIDs: ["context7"],
+                    configsByRuntimeID: [
+                        "context7": GooseExtensionDefinition(
+                            enabled: true,
+                            type: "stdio",
+                            name: "Context7",
+                            description: nil,
+                            displayName: nil,
+                            cmd: "context7",
+                            args: [],
+                            envs: nil,
+                            envKeys: nil,
+                            timeout: nil,
+                            bundled: nil,
+                            availableTools: nil
+                        )
+                    ]
+                )
+            }
+        )
+        let agent = ResolvedAgent(
+            id: "test_agent",
+            title: "Test Agent",
+            mode: "autonomous",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            mcpProfileID: "docs_reference",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a test agent.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["input_artifact"],
+            outputs: ["output_artifact"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil,
             catalog: makeCatalog()
         )
 

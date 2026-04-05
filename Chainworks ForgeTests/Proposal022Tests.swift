@@ -110,13 +110,57 @@ struct Proposal022Tests {
         #expect(eventKinds.contains("final_output"))
     }
 
+    @Test("Proposal 022 fixture run reaches review-refine checkpoint before terminal status")
+    func proposal022FixtureRunReachesCheckpointBeforeTerminalStatus() async throws {
+        let (_, context) = try makeTestModelContainer()
+        let executionService = try makeFixtureExecutionService(context: context)
+        let compiler = RunPlanCompiler(modelContext: context)
+        let repoRoot = testRepositoryRootURL(file: #filePath)
+        let workflowURL = repoRoot.appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
+        let catalogURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml")
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
+
+        let idea = Idea(
+            title: "Proposal 022 checkpoint diagnostic",
+            body: "Fixture-backed proposal loop proof",
+            workspaceRootPath: testRepositoryRootURL(file: #filePath).path
+        )
+        context.insert(idea)
+
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: workflowURL.path,
+            catalogSourcePath: catalogURL.path
+        )
+
+        executionService.startRun(run: run, plan: plan, workspace: workspace)
+
+        await awaitCondition("Proposal 022 fixture run should reach the review/refine checkpoint", timeout: 10.0) {
+            let reviewStages = run.stageExecutions.filter { $0.stageID == "state_3_proposal_reviewed" && $0.status == .completed }
+            let writerStages = run.stageExecutions.filter { $0.stageID == "state_4_proposal_refined" && $0.status == .completed }
+            return reviewStages.count >= 2 && writerStages.isEmpty == false
+        }
+
+        let reviewStages = run.stageExecutions.filter { $0.stageID == "state_3_proposal_reviewed" && $0.status == .completed }
+        let writerStages = run.stageExecutions.filter { $0.stageID == "state_4_proposal_refined" && $0.status == .completed }
+        #expect(reviewStages.count >= 2)
+        #expect(writerStages.isEmpty == false)
+    }
+
     @Test("Proposal 022 app harness proves corpus fidelity, backlog persistence, and targeted rereview")
     func proposal022AppHarnessProducesCanonicalProof() async throws {
         let (_, context) = try makeTestModelContainer()
         let executionService = try makeFixtureExecutionService(context: context)
         let harness = Proposal022AppProofHarness(modelContext: context, executionService: executionService)
 
-        let (run, _, result) = try await harness.run()
+        let (_, _, result) = try await harness.run()
 
         #expect(result.terminalStatus.isEmpty == false)
         #expect(result.refineCorpusInputCount == 5)

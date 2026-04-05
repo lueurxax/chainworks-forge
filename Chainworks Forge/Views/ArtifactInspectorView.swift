@@ -110,7 +110,10 @@ struct ArtifactInspectorView: View {
 
                 // §9.1: Format-aware rendering
                 if let content {
-                    formatAwareRenderer(content: content, format: artifact.format)
+                    ArtifactContentRenderer(
+                        content: content,
+                        context: .artifactBacked(artifact: artifact, run: run)
+                    )
                 } else {
                     ContentUnavailableView(
                         "Content Unavailable",
@@ -249,9 +252,10 @@ struct ArtifactInspectorView: View {
                             Text("Resolved Skill Content")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text(resolvedSkill.resolvedContent)
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
+                            ArtifactContentRenderer(
+                                content: resolvedSkill.resolvedContent,
+                                context: .explicit(format: .markdown)
+                            )
                         }
                     }
                 }
@@ -296,62 +300,6 @@ struct ArtifactInspectorView: View {
         }
     }
 
-    // MARK: - Format-Aware Rendering (§9.1)
-
-    @ViewBuilder
-    private func formatAwareRenderer(content: String, format: ArtifactFormat) -> some View {
-        switch format {
-        case .markdown:
-            Text(content)
-                .font(.body)
-                .textSelection(.enabled)
-
-        case .json:
-            // Pretty-print JSON
-            Text(prettyPrintJSON(content))
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-
-        case .diff:
-            VStack(alignment: .leading, spacing: 1) {
-                ForEach(Array(content.components(separatedBy: .newlines).enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.body.monospaced())
-                        .foregroundStyle(diffLineColor(line))
-                        .background(diffLineBackground(line))
-                }
-            }
-            .textSelection(.enabled)
-
-        case .report:
-            Text(content)
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-        }
-    }
-
-    private func prettyPrintJSON(_ raw: String) -> String {
-        guard let data = raw.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data),
-              let pretty = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else {
-            return raw
-        }
-        return String(data: pretty, encoding: .utf8) ?? raw
-    }
-
-    private func diffLineColor(_ line: String) -> Color {
-        if line.hasPrefix("+") { return .green }
-        if line.hasPrefix("-") { return .red }
-        if line.hasPrefix("@@") { return .blue }
-        return .primary
-    }
-
-    private func diffLineBackground(_ line: String) -> Color {
-        if line.hasPrefix("+") { return .green.opacity(0.1) }
-        if line.hasPrefix("-") { return .red.opacity(0.1) }
-        return .clear
-    }
-
     private var shouldShowProposalLoopSummary: Bool {
         artifact.name == "proposal_review_summary"
         || artifact.name == "score_lift_backlog"
@@ -377,8 +325,7 @@ struct ArtifactInspectorView: View {
             }
 
             Button("Copy Path", systemImage: "doc.on.clipboard") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(artifact.filePath, forType: .string)
+                ArtifactPathClipboard.copy(path: artifact.filePath)
             }
         }
         .buttonStyle(.bordered)

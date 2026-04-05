@@ -20,6 +20,24 @@ struct ProviderPlatformTests {
         }
     }
 
+    final class TestLifecycleGooseController: ManagedGooseServerControlling {
+        var stopCallCount = 0
+        var sleepCallCount = 0
+        var wakeCallCount = 0
+
+        func stopManagedServer() {
+            stopCallCount += 1
+        }
+
+        func prepareForSystemSleep() {
+            sleepCallCount += 1
+        }
+
+        func reconcileAfterSystemWake() async {
+            wakeCallCount += 1
+        }
+    }
+
     private func makeTestSecretStore(_ serviceName: String) -> KeychainSecretStore {
         KeychainSecretStore(serviceName: serviceName, useInMemoryStore: true)
     }
@@ -426,6 +444,128 @@ struct ProviderPlatformTests {
 #endif
 
         #expect(!adoptedHandle.isRunning)
+    }
+
+    @Test("Managed Goose server clears adopted handle for sleep and reconciles on wake")
+    mutating func managedGooseServerClearsHandleForSleepAndReconcilesOnWake() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let store = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: AppConfiguration(
+                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+                gooseServerAutostart: true,
+                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
+                gooseServerSecretKey: "dev-secret",
+                activeConfigurationSource: .persistedSettings
+            )
+        ))
+
+        let adoptedHandle = TestGooseHandle()
+        var probeCount = 0
+        var launchCount = 0
+        let manager = GooseServerManager(
+            appConfigurationStore: store,
+            probe: { _ in
+                probeCount += 1
+                switch probeCount {
+                case 1:
+                    return .reachable(statusCode: 200)
+                case 2:
+                    return .unreachable(reason: "Connection refused after wake")
+                default:
+                    return .reachable(statusCode: 200)
+                }
+            },
+            launcher: { _ in
+                launchCount += 1
+                return TestGooseHandle()
+            },
+            managedProcessPIDResolver: { _ in 5151 },
+            adoptedHandleFactory: { _ in adoptedHandle }
+        )
+
+        await manager.bootstrap()
+        #expect(manager.launchState == .running)
+        #expect(adoptedHandle.isRunning)
+
+        manager.prepareForSystemSleep()
+        #expect(manager.launchState == .idle)
+        #expect(adoptedHandle.isRunning)
+
+        await manager.reconcileAfterSystemWake()
+        #expect(manager.launchState == .running)
+        #expect(launchCount == 1)
+    }
+
+    @Test("Managed Goose server wake refresh uses status-only path when autostart is disabled")
+    mutating func managedGooseServerWakeRefreshUsesStatusOnlyPathWhenAutostartDisabled() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let store = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: AppConfiguration(
+                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+                gooseServerAutostart: false,
+                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
+                gooseServerSecretKey: "dev-secret",
+                activeConfigurationSource: .persistedSettings
+            )
+        ))
+
+        var launchCount = 0
+        var probeCount = 0
+        let manager = GooseServerManager(
+            appConfigurationStore: store,
+            probe: { _ in
+                probeCount += 1
+                return .reachable(statusCode: 200)
+            },
+            launcher: { _ in
+                launchCount += 1
+                return TestGooseHandle()
+            }
+        )
+
+        await manager.bootstrap()
+        #expect(manager.launchState == .external)
+
+        manager.prepareForSystemSleep()
+        #expect(manager.launchState == .idle)
+
+        await manager.reconcileAfterSystemWake()
+        #expect(manager.launchState == .external)
+        #expect(launchCount == 0)
+        #expect(probeCount >= 2)
+    }
+
+    @Test("App termination coordinator forwards sleep and wake lifecycle notifications")
+    mutating func appTerminationCoordinatorForwardsSleepAndWakeLifecycleNotifications() async throws {
+        #if os(macOS)
+        let controller = TestLifecycleGooseController()
+        let workspaceCenter = NotificationCenter()
+        let coordinator = AppTerminationCoordinator(workspaceNotificationCenter: workspaceCenter)
+        coordinator.gooseServerManager = controller
+
+        workspaceCenter.post(name: NSWorkspace.willSleepNotification, object: nil)
+        #expect(controller.sleepCallCount == 1)
+
+        workspaceCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(controller.wakeCallCount == 1)
+        #else
+        Issue.record("macOS-only lifecycle notification test")
+        #endif
     }
 
     @Test("Backend profile resolver resolves preferred provider and overrides")

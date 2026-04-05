@@ -130,6 +130,8 @@ final class GooseServerTransport: GooseTransportProtocol, @unchecked Sendable {
         self.session = URLSession(configuration: sessionConfiguration)
     }
 
+    var mcpRuntimeNamespace: String? { "goose" }
+
     // MARK: - GooseTransportProtocol
 
     /// Create a new session on goosed.

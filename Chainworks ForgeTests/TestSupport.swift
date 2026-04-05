@@ -25,6 +25,7 @@ enum TestModelContainerRetainer {
 /// Includes all Chainworks Forge model types.
 @MainActor
 func makeTestModelContext() throws -> ModelContext {
+    _ = installPortableGooseRegistryFixtureIfNeeded()
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self,
@@ -40,6 +41,7 @@ func makeTestModelContext() throws -> ModelContext {
 /// Creates an in-memory ModelContainer + ModelContext pair suitable for XCTestCase setUp.
 @MainActor
 func makeTestModelContainer() throws -> (container: ModelContainer, context: ModelContext) {
+    _ = installPortableGooseRegistryFixtureIfNeeded()
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self,
@@ -203,32 +205,82 @@ func makeTestRun(
 /// Marker class to locate the test bundle.
 final class TestBundleMarker: NSObject {}
 
+@discardableResult
+private func installPortableGooseRegistryFixtureIfNeeded(file: StaticString = #filePath) -> String? {
+    let repoRoot = testRepositoryRootURL(file: file)
+    let fixturePath = repoRoot.appendingPathComponent("examples/goose/goose-config-fixture.yaml").path
+    guard FileManager.default.isReadableFile(atPath: fixturePath) else {
+        return nil
+    }
+
+    setenv(GooseExtensionRegistryReader.environmentConfigPathKey, fixturePath, 1)
+    return fixturePath
+}
+
 func testRepositoryRootURL(file: StaticString = #filePath) -> URL {
     URL(fileURLWithPath: "\(file)", isDirectory: false)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
 }
 
-private func portableExternalSkillRewrites(file: StaticString = #filePath) -> [(String, String)] {
-    let repoRoot = testRepositoryRootURL(file: file)
-    let triadPath = repoRoot.appendingPathComponent("examples/skills/proposal-review-triad").path
-    let auditPath = repoRoot.appendingPathComponent("examples/skills/proposal-implementation-audit").path
+private func portableExternalSkillRewrites(
+    localizedTriadPath: String,
+    localizedAuditPath: String
+) -> [(String, String)] {
     let legacyRoot = ["", "Users", "user", ".codex", "skills"].joined(separator: "/")
 
     return [
-        ("\(legacyRoot)/proposal-review-triad", triadPath),
-        ("\(legacyRoot)/proposal-implementation-audit", auditPath),
-        ("../skills/proposal-review-triad", triadPath),
-        ("../skills/proposal-implementation-audit", auditPath),
-        ("../../examples/skills/proposal-review-triad", triadPath),
-        ("../../examples/skills/proposal-implementation-audit", auditPath)
+        ("\(legacyRoot)/proposal-review-triad", localizedTriadPath),
+        ("\(legacyRoot)/proposal-implementation-audit", localizedAuditPath),
+        ("../skills/proposal-review-triad", localizedTriadPath),
+        ("../skills/proposal-implementation-audit", localizedAuditPath),
+        ("../../examples/skills/proposal-review-triad", localizedTriadPath),
+        ("../../examples/skills/proposal-implementation-audit", localizedAuditPath)
     ]
+}
+
+private func materializePortableSkillBundles(
+    nextTo destinationURL: URL,
+    file: StaticString = #filePath
+) throws -> (triadPath: String, auditPath: String) {
+    let repoRoot = testRepositoryRootURL(file: file)
+    let sourceSkillsRoot = repoRoot.appendingPathComponent("examples/skills", isDirectory: true)
+    let localizedSkillsRoot = destinationURL.deletingLastPathComponent().appendingPathComponent(
+        "portable-skills-\(destinationURL.deletingPathExtension().lastPathComponent)",
+        isDirectory: true
+    )
+    let triadDestination = localizedSkillsRoot.appendingPathComponent("proposal-review-triad", isDirectory: true)
+    let auditDestination = localizedSkillsRoot.appendingPathComponent("proposal-implementation-audit", isDirectory: true)
+
+    try FileManager.default.createDirectory(at: localizedSkillsRoot, withIntermediateDirectories: true)
+    if FileManager.default.fileExists(atPath: triadDestination.path) {
+        try FileManager.default.removeItem(at: triadDestination)
+    }
+    if FileManager.default.fileExists(atPath: auditDestination.path) {
+        try FileManager.default.removeItem(at: auditDestination)
+    }
+
+    try FileManager.default.copyItem(
+        at: sourceSkillsRoot.appendingPathComponent("proposal-review-triad", isDirectory: true),
+        to: triadDestination
+    )
+    try FileManager.default.copyItem(
+        at: sourceSkillsRoot.appendingPathComponent("proposal-implementation-audit", isDirectory: true),
+        to: auditDestination
+    )
+
+    return (triadDestination.path, auditDestination.path)
 }
 
 @discardableResult
 func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
+    _ = installPortableGooseRegistryFixtureIfNeeded()
     let source = try String(contentsOf: sourceURL, encoding: .utf8)
-    let rewritten = portableExternalSkillRewrites().reduce(source) { partial, mapping in
+    let localizedBundles = try materializePortableSkillBundles(nextTo: destinationURL)
+    let rewritten = portableExternalSkillRewrites(
+        localizedTriadPath: localizedBundles.triadPath,
+        localizedAuditPath: localizedBundles.auditPath
+    ).reduce(source) { partial, mapping in
         partial.replacingOccurrences(of: mapping.0, with: mapping.1)
     }
     try rewritten.write(to: destinationURL, atomically: true, encoding: .utf8)
@@ -237,19 +289,26 @@ func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throw
 
 /// Loads the canonical workflow fixture from the test bundle.
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
-    let url = try #require(
-        Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
-        "workflow.yaml fixture must be bundled with tests"
-    )
+    let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
+    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
+        ? repoURL
+        : try #require(
+            Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
+            "workflow.yaml fixture must be bundled with tests"
+        )
     return try YAMLParser.loadWorkflow(from: url)
 }
 
 /// Loads the canonical agent catalog fixture from the test bundle.
 func loadTestCanonicalCatalog() throws -> AgentCatalog {
-    let url = try #require(
-        Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml"),
-        "agents.yaml fixture must be bundled with tests"
-    )
+    _ = installPortableGooseRegistryFixtureIfNeeded()
+    let repoURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
+    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
+        ? repoURL
+        : try #require(
+            Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml"),
+            "agents.yaml fixture must be bundled with tests"
+        )
     let portableURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("chainworks-test-catalog-\(UUID().uuidString).yaml")
     try writePortableCatalogCopy(from: url, to: portableURL)
@@ -267,19 +326,27 @@ func loadTestStewardConfig() throws -> StewardConfig {
 
 /// Loads the live proposal loop workflow fixture from the test bundle.
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
-    let url = try #require(
-        Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
-        "proposal-loop-live.yaml fixture must be bundled with tests"
-    )
+    _ = installPortableGooseRegistryFixtureIfNeeded()
+    let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
+    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
+        ? repoURL
+        : try #require(
+            Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
+            "proposal-loop-live.yaml fixture must be bundled with tests"
+        )
     return try YAMLParser.loadWorkflow(from: url)
 }
 
 /// Loads the full MVP live workflow fixture from the test bundle.
 func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
-    let url = try #require(
-        Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
-        "full-mvp-live.yaml fixture must be bundled with tests"
-    )
+    _ = installPortableGooseRegistryFixtureIfNeeded()
+    let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml")
+    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
+        ? repoURL
+        : try #require(
+            Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
+            "full-mvp-live.yaml fixture must be bundled with tests"
+        )
     return try YAMLParser.loadWorkflow(from: url)
 }
 

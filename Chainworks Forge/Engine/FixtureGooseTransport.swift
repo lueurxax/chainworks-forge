@@ -21,6 +21,8 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         self.scenario = scenario
     }
 
+    var mcpRuntimeNamespace: String? { "goose" }
+
     // MARK: - GooseTransportProtocol
 
     func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {

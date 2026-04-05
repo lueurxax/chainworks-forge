@@ -9,6 +9,10 @@ import Foundation
 /// Proposal 005: LOCKED-001 — transport protocol extraction is mandatory before
 /// adding the new adapter. Keeps both transports interchangeable without if/else branching.
 protocol GooseTransportProtocol: Sendable {
+    /// Transport-owned runtime namespace used to resolve session-scoped MCP mappings.
+    /// Keeps MCP policy independent from frozen provider bindings in fixture/proof flows.
+    var mcpRuntimeNamespace: String? { get }
+
     /// Create a new isolated Goose session.
     func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse
 
@@ -23,6 +27,8 @@ protocol GooseTransportProtocol: Sendable {
 }
 
 extension GooseTransportProtocol {
+    var mcpRuntimeNamespace: String? { nil }
+
     func readSessionRuntimeState(sessionID: String) async throws -> GooseSessionRuntimeState? {
         nil
     }

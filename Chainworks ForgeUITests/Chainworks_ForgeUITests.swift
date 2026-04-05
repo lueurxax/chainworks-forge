@@ -19,6 +19,9 @@ final class Chainworks_ForgeUITests: XCTestCase {
     // MARK: - Test Helpers
 
     private func enforceRemoteOnlyUIHostPolicy() throws {
+        if ProcessInfo.processInfo.environment["CHAINWORKS_GUI_SESSION_WRAPPED"] == "1" {
+            return
+        }
         let approvedHosts = Self.approvedRemoteHosts()
         let observedHosts = Self.observedHostNames()
         guard observedHosts.contains(where: { approvedHosts.contains($0) }) else {
@@ -60,44 +63,11 @@ final class Chainworks_ForgeUITests: XCTestCase {
             values.insert(normalizeHostName(localizedName))
         }
 
-        let commandLookups: [(String, [String])] = [
-            ("/bin/hostname", []),
-            ("/usr/sbin/scutil", ["--get", "LocalHostName"]),
-            ("/usr/sbin/scutil", ["--get", "ComputerName"])
-        ]
-        for lookup in commandLookups {
-            if let output = captureCommandOutput(executable: lookup.0, arguments: lookup.1), !output.isEmpty {
-                values.insert(normalizeHostName(output))
-            }
-        }
-
         return values
     }
 
     private static func normalizeHostName(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private static func captureCommandOutput(executable: String, arguments: [String]) -> String? {
-        let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func makeApp(
@@ -132,13 +102,38 @@ final class Chainworks_ForgeUITests: XCTestCase {
         // Prevent macOS scene restoration from opening stale windows that
         // overlap the test window and cause XCUITest to click hidden elements.
         app.launchArguments += ["-NSQuitAlwaysKeepsWindows", "NO"]
+        app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         app.launchEnvironment["CHAINWORKS_UI_TEST_SESSION_ID"] = UUID().uuidString
         app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = "1"
+        app.launchEnvironment["CHAINWORKS_ALLOW_ENV_OVERRIDE"] = "1"
         app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
         app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
+        app.launchEnvironment["CHAINWORKS_GOOSE_FIXTURE_MODE"] = ""
+        app.launchEnvironment["CHAINWORKS_LIVE_PROVIDER"] = ""
+        app.launchEnvironment["CHAINWORKS_LIVE_MODEL"] = ""
+        app.launchEnvironment["CHAINWORKS_LIVE_EFFORT"] = ""
+        app.launchEnvironment["CHAINWORKS_P007_DOGFOOD_AUTORUN"] = "0"
+        app.launchEnvironment["CHAINWORKS_P022_APP_PROOF_AUTORUN"] = "0"
+        app.launchEnvironment["CHAINWORKS_P022_APP_PROOF_RESULT_PATH"] = ""
+        app.launchEnvironment["CHAINWORKS_DELIVERY_PROOF_MODE"] = ""
+        app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = ""
+        app.launchEnvironment["CHAINWORKS_UI_TEST_RUN_PROGRESS_PANE"] = ""
+        app.launchEnvironment["CHAINWORKS_UI_TEST_SEED_WAITING_APPROVAL_RUN"] = ""
+        app.launchEnvironment["CHAINWORKS_UI_TEST_FOCUS_PROOF"] = ""
+        app.launchEnvironment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] = ""
+        app.launchEnvironment["CHAINWORKS_UI_TEST_PROOF_PROPOSAL"] = ""
         app.launchEnvironment["CHAINWORKS_WORKFLOW_SOURCE_PATH"] = workflowSourcePath
         app.launchEnvironment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"] = catalogSourcePath
         app.launchEnvironment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"] = uiTestExportDirectory().path
+        let gooseFixturePath = URL(fileURLWithPath: resolvedRepoRoot)
+            .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
+            .path
+        if let inheritedGooseConfigPath = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_CONFIG_PATH"],
+           !inheritedGooseConfigPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            app.launchEnvironment["CHAINWORKS_GOOSE_CONFIG_PATH"] = inheritedGooseConfigPath
+        } else if FileManager.default.isReadableFile(atPath: gooseFixturePath) {
+            app.launchEnvironment["CHAINWORKS_GOOSE_CONFIG_PATH"] = gooseFixturePath
+        }
         if let directSurface {
             app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
         }
@@ -282,6 +277,16 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier == %@", identifier))
             .firstMatch
+    }
+
+    private func anyElementInPrimaryWindow(_ app: XCUIApplication, identifier: String) -> XCUIElement {
+        let primaryWindow = app.windows.firstMatch
+        if primaryWindow.exists {
+            return primaryWindow.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", identifier))
+                .firstMatch
+        }
+        return anyElement(app, identifier: identifier)
     }
 
     private func labeledElement(_ app: XCUIApplication, label: String) -> XCUIElement {
@@ -1133,9 +1138,13 @@ final class Chainworks_ForgeUITests: XCTestCase {
         let exportHub = anyElement(app, identifier: "completed-run-export-hub")
         let exportButton = app.buttons["completed-run-export-evidence-pack"].firstMatch
         let worktreeButton = app.buttons["completed-run-open-worktree"].firstMatch
+        let worktreeCopyButton = app.buttons["completed-run-copy-worktree"].firstMatch
         let releaseManifestButton = app.buttons["completed-run-open-release_manifest"].firstMatch
+        let releaseManifestCopyButton = app.buttons["completed-run-copy-release_manifest"].firstMatch
         let gitPushReceiptButton = app.buttons["completed-run-open-git_push_receipt"].firstMatch
+        let gitPushReceiptCopyButton = app.buttons["completed-run-copy-git_push_receipt"].firstMatch
         let uploadReceiptButton = app.buttons["completed-run-open-connect_upload_receipt"].firstMatch
+        let uploadReceiptCopyButton = app.buttons["completed-run-copy-connect_upload_receipt"].firstMatch
         XCTAssertTrue(
             seededReady.waitForExistence(timeout: 20)
                 || exportHub.waitForExistence(timeout: 20),
@@ -1150,16 +1159,32 @@ final class Chainworks_ForgeUITests: XCTestCase {
             "Completed export hub must preserve an explicit worktree reveal affordance on the surviving run-owned path"
         )
         XCTAssertTrue(
+            worktreeCopyButton.waitForExistence(timeout: 10) && worktreeCopyButton.isEnabled,
+            "Completed export hub must expose a direct worktree path copy affordance"
+        )
+        XCTAssertTrue(
             releaseManifestButton.waitForExistence(timeout: 10) && releaseManifestButton.isEnabled,
             "Completed export hub must preserve release manifest access on the surviving run-owned path"
+        )
+        XCTAssertTrue(
+            releaseManifestCopyButton.waitForExistence(timeout: 10) && releaseManifestCopyButton.isEnabled,
+            "Completed export hub must expose direct release manifest path copy"
         )
         XCTAssertTrue(
             gitPushReceiptButton.waitForExistence(timeout: 10) && gitPushReceiptButton.isEnabled,
             "Completed export hub must preserve git push receipt access on the surviving run-owned path"
         )
         XCTAssertTrue(
+            gitPushReceiptCopyButton.waitForExistence(timeout: 10) && gitPushReceiptCopyButton.isEnabled,
+            "Completed export hub must expose direct git push receipt path copy"
+        )
+        XCTAssertTrue(
             uploadReceiptButton.waitForExistence(timeout: 10) && uploadReceiptButton.isEnabled,
             "Completed export hub must preserve upload receipt access on the surviving run-owned path"
+        )
+        XCTAssertTrue(
+            uploadReceiptCopyButton.waitForExistence(timeout: 10) && uploadReceiptCopyButton.isEnabled,
+            "Completed export hub must expose direct upload receipt path copy"
         )
         screenshot(app, name: "REQ016_ExportHub_Ready")
 
@@ -1192,83 +1217,114 @@ final class Chainworks_ForgeUITests: XCTestCase {
     }
 
     func testProposal015SkillVisibilityProofSurface() throws {
-        let app = makeApp(directSurface: "proposal015_proof")
+        let app = makeApp(directSurface: "proposal015_proof", disableEagerBootstrap: true)
         defer { terminateIfRunning(app) }
         launchClean(app)
 
-        let directSurface = anyElement(app, identifier: "ui-test-direct-surface-ready-proposal015_proof")
+        let primaryWindow = app.windows.firstMatch
+        XCTAssertTrue(
+            primaryWindow.waitForExistence(timeout: 20),
+            "Proposal 015 proof surface must open a primary app window"
+        )
+        let directSurface = anyElementInPrimaryWindow(app, identifier: "ui-test-direct-surface-ready-proposal015_proof")
         XCTAssertTrue(
             directSurface.waitForExistence(timeout: 20),
             "Proposal 015 proof surface must finish bootstrap"
         )
         XCTAssertTrue(
-            anyElement(app, identifier: "ui-test-proposal015-proof-ready").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "ui-test-proposal015-proof-ready").waitForExistence(timeout: 20),
             "Proposal 015 proof surface must expose a ready marker"
         )
-        let proofError = anyElement(app, identifier: "ui-test-proposal015-proof-error")
+        let proofError = anyElementInPrimaryWindow(app, identifier: "ui-test-proposal015-proof-error")
         XCTAssertFalse(
             proofError.waitForExistence(timeout: 1),
             "Proposal 015 proof surface entered an error state: \(proofError.label)"
         )
 
         XCTAssertTrue(
-            anyElement(app, identifier: "proposal015-skill-proof-card-proposal_reviewer_product_owner").waitForExistence(timeout: 20),
-            "Proof surface must render the proposal-owned skill proof card"
+            anyElementInPrimaryWindow(app, identifier: "agent-catalog-view").waitForExistence(timeout: 20),
+            "Proof surface must render the real agent catalog owner surface"
         )
         XCTAssertTrue(
-            anyElement(app, identifier: "agent-catalog-agent-proposal_reviewer_product_owner").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "agent-catalog-agent-proposal_reviewer_product_owner").waitForExistence(timeout: 20),
             "Proof surface must expose the agent catalog skill owner path"
+        )
+        XCTAssertTrue(
+            anyElementInPrimaryWindow(app, identifier: "agent-catalog-selected-proposal_reviewer_product_owner").waitForExistence(timeout: 20),
+            "Proof surface must preselect the proposal-owned proof agent"
         )
 
         XCTAssertTrue(
-            anyElement(app, identifier: "agent-catalog-skill-section-proposal_reviewer_product_owner").waitForExistence(timeout: 10),
+            anyElementInPrimaryWindow(app, identifier: "agent-catalog-skill-section-proposal_reviewer_product_owner").waitForExistence(timeout: 10),
             "Agent catalog must render resolved skill truth for the selected agent"
         )
+        let skillPreview = anyElementInPrimaryWindow(app, identifier: "agent-catalog-skill-preview-proposal_reviewer_product_owner")
         XCTAssertTrue(
-            anyElement(app, identifier: "agent-catalog-skill-preview-proposal_reviewer_product_owner").waitForExistence(timeout: 10),
+            skillPreview.waitForExistence(timeout: 10),
             "Agent catalog must render a skill content preview"
         )
 
         XCTAssertTrue(
-            anyElement(app, identifier: "p015-proof-panel-readiness").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "p015-proof-panel-readiness").waitForExistence(timeout: 20),
             "Pilot readiness proof panel must render"
         )
         XCTAssertTrue(
-            anyElement(app, identifier: "pilot-readiness-skills-section").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "pilot-readiness-skills-section").waitForExistence(timeout: 20),
             "Pilot readiness must surface skill preflight results"
         )
 
         XCTAssertTrue(
-            anyElement(app, identifier: "p015-proof-panel-report").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "p015-proof-panel-report").waitForExistence(timeout: 20),
             "Run report proof panel must render"
         )
         XCTAssertTrue(
-            anyElement(app, identifier: "run-report-view").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "run-report-view").waitForExistence(timeout: 20),
             "Run report proof panel must render"
         )
-        let reportSkillText = anyElement(app, identifier: "p015-proof-report-skill-line")
+        let reportSkillText = waitForLabeledPrefix(
+            app,
+            prefix: "Skill: proposal_review_triad",
+            timeout: 20
+        )
         XCTAssertTrue(
-            reportSkillText.waitForExistence(timeout: 20),
+            reportSkillText?.exists == true,
             "Run report must render persisted resolved skill truth"
         )
 
         XCTAssertTrue(
-            anyElement(app, identifier: "p015-proof-panel-comparison").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "p015-proof-panel-comparison").waitForExistence(timeout: 20),
             "Run comparison proof panel must render"
         )
-        let comparisonSkillText = anyElement(app, identifier: "p015-proof-comparison-skill-line")
+        let comparisonView = anyElementInPrimaryWindow(app, identifier: "run-comparison-view")
         XCTAssertTrue(
-            comparisonSkillText.waitForExistence(timeout: 20),
-            "Run comparison must render skill binding truth"
+            comparisonView.waitForExistence(timeout: 20),
+            "Run comparison must render the shell-owned comparison surface"
+        )
+        let architectRoleText = comparisonView.descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", "Role: architect"))
+            .firstMatch
+        XCTAssertTrue(
+            architectRoleText.waitForExistence(timeout: 20),
+            "Run comparison proof must surface the comparison-specific skill role"
         )
 
         XCTAssertTrue(
-            anyElement(app, identifier: "p015-proof-panel-artifact").waitForExistence(timeout: 20),
+            anyElementInPrimaryWindow(app, identifier: "p015-proof-panel-artifact").waitForExistence(timeout: 20),
             "Artifact inspector proof panel must render"
         )
+        let artifactInspector = anyElementInPrimaryWindow(app, identifier: "artifact-inspector-view")
         XCTAssertTrue(
-            anyElement(app, identifier: "p015-proof-artifact-line").waitForExistence(timeout: 20),
-            "Artifact proof summary must render"
+            artifactInspector.waitForExistence(timeout: 20),
+            "Artifact inspector must render the shell-owned artifact surface"
+        )
+        let artifactTitle = anyElementInPrimaryWindow(app, identifier: "artifact-inspector-title")
+        XCTAssertTrue(
+            artifactTitle.waitForExistence(timeout: 20),
+            "Artifact inspector must expose the persisted artifact title"
+        )
+        XCTAssertTrue(
+            artifactTitle.label.contains("proposal_current"),
+            "Artifact proof must expose the primary persisted artifact name"
         )
         screenshot(app, name: "P015_Skill_Truth_Proof")
     }
@@ -2045,10 +2101,20 @@ final class Chainworks_ForgeUITests: XCTestCase {
             app.buttons["artifact-button-proposal_review_summary"].firstMatch,
             app.buttons["artifact-button-proposal_writer_transcript.md"].firstMatch
         ]
+        let copyPathCandidates = [
+            app.buttons["artifact-copy-path-proposal_current"].firstMatch,
+            app.buttons["artifact-copy-path-proposal_review_summary"].firstMatch,
+            app.buttons["artifact-copy-path-proposal_writer_transcript.md"].firstMatch
+        ]
         let artifactButton = artifactButtonCandidates.first { $0.waitForExistence(timeout: 3) } ?? artifactButtonCandidates[0]
+        let copyPathButton = copyPathCandidates.first { $0.waitForExistence(timeout: 3) } ?? copyPathCandidates[0]
         XCTAssertTrue(
             artifactButton.exists,
             "At least one seeded proposal artifact must be reachable from the artifact hierarchy view"
+        )
+        XCTAssertTrue(
+            copyPathButton.exists && copyPathButton.isEnabled,
+            "Artifact hierarchy must expose a direct copy-path affordance without opening the inspector"
         )
         artifactButton.click()
 

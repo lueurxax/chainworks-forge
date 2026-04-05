@@ -1010,81 +1010,348 @@ struct UITestAccessibilityAuditSurface: View {
 
 // MARK: - Proposal 015: Skill Resolution Proof Surface
 
-private struct Proposal015ProofFixture {
+struct Proposal015ProofFixture {
     let rootURL: URL
     let catalogURL: URL
     let workflowURL: URL
-    let appConfiguration: AppConfiguration
-    let reportRun: Run
+    let proofAgentID: String
+    let modelContainer: ModelContainer
+    let executionService: ExecutionService
+    let appConfigurationStore: AppConfigurationStore
+    let providerSettingsStore: ProviderSettingsStore
+    let providerRegistry: ProviderRegistry
+    let gooseServerManager: GooseServerManager
+    let proofRun: Run
     let comparisonRun: Run
     let primaryArtifact: Artifact
-    let proofAgentID: String
-    let proofAgentTitle: String
-    let proofResolvedSkill: ResolvedSkill
 }
 
-struct UITestProposal015ProofSurface: View {
-    private enum Panel: String, CaseIterable, Identifiable {
-        case catalog = "Catalog"
-        case readiness = "Readiness"
-        case report = "Report"
-        case comparison = "Comparison"
-        case artifact = "Artifact"
-
-        var id: String { rawValue }
-    }
-
-    @Environment(\.modelContext) private var modelContext
-    @Environment(ExecutionService.self) private var executionService
-    @Environment(GooseServerManager.self) private var gooseServerManager
-
-    @State private var didSeed = false
-    @State private var seedErrorMessage: String?
-    @State private var selectedCatalogAgentID: String?
-    @State private var proofReportSkillLine: String?
-    @State private var proofComparisonSkillLine: String?
-
-    private let fixture: Proposal015ProofFixture?
-    private let proofAppConfigurationStore: AppConfigurationStore?
-    private let proofProviderSettingsStore: ProviderSettingsStore?
-    private let proofProviderRegistry: ProviderRegistry?
-
+enum Proposal015ProofFixtureBuilder {
     @MainActor
-    init() {
-        let result = Self.makeFixture()
-        self.fixture = result.fixture
-        self._seedErrorMessage = State(initialValue: result.errorMessage)
+    static func makeFixture() -> (fixture: Proposal015ProofFixture?, errorMessage: String?) {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("UITestProposal015Proof-\(UUID().uuidString)", isDirectory: true)
+        let repoRoot = AppConfiguration.defaultRepositoryRoot()
+        let catalogURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml", isDirectory: false)
+        let workflowURL = repoRoot.appendingPathComponent("examples/workflows/proposal-loop-live.yaml", isDirectory: false)
+        let artifactsRoot = rootURL.appendingPathComponent("artifacts", isDirectory: true)
+        do {
+            try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: artifactsRoot, withIntermediateDirectories: true)
+        } catch {
+            return (nil, "Failed to prepare Proposal 015 proof fixture: \(error.localizedDescription)")
+        }
 
-        if let fixture = result.fixture {
-            let configurationStore = AppConfigurationStore(
-                fileURL: fixture.rootURL.appendingPathComponent("app-configuration.json"),
-                initialConfiguration: fixture.appConfiguration
+        do {
+            let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+            guard
+                let proofAgent = catalog.agents.first(where: { $0.id == "proposal_reviewer_product_owner" }),
+                let comparisonAgent = catalog.agents.first(where: { $0.id == "proposal_reviewer_architect" }),
+                let proofSkillRef = catalog.skills[proofAgent.skillRef],
+                let comparisonSkillRef = catalog.skills[comparisonAgent.skillRef]
+            else {
+                return (nil, "Failed to load Proposal 015 proof agents from current catalog.")
+            }
+
+            let resolverContext = SkillResolverContext(catalogBaseURL: catalogURL)
+            let proofSkill = try SkillResolver.resolve(
+                skillID: proofAgent.skillRef,
+                skillRef: proofSkillRef,
+                skillRole: proofAgent.skillRole,
+                context: resolverContext
+            )
+            let comparisonSkill = try SkillResolver.resolve(
+                skillID: comparisonAgent.skillRef,
+                skillRef: comparisonSkillRef,
+                skillRole: comparisonAgent.skillRole,
+                context: resolverContext
+            )
+
+            let workflowSource = try String(contentsOf: workflowURL, encoding: .utf8)
+            let catalogSource = try String(contentsOf: catalogURL, encoding: .utf8)
+            let workflowData = Data(workflowSource.utf8)
+            let catalogData = Data(catalogSource.utf8)
+            let workflowHash = DefinitionHasher.hashString(workflowSource)
+            let catalogHash = DefinitionHasher.hashString(catalogSource)
+
+            let container = try ModelContainer(
+                for: PreviewSupport.schema,
+                configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
+            )
+            let context = container.mainContext
+
+            let proofIdea = Idea(
+                title: "Proposal 015 Skill Proof",
+                body: "Seeded same-tree proof run for skill visibility surfaces.",
+                status: .completed
+            )
+            context.insert(proofIdea)
+
+            let proofSeed = seedRun(
+                context: context,
+                idea: proofIdea,
+                rootURL: rootURL,
+                workflowURL: workflowURL,
+                catalogURL: catalogURL,
+                workflowData: workflowData,
+                catalogData: catalogData,
+                workflowHash: workflowHash,
+                catalogHash: catalogHash,
+                workflowTitle: "Proposal 015 Skill Proof",
+                agent: proofAgent,
+                resolvedSkill: proofSkill,
+                summaryLabel: "Product-owner review proof",
+                artifactFileName: "proposal_current.md",
+                artifactBody: """
+                # Proposal Current
+
+                Seeded persisted artifact for Proposal 015 proof.
+                """
+            )
+
+            let comparisonSeed = seedRun(
+                context: context,
+                idea: proofIdea,
+                rootURL: rootURL,
+                workflowURL: workflowURL,
+                catalogURL: catalogURL,
+                workflowData: workflowData,
+                catalogData: catalogData,
+                workflowHash: workflowHash,
+                catalogHash: catalogHash,
+                workflowTitle: "Proposal 015 Skill Proof (Architect)",
+                agent: comparisonAgent,
+                resolvedSkill: comparisonSkill,
+                summaryLabel: "Architect review proof",
+                artifactFileName: "proposal_architect.md",
+                artifactBody: """
+                # Proposal Current (Architect)
+
+                Seeded comparison artifact for Proposal 015 proof.
+                """
+            )
+
+            try context.save()
+
+            let appConfigurationStore = AppConfigurationStore(
+                fileURL: rootURL.appendingPathComponent("proposal015-app-config.json"),
+                initialConfiguration: AppConfiguration(
+                    runStorageBasePath: rootURL.appendingPathComponent("runs", isDirectory: true).path,
+                    worktreeBasePath: rootURL.appendingPathComponent("worktrees", isDirectory: true).path,
+                    workflowSourcePath: workflowURL.path,
+                    agentCatalogSourcePath: catalogURL.path,
+                    supportBundleExportPath: rootURL.appendingPathComponent("exports", isDirectory: true).path,
+                    gooseServerAutostart: false,
+                    activeConfigurationSource: .persistedSettings
+                )
             )
             let providerSettingsStore = ProviderSettingsStore(
-                fileURL: fixture.rootURL.appendingPathComponent("provider-settings.json"),
+                fileURL: rootURL.appendingPathComponent("proposal015-provider-settings.json"),
                 initialSettings: .empty
             )
-            self.proofAppConfigurationStore = configurationStore
-            self.proofProviderSettingsStore = providerSettingsStore
-            self.proofProviderRegistry = ProviderRegistry(settingsStore: providerSettingsStore)
-        } else {
-            self.proofAppConfigurationStore = nil
-            self.proofProviderSettingsStore = nil
-            self.proofProviderRegistry = nil
+            let providerRegistry = ProviderRegistry(
+                settingsStore: providerSettingsStore,
+                secretStore: KeychainSecretStore(useInMemoryStore: true)
+            )
+            let gooseServerManager = GooseServerManager(
+                appConfigurationStore: appConfigurationStore,
+                probe: { _ in .unreachable(reason: "Proposal 015 proof fixture does not use a live Goose server.") }
+            )
+            let executionService = ExecutionService(
+                modelContext: context,
+                executor: SimulatedAgentExecutor(catalog: catalog),
+                catalog: catalog,
+                liveRuntimeConfiguration: nil,
+                gooseServerManager: gooseServerManager,
+                notificationService: NotificationService()
+            )
+
+            return (
+                Proposal015ProofFixture(
+                    rootURL: rootURL,
+                    catalogURL: catalogURL,
+                    workflowURL: workflowURL,
+                    proofAgentID: proofAgent.id,
+                    modelContainer: container,
+                    executionService: executionService,
+                    appConfigurationStore: appConfigurationStore,
+                    providerSettingsStore: providerSettingsStore,
+                    providerRegistry: providerRegistry,
+                    gooseServerManager: gooseServerManager,
+                    proofRun: proofSeed.run,
+                    comparisonRun: comparisonSeed.run,
+                    primaryArtifact: proofSeed.primaryArtifact
+                ),
+                nil
+            )
+        } catch {
+            return (nil, "Failed to prepare Proposal 015 proof fixture: \(error.localizedDescription)")
         }
     }
 
+    @MainActor
+    private static func seedRun(
+        context: ModelContext,
+        idea: Idea,
+        rootURL: URL,
+        workflowURL: URL,
+        catalogURL: URL,
+        workflowData: Data,
+        catalogData: Data,
+        workflowHash: String,
+        catalogHash: String,
+        workflowTitle: String,
+        agent: AgentDefinition,
+        resolvedSkill: ResolvedSkill,
+        summaryLabel: String,
+        artifactFileName: String,
+        artifactBody: String
+    ) -> (run: Run, primaryArtifact: Artifact) {
+        let now = Date()
+        let runRoot = rootURL.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let artifactsRoot = runRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try? FileManager.default.createDirectory(at: artifactsRoot, withIntermediateDirectories: true)
+
+        let run = Run(
+            startedAt: now.addingTimeInterval(-600),
+            status: .completed,
+            workflowID: "proposal015_proof",
+            workflowTitle: workflowTitle,
+            workflowSnapshotHash: workflowHash,
+            catalogSnapshotHash: catalogHash,
+            workflowSourcePath: workflowURL.path,
+            catalogSourcePath: catalogURL.path,
+            workflowSnapshotJSON: workflowData,
+            catalogSnapshotJSON: catalogData,
+            workspaceRoot: runRoot.path,
+            artifactRoot: artifactsRoot.path,
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+        run.idea = idea
+        idea.runs.append(run)
+        run.completedAt = now
+        run.runtimeTrustLevel = "fixture_verified"
+        run.resolvedSkillsJSON = try? JSONEncoder().encode([resolvedSkill.id: resolvedSkill])
+        run.skillContentHashesJSON = try? JSONEncoder().encode([resolvedSkill.id: resolvedSkill.contentHash])
+        run.skillInjectedContentHashesJSON = try? JSONEncoder().encode([resolvedSkill.id: resolvedSkill.injectedContentHash])
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: now.addingTimeInterval(-540),
+            status: .completed
+        )
+        stage.completedAt = now.addingTimeInterval(-500)
+        stage.run = run
+        run.stageExecutions.append(stage)
+        context.insert(stage)
+
+        let execution = AgentExecution(
+            agentID: agent.id,
+            agentTitle: agent.title,
+            taskName: summaryLabel,
+            startedAt: now.addingTimeInterval(-530),
+            status: .completed,
+            provider: agent.backendProfile,
+            effort: "high"
+        )
+        execution.completedAt = now.addingTimeInterval(-505)
+        execution.resolvedModel = "proof-model"
+        execution.skillRef = agent.skillRef
+        execution.skillType = resolvedSkill.type.catalogType
+        execution.skillRole = agent.skillRole
+        execution.skillSnapshotHash = resolvedSkill.injectedContentHash
+        execution.skillContentSummary = resolvedSkill.contentSummary
+        execution.stageExecution = stage
+        stage.agentExecutions.append(execution)
+        context.insert(execution)
+
+        let summaryURL = artifactsRoot.appendingPathComponent("latest_summary.md")
+        let immutableURL = artifactsRoot.appendingPathComponent("immutable_report_v1.md")
+        let primaryArtifactURL = artifactsRoot.appendingPathComponent(artifactFileName)
+
+        let summaryText = """
+        # Latest Summary
+
+        Skill: \(agent.skillRef)
+        Role: \(agent.skillRole ?? "none")
+        Type: \(resolvedSkill.type.catalogType)
+        Summary: \(resolvedSkill.contentSummary)
+        Hash: \(resolvedSkill.injectedContentHash)
+        """
+        let immutableText = """
+        # Immutable Report v1
+
+        Skill: \(agent.skillRef)
+        Role: \(agent.skillRole ?? "none")
+        Hash: \(resolvedSkill.injectedContentHash)
+        """
+
+        try? summaryText.write(to: summaryURL, atomically: true, encoding: .utf8)
+        try? immutableText.write(to: immutableURL, atomically: true, encoding: .utf8)
+        try? artifactBody.write(to: primaryArtifactURL, atomically: true, encoding: .utf8)
+
+        let summaryArtifact = Artifact(
+            name: "latest_summary",
+            contractID: "run_summary",
+            format: .report,
+            filePath: summaryURL.path,
+            runID: run.id,
+            stageID: stage.stageID,
+            agentID: execution.agentID,
+            provider: execution.provider
+        )
+        summaryArtifact.agentExecution = execution
+        summaryArtifact.reportKind = "latest_summary"
+        execution.artifacts.append(summaryArtifact)
+        context.insert(summaryArtifact)
+        run.latestSummaryArtifactID = summaryArtifact.id
+
+        let immutableArtifact = Artifact(
+            name: "immutable_report_v1",
+            contractID: "run_report",
+            format: .report,
+            filePath: immutableURL.path,
+            runID: run.id,
+            stageID: stage.stageID,
+            agentID: execution.agentID,
+            provider: execution.provider
+        )
+        immutableArtifact.agentExecution = execution
+        immutableArtifact.reportKind = "immutable_history"
+        immutableArtifact.reportVersion = 1
+        execution.artifacts.append(immutableArtifact)
+        context.insert(immutableArtifact)
+        run.latestImmutableReportArtifactID = immutableArtifact.id
+        run.latestReportVersion = 1
+
+        let primaryArtifact = Artifact(
+            name: (artifactFileName as NSString).deletingPathExtension,
+            contractID: "proposal_current",
+            format: .markdown,
+            filePath: primaryArtifactURL.path,
+            runID: run.id,
+            stageID: stage.stageID,
+            agentID: execution.agentID,
+            provider: execution.provider
+        )
+        primaryArtifact.agentExecution = execution
+        execution.artifacts.append(primaryArtifact)
+        context.insert(primaryArtifact)
+
+        return (run, primaryArtifact)
+    }
+}
+
+struct UITestProposal015ProofSurface: View {
+    @State private var isPreparingFixture = false
+    @State private var fixture: Proposal015ProofFixture?
+    @State private var seedErrorMessage: String?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Color.clear
-                .frame(width: 1, height: 1)
-                .accessibilityIdentifier("ui-test-proposal015-proof-ready")
-            if let selectedCatalogAgentID {
-                Color.clear
-                    .frame(width: 1, height: 1)
-                    .accessibilityIdentifier("agent-catalog-selected-\(selectedCatalogAgentID)")
-            }
-
             if let seedErrorMessage {
                 ContentUnavailableView(
                     "Proposal 015 proof unavailable",
@@ -1094,72 +1361,50 @@ struct UITestProposal015ProofSurface: View {
                 .accessibilityIdentifier("ui-test-proposal015-proof-error")
             } else if let fixture {
                 VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let proofReportSkillLine {
-                            Text(proofReportSkillLine)
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
-                                .accessibilityIdentifier("p015-proof-report-skill-line")
-                        }
-                        if let proofComparisonSkillLine {
-                            Text(proofComparisonSkillLine)
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
-                                .accessibilityIdentifier("p015-proof-comparison-skill-line")
-                        }
-                        Text("Artifact: \(fixture.primaryArtifact.name)")
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                            .accessibilityIdentifier("p015-proof-artifact-line")
-                    }
-                    .padding(.horizontal, 4)
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .accessibilityIdentifier("ui-test-proposal015-proof-ready")
 
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
                             panelSection(title: "Catalog", identifier: "p015-proof-panel-catalog") {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    skillProofCard(
-                                        agentID: fixture.proofAgentID,
-                                        agentTitle: fixture.proofAgentTitle,
-                                        resolvedSkill: fixture.proofResolvedSkill
-                                    )
-                                    AgentCatalogView(
-                                        catalogURL: fixture.catalogURL,
-                                        initialSelectedAgentID: fixture.proofAgentID,
-                                        selectionState: $selectedCatalogAgentID
-                                    )
-                                }
+                                AgentCatalogView(
+                                    catalogURL: fixture.catalogURL,
+                                    initialSelectedAgentID: fixture.proofAgentID
+                                )
+                                .frame(minHeight: 420)
                             }
 
-                            if let proofAppConfigurationStore,
-                               let proofProviderSettingsStore,
-                               let proofProviderRegistry {
-                                panelSection(title: "Readiness", identifier: "p015-proof-panel-readiness") {
-                                    PilotReadinessView()
-                                        .environment(executionService)
-                                        .environment(proofAppConfigurationStore)
-                                        .environment(proofProviderSettingsStore)
-                                        .environment(proofProviderRegistry)
-                                        .environment(gooseServerManager)
-                                }
+                            panelSection(title: "Readiness", identifier: "p015-proof-panel-readiness") {
+                                PilotReadinessView()
+                                    .environment(fixture.executionService)
+                                    .environment(fixture.appConfigurationStore)
+                                    .environment(fixture.providerSettingsStore)
+                                    .environment(fixture.providerRegistry)
+                                    .environment(fixture.gooseServerManager)
+                                    .modelContainer(fixture.modelContainer)
+                                    .frame(minHeight: 420)
                             }
 
                             panelSection(title: "Report", identifier: "p015-proof-panel-report") {
-                                RunReportView(
-                                    run: fixture.reportRun,
-                                    initialTab: .immutableHistory,
-                                    autoSelectLatestImmutableReport: true
-                                )
+                                RunReportView(run: fixture.proofRun)
+                                    .modelContainer(fixture.modelContainer)
+                                    .frame(minHeight: 320)
                             }
 
                             panelSection(title: "Comparison", identifier: "p015-proof-panel-comparison") {
-                                RunComparisonView(runA: fixture.reportRun, runB: fixture.comparisonRun)
+                                RunComparisonView(runA: fixture.proofRun, runB: fixture.comparisonRun)
+                                    .modelContainer(fixture.modelContainer)
+                                    .frame(minHeight: 420)
                             }
 
                             panelSection(title: "Artifact", identifier: "p015-proof-panel-artifact") {
-                                NavigationStack {
-                                    ArtifactInspectorView(artifact: fixture.primaryArtifact, run: fixture.reportRun)
-                                }
+                                ArtifactInspectorView(
+                                    artifact: fixture.primaryArtifact,
+                                    run: fixture.proofRun
+                                )
+                                .modelContainer(fixture.modelContainer)
+                                .frame(minHeight: 420)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1167,47 +1412,19 @@ struct UITestProposal015ProofSurface: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityIdentifier("p015-proof-panels")
                 }
+            } else {
+                ContentUnavailableView(
+                    "Preparing Proposal 015 proof",
+                    systemImage: "hourglass",
+                    description: Text("Building portable proof fixtures and shell-owned evidence.")
+                )
+                .accessibilityIdentifier("ui-test-proposal015-proof-loading")
             }
         }
         .frame(minWidth: 1100, minHeight: 760)
         .task {
-            await seedModelContextIfNeeded()
+            await prepareFixtureIfNeeded()
         }
-    }
-
-    private func skillProofCard(
-        agentID: String,
-        agentTitle: String,
-        resolvedSkill: ResolvedSkill
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Proposal 015 Skill Proof")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .accessibilityIdentifier("proposal015-skill-proof-card-\(agentID)")
-            Text(agentTitle)
-                .font(.headline)
-                .accessibilityIdentifier("agent-catalog-agent-\(agentID)")
-            Text(agentID)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Color.clear
-                .frame(width: 1, height: 1)
-                .accessibilityIdentifier("agent-catalog-skill-section-\(agentID)")
-
-            Text("Resolved Skill")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(resolvedSkill.contentSummary)
-                .font(.system(.body, design: .monospaced))
-                .textSelection(.enabled)
-                .accessibilityIdentifier("agent-catalog-skill-preview-\(agentID)")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .accessibilityElement(children: .contain)
     }
 
     private func panelSection<Content: View>(
@@ -1228,329 +1445,13 @@ struct UITestProposal015ProofSurface: View {
     }
 
     @MainActor
-    private func seedModelContextIfNeeded() async {
-        guard didSeed == false, let fixture else { return }
-        didSeed = true
-
-        insert(run: fixture.reportRun)
-        insert(run: fixture.comparisonRun)
-
-        do {
-            try modelContext.save()
-            let builder = RunReportBuilder(modelContext: modelContext)
-            let reportArtifacts = try builder.emitReport(for: fixture.reportRun)
-            if let content = try? String(contentsOfFile: reportArtifacts.markdownArtifact.filePath, encoding: .utf8) {
-                proofReportSkillLine = content
-                    .split(separator: "\n", omittingEmptySubsequences: false)
-                    .map(String.init)
-                    .first(where: { $0.contains("Skill: ") })
-            }
-            proofComparisonSkillLine = fixture.reportRun.stageExecutions
-                .flatMap(\.agentExecutions)
-                .compactMap(\.skillRef)
-                .first
-                .map { "Skill: \($0)" }
-        } catch {
-            seedErrorMessage = "Unable to seed Proposal 015 proof: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
-    private func insert(run: Run) {
-        modelContext.insert(run)
-        for stage in run.stageExecutions {
-            modelContext.insert(stage)
-            for agent in stage.agentExecutions {
-                modelContext.insert(agent)
-                for artifact in agent.artifacts {
-                    modelContext.insert(artifact)
-                }
-            }
-        }
-    }
-
-    @MainActor
-    private static func makeFixture() -> (fixture: Proposal015ProofFixture?, errorMessage: String?) {
-        func fail(_ message: String) -> (fixture: Proposal015ProofFixture?, errorMessage: String?) {
-            print("UITestProposal015ProofSurface fixture failed: \(message)")
-            return (nil, message)
-        }
-
-        let fileManager = FileManager.default
-        let rootURL = fileManager.temporaryDirectory
-            .appendingPathComponent("UITestProposal015Proof-\(UUID().uuidString)", isDirectory: true)
-        let skillsRoot = rootURL.appendingPathComponent("skills", isDirectory: true)
-        let runsRoot = rootURL.appendingPathComponent("runs", isDirectory: true)
-        let exportsRoot = rootURL.appendingPathComponent("exports", isDirectory: true)
-        let worktreesRoot = rootURL.appendingPathComponent("worktrees", isDirectory: true)
-        let catalogURL = rootURL.appendingPathComponent("agents-proof.yaml")
-        let workflowURL = rootURL.appendingPathComponent("workflow-proof.yaml")
-
-        do {
-            try fileManager.createDirectory(at: skillsRoot, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: runsRoot, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: exportsRoot, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: worktreesRoot, withIntermediateDirectories: true)
-        } catch {
-            return fail("Unable to create fixture directories: \(error.localizedDescription)")
-        }
-
-        let triadSkillRoot = skillsRoot.appendingPathComponent("proposal-review-triad", isDirectory: true)
-        let auditSkillRoot = skillsRoot.appendingPathComponent("proposal-implementation-audit", isDirectory: true)
-        do {
-            try fileManager.createDirectory(at: triadSkillRoot, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: auditSkillRoot, withIntermediateDirectories: true)
-            try """
-            Shared proposal review instructions.
-            Focus on score-limiting issues and make the specialization mode explicit.
-            """.write(
-                to: triadSkillRoot.appendingPathComponent("SKILL.md"),
-                atomically: true,
-                encoding: .utf8
-            )
-            try """
-            Compare implementation evidence against approved proposal requirements.
-            Preserve authoritative artifact truth and fail closed on missing proof.
-            """.write(
-                to: auditSkillRoot.appendingPathComponent("SKILL.md"),
-                atomically: true,
-                encoding: .utf8
-            )
-        } catch {
-            return fail("Unable to create external skill bundles: \(error.localizedDescription)")
-        }
-
-        let environment = ProcessInfo.processInfo.environment
-        let defaultRepoRoot = AppConfiguration.defaultRepositoryRoot()
-        let sourceCatalogURL = environment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"]
-            .flatMap { value -> URL? in
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return nil }
-                return URL(fileURLWithPath: trimmed)
-            }
-            ?? defaultRepoRoot.appendingPathComponent("examples/agents/agents.yaml")
-        let sourceWorkflowURL = environment["CHAINWORKS_WORKFLOW_SOURCE_PATH"]
-            .flatMap { value -> URL? in
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return nil }
-                return URL(fileURLWithPath: trimmed)
-            }
-            ?? defaultRepoRoot.appendingPathComponent("examples/workflows/workflow.yaml")
-        guard let sourceCatalog = try? String(contentsOf: sourceCatalogURL, encoding: .utf8) else {
-            return fail("Unable to read source catalog at \(sourceCatalogURL.path)")
-        }
-        guard fileManager.isReadableFile(atPath: sourceWorkflowURL.path) else {
-            return fail("Unable to read source workflow at \(sourceWorkflowURL.path)")
-        }
-
-        let legacySkillsRoot = ["", "Users", "user", ".codex", "skills"].joined(separator: "/")
-        let rewrittenCatalog = sourceCatalog
-            .replacingOccurrences(of: "\(legacySkillsRoot)/proposal-review-triad", with: triadSkillRoot.path)
-            .replacingOccurrences(of: "\(legacySkillsRoot)/proposal-implementation-audit", with: auditSkillRoot.path)
-            .replacingOccurrences(of: "../skills/proposal-review-triad", with: triadSkillRoot.path)
-            .replacingOccurrences(of: "../skills/proposal-implementation-audit", with: auditSkillRoot.path)
-            .replacingOccurrences(of: "../../examples/skills/proposal-review-triad", with: triadSkillRoot.path)
-            .replacingOccurrences(of: "../../examples/skills/proposal-implementation-audit", with: auditSkillRoot.path)
-
-        do {
-            try rewrittenCatalog.write(to: catalogURL, atomically: true, encoding: .utf8)
-            try fileManager.copyItem(at: sourceWorkflowURL, to: workflowURL)
-        } catch {
-            return fail("Unable to write rewritten catalog/workflow fixtures: \(error.localizedDescription)")
-        }
-
-        guard let catalog = try? YAMLParser.loadAgentCatalog(from: catalogURL) else {
-            return fail("Rewritten Proposal 015 proof catalog did not decode")
-        }
-        guard let workflow = try? YAMLParser.loadWorkflow(from: workflowURL) else {
-            return fail("Workflow proof fixture did not decode")
-        }
-        guard let proofAgent = catalog.agents.first(where: { $0.id == "proposal_reviewer_product_owner" }) else {
-            return fail("Proof catalog is missing proposal_reviewer_product_owner")
-        }
-        guard let proofSkillRef = catalog.skills[proofAgent.skillRef] else {
-            return fail("Proof catalog is missing skill ref \(proofAgent.skillRef)")
-        }
-        let proofSkillContext = SkillResolverContext(catalogBaseURL: catalogURL)
-        guard let proofResolvedSkill = try? SkillResolver.resolve(
-            skillID: proofAgent.skillRef,
-            skillRef: proofSkillRef,
-            skillRole: proofAgent.skillRole,
-            context: proofSkillContext
-        ) else {
-            return fail("Proof skill \(proofAgent.skillRef) did not resolve")
-        }
-
-        let sharedSkill = ResolvedSkill(
-            id: "proposal_writer_core",
-            type: .inline,
-            resolvedContent: "Draft and refine product and technical proposals with explicit assumptions and next steps.",
-            contentHash: DefinitionHasher.hashString("Draft and refine product and technical proposals with explicit assumptions and next steps."),
-            injectedContent: SkillInjector.injectedContent(
-                skillID: "proposal_writer_core",
-                type: .inline,
-                content: "Draft and refine product and technical proposals with explicit assumptions and next steps."
-            ),
-            injectedContentHash: DefinitionHasher.hashString(
-                SkillInjector.injectedContent(
-                    skillID: "proposal_writer_core",
-                    type: .inline,
-                    content: "Draft and refine product and technical proposals with explicit assumptions and next steps."
-                )
-            ),
-            sourcePath: nil,
-            sourceDescription: "Draft and refine product and technical proposals with explicit assumptions and next steps.",
-            bundleManifest: nil,
-            role: "primary_writer",
-            specializationSummary: "generic role block: primary_writer",
-            injectionPolicy: .prependToSystemPrompt
-        )
-        let variantSkill = ResolvedSkill(
-            id: "proposal_writer_core",
-            type: .inline,
-            resolvedContent: "Draft and refine product and technical proposals with stronger emphasis on implementation sequencing.",
-            contentHash: DefinitionHasher.hashString("Draft and refine product and technical proposals with stronger emphasis on implementation sequencing."),
-            injectedContent: SkillInjector.injectedContent(
-                skillID: "proposal_writer_core",
-                type: .inline,
-                content: "Draft and refine product and technical proposals with stronger emphasis on implementation sequencing."
-            ),
-            injectedContentHash: DefinitionHasher.hashString(
-                SkillInjector.injectedContent(
-                    skillID: "proposal_writer_core",
-                    type: .inline,
-                    content: "Draft and refine product and technical proposals with stronger emphasis on implementation sequencing."
-                )
-            ),
-            sourcePath: nil,
-            sourceDescription: "Draft and refine product and technical proposals with stronger emphasis on implementation sequencing.",
-            bundleManifest: nil,
-            role: "secondary_writer",
-            specializationSummary: "generic role block: secondary_writer",
-            injectionPolicy: .prependToSystemPrompt
-        )
-        let workflowSnapshot = (try? DefinitionHasher.hash(workflow)) ?? (Data(), "p015-workflow")
-        let catalogSnapshot = (try? DefinitionHasher.hash(catalog)) ?? (Data(), "p015-catalog")
-
-        func makeRun(
-            id: UUID,
-            role: String,
-            resolvedSkill: ResolvedSkill,
-            proposalBody: String
-        ) -> (Run, Artifact) {
-            let runRoot = rootURL.appendingPathComponent(id.uuidString, isDirectory: true)
-            let artifactRoot = runRoot.appendingPathComponent("artifacts", isDirectory: true)
-            try? fileManager.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
-
-            let run = Run(
-                id: id,
-                startedAt: Date().addingTimeInterval(-600),
-                status: .completed,
-                workflowID: workflow.workflow.id,
-                workflowTitle: workflow.workflow.name,
-                workflowSnapshotHash: workflowSnapshot.1,
-                catalogSnapshotHash: catalogSnapshot.1,
-                workflowSourcePath: workflowURL.path,
-                catalogSourcePath: catalogURL.path,
-                workflowSnapshotJSON: workflowSnapshot.0,
-                catalogSnapshotJSON: catalogSnapshot.0,
-                workspaceRoot: runRoot.path,
-                artifactRoot: artifactRoot.path,
-                planCompilerVersion: RunPlan.currentCompilerVersion
-            )
-            run.completedAt = Date().addingTimeInterval(-120)
-            run.resolvedSkillsJSON = try? JSONEncoder().encode(["proposal_writer_core": resolvedSkill])
-            run.skillContentHashesJSON = try? JSONEncoder().encode(["proposal_writer_core": resolvedSkill.contentHash])
-            run.skillInjectedContentHashesJSON = try? JSONEncoder().encode(["proposal_writer_core": resolvedSkill.injectedContentHash])
-
-            let stage = StageExecution(
-                stageID: "state_2_proposal_drafted",
-                label: "Proposal drafted",
-                startedAt: Date().addingTimeInterval(-540),
-                status: .completed,
-                iteration: 1,
-                attemptNumber: 1
-            )
-            stage.completedAt = Date().addingTimeInterval(-240)
-            stage.run = run
-
-            let execution = AgentExecution(
-                agentID: "proposal_writer",
-                agentTitle: "Proposal Writer",
-                taskName: "draft_initial_proposal",
-                startedAt: Date().addingTimeInterval(-520),
-                status: .completed,
-                provider: "claude_code",
-                effort: "high"
-            )
-            execution.completedAt = Date().addingTimeInterval(-260)
-            execution.resolvedModel = "claude-opus-4.6"
-            execution.skillRef = "proposal_writer_core"
-            execution.skillType = resolvedSkill.type.catalogType
-            execution.skillRole = role
-            execution.skillContentSummary = resolvedSkill.contentSummary
-            execution.skillSnapshotHash = resolvedSkill.injectedContentHash
-            execution.stageExecution = stage
-
-            let artifactURL = artifactRoot.appendingPathComponent("proposal_current.md")
-            try? proposalBody.write(to: artifactURL, atomically: true, encoding: .utf8)
-            let artifact = Artifact(
-                name: "proposal_current",
-                contractID: "proposal_current",
-                format: .markdown,
-                filePath: artifactURL.path,
-                runID: run.id,
-                stageID: stage.stageID,
-                agentID: execution.agentID,
-                provider: execution.provider,
-                attemptNumber: stage.attemptNumber
-            )
-            artifact.agentExecution = execution
-            execution.artifacts = [artifact]
-            stage.agentExecutions = [execution]
-            run.stageExecutions = [stage]
-            return (run, artifact)
-        }
-
-        let (reportRun, primaryArtifact) = makeRun(
-            id: UUID(),
-            role: "primary_writer",
-            resolvedSkill: sharedSkill,
-            proposalBody: "# Proposal\n\nSkill-aware draft with assumptions and next steps."
-        )
-        let (comparisonRun, _) = makeRun(
-            id: UUID(),
-            role: "secondary_writer",
-            resolvedSkill: variantSkill,
-            proposalBody: "# Proposal\n\nVariant draft with stronger implementation sequencing."
-        )
-
-        let appConfiguration = AppConfiguration(
-            runStorageBasePath: runsRoot.path,
-            worktreeBasePath: worktreesRoot.path,
-            workflowSourcePath: workflowURL.path,
-            agentCatalogSourcePath: catalogURL.path,
-            supportBundleExportPath: exportsRoot.path,
-            gooseServerAutostart: false,
-            gooseServerBinaryPath: nil,
-            activeConfigurationSource: .persistedSettings
-        )
-
-        return (
-            Proposal015ProofFixture(
-                rootURL: rootURL,
-                catalogURL: catalogURL,
-                workflowURL: workflowURL,
-                appConfiguration: appConfiguration,
-                reportRun: reportRun,
-                comparisonRun: comparisonRun,
-                primaryArtifact: primaryArtifact,
-                proofAgentID: proofAgent.id,
-                proofAgentTitle: proofAgent.title,
-                proofResolvedSkill: proofResolvedSkill
-            ),
-            nil
-        )
+    private func prepareFixtureIfNeeded() async {
+        guard fixture == nil, seedErrorMessage == nil, isPreparingFixture == false else { return }
+        isPreparingFixture = true
+        let result = Proposal015ProofFixtureBuilder.makeFixture()
+        fixture = result.fixture
+        seedErrorMessage = result.errorMessage
+        isPreparingFixture = false
     }
 }
 

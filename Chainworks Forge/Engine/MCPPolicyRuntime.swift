@@ -76,10 +76,35 @@ struct GooseExtensionRegistrySnapshot: Equatable, Sendable {
 }
 
 struct GooseExtensionRegistryReader: Sendable {
+    static let environmentConfigPathKey = "CHAINWORKS_GOOSE_CONFIG_PATH"
     let configURL: URL
 
-    init(configURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/goose/config.yaml")) {
-        self.configURL = configURL
+    init(configURL: URL? = nil) {
+        if let configURL {
+            self.configURL = configURL
+            return
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let isTestHost = environment["XCTestConfigurationFilePath"] != nil
+        let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
+        if (isTestHost || usesInMemoryStore),
+           let portableFixtureURL = AppConfiguration.preferredExampleURL(
+                repoRelativePath: "examples/goose/goose-config-fixture.yaml"
+           ) {
+            self.configURL = portableFixtureURL
+            return
+        }
+
+        if let environmentPath = ProcessInfo.processInfo.environment[Self.environmentConfigPathKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !environmentPath.isEmpty {
+            self.configURL = URL(fileURLWithPath: environmentPath)
+            return
+        }
+
+        self.configURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/goose/config.yaml")
     }
 
     func snapshot() throws -> GooseExtensionRegistrySnapshot {
@@ -103,7 +128,8 @@ struct MCPPolicyResolver: Sendable {
         agent: ResolvedAgent,
         catalog: AgentCatalog,
         providerBinding: ResolvedProviderBinding?,
-        gooseRegistry: GooseExtensionRegistrySnapshot?
+        gooseRegistry: GooseExtensionRegistrySnapshot?,
+        runtimeNamespaceOverride: String? = nil
     ) -> MCPPolicyResolutionReport {
         let defaultProfile = catalog.mcpPolicy.defaultProfile
         let profileID = (agent.mcpProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -131,7 +157,7 @@ struct MCPPolicyResolver: Sendable {
         }
 
         let fallback = MCPFallbackPolicy(rawValue: profile.fallbackPolicy) ?? .failIfRequiredMissing
-        let runtimeNamespace = runtimeNamespace(for: providerBinding)
+        let runtimeNamespace = runtimeNamespaceOverride ?? runtimeNamespace(for: providerBinding)
 
         var requiredRuntimeIDs: [String] = []
         var optionalRuntimeIDs: [String] = []

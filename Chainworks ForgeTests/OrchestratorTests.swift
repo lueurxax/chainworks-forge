@@ -265,6 +265,46 @@ struct OrchestratorTests {
         )
     }
 
+    private func makeImplementationCatalog() -> AgentCatalog {
+        AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Implementation test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: ["codex"]
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: [:],
+            contracts: [
+                "implementation_progress": ArtifactContract(
+                    format: "json",
+                    requiredFields: ["status", "current_phase", "completed_items", "deferred_items", "notes"]
+                ),
+                "implementation_self_assessment_v1": ArtifactContract(
+                    format: "json",
+                    requiredFields: ["seemingly_complete", "remaining_tasks", "known_risks", "tests_run", "docs_impacted"]
+                ),
+                "changed_files_manifest": ArtifactContract(
+                    format: "json",
+                    requiredFields: ["files"]
+                ),
+                "tests_result": ArtifactContract(
+                    format: "json",
+                    requiredFields: ["green", "summary"]
+                )
+            ],
+            backendProfiles: [:],
+            permissionProfiles: [:],
+            agents: []
+        )
+    }
+
     // MARK: - Simple Linear Workflow
 
     @Test("Simple linear workflow completes successfully")
@@ -2063,6 +2103,161 @@ struct OrchestratorTests {
         #expect(run.status == .completed)
     }
 
+    @Test("Implementation partial artifact set recovers failed code writer into continue path")
+    func implementationPartialArtifactSetRecoversFailedCodeWriter() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            provider: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 12,
+            temperature: 0,
+            permissionProfile: "CODE_WRITE",
+            skillRef: "code_writer_core",
+            skillRole: nil,
+            prompt: "Implement the approved proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: [
+                "implementation_progress",
+                "implementation_self_assessment",
+                "changed_files_manifest",
+                "tests_result"
+            ],
+            worktreeWriteEnabled: true
+        )
+
+        let partialOutputs: [String: Data] = [
+            "implementation_progress": try JSONSerialization.data(withJSONObject: [
+                "status": "blocked",
+                "current_phase": "implementation",
+                "completed_items": ["Partial worktree edits preserved."],
+                "deferred_items": ["tests_result"],
+                "notes": "Execution stopped before canonical test reporting."
+            ], options: [.sortedKeys]),
+            "implementation_self_assessment": try JSONSerialization.data(withJSONObject: [
+                "seemingly_complete": false,
+                "remaining_tasks": ["Resume implementation", "Run verification"],
+                "known_risks": ["Execution stopped before canonical test report was written."],
+                "tests_run": false,
+                "docs_impacted": []
+            ], options: [.sortedKeys]),
+            "changed_files_manifest": try JSONSerialization.data(withJSONObject: [
+                "files": ["Sources/App.swift"]
+            ], options: [.sortedKeys]),
+            "tests_result": try JSONSerialization.data(withJSONObject: [
+                "green": false,
+                "summary": "Execution stopped before canonical test reporting."
+            ], options: [.sortedKeys])
+        ]
+
+        let failedResult = AgentResult(
+            outputs: partialOutputs,
+            logSnippet: "partial implementation artifacts preserved",
+            costCents: 1,
+            succeeded: false,
+            errorMessage: "Required outputs missing from primary execution; recovered from partial artifact set",
+            sessionID: "code-writer-session",
+            durationSeconds: 1.0,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .failedBeforeOutput,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Implementation",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "implement", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [
+                        ExecutableTransition(to: "continue", condition: .expression("implementation_self_assessment.seemingly_complete == false")),
+                        ExecutableTransition(to: "end", condition: .expression("implementation_self_assessment.seemingly_complete == true"))
+                    ],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "continue": ExecutableState(
+                    id: "continue",
+                    label: "Continue",
+                    type: nil,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "Done",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: failedResult),
+            modelContext: context,
+            catalog: makeImplementationCatalog()
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+        #expect(run.currentStageID == "continue")
+        let stageExecutionsByID = Dictionary(uniqueKeysWithValues: run.stageExecutions.map { ($0.stageID, $0) })
+        #expect(stageExecutionsByID["start"]?.status == .completed)
+        #expect(stageExecutionsByID["continue"]?.status == .completed)
+        #expect(stageExecutionsByID["end"] == nil)
+        let stageExec = try #require(stageExecutionsByID["start"])
+        let agentExec = try #require(stageExec.agentExecutions.first)
+        #expect(agentExec.status == .completed)
+        let artifactNames = Set(agentExec.artifacts.map(\.name))
+        #expect(artifactNames.contains("implementation_progress"))
+        #expect(artifactNames.contains("implementation_self_assessment"))
+        #expect(artifactNames.contains("changed_files_manifest"))
+        #expect(artifactNames.contains("tests_result"))
+    }
+
     @Test("Delivery receipt is emitted from real release artifacts on terminal delivery run")
     func deliveryReceiptEmittedFromReleaseArtifacts() async throws {
         let repoRoot = tempDir.appendingPathComponent("delivery-\(UUID().uuidString)", isDirectory: true)
@@ -2268,6 +2463,142 @@ struct OrchestratorTests {
         #expect(receipt.releaseResult?.succeeded == true)
         #expect(receipt.releaseResult?.commitSHA == "abc123def456")
         #expect(receipt.implementationReviewStatus == "implemented")
+    }
+
+    @Test("End state with run block executes terminal work before completion")
+    func endStateWithRunBlockExecutesBeforeCompletion() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let terminalAgent = makeAgent(id: "terminal_writer", outputs: ["terminal_receipt"])
+        let terminalResult = AgentResult(
+            outputs: ["terminal_receipt": Data(#"{"status":"done"}"#.utf8)],
+            logSnippet: "done",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: nil,
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
+        )
+        let endState = ExecutableState(
+            id: "end",
+            label: "Workflow complete",
+            type: .end,
+            ownerAgentID: "terminal_writer",
+            runBlock: ExecutableRunBlock(phases: [
+                .sequential([AgentTask(agent: "terminal_writer", task: "finalize", inputs: nil, outputs: nil)])
+            ]),
+            runAfterApproval: nil,
+            transitions: [],
+            approvalRequired: false,
+            approvalPolicy: nil,
+            loop: nil
+        )
+        let plan = RunPlan(
+            workflowID: "terminal_work",
+            workflowTitle: "Terminal Work",
+            states: ["end": endState],
+            initialStateID: "end",
+            agentBindings: ["terminal_writer": terminalAgent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: terminalResult),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+        #expect(run.currentStageID == "end")
+        let endStage = try #require(run.stageExecutions.first(where: { $0.stageID == "end" }))
+        #expect(endStage.status == .completed)
+        let artifactNames = Set(endStage.agentExecutions.flatMap(\.artifacts).map(\.name))
+        #expect(artifactNames.contains("terminal_receipt"))
+    }
+
+    @Test("End state with terminal work ignores self-loop transitions and completes")
+    func endStateWithSelfLoopStillCompletes() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let terminalAgent = makeAgent(id: "terminal_writer", outputs: ["terminal_receipt"])
+        let terminalResult = AgentResult(
+            outputs: ["terminal_receipt": Data(#"{"status":"done"}"#.utf8)],
+            logSnippet: "done",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: nil,
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
+        )
+        let endState = ExecutableState(
+            id: "end",
+            label: "Workflow complete",
+            type: .end,
+            ownerAgentID: "terminal_writer",
+            runBlock: ExecutableRunBlock(phases: [
+                .sequential([AgentTask(agent: "terminal_writer", task: "finalize", inputs: nil, outputs: nil)])
+            ]),
+            runAfterApproval: nil,
+            transitions: [
+                ExecutableTransition(to: "end", condition: .always)
+            ],
+            approvalRequired: false,
+            approvalPolicy: nil,
+            loop: nil
+        )
+        let plan = RunPlan(
+            workflowID: "terminal_self_loop",
+            workflowTitle: "Terminal Self Loop",
+            states: ["end": endState],
+            initialStateID: "end",
+            agentBindings: ["terminal_writer": terminalAgent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: terminalResult),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+        let endStage = try #require(run.stageExecutions.first(where: { $0.stageID == "end" }))
+        #expect(endStage.status == .completed)
+        #expect(endStage.agentExecutions.count == 1)
     }
 
     @Test("Delivery receipt is emitted for partial delivery failure")

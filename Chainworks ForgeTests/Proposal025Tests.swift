@@ -4,8 +4,99 @@ import SwiftData
 @testable import Chainworks_Forge
 
 @MainActor
-@Suite("Proposal 025")
+@Suite("Proposal 025", .serialized)
 struct Proposal025Tests {
+    @Test("Portable Goose registry fixture overrides unreadable inherited config path")
+    func portableGooseRegistryFixtureOverridesUnreadableInheritedPath() throws {
+        let envKey = GooseExtensionRegistryReader.environmentConfigPathKey
+        let original = ProcessInfo.processInfo.environment[envKey]
+        let unreadablePath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-goose-\(UUID().uuidString).yaml", isDirectory: false)
+            .path
+
+        setenv(envKey, unreadablePath, 1)
+        defer {
+            if let original {
+                setenv(envKey, original, 1)
+            } else {
+                unsetenv(envKey)
+            }
+        }
+
+        _ = try makeTestModelContext()
+
+        let resolved = ProcessInfo.processInfo.environment[envKey]
+        let expectedSuffix = "/examples/goose/goose-config-fixture.yaml"
+        #expect(resolved?.hasSuffix(expectedSuffix) == true)
+        #expect(resolved != unreadablePath)
+    }
+
+    @Test("Goose registry reader falls back to repo fixture on test hosts")
+    func gooseRegistryReaderFallsBackToRepoFixtureOnTestHosts() {
+        let envKey = GooseExtensionRegistryReader.environmentConfigPathKey
+        let original = ProcessInfo.processInfo.environment[envKey]
+        unsetenv(envKey)
+        defer {
+            if let original {
+                setenv(envKey, original, 1)
+            } else {
+                unsetenv(envKey)
+            }
+        }
+
+        let reader = GooseExtensionRegistryReader()
+        #expect(reader.configURL.path.hasSuffix("/examples/goose/goose-config-fixture.yaml"))
+    }
+
+    @Test("Simulated canonical contract outputs satisfy bundled workflow thresholds")
+    func simulatedCanonicalContractOutputsSatisfyBundledWorkflowThresholds() throws {
+        let summaryData = OutputContractTemplates.generate(
+            contractID: "proposal_review_summary_v1",
+            agentID: "lead_orchestrator",
+            stageID: "state_4_proposal_reviewed"
+        ).data
+        let auditData = OutputContractTemplates.generate(
+            contractID: "audit_report_v1",
+            agentID: "security_checker",
+            stageID: "state_9_implementation_reviewed"
+        ).data
+        let implementationReviewData = OutputContractTemplates.generate(
+            contractID: "implementation_review_summary_v1",
+            agentID: "lead_orchestrator",
+            stageID: "state_9_implementation_reviewed"
+        ).data
+
+        let summary = try JSONSerialization.jsonObject(with: summaryData) as? [String: Any]
+        let audit = try JSONSerialization.jsonObject(with: auditData) as? [String: Any]
+        let implementationReview = try JSONSerialization.jsonObject(with: implementationReviewData) as? [String: Any]
+
+        #expect((summary?["average_score"] as? Double ?? 0) > 9.1)
+        #expect((summary?["min_individual_score"] as? Double ?? 0) >= 8.5)
+        #expect((summary?["blocker_count"] as? Int) == 0)
+        #expect((audit?["status"] as? String) == "Implemented")
+        #expect((implementationReview?["status"] as? String) == "Implemented")
+
+        let connectUploadReceiptData = OutputContractTemplates.generate(
+            contractID: "connect_upload_receipt_v1",
+            agentID: "build_archive_and_push_connect",
+            stageID: "state_11_manual_release"
+        ).data
+        let finalFeatureReportData = OutputContractTemplates.generate(
+            contractID: "final_feature_report_v1",
+            agentID: "lead_orchestrator",
+            stageID: "state_12_workflow_complete"
+        ).data
+        let connectUploadReceipt = try JSONSerialization.jsonObject(with: connectUploadReceiptData) as? [String: Any]
+        let finalFeatureReport = try JSONSerialization.jsonObject(with: finalFeatureReportData) as? [String: Any]
+        #expect((connectUploadReceipt?["status"] as? String) == "success")
+        #expect((connectUploadReceipt?["artifact_id"] as? String)?.isEmpty == false)
+        #expect((connectUploadReceipt?["checksum"] as? String)?.isEmpty == false)
+        #expect((connectUploadReceipt?["destination"] as? String)?.isEmpty == false)
+        #expect((finalFeatureReport?["final_status"] as? String) == "completed")
+        #expect((finalFeatureReport?["summary"] as? String)?.isEmpty == false)
+        #expect((finalFeatureReport?["cost_currency"] as? String) == "USD")
+    }
+
     @Test("Portability-sensitive runtime sources avoid workstation-specific absolute paths")
     func portabilitySensitiveSourcesAvoidHardcodedUserPaths() throws {
         let repoRoot = testRepositoryRootURL()

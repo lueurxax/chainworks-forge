@@ -110,6 +110,7 @@ struct IdeaListView: View {
         } detail: {
             if let selectedIdea {
                 IdeaDetailView(idea: selectedIdea)
+                    .id(selectedIdea.id)
             } else {
                 // Proposal 012 (L-01): Enhanced empty state
                 StyledEmptyState(
@@ -1153,9 +1154,10 @@ struct IdeaDetailView: View {
             }
         }
         .task(id: idea.id) {
-            if activeRun == nil {
-                activeRun = latestActiveRun
-            }
+            activeRun = latestActiveRun
+            showStartRunSheet = false
+            archiveMessage = nil
+            showStopConfirmation = false
             editingWorkspacePath = idea.workspaceRootPath ?? ""
         }
         .formStyle(.grouped)
@@ -3344,31 +3346,10 @@ struct WorkflowArtifactInspectorView: View {
             Divider()
 
             ScrollView {
-                if artifact.format == .markdown {
-                    // Render markdown with full block-level support (proposal contract REQ-010)
-                    let attributed = (try? AttributedString(markdown: renderedContent,
-                                                            options: .init(interpretedSyntax: .full))) ?? AttributedString(renderedContent)
-                    Text(attributed)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                } else if artifact.format == .diff {
-                    // Diff: monospaced with color per line
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(renderedContent.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(line.hasPrefix("+") ? .green : line.hasPrefix("-") ? .red : line.hasPrefix("@@") ? .blue : .primary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .textSelection(.enabled)
-                } else {
-                    // JSON / report: monospaced
-                    Text(renderedContent)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .font(.system(.body, design: .monospaced))
-                }
+                ArtifactContentRenderer(
+                    content: renderedContent,
+                    context: .artifactBacked(artifact: artifact, run: run)
+                )
             }
             .accessibilityIdentifier("artifact-inspector-content")
         }
@@ -3391,13 +3372,6 @@ struct WorkflowArtifactInspectorView: View {
         do {
             let manager = ArtifactManager(modelContext: modelContext)
             let data = try manager.readArtifact(artifact, workspace: workspace)
-
-            if artifact.format == .json,
-               let jsonObject = try? JSONSerialization.jsonObject(with: data),
-               let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.prettyPrinted]),
-               let string = String(data: prettyData, encoding: .utf8) {
-                return string
-            }
 
             if let string = String(data: data, encoding: .utf8) {
                 return string

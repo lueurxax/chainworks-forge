@@ -238,6 +238,21 @@ final class GooseServerManager: ManagedGooseServerControlling {
         lastCheckedAt = Date()
     }
 
+    func prepareForSystemSleep() {
+        processHandle = nil
+        launchState = .idle
+        lastCheckedAt = Date()
+    }
+
+    func reconcileAfterSystemWake() async {
+        processHandle = nil
+        if configuration.gooseServerAutostart {
+            await ensureRunning()
+        } else {
+            await refreshStatus()
+        }
+    }
+
     private func registerTerminationObserverIfNeeded() {
 #if os(macOS)
         terminationObserver = NotificationCenter.default.addObserver(

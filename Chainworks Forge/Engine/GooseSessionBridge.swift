@@ -140,7 +140,8 @@ final class GooseSessionBridge: Sendable {
             agent: agent,
             catalog: catalog,
             providerBinding: context.providerBinding,
-            gooseRegistry: gooseRegistry
+            gooseRegistry: gooseRegistry,
+            runtimeNamespaceOverride: transport.mcpRuntimeNamespace
         )
     }
 

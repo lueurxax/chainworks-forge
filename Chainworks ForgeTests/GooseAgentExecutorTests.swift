@@ -15,7 +15,8 @@ struct GooseAgentExecutorTests {
 
     private func makeAgent(
         id: String = "test_agent",
-        outputs: [String] = ["test_output.md"]
+        outputs: [String] = ["test_output.md"],
+        worktreeWriteEnabled: Bool = false
     ) -> ResolvedAgent {
         ResolvedAgent(
             id: id,
@@ -33,7 +34,8 @@ struct GooseAgentExecutorTests {
             outputContract: "test_contract",
             requiresHumanApproval: false,
             inputs: [],
-            outputs: outputs
+            outputs: outputs,
+            worktreeWriteEnabled: worktreeWriteEnabled
         )
     }
 
@@ -453,6 +455,43 @@ struct GooseAgentExecutorTests {
         )
     }
 
+    private func makeContext(runID: UUID = UUID(), worktreeRoot: URL?) -> ExecutionContext {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+
+        try? FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: worktreeRoot
+        )
+
+        return ExecutionContext(
+            workspace: workspace,
+            stageID: "state_1",
+            stageLineageID: "state_1",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea body",
+            providerBinding: nil
+        )
+    }
+
+    private func initializeGitRepository(at root: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["init"]
+        process.currentDirectoryURL = root
+        try process.run()
+        process.waitUntilExit()
+    }
+
     private func waitForSessionClose(_ transport: ObservableGooseTransport) async -> Bool {
         for _ in 0..<20 {
             let closed = await transport.closeSessionCalled
@@ -715,6 +754,58 @@ struct GooseAgentExecutorTests {
         #expect(!result.succeeded, "Should fail when required outputs are missing")
         #expect(result.errorMessage != nil)
         #expect(result.errorMessage?.contains("required_output.json") == true)
+    }
+
+    @MainActor
+    @Test("Executor synthesizes partial implementation artifacts when code writer fails before writing them")
+    func gooseExecutorSynthesizesPartialImplementationArtifactsOnFailure() async throws {
+        let transport = ObservableGooseTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let runID = UUID()
+        let worktreeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("code-writer-worktree-\(runID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        try initializeGitRepository(at: worktreeRoot)
+        try FileManager.default.createDirectory(
+            at: worktreeRoot.appendingPathComponent("Sources", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try "print(\"debug\")\n".write(
+            to: worktreeRoot.appendingPathComponent("Sources/App.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let executor = GooseAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "code_writer",
+            outputs: [
+                "implementation_progress",
+                "implementation_self_assessment",
+                "changed_files_manifest",
+                "tests_result"
+            ],
+            worktreeWriteEnabled: true
+        )
+        let task = makeTask(agent: "code_writer", task: "initial_implementation")
+        let context = makeContext(runID: runID, worktreeRoot: worktreeRoot)
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.outputs["implementation_progress"] != nil)
+        #expect(result.outputs["implementation_self_assessment"] != nil)
+        #expect(result.outputs["changed_files_manifest"] != nil)
+        #expect(result.outputs["tests_result"] != nil)
     }
 
     /// testGooseExecutorReturnsAgentResult — Section 12.1

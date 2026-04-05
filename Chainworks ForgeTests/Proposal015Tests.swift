@@ -67,6 +67,25 @@ struct Proposal015Tests {
         #expect(resolved.sourcePath?.contains("/../") == false)
     }
 
+    @Test("Portable catalog copy localizes external skill bundles next to the rewritten catalog")
+    func portableCatalogCopyLocalizesExternalSkillBundles() throws {
+        let catalogFixtureURL = try fixtureURL(name: "agents", ext: "yaml")
+        let localizedURL = tempDirectory.appendingPathComponent("agents-portable.yaml")
+        let copiedURL = try writePortableCatalogCopy(from: catalogFixtureURL, to: localizedURL)
+        let copiedCatalog = try YAMLParser.loadAgentCatalog(from: copiedURL)
+        let triadSkill = try #require(copiedCatalog.skills["proposal_review_triad"])
+        let auditSkill = try #require(copiedCatalog.skills["proposal_implementation_audit"])
+        let triadPath = try #require(triadSkill.path)
+        let auditPath = try #require(auditSkill.path)
+
+        #expect(triadPath.contains("portable-skills-"))
+        #expect(auditPath.contains("portable-skills-"))
+        #expect(FileManager.default.fileExists(atPath: (triadPath as NSString).appendingPathComponent("SKILL.md")))
+        #expect(FileManager.default.fileExists(atPath: (auditPath as NSString).appendingPathComponent("SKILL.md")))
+        #expect(triadPath.hasPrefix(tempDirectory.path))
+        #expect(auditPath.hasPrefix(tempDirectory.path))
+    }
+
     @Test("Goose session packet injects resolved skill content before agent prompt")
     func gooseSessionPacketInjectsResolvedSkillContentBeforeAgentPrompt() throws {
         let resolvedSkill = ResolvedSkill(
@@ -222,6 +241,32 @@ struct Proposal015Tests {
         #expect(decodedSkills["inline_writer"]?.resolvedContent == resolvedSkill.resolvedContent)
         #expect(decodedContentHashes["inline_writer"] == resolvedSkill.contentHash)
         #expect(decodedInjectedHashes["inline_writer"] == resolvedSkill.injectedContentHash)
+    }
+
+    @Test("Proposal 015 proof fixture seeds repo-backed shell-owned truth")
+    func proposal015ProofFixtureSeedsRepoBackedShellOwnedTruth() throws {
+        let result = Proposal015ProofFixtureBuilder.makeFixture()
+        let fixture = try #require(result.fixture)
+        #expect(result.errorMessage == nil)
+        #expect(fixture.catalogURL.path.hasSuffix("/examples/agents/agents.yaml"))
+        #expect(fixture.workflowURL.path.hasSuffix("/examples/workflows/proposal-loop-live.yaml"))
+        #expect(fixture.proofAgentID == "proposal_reviewer_product_owner")
+        #expect(fixture.proofRun.runtimeTrustLevel == "fixture_verified")
+        #expect(fixture.comparisonRun.workflowTitle.contains("Architect"))
+        #expect(fixture.primaryArtifact.name == "proposal_current")
+        #expect(FileManager.default.fileExists(atPath: fixture.primaryArtifact.filePath))
+
+        let encodedSkillHashes = try #require(fixture.proofRun.skillInjectedContentHashesJSON)
+        let skillHashes = try encodedSkillHashes.decoded([String: String].self)
+        #expect(skillHashes["proposal_review_triad"]?.isEmpty == false)
+
+        let summaryArtifactID = try #require(fixture.proofRun.latestSummaryArtifactID)
+        let summaryArtifacts = try fixture.modelContainer.mainContext.fetch(FetchDescriptor<Artifact>())
+        let summaryArtifact = try #require(summaryArtifacts.first(where: { $0.id == summaryArtifactID }))
+        let summaryPath = summaryArtifact.filePath
+        let summaryBody = try String(contentsOfFile: summaryPath, encoding: .utf8)
+        #expect(summaryBody.contains("Skill: proposal_review_triad"))
+        #expect(summaryBody.contains("Role: product_owner"))
     }
 
     @Test("Execution rows and run reports persist injected skill truth")

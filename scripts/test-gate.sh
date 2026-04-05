@@ -7,6 +7,7 @@ SCHEME_NAME="Chainworks Forge"
 DESTINATION="platform=macOS"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 TEST_PLANS_DIR="$ROOT_DIR/TestPlans"
+PORTABLE_GOOSE_CONFIG_PATH="$ROOT_DIR/examples/goose/goose-config-fixture.yaml"
 UNSIGNED_BUILD_ARGS=(
   CODE_SIGNING_ALLOWED=NO
   CODE_SIGNING_REQUIRED=NO
@@ -114,6 +115,41 @@ log() {
   printf '==> %s\n' "$*"
 }
 
+should_use_unsigned_ui_tests() {
+  local configured="${CHAINWORKS_USE_UNSIGNED_UI_TESTS:-}"
+  if [[ -n "$configured" ]]; then
+    [[ "$configured" == "1" ]]
+    return
+  fi
+
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+append_xcodebuild_signing_args() {
+  local gate_name="${1:-}"
+  local includes_ui="${2:-0}"
+
+  if [[ "$includes_ui" == "1" ]] && ! should_use_unsigned_ui_tests; then
+    return 0
+  fi
+
+  if [[ "$gate_name" == "full" ]] && ! should_use_unsigned_ui_tests; then
+    return 0
+  fi
+
+  printf '%s\0' "${UNSIGNED_BUILD_ARGS[@]}"
+}
+
+export_portable_goose_registry() {
+  if [[ -f "$PORTABLE_GOOSE_CONFIG_PATH" ]]; then
+    export CHAINWORKS_GOOSE_CONFIG_PATH="$PORTABLE_GOOSE_CONFIG_PATH"
+  fi
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -134,6 +170,112 @@ approved_remote_ui_hosts() {
   else
     printf '%s\n' "${DEFAULT_REMOTE_UI_TEST_HOSTS[@]}"
   fi
+}
+
+gate_requires_remote_ui_host() {
+  case "${1:-}" in
+    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|full)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+should_wrap_gate_in_terminal_gui_session() {
+  local gate_name="${1:-}"
+  gate_requires_remote_ui_host "$gate_name" || return 1
+  [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+  [[ "${CHAINWORKS_GUI_SESSION_WRAPPED:-0}" != "1" ]] || return 1
+  command -v open >/dev/null 2>&1 || return 1
+  return 0
+}
+
+emit_forwarded_chainworks_env() {
+  local key
+  local -a allowed_chainworks_env=(
+    CHAINWORKS_REMOTE_UI_TEST_HOSTS
+    CHAINWORKS_USE_UNSIGNED_UI_TESTS
+    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
+    CHAINWORKS_CODESIGN_KEYCHAIN
+    CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD
+    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
+    CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS
+    CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS
+    CHAINWORKS_P015_UI_HARD_TIMEOUT_SECONDS
+    CHAINWORKS_P022_UI_SUCCESS_GRACE_SECONDS
+    CHAINWORKS_P022_UI_HARD_TIMEOUT_SECONDS
+  )
+
+  for key in "${allowed_chainworks_env[@]}"; do
+    if [[ -n ${!key+x} ]]; then
+      printf 'export %s=%q\n' "$key" "${!key}"
+    fi
+  done
+
+  if [[ -n ${USE_TEST_PLANS+x} ]]; then
+    printf 'export %s=%q\n' "USE_TEST_PLANS" "$USE_TEST_PLANS"
+  fi
+}
+
+run_gate_in_terminal_gui_session() {
+  local gate_name="$1"
+  local stamp command_path log_path rc_path resolved_unsigned_ui_tests
+  stamp="$(make_stamp)"
+  command_path="$TMP_BASE/${gate_name}-${stamp}-gui.command"
+  log_path="$TMP_BASE/${gate_name}-${stamp}-gui.log"
+  rc_path="$TMP_BASE/${gate_name}-${stamp}-gui.rc"
+  mkdir -p "$TMP_BASE"
+
+  if should_use_unsigned_ui_tests; then
+    resolved_unsigned_ui_tests=1
+  else
+    resolved_unsigned_ui_tests=0
+  fi
+
+  {
+    printf '#!/bin/zsh\n'
+    printf 'cd %q || exit 97\n' "$ROOT_DIR"
+    printf 'export CHAINWORKS_GUI_SESSION_WRAPPED=1\n'
+    printf 'export CHAINWORKS_USE_UNSIGNED_UI_TESTS=%q\n' "$resolved_unsigned_ui_tests"
+    printf 'trap "" HUP\n'
+    emit_forwarded_chainworks_env
+    printf 'nohup ./scripts/test-gate.sh %q > %q 2>&1\n' "$gate_name" "$log_path"
+    printf 'printf %%s \"$?\" > %q\n' "$rc_path"
+  } >"$command_path"
+  chmod +x "$command_path"
+
+  log "Re-executing gate '$gate_name' in Terminal GUI session"
+  open -a Terminal "$command_path" >/dev/null 2>&1
+
+  local offset=0
+  local start_epoch timeout_seconds now size rc_value
+  start_epoch="$(date +%s)"
+  timeout_seconds="${CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS:-7200}"
+
+  while true; do
+    if [[ -f "$log_path" ]]; then
+      size="$(wc -c <"$log_path" | tr -d '[:space:]')"
+      if [[ -n "$size" ]] && (( size > offset )); then
+        tail -c "+$((offset + 1))" "$log_path"
+        offset="$size"
+      fi
+    fi
+
+    if [[ -f "$rc_path" ]]; then
+      rc_value="$(cat "$rc_path")"
+      return "${rc_value:-1}"
+    fi
+
+    now="$(date +%s)"
+    if (( now - start_epoch >= timeout_seconds )); then
+      printf 'error: terminal GUI session timed out after %ss for gate %s\n' "$timeout_seconds" "$gate_name" >&2
+      return 124
+    fi
+
+    sleep 2
+  done
 }
 
 observed_host_names() {
@@ -160,7 +302,7 @@ default_codesign_keychain() {
 }
 
 prepare_codesign_keychain() {
-  if [[ "${CHAINWORKS_USE_UNSIGNED_UI_TESTS:-1}" == "1" ]]; then
+  if should_use_unsigned_ui_tests; then
     return 0
   fi
 
@@ -262,6 +404,8 @@ check_idle_environment() {
     exit 2
   fi
 }
+
+export_portable_goose_registry
 
 guard_direct_run_insertion() {
   log "Guard: no direct Run construction outside RunRepository"
@@ -406,17 +550,21 @@ make_stamp() {
 run_build() {
   local gate_name="$1"
   local stamp derived_data
+  local -a signing_args=()
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
   LAST_BUILD_DERIVED_DATA_PATH="$derived_data"
   mkdir -p "$TMP_BASE"
+  while IFS= read -r -d '' arg; do
+    signing_args+=("$arg")
+  done < <(append_xcodebuild_signing_args "$gate_name" "0")
   log "Build gate: $gate_name"
   xcodebuild \
     -project "$PROJECT_PATH" \
     -scheme "$SCHEME_NAME" \
     -destination "$DESTINATION" \
     -derivedDataPath "$derived_data" \
-    "${UNSIGNED_BUILD_ARGS[@]}" \
+    "${signing_args[@]}" \
     build
 }
 
@@ -517,10 +665,14 @@ run_test_plan() {
   local plan_name="$2"
 
   local stamp derived_data result_bundle
+  local -a signing_args=()
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
   result_bundle="$TMP_BASE/${gate_name}-${stamp}.xcresult"
   mkdir -p "$TMP_BASE"
+  while IFS= read -r -d '' arg; do
+    signing_args+=("$arg")
+  done < <(append_xcodebuild_signing_args "$gate_name" "1")
 
   log "Test gate (test plan): $gate_name — plan=$plan_name"
   xcodebuild test \
@@ -528,9 +680,11 @@ run_test_plan() {
     -scheme "$SCHEME_NAME" \
     -destination "$DESTINATION" \
     -testPlan "$plan_name" \
+    -parallel-testing-enabled NO \
+    -maximum-parallel-testing-workers 1 \
     -derivedDataPath "$derived_data" \
     -resultBundlePath "$result_bundle" \
-    "${UNSIGNED_BUILD_ARGS[@]}"
+    "${signing_args[@]}"
   log "Result bundle: $result_bundle"
 }
 
@@ -538,7 +692,8 @@ run_targeted_tests() {
   local gate_name="$1"
   shift
 
-  local stamp derived_data result_bundle log_path
+  local stamp derived_data result_bundle log_path automation_log_path previous_automation_log_path
+  local -a signing_args=()
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
   result_bundle="$TMP_BASE/${gate_name}-${stamp}.xcresult"
@@ -564,12 +719,19 @@ run_targeted_tests() {
     fi
   done
 
+  while IFS= read -r -d '' arg; do
+    signing_args+=("$arg")
+  done < <(append_xcodebuild_signing_args "$gate_name" "$includes_ui")
+
   if [[ $includes_ui -eq 0 ]]; then
     cmd+=("-resultBundlePath" "$result_bundle")
-    cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
+    cmd+=("${signing_args[@]}")
     cmd+=("-skip-testing:Chainworks ForgeUITests")
   else
-    cmd+=("${UNSIGNED_BUILD_ARGS[@]}")
+    automation_log_path="$TMP_BASE/${gate_name}-${stamp}-automation.log"
+    previous_automation_log_path="${CHAINWORKS_UI_AUTOMATION_LOG_PATH:-}"
+    export CHAINWORKS_UI_AUTOMATION_LOG_PATH="$automation_log_path"
+    cmd+=("${signing_args[@]}")
     cmd+=("-parallel-testing-enabled" "NO")
     cmd+=("-maximum-parallel-testing-workers" "1")
     if [[ "$gate_name" != "proposal-013-ui" ]]; then
@@ -589,26 +751,44 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 gate_name = sys.argv[1]
 log_path = sys.argv[2]
 cmd = sys.argv[3:]
+automation_log_path = Path(os.environ.get("CHAINWORKS_UI_AUTOMATION_LOG_PATH", "/tmp/chainworks-ui-automation.log"))
+
+def dump_automation_log():
+    if not automation_log_path.exists():
+        return
+    try:
+        lines = automation_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:
+        print(f"warning: failed to read UI automation log {automation_log_path}: {exc}", file=sys.stderr)
+        return
+
+    tail = lines[-80:]
+    if not tail:
+        return
+    print(f"--- UI automation log tail: {automation_log_path} ---", file=sys.stderr)
+    for line in tail:
+        print(line, file=sys.stderr)
 
 if gate_name == "proposal-013-ui":
     marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal013AppProofSurface]' passed"
-    marker_suite_passed = "Executed 1 test, with 0 failures"
+    suite_markers = ("Executed 1 test, with 0 failures", "** TEST SUCCEEDED **")
     success_label = "Proposal 013 UI watchdog"
     grace_seconds = float(os.environ.get("CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS", "15"))
     hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS", "1800"))
 elif gate_name == "proposal-022-ui":
     marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal022AppProofSurface]' passed"
-    marker_suite_passed = "** TEST SUCCEEDED **"
+    suite_markers = ("Executed 1 test, with 0 failures", "** TEST SUCCEEDED **")
     success_label = "Proposal 022 gate watchdog"
     grace_seconds = float(os.environ.get("CHAINWORKS_P022_UI_SUCCESS_GRACE_SECONDS", "10"))
     hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P022_UI_HARD_TIMEOUT_SECONDS", "1800"))
 elif gate_name == "proposal-015-ui":
     marker_test_passed = "Test Case '-[Chainworks_ForgeUITests.Chainworks_ForgeUITests testProposal015SkillVisibilityProofSurface]' passed"
-    marker_suite_passed = "Executed 1 test, with 0 failures"
+    suite_markers = ("Executed 1 test, with 0 failures", "** TEST SUCCEEDED **")
     success_label = "Proposal 015 UI watchdog"
     grace_seconds = float(os.environ.get("CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS", "15"))
     hard_timeout_seconds = float(os.environ.get("CHAINWORKS_P015_UI_HARD_TIMEOUT_SECONDS", "1800"))
@@ -619,6 +799,11 @@ test_passed = False
 suite_passed = False
 success_at = None
 start = time.time()
+known_failure_markers = (
+    "before establishing connection",
+    "Early unexpected exit",
+    "signal kill",
+)
 
 with open(log_path, "w", encoding="utf-8") as log:
     proc = subprocess.Popen(
@@ -640,13 +825,29 @@ with open(log_path, "w", encoding="utf-8") as log:
                 log.flush()
                 if marker_test_passed in line:
                     test_passed = True
-                if marker_suite_passed in line:
+                if any(marker in line for marker in suite_markers):
                     suite_passed = True
+                if any(marker in line for marker in known_failure_markers):
+                    print(f"error: {success_label} saw known launch failure marker", file=sys.stderr)
+                    dump_automation_log()
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    time.sleep(2)
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    raise SystemExit(65)
                 if test_passed and suite_passed and success_at is None:
                     success_at = time.time()
                 continue
 
             if proc.poll() is not None:
+                if proc.returncode != 0:
+                    dump_automation_log()
                 raise SystemExit(proc.returncode)
 
             now = time.time()
@@ -675,6 +876,7 @@ with open(log_path, "w", encoding="utf-8") as log:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+                dump_automation_log()
                 print(f"error: {success_label} hit hard timeout before success markers", file=sys.stderr)
                 raise SystemExit(124)
 
@@ -693,6 +895,14 @@ PY
   else
     "${cmd[@]}"
     log "Result bundle: $result_bundle"
+  fi
+
+  if [[ $includes_ui -eq 1 ]]; then
+    if [[ -n "$previous_automation_log_path" ]]; then
+      export CHAINWORKS_UI_AUTOMATION_LOG_PATH="$previous_automation_log_path"
+    else
+      unset CHAINWORKS_UI_AUTOMATION_LOG_PATH
+    fi
   fi
 }
 
@@ -722,10 +932,14 @@ run_split_targeted_gate() {
 
 run_full_suite() {
   local stamp derived_data result_bundle
+  local -a signing_args=()
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/full-${stamp}-DerivedData"
   result_bundle="$TMP_BASE/full-${stamp}.xcresult"
   mkdir -p "$TMP_BASE"
+  while IFS= read -r -d '' arg; do
+    signing_args+=("$arg")
+  done < <(append_xcodebuild_signing_args "full" "1")
 
   log "Full gate: xcodebuild test"
   xcodebuild \
@@ -733,9 +947,11 @@ run_full_suite() {
     -project "$PROJECT_PATH" \
     -scheme "$SCHEME_NAME" \
     -destination "$DESTINATION" \
+    -parallel-testing-enabled NO \
+    -maximum-parallel-testing-workers 1 \
     -derivedDataPath "$derived_data" \
     -resultBundlePath "$result_bundle" \
-    "${UNSIGNED_BUILD_ARGS[@]}"
+    "${signing_args[@]}"
   log "Result bundle: $result_bundle"
 }
 
@@ -774,6 +990,11 @@ trap '
 ' EXIT
 
 GATE="${1:-list}"
+
+if should_wrap_gate_in_terminal_gui_session "$GATE"; then
+  run_gate_in_terminal_gui_session "$GATE"
+  exit $?
+fi
 
 case "$GATE" in
   list|-h|--help)

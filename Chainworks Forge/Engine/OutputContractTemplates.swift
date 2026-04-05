@@ -54,6 +54,8 @@ struct OutputContractTemplates {
             return (releaseBundleManifest(), .json)
         case "connect_upload_receipt_v1":
             return (connectUploadReceipt(), .json)
+        case "final_feature_report_v1":
+            return (finalFeatureReport(), .json)
         // Steward contracts (Proposal 003)
         case "sdlc_health_report_v1":
             return (sdlcHealthReport(), .json)
@@ -147,9 +149,9 @@ struct OutputContractTemplates {
     private static func proposalReviewSummary() -> Data {
         let json: [String: Any] = [
             "pass": true,
-            "average_score": 8.7,
-            "aggregate_score": 8.7,
-            "min_individual_score": 8.0,
+            "average_score": 9.25,
+            "aggregate_score": 9.25,
+            "min_individual_score": 9.1,
             "blocker_count": 0,
             "summary": "The proposal clears the review threshold and can move to approval.",
             "required_changes": [] as [String],
@@ -290,7 +292,7 @@ struct OutputContractTemplates {
 
     private static func auditReport() -> Data {
         let json: [String: Any] = [
-            "status": "pass",
+            "status": "Implemented",
             "matches_proposal": true,
             "missing_items": [] as [String],
             "extra_items": [] as [String],
@@ -326,7 +328,7 @@ struct OutputContractTemplates {
 
     private static func implementationReviewSummary() -> Data {
         let json: [String: Any] = [
-            "status": "pass",
+            "status": "Implemented",
             "open_blockers": 0,
             "must_fix": [] as [String],
             "recommended_next_step": "proceed_to_release"
@@ -392,7 +394,22 @@ struct OutputContractTemplates {
     private static func connectUploadReceipt() -> Data {
         let json: [String: Any] = [
             "status": "success",
-            "artifact_id": "sim-\(UUID().uuidString.prefix(8))"
+            "artifact_id": "sim-\(UUID().uuidString.prefix(8))",
+            "checksum": "deadbeef",
+            "destination": "App Store Connect"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func finalFeatureReport() -> Data {
+        let json: [String: Any] = [
+            "final_status": "completed",
+            "summary": "Workflow completed successfully with durable release evidence and final orchestration summary.",
+            "started_at": ISO8601DateFormatter().string(from: Date().addingTimeInterval(-300)),
+            "completed_at": ISO8601DateFormatter().string(from: Date()),
+            "duration_seconds": 300,
+            "total_cost": 12.34,
+            "cost_currency": "USD"
         ]
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }

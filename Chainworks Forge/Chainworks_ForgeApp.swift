@@ -5,7 +5,14 @@ import AppKit
 #endif
 
 private enum UIAutomationDiagnostics {
-    private static let logURL = URL(fileURLWithPath: "/tmp/chainworks-ui-automation.log")
+    private static let logURL: URL = {
+        let path = ProcessInfo.processInfo.environment["CHAINWORKS_UI_AUTOMATION_LOG_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let path, !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: "/tmp/chainworks-ui-automation.log")
+    }()
 
     static func log(_ message: String) {
         guard Chainworks_ForgeApp.isUIAutomationHost else { return }
@@ -119,6 +126,7 @@ struct Chainworks_ForgeApp: App {
     static let isTestHost = processEnvironment["XCTestConfigurationFilePath"] != nil
     static let isUIAutomationHost = processEnvironment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
     static let isUnitTestHost = isTestHost && !isUIAutomationHost
+    static let initialForcedUISurface = forcedUISurface(from: processEnvironment)
     fileprivate static let uiWindowSize = UITestWindowSize.requested ?? .default
     fileprivate static let uiAccessibilitySettings = UITestAccessibilitySettings.requested
     static let sharedModelContainer: ModelContainer = {
@@ -147,7 +155,7 @@ struct Chainworks_ForgeApp: App {
         ])
         let modelConfiguration = ModelConfiguration(
             schema: schema,
-            isStoredInMemoryOnly: environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
+            isStoredInMemoryOnly: environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" || isUIAutomationHost
         )
 
         do {
@@ -165,8 +173,13 @@ struct Chainworks_ForgeApp: App {
     /// to find (and click) elements hidden behind the wrong window — leading
     /// to indefinite hangs.
     init() {
-        if ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+        if Self.isUIAutomationHost || ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
             UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+            UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
+            Self.clearSavedWindowState()
+        }
+        if Self.isUIAutomationHost {
+            ProcessInfo.processInfo.disableAutomaticTermination("Chainworks Forge UI automation session")
         }
         UIAutomationDiagnostics.log(
             "app.init uiAutomation=\(Self.isUIAutomationHost) unitTest=\(Self.isUnitTestHost) " +
@@ -176,39 +189,93 @@ struct Chainworks_ForgeApp: App {
 
     var body: some Scene {
         Window("Chainworks Forge", id: "main-window") {
-            RootHostView()
+            RootHostView(forcedUISurface: Self.initialForcedUISurface)
+                .modifier(OptionalModelContainerModifier(enabled: Self.requiresSharedModelContainer(for: Self.initialForcedUISurface)))
         }
-        .modelContainer(Self.sharedModelContainer)
         .defaultSize(width: Self.uiWindowSize.width, height: Self.uiWindowSize.height)
     }
 
 }
 
+extension Chainworks_ForgeApp {
+    static func forcedUISurface(from environment: [String: String]) -> ContentView.UISurface? {
+        environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
+            .flatMap(ContentView.UISurface.init(rawValue:))
+    }
+
+    static func usesStandaloneUISurface(_ surface: ContentView.UISurface?) -> Bool {
+        surface == .proposal015Proof
+    }
+
+    static func requiresSharedModelContainer(for surface: ContentView.UISurface?) -> Bool {
+        !usesStandaloneUISurface(surface)
+    }
+
+    static func shouldCreateFallbackWindow(for surface: ContentView.UISurface?) -> Bool {
+        !usesStandaloneUISurface(surface)
+    }
+
+    fileprivate static func clearSavedWindowState() {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+        let savedStateURL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library/Saved Application State", isDirectory: true)
+            .appendingPathComponent("\(bundleIdentifier).savedState", isDirectory: true)
+        if FileManager.default.fileExists(atPath: savedStateURL.path) {
+            try? FileManager.default.removeItem(at: savedStateURL)
+        }
+    }
+}
+
 final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
     private var fallbackWindow: NSWindow?
 
+    private func hasVisibleWindow() -> Bool {
+        NSApp.windows.contains { window in
+            window.isVisible && !window.isMiniaturized
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard Chainworks_ForgeApp.isUIAutomationHost else { return }
-        UIAutomationDiagnostics.log("applicationDidFinishLaunching windows=\(NSApp.windows.count)")
+        let forcedUISurface = Chainworks_ForgeApp.forcedUISurface(from: Chainworks_ForgeApp.processEnvironment)
+        let directSurfaceRequested = forcedUISurface != nil
+        UIAutomationDiagnostics.log(
+            "applicationDidFinishLaunching windows=\(NSApp.windows.count) visible=\(hasVisibleWindow())"
+        )
+
+        if directSurfaceRequested {
+            UIAutomationDiagnostics.log("directSurfaceRequested fallbackWindowWillBeCreatedOnlyIfNoNativeWindowAppears")
+        }
+
+        if !Chainworks_ForgeApp.shouldCreateFallbackWindow(for: forcedUISurface) {
+            UIAutomationDiagnostics.log("fallbackWindowSuppressed directSurface=\(forcedUISurface?.rawValue ?? "nil")")
+            return
+        }
 
         Task { @MainActor in
-            if !NSApp.windows.isEmpty {
-                UIAutomationDiagnostics.log("nativeWindowDetected attempt=0 count=\(NSApp.windows.count)")
-                return
+            let retryDelays: [Duration] = directSurfaceRequested
+                ? [.zero, .milliseconds(300), .milliseconds(900)]
+                : [.zero, .milliseconds(100)]
+
+            for (attempt, delay) in retryDelays.enumerated() {
+                if delay != .zero {
+                    try? await Task.sleep(for: delay)
+                }
+
+                if hasVisibleWindow() {
+                    UIAutomationDiagnostics.log(
+                        "nativeWindowDetected attempt=\(attempt) count=\(NSApp.windows.count) visible=\(hasVisibleWindow())"
+                    )
+                    return
+                }
             }
 
-            try? await Task.sleep(for: .milliseconds(100))
-
-            if !NSApp.windows.isEmpty {
-                UIAutomationDiagnostics.log("nativeWindowDetected attempt=1 count=\(NSApp.windows.count)")
-                return
-            }
-
-            UIAutomationDiagnostics.log("creatingFallbackWindow")
+            UIAutomationDiagnostics.log(
+                "creatingFallbackWindow count=\(NSApp.windows.count) visible=\(hasVisibleWindow())"
+            )
 
             let hostingController = NSHostingController(
-                rootView: RootHostView()
-                    .modelContainer(Chainworks_ForgeApp.sharedModelContainer)
+                rootView: fallbackRootView(for: forcedUISurface)
             )
             let window = NSWindow(contentViewController: hostingController)
             window.title = "Chainworks Forge"
@@ -227,6 +294,12 @@ final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
             UIAutomationDiagnostics.log("fallbackWindowCreated windows=\(NSApp.windows.count) isVisible=\(window.isVisible)")
         }
     }
+
+    @MainActor
+    private func fallbackRootView(for forcedUISurface: ContentView.UISurface?) -> some View {
+        RootHostView(forcedUISurface: forcedUISurface)
+            .modifier(OptionalModelContainerModifier(enabled: Chainworks_ForgeApp.requiresSharedModelContainer(for: forcedUISurface)))
+    }
 }
 
 private struct UnitTestHostView: View {
@@ -236,17 +309,35 @@ private struct UnitTestHostView: View {
     }
 }
 
+private struct OptionalModelContainerModifier: ViewModifier {
+    let enabled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.modelContainer(Chainworks_ForgeApp.sharedModelContainer)
+        } else {
+            content
+        }
+    }
+}
+
 private struct RootHostView: View {
+    let forcedUISurface: ContentView.UISurface?
+
     var body: some View {
         Group {
             if Chainworks_ForgeApp.isUnitTestHost {
                 UnitTestHostView()
+            } else if Chainworks_ForgeApp.usesStandaloneUISurface(forcedUISurface) {
+                StandaloneProposal015HostView()
             } else {
                 AppBootstrapView()
             }
         }
         .task {
             guard Chainworks_ForgeApp.isUIAutomationHost else { return }
+            guard !Chainworks_ForgeApp.usesStandaloneUISurface(forcedUISurface) else { return }
             #if os(macOS)
             UIAutomationDiagnostics.log("rootHost.task.begin windows=\(NSApp.windows.count)")
             NSApp.setActivationPolicy(.regular)
@@ -279,6 +370,61 @@ private struct RootHostView: View {
             UIAutomationDiagnostics.log("rootHost.task.end windows=\(NSApp.windows.count)")
             #endif
         }
+    }
+}
+
+private struct StandaloneProposal015HostView: View {
+    var body: some View {
+        withRequestedWindowSizeMarker {
+            VStack(spacing: 0) {
+                Text("UI Test Surface: proposal015_proof")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .accessibilityIdentifier("ui-test-direct-surface-ready-proposal015_proof")
+
+                if let requestedWindowSize = UITestWindowSize.requested {
+                    Text("Window \(Int(requestedWindowSize.width))×\(Int(requestedWindowSize.height))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 4)
+                        .accessibilityIdentifier(requestedWindowSize.accessibilityIdentifier)
+                }
+
+                UITestProposal015ProofSurface()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 960, minHeight: 720)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("ui-test-direct-surface-container-proposal015_proof")
+    }
+
+    @ViewBuilder
+    private func withRequestedWindowSizeMarker<Content: View>(
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        content()
+            .environment(\.uiTestAccessibilitySettings, Chainworks_ForgeApp.uiAccessibilitySettings ?? .none)
+            .overlay(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: 1) {
+                    if let requestedWindowSize = UITestWindowSize.requested {
+                        Color.clear
+                            .frame(width: 1, height: 1)
+                            .accessibilityIdentifier(requestedWindowSize.accessibilityIdentifier)
+                    }
+
+                    if let requestedSettings = Chainworks_ForgeApp.uiAccessibilitySettings {
+                        ForEach(requestedSettings.activeIdentifiers, id: \.self) { identifier in
+                            Color.clear
+                                .frame(width: 1, height: 1)
+                                .accessibilityIdentifier(identifier)
+                        }
+                    }
+                }
+            }
     }
 }
 
@@ -321,7 +467,9 @@ struct AppBootstrapView: View {
         .flatMap(ContentView.UISurface.init(rawValue:))
 
     var body: some View {
-        if let service = executionService,
+        if forcedUISurface == .proposal015Proof {
+            proposal015ProofRoot()
+        } else if let service = executionService,
            let appConfigurationStore,
            let providerSettingsStore,
            let providerRegistry,
@@ -352,12 +500,30 @@ struct AppBootstrapView: View {
         let isUIAutomationHost = environment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
         let isUnitTestHost = isTestHost && !isUIAutomationHost
         let forceLiveRuntimeUnavailable = environment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] == "1"
-        let disableEagerUITestBootstrap = isUIAutomationHost && environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1"
-        let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled
-        let isProposal022AppProofAutorun = Proposal022AppProofAutorun.isEnabled
+        let hasDirectUISurface = !(environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty ?? true)
+        var bootstrapEnvironment = environment
+        if isUIAutomationHost &&
+            (hasDirectUISurface ||
+             environment["CHAINWORKS_WORKFLOW_SOURCE_PATH"] != nil ||
+             environment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"] != nil) {
+            // UI proof lanes must honor the synced-tree fixtures even when the host machine
+            // has a persisted app configuration from unrelated local usage.
+            bootstrapEnvironment["CHAINWORKS_ALLOW_ENV_OVERRIDE"] = "1"
+        }
+        let suppressProposalAutoruns = isUIAutomationHost || hasDirectUISurface
+        let disableEagerUITestBootstrap = isUIAutomationHost &&
+            (environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1" || hasDirectUISurface)
+        let skipBackgroundBootstrap = disableEagerUITestBootstrap || (isUIAutomationHost && hasDirectUISurface)
+        let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled && !suppressProposalAutoruns
+        let isProposal022AppProofAutorun = Proposal022AppProofAutorun.isEnabled && !suppressProposalAutoruns
 
         let appConfigurationStore = AppConfigurationStore()
-        let resolvedConfiguration = BootstrapConfigurationResolver.resolve(store: appConfigurationStore)
+        let resolvedConfiguration = BootstrapConfigurationResolver.resolve(
+            store: appConfigurationStore,
+            environment: bootstrapEnvironment
+        )
         let providerSettingsStore = ProviderSettingsStore()
         let providerRegistry = ProviderRegistry(settingsStore: providerSettingsStore)
         let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
@@ -403,7 +569,7 @@ struct AppBootstrapView: View {
         Self.seedWorkflowMapRunIfRequested(modelContext: modelContext)
         Self.seedReleaseGateRunIfRequested(modelContext: modelContext)
 
-        if !isUnitTestHost && !isProposal022AppProofAutorun {
+        if !isUnitTestHost && !isProposal022AppProofAutorun && !skipBackgroundBootstrap {
             let compiler = RunPlanCompiler(modelContext: modelContext)
             service.resumeInterruptedRuns(compiler: compiler)
 
@@ -419,7 +585,7 @@ struct AppBootstrapView: View {
             }
         }
 
-        if shouldPresentFirstRunWizard(
+        if !isUIAutomationHost && shouldPresentFirstRunWizard(
             configuration: resolvedConfiguration,
             providerSettings: providerSettingsStore.settings
         ) {
@@ -627,6 +793,38 @@ struct AppBootstrapView: View {
                     }
             }
         }
+    }
+
+    @ViewBuilder
+    private func proposal015ProofRoot() -> some View {
+        // Proposal 015's proof surface is fully fixture-backed and does not depend on
+        // runtime/provider bootstrap. Keep this path minimal so approved-host UI proof
+        // does not fail behind unrelated Goose/provider initialization.
+        withRequestedWindowSizeMarker {
+            VStack(spacing: 0) {
+                Text("UI Test Surface: proposal015_proof")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .accessibilityIdentifier("ui-test-direct-surface-ready-proposal015_proof")
+
+                if let requestedWindowSize = UITestWindowSize.requested {
+                    Text("Window \(Int(requestedWindowSize.width))×\(Int(requestedWindowSize.height))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 4)
+                        .accessibilityIdentifier(requestedWindowSize.accessibilityIdentifier)
+                }
+
+                UITestProposal015ProofSurface()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 960, minHeight: 720)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("ui-test-direct-surface-container-proposal015_proof")
     }
 
     @ViewBuilder

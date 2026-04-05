@@ -16,7 +16,9 @@ struct RunReportView: View {
     @State private var selectedTab: ReportTab = .latestSummary
     @State private var reportArtifacts: [Artifact] = []
     @State private var summaryContent: String?
+    @State private var summaryArtifact: Artifact?
     @State private var selectedReportContent: String?
+    @State private var selectedReportArtifact: Artifact?
     @State private var strategyRecommendation: StrategyRecommendation?
     @State private var strategyPairComparison: RunComparison?
     // Proposal 008 (REQ-012): Loading/timeout/retry states for report surfaces.
@@ -193,10 +195,11 @@ struct RunReportView: View {
                     .accessibilityIdentifier("report-retry-button")
             }
         } else if let content = summaryContent {
-            Text(content)
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-                .padding()
+            ArtifactContentRenderer(
+                content: content,
+                context: summaryArtifact.map { .artifactBacked(artifact: $0, run: run) } ?? .explicit(format: .markdown)
+            )
+            .padding()
         } else {
             ContentUnavailableView(
                 "No Summary",
@@ -227,10 +230,11 @@ struct RunReportView: View {
 
                 if let content = selectedReportContent {
                     Divider()
-                    Text(content)
-                        .font(.body.monospaced())
-                        .textSelection(.enabled)
-                        .padding()
+                    ArtifactContentRenderer(
+                        content: content,
+                        context: selectedReportArtifact.map { .artifactBacked(artifact: $0, run: run) } ?? .explicit(format: .report)
+                    )
+                    .padding()
                 }
             }
             .padding()
@@ -417,6 +421,7 @@ struct RunReportView: View {
                 }
             )
             if let summaryArtifact = try? modelContext.fetch(summaryDescriptor).first {
+                self.summaryArtifact = summaryArtifact
                 do {
                     summaryContent = try sloProbe.measure(
                         artifactName: summaryArtifact.name,
@@ -480,11 +485,14 @@ struct RunReportView: View {
     /// Proposal 008 (REQ-012): Retry report retrieval after error or timeout.
     private func retryLoadReport() {
         summaryContent = nil
+        summaryArtifact = nil
         selectedReportContent = nil
+        selectedReportArtifact = nil
         loadReportData()
     }
 
     private func loadReportContent(_ artifact: Artifact) {
+        selectedReportArtifact = artifact
         // Proposal 008 (PERF-080): Measure report retrieval latency.
         selectedReportContent = try? sloProbe.measure(
             artifactName: artifact.name,

@@ -363,6 +363,14 @@ struct CompletedRunExportHub: View {
             .buttonStyle(.bordered)
             .disabled(worktreeRoot.isEmpty)
             .accessibilityIdentifier("completed-run-open-worktree")
+            Button {
+                ArtifactPathClipboard.copy(path: worktreeRoot)
+            } label: {
+                Label("Copy Path", systemImage: "doc.on.clipboard")
+            }
+            .buttonStyle(.bordered)
+            .disabled(worktreeRoot.isEmpty)
+            .accessibilityIdentifier("completed-run-copy-worktree")
         }
     }
 
@@ -396,6 +404,16 @@ struct CompletedRunExportHub: View {
             .buttonStyle(.bordered)
             .disabled(artifact == nil)
             .accessibilityIdentifier(accessibilityIdentifier)
+            Button {
+                if let artifact {
+                    ArtifactPathClipboard.copy(path: artifact.filePath)
+                }
+            } label: {
+                Label("Copy Path", systemImage: "doc.on.clipboard")
+            }
+            .buttonStyle(.bordered)
+            .disabled(artifact == nil)
+            .accessibilityIdentifier(accessibilityIdentifier.replacingOccurrences(of: "-open-", with: "-copy-"))
         }
     }
 

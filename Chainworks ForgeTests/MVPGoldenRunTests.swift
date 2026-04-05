@@ -6,6 +6,28 @@ import SwiftData
 @MainActor
 @Suite("MVP Golden Run", .serialized, .tags(.live))
 struct MVPGoldenRunTests {
+    private func encodeFixtureProviderBindings(for plan: RunPlan) throws -> Data {
+        let bindings = Dictionary(uniqueKeysWithValues: plan.agentBindings.map { agentID, agent in
+            let family = ProviderFamily.from(runtimeIdentifier: agent.provider) ?? .claude
+            let binding = ResolvedProviderBinding(
+                agentID: agentID,
+                backendProfileID: agent.backendProfileID,
+                configuredProviderID: UUID(),
+                providerFamily: family.rawValue,
+                providerIdentifier: family.runtimeProviderIdentifier,
+                model: agent.model,
+                effort: agent.effort,
+                transport: ProviderTransport.gooseServer.rawValue,
+                adapterVersion: "fixture-v1"
+            )
+            return (agentID, binding)
+        })
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(bindings)
+    }
+
     @Test("full-mvp-live reaches workflow_complete with fixture transport")
     func fullMVPLiveReachesWorkflowComplete() async throws {
         let (_, context) = try makeTestModelContainer()
@@ -20,8 +42,12 @@ struct MVPGoldenRunTests {
             for: idea,
             plan: plan,
             workflowSourcePath: "test/full-mvp-live.yaml",
-            catalogSourcePath: "test/agents.yaml"
+            catalogSourcePath: "test/agents.yaml",
+            startSnapshot: RunStartSnapshot(
+                providerBindingSnapshotJSON: try encodeFixtureProviderBindings(for: plan)
+            )
         )
+        #expect(run.providerBindingSnapshotJSON != nil)
         let transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
         let executor = GooseAgentExecutor(transport: transport)
         let liveConfiguration = LiveRuntimeConfiguration(
@@ -57,9 +83,11 @@ struct MVPGoldenRunTests {
         }
 
         #expect(run.status == .completed)
+        let artifactManager = ArtifactManager(modelContext: context)
+        let artifactNames = Set(try artifactManager.artifacts(forRunID: run.id).map(\.name))
         #expect(
-            run.currentStageID == "state_11_manual_release" || run.currentStageID == "state_12_workflow_complete",
-            "Completed full-MVP runs currently persist the last executed state ID; reaching the terminal end state may leave currentStageID at manual release."
+            artifactNames.isSuperset(of: ["release_manifest", "git_push_receipt", "connect_upload_receipt", "delivery_receipt"]),
+            "Completed full-MVP runs must persist the release and delivery artifacts that prove the manual-release and terminal workflow steps executed."
         )
     }
 }

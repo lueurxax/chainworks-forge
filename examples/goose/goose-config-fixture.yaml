@@ -1,0 +1,73 @@
+extensions:
+  developer:
+    enabled: false
+    type: builtin
+    name: developer
+  analyze:
+    enabled: false
+    type: builtin
+    name: analyze
+  todo:
+    enabled: false
+    type: builtin
+    name: todo
+  xcode:
+    enabled: false
+    type: builtin
+    name: xcode
+  context7:
+    enabled: false
+    type: builtin
+    name: context7
+  summarize:
+    enabled: false
+    type: builtin
+    name: summarize
+  summon:
+    enabled: false
+    type: builtin
+    name: summon
+  autovisualiser:
+    enabled: false
+    type: builtin
+    name: autovisualiser
+  tom:
+    enabled: false
+    type: builtin
+    name: tom
+  extensionmanager:
+    enabled: false
+    type: builtin
+    name: extensionmanager
+  apps:
+    enabled: false
+    type: builtin
+    name: apps
+  chatrecall:
+    enabled: false
+    type: builtin
+    name: chatrecall
+  code_execution:
+    enabled: false
+    type: builtin
+    name: code_execution
+  computercontroller:
+    enabled: false
+    type: builtin
+    name: computercontroller
+  memory:
+    enabled: false
+    type: builtin
+    name: memory
+  tutorial:
+    enabled: false
+    type: builtin
+    name: tutorial
+  chromedevtools:
+    enabled: false
+    type: builtin
+    name: chromedevtools
+  orchestrator:
+    enabled: false
+    type: builtin
+    name: orchestrator

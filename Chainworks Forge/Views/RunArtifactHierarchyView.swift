@@ -189,49 +189,64 @@ struct RunArtifactHierarchyView: View {
     }
 
     private func artifactRow(for leaf: RunArtifactLeaf) -> some View {
-        Button {
-            if let artifact = artifactResolver(leaf.artifactID) {
-                onOpenArtifact(artifact)
-            }
-        } label: {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(leaf.name)
-                            .font(.subheadline)
-                        if leaf.isLatestSummaryReport {
-                            statusBadge("Latest Summary", color: DesignTokens.Status.warning)
-                        }
-                        if leaf.isLatestImmutableReport {
-                            statusBadge("Immutable Report", color: DesignTokens.Status.success)
-                        }
-                        if leaf.isPinned {
-                            statusBadge("Pinned", color: DesignTokens.Action.primary)
-                        }
-                    }
-
-                    Text("\(leaf.contractID) · \(leaf.format.rawValue)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-
-                    if let reportKind = leaf.reportKind {
-                        Text("reportKind: \(reportKind)\(leaf.reportVersion.map { " · v\($0)" } ?? "")")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
+        HStack(alignment: .top, spacing: 10) {
+            Button {
+                if let artifact = artifactResolver(leaf.artifactID) {
+                    onOpenArtifact(artifact)
                 }
+            } label: {
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(leaf.name)
+                                .font(.subheadline)
+                            if leaf.isLatestSummaryReport {
+                                statusBadge("Latest Summary", color: DesignTokens.Status.warning)
+                            }
+                            if leaf.isLatestImmutableReport {
+                                statusBadge("Immutable Report", color: DesignTokens.Status.success)
+                            }
+                            if leaf.isPinned {
+                                statusBadge("Pinned", color: DesignTokens.Action.primary)
+                            }
+                        }
 
-                Spacer()
+                        Text("\(leaf.contractID) · \(leaf.format.rawValue)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
 
-                Text(leaf.createdAt, format: .dateTime.hour().minute().second())
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                        if let reportKind = leaf.reportKind {
+                            Text("reportKind: \(reportKind)\(leaf.reportVersion.map { " · v\($0)" } ?? "")")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+
+                    Spacer()
+
+                    Text(leaf.createdAt, format: .dateTime.hour().minute().second())
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("artifact-button-\(leaf.name)")
+
+            Button {
+                if let path = artifactResolver(leaf.artifactID)?.filePath ?? leaf.fileURL?.path {
+                    ArtifactPathClipboard.copy(path: path)
+                }
+            } label: {
+                Label("Copy Path", systemImage: "doc.on.clipboard")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Copy path for \(leaf.name)")
+            .disabled((artifactResolver(leaf.artifactID)?.filePath ?? leaf.fileURL?.path) == nil)
+            .accessibilityIdentifier("artifact-copy-path-\(leaf.name)")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("artifact-button-\(leaf.name)")
     }
 
     private func artifactChip(for leaf: RunArtifactLeaf) -> some View {

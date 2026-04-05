@@ -423,7 +423,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             agent: agent,
             catalog: catalog,
             providerBinding: context.providerBinding,
-            gooseRegistry: gooseRegistry
+            gooseRegistry: gooseRegistry,
+            runtimeNamespaceOverride: sessionBridge.transport.mcpRuntimeNamespace
         )
     }
 
@@ -532,6 +533,14 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         }
 
         let failureMsg = failureMessage(for: canonicalOutcome, fallback: surfacedErrorMessage)
+        salvaged = ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
+            existingOutputs: salvaged,
+            expectedOutputs: expectedOutputs,
+            agent: agent,
+            context: context,
+            failureSummary: failureMsg
+        )
+        let finalOutputPresence: OutputPresence = salvaged.isEmpty ? .none : .durableOutput
         let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: nil,
@@ -552,14 +561,14 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(failureMsg)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
             providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: "goose", costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
             resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: finalOutputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
             mcpProfileID: sessionInfo.mcpResolution.profileID,
             requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
             effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
             deniedMCPExtensions: sessionInfo.mcpResolution.deniedExtensions,
             mcpSessionStartupLatencyMilliseconds: sessionInfo.execution.startupLatencyMilliseconds,
             mcpServerMetrics: mcpServerMetrics,
-            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: outputPresence, rawErrorMessage: rawErrorMessage, rawFinishEvent: nil),
+            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: finalOutputPresence, rawErrorMessage: rawErrorMessage, rawFinishEvent: nil),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
     }
@@ -676,9 +685,31 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             if let primary = expectedOutputs.first { outputs[primary] = content.data(using: .utf8) ?? Data() }
         }
 
+        let initialOutputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
+        let canonicalOutcome = classifyCompletedStreamOutcome(
+            outputPresence: initialOutputPresence,
+            finishReason: streamResult.finishReason,
+            hadExplicitFinalOutput: streamResult.finalContent != nil
+        )
+
+        let initialMissingOutputs = expectedOutputs.filter { outputs[$0] == nil }
+        let initialError: String? = if !initialMissingOutputs.isEmpty {
+            "Required outputs missing: \(initialMissingOutputs.joined(separator: ", "))"
+        } else if canonicalOutcome != .completed {
+            failureMessage(for: canonicalOutcome, fallback: "Execution did not produce final output")
+        } else {
+            nil
+        }
+
+        outputs = ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
+            existingOutputs: outputs,
+            expectedOutputs: expectedOutputs,
+            agent: agent,
+            context: context,
+            failureSummary: initialError ?? "Execution stopped before producing all required implementation artifacts."
+        )
+
         let outputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
-        let canonicalOutcome = classifyCompletedStreamOutcome(outputPresence: outputPresence, finishReason: streamResult.finishReason, hadExplicitFinalOutput: streamResult.finalContent != nil)
-        
         let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
         let finalOutcome: AgentCanonicalOutcome = !missingOutputs.isEmpty ? (canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome) : canonicalOutcome
         let finalError: String? = if !missingOutputs.isEmpty {

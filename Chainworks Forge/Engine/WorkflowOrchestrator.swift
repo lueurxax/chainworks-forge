@@ -261,7 +261,7 @@ final class WorkflowOrchestrator {
             }
 
             // Check for end state
-            if state.type == .end {
+            if state.type == .end && !stateHasExecutableWork(state) {
                 RuntimeDiagnostics.log("executeStateMachine reachedEnd stateID=\(state.id)")
                 run.status = .completed
                 run.completedAt = Date()
@@ -286,6 +286,17 @@ final class WorkflowOrchestrator {
                 handleFailure(state: state)
                 return
             case .succeeded:
+                if state.type == .end {
+                    RuntimeDiagnostics.log("executeStateMachine completedTerminalEndState stateID=\(state.id)")
+                    run.status = .completed
+                    run.completedAt = Date()
+                    persistDeliveryReceiptIfNeeded(finalStateID: state.id)
+                    persistFinalFeatureReportIfNeeded(finalStateID: state.id)
+                    persistDeclarativeCoverageIfNeeded(finalStateID: state.id)
+                    isRunning = false
+                    onComplete?(true)
+                    return
+                }
                 break // Continue to transition evaluation
             }
 
@@ -336,6 +347,10 @@ final class WorkflowOrchestrator {
         case succeeded
         case failed
         case paused // waiting for approval
+    }
+
+    private func stateHasExecutableWork(_ state: ExecutableState) -> Bool {
+        state.runBlock != nil || state.runAfterApproval != nil || state.approvalRequired
     }
 
     // MARK: - Execute State
@@ -1021,6 +1036,9 @@ final class WorkflowOrchestrator {
 
     private func shouldTreatAfterOutputFailureAsRecoveredSuccess(_ result: AgentResult) -> Bool {
         guard result.outputPresence == .durableOutput else { return false }
+        if ImplementationFailureArtifactSynthesizer.containsRecoverableArtifactSet(result.outputs) {
+            return true
+        }
         let canonicalOutcome = result.canonicalOutcome ?? (result.succeeded ? .completed : .failedBeforeOutput)
         switch canonicalOutcome {
         case .timedOutAfterOutput, .completedWithTransportError, .limitExhaustedAfterOutput:

@@ -422,10 +422,11 @@ struct RunComparisonView: View {
                 }
                 if let content = binding.resolvedSkillContent, !content.isEmpty {
                     DisclosureGroup("Resolved Skill Content") {
-                        Text(content)
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                            .padding(.top, 2)
+                        ArtifactContentRenderer(
+                            content: content,
+                            context: .explicit(format: .markdown)
+                        )
+                        .padding(.top, 2)
                     }
                     .font(.caption2)
                 }
