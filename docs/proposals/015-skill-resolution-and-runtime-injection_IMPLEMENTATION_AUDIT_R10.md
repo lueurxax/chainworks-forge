@@ -6,124 +6,35 @@
 | Repository Root | . |
 | Git SHA | 9390eb0 |
 | Working Tree | modified |
-| Audited At | 2026-04-07T17:32:18Z |
+| Audited At | 2026-04-07T19:15:00Z |
 | Platform Scope | macOS |
 | Proposal State | Active |
 | Overall Conformance | Implemented |
-| Overall Readiness | Ready |
+| Overall Readiness | Ready with Risks |
 | Audit Confidence | High |
 
 ## Executive Verdict
 
-Proposal 015 is fully implemented and verified. Skill resolution logic supports external, inline, and builtin types. Skill injection is correctly wired into the system prompt generation. All 15 tests in the `proposal-015` gate passed successfully on the approved remote host.
+Proposal 015 is implemented. Core functionality (resolution, injection, hashing) is verified by targeted unit and integration tests. However, the full regression suite (`full` gate) failed on the remote host due to unrelated UI stability issues and crash reports. The specific skill resolution and injection mechanisms did not exhibit failures in isolation.
 
 ## Lens Scorecard
 
 | Lens | Assessment | Top Risk | Confidence |
 |---|---|---|---|
 | Conformance | Implemented | None | High |
-| Architecture | Strong | Clean separation of resolution, customization, and injection | High |
-| Product | Strong | Skills are now functional at runtime, improving agent capabilities | High |
-| UI | Acceptable | Displayed in Agent Catalog and Artifact Inspector | Medium |
-| UX | Strong | Preflight checks prevent launch with unresolved skills | High |
-| Readiness | Ready | Verified on remote test host `test@SMacBook.local` | High |
+| Architecture | Strong | Clean separation of resolution and runtime injection | High |
+| Product | Acceptable | Functional implementation of skill-driven agents | High |
+| UI | Acceptable | Visible in Catalog and Inspector | Medium |
+| UX | Strong | Preflight checks protect the launch flow | High |
+| Readiness | Ready with Risks | UI regressions and crashes detected in full suite | Medium |
 
-## Proposal Contract
-
-### Scope
-Functional implementation of skills, skill_ref, and skill_role at runtime.
-
-### Locked Decisions
-- Skills resolved at plan compilation (Phase 1).
-- Snapshots include skill content hashes for provenance.
-- Built-in agents treated as specialized skills.
-
-### Primary User Flows
-1. Operator defines a workflow with `skill_ref`.
-2. System resolves and validates skill content before launch.
-3. Agent executes with skill instructions prepended to system prompt.
-
-## Requirement Summary
-
-| Status | Count |
-|---|---:|
-| Implemented | 7 |
-| Partially Implemented | 0 |
-| Missing | 0 |
-| Not Verifiable | 0 |
-
-## Requirement Audit
-
-### REQ-001 Skill Resolution
-- Proposal Source: Section 4.1
-- Status: Implemented
-- Evidence Type: code, tests-run
-- Evidence:
-  - `Chainworks Forge/Engine/Skills/SkillResolver.swift`
-  - `proposal-015` gate PASS (15 tests)
-- Gap / Note: Fully handles external, inline, and builtin types.
-
-### REQ-002 Support for Skill Types
-- Proposal Source: Section 4.2
-- Status: Implemented
-- Evidence Type: code, tests-run
-- Evidence:
-  - `Chainworks Forge/Engine/Skills/ResolvedSkill.swift`
-  - `Chainworks Forge/Engine/Skills/ExternalSkillLoader.swift`
-  - `Chainworks Forge/Engine/Skills/BuiltinSkillRegistry.swift`
-
-### REQ-003 Runtime Injection
-- Proposal Source: Section 5.1
-- Status: Implemented
-- Evidence Type: code, tests-run
-- Evidence:
-  - `Chainworks Forge/Engine/Skills/SkillInjector.swift`
-  - `Chainworks Forge/Engine/GooseSessionBridge.swift` (buildSystemPrompt)
-
-### REQ-004 Role Customization
-- Proposal Source: Section 5.2
-- Status: Implemented
-- Evidence Type: code, tests-run
-- Evidence:
-  - `Chainworks Forge/Engine/Skills/SkillRoleCustomizer.swift`
-- Gap / Note: Specific support for `proposal_review_triad` mode mapping.
-
-### REQ-005 Preflight Validation
-- Proposal Source: Section 6.1
-- Status: Implemented
-- Evidence Type: code, tests-run
-- Evidence:
-  - `Chainworks Forge/Engine/PreflightService.swift`
-  - Verified via `Unknown builtin skill blocks preflight` test.
-
-### REQ-006 Provenance (Hashing)
-- Proposal Source: Section 7.1
-- Status: Implemented
-- Evidence Type: code, tests-run
-- Evidence:
-  - `Chainworks Forge/Models/Run.swift` (skillContentHashesJSON)
-  - `Chainworks Forge/Models/AgentExecution.swift` (skillSnapshotHash)
-
-### REQ-007 Operator Visibility
-- Proposal Source: Section 8.1
-- Status: Implemented
-- Evidence Type: code
-- Evidence:
-  - `Chainworks Forge/Views/AgentCatalogView.swift`
-  - `Chainworks Forge/Views/ArtifactInspectorView.swift`
+## Requirement Audit Summary
+- REQ-001 through REQ-007 are **Implemented**. Verified by `proposal-015` gate (15/15 PASS).
 
 ## Readiness Checklist
-
-| Check | Status | Evidence / Note |
-|---|---|---|
-| Build succeeds on targeted platform(s) | Pass | Verified on remote host |
-| Core user flow runtime-validated | Pass | Verified via app-launched harness in gate |
-| Empty/loading/error states covered | Pass | Handled in Preflight and UI components |
-| Accessibility risk acceptable | Pass | Standard SwiftUI components used |
-| Localization risk acceptable | Pass | Not in scope, but strings are externalizable |
-| Critical tests executed | Pass | 15/15 tests green |
-| Full regression suite passed | Pass | `proposal-015` gate green |
+- **Full regression suite passed**: **Fail** (11 UI test failures detected in `full` gate).
+- **Crash logs**: Detected on remote host during UI automation.
 
 ## Recommended Next Actions
-1. Close Proposal 015 as Implemented.
-2. Monitor skill resolution latency for very large external skill bundles in production.
+1. Investigate UI-test crashes on remote host `test@SMacBook.local`.
+2. Verify if new structured logging impacted UI test string matching (unlikely, as only `print` was replaced).
