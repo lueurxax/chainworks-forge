@@ -320,6 +320,7 @@ Must additionally support enough evidence for Forge live surfaces:
 
 - **Claude Agent ACP** -> current best **operator-grade** candidate
 - **Gemini CLI ACP** -> strong **control-capable** and near-operator-grade native candidate
+- **Codex ACP** -> strong **control-capable** candidate with strong replay/session truth, but incomplete live tool/callback/MCP settlement proof
 - **Auggie** -> strong second-wave control candidate
 - **Junie** -> strong second-wave control candidate
 - **OpenCode** -> strong broader runtime, but ACP still below operator-grade for Forge
@@ -374,8 +375,9 @@ Minimum first-wave runtimes:
 
 ## 10. Follow-up proposal
 
-The next ACP runtime expansion proposal should introduce:
+The next ACP runtime expansion proposal ([Proposal 029](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md)) should introduce:
 
+- Codex ACP
 - Auggie CLI ACP
 - Junie CLI ACP
 
@@ -396,7 +398,7 @@ The current best path is:
 - make ACP the long-term transport direction,
 - add ACP support through runtime profiles,
 - ship first-wave adapters for Claude Agent ACP and Gemini CLI ACP,
-- then expand to Auggie and Junie in the next proposal.
+- then expand to Codex ACP, Auggie, and Junie in the next proposal.
 
 This path is additive, realistic, and consistent with the current evidence.
 

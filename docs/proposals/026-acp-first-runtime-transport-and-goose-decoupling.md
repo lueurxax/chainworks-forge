@@ -271,6 +271,7 @@ Current rollout posture:
   - Claude Agent ACP
   - Gemini CLI ACP
 - second-wave candidates for follow-up proposal:
+  - Codex ACP
   - Auggie CLI ACP
   - Junie CLI ACP
 
@@ -490,7 +491,8 @@ Proposal 026 does **not** authorize a parallel runtime-diagnostics truth lane ou
 After the first-wave seam is proven:
 
 - add second-wave runtimes through a follow-up proposal
-- likely next candidates:
+- likely next candidates in [Proposal 029](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md):
+  - Codex ACP
   - Auggie CLI ACP
   - Junie CLI ACP
 - defer any Goose-default removal or broader cutover decision until after that evidence exists
@@ -546,6 +548,7 @@ Current ranking from the research round in
 
 - Claude Agent ACP
 - Gemini CLI ACP
+- Codex ACP
 - Auggie CLI ACP
 - Junie CLI ACP
 - Cline CLI ACP
@@ -555,7 +558,7 @@ Current ranking from the research round in
 Implications for Proposal 026:
 
 - Claude and Gemini are strong enough for the first additive wave
-- Auggie and Junie are strong enough to justify a second-wave proposal
+- Codex, Auggie, and Junie are strong enough to justify a second-wave proposal
 - OpenCode remains strategically interesting, but not the right first target for operator-grade parity
 - Goose ACP remains a bridge/reference, not a long-term target runtime
 
