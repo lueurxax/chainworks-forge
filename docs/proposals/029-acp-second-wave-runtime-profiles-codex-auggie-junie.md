@@ -197,6 +197,7 @@ Proposal 029 is complete when:
 5. Run snapshots and execution reports preserve persisted truth consistently across default/second-wave profiles.
 6. Preflight blocks unsafe MCP contracts based on provider-specific capability declarations.
 7. Proposal documentation explicitly records remaining evidence gaps per provider (tool callbacks, replay durability, and persisted mutation truth).
+8. Once these three providers ship and complete same-tree proof, the implementation enters transport simplification phase in [Proposal 030](030-remove-goose-from-canonical-transport-and-simplify-runtime.md).
 
 ---
 

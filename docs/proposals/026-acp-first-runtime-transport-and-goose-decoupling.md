@@ -611,7 +611,8 @@ Concretely:
   - Claude Agent ACP
   - Gemini CLI ACP
 - preserve execution truth, report truth, recovery truth, and MCP truth as Forge-owned surfaces,
-- defer Auggie and Junie to the next expansion proposal once the first-wave seam is proven.
+- defer Codex, Auggie, and Junie to the next expansion proposal ([Proposal 029](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md)) once the first-wave seam is proven.
+- transition to canonical transport simplification in [Proposal 030](030-remove-goose-from-canonical-transport-and-simplify-runtime.md) after Proposal 029 is implemented and proven.
 
 This path is lower-risk, more honest to the current evidence, and avoids two bad outcomes:
 

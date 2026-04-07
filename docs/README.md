@@ -63,6 +63,9 @@ Active work that is not yet fully promoted into `reference/` lives under [`propo
 - [proposals/021-run-transition-notifications-and-attention-routing.md](proposals/021-run-transition-notifications-and-attention-routing.md)
 - [proposals/023-loop-improvement-analytics-and-iteration-progression.md](proposals/023-loop-improvement-analytics-and-iteration-progression.md)
 - [proposals/025-per-agent-mcp-policy-and-runtime-validation.md](proposals/025-per-agent-mcp-policy-and-runtime-validation.md)
+- [proposals/026-acp-first-runtime-transport-and-goose-decoupling.md](proposals/026-acp-first-runtime-transport-and-goose-decoupling.md)
+- [proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md)
+- [proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md](proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md)
 
 ## Examples
 

@@ -398,7 +398,13 @@ The current best path is:
 - make ACP the long-term transport direction,
 - add ACP support through runtime profiles,
 - ship first-wave adapters for Claude Agent ACP and Gemini CLI ACP,
-- then expand to Codex ACP, Auggie, and Junie in the next proposal.
+- then expand to Codex ACP, Auggie, and Junie in Proposal 029.
+
+After the second-wave implementation is in place and proven, execution simplification should be handled by [Proposal 030](030-remove-goose-from-canonical-transport-and-simplify-runtime.md):
+
+- remove Goose as the canonical transport implementation
+- keep only compatibility-facing Goose adapter code where explicitly needed
+- simplify transport dispatch to one primary ACP path with capability-gated fallback
 
 This path is additive, realistic, and consistent with the current evidence.
 
