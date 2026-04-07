@@ -718,12 +718,12 @@ struct BlockedRunRecoveryView: View {
     @MainActor
     private func beginExecuteRecoveryAction(_ action: RecoveryAction) {
         guard !isExecuting else {
-            print("[Recovery] Action blocked: isExecuting=true (action: \(action.label))")
+            ForgeLogger.recovery.info("Action blocked: isExecuting=true (action: \(action.label))")
             return
         }
         isExecuting = true
         errorMessage = nil
-        print("[Recovery] Starting action: \(action.label)")
+        ForgeLogger.recovery.info("Starting action: \(action.label)")
 
         Task { @MainActor in
             await executeRecoveryAction(action)
@@ -737,12 +737,12 @@ struct BlockedRunRecoveryView: View {
         do {
             switch action {
             case .retryAgent(let stageID, let agentID):
-                print("[Recovery] retryAgent: stage=\(stageID) agent=\(agentID) run.status=\(run.status.rawValue)")
+                ForgeLogger.recovery.debug("retryAgent: stage=\(stageID) agent=\(agentID) run.status=\(run.status.rawValue)")
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
-                print("[Recovery] retryAgent succeeded, now calling resumeRun")
+                ForgeLogger.recovery.debug("retryAgent succeeded, now calling resumeRun")
                 let compiler = RunPlanCompiler(modelContext: modelContext)
                 try executionService.resumeRun(run: run, compiler: compiler)
-                print("[Recovery] resumeRun succeeded, dismissing")
+                ForgeLogger.recovery.debug("resumeRun succeeded, dismissing")
                 dismiss()
 
             case .retryAggregateStep(let stageID, let agentID):
@@ -801,12 +801,12 @@ struct BlockedRunRecoveryView: View {
                 return
             }
         } catch {
-            print("[Recovery] Action failed: \(error)")
+            ForgeLogger.recovery.error("Action failed: \(error)")
             errorMessage = error.localizedDescription
         }
 
         isExecuting = false
-        print("[Recovery] Action complete, isExecuting=false, errorMessage=\(errorMessage ?? "nil")")
+        ForgeLogger.recovery.info("Action complete, isExecuting=false, errorMessage=\(errorMessage ?? "nil")")
     }
 
     @MainActor

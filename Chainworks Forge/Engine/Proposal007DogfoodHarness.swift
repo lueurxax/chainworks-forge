@@ -87,7 +87,7 @@ final class Proposal007DogfoodHarness {
 
         let startOptions = RunStartOptions.empty
         let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
-        let bindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions)
+        let bindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions, runtimeProfiles: catalog.runtimeProfiles)
         try ensureNoCrossFamilyMismatches(bindings: bindings)
         let adjustedPlan = RunStartOverrideResolver.applying(bindings: bindings, to: compiledPlan)
         let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)

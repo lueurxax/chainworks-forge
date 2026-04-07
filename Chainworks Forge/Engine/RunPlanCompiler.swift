@@ -253,6 +253,9 @@ final class RunPlanCompiler {
                 sessionFamilyID: agentDef.sessionFamilyID,
                 runtimeProfileID: backend.runtimeProfile
             )
+            if backend.runtimeProfile != nil {
+                ForgeLogger.compiler.debug("Agent \(agentDef.id) -> backendProfile=\(agentDef.backendProfile), runtimeProfile=\(backend.runtimeProfile ?? "nil")")
+            }
         }
 
         return bindings

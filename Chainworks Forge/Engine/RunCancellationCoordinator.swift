@@ -180,11 +180,15 @@ final class RunCancellationCoordinator {
             return []
         }
 
+        guard let transport = gooseExecutor.gooseTransportForCancellation else {
+            // No Goose transport — ACP-only run; sessions are subprocess-managed.
+            return sessionIDs.map { SessionCloseOutcome(sessionID: $0, attempted: false, succeeded: false) }
+        }
         var outcomes: [SessionCloseOutcome] = []
         for sessionID in sessionIDs {
             let succeeded = await closeSessionWithTimeout(
                 sessionID: sessionID,
-                transport: gooseExecutor.sessionBridge.transport,
+                transport: transport,
                 timeout: perSessionTimeout
             )
             outcomes.append(SessionCloseOutcome(sessionID: sessionID, attempted: true, succeeded: succeeded))
@@ -213,7 +217,7 @@ final class RunCancellationCoordinator {
                 return result
             }
         } catch {
-            print("[RunCancellationCoordinator] Session close failed for \(sessionID): \(error.localizedDescription)")
+            ForgeLogger.execution.error("Session close failed for \(sessionID): \(error.localizedDescription)")
             return false
         }
     }

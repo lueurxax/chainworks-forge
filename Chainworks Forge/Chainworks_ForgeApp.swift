@@ -470,6 +470,7 @@ struct AppBootstrapView: View {
     @State private var gooseServerManager: GooseServerManager?
     @State private var showFirstRunWizard = false
     @State private var dogfoodHarnessStarted = false
+    @State private var proposal015AppProofStarted = false
     @State private var proposal022AppProofStarted = false
     private let forcedUISurface = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
         .flatMap(ContentView.UISurface.init(rawValue:))
@@ -525,6 +526,7 @@ struct AppBootstrapView: View {
             (environment["CHAINWORKS_UI_TEST_DISABLE_EAGER_BOOTSTRAP"] == "1" || hasDirectUISurface)
         let skipBackgroundBootstrap = disableEagerUITestBootstrap || (isUIAutomationHost && hasDirectUISurface)
         let isProposal007DogfoodHarness = Proposal007DogfoodHarness.isEnabled && !suppressProposalAutoruns
+        let isProposal015AppProofAutorun = Proposal015AppProofAutorun.isEnabled && !suppressProposalAutoruns
         let isProposal022AppProofAutorun = Proposal022AppProofAutorun.isEnabled && !suppressProposalAutoruns
 
         let appConfigurationStore = AppConfigurationStore()
@@ -553,6 +555,7 @@ struct AppBootstrapView: View {
             !forceLiveRuntimeUnavailable &&
             !disableEagerUITestBootstrap &&
             !isProposal007DogfoodHarness &&
+            !isProposal015AppProofAutorun &&
             !isProposal022AppProofAutorun {
             await gooseServerManager.bootstrap()
         }
@@ -577,7 +580,10 @@ struct AppBootstrapView: View {
         Self.seedWorkflowMapRunIfRequested(modelContext: modelContext)
         Self.seedReleaseGateRunIfRequested(modelContext: modelContext)
 
-        if !isUnitTestHost && !isProposal022AppProofAutorun && !skipBackgroundBootstrap {
+        if !isUnitTestHost &&
+            !isProposal015AppProofAutorun &&
+            !isProposal022AppProofAutorun &&
+            !skipBackgroundBootstrap {
             let compiler = RunPlanCompiler(modelContext: modelContext)
             service.resumeInterruptedRuns(compiler: compiler)
 
@@ -587,13 +593,17 @@ struct AppBootstrapView: View {
 
         if !isUnitTestHost &&
             !disableEagerUITestBootstrap &&
+            !isProposal015AppProofAutorun &&
             !isProposal022AppProofAutorun {
             Task { @MainActor in
                 await providerRegistry.refreshHealth()
             }
         }
 
-        if !isUIAutomationHost && shouldPresentFirstRunWizard(
+        if !isUIAutomationHost &&
+            !isProposal015AppProofAutorun &&
+            !isProposal022AppProofAutorun &&
+            shouldPresentFirstRunWizard(
             configuration: resolvedConfiguration,
             providerSettings: providerSettingsStore.settings
         ) {
@@ -613,9 +623,28 @@ struct AppBootstrapView: View {
 
                 do {
                     let result = try await harness.runFromEnvironment()
-                    print("Proposal 007 dogfood harness completed: \(result.exportPath)")
+                    ForgeLogger.app.info("Proposal 007 dogfood harness completed: \(result.exportPath)")
                 } catch {
-                    print("Proposal 007 dogfood harness failed: \(error.localizedDescription)")
+                    ForgeLogger.app.error("Proposal 007 dogfood harness failed: \(error.localizedDescription)")
+                }
+
+                #if os(macOS)
+                NSApp.terminate(nil)
+                #endif
+            }
+        }
+
+        if isProposal015AppProofAutorun,
+           proposal015AppProofStarted == false {
+            proposal015AppProofStarted = true
+            Task { @MainActor in
+                let autorun = Proposal015AppProofAutorun()
+
+                do {
+                    let export = try autorun.runFromEnvironment()
+                    ForgeLogger.app.info("Proposal 015 app proof completed: \(export.result.proofStatus)")
+                } catch {
+                    ForgeLogger.app.error("Proposal 015 app proof failed: \(error.localizedDescription)")
                 }
 
                 #if os(macOS)
@@ -635,9 +664,9 @@ struct AppBootstrapView: View {
 
                 do {
                     let export = try await autorun.runFromEnvironment()
-                    print("Proposal 022 app proof completed: \(export.result.proofStatus)")
+                    ForgeLogger.app.info("Proposal 022 app proof completed: \(export.result.proofStatus)")
                 } catch {
-                    print("Proposal 022 app proof failed: \(error.localizedDescription)")
+                    ForgeLogger.app.error("Proposal 022 app proof failed: \(error.localizedDescription)")
                 }
 
                 #if os(macOS)
@@ -885,6 +914,7 @@ struct AppBootstrapView: View {
         if environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] != nil
             || environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
             || Proposal007DogfoodHarness.isEnabled
+            || Proposal015AppProofAutorun.isEnabled
             || Proposal022AppProofAutorun.isEnabled {
             return false
         }
@@ -919,7 +949,7 @@ struct AppBootstrapView: View {
             let issues = YAMLValidator.validateStewardConfig(config)
             let errors = issues.filter { $0.severity == .error }
             if !errors.isEmpty {
-                print("[Steward] steward_config.yaml validation failed: \(errors.map(\.message).joined(separator: "; ")). Using defaults.")
+                ForgeLogger.steward.error("steward_config.yaml validation failed: \(errors.map(\.message).joined(separator: "; ")). Using defaults.")
                 return StewardConfig.defaultConfig
             }
             return config
@@ -1277,7 +1307,7 @@ struct AppBootstrapView: View {
 
             try modelContext.save()
         } catch {
-            print("Failed to seed waiting approval run: \(error.localizedDescription)")
+            ForgeLogger.test.error("Failed to seed waiting approval run: \(error.localizedDescription)")
         }
     }
 
@@ -1442,7 +1472,7 @@ struct AppBootstrapView: View {
 
             try modelContext.save()
         } catch {
-            print("Failed to seed release gate run: \(error.localizedDescription)")
+            ForgeLogger.test.error("Failed to seed release gate run: \(error.localizedDescription)")
         }
     }
 

@@ -722,7 +722,7 @@ struct UITestCompletedExportHubSurface: View {
     @MainActor
     private static func makeFallbackRun() -> (run: Run?, errorMessage: String?) {
         func fail(_ message: String) -> (run: Run?, errorMessage: String?) {
-            print("UITestCompletedExportHubSurface fallback failed: \(message)")
+            ForgeLogger.test.error("fallback failed: \(message)")
             return (nil, message)
         }
 
@@ -853,7 +853,7 @@ struct UITestCompletedExportHubSurface: View {
         agentExecution.artifacts = artifacts
         stage.agentExecutions = [agentExecution]
         run.stageExecutions = [stage]
-        print("UITestCompletedExportHubSurface fallback seeded run \(run.id.uuidString)")
+        ForgeLogger.test.info("fallback seeded run \(run.id.uuidString)")
         return (run, nil)
     }
 }

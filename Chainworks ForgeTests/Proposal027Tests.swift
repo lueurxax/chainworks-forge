@@ -89,6 +89,26 @@ struct Proposal027Tests {
         #expect(MarkdownImageSourcePolicy.v1.resolve(source: "../outside/diagram.png", localRoots: allowedRoots) == nil)
     }
 
+    @Test("Markdown image source policy rejects photo library packages and unsupported file types")
+    func markdownImageSourcePolicyRejectsProtectedPackagesAndUnsupportedTypes() throws {
+        let workspaceRoot = tempDirectory.appendingPathComponent("workspace-protected", isDirectory: true)
+        let protectedLibrary = workspaceRoot
+            .appendingPathComponent("Pictures/Photos Library.photoslibrary/originals", isDirectory: true)
+        let docsDir = workspaceRoot.appendingPathComponent("docs/images", isDirectory: true)
+        try FileManager.default.createDirectory(at: protectedLibrary, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: docsDir, withIntermediateDirectories: true)
+
+        let protectedImage = protectedLibrary.appendingPathComponent("photo.png")
+        let unsupportedFile = docsDir.appendingPathComponent("notes.txt")
+        FileManager.default.createFile(atPath: protectedImage.path, contents: Data("png".utf8))
+        FileManager.default.createFile(atPath: unsupportedFile.path, contents: Data("text".utf8))
+
+        let allowedRoots = [workspaceRoot]
+
+        #expect(MarkdownImageSourcePolicy.v1.resolve(source: "Pictures/Photos Library.photoslibrary/originals/photo.png", localRoots: allowedRoots) == nil)
+        #expect(MarkdownImageSourcePolicy.v1.resolve(source: "docs/images/notes.txt", localRoots: allowedRoots) == nil)
+    }
+
     @Test("Markdown document parser extracts standalone image blocks and keeps prose blocks")
     func markdownDocumentParserPartitionsStandaloneImages() throws {
         let workspaceRoot = tempDirectory.appendingPathComponent("workspace-markdown", isDirectory: true)
@@ -411,6 +431,26 @@ struct Proposal027Tests {
         #expect(presentation.summary == "Gemini CLI failed: JavaScript heap out of memory.")
         #expect(presentation.highlights.contains(where: { $0.contains("/Library/Bluetooth") }))
         #expect(presentation.highlights.contains(where: { $0.localizedCaseInsensitiveContains("out of memory") }))
+        #expect(presentation.shouldOfferRawDisclosure)
+    }
+
+    @Test("Streaming text presentation collapses raw Node provider stack traces")
+    func streamingTextPresentationCollapsesProviderStacks() {
+        let raw = """
+        15: 0x10dda2430
+        16: 0x10dda1490
+        17: 0x10dda9d5c
+        24: 0x10310ac0c Builtins_JSEntryTrampoline [/usr/local/bin/node]
+        30: 0x10241c098 node::AsyncWrap::MakeCallback(v8::Local<v8::Function>, int, v8::Local<v8::Value>*) [/usr/local/bin/node]
+
+        Please retry if you think this is a transient or recoverable error.
+        """
+
+        let presentation = StreamingTimelineTextPresentation(rawText: raw)
+
+        #expect(presentation.kind == .providerError)
+        #expect(presentation.summary.localizedCaseInsensitiveContains("provider runtime"))
+        #expect(presentation.summary.localizedCaseInsensitiveContains("node"))
         #expect(presentation.shouldOfferRawDisclosure)
     }
 }

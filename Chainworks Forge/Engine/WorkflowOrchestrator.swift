@@ -2051,7 +2051,8 @@ final class WorkflowOrchestrator {
             outputs: agent.outputs,
             worktreeWriteEnabled: agent.worktreeWriteEnabled,
             sessionReuseScope: effectiveScope,
-            sessionFamilyID: agent.sessionFamilyID
+            sessionFamilyID: agent.sessionFamilyID,
+            runtimeProfileID: agent.runtimeProfileID
         )
     }
 
@@ -3291,7 +3292,8 @@ final class WorkflowOrchestrator {
             outputs: agent.outputs,
             worktreeWriteEnabled: agent.worktreeWriteEnabled,
             sessionReuseScope: agent.sessionReuseScope,
-            sessionFamilyID: agent.sessionFamilyID
+            sessionFamilyID: agent.sessionFamilyID,
+            runtimeProfileID: agent.runtimeProfileID
         )
     }
 

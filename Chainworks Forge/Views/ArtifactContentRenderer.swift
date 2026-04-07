@@ -65,6 +65,17 @@ struct ArtifactRenderContext: Equatable {
 enum MarkdownImageSourcePolicy {
     case v1
 
+    private static let allowedRenderableExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp",
+        "bmp", "tif", "tiff", "heic", "heif", "pdf"
+    ]
+
+    private static let blockedAncestorExtensions: Set<String> = [
+        "photoslibrary", "photolibrary",
+        "app", "appex", "bundle", "framework",
+        "plugin", "pkg", "xcodeproj", "xcworkspace", "playground"
+    ]
+
     func resolve(source: String, localRoots: [URL]) -> URL? {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -84,19 +95,20 @@ enum MarkdownImageSourcePolicy {
         for root in localRoots {
             let candidate = root.appendingPathComponent(trimmed).standardizedFileURL
             if isAllowed(candidate, within: localRoots) {
-                if FileManager.default.fileExists(atPath: candidate.path) {
+                if isSafeRenderableLocalFile(candidate) {
                     return candidate
                 }
                 allowedCandidates.append(candidate)
             }
         }
 
-        return allowedCandidates.first
+        return allowedCandidates.first(where: isSafeRenderableLocalFile)
     }
 
     private func resolveLocalURL(_ url: URL, localRoots: [URL]) -> URL? {
         let standardized = url.standardizedFileURL
-        return isAllowed(standardized, within: localRoots) ? standardized : nil
+        guard isAllowed(standardized, within: localRoots) else { return nil }
+        return isSafeRenderableLocalFile(standardized) ? standardized : nil
     }
 
     private func isAllowed(_ url: URL, within roots: [URL]) -> Bool {
@@ -104,6 +116,33 @@ enum MarkdownImageSourcePolicy {
         return roots.contains { root in
             let rootPath = root.standardizedFileURL.path
             return path == rootPath || path.hasPrefix(rootPath + "/")
+        }
+    }
+
+    private func isSafeRenderableLocalFile(_ url: URL) -> Bool {
+        let standardized = url.standardizedFileURL
+        let path = standardized.path
+        guard !path.isEmpty else { return false }
+
+        let lowercasedComponents = standardized.pathComponents.map { $0.lowercased() }
+        if lowercasedComponents.contains(where: { component in
+            guard let ext = component.split(separator: ".").last.map(String.init),
+                  component.contains(".")
+            else { return false }
+            return Self.blockedAncestorExtensions.contains(ext)
+        }) {
+            return false
+        }
+
+        let fileExtension = standardized.pathExtension.lowercased()
+        guard Self.allowedRenderableExtensions.contains(fileExtension) else { return false }
+
+        do {
+            let resourceValues = try standardized.resourceValues(forKeys: [.isRegularFileKey, .isPackageKey])
+            guard resourceValues.isPackage != true else { return false }
+            return resourceValues.isRegularFile == true
+        } catch {
+            return false
         }
     }
 }
@@ -175,7 +214,7 @@ enum MarkdownDocumentParser {
         options: []
     )
 
-    static func parse(_ content: String, localRoots: [URL], policy: MarkdownImageSourcePolicy = .v1) -> [MarkdownDocumentBlock] {
+    nonisolated static func parse(_ content: String, localRoots: [URL], policy: MarkdownImageSourcePolicy = .v1) -> [MarkdownDocumentBlock] {
         let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
         var blocks: [MarkdownDocumentBlock] = []
         let lines = normalized.components(separatedBy: .newlines)
@@ -659,7 +698,7 @@ struct MarkdownDocumentView: View {
 }
 
 enum MarkdownDocumentLoader {
-    static func load(content: String, localRoots: [URL]) async -> [MarkdownDocumentBlock] {
+    nonisolated static func load(content: String, localRoots: [URL]) async -> [MarkdownDocumentBlock] {
         await Task.detached(priority: .userInitiated) {
             MarkdownDocumentParser.parse(content, localRoots: localRoots)
         }.value

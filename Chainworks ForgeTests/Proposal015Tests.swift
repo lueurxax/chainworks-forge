@@ -269,6 +269,40 @@ struct Proposal015Tests {
         #expect(summaryBody.contains("Role: product_owner"))
     }
 
+    @Test("Proposal 015 app harness proves shell-owned skill truth without XCUI automation")
+    func proposal015AppHarnessProducesCanonicalProof() throws {
+        let result = try Proposal015AppProofHarness().run()
+
+        #expect(result.proofAgentID == "proposal_reviewer_product_owner")
+        #expect(result.reportSkillRef == "proposal_review_triad")
+        #expect(result.reportSkillRole == "product_owner")
+        #expect(result.comparisonSkillRole == "architect")
+        #expect(result.primaryArtifactName == "proposal_current")
+        #expect(result.primaryArtifactExists)
+        #expect(result.summaryMentionsSkillTruth)
+        #expect(result.injectedSkillHashPresent)
+        #expect(result.proofStatus.contains("PASS"))
+    }
+
+    @Test("Proposal 015 app harness persists canonical proof export for gate consumption")
+    func proposal015AppHarnessPersistsCanonicalProofExport() throws {
+        let exportURL = tempDirectory.appendingPathComponent("proposal015-app-proof.json")
+        let export = try Proposal015AppProofHarness().runAndPersist(to: exportURL)
+        let persisted = try JSONDecoder().decode(
+            Proposal015AppProofExport.self,
+            from: try Data(contentsOf: exportURL)
+        )
+
+        #expect(export.result.runID == persisted.result.runID)
+        #expect(persisted.result.reportSkillRef == "proposal_review_triad")
+        #expect(persisted.result.reportSkillRole == "product_owner")
+        #expect(persisted.result.comparisonSkillRole == "architect")
+        #expect(persisted.result.primaryArtifactExists)
+        #expect(persisted.result.summaryMentionsSkillTruth)
+        #expect(persisted.result.injectedSkillHashPresent)
+        #expect(persisted.result.proofStatus.contains("PASS"))
+    }
+
     @Test("Execution rows and run reports persist injected skill truth")
     func executionRowsAndRunReportsPersistInjectedSkillTruth() async throws {
         let workspace = makeTestWorkspace(tempDir: tempDirectory)

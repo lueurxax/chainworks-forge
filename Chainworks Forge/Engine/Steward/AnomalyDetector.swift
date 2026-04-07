@@ -21,7 +21,7 @@ struct AnomalyDetector: Sendable {
         // and log a `sample_too_small` event instead of silently returning empty results.
         guard observation.runCount >= minimumWindowSize,
               baseline.runCount >= max(minimumWindowSize, 3) else {
-            print("[Steward] sample_too_small: observation=\(observation.runCount), baseline=\(baseline.runCount), minimum=\(minimumWindowSize). Refusing to produce findings.")
+            ForgeLogger.steward.info("sample_too_small: observation=\(observation.runCount), baseline=\(baseline.runCount), minimum=\(minimumWindowSize). Refusing to produce findings.")
             return []
         }
 

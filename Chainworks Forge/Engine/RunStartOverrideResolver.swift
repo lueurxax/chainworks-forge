@@ -41,7 +41,8 @@ enum RunStartOverrideResolver {
                 outputs: agent.outputs,
                 worktreeWriteEnabled: agent.worktreeWriteEnabled,
                 sessionReuseScope: agent.sessionReuseScope,
-                sessionFamilyID: agent.sessionFamilyID
+                sessionFamilyID: agent.sessionFamilyID,
+                runtimeProfileID: agent.runtimeProfileID
             ))
         })
 

@@ -382,19 +382,19 @@ struct LiveGooseConnectionProofTests {
         try evidenceData.write(to: evidencePath)
 
         // Log evidence path for manual inspection
-        print("======================================================================")
-        print("  LIVE GOOSE CONNECTION PROOF")
-        print("======================================================================")
-        print("  Verdict: \(verdict)")
-        print("  Session ID: \(sessionResponse.sessionId)")
-        print("  Goose URL: \(runtime.baseURL.absoluteString)")
-        print("  SSE events: \(eventLog.count)")
-        print("  Session create: \(String(format: "%.2f", sessionCreateDuration))s")
-        print("  Prompt round-trip: \(String(format: "%.2f", promptRoundTripDuration))s")
-        print("  Total duration: \(String(format: "%.2f", totalDuration))s")
-        print("  Session closed cleanly: \(sessionClosedCleanly)")
-        print("  Evidence: \(evidencePath.path)")
-        print("======================================================================")
+        ForgeLogger.test.info("======================================================================")
+        ForgeLogger.test.info("  LIVE GOOSE CONNECTION PROOF")
+        ForgeLogger.test.info("======================================================================")
+        ForgeLogger.test.info("  Verdict: \(verdict)")
+        ForgeLogger.test.info("  Session ID: \(sessionResponse.sessionId)")
+        ForgeLogger.test.info("  Goose URL: \(runtime.baseURL.absoluteString)")
+        ForgeLogger.test.info("  SSE events: \(eventLog.count)")
+        ForgeLogger.test.info("  Session create: \(String(format: "%.2f", sessionCreateDuration))s")
+        ForgeLogger.test.info("  Prompt round-trip: \(String(format: "%.2f", promptRoundTripDuration))s")
+        ForgeLogger.test.info("  Total duration: \(String(format: "%.2f", totalDuration))s")
+        ForgeLogger.test.info("  Session closed cleanly: \(sessionClosedCleanly)")
+        ForgeLogger.test.info("  Evidence: \(evidencePath.path)")
+        ForgeLogger.test.info("======================================================================")
 
         // Assertions
         #expect(!sessionResponse.sessionId.isEmpty, "Must have a valid session ID from real Goose")
@@ -470,7 +470,7 @@ struct LiveGooseConnectionProofTests {
             #expect(key.count > 16, "Secret key should be reasonably long")
         }
 
-        print("[GooseRuntimeDiscovery] GOOSE_PORT=\(goosePort ?? "nil"), key length=\(gooseSecretKey?.count ?? 0)")
+        ForgeLogger.test.info("[GooseRuntimeDiscovery] GOOSE_PORT=\(goosePort ?? "nil"), key length=\(gooseSecretKey?.count ?? 0)")
     }
 
     /// PROOF: Full RuntimeAgentExecutor pipeline works against real Goose (session -> prompt -> events -> result).
@@ -573,15 +573,15 @@ struct LiveGooseConnectionProofTests {
             #expect(!receipt.sessionID.isEmpty, "Receipt must capture real session ID")
         }
 
-        print("======================================================================")
-        print("  FULL PIPELINE PROOF")
-        print("======================================================================")
-        print("  Session ID: \(result.sessionID ?? "nil")")
-        print("  Succeeded: \(result.succeeded)")
-        print("  Duration: \(String(format: "%.2f", duration))s")
-        print("  Events received: \(collector.events.count)")
-        print("  Outputs: \(result.outputs.keys.sorted().joined(separator: ", "))")
-        print("  Error: \(result.errorMessage ?? "none")")
-        print("======================================================================")
+        ForgeLogger.test.info("======================================================================")
+        ForgeLogger.test.info("  FULL PIPELINE PROOF")
+        ForgeLogger.test.info("======================================================================")
+        ForgeLogger.test.info("  Session ID: \(result.sessionID ?? "nil")")
+        ForgeLogger.test.info("  Succeeded: \(result.succeeded)")
+        ForgeLogger.test.info("  Duration: \(String(format: "%.2f", duration))s")
+        ForgeLogger.test.info("  Events received: \(collector.events.count)")
+        ForgeLogger.test.info("  Outputs: \(result.outputs.keys.sorted().joined(separator: ", "))")
+        ForgeLogger.test.info("  Error: \(result.errorMessage ?? "none")")
+        ForgeLogger.test.info("======================================================================")
     }
 }

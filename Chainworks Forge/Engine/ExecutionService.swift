@@ -184,18 +184,18 @@ final class ExecutionService {
     /// after retry-in-place mutated SwiftData but no orchestrator was attached.
     func resumeRun(run: Run, compiler: RunPlanCompiler) throws {
         guard activeOrchestrators[run.id] == nil else {
-            print("[ExecutionService.resumeRun] Skipped: orchestrator already active for run \(run.id)")
+            ForgeLogger.execution.info("resumeRun skipped: orchestrator already active for run \(run.id)")
             return
         }
 
         let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: run)
         guard let orchestrator = prepareOrchestrator(run: run, plan: plan, workspace: workspace) else {
-            print("[ExecutionService.resumeRun] prepareOrchestrator returned nil for run \(run.id), status=\(run.status.rawValue)")
+            ForgeLogger.execution.error("resumeRun failed: prepareOrchestrator returned nil for run \(run.id), status=\(run.status.rawValue)")
             return
         }
 
         let resumeStateID = run.currentStageID
-        print("[ExecutionService.resumeRun] Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id)")
+        ForgeLogger.execution.info("Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id)")
         synchronizeIdeaStatus(for: run)
 
         Task { @MainActor in
@@ -240,7 +240,7 @@ final class ExecutionService {
             }
         } catch {
             // Log but don't crash
-            print("Resume failed: \(error.localizedDescription)")
+            ForgeLogger.execution.error("Resume interrupted runs failed: \(error.localizedDescription)")
         }
     }
 
@@ -439,7 +439,7 @@ final class ExecutionService {
             do {
                 try self?.modelContext.save()
             } catch {
-                print("[ExecutionService] Failed to persist run completion state: \(error.localizedDescription)")
+                ForgeLogger.execution.error("Failed to persist run completion state: \(error.localizedDescription)")
             }
             self?.emitReportIfNeeded(for: run)
 
@@ -623,34 +623,36 @@ final class ExecutionService {
     }
 
     private func requiresLiveRuntimeConfiguration(for plan: RunPlan) -> Bool {
-        isLiveWorkflow(plan.workflowID) && liveRuntimeConfiguration == nil
+        // Proposal 026: ACP-profiled runs launch their own subprocess —
+        // they do NOT require a Goose server to be configured.
+        if planHasACPRuntime(plan) { return false }
+        return isLiveWorkflow(plan.workflowID) && liveRuntimeConfiguration == nil
+    }
+
+    /// Proposal 026: Whether the plan contains any agent with a non-nil ACP runtime profile.
+    private func planHasACPRuntime(_ plan: RunPlan) -> Bool {
+        plan.agentBindings.values.contains { $0.runtimeProfileID != nil }
     }
 
     private func executorForRun(plan: RunPlan) -> AgentExecutor {
-        guard isLiveWorkflow(plan.workflowID), let liveRuntimeConfiguration else {
+        guard isLiveWorkflow(plan.workflowID) else {
             return executor
         }
 
-        let transport: any RuntimeTransportProtocol
-
-        // Proposal 026 Phase 3: ACP runtime selection by runtime profile ID.
-        // The runtime profile ID is frozen on ResolvedAgent at run start.
-        // Profile ID convention: "claude_agent_acp", "gemini_cli_acp", or nil (Goose default).
-        let runtimeProfileID = plan.agentBindings.values.first?.runtimeProfileID
-
-        switch runtimeProfileID {
-        case "claude_agent_acp":
-            transport = ClaudeAgentACPTransport()
-        case "gemini_cli_acp":
-            transport = GeminiCLIACPTransport()
-        default:
-            transport = resolveGooseTransport(liveRuntimeConfiguration)
+        // Proposal 026: Per-agent transport via factory.
+        // Goose transport shared for all Goose agents; ACP transports cached per adapter family.
+        let gooseTransport: (any RuntimeTransportProtocol)?
+        if let liveRuntimeConfiguration {
+            gooseTransport = resolveGooseTransport(liveRuntimeConfiguration)
+        } else {
+            gooseTransport = nil // ACP-only runs don't need Goose
         }
 
+        let factory = DefaultRuntimeTransportFactory(gooseTransport: gooseTransport)
         let sessionManager = AgentSessionManager(container: modelContext.container)
         return RuntimeAgentExecutor(
-            transport: transport,
-            override: liveRuntimeConfiguration.override,
+            transportFactory: factory,
+            override: liveRuntimeConfiguration?.override,
             sessionManager: sessionManager
         )
     }
@@ -698,7 +700,7 @@ final class ExecutionService {
         do {
             _ = try await service.runAnalysis()
         } catch {
-            print("Steward analysis failed: \(error.localizedDescription)")
+            ForgeLogger.steward.error("Steward analysis failed: \(error.localizedDescription)")
         }
     }
 
@@ -753,14 +755,14 @@ final class ExecutionService {
         guard let lastAnalysis = (try? modelContext.fetch(descriptor))?.first else {
             // No previous analysis exists — schedule one after the next completed run.
             configChangeAnalysisScheduled = true
-            print("[Steward] No previous analysis found. Scheduling config-change analysis.")
+            ForgeLogger.steward.info("No previous analysis found. Scheduling config-change analysis.")
             return
         }
 
         if lastAnalysis.stewardConfigSnapshotHash != currentStewardHash
             || lastAnalysis.workflowCatalogSnapshotHash != currentCatalogHash {
             configChangeAnalysisScheduled = true
-            print("[Steward] Config change detected (steward: \(lastAnalysis.stewardConfigSnapshotHash != currentStewardHash), catalog: \(lastAnalysis.workflowCatalogSnapshotHash != currentCatalogHash)). Scheduling analysis after next completed run.")
+            ForgeLogger.steward.info("Config change detected (steward: \(lastAnalysis.stewardConfigSnapshotHash != currentStewardHash), catalog: \(lastAnalysis.workflowCatalogSnapshotHash != currentCatalogHash)). Scheduling analysis after next completed run.")
         }
     }
 
@@ -775,7 +777,7 @@ final class ExecutionService {
         do {
             _ = try builder.emitReport(for: run)
         } catch {
-            print("[P005-OPS] Report emission failed: \(error.localizedDescription)")
+            ForgeLogger.execution.error("Report emission failed: \(error.localizedDescription)")
         }
     }
 
@@ -797,9 +799,9 @@ final class ExecutionService {
         let recorder = BenchmarkRunRecorder(modelContext: modelContext)
         do {
             try recorder.recordAppDrivenExecution(pair: pair, run: run)
-            print("[P008] Benchmark execution recorded for run \(run.id.uuidString.prefix(8))")
+            ForgeLogger.execution.info("Benchmark execution recorded for run \(run.id.uuidString.prefix(8))")
         } catch {
-            print("[P008] Benchmark recording failed: \(error.localizedDescription)")
+            ForgeLogger.execution.error("Benchmark recording failed: \(error.localizedDescription)")
         }
     }
 
@@ -884,5 +886,52 @@ final class ExecutionService {
             effort: nil,
             attemptNumber: latestStage?.attemptNumber ?? 1
         )
+    }
+}
+
+// MARK: - DefaultRuntimeTransportFactory (Proposal 026 — per-agent transport resolution)
+
+/// Resolves the correct transport for each agent based on adapter family from its provider binding.
+/// Transports are cached by adapter family — max one instance per family per run.
+/// Goose transport is shared (created once). ACP transports are created on demand and cached.
+final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked Sendable {
+    let gooseTransport: (any RuntimeTransportProtocol)?
+    private let lock = NSLock()
+    private var transportsByFamily: [String: any RuntimeTransportProtocol] = [:]
+
+    init(gooseTransport: (any RuntimeTransportProtocol)?) {
+        self.gooseTransport = gooseTransport
+    }
+
+    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> any RuntimeTransportProtocol {
+        let family = binding?.adapterFamily ?? "goose"
+        guard family != "goose" && !family.isEmpty else {
+            guard let gooseTransport else {
+                fatalError("[DefaultRuntimeTransportFactory] Goose transport required but not configured. Agent '\(agent.id)' needs Goose but liveRuntimeConfiguration is absent.")
+            }
+            return gooseTransport
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = transportsByFamily[family] { return existing }
+
+        let created: any RuntimeTransportProtocol
+        switch family {
+        case "claude_agent_acp":
+            print("[TransportFactory] Creating ClaudeAgentACPTransport for family '\(family)'")
+            created = ClaudeAgentACPTransport()
+        case "gemini_cli_acp":
+            print("[TransportFactory] Creating GeminiCLIACPTransport for family '\(family)'")
+            created = GeminiCLIACPTransport()
+        default:
+            print("[TransportFactory] Unknown adapter family '\(family)', falling back to Goose")
+            guard let gooseTransport else {
+                fatalError("[DefaultRuntimeTransportFactory] Goose fallback required but not configured for unknown family '\(family)'.")
+            }
+            return gooseTransport
+        }
+        transportsByFamily[family] = created
+        return created
     }
 }

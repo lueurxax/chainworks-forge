@@ -77,7 +77,7 @@ final class StewardAnalysisService {
         let isInconclusive = observationRuns.count < windows.minimumWindowSize
             || baselineRuns.count < windows.minimumWindowSize
         if isInconclusive {
-            print("[Steward] sample_too_small: observation=\(observationRuns.count), baseline=\(baselineRuns.count), minimum=\(windows.minimumWindowSize). Analysis will be marked inconclusive.")
+            ForgeLogger.steward.info("sample_too_small: observation=\(observationRuns.count), baseline=\(baselineRuns.count), minimum=\(windows.minimumWindowSize). Analysis will be marked inconclusive.")
         }
 
         // Step 3: Classify cohort quality
@@ -190,13 +190,13 @@ final class StewardAnalysisService {
                 if result.succeeded, let reportData = result.outputs["sdlc_health_report"] {
                     try reportData.write(to: URL(fileURLWithPath: reportPath))
                     healthReportData = reportData
-                    print("[Steward] health-report.json written to \(reportPath)")
+                    ForgeLogger.steward.info("health-report.json written to \(reportPath)")
                 }
             } catch {
-                print("[Steward] system_steward execution failed: \(error.localizedDescription)")
+                ForgeLogger.steward.error("system_steward execution failed: \(error.localizedDescription)")
             }
         } else {
-            print("[Steward] system_steward agent not found in catalog — skipping agentic analysis.")
+            ForgeLogger.steward.info("system_steward agent not found in catalog — skipping agentic analysis.")
         }
 
         // Step 7c — REQ-010: Execute steward_auditor and write audit report.
@@ -241,13 +241,13 @@ final class StewardAnalysisService {
                 if result.succeeded, let auditData = result.outputs["stewardship_audit_report"] {
                     try auditData.write(to: URL(fileURLWithPath: auditReportPath))
                     auditArtifactPath = auditReportPath
-                    print("[Steward] audit-report.json written to \(auditReportPath)")
+                    ForgeLogger.steward.info("audit-report.json written to \(auditReportPath)")
                 }
             } catch {
-                print("[Steward] steward_auditor execution failed: \(error.localizedDescription)")
+                ForgeLogger.steward.error("steward_auditor execution failed: \(error.localizedDescription)")
             }
         } else if healthReportData != nil {
-            print("[Steward] steward_auditor agent not found in catalog — skipping audit.")
+            ForgeLogger.steward.info("steward_auditor agent not found in catalog — skipping audit.")
         }
 
         let analysisStatus: AnalysisStatus = isInconclusive ? .inconclusive : .completed
@@ -321,7 +321,7 @@ final class StewardAnalysisService {
         }
 
         if groups.count > 1 {
-            print("[Steward] Found \(groups.count) primary cohort groups. Analyzing largest: '\(largest.key)' (\(largest.value.count) runs). Other groups excluded per cohorting contract.")
+            ForgeLogger.steward.info("Found \(groups.count) primary cohort groups. Analyzing largest: '\(largest.key)' (\(largest.value.count) runs). Other groups excluded per cohorting contract.")
         }
 
         return largest.value
@@ -334,7 +334,7 @@ final class StewardAnalysisService {
         guard let catalog else { return nil }
         guard let agentDef = catalog.agents.first(where: { $0.id == agentID }) else { return nil }
         guard let backend = catalog.backendProfiles[agentDef.backendProfile] else {
-            print("[Steward] Backend profile '\(agentDef.backendProfile)' not found for agent '\(agentID)'")
+            ForgeLogger.steward.error("Backend profile '\(agentDef.backendProfile)' not found for agent '\(agentID)'")
             return nil
         }
         return ResolvedAgent(

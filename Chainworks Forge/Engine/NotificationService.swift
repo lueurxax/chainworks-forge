@@ -28,10 +28,10 @@ final class NotificationService {
         do {
             let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
             if !granted {
-                print("[NotificationService] User denied notification authorization")
+                ForgeLogger.notification.info("User denied notification authorization")
             }
         } catch {
-            print("[NotificationService] Authorization request failed: \(error.localizedDescription)")
+            ForgeLogger.notification.error("Authorization request failed: \(error.localizedDescription)")
         }
     }
 
@@ -133,7 +133,7 @@ final class NotificationService {
         )
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
-                print("[NotificationService] Failed to schedule: \(error.localizedDescription)")
+                ForgeLogger.notification.error("Failed to schedule: \(error.localizedDescription)")
             }
         }
     }

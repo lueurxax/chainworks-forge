@@ -3,11 +3,24 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-05 |
-| Status | Draft |
+| Status | Implemented |
 | Author | Codex |
+| Reference contract | [../reference/artifact-content-rendering.md](../reference/artifact-content-rendering.md) |
+| Proof | [../evidence/artifact-content-rendering-proof.md](../evidence/artifact-content-rendering-proof.md) |
 | Depends on | [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [015-skill-resolution-and-runtime-injection.md](015-skill-resolution-and-runtime-injection.md), [025-per-agent-mcp-policy-and-runtime-validation.md](025-per-agent-mcp-policy-and-runtime-validation.md) |
 | Scope | Replace raw text fallbacks for JSON and Markdown across the app with a single read-only rendering pipeline that supports collapsible JSON trees and proper Markdown document rendering. |
 | Goal | Make JSON and Markdown artifacts readable everywhere in `Chainworks Forge` without introducing editing flows, while preserving deterministic artifact truth and keeping operator surfaces fast and consistent. |
+
+---
+
+## Consolidation Note
+
+This proposal has been implemented and promoted to stable documentation:
+
+- [reference/artifact-content-rendering.md](../reference/artifact-content-rendering.md)
+- [../evidence/artifact-content-rendering-proof.md](../evidence/artifact-content-rendering-proof.md)
+
+For current-head behavior and proof, treat this file as historical context and the linked reference/proof documents as canonical.
 
 ---
 

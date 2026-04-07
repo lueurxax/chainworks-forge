@@ -38,6 +38,7 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
 
     private var activeSessions: [String: ACPSubprocessManager] = [:]
     private var requestCounters: [String: Int] = [:]
+    private var sessionSystemPrompts: [String: String] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -88,15 +89,8 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         if let model = request.model {
             sessionParams["model"] = model
         }
-        if let extensions = request.requestedExtensions, !extensions.isEmpty {
-            sessionParams["requestedExtensions"] = extensions
-        }
-        if let systemPrompt = request.systemPrompt as String?, !systemPrompt.isEmpty {
-            sessionParams["systemPrompt"] = systemPrompt
-        }
-
-        // Gemini CLI supports mcpServers in session/new directly
-        // (live-proved in research probes)
+        // Note: requestedExtensions from Forge are Goose extension IDs — not applicable for ACP.
+        // Gemini CLI ACP handles MCP through its own config or mcpServers param.
         sessionParams["mcpServers"] = [] as [[String: Any]]
 
         let sessionNewRequest = makeJSONRPCRequest(
@@ -117,6 +111,9 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         lock.lock()
         activeSessions[sessionId] = subprocess
         requestCounters[sessionId] = 2 // initialize=1, session/new=2
+        if !request.systemPrompt.isEmpty {
+            sessionSystemPrompts[sessionId] = request.systemPrompt
+        }
         lock.unlock()
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -160,36 +157,47 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                     return
                 }
 
-                do {
-                    // Gemini CLI ACP uses a slightly different prompt format:
-                    // prompt is an array of content items
-                    var promptContent: [[String: Any]] = [
-                        ["type": "text", "text": prompt.content]
-                    ]
+                // Synthesize lifecycle events (matching GooseServerTransport pattern)
+                continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
-                    // Append context attachments if present
-                    if let attachments = prompt.context {
+                do {
+                    // LOCKED-003: System prompt embedded in prompt content
+                    self.lock.lock()
+                    let systemPrompt = self.sessionSystemPrompts[sessionID]
+                    self.lock.unlock()
+
+                    var fullContent = ""
+                    if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        fullContent += "## System Instructions\n\(systemPrompt)\n\n---\n\n"
+                    }
+                    fullContent += prompt.content
+
+                    // Append context attachments as text
+                    if let attachments = prompt.context, !attachments.isEmpty {
+                        fullContent += "\n\n---\n\n"
                         for attachment in attachments {
-                            var item: [String: Any] = ["type": attachment.type, "name": attachment.name]
-                            if let content = attachment.content {
-                                item["content"] = content
-                            }
-                            if let path = attachment.path {
-                                item["path"] = path
-                            }
-                            promptContent.append(item)
+                            fullContent += "### \(attachment.name)\n"
+                            if let content = attachment.content { fullContent += content }
+                            if let path = attachment.path { fullContent += "Path: \(path)" }
+                            fullContent += "\n\n"
                         }
                     }
+
+                    // ACP session/prompt: prompt as array of content items
+                    let promptItems: [[String: Any]] = [
+                        ["type": "text", "text": fullContent]
+                    ]
 
                     let promptRequest = self.makeJSONRPCRequest(
                         method: "session/prompt",
                         params: [
                             "sessionId": sessionID,
-                            "prompt": promptContent
+                            "prompt": promptItems
                         ] as [String: Any],
                         sessionID: sessionID
                     )
                     try subprocess.sendJSON(promptRequest)
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
                     let promptRequestID = self.currentRequestID(for: sessionID)
 
@@ -266,6 +274,7 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         lock.lock()
         let subprocess = activeSessions.removeValue(forKey: sessionID)
         requestCounters.removeValue(forKey: sessionID)
+        sessionSystemPrompts.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let subprocess else {

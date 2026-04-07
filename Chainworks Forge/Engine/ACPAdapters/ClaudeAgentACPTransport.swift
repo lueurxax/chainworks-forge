@@ -29,6 +29,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
 
     private var activeSessions: [String: ACPSubprocessManager] = [:]
     private var requestCounters: [String: Int] = [:]
+    private var sessionSystemPrompts: [String: String] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -40,6 +41,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     // MARK: - RuntimeTransportProtocol
 
     func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+        ForgeLogger.claudeACP.debug("createSession called, executablePath=\(executablePath), workingDir=\(request.workingDirectory ?? "nil")")
         let startTime = Date()
         let subprocess = ACPSubprocessManager(
             executablePath: executablePath,
@@ -72,20 +74,42 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         }
 
         // Step 2: Send `session/new` with session configuration
-        var sessionParams: [String: Any] = [:]
+        // mcpServers is required by the ACP adapter (must be an array, even if empty)
+        var sessionParams: [String: Any] = ["mcpServers": [] as [[String: Any]]]
         if let workingDirectory = request.workingDirectory {
             sessionParams["cwd"] = workingDirectory
         }
+        // Map model name to ACP adapter catalog: default, sonnet, haiku.
+        // Evidence: claude-agent-acp model catalog does NOT include "opus" —
+        // the adapter maps "default" to the best available model.
         if let model = request.model {
-            sessionParams["model"] = model
+            sessionParams["model"] = Self.mapModelForACPCatalog(model)
         }
-        if let extensions = request.requestedExtensions, !extensions.isEmpty {
-            // Map extensions to ACP mcpServers format if needed
-            sessionParams["requestedExtensions"] = extensions
+        // Note: requestedExtensions from Forge are Goose extension IDs — not applicable for ACP.
+        // Claude Agent ACP handles MCP through its own config; client-provided MCP servers
+        // can be passed via mcpServers array if needed in the future.
+        // Map execution policy to ACP mode.
+        // Evidence mode catalog: auto, default, acceptEdits, plan, dontAsk, bypassPermissions.
+        // Write-enabled agents → bypassPermissions for autonomous execution.
+        // Read-only agents → default.
+        if let policy = request.executionPolicy {
+            if policy.repoWritesAllowed {
+                sessionParams["mode"] = "bypassPermissions"
+            }
         }
-        if let systemPrompt = request.systemPrompt as String?, !systemPrompt.isEmpty {
-            sessionParams["systemPrompt"] = systemPrompt
-        }
+
+        // Proposal 026: Control MCP/tool exposure through ACP _meta.claudeCode.options.
+        // Disable plugins that are not managed by Forge (e.g. swift-lsp Xcode MCP bridge)
+        // to prevent token waste and unwanted Xcode connections.
+        // Pass only Forge-declared MCP servers; disable built-in plugins.
+        sessionParams["_meta"] = [
+            "claudeCode": [
+                "options": [
+                    "enabledPlugins": [String: Bool](),  // empty = no plugins
+                    "mcpServers": [String: Any]()  // no additional MCP servers beyond what's in mcpServers[]
+                ] as [String: Any]
+            ] as [String: Any]
+        ] as [String: Any]
 
         let sessionNewRequest = makeJSONRPCRequest(
             method: "session/new",
@@ -101,10 +125,13 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
             throw RuntimeTransportError.sessionCreationFailed(reason: "Invalid session/new response from Claude Agent ACP")
         }
 
-        // Register the active session
+        // Register the active session and store systemPrompt for later prepending
         lock.lock()
         activeSessions[sessionId] = subprocess
         requestCounters[sessionId] = 2 // initialize=1, session/new=2
+        if !request.systemPrompt.isEmpty {
+            sessionSystemPrompts[sessionId] = request.systemPrompt
+        }
         lock.unlock()
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -148,35 +175,52 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                     return
                 }
 
-                do {
-                    // Build prompt content in ACP format
-                    var promptContent: [[String: Any]] = [
-                        ["type": "text", "text": prompt.content]
-                    ]
+                // Synthesize session lifecycle events (matches GooseServerTransport behavior)
+                continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
-                    // Append context attachments if present
-                    if let attachments = prompt.context {
+                do {
+                    // ACP session/prompt expects prompt as an array of content items:
+                    // [{"type": "text", "text": "..."}]
+                    // LOCKED-003: System prompt is embedded in the prompt content (same as GooseServerTransport).
+                    self.lock.lock()
+                    let systemPrompt = self.sessionSystemPrompts[sessionID]
+                    self.lock.unlock()
+
+                    var fullContent = ""
+                    if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        fullContent += "## System Instructions\n\(systemPrompt)\n\n---\n\n"
+                    }
+                    fullContent += prompt.content
+
+                    var promptItems: [[String: Any]] = [
+                        ["type": "text", "text": fullContent]
+                    ]
+                    if let attachments = prompt.context, !attachments.isEmpty {
+                        var attachmentText = "---\n\n"
                         for attachment in attachments {
-                            var item: [String: Any] = ["type": attachment.type, "name": attachment.name]
+                            attachmentText += "### \(attachment.name)\n"
                             if let content = attachment.content {
-                                item["content"] = content
+                                attachmentText += content
                             }
                             if let path = attachment.path {
-                                item["path"] = path
+                                attachmentText += "Path: \(path)"
                             }
-                            promptContent.append(item)
+                            attachmentText += "\n\n"
                         }
+                        promptItems.append(["type": "text", "text": attachmentText])
                     }
 
                     let promptRequest = self.makeJSONRPCRequest(
                         method: "session/prompt",
                         params: [
                             "sessionId": sessionID,
-                            "prompt": promptContent
+                            "prompt": promptItems
                         ] as [String: Any],
                         sessionID: sessionID
                     )
                     try subprocess.sendJSON(promptRequest)
+
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
                     let promptRequestID = self.currentRequestID(for: sessionID)
 
@@ -186,11 +230,24 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
 
                         guard let lineData = line.data(using: .utf8),
                               let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                            ForgeLogger.claudeACP.info("Non-JSON line from subprocess: \(line.prefix(200))")
                             continue
                         }
 
-                        // Check if this is a JSON-RPC response (has "id" and "result")
-                        if let responseID = json["id"] as? Int, responseID == promptRequestID {
+                        ForgeLogger.claudeACP.debug("Received JSON-RPC: method=\(json["method"] ?? "nil"), id=\(json["id"] ?? "nil"), hasResult=\(json["result"] != nil)")
+
+                        // Check if this is a JSON-RPC response (has "id" and "result" or "error")
+                        // ACP may send id as Int or String — handle both.
+                        let responseID: Int?
+                        if let intID = json["id"] as? Int {
+                            responseID = intID
+                        } else if let strID = json["id"] as? String, let parsed = Int(strID) {
+                            responseID = parsed
+                        } else {
+                            responseID = nil
+                        }
+
+                        if let responseID, responseID == promptRequestID {
                             // This is the final prompt result
                             if let result = json["result"] as? [String: Any] {
                                 let finishEvent = ACPStreamEventMapper.mapPromptResult(result)
@@ -207,6 +264,12 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                         // Check if this is a JSON-RPC notification (has "method", no "id")
                         if let method = json["method"] as? String {
                             let params = json["params"] as? [String: Any]
+                            // Log first few events to diagnose structure
+                            if method == "session/update" {
+                                let updateKeys = (params?["update"] as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "no-update"
+                                let sessionUpdate = (params?["update"] as? [String: Any])?["sessionUpdate"] as? String ?? "no-sessionUpdate"
+                                ForgeLogger.claudeACP.debug("session/update: sessionUpdate=\(sessionUpdate) updateKeys=\(updateKeys)")
+                            }
 
                             // Handle permission requests by auto-granting (for now)
                             if method == "session/request_permission" {
@@ -243,6 +306,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         lock.lock()
         let subprocess = activeSessions.removeValue(forKey: sessionID)
         requestCounters.removeValue(forKey: sessionID)
+        sessionSystemPrompts.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let subprocess else {
@@ -260,6 +324,23 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         // Brief wait for clean shutdown, then terminate
         try? await Task.sleep(for: .milliseconds(200))
         subprocess.terminate()
+    }
+
+    // MARK: - Private: Model Mapping
+
+    /// Map Forge model identifiers to the claude-agent-acp catalog.
+    /// Live-verified model catalog (2026-04-07): `default`, `opus`, `sonnet`, `haiku`.
+    private static func mapModelForACPCatalog(_ model: String) -> String {
+        let lowered = model.lowercased()
+        switch lowered {
+        case "opus", "sonnet", "haiku", "default":
+            return lowered
+        default:
+            if lowered.contains("opus") { return "opus" }
+            if lowered.contains("haiku") { return "haiku" }
+            if lowered.contains("sonnet") { return "sonnet" }
+            return "default"
+        }
     }
 
     // MARK: - Private: JSON-RPC Request Construction

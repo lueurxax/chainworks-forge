@@ -155,7 +155,7 @@ struct TimelineErrorPresentation: Equatable {
         return !normalizedRaw.isEmpty && normalizedRaw != summary
     }
 
-    private static func compactLine(_ line: String) -> String {
+    nonisolated private static func compactLine(_ line: String) -> String {
         let collapsed = line.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
         if collapsed.count > 220 {
             return String(collapsed.prefix(217)) + "..."
@@ -217,6 +217,9 @@ private struct TimelineErrorDetailView: View {
 private struct StreamingTimelineTextView: View {
     let text: String
     @State private var displayedText: String = ""
+    private var presentation: StreamingTimelineTextPresentation {
+        StreamingTimelineTextPresentation(rawText: displayedText)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -224,22 +227,158 @@ private struct StreamingTimelineTextView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            ZStack(alignment: .leading) {
+            switch presentation.kind {
+            case .plainText:
                 Text(displayedText)
-                    .id(displayedText)
                     .font(.caption)
                     .foregroundStyle(.primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            case .providerError:
+                StreamingTimelineProviderErrorView(presentation: presentation)
             }
-            .animation(.easeOut(duration: 0.18), value: displayedText)
         }
         .onAppear {
             displayedText = text
         }
         .onChange(of: text) {
             displayedText = text
+        }
+    }
+}
+
+struct StreamingTimelineTextPresentation: Equatable {
+    enum Kind: Equatable {
+        case plainText
+        case providerError
+    }
+
+    let kind: Kind
+    let summary: String
+    let highlights: [String]
+    let rawText: String
+
+    init(rawText: String) {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = trimmed
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if Self.looksLikeProviderRuntimeStack(lines: lines, rawText: trimmed) {
+            kind = .providerError
+            summary = Self.providerErrorSummary(lines: lines, rawText: trimmed)
+            highlights = Self.providerErrorHighlights(lines: lines, summary: summary)
+        } else {
+            kind = .plainText
+            summary = trimmed
+            highlights = []
+        }
+        self.rawText = rawText
+    }
+
+    var shouldOfferRawDisclosure: Bool {
+        kind == .providerError && rawText.trimmingCharacters(in: .whitespacesAndNewlines) != summary
+    }
+
+    private static func looksLikeProviderRuntimeStack(lines: [String], rawText: String) -> Bool {
+        guard lines.isEmpty == false else { return false }
+        let lowercased = rawText.lowercased()
+        let hasRetryBoilerplate = lowercased.contains("please retry if you think this is a transient or recoverable error")
+        let hasNodePath = lowercased.contains("/usr/local/bin/node") || lowercased.contains("/opt/homebrew/bin/node")
+        let stackLineCount = lines.filter { line in
+            line.range(of: #"^\d+:\s+0x[0-9a-f]+.*"#, options: .regularExpression) != nil
+        }.count
+        let hasFatalMarker = lowercased.contains("fatal error") || lowercased.contains("javascript heap out of memory")
+        let hasRequestFailedPrefix = lowercased.contains("request failed:")
+        return (hasNodePath && stackLineCount >= 3) || hasFatalMarker || (hasRetryBoilerplate && hasRequestFailedPrefix)
+    }
+
+    private static func providerErrorSummary(lines: [String], rawText: String) -> String {
+        let lowercased = rawText.lowercased()
+        if lowercased.contains("javascript heap out of memory") {
+            return "Provider runtime emitted a Node.js out-of-memory failure."
+        }
+        if let requestLine = lines.first(where: { $0.lowercased().contains("request failed:") }) {
+            let compact = compactLine(requestLine.replacingOccurrences(of: "Request failed: ", with: ""))
+            return "Provider runtime emitted an internal error: \(compact)"
+        }
+        return "Provider runtime emitted an internal Node.js error."
+    }
+
+    private static func providerErrorHighlights(lines: [String], summary: String) -> [String] {
+        let interesting = lines.filter { line in
+            let lowercased = line.lowercased()
+            return lowercased.contains("request failed")
+                || lowercased.contains("fatal error")
+                || lowercased.contains("out of memory")
+                || lowercased.contains("/usr/local/bin/node")
+                || lowercased.contains("/opt/homebrew/bin/node")
+        }
+
+        var seen = Set<String>()
+        return interesting
+            .map(compactLine)
+            .filter { seen.insert($0).inserted && $0 != summary }
+            .prefix(4)
+            .map { $0 }
+    }
+
+    private static func compactLine(_ line: String) -> String {
+        let collapsed = line.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        if collapsed.count > 220 {
+            return String(collapsed.prefix(217)) + "..."
+        }
+        return collapsed
+    }
+}
+
+private struct StreamingTimelineProviderErrorView: View {
+    let presentation: StreamingTimelineTextPresentation
+    @State private var showRawText = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Provider runtime error output", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+
+            Text(presentation.summary)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+
+            if !presentation.highlights.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(presentation.highlights, id: \.self) { highlight in
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "circle.fill")
+                                .font(.system(size: 4))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 6)
+                            Text(highlight)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+
+            if presentation.shouldOfferRawDisclosure {
+                DisclosureGroup(showRawText ? "Hide raw output" : "Show raw output", isExpanded: $showRawText) {
+                    ScrollView {
+                        Text(presentation.rawText)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 220)
+                    .padding(.top, 4)
+                }
+                .font(.caption2)
+            }
         }
     }
 }

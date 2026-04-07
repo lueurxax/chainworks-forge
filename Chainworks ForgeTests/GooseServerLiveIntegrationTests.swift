@@ -159,7 +159,7 @@ struct GooseServerLiveIntegrationTests {
             try await transport.closeSession(sessionID: sessionID)
         } catch {
             // Acceptable — session may already be closed by server after Finish
-            print("Note: closeSession returned error (acceptable): \(error)")
+            ForgeLogger.test.info("Note: closeSession returned error (acceptable): \(error)")
         }
 
         // Save evidence
@@ -177,6 +177,6 @@ struct GooseServerLiveIntegrationTests {
 
         let evidencePath = workDir.appendingPathComponent("live-test-evidence.txt")
         try? evidence.data(using: .utf8)?.write(to: evidencePath)
-        print("Live test evidence saved to: \(evidencePath.path)")
+        ForgeLogger.test.info("Live test evidence saved to: \(evidencePath.path)")
     }
 }

@@ -27,6 +27,11 @@ final class ACPSubprocessManager: @unchecked Sendable {
     private var stderrPipe: Pipe?
     private let lock = NSLock()
 
+    /// Shared line stream — created once per subprocess, reused by all callers.
+    /// Prevents multiple tasks from racing on the same stdout FileHandle.
+    private var sharedLineStream: AsyncThrowingStream<String, Error>?
+    private var sharedStreamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+
     // MARK: - Init
 
     init(
@@ -54,7 +59,8 @@ final class ACPSubprocessManager: @unchecked Sendable {
         }
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: executablePath)
+        let resolvedPath = Self.resolveExecutablePath(executablePath)
+        proc.executableURL = URL(fileURLWithPath: resolvedPath)
         proc.arguments = arguments
 
         // Inherit current environment and merge custom entries
@@ -78,7 +84,9 @@ final class ACPSubprocessManager: @unchecked Sendable {
         proc.standardOutput = stdout
         proc.standardError = stderr
 
+        ForgeLogger.acpSubprocess.debug("Launching: \(resolvedPath) args=\(arguments) PATH=\(mergedEnv["PATH"]?.prefix(200) ?? "nil")")
         try proc.run()
+        ForgeLogger.acpSubprocess.debug("Launched pid=\(proc.processIdentifier)")
 
         self.process = proc
         self.stdinPipe = stdin
@@ -107,45 +115,41 @@ final class ACPSubprocessManager: @unchecked Sendable {
             throw ACPSubprocessError.serializationFailed
         }
 
-        try pipe.fileHandleForWriting.write(contentsOf: payloadData)
+        let handle = pipe.fileHandleForWriting
+        handle.write(payloadData)
+        ForgeLogger.acpSubprocess.debug("Sent \(payloadData.count) bytes to stdin: \(payload.prefix(200))")
     }
 
-    /// Returns an `AsyncThrowingStream` that reads stdout line by line.
-    /// Each yielded string is a single ndjson line (without the trailing newline).
+    /// Returns a **shared** `AsyncThrowingStream` that reads stdout line by line.
+    /// The reader task is started once on first call; subsequent calls return the same stream.
+    /// This prevents multiple tasks from racing on the same stdout FileHandle.
     func readLines() -> AsyncThrowingStream<String, Error> {
         lock.lock()
+        if let existing = sharedLineStream {
+            lock.unlock()
+            return existing
+        }
         let pipe = stdoutPipe
-        lock.unlock()
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            self.sharedStreamContinuation = continuation
 
-        return AsyncThrowingStream { continuation in
             guard let pipe else {
                 continuation.finish(throwing: ACPSubprocessError.notRunning)
                 return
             }
 
-            let task = Task.detached { [weak self] in
+            let readerTask = Task.detached { [weak self] in
                 let handle = pipe.fileHandleForReading
                 var buffer = Data()
 
-                while true {
-                    do {
-                        try Task.checkCancellation()
-                    } catch {
-                        continuation.finish()
-                        return
-                    }
+                while !Task.isCancelled {
+                    let chunk = handle.availableData
 
-                    let chunk: Data?
-                    do {
-                        chunk = try handle.availableData
-                    } catch {
-                        continuation.finish(throwing: error)
-                        return
+                    if !chunk.isEmpty {
+                        ForgeLogger.acpSubprocess.debug("Read \(chunk.count) bytes from stdout")
                     }
-
-                    guard let chunk, !chunk.isEmpty else {
+                    guard !chunk.isEmpty else {
                         // EOF — subprocess closed stdout
-                        // Flush any remaining partial line
                         if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
                             continuation.yield(line)
                         }
@@ -155,7 +159,6 @@ final class ACPSubprocessManager: @unchecked Sendable {
 
                     buffer.append(chunk)
 
-                    // Extract complete lines from buffer
                     while let newlineRange = buffer.range(of: Data([0x0A])) {
                         let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
                         buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
@@ -165,19 +168,22 @@ final class ACPSubprocessManager: @unchecked Sendable {
                         }
                     }
 
-                    // Check if process is still alive
                     let running = self?.isRunning ?? false
                     if !running && buffer.isEmpty {
                         continuation.finish()
                         return
                     }
                 }
+                continuation.finish()
             }
 
             continuation.onTermination = { @Sendable _ in
-                task.cancel()
+                readerTask.cancel()
             }
         }
+        sharedLineStream = stream
+        lock.unlock()
+        return stream
     }
 
     /// Terminate the subprocess gracefully (SIGTERM), then forcefully (SIGKILL) if needed.
@@ -229,6 +235,27 @@ final class ACPSubprocessManager: @unchecked Sendable {
 
     /// Ensure common tool directories are on PATH so that ACP binaries installed
     /// via npm/Homebrew are discoverable.
+    /// Resolve a command name to an absolute path by searching the enriched PATH.
+    /// If the input is already absolute, returns it as-is.
+    private static func resolveExecutablePath(_ name: String) -> String {
+        if name.hasPrefix("/") { return name }
+        let searchDirs = [
+            "\(NSHomeDirectory())/.local/bin",
+            "\(NSHomeDirectory())/.npm-global/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin"
+        ]
+        for dir in searchDirs {
+            let candidate = "\(dir)/\(name)"
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return name // Fallback: let Process try and fail with a clear error
+    }
+
     private static func enrichedPATH(base: String?) -> String {
         let preferred = [
             "\(NSHomeDirectory())/.local/bin",

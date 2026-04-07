@@ -202,3 +202,20 @@ enum RuntimeTransportError: Error, LocalizedError {
         }
     }
 }
+
+// MARK: - RuntimeTransportFactory (Proposal 026 — per-agent transport resolution)
+
+/// Resolves the correct transport for each agent based on its runtime profile.
+/// Transports are cached by adapter family — max one instance per family per run.
+protocol RuntimeTransportFactory: Sendable {
+    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> any RuntimeTransportProtocol
+}
+
+/// Trivial factory wrapping a single transport — backward compatibility for tests
+/// and runs where all agents share one transport.
+struct SingleTransportFactory: RuntimeTransportFactory {
+    let transport: any RuntimeTransportProtocol
+    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> any RuntimeTransportProtocol {
+        transport
+    }
+}

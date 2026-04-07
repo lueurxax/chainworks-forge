@@ -1544,8 +1544,7 @@ mcp_profiles:
   review_visual:
     required_extensions:
     - xcode
-    optional_extensions:
-    - autovisualiser
+    optional_extensions: []
     fallback_policy: fail_if_required_missing
   review_architecture:
     required_extensions:

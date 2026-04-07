@@ -539,6 +539,24 @@ contracts:
     - evidence_refs
     - suggested_changes
     - confidence
+runtime_profiles:
+  claude_agent_acp:
+    capability_class: operator_grade
+    adapter_family: claude_agent_acp
+    requires:
+      - streaming
+      - tools
+      - permission_callbacks
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
+  gemini_cli_acp:
+    capability_class: control_capable
+    adapter_family: gemini_cli_acp
+    requires:
+      - streaming
+      - tools
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_code
@@ -547,6 +565,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 20
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_writer_high:
     provider: claude_code
     model: opus
@@ -668,6 +687,7 @@ backend_profiles:
     structured_output: required
   gemini_review_flash:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-2.5-pro
     effort: medium
     temperature: 0.2
@@ -1544,8 +1564,7 @@ mcp_profiles:
   review_visual:
     required_extensions:
     - xcode
-    optional_extensions:
-    - autovisualiser
+    optional_extensions: []
     fallback_policy: fail_if_required_missing
   review_architecture:
     required_extensions:

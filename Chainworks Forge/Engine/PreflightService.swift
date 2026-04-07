@@ -138,7 +138,7 @@ struct PreflightService {
         let providerBindings: [String: ResolvedProviderBinding]
         if let plan {
             do {
-                providerBindings = try resolver.resolveBindings(plan: plan, startOptions: startOptions)
+                providerBindings = try resolver.resolveBindings(plan: plan, startOptions: startOptions, runtimeProfiles: loadedCatalog?.runtimeProfiles ?? [:])
                 checks.append(PreflightCheck(
                     category: "Providers",
                     title: "Provider Binding Resolution",

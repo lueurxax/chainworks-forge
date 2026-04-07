@@ -63,7 +63,10 @@ final class RuntimeSessionBridge: Sendable {
             ? context.workspace.worktreeRoot!.path
             : readOnlyRoot
         let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
-        if !mcpResolution.blockingIssues.isEmpty {
+        // Proposal 026: ACP runtimes handle MCP natively — Goose extension registry mismatches
+        // are not blocking for non-Goose transports.
+        let isACPRuntime = transport.mcpRuntimeNamespace != nil && transport.mcpRuntimeNamespace != "goose"
+        if !mcpResolution.blockingIssues.isEmpty && !isACPRuntime {
             throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
         }
 
@@ -86,7 +89,8 @@ final class RuntimeSessionBridge: Sendable {
                 "iteration": String(context.iteration),
                 "attempt": String(context.attemptNumber)
             ],
-            requestedExtensions: mcpResolution.predictedEffectiveRuntimeExtensionIDs
+            // Proposal 026: ACP runtimes handle MCP natively — don't pass Goose extension IDs.
+            requestedExtensions: isACPRuntime ? nil : mcpResolution.predictedEffectiveRuntimeExtensionIDs
         )
 
         let sessionResponse = try await transport.createSession(request: sessionRequest)
@@ -330,7 +334,7 @@ final class RuntimeSessionBridge: Sendable {
                     path: attachmentPath
                 ))
             } else {
-                print("[RuntimeSessionBridge] Idea attachment not readable, skipping: \(attachmentPath)")
+                ForgeLogger.bridge.info("Idea attachment not readable, skipping: \(attachmentPath)")
             }
         }
 
@@ -783,7 +787,7 @@ struct RuntimeSessionExecution: Sendable {
                 let isCancelled = msg.contains("cancelled") || (error as? CancellationError) != nil
 
                 if !isAlreadyClosed && !isCancelled {
-                    print("Warning: Failed to cleanup Goose session \(sessionID): \(msg)")
+                    ForgeLogger.bridge.error("Failed to cleanup Goose session \(sessionID): \(msg)")
                 }
             }
         }

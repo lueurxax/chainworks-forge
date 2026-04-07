@@ -671,6 +671,23 @@ struct YAMLParserTests {
         #expect(codeWriter.mcpProfile == "code_build_rich")
     }
 
+    @Test func reviewVisualProfileDoesNotOptIntoAutovisualiser() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let catalogURLs = [
+            repoRoot.appendingPathComponent("examples/agents/agents.yaml"),
+            repoRoot.appendingPathComponent("examples/agents/agents_mcp_profiles_v2.yaml")
+        ]
+
+        for url in catalogURLs {
+            let catalog = try YAMLParser.loadAgentCatalog(from: url)
+            let reviewVisual = try #require(catalog.mcpProfiles["review_visual"])
+            #expect(reviewVisual.requiredExtensions == ["xcode"])
+            #expect(reviewVisual.optionalExtensions.isEmpty)
+        }
+    }
+
     @Test func parseFullWorkflow() throws {
         let workflow = try YAMLParser.loadWorkflow(
             from: fixtureURL("workflow.yaml")

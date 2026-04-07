@@ -2170,7 +2170,7 @@ struct WorkflowStartRunSheet: View {
         do {
             let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
             let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
-            let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions)
+            let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions, runtimeProfiles: catalog.runtimeProfiles)
             let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
             let startSnapshot = try buildRunStartSnapshot(
                 resolver: resolver,

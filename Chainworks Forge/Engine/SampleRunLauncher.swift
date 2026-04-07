@@ -56,7 +56,8 @@ struct SampleRunLauncher {
         }
 
         let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
-        let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: .empty)
+        let sampleCatalog = try? YAMLParser.loadAgentCatalog(from: catalogURL)
+        let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: .empty, runtimeProfiles: sampleCatalog?.runtimeProfiles ?? [:])
         let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
         let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: .empty)
         let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)

@@ -34,34 +34,60 @@ enum ACPStreamEventMapper {
     ///
     /// - Parameter json: The `params` dictionary from the JSON-RPC notification.
     static func mapSessionUpdate(_ json: [String: Any]) -> RuntimeStreamEvent? {
-        guard let type = json["type"] as? String else {
+        // ACP session/update structure: params.update.sessionUpdate = "event_type"
+        // Content fields are siblings of sessionUpdate inside the update dict.
+        let update = json["update"] as? [String: Any] ?? json
+        guard let type = update["sessionUpdate"] as? String ?? update["type"] as? String else {
+            // Log first unrecognized event to diagnose structure
+            let keys = json.keys.sorted().joined(separator: ",")
+            let updateKeys = (json["update"] as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "nil"
+            ForgeLogger.bridge.info("Unrecognized session/update: topKeys=[\(keys)] updateKeys=[\(updateKeys)] raw=\(serializeToJSON(json)?.prefix(300) ?? "nil")")
             return .unknown(type: "unknown_session_update", data: serializeToJSON(json) ?? "{}")
         }
+        // Merge update dict as the working payload for content extraction
+        let payload = update
 
         switch type {
         case "agent_message_chunk":
-            let content = json["content"] as? String ?? ""
+            // content may be String or structured. Try String first, fall back to nested text.
+            if let rawContent = payload["content"], !(rawContent is String) {
+                ForgeLogger.bridge.info("agent_message_chunk content is NOT String, actual: \(Swift.type(of: rawContent)), value: \(String(describing: rawContent).prefix(200))")
+            }
+            let content: String
+            if let str = payload["content"] as? String {
+                content = str
+            } else if let dict = payload["content"] as? [String: Any], let text = dict["text"] as? String {
+                content = text
+            } else {
+                content = ""
+            }
             guard !content.isEmpty else { return nil }
             return .textChunk(text: content)
 
         case "agent_thought_chunk":
-            let content = json["content"] as? String ?? ""
+            let content: String
+            if let str = payload["content"] as? String {
+                content = str
+            } else if let dict = payload["content"] as? [String: Any], let text = dict["text"] as? String {
+                content = text
+            } else {
+                content = ""
+            }
             guard !content.isEmpty else { return nil }
             return .textChunk(text: "[thinking] \(content)")
 
         case "tool_call":
-            return mapToolCall(json)
+            return mapToolCall(payload)
 
         case "tool_call_update":
-            return mapToolCallUpdate(json)
+            return mapToolCallUpdate(payload)
 
         case "usage_update":
-            let raw = serializeToJSON(json) ?? "{}"
+            let raw = serializeToJSON(payload) ?? "{}"
             return .unknown(type: "usage_update", data: raw)
 
         case "plan":
-            // Plan updates from plan-mode sessions — informational
-            let raw = serializeToJSON(json) ?? "{}"
+            let raw = serializeToJSON(payload) ?? "{}"
             return .unknown(type: "plan", data: raw)
 
         case "available_commands_update",
@@ -69,11 +95,10 @@ enum ACPStreamEventMapper {
              "config_option_update",
              "session_info_update",
              "user_message_chunk":
-            // Silently ignored — not actionable for Forge live surfaces
             return nil
 
         default:
-            let raw = serializeToJSON(json) ?? "{}"
+            let raw = serializeToJSON(payload) ?? "{}"
             return .unknown(type: type, data: raw)
         }
     }

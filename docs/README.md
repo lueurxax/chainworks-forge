@@ -38,6 +38,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — Stable Forge token lane, brand assets, and bounded visual rollout
 - [reference/run-control.md](reference/run-control.md) — Stable stop/cancel and cancellation-settlement contract
 - [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Stable idea-owned workspace and frozen run project contract
+- [reference/artifact-content-rendering.md](reference/artifact-content-rendering.md) — Stable unified read-only markdown/json artifact rendering contract
 - [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Stable provider/model truth and provenance contract
 - [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — Stable archive/restore lifecycle for ideas
 - [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Stable Goose-backed provider verification/remediation flow
@@ -85,6 +86,7 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 - [evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md) -- consolidated implementation/proof status for segmented run surfaces, focused timeline, and hierarchical artifact browsing
 - [evidence/ui-quality-and-polish-proof.md](evidence/ui-quality-and-polish-proof.md) -- consolidated implementation/proof status for the UI quality and visual polish slice
 - [evidence/design-system-and-brand-application-proof.md](evidence/design-system-and-brand-application-proof.md) -- consolidated implementation/proof status for the design-system and brand-application slice
+- [evidence/artifact-content-rendering-proof.md](evidence/artifact-content-rendering-proof.md) -- consolidated implementation/proof status for unified read-only markdown/json artifact rendering
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
 - [evidence/mvp-sign-off-proof.md](evidence/mvp-sign-off-proof.md) -- consolidated implementation/proof status for MVP hardening and sign-off
 - [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON

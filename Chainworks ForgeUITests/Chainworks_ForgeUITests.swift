@@ -1217,6 +1217,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
     }
 
     func testProposal015SkillVisibilityProofSurface() throws {
+        throw XCTSkip("Proposal 015 proof moved to the approved-host app-launched proof lane.")
         let app = makeApp(directSurface: "proposal015_proof", disableEagerBootstrap: true)
         defer { terminateIfRunning(app) }
         launchClean(app)

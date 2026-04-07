@@ -362,6 +362,35 @@ Important:
 - the gate keeps its historical proposal label for reproducibility
 - the stable documentation source of truth for the slice is now [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md), not the old proposal file
 
+### `proposal-027`
+
+Artifact content rendering gate for the unified read-only Markdown/JSON artifact presentation slice.
+
+Scope:
+
+- `Proposal027Tests`
+
+Use when:
+
+- reproving the implemented unified renderer on the current head
+- validating payload-rescue intent, image-safety policy, and parse fallback behavior for artifact content
+- confirming JSON tree behavior and markdown document rendering contracts
+
+Host policy:
+
+- local target only; this gate currently executes unit tests without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-027
+```
+
+Important:
+
+- the stable documentation source of truth for this slice is now [artifact-content-rendering.md](../reference/artifact-content-rendering.md), not the old proposal file
+- the consolidated proof summary is in [artifact-content-rendering-proof.md](../evidence/artifact-content-rendering-proof.md)
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
@@ -419,6 +448,12 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ```bash
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-022"
+```
+
+### Artifact rendering proof
+
+```bash
+./scripts/test-gate.sh proposal-027
 ```
 
 ### Before sign-off

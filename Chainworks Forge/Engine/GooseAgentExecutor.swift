@@ -8,7 +8,9 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     // MARK: - Dependencies
 
-    let sessionBridge: RuntimeSessionBridge
+    /// Proposal 026: Per-agent transport factory. Resolves the correct transport
+    /// for each agent based on its runtime profile / adapter family.
+    let transportFactory: any RuntimeTransportFactory
     let override: LiveExecutionOverride?
     let sessionManager: AgentSessionManager?
 
@@ -17,14 +19,39 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     // MARK: - Init
 
+    /// Proposal 026: Primary init with transport factory for per-agent transport resolution.
     init(
+        transportFactory: any RuntimeTransportFactory,
+        override: LiveExecutionOverride? = nil,
+        sessionManager: AgentSessionManager? = nil
+    ) {
+        self.transportFactory = transportFactory
+        self.override = override
+        self.sessionManager = sessionManager
+    }
+
+    /// Convenience init wrapping a single transport (backward compat for tests).
+    convenience init(
         transport: any RuntimeTransportProtocol,
         override: LiveExecutionOverride? = nil,
         sessionManager: AgentSessionManager? = nil
     ) {
-        self.sessionBridge = RuntimeSessionBridge(transport: transport)
-        self.override = override
-        self.sessionManager = sessionManager
+        self.init(
+            transportFactory: SingleTransportFactory(transport: transport),
+            override: override,
+            sessionManager: sessionManager
+        )
+    }
+
+    /// Transport used for cancellation/cleanup of Goose sessions.
+    var gooseTransportForCancellation: (any RuntimeTransportProtocol)? {
+        (transportFactory as? DefaultRuntimeTransportFactory)?.gooseTransport
+    }
+
+    /// Resolve the session bridge for a specific agent using the transport factory.
+    private func sessionBridge(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> RuntimeSessionBridge {
+        let transport = transportFactory.transport(for: agent, binding: binding)
+        return RuntimeSessionBridge(transport: transport)
     }
 
     // MARK: - AgentExecutor Protocol
@@ -163,7 +190,7 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 // 2. Stream & Process
 let streamResult: ExecutionStreamResult
 let sessionID = sessionInfo.execution.sessionID
-print("[Session:Stream][\(sessionID)][Start] Agent: \(agent.id)")
+ForgeLogger.session.info("[\(sessionID)] Stream Start. Agent: \(agent.id)")
 
 do {
     streamResult = try await eventBridge.processStream(
@@ -173,16 +200,16 @@ do {
             switch event.type {
             case .toolCallStarted:
                 if let tool = event.toolName {
-                    print("[Session:Tool][\(sessionID)][Active] \(agentID) -> \(tool)")
+                    ForgeLogger.session.debug("[\(sessionID)] Tool Active: \(agentID) -> \(tool)")
                 }
             case .toolCallFinished:
                 if let tool = event.toolName {
-                    print("[Session:Tool][\(sessionID)][Done] \(agentID) -> \(tool)")
+                    ForgeLogger.session.debug("[\(sessionID)] Tool Done: \(agentID) -> \(tool)")
                 }
             case .error:
-                print("[Session:Stream][\(sessionID)][Error] \(event.detail)")
+                ForgeLogger.session.error("[\(sessionID)] Stream Error: \(event.detail)")
             case .finish:
-                print("[Session:Stream][\(sessionID)][Finish] \(event.detail)")
+                ForgeLogger.session.info("[\(sessionID)] Stream Finish: \(event.detail)")
             default:
                 break
             }
@@ -190,7 +217,7 @@ do {
         }
     )
 } catch {
-    print("[Session:Stream][\(sessionID)][Failed] \(error.localizedDescription)")
+    ForgeLogger.session.error("[\(sessionID)] Stream Failed: \(error.localizedDescription)")
     return await handleStreamFailure(
         error: error,
         sessionInfo: sessionInfo,
@@ -204,7 +231,7 @@ do {
 
 let completedAt = Date()
 await sessionInfo.execution.closeSession()
-print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeIntervalSince(startedAt)))s")
+ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(completedAt.timeIntervalSince(startedAt)))s")
 
 
         // 3. Update Economics & Budget (Proposal 018)
@@ -250,10 +277,12 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> SessionResolutionInfo {
+        // Proposal 026: Resolve per-agent transport via factory
+        let bridge = sessionBridge(for: agent, binding: context.providerBinding)
         let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
         let (workingDirectory, workspaceMode) = resolveWorkingDirectoryAndMode(agent: agent, context: context)
         let fingerprint = calculateFingerprint(agent: agent, context: context, systemPrompt: packet.systemPrompt, workingDirectory: workingDirectory, workspaceMode: workspaceMode)
-        let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
+        let mcpResolution = resolveMCPPolicy(agent: agent, context: context, bridge: bridge)
         
         let ownerKey = InvocationOwnerKeyBuilder.build(
             runID: context.workspace.runID,
@@ -264,7 +293,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         )
 
         guard let sessionManager = sessionManager else {
-            let execution = try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            let execution = try await bridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
             return SessionResolutionInfo(
                 execution: execution,
                 lineageID: nil,
@@ -295,7 +324,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         
         switch decision {
         case .reuse(let generation):
-            print("[Session:Resolve][\(lid)][Reuse] ID: \(generation.providerSessionID ?? "unknown") (Owner: \(ownerKey))")
+            ForgeLogger.session.debug("[\(lid)] Reuse session ID: \(generation.providerSessionID ?? "unknown") (Owner: \(ownerKey))")
             if let providerSessionID = generation.providerSessionID {
                 let conflicts = try await sessionManager.providerSessionConflicts(
                     runID: context.workspace.runID,
@@ -304,7 +333,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 )
                 if !conflicts.isEmpty {
                     let details = Self.describeProviderSessionConflicts(conflicts)
-                    print("[Session:Resolve][\(lid)][Collision] Reuse denied for \(providerSessionID): \(details)")
+                    ForgeLogger.session.error("[\(lid)] Reuse denied for \(providerSessionID): \(details)")
                     let freshExecution = try await createFreshExecutionWithCollisionGuard(
                         agent: agent,
                         task: task,
@@ -313,7 +342,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                         ownerKey: ownerKey,
                         fingerprint: fingerprint,
                         workingDirectory: workingDirectory,
-                        workspaceMode: workspaceMode
+                        workspaceMode: workspaceMode,
+                        bridge: bridge
                     )
                     let gid = try await sessionManager.createGeneration(
                         lineageID: lid,
@@ -334,13 +364,13 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             // catch the "Session not found" error and fall back to a fresh session instead of failing.
             do {
                 try await sessionManager.recordEvent(lineageID: lid, generationID: generation.id, type: .reused)
-                let execution = try await sessionBridge.executeInExistingSession(sessionID: generation.providerSessionID!, packet: packet)
+                let execution = try await bridge.executeInExistingSession(sessionID: generation.providerSessionID!, packet: packet)
                 return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: generation.id, reuseDisposition: .reused, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
             } catch {
                 let errorDesc = error.localizedDescription
-                if errorDesc.contains("Session not found") || errorDesc.contains("session not found") || errorDesc.contains("404") {
+                if errorDesc.contains("Session not found") || errorDesc.contains("session not found") || errorDesc.contains("404") || errorDesc.contains("No active session") {
                     // Session expired — invalidate the stale generation and create a fresh session
-                    print("[Session:Resolve][\(lid)][Expired] Fallback to fresh session: \(errorDesc)")
+                    ForgeLogger.session.info("[\(lid)] Expired session fallback: \(errorDesc)")
                     try? await sessionManager.invalidateGeneration(generationID: generation.id, reason: "Stale session: \(errorDesc)")
                     try? await sessionManager.recordEvent(lineageID: lid, generationID: generation.id, type: .invalidated)
 
@@ -352,7 +382,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                         ownerKey: ownerKey,
                         fingerprint: fingerprint,
                         workingDirectory: workingDirectory,
-                        workspaceMode: workspaceMode
+                        workspaceMode: workspaceMode,
+                        bridge: bridge
                     )
                     let gid = try await sessionManager.createGeneration(
                         lineageID: lid,
@@ -379,7 +410,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 ownerKey: ownerKey,
                 fingerprint: fingerprint,
                 workingDirectory: workingDirectory,
-                workspaceMode: workspaceMode
+                workspaceMode: workspaceMode,
+                bridge: bridge
             )
             let gid = try await sessionManager.createGeneration(
                 lineageID: lid,
@@ -403,7 +435,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
                 ownerKey: ownerKey,
                 fingerprint: fingerprint,
                 workingDirectory: workingDirectory,
-                workspaceMode: workspaceMode
+                workspaceMode: workspaceMode,
+                bridge: bridge
             )
             let gid = try await sessionManager.createGeneration(
                 lineageID: lid,
@@ -420,7 +453,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         }
     }
 
-    private func resolveMCPPolicy(agent: ResolvedAgent, context: ExecutionContext) -> MCPPolicyResolutionReport {
+    private func resolveMCPPolicy(agent: ResolvedAgent, context: ExecutionContext, bridge: RuntimeSessionBridge) -> MCPPolicyResolutionReport {
         guard let catalog = context.catalog else {
             return agent.mcpProfileID == nil ? .none : MCPPolicyResolutionReport(
                 profileID: agent.mcpProfileID ?? "none",
@@ -443,7 +476,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             catalog: catalog,
             providerBinding: context.providerBinding,
             gooseRegistry: gooseRegistry,
-            runtimeNamespaceOverride: sessionBridge.transport.mcpRuntimeNamespace
+            runtimeNamespaceOverride: bridge.transport.mcpRuntimeNamespace
         )
     }
 
@@ -455,16 +488,17 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         ownerKey: String,
         fingerprint: String,
         workingDirectory: String,
-        workspaceMode: String
+        workspaceMode: String,
+        bridge: RuntimeSessionBridge
     ) async throws -> RuntimeSessionExecution {
         guard let sessionManager else {
-            return try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
+            return try await bridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
         }
 
         var lastCollisionDetails = ""
 
         for attempt in 0...Self.maxFreshSessionCollisionRetries {
-            let execution = try await sessionBridge.executeInIsolatedSession(
+            let execution = try await bridge.executeInIsolatedSession(
                 agent: agent,
                 task: task,
                 context: context,
@@ -482,7 +516,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             }
 
             lastCollisionDetails = Self.describeProviderSessionConflicts(conflicts)
-            print("[Session:Resolve][\(lineageID)][Collision] Fresh session \(execution.sessionID) already belongs to another lineage. Owner=\(ownerKey) Fingerprint=\(fingerprint) WorkingDir=\(workingDirectory) Mode=\(workspaceMode) Details=\(lastCollisionDetails)")
+            ForgeLogger.session.error("[\(lineageID)] Fresh session \(execution.sessionID) already belongs to another lineage. Owner=\(ownerKey) Fingerprint=\(fingerprint) WorkingDir=\(workingDirectory) Mode=\(workspaceMode) Details=\(lastCollisionDetails)")
             await execution.closeSession()
 
             if attempt == Self.maxFreshSessionCollisionRetries {

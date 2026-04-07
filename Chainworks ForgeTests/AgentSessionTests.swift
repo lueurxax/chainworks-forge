@@ -59,7 +59,7 @@ struct AgentSessionTests {
         lineage.activeGenerationID = generation.id
         try context.save()
         
-        print("DEBUG: Lineage count: \(lineage.generations.count)")
+        ForgeLogger.test.debug("Lineage count: \(lineage.generations.count)")
         
         // 1. Success case: same owner, same fingerprint
         let decision1 = SessionReusePolicy.evaluate(
@@ -68,7 +68,7 @@ struct AgentSessionTests {
             currentBindingFingerprint: "fp_1", 
             currentRecoveryBranchID: nil
         )
-        print("DEBUG: Decision 1: \(decision1)")
+        ForgeLogger.test.debug("Decision 1: \(decision1)")
         if case .reuse(let gen) = decision1 {
             #expect(gen.id == generation.id)
         } else {

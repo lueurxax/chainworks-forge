@@ -75,6 +75,11 @@ PROPOSAL_015_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal015SkillVisibilityProofSurface"
 )
 
+PROPOSAL_015_NON_UI_TESTS=(
+  "Chainworks ForgeTests/Proposal015Tests"
+  "Chainworks ForgeTests/GooseSessionBridgeTests"
+)
+
 PROPOSAL_018_TESTS=(
   "Chainworks ForgeTests/AgentSessionTests"
   "Chainworks ForgeTests/GooseAgentExecutorTests"
@@ -725,6 +730,94 @@ print(f"Proposal 022 app proof result: {result_path}")
 PY
 }
 
+run_proposal015_app_proof() {
+  local derived_data="$1"
+  local stamp app_binary result_path log_path timeout_seconds pid app_status
+  stamp="$(make_stamp)"
+  app_binary="$derived_data/Build/Products/Debug/Chainworks Forge.app/Contents/MacOS/Chainworks Forge"
+  result_path="$TMP_BASE/proposal-015-app-proof-${stamp}.json"
+  log_path="$TMP_BASE/proposal-015-app-proof-${stamp}.log"
+  timeout_seconds="${CHAINWORKS_P015_APP_PROOF_TIMEOUT_SECONDS:-90}"
+
+  [[ -x "$app_binary" ]] || die "Proposal 015 app proof binary not found: $app_binary"
+
+  log "App proof gate: proposal-015"
+  rm -f "$result_path" "$log_path"
+
+  env \
+    CHAINWORKS_IN_MEMORY_STORE=1 \
+    CHAINWORKS_P015_APP_PROOF_AUTORUN=1 \
+    CHAINWORKS_P015_APP_PROOF_RESULT_PATH="$result_path" \
+    "$app_binary" >"$log_path" 2>&1 &
+  pid=$!
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      printf 'Proposal 015 app proof timed out after %s seconds.\n' "$timeout_seconds" >&2
+      if [[ -f "$log_path" ]]; then
+        printf '%s\n' '--- app proof log ---' >&2
+        cat "$log_path" >&2
+      fi
+      exit 1
+    fi
+    sleep 1
+  done
+
+  wait "$pid"
+  app_status=$?
+  if [[ $app_status -ne 0 ]]; then
+    printf 'Proposal 015 app proof process exited with status %s.\n' "$app_status" >&2
+    if [[ -f "$log_path" ]]; then
+      printf '%s\n' '--- app proof log ---' >&2
+      cat "$log_path" >&2
+    fi
+    exit 1
+  fi
+
+  [[ -f "$result_path" ]] || {
+    printf 'Proposal 015 app proof did not produce result JSON at %s.\n' "$result_path" >&2
+    if [[ -f "$log_path" ]]; then
+      printf '%s\n' '--- app proof log ---' >&2
+      cat "$log_path" >&2
+    fi
+    exit 1
+  }
+
+  python3 - "$result_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result_path = Path(sys.argv[1])
+payload = json.loads(result_path.read_text(encoding="utf-8"))
+result = payload.get("result") or {}
+
+checks = [
+    (result.get("proofAgentID") == "proposal_reviewer_product_owner", "proof agent id must be proposal_reviewer_product_owner"),
+    (result.get("reportSkillRef") == "proposal_review_triad", "report skill ref must be proposal_review_triad"),
+    (result.get("reportSkillRole") == "product_owner", "report skill role must be product_owner"),
+    (result.get("comparisonSkillRole") == "architect", "comparison skill role must be architect"),
+    (result.get("primaryArtifactName") == "proposal_current", "primary artifact must be proposal_current"),
+    (result.get("primaryArtifactExists") is True, "primary artifact must exist on disk"),
+    (result.get("summaryMentionsSkillTruth") is True, "summary must mention skill truth"),
+    (result.get("injectedSkillHashPresent") is True, "injected skill hash must be present"),
+    ("PASS" in (result.get("proofStatus") or ""), "proof status must be PASS"),
+]
+
+failed = [message for ok, message in checks if not ok]
+if failed:
+    print("Proposal 015 app proof validation failed:", file=sys.stderr)
+    for message in failed:
+        print(f"  - {message}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"Proposal 015 app proof result: {result_path}")
+PY
+}
+
 run_test_plan() {
   local gate_name="$1"
   local plan_name="$2"
@@ -1174,7 +1267,8 @@ case "$GATE" in
     fi
     guard_direct_run_insertion
     run_build "proposal-015"
-    run_split_targeted_gate "proposal-015" "${PROPOSAL_015_TESTS[@]}"
+    run_targeted_tests "proposal-015-non-ui" "${PROPOSAL_015_NON_UI_TESTS[@]}"
+    run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
     ;;
   proposal-018|p018)
     check_idle_environment allow_app
