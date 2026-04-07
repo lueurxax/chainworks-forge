@@ -70,10 +70,61 @@ struct ProviderPlatformTests {
         let catalogSourceURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml")
         let workflowCopyURL = tempDirectory.appendingPathComponent("workflow.yaml")
         let catalogCopyURL = tempDirectory.appendingPathComponent("agents.yaml")
-        try fileManager.copyItem(at: workflowSourceURL, to: workflowCopyURL)
-        try writePortableCatalogCopy(from: catalogSourceURL, to: catalogCopyURL)
+
+        if fileManager.isReadableFile(atPath: workflowSourceURL.path) {
+            try fileManager.copyItem(at: workflowSourceURL, to: workflowCopyURL)
+            try writePortableCatalogCopy(from: catalogSourceURL, to: catalogCopyURL)
+        } else {
+            // Source tree not accessible from sandboxed test process —
+            // write minimal inline fixtures sufficient for provider-platform proof.
+            try minimalWorkflowFixture.write(to: workflowCopyURL, atomically: true, encoding: .utf8)
+            try minimalCatalogFixture.write(to: catalogCopyURL, atomically: true, encoding: .utf8)
+        }
         return (workflowCopyURL, catalogCopyURL)
     }
+
+    private let minimalWorkflowFixture = """
+    schema_version: 1
+    workflow:
+      id: provider_platform_test
+      name: Provider Platform Test
+      uses_agent_catalog: ./agents.yaml
+      description: Minimal fixture for provider-platform proof.
+      idea_input:
+        mode: text_with_optional_file
+      execution:
+        single_active_run_per_idea: true
+      required_providers:
+        - codex
+    variables: {}
+    states:
+      state_1_write:
+        agents: [code_writer]
+        transitions:
+          - to: end
+    initial_state: state_1_write
+    """
+
+    private let minimalCatalogFixture = """
+    schema_version: 1
+    app:
+      name: Chainworks
+      runtime: goose
+      transport: rest_sse
+    agents:
+      code_writer:
+        title: Code Writer
+        mode: tool_use
+        provider: codex
+        model: codex
+        effort: high
+        max_turns: 5
+        temperature: 0.0
+        permission_profile: ORCH
+        prompt: Write code.
+        output_contract: implementation
+        outputs: [output]
+    """
 
     private func makeAdapters(
         gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = { _ in .reachable(statusCode: 200) }

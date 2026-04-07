@@ -2984,8 +2984,7 @@ final class WorkflowOrchestrator {
         }
 
         suppressingStructuredOutputByAgentID[agentID] = suppressing
-        let trimmed = visible.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : visible
+        return visible.isEmpty ? nil : visible
     }
 
     private func flushBufferedLiveTextChunkIfNeeded(agentID: String, timestamp: Date) {

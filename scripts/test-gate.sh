@@ -462,6 +462,59 @@ if violations:
 PY
 }
 
+guard_portability_paths() {
+  log "Guard: portability-sensitive sources avoid hardcoded user paths"
+  python3 - "$ROOT_DIR/Chainworks Forge" "$ROOT_DIR/Chainworks ForgeTests" <<'PY'
+from pathlib import Path
+import sys
+
+app_root = Path(sys.argv[1])
+test_root = Path(sys.argv[2])
+violations = []
+
+sensitive_files = [
+    app_root / "Support/PreviewSupport.swift",
+    app_root / "Views/DeliveryPreflightReportView.swift",
+    app_root / "Views/ReleaseGateView.swift",
+    app_root / "Views/IdeaListView.swift",
+    test_root / "Chainworks_ForgeTests.swift",
+    test_root / "GooseSessionBridgeTests.swift",
+]
+
+for f in sensitive_files:
+    if not f.exists():
+        continue
+    content = f.read_text(encoding="utf-8")
+    if "/Users/user/" in content:
+        violations.append(f"{f.name}: contains hardcoded /Users/user/ path")
+
+cwd_sensitive_files = [
+    app_root / "Chainworks_ForgeApp.swift",
+    app_root / "Views/UITestDirectSurfaces.swift",
+    app_root / "Engine/SampleRunLauncher.swift",
+]
+forbidden_fragments = [
+    "repoRoot: FileManager.default.currentDirectoryPath",
+    "run.repoRoot = FileManager.default.currentDirectoryPath",
+    "workspaceRootPath: FileManager.default.currentDirectoryPath",
+]
+
+for f in cwd_sensitive_files:
+    if not f.exists():
+        continue
+    content = f.read_text(encoding="utf-8")
+    for frag in forbidden_fragments:
+        if frag in content:
+            violations.append(f"{f.name}: derives repo truth from cwd via: {frag}")
+
+if violations:
+    print("Portability violations:", file=sys.stderr)
+    for v in violations:
+        print(f"  {v}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 guard_plan_tag_sync() {
   log "Guard: test-plan selectedTests match Swift Testing tags"
   python3 - "$ROOT_DIR" <<'PY'
@@ -1179,6 +1232,7 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     guard_direct_run_insertion
+    guard_portability_paths
     run_build "proposal-025"
     run_targeted_tests "proposal-025" "${PROPOSAL_025_TESTS[@]}"
     ;;
