@@ -139,8 +139,20 @@ struct AppConfiguration: Codable, Equatable, Sendable {
             append(URL(fileURLWithPath: override, isDirectory: true))
         }
 
-        append(URL(fileURLWithPath: currentDirectoryPath, isDirectory: true))
-        append(repositoryRootDerivedFromSourcePath(sourceFilePath))
+        let currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
+        let sourceRepositoryRoot = repositoryRootDerivedFromSourcePath(sourceFilePath)
+        let authorizedRoots = SecurityScopedAccess.authorizedRepositoryRoots()
+
+        if authorizedRoots.contains(where: {
+            currentDirectoryURL.standardizedFileURL.path == $0.path
+                || currentDirectoryURL.standardizedFileURL.path.hasPrefix($0.path + "/")
+        }) || currentDirectoryURL.standardizedFileURL.path == sourceRepositoryRoot.standardizedFileURL.path
+            || currentDirectoryURL.standardizedFileURL.path.hasPrefix(sourceRepositoryRoot.standardizedFileURL.path + "/") {
+            append(currentDirectoryURL)
+        }
+
+        append(sourceRepositoryRoot)
+        authorizedRoots.forEach(append)
 
         if let bundleURL {
             append(bundleURL)
@@ -149,10 +161,11 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         }
 
         if allowsDocumentsFallback {
-            append(
-                URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-                    .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
-            )
+            let documentsFallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
+            if SecurityScopedAccess.hasBookmark(for: documentsFallback) {
+                append(documentsFallback)
+            }
         }
 
         if candidates.isEmpty {
@@ -177,34 +190,42 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         allowsDocumentsFallback: Bool = AppConfiguration.allowsDocumentsFallbackForCurrentProcess,
         sourceFilePath: String = #filePath
     ) -> URL? {
-        let fileManager = FileManager.default
         let trimmedRelativePath = repoRelativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 
-        var candidates: [URL?] = [
-            configuredURL,
-            URL(fileURLWithPath: currentDirectoryPath, isDirectory: true).appendingPathComponent(trimmedRelativePath),
-            repositoryRootDerivedFromSourcePath(sourceFilePath).appendingPathComponent(trimmedRelativePath),
-            defaultRepositoryRoot(
+        var candidates: [URL?] = [configuredURL]
+        let sourceRepositoryRoot = repositoryRootDerivedFromSourcePath(sourceFilePath)
+        let currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
+
+        if currentDirectoryURL.standardizedFileURL.path == sourceRepositoryRoot.standardizedFileURL.path
+            || currentDirectoryURL.standardizedFileURL.path.hasPrefix(sourceRepositoryRoot.standardizedFileURL.path + "/")
+            || SecurityScopedAccess.hasBookmark(for: currentDirectoryURL) {
+            candidates.append(currentDirectoryURL.appendingPathComponent(trimmedRelativePath))
+        }
+
+        candidates.append(sourceRepositoryRoot.appendingPathComponent(trimmedRelativePath))
+        candidates.append(contentsOf: SecurityScopedAccess.authorizedRepositoryRoots().map {
+            $0.appendingPathComponent(trimmedRelativePath)
+        })
+        candidates.append(defaultRepositoryRoot(
                 currentDirectoryPath: currentDirectoryPath,
-                bundleURL: Bundle.main.bundleURL,
+                bundleURL: nil,
                 allowsDocumentsFallback: allowsDocumentsFallback,
                 sourceFilePath: sourceFilePath
-            ).appendingPathComponent(trimmedRelativePath)
-        ]
+        ).appendingPathComponent(trimmedRelativePath))
 
         if allowsDocumentsFallback {
-            candidates.append(
-                URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-                    .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
-                    .appendingPathComponent(trimmedRelativePath)
-            )
+            let documentsFallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Documents/Chainworks Forge", isDirectory: true)
+            if SecurityScopedAccess.hasBookmark(for: documentsFallback) {
+                candidates.append(documentsFallback.appendingPathComponent(trimmedRelativePath))
+            }
         }
 
         candidates.append(bundledURL)
 
         return candidates.first { candidate in
             guard let candidate else { return false }
-            return fileManager.isReadableFile(atPath: candidate.path)
+            return SecurityScopedAccess.fileExists(at: candidate)
         } ?? nil
     }
 

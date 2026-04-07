@@ -45,6 +45,8 @@ struct ExecutionContext: Sendable {
     let variables: [String: AnyCodableValue]
     /// The idea body text for the run.
     let ideaBody: String
+    /// Optional absolute path to a file attached to the idea (e.g. a prior proposal).
+    let ideaAttachmentPath: String?
     /// Resolved provider binding frozen at run start.
     let providerBinding: ResolvedProviderBinding?
     /// Optional contract catalog for catalog-driven prompt/runtime hints.
@@ -73,6 +75,7 @@ struct ExecutionContext: Sendable {
         inputArtifactPaths: [String: String] = [:],
         variables: [String: AnyCodableValue],
         ideaBody: String,
+        ideaAttachmentPath: String? = nil,
         providerBinding: ResolvedProviderBinding?,
         catalog: AgentCatalog? = nil,
         contextStrategyProfileID: String? = nil,
@@ -92,6 +95,7 @@ struct ExecutionContext: Sendable {
         self.inputArtifactPaths = inputArtifactPaths
         self.variables = variables
         self.ideaBody = ideaBody
+        self.ideaAttachmentPath = ideaAttachmentPath
         self.providerBinding = providerBinding
         self.catalog = catalog
         self.contextStrategyProfileID = contextStrategyProfileID
@@ -159,6 +163,8 @@ struct AgentResult: Sendable {
     let mcpSessionStartupLatencyMilliseconds: Int?
     /// Per-server MCP usage measured during this execution.
     let mcpServerMetrics: [MCPServerExecutionMetric]
+    /// Raw accumulated text from the agent's stream (for error classification when errors arrive as text, not transport failures).
+    let accumulatedText: String?
     /// Supporting diagnostic envelope for later readers.
     let outcomeEnvelope: OutcomeEnvelope?
     /// Unique lazy-evidence artifacts actually fetched during execution.
@@ -192,6 +198,7 @@ struct AgentResult: Sendable {
         deniedMCPExtensions: [String] = [],
         mcpSessionStartupLatencyMilliseconds: Int? = nil,
         mcpServerMetrics: [MCPServerExecutionMetric] = [],
+        accumulatedText: String? = nil,
         outcomeEnvelope: OutcomeEnvelope? = nil,
         lazyEvidenceArtifactHits: [String] = []
     ) {
@@ -222,6 +229,7 @@ struct AgentResult: Sendable {
         self.deniedMCPExtensions = deniedMCPExtensions
         self.mcpSessionStartupLatencyMilliseconds = mcpSessionStartupLatencyMilliseconds
         self.mcpServerMetrics = mcpServerMetrics
+        self.accumulatedText = accumulatedText
         self.outcomeEnvelope = outcomeEnvelope
         self.lazyEvidenceArtifactHits = lazyEvidenceArtifactHits
     }

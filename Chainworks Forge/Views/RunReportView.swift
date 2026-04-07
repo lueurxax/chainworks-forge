@@ -427,7 +427,7 @@ struct RunReportView: View {
                         artifactName: summaryArtifact.name,
                         runID: run.id
                     ) {
-                        try String(contentsOfFile: summaryArtifact.filePath, encoding: .utf8)
+                        try SecurityScopedAccess.loadString(from: URL(fileURLWithPath: summaryArtifact.filePath))
                     }
                 } catch {
                     loadError = "Failed to load summary: \(error.localizedDescription)"
@@ -498,7 +498,7 @@ struct RunReportView: View {
             artifactName: artifact.name,
             runID: run.id
         ) {
-            try String(contentsOfFile: artifact.filePath, encoding: .utf8)
+            try SecurityScopedAccess.loadString(from: URL(fileURLWithPath: artifact.filePath))
         }
     }
 

@@ -880,7 +880,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = GooseAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
@@ -1046,7 +1046,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = GooseAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
@@ -1158,7 +1158,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = GooseAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPRefineThenSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPRefineThenSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,

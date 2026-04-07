@@ -4,38 +4,38 @@ import os
 
 // MARK: - Shared Mock Objects
 //
-// Two-lane test double strategy for GooseTransportProtocol:
-// - Lane A (StubGooseTransport): lightweight Sendable struct for stimulus-only tests
-// - Lane B (ObservableGooseTransport): actor-backed observable for side-effect assertions
+// Two-lane test double strategy for RuntimeTransportProtocol:
+// - Lane A (StubRuntimeTransport): lightweight Sendable struct for stimulus-only tests
+// - Lane B (ObservableRuntimeTransport): actor-backed observable for side-effect assertions
 
-// MARK: - Lane A: StubGooseTransport (lightweight value witness)
+// MARK: - Lane A: StubRuntimeTransport (lightweight value witness)
 
 /// Lightweight struct stub for tests that only need stimulus injection (pre-configured
 /// responses and event streams) and do NOT assert on transport-side effects.
 ///
-/// Applicable to: GooseStreamEventMapperTests, SimulatedAgentExecutorTests,
+/// Applicable to: RuntimeStreamEventMapperTests, SimulatedAgentExecutorTests,
 /// stream-only tests in GooseServerTransportTests, EndToEndTests, and any
 /// new test that does not need observation.
-struct StubGooseTransport: GooseTransportProtocol, Sendable {
-    var onCreateSession: @Sendable (GooseSessionRequest) async throws -> GooseSessionResponse = { _ in
-        GooseSessionResponse(
+struct StubRuntimeTransport: RuntimeTransportProtocol, Sendable {
+    var onCreateSession: @Sendable (RuntimeSessionRequest) async throws -> RuntimeSessionResponse = { _ in
+        RuntimeSessionResponse(
             sessionId: "stub-\(UUID().uuidString.prefix(8))",
             status: "active",
-            policyAcknowledgement: GoosePolicyAcknowledgement(
+            policyAcknowledgement: RuntimePolicyAcknowledgement(
                 accepted: true, capabilityToken: "stub", backendPolicyVersion: "v1"
             )
         )
     }
-    var events: [GooseStreamEvent] = []
+    var events: [RuntimeStreamEvent] = []
 
-    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+    func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
         try await onCreateSession(request)
     }
 
     func submitPrompt(
         sessionID: String,
-        prompt: GoosePromptRequest
-    ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+        prompt: RuntimePromptRequest
+    ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
         let events = self.events
         return AsyncThrowingStream { c in
             Task { for e in events { c.yield(e) }; c.finish() }
@@ -45,24 +45,24 @@ struct StubGooseTransport: GooseTransportProtocol, Sendable {
     func closeSession(sessionID: String) async throws {}
 }
 
-// MARK: - Lane B: ObservableGooseTransport (actor-backed observable mock)
+// MARK: - Lane B: ObservableRuntimeTransport (actor-backed observable mock)
 
 /// Lock-backed observable mock for tests that need to assert on request content,
 /// session lifecycle, and call counts after execution.
 ///
-/// Applicable to: GooseAgentExecutorTests, GooseSessionBridgeTests, OrchestratorTests,
+/// Applicable to: RuntimeAgentExecutorTests, GooseSessionBridgeTests, OrchestratorTests,
 /// and session-lifecycle tests in GooseServerTransportTests.
 ///
 /// Keep the surface async-friendly for tests, but avoid actor/protocol isolation
 /// mismatches with the synchronous `submitPrompt` requirement.
-final class ObservableGooseTransport: GooseTransportProtocol, @unchecked Sendable {
+final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sendable {
     private struct State {
-        var createSessionResult: GooseSessionResponse?
+        var createSessionResult: RuntimeSessionResponse?
         var createSessionError: Error?
-        var streamEvents: [GooseStreamEvent] = []
+        var streamEvents: [RuntimeStreamEvent] = []
         var closeSessionCalled = false
         var lastSessionID: String?
-        var lastSessionRequest: GooseSessionRequest?
+        var lastSessionRequest: RuntimeSessionRequest?
         var createSessionCallCount = 0
         var submitPromptCallCount = 0
     }
@@ -71,9 +71,9 @@ final class ObservableGooseTransport: GooseTransportProtocol, @unchecked Sendabl
 
     /// Convenience configuration method for test setup.
     func configure(
-        sessionResult: GooseSessionResponse? = nil,
+        sessionResult: RuntimeSessionResponse? = nil,
         sessionError: Error? = nil,
-        events: [GooseStreamEvent] = []
+        events: [RuntimeStreamEvent] = []
     ) async {
         state.withLock { state in
             state.createSessionResult = sessionResult
@@ -82,17 +82,17 @@ final class ObservableGooseTransport: GooseTransportProtocol, @unchecked Sendabl
         }
     }
 
-    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-        let (result, error): (GooseSessionResponse?, Error?) = state.withLock { state in
+    func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+        let (result, error): (RuntimeSessionResponse?, Error?) = state.withLock { state in
             state.createSessionCallCount += 1
             state.lastSessionRequest = request
             return (state.createSessionResult, state.createSessionError)
         }
         if let error { throw error }
-        return result ?? GooseSessionResponse(
+        return result ?? RuntimeSessionResponse(
             sessionId: "obs-\(UUID().uuidString.prefix(8))",
             status: "active",
-            policyAcknowledgement: GoosePolicyAcknowledgement(
+            policyAcknowledgement: RuntimePolicyAcknowledgement(
                 accepted: true, capabilityToken: "obs", backendPolicyVersion: "v1"
             )
         )
@@ -100,8 +100,8 @@ final class ObservableGooseTransport: GooseTransportProtocol, @unchecked Sendabl
 
     func submitPrompt(
         sessionID: String,
-        prompt: GoosePromptRequest
-    ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+        prompt: RuntimePromptRequest
+    ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
         let events = state.withLock { state in
             state.submitPromptCallCount += 1
             state.lastSessionID = sessionID
@@ -134,7 +134,7 @@ final class ObservableGooseTransport: GooseTransportProtocol, @unchecked Sendabl
         get async { state.withLock { $0.lastSessionID } }
     }
 
-    var lastSessionRequest: GooseSessionRequest? {
+    var lastSessionRequest: RuntimeSessionRequest? {
         get async { state.withLock { $0.lastSessionRequest } }
     }
 
@@ -166,7 +166,7 @@ struct SharedStaticResultExecutor: AgentExecutor {
 // MARK: - Thread-Safe Event Collector
 
 /// Thread-safe collector for execution events (compiler-verified Sendable via OSAllocatedUnfairLock).
-/// Use in GooseAgentExecutor tests to avoid unsafe mutation of captured vars in @Sendable closures.
+/// Use in RuntimeAgentExecutor tests to avoid unsafe mutation of captured vars in @Sendable closures.
 /// Replaces the former `@unchecked Sendable` class per TEST-004.
 final class SharedEventCollector: Sendable {
     private let storage = OSAllocatedUnfairLock(initialState: [ExecutionEvent]())

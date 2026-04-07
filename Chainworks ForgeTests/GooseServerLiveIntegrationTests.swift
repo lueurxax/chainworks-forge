@@ -95,7 +95,7 @@ struct GooseServerLiveIntegrationTests {
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: workDir) }
 
-        let sessionRequest = GooseSessionRequest(
+        let sessionRequest = RuntimeSessionRequest(
             systemPrompt: """
             You are a test agent.
             Do not call xcode_mcp or any IDE/editor MCP tools.
@@ -116,7 +116,7 @@ struct GooseServerLiveIntegrationTests {
 
         // Step 3: Submit a trivial prompt and collect events
         // Allow up to 180 seconds for cold-start + execution
-        let prompt = GoosePromptRequest(
+        let prompt = RuntimePromptRequest(
             content: "Reply with exactly: live test ok",
             context: nil
         )

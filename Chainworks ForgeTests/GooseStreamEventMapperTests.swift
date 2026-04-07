@@ -5,7 +5,7 @@ import Foundation
 // MARK: - GooseStreamEventMapperTests (Proposal 005, Section 8)
 
 /// Unit tests for GooseStreamEventMapper.
-/// Validates that all goosed MessageEvent types are correctly mapped to GooseStreamEvent.
+/// Validates that all goosed MessageEvent types are correctly mapped to RuntimeStreamEvent.
 @Suite("GooseStreamEventMapper")
 struct GooseStreamEventMapperTests {
 

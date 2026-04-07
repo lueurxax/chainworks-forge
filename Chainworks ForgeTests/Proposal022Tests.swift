@@ -59,12 +59,12 @@ struct Proposal022Tests {
             .appendingPathComponent("Proposal022Fixture-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
 
-        let request = GooseSessionRequest(
+        let request = RuntimeSessionRequest(
             systemPrompt: "Proposal 022 proof",
             workingDirectory: workspace.path,
             model: "fixture-model",
             provider: "claude_code",
-            executionPolicy: GooseExecutionPolicy(
+            executionPolicy: RuntimeExecutionPolicy(
                 permissionProfileID: "fixture-read-only",
                 workspaceMode: "artifact_only",
                 gitOperationsAllowed: false,
@@ -75,7 +75,7 @@ struct Proposal022Tests {
         )
         let session = try await transport.createSession(request: request)
 
-        let prompt = GoosePromptRequest(content: """
+        let prompt = RuntimePromptRequest(content: """
         ## Task: aggregate_proposal_reviews
 
         ### Expected Outputs

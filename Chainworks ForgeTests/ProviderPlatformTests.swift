@@ -58,6 +58,11 @@ struct ProviderPlatformTests {
         return url
     }
 
+    private func clearSecurityScopedBookmarks() {
+        SecurityScopedAccess.resetForTesting()
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
+    }
+
     private func makeCanonicalYAMLCopies(in tempDirectory: URL) throws -> (workflowURL: URL, catalogURL: URL) {
         let fileManager = FileManager.default
         let repoRoot = testRepositoryRootURL()
@@ -224,6 +229,33 @@ struct ProviderPlatformTests {
         #expect(overridden.activeConfigurationSource == .developmentEnvOverride)
     }
 
+    @Test("App configuration store does not auto-bookmark seeded or persisted paths")
+    mutating func appConfigurationStoreDoesNotAutoBookmarkSeededOrPersistedPaths() throws {
+        clearSecurityScopedBookmarks()
+
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            clearSecurityScopedBookmarks()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let configuration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
+            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+
+        _ = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: configuration
+        ))
+
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
+    }
+
     @Test("Fixture live runtime is ready even when managed Goose server is idle")
     mutating func fixtureLiveRuntimeIsReadyWhenServerManagerIsIdle() throws {
         let tempDirectory = try makeTempDirectory()
@@ -319,6 +351,7 @@ struct ProviderPlatformTests {
         #expect(launchPlan?.environment["GOOSE_HOST"] == "127.0.0.1")
         #expect(launchPlan?.environment["GOOSE_TLS"] == "true")
         #expect(launchPlan?.environment["PATH"]?.contains("/opt/homebrew/bin") == true)
+        #expect(launchPlan?.environment["NODE_OPTIONS"]?.contains("--max-old-space-size=4096") == true)
     }
 
     @Test("Managed Goose server does not auto-launch when autostart is disabled")

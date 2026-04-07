@@ -70,7 +70,10 @@ struct RunRepository {
         workflowSourcePath: String,
         catalogSourcePath: String,
         workflowSnapshotJSON: Data,
-        catalogSnapshotJSON: Data
+        catalogSnapshotJSON: Data,
+        workspaceRoot: String = "",
+        artifactRoot: String = "",
+        planCompilerVersion: Int = 0
     ) throws -> Run {
         let activeStatuses: [RunStatus] = [.pending, .ready, .running, .waitingApproval, .blocked]
         if let existing = idea.runs.first(where: { activeStatuses.contains($0.status) }) {
@@ -85,7 +88,10 @@ struct RunRepository {
             workflowSourcePath: workflowSourcePath,
             catalogSourcePath: catalogSourcePath,
             workflowSnapshotJSON: workflowSnapshotJSON,
-            catalogSnapshotJSON: catalogSnapshotJSON
+            catalogSnapshotJSON: catalogSnapshotJSON,
+            workspaceRoot: workspaceRoot,
+            artifactRoot: artifactRoot,
+            planCompilerVersion: planCompilerVersion
         )
         run.idea = idea
         context.insert(run)

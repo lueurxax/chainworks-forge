@@ -287,8 +287,12 @@ final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
             window.orderFrontRegardless()
 
             NSApp.setActivationPolicy(.regular)
-            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-            NSApp.activate(ignoringOtherApps: true)
+            if #available(macOS 14.0, *) {
+                NSApp.activate()
+            } else {
+                NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+                NSApp.activate(ignoringOtherApps: true)
+            }
 
             fallbackWindow = window
             UIAutomationDiagnostics.log("fallbackWindowCreated windows=\(NSApp.windows.count) isVisible=\(window.isVisible)")
@@ -347,8 +351,12 @@ private struct RootHostView: View {
                 }
 
                 let shouldContinue = await MainActor.run { () -> Bool in
-                    NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-                    NSApp.activate(ignoringOtherApps: true)
+                    if #available(macOS 14.0, *) {
+                        NSApp.activate()
+                    } else {
+                        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
 
                     var shouldRetry = true
                     for window in NSApp.windows {
@@ -881,11 +889,11 @@ struct AppBootstrapView: View {
             return false
         }
 
-        if !FileManager.default.fileExists(atPath: configuration.workflowSourcePath) {
+        if !SecurityScopedAccess.fileExists(at: URL(fileURLWithPath: configuration.workflowSourcePath)) {
             return true
         }
 
-        if !FileManager.default.fileExists(atPath: configuration.agentCatalogSourcePath) {
+        if !SecurityScopedAccess.fileExists(at: URL(fileURLWithPath: configuration.agentCatalogSourcePath)) {
             return true
         }
 
@@ -1172,7 +1180,7 @@ struct AppBootstrapView: View {
             writerExecution.completedAt = Date().addingTimeInterval(-95)
             writerExecution.stageExecution = refinedStage
             writerExecution.providerSessionID = "fixture-seeded-session"
-            writerExecution.gooseSessionID = "fixture-seeded-session"
+            writerExecution.runtimeSessionID = "fixture-seeded-session"
             writerExecution.transcriptArtifactPath = workspace.artifactRoot
                 .appendingPathComponent("seed")
                 .appendingPathComponent("proposal_writer_transcript.md")
@@ -1191,7 +1199,7 @@ struct AppBootstrapView: View {
             reviewExecution.completedAt = Date().addingTimeInterval(-90)
             reviewExecution.stageExecution = refinedStage
             reviewExecution.providerSessionID = "fixture-seeded-session"
-            reviewExecution.gooseSessionID = "fixture-seeded-session"
+            reviewExecution.runtimeSessionID = "fixture-seeded-session"
             modelContext.insert(reviewExecution)
 
             let artifactManager = ArtifactManager(modelContext: modelContext)

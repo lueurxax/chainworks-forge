@@ -2,11 +2,11 @@ import Foundation
 
 // MARK: - ExecutionEventBridge (Provider events -> App events)
 
-/// Converts raw Goose SSE stream events into app-friendly execution events
+/// Converts raw runtime SSE stream events into app-friendly execution events
 /// for UI display, logging, and receipt building.
 ///
 /// This bridge provides a stable, provider-agnostic event interface.
-/// The UI reads `ExecutionEvent`, never raw `GooseStreamEvent`.
+/// The UI reads `ExecutionEvent`, never raw `RuntimeStreamEvent`.
 final class ExecutionEventBridge: @unchecked Sendable {
 
     // MARK: - State
@@ -18,6 +18,9 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     /// Tool calls observed during execution.
     private var _toolCalls: [ToolCallRecord] = []
+
+    /// Best-known tool names keyed by provider tool-call id.
+    private var _toolNamesByCallID: [String: String] = [:]
 
     /// All events in order (for receipt building).
     private var _eventLog: [ExecutionEvent] = []
@@ -55,9 +58,9 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     // MARK: - Event Processing
 
-    /// Process a stream of GooseStreamEvents and yield app-friendly ExecutionEvents.
+    /// Process a stream of RuntimeStreamEvents and yield app-friendly ExecutionEvents.
     func processStream(
-        _ stream: AsyncThrowingStream<GooseStreamEvent, Error>,
+        _ stream: AsyncThrowingStream<RuntimeStreamEvent, Error>,
         onEvent: @Sendable @escaping (ExecutionEvent) -> Void
     ) async throws -> ExecutionStreamResult {
         var finalContent: String?
@@ -83,9 +86,10 @@ final class ExecutionEventBridge: @unchecked Sendable {
                     _accumulatedText += text
                 }
             case .toolCallStarted(let toolName, let raw):
+                let resolvedToolName = appEvent.toolName ?? toolName
                 withLock {
                     _toolCalls.append(ToolCallRecord(
-                        toolName: toolName,
+                        toolName: resolvedToolName,
                         rawPayload: raw,
                         startedAt: Date(),
                         completedAt: nil,
@@ -94,9 +98,10 @@ final class ExecutionEventBridge: @unchecked Sendable {
                     ))
                 }
             case .toolCallFinished(let toolName, let raw):
+                let resolvedToolName = appEvent.toolName ?? toolName
                 withLock {
                     let idx =
-                        _toolCalls.lastIndex(where: { $0.toolName == toolName && $0.completedAt == nil })
+                        _toolCalls.lastIndex(where: { $0.toolName == resolvedToolName && $0.completedAt == nil })
                         ?? _toolCalls.lastIndex(where: { $0.completedAt == nil })
                     if let idx {
                         _toolCalls[idx].completedAt = Date()
@@ -123,7 +128,7 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     // MARK: - Private: Event Mapping
 
-    private func mapToAppEvent(_ event: GooseStreamEvent) -> ExecutionEvent {
+    private func mapToAppEvent(_ event: RuntimeStreamEvent) -> ExecutionEvent {
         let timestamp = Date()
 
         switch event {
@@ -146,18 +151,20 @@ final class ExecutionEventBridge: @unchecked Sendable {
                 requestID: requestID
             )
         case .toolCallStarted(let toolName, _):
+            let resolvedToolName = resolveToolCallStartedName(toolName: toolName, raw: event.rawPayload)
             return ExecutionEvent(
                 type: .toolCallStarted,
                 timestamp: timestamp,
-                detail: "Tool: \(toolName)",
-                toolName: toolName
+                detail: "Tool: \(resolvedToolName)",
+                toolName: resolvedToolName
             )
         case .toolCallFinished(let toolName, _):
+            let resolvedToolName = resolveToolCallFinishedName(toolName: toolName, raw: event.rawPayload)
             return ExecutionEvent(
                 type: .toolCallFinished,
                 timestamp: timestamp,
-                detail: "Tool completed: \(toolName)",
-                toolName: toolName
+                detail: "Tool completed: \(resolvedToolName)",
+                toolName: resolvedToolName
             )
         case .textChunk(let text):
             return ExecutionEvent(type: .textChunk, timestamp: timestamp, detail: text)
@@ -201,6 +208,7 @@ final class ExecutionEventBridge: @unchecked Sendable {
         withLock {
             _accumulatedText = ""
             _toolCalls = []
+            _toolNamesByCallID = [:]
             _eventLog = []
             _hasFinalOutput = false
             _finishReason = nil
@@ -212,6 +220,125 @@ final class ExecutionEventBridge: @unchecked Sendable {
         _lock.lock()
         defer { _lock.unlock() }
         return body()
+    }
+
+    private func resolveToolCallStartedName(toolName: String, raw: String) -> String {
+        let metadata = parseToolPayloadMetadata(from: raw)
+        let resolved = preferredToolName(primary: toolName, fallback: metadata.toolName)
+
+        if let callID = metadata.callID, isDisplayableToolName(resolved) {
+            withLock {
+                _toolNamesByCallID[callID] = resolved
+            }
+        }
+
+        return resolved
+    }
+
+    private func resolveToolCallFinishedName(toolName: String, raw: String) -> String {
+        let metadata = parseToolPayloadMetadata(from: raw)
+        let fallbackFromCallID = metadata.callID.flatMap { callID in
+            withLock { _toolNamesByCallID[callID] }
+        }
+        return preferredToolName(primary: toolName, fallback: metadata.toolName ?? fallbackFromCallID)
+    }
+
+    private func preferredToolName(primary: String, fallback: String?) -> String {
+        if isDisplayableToolName(primary) {
+            return primary
+        }
+        if let fallback, isDisplayableToolName(fallback) {
+            return fallback
+        }
+        return "unknown"
+    }
+
+    private func isDisplayableToolName(_ candidate: String?) -> Bool {
+        guard let candidate else { return false }
+        return !candidate.isEmpty && candidate != "unknown" && !candidate.hasPrefix("call_")
+    }
+
+    private func parseToolPayloadMetadata(from raw: String) -> ToolPayloadMetadata {
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ToolPayloadMetadata(callID: nil, toolName: nil)
+        }
+
+        let callID = firstString(
+            in: json,
+            paths: [
+                ["id"],
+                ["tool_call_id"],
+                ["toolCallId"],
+                ["call_id"],
+                ["callId"]
+            ]
+        )
+
+        let toolName = firstString(
+            in: json,
+            paths: [
+                ["tool_name"],
+                ["toolName"],
+                ["tool_call", "name"],
+                ["toolCall", "name"],
+                ["tool", "name"],
+                ["function", "name"],
+                ["name"]
+            ]
+        )
+
+        return ToolPayloadMetadata(callID: callID, toolName: toolName)
+    }
+
+    private func firstString(in json: [String: Any], paths: [[String]]) -> String? {
+        for path in paths {
+            if let value = stringValue(in: json, path: path), !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func stringValue(in json: [String: Any], path: [String]) -> String? {
+        var current: Any = json
+
+        for key in path {
+            guard let dictionary = current as? [String: Any],
+                  let next = dictionary[key] else {
+                return nil
+            }
+            current = next
+        }
+
+        return current as? String
+    }
+}
+
+private struct ToolPayloadMetadata {
+    let callID: String?
+    let toolName: String?
+}
+
+private extension RuntimeStreamEvent {
+    var rawPayload: String {
+        switch self {
+        case .sessionStarted(let raw),
+                .promptSubmitted(let raw),
+                .toolCallStarted(_, let raw),
+                .toolCallFinished(_, let raw),
+                .finish(_, _, let raw),
+                .sessionClosed(let raw):
+            return raw
+        case .textChunk(let text):
+            return text
+        case .finalOutput(let content):
+            return content
+        case .error(let message):
+            return message
+        case .unknown(_, let data):
+            return data
+        }
     }
 }
 

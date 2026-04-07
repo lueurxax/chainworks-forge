@@ -183,7 +183,6 @@ final class SessionReuseKPIExporter {
             let agentFresh = createEvents.count
 
             // Token economics
-            let totalTurns = generations.reduce(0) { $0 + $1.turnCount }
             let totalTokens = generations.reduce(Int64(0)) { $0 + $1.cumulativePromptTokens }
             let avgTokensPerInvocation = agentTotalExec > 0 ? totalTokens / Int64(max(1, agentTotalExec)) : Int64(0)
 
@@ -310,7 +309,11 @@ final class SessionReuseKPIExporter {
         let startupLatencyByExtensionSet = startupLatencyBuckets(for: mcpExecutions)
         let serverUsage = aggregateServerUsage(from: mcpExecutions)
         let totalPromptContextDeltaBytes = serverUsage.reduce(Int64(0)) { $0 + $1.promptContextDeltaBytes }
-        let totalMCPPreflightBlockedRuns = run.map(mcpPreflightBlockedRunCount(for:)) ?? 0
+        let totalMCPPreflightBlockedRuns: Int = {
+            guard let r = run, r.status == .blocked else { return 0 }
+            let reason = (r.driftDetails ?? "").lowercased()
+            return (reason.contains("mcp") || reason.contains("goose extension registry") || reason.contains("session-scoped mcp")) ? 1 : 0
+        }()
         let averageRequestedExtensionsPerExecution = mcpExecutions.isEmpty
             ? 0.0
             : Double(totalRequestedExtensionCount) / Double(mcpExecutions.count)

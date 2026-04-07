@@ -1,9 +1,9 @@
 import Foundation
 
 /// Deterministic Goose transport used for Proposal 004 integration/UI proof without a real backend.
-/// Proposal 005: conforms to `GooseTransportProtocol` directly (no longer subclasses `GooseTransport`).
+/// Proposal 005: conforms to `RuntimeTransportProtocol` directly (no longer subclasses `GooseTransport`).
 /// LOCKED-004: Fixture mode is not touched — fixture transport continues to work unchanged behind the protocol.
-final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
+final class FixtureGooseTransport: RuntimeTransportProtocol, @unchecked Sendable {
     enum Scenario {
         case proposalLoopSuccess
         case proposal022FeedbackCycle
@@ -14,7 +14,7 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     private let scenario: Scenario
     private let stateQueue = DispatchQueue(label: "FixtureGooseTransport.state")
-    private var sessionRequests: [String: GooseSessionRequest] = [:]
+    private var sessionRequests: [String: RuntimeSessionRequest] = [:]
     private var taskInvocationCounts: [String: Int] = [:]
 
     nonisolated init(scenario: Scenario = .proposalLoopSuccess) {
@@ -23,17 +23,17 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     var mcpRuntimeNamespace: String? { "goose" }
 
-    // MARK: - GooseTransportProtocol
+    // MARK: - RuntimeTransportProtocol
 
-    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+    func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
         let sessionID = "fixture-\(UUID().uuidString.prefix(8))"
         stateQueue.sync {
             sessionRequests[sessionID] = request
         }
-        return GooseSessionResponse(
+        return RuntimeSessionResponse(
             sessionId: sessionID,
             status: "active",
-            policyAcknowledgement: GoosePolicyAcknowledgement(
+            policyAcknowledgement: RuntimePolicyAcknowledgement(
                 accepted: true,
                 capabilityToken: "fixture-read-only",
                 backendPolicyVersion: "fixture-v1"
@@ -45,8 +45,8 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     func submitPrompt(
         sessionID: String,
-        prompt: GoosePromptRequest
-    ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+        prompt: RuntimePromptRequest
+    ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
         let request = stateQueue.sync { sessionRequests[sessionID] }
         let events = buildEvents(sessionID: sessionID, prompt: prompt, request: request)
 
@@ -70,9 +70,9 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     private func buildEvents(
         sessionID: String,
-        prompt: GoosePromptRequest,
-        request: GooseSessionRequest?
-    ) -> [GooseStreamEvent] {
+        prompt: RuntimePromptRequest,
+        request: RuntimeSessionRequest?
+    ) -> [RuntimeStreamEvent] {
         switch scenario {
         case .proposalLoopSuccess:
             return proposalLoopSuccessEvents(sessionID: sessionID, prompt: prompt, request: request)
@@ -89,26 +89,20 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     private func proposalLoopSuccessEvents(
         sessionID: String,
-        prompt: GoosePromptRequest,
-        request: GooseSessionRequest?
-    ) -> [GooseStreamEvent] {
+        prompt: RuntimePromptRequest,
+        request: RuntimeSessionRequest?
+    ) -> [RuntimeStreamEvent] {
         let taskName = parseTaskName(from: prompt.content)
         let agentID = request?.metadata?["agent_id"] ?? "unknown_agent"
-        let outputDirectory = parseOutputDirectory(from: prompt.content)
         let outputNames = parseOutputNames(from: prompt.content)
         let invocation = nextInvocation(for: taskName)
 
-        if let outputDirectory {
-            writeFixtureOutputs(
-                for: taskName,
-                agentID: agentID,
-                outputNames: outputNames,
-                outputDirectory: outputDirectory,
-                invocation: invocation
-            )
-        }
-
-        let finalOutput = makeFinalOutput(taskName: taskName, agentID: agentID, invocation: invocation)
+        let finalOutput = makeFinalOutput(
+            taskName: taskName,
+            agentID: agentID,
+            invocation: invocation,
+            outputNames: outputNames
+        )
 
         return [
             .sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#),
@@ -123,31 +117,25 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
 
     private func fullMVPSuccessEvents(
         sessionID: String,
-        prompt: GoosePromptRequest,
-        request: GooseSessionRequest?
-    ) -> [GooseStreamEvent] {
+        prompt: RuntimePromptRequest,
+        request: RuntimeSessionRequest?
+    ) -> [RuntimeStreamEvent] {
         let taskName = parseTaskName(from: prompt.content)
         let agentID = request?.metadata?["agent_id"] ?? "unknown_agent"
-        let outputDirectory = parseOutputDirectory(from: prompt.content)
         let outputNames = parseOutputNames(from: prompt.content)
         let invocation = nextInvocation(for: taskName)
-
-        if let outputDirectory {
-            writeFixtureOutputs(
-                for: taskName,
-                agentID: agentID,
-                outputNames: outputNames,
-                outputDirectory: outputDirectory,
-                invocation: invocation
-            )
-        }
 
         if shouldWriteToWorktree(taskName: taskName, request: request),
            let workingDirectory = request?.workingDirectory {
             writeFixtureWorktreeChange(taskName: taskName, workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true))
         }
 
-        let finalOutput = makeFinalOutput(taskName: taskName, agentID: agentID, invocation: invocation)
+        let finalOutput = makeFinalOutput(
+            taskName: taskName,
+            agentID: agentID,
+            invocation: invocation,
+            outputNames: outputNames
+        )
 
         return [
             .sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#),
@@ -177,7 +165,7 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         var names: [String] = []
         for rawLine in tail.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("Output directory:") || line.hasPrefix("### Stop Condition") {
+            if line.hasPrefix("### Stop Condition") {
                 break
             }
             if line.hasPrefix("- ") {
@@ -187,42 +175,25 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         return names
     }
 
-    private func parseOutputDirectory(from prompt: String) -> URL? {
-        guard let line = prompt
-            .components(separatedBy: .newlines)
-            .first(where: { $0.hasPrefix("Output directory:") }) else {
-            return nil
+    private func makeFinalOutput(taskName: String, agentID: String, invocation: Int, outputNames: [String]) -> String {
+        guard !outputNames.isEmpty else {
+            return makeOutputContent(taskName: taskName, agentID: agentID, outputName: "final_output", invocation: invocation)
         }
-        let path = line.replacingOccurrences(of: "Output directory:", with: "").trimmingCharacters(in: .whitespaces)
-        guard !path.isEmpty else { return nil }
-        return URL(fileURLWithPath: path, isDirectory: true)
-    }
 
-    // MARK: - Private: Fixture Output Writing
-
-    private func writeFixtureOutputs(
-        for taskName: String,
-        agentID: String,
-        outputNames: [String],
-        outputDirectory: URL,
-        invocation: Int
-    ) {
-        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-
-        for outputName in outputNames {
-            let content = makeOutputContent(
+        return outputNames.map { outputName in
+            let body = makeOutputContent(
                 taskName: taskName,
                 agentID: agentID,
                 outputName: outputName,
                 invocation: invocation
             )
-            let url = outputDirectory.appendingPathComponent(outputName)
-            try? content.data(using: .utf8)?.write(to: url)
+            return """
+            <<<CHAINWORKS_OUTPUT:\(outputName)>>>
+            \(body)
+            <<<END_CHAINWORKS_OUTPUT>>>
+            """
         }
-    }
-
-    private func makeFinalOutput(taskName: String, agentID: String, invocation: Int) -> String {
-        makeOutputContent(taskName: taskName, agentID: agentID, outputName: "final_output", invocation: invocation)
+        .joined(separator: "\n\n")
     }
 
     private func makeOutputContent(taskName: String, agentID: String, outputName: String, invocation: Int) -> String {
@@ -854,7 +825,7 @@ final class FixtureGooseTransport: GooseTransportProtocol, @unchecked Sendable {
         }
     }
 
-    private func shouldWriteToWorktree(taskName: String, request: GooseSessionRequest?) -> Bool {
+    private func shouldWriteToWorktree(taskName: String, request: RuntimeSessionRequest?) -> Bool {
         guard request?.executionPolicy?.repoWritesAllowed == true else { return false }
         return taskName == "initial_implementation"
             || taskName == "continue_implementation"

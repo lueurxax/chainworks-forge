@@ -70,8 +70,8 @@ final class RunCancellationCoordinator {
             agentExec.completedAt = agentExec.completedAt ?? Date()
 
             // Collect session IDs for async cleanup.
-            let hasSession = agentExec.gooseSessionID != nil && !(agentExec.gooseSessionID?.isEmpty ?? true)
-            if let sessionID = agentExec.gooseSessionID, !sessionID.isEmpty {
+            let hasSession = agentExec.runtimeSessionID != nil && !(agentExec.runtimeSessionID?.isEmpty ?? true)
+            if let sessionID = agentExec.runtimeSessionID, !sessionID.isEmpty {
                 pendingSessionIDs.append(sessionID)
                 sessionToAgentExecutionID[sessionID] = agentExec.id
             }
@@ -175,7 +175,7 @@ final class RunCancellationCoordinator {
         executor: AgentExecutor,
         perSessionTimeout: Duration = .seconds(10)
     ) async -> [SessionCloseOutcome] {
-        guard let gooseExecutor = executor as? GooseAgentExecutor else {
+        guard let gooseExecutor = executor as? RuntimeAgentExecutor else {
             // No Goose executor — nothing to close (simulated executor).
             return []
         }
@@ -195,7 +195,7 @@ final class RunCancellationCoordinator {
     /// Attempt to close a single session with a timeout guard.
     private nonisolated static func closeSessionWithTimeout(
         sessionID: String,
-        transport: any GooseTransportProtocol,
+        transport: any RuntimeTransportProtocol,
         timeout: Duration
     ) async -> Bool {
         do {

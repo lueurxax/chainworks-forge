@@ -9,6 +9,7 @@ enum ArtifactRenderProvenance: Equatable {
 
 struct ArtifactRenderContext: Equatable {
     let format: ArtifactFormat
+    let artifactName: String?
     let localRoots: [URL]
     let provenance: ArtifactRenderProvenance
 
@@ -26,6 +27,7 @@ struct ArtifactRenderContext: Equatable {
         }
         return ArtifactRenderContext(
             format: artifact.format,
+            artifactName: artifact.name,
             localRoots: deduplicatedRoots(roots),
             provenance: .artifactBacked
         )
@@ -34,6 +36,16 @@ struct ArtifactRenderContext: Equatable {
     static func explicit(format: ArtifactFormat, localRoots: [URL] = []) -> ArtifactRenderContext {
         ArtifactRenderContext(
             format: format,
+            artifactName: nil,
+            localRoots: deduplicatedRoots(localRoots),
+            provenance: .explicit
+        )
+    }
+
+    static func explicitNamed(format: ArtifactFormat, artifactName: String?, localRoots: [URL] = []) -> ArtifactRenderContext {
+        ArtifactRenderContext(
+            format: format,
+            artifactName: artifactName,
             localRoots: deduplicatedRoots(localRoots),
             provenance: .explicit
         )
@@ -97,7 +109,12 @@ enum MarkdownImageSourcePolicy {
 }
 
 enum MarkdownDocumentBlockKind: Equatable {
-    case markdown
+    case heading
+    case paragraph
+    case list
+    case blockQuote
+    case codeBlock
+    case table
     case image
 }
 
@@ -108,13 +125,33 @@ struct MarkdownImageBlock: Equatable {
     let isAllowed: Bool
 }
 
+struct MarkdownListItem: Equatable {
+    let ordinal: Int?
+    let text: String
+}
+
+struct MarkdownTableBlock: Equatable {
+    let header: [String]
+    let rows: [[String]]
+}
+
 enum MarkdownDocumentBlock: Equatable {
-    case markdown(String)
+    case heading(level: Int, text: String)
+    case paragraph(String)
+    case list(items: [MarkdownListItem], ordered: Bool)
+    case blockQuote(String)
+    case codeBlock(language: String?, code: String)
+    case table(MarkdownTableBlock)
     case image(MarkdownImageBlock)
 
     var kind: MarkdownDocumentBlockKind {
         switch self {
-        case .markdown: return .markdown
+        case .heading: return .heading
+        case .paragraph: return .paragraph
+        case .list: return .list
+        case .blockQuote: return .blockQuote
+        case .codeBlock: return .codeBlock
+        case .table: return .table
         case .image: return .image
         }
     }
@@ -125,28 +162,80 @@ enum MarkdownDocumentParser {
         pattern: #"^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$"#,
         options: []
     )
+    private static let headingPattern = try! NSRegularExpression(
+        pattern: #"^\s*(#{1,6})\s+(.+?)\s*$"#,
+        options: []
+    )
+    private static let unorderedListPattern = try! NSRegularExpression(
+        pattern: #"^\s*[-*+]\s+(.+?)\s*$"#,
+        options: []
+    )
+    private static let orderedListPattern = try! NSRegularExpression(
+        pattern: #"^\s*(\d+)\.\s+(.+?)\s*$"#,
+        options: []
+    )
 
     static func parse(_ content: String, localRoots: [URL], policy: MarkdownImageSourcePolicy = .v1) -> [MarkdownDocumentBlock] {
         let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-        let paragraphs = normalized.components(separatedBy: "\n\n")
         var blocks: [MarkdownDocumentBlock] = []
+        let lines = normalized.components(separatedBy: .newlines)
+        var index = 0
 
-        for paragraph in paragraphs {
-            let trimmed = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if trimmed.isEmpty {
+                index += 1
+                continue
+            }
 
             if let imageBlock = parseStandaloneImage(trimmed, localRoots: localRoots, policy: policy) {
                 blocks.append(.image(imageBlock))
-            } else {
-                blocks.append(.markdown(trimmed))
+                index += 1
+                continue
             }
+
+            if let heading = parseHeading(trimmed) {
+                blocks.append(heading)
+                index += 1
+                continue
+            }
+
+            if let codeBlock = parseCodeBlock(lines: lines, startingAt: index) {
+                blocks.append(.codeBlock(language: codeBlock.language, code: codeBlock.code))
+                index = codeBlock.nextIndex
+                continue
+            }
+
+            if let tableBlock = parseTable(lines: lines, startingAt: index) {
+                blocks.append(.table(tableBlock.table))
+                index = tableBlock.nextIndex
+                continue
+            }
+
+            if let listBlock = parseList(lines: lines, startingAt: index) {
+                blocks.append(.list(items: listBlock.items, ordered: listBlock.ordered))
+                index = listBlock.nextIndex
+                continue
+            }
+
+            if let quoteBlock = parseBlockQuote(lines: lines, startingAt: index) {
+                blocks.append(.blockQuote(quoteBlock.text))
+                index = quoteBlock.nextIndex
+                continue
+            }
+
+            let paragraph = parseParagraph(lines: lines, startingAt: index)
+            blocks.append(.paragraph(paragraph.text))
+            index = paragraph.nextIndex
         }
 
         if blocks.isEmpty, !content.isEmpty {
-            blocks.append(.markdown(content))
+            blocks.append(.paragraph(content))
         }
 
-        return mergeMarkdownBlocks(blocks)
+        return blocks
     }
 
     private static func parseStandaloneImage(
@@ -173,24 +262,195 @@ enum MarkdownDocumentParser {
         )
     }
 
-    private static func mergeMarkdownBlocks(_ blocks: [MarkdownDocumentBlock]) -> [MarkdownDocumentBlock] {
-        var merged: [MarkdownDocumentBlock] = []
+    private static func parseHeading(_ line: String) -> MarkdownDocumentBlock? {
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = headingPattern.firstMatch(in: line, options: [], range: range),
+              let levelRange = Range(match.range(at: 1), in: line),
+              let textRange = Range(match.range(at: 2), in: line)
+        else {
+            return nil
+        }
+        let level = line[levelRange].count
+        let text = String(line[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return .heading(level: level, text: text)
+    }
 
-        for block in blocks {
-            switch block {
-            case let .markdown(text):
-                if case let .markdown(existing)? = merged.last {
-                    merged.removeLast()
-                    merged.append(.markdown(existing + "\n\n" + text))
-                } else {
-                    merged.append(.markdown(text))
-                }
-            case .image:
-                merged.append(block)
+    private static func parseCodeBlock(lines: [String], startingAt index: Int) -> (language: String?, code: String, nextIndex: Int)? {
+        let opener = lines[index].trimmingCharacters(in: .whitespaces)
+        guard opener.hasPrefix("```") else { return nil }
+
+        let languageHint = opener.dropFirst(3).trimmingCharacters(in: .whitespacesAndNewlines)
+        var cursor = index + 1
+        var codeLines: [String] = []
+
+        while cursor < lines.count {
+            let line = lines[cursor]
+            if line.trimmingCharacters(in: .whitespaces) == "```" {
+                return (
+                    language: languageHint.isEmpty ? nil : languageHint,
+                    code: codeLines.joined(separator: "\n"),
+                    nextIndex: cursor + 1
+                )
             }
+            codeLines.append(line)
+            cursor += 1
         }
 
-        return merged
+        return (
+            language: languageHint.isEmpty ? nil : languageHint,
+            code: codeLines.joined(separator: "\n"),
+            nextIndex: cursor
+        )
+    }
+
+    private static func parseTable(lines: [String], startingAt index: Int) -> (table: MarkdownTableBlock, nextIndex: Int)? {
+        guard index + 1 < lines.count else { return nil }
+        let header = splitTableRow(lines[index])
+        guard header.count >= 2, isTableSeparator(lines[index + 1]) else { return nil }
+
+        var rows: [[String]] = []
+        var cursor = index + 2
+        while cursor < lines.count {
+            let row = splitTableRow(lines[cursor])
+            guard row.count >= 2 else { break }
+            rows.append(row)
+            cursor += 1
+        }
+
+        return (MarkdownTableBlock(header: header, rows: rows), cursor)
+    }
+
+    private static func parseList(lines: [String], startingAt index: Int) -> (items: [MarkdownListItem], ordered: Bool, nextIndex: Int)? {
+        guard let firstMatch = parseListItem(lines[index]) else { return nil }
+
+        var items: [MarkdownListItem] = [firstMatch.item]
+        let ordered = firstMatch.ordered
+        var cursor = index + 1
+
+        while cursor < lines.count {
+            let line = lines[cursor]
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { break }
+
+            if let match = parseListItem(line), match.ordered == ordered {
+                items.append(match.item)
+                cursor += 1
+                continue
+            }
+
+            guard isListContinuation(line) else { break }
+            if let last = items.indices.last {
+                let continuation = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                items[last] = MarkdownListItem(
+                    ordinal: items[last].ordinal,
+                    text: items[last].text + " " + continuation
+                )
+                cursor += 1
+                continue
+            }
+            break
+        }
+
+        return (items, ordered, cursor)
+    }
+
+    private static func parseListItem(_ line: String) -> (item: MarkdownListItem, ordered: Bool)? {
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        if let match = orderedListPattern.firstMatch(in: line, options: [], range: range),
+           let ordinalRange = Range(match.range(at: 1), in: line),
+           let textRange = Range(match.range(at: 2), in: line),
+           let ordinal = Int(line[ordinalRange]) {
+            return (
+                MarkdownListItem(
+                    ordinal: ordinal,
+                    text: String(line[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                ),
+                true
+            )
+        }
+
+        if let match = unorderedListPattern.firstMatch(in: line, options: [], range: range),
+           let textRange = Range(match.range(at: 1), in: line) {
+            return (
+                MarkdownListItem(
+                    ordinal: nil,
+                    text: String(line[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                ),
+                false
+            )
+        }
+
+        return nil
+    }
+
+    private static func parseBlockQuote(lines: [String], startingAt index: Int) -> (text: String, nextIndex: Int)? {
+        guard lines[index].trimmingCharacters(in: .whitespaces).hasPrefix(">") else { return nil }
+
+        var quoteLines: [String] = []
+        var cursor = index
+        while cursor < lines.count {
+            let trimmed = lines[cursor].trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix(">") else { break }
+            let stripped = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
+            quoteLines.append(stripped)
+            cursor += 1
+        }
+
+        return (quoteLines.joined(separator: "\n"), cursor)
+    }
+
+    private static func parseParagraph(lines: [String], startingAt index: Int) -> (text: String, nextIndex: Int) {
+        var paragraphLines: [String] = []
+        var cursor = index
+
+        while cursor < lines.count {
+            let line = lines[cursor]
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || isStructuralBoundary(lines: lines, at: cursor) {
+                break
+            }
+            paragraphLines.append(trimmed)
+            cursor += 1
+        }
+
+        return (paragraphLines.joined(separator: " "), cursor)
+    }
+
+    private static func isStructuralBoundary(lines: [String], at index: Int) -> Bool {
+        let trimmed = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        if parseStandaloneImage(trimmed, localRoots: [], policy: .v1) != nil { return true }
+        if parseHeading(trimmed) != nil { return true }
+        if lines[index].trimmingCharacters(in: .whitespaces).hasPrefix("```") { return true }
+        if parseListItem(lines[index]) != nil { return true }
+        if lines[index].trimmingCharacters(in: .whitespaces).hasPrefix(">") { return true }
+        if index + 1 < lines.count, splitTableRow(lines[index]).count >= 2, isTableSeparator(lines[index + 1]) {
+            return true
+        }
+        return false
+    }
+
+    private static func isListContinuation(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .newlines)
+        guard !trimmed.isEmpty else { return false }
+        return line.hasPrefix(" ") || line.hasPrefix("\t")
+    }
+
+    private static func splitTableRow(_ line: String) -> [String] {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.contains("|") else { return [] }
+        let withoutEdges = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+        return withoutEdges
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = splitTableRow(line)
+        guard !cells.isEmpty else { return false }
+        return cells.allSatisfy { cell in
+            let stripped = cell.replacingOccurrences(of: ":", with: "")
+            return !stripped.isEmpty && stripped.allSatisfy { $0 == "-" }
+        }
     }
 }
 
@@ -297,16 +557,65 @@ struct ArtifactContentRenderer: View {
     let context: ArtifactRenderContext
 
     var body: some View {
-        switch context.format {
-        case .markdown:
+        switch ArtifactPresentationIntent.resolve(content: content, context: context) {
+        case .markdownDocument:
             MarkdownDocumentView(content: content, localRoots: context.localRoots)
-        case .json:
+        case .jsonTree:
             JSONTreeDocumentView(rawJSON: content)
         case .diff:
             DiffArtifactView(content: content)
-        case .report:
-            PlainTextArtifactView(content: content, monospaced: true)
+        case .plainText(let monospaced):
+            PlainTextArtifactView(content: content, monospaced: monospaced)
         }
+    }
+}
+
+enum ArtifactPresentationIntent: Equatable {
+    case markdownDocument
+    case jsonTree(rescuedFrom: ArtifactFormat?)
+    case diff
+    case plainText(monospaced: Bool)
+
+    static func resolve(content: String, context: ArtifactRenderContext) -> ArtifactPresentationIntent {
+        if let rescuedFrom = rescuedJSONSourceFormat(content: content, declaredFormat: context.format) {
+            return .jsonTree(rescuedFrom: rescuedFrom)
+        }
+
+        switch context.format {
+        case .markdown:
+            return .markdownDocument
+        case .json:
+            return .jsonTree(rescuedFrom: nil)
+        case .diff:
+            return .diff
+        case .report:
+            return .plainText(monospaced: true)
+        }
+    }
+
+    private static func rescuedJSONSourceFormat(content: String, declaredFormat: ArtifactFormat) -> ArtifactFormat? {
+        guard declaredFormat == .markdown || declaredFormat == .report else { return nil }
+        guard StructuredPayloadProbe.isTopLevelJSONObjectOrArray(content) else { return nil }
+        return declaredFormat
+    }
+}
+
+enum StructuredPayloadProbe {
+    static func isTopLevelJSONObjectOrArray(_ content: String) -> Bool {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first, first == "{" || first == "[" else {
+            return false
+        }
+        if first == "{", trimmed.last != "}" { return false }
+        if first == "[", trimmed.last != "]" { return false }
+
+        guard let data = content.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data)
+        else {
+            return false
+        }
+
+        return object is [String: Any] || object is [Any]
     }
 }
 
@@ -314,37 +623,404 @@ struct MarkdownDocumentView: View {
     let content: String
     let localRoots: [URL]
 
-    private var blocks: [MarkdownDocumentBlock] {
-        MarkdownDocumentParser.parse(content, localRoots: localRoots)
-    }
+    @State private var blocks: [MarkdownDocumentBlock] = []
+    @State private var isLoadingBlocks = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                switch block {
-                case let .markdown(text):
-                    MarkdownTextBlockView(content: text)
-                case let .image(imageBlock):
-                    MarkdownImageBlockView(block: imageBlock)
+        Group {
+            if isLoadingBlocks {
+                ProgressView("Rendering document…")
+                    .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(blocks.indices, id: \.self) { index in
+                        MarkdownDocumentBlockView(block: blocks[index])
+                            .id(index)
+                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .task(id: renderTaskKey) {
+            isLoadingBlocks = true
+            blocks = await MarkdownDocumentLoader.load(content: content, localRoots: localRoots)
+            isLoadingBlocks = false
+        }
+    }
+
+    private var renderTaskKey: Int {
+        var hasher = Hasher()
+        hasher.combine(content)
+        for root in localRoots {
+            hasher.combine(root.path)
+        }
+        return hasher.finalize()
     }
 }
 
-private struct MarkdownTextBlockView: View {
-    let content: String
+enum MarkdownDocumentLoader {
+    static func load(content: String, localRoots: [URL]) async -> [MarkdownDocumentBlock] {
+        await Task.detached(priority: .userInitiated) {
+            MarkdownDocumentParser.parse(content, localRoots: localRoots)
+        }.value
+    }
+}
+
+private struct MarkdownDocumentBlockView: View {
+    let block: MarkdownDocumentBlock
 
     var body: some View {
-        let attributed = (try? AttributedString(
-            markdown: content,
-            options: .init(interpretedSyntax: .full)
-        )) ?? AttributedString(content)
+        switch block {
+        case let .heading(level, text):
+            MarkdownRichTextBlockView(content: text, role: .heading(level))
+        case let .paragraph(text):
+            MarkdownRichTextBlockView(content: text, role: .body)
+        case let .list(items, ordered):
+            MarkdownListBlockView(items: items, ordered: ordered)
+        case let .blockQuote(text):
+            MarkdownBlockQuoteView(text: text)
+        case let .codeBlock(language, code):
+            MarkdownCodeBlockView(language: language, code: code)
+        case let .table(table):
+            MarkdownTableView(table: table)
+        case let .image(imageBlock):
+            MarkdownImageBlockView(block: imageBlock)
+        }
+    }
+}
 
-        Text(attributed)
+private enum MarkdownTextRole {
+    case heading(Int)
+    case body
+    case listItem
+    case blockQuote
+    case codeBlock
+    case tableHeader
+    case tableCell
+}
+
+private enum MarkdownAttributedStringBuilder {
+    static func build(markdown: String, role: MarkdownTextRole) -> NSAttributedString {
+        switch role {
+        case .codeBlock:
+            return codeBlockString(markdown)
+        default:
+            guard let attributed = try? AttributedString(
+                markdown: markdown,
+                options: .init(interpretedSyntax: .full)
+            ) else {
+                return NSAttributedString(
+                    string: markdown,
+                    attributes: baseAttributes(for: role)
+                )
+            }
+
+            let mutable = NSMutableAttributedString()
+            for run in attributed.runs {
+                let text = String(attributed[run.range].characters)
+                guard !text.isEmpty else { continue }
+                var attributes = baseAttributes(for: role)
+                let inlineIntent = run.inlinePresentationIntent
+                attributes[.font] = font(for: role, inlineIntent: inlineIntent)
+                attributes[.foregroundColor] = foregroundColor(for: role, inlineIntent: inlineIntent, link: run.link)
+
+                if let link = run.link {
+                    attributes[.link] = link
+                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                }
+
+                if inlineIntent?.contains(.code) == true {
+                    attributes[.backgroundColor] = NSColor.controlBackgroundColor
+                }
+
+                mutable.append(NSAttributedString(string: text, attributes: attributes))
+            }
+
+            if mutable.length == 0 {
+                return NSAttributedString(string: markdown, attributes: baseAttributes(for: role))
+            }
+
+            return mutable
+        }
+    }
+
+    private static func codeBlockString(_ code: String) -> NSAttributedString {
+        NSAttributedString(
+            string: code,
+            attributes: baseAttributes(for: .codeBlock)
+        )
+    }
+
+    private static func baseAttributes(for role: MarkdownTextRole) -> [NSAttributedString.Key: Any] {
+        [
+            .font: font(for: role, inlineIntent: nil),
+            .foregroundColor: foregroundColor(for: role, inlineIntent: nil, link: nil),
+            .paragraphStyle: paragraphStyle(for: role)
+        ]
+    }
+
+    private static func paragraphStyle(for role: MarkdownTextRole) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byWordWrapping
+
+        switch role {
+        case let .heading(level):
+            style.lineSpacing = 3
+            style.paragraphSpacing = level <= 2 ? 8 : 6
+        case .body:
+            style.lineSpacing = 4
+            style.paragraphSpacing = 10
+        case .listItem:
+            style.lineSpacing = 4
+            style.paragraphSpacing = 4
+        case .blockQuote:
+            style.lineSpacing = 4
+            style.paragraphSpacing = 6
+        case .codeBlock:
+            style.lineSpacing = 2
+            style.paragraphSpacing = 0
+        case .tableHeader, .tableCell:
+            style.lineSpacing = 2
+            style.paragraphSpacing = 0
+        }
+
+        return style
+    }
+
+    private static func font(for role: MarkdownTextRole, inlineIntent: InlinePresentationIntent?) -> NSFont {
+        let baseFont: NSFont
+        switch role {
+        case let .heading(level):
+            switch level {
+            case 1:
+                baseFont = .systemFont(ofSize: 28, weight: .semibold)
+            case 2:
+                baseFont = .systemFont(ofSize: 24, weight: .semibold)
+            case 3:
+                baseFont = .systemFont(ofSize: 20, weight: .semibold)
+            default:
+                baseFont = .systemFont(ofSize: 17, weight: .semibold)
+            }
+        case .body, .listItem, .blockQuote, .tableCell:
+            baseFont = .systemFont(ofSize: 14)
+        case .tableHeader:
+            baseFont = .systemFont(ofSize: 13, weight: .semibold)
+        case .codeBlock:
+            baseFont = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        }
+
+        guard let inlineIntent else { return baseFont }
+        if inlineIntent.contains(.code) {
+            return .monospacedSystemFont(
+                ofSize: max(baseFont.pointSize - 1, 12),
+                weight: inlineIntent.contains(.stronglyEmphasized) ? .semibold : .regular
+            )
+        }
+
+        var font = baseFont
+        if inlineIntent.contains(.stronglyEmphasized) {
+            font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
+        }
+        if inlineIntent.contains(.emphasized) {
+            font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+        }
+        return font
+    }
+
+    private static func foregroundColor(for role: MarkdownTextRole, inlineIntent: InlinePresentationIntent?, link: URL?) -> NSColor {
+        if link != nil { return .linkColor }
+        switch role {
+        case .blockQuote:
+            return .secondaryLabelColor
+        case .tableHeader:
+            return .labelColor
+        case .codeBlock:
+            return .labelColor
+        case .heading, .body, .listItem, .tableCell:
+            return .labelColor
+        }
+    }
+}
+
+private struct MarkdownRichTextBlockView: View {
+    let content: String
+    let role: MarkdownTextRole
+
+    var body: some View {
+        MarkdownDocumentTextView(
+            attributedString: MarkdownAttributedStringBuilder.build(markdown: content, role: role),
+            backgroundColor: .clear
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct MarkdownListBlockView: View {
+    let items: [MarkdownListItem]
+    let ordered: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                HStack(alignment: .top, spacing: 12) {
+                    Text(marker(for: item, index: index))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, alignment: .trailing)
+                    MarkdownRichTextBlockView(content: item.text, role: .listItem)
+                }
+            }
+        }
+    }
+
+    private func marker(for item: MarkdownListItem, index: Int) -> String {
+        if ordered {
+            return "\(item.ordinal ?? (index + 1))."
+        }
+        return "•"
+    }
+}
+
+private struct MarkdownBlockQuoteView: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            RoundedRectangle(cornerRadius: 999, style: .continuous)
+                .fill(Color.secondary.opacity(0.35))
+                .frame(width: 4)
+            MarkdownRichTextBlockView(content: text, role: .blockQuote)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct MarkdownCodeBlockView: View {
+    let language: String?
+    let code: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let language, !language.isEmpty {
+                Text(language.uppercased())
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            MarkdownDocumentTextView(
+                attributedString: MarkdownAttributedStringBuilder.build(markdown: code, role: .codeBlock),
+                backgroundColor: NSColor.controlBackgroundColor
+            )
             .frame(maxWidth: .infinity, alignment: .leading)
-            .textSelection(.enabled)
+            .padding(12)
+            .background(Color.secondary.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+}
+
+private struct MarkdownTableView: View {
+    let table: MarkdownTableBlock
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    ForEach(Array(table.header.enumerated()), id: \.offset) { _, cell in
+                        tableCell(content: cell, role: .tableHeader, fill: Color.secondary.opacity(0.08))
+                    }
+                }
+
+                ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, row in
+                    GridRow {
+                        ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
+                            tableCell(
+                                content: cell,
+                                role: .tableCell,
+                                fill: rowIndex.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.03)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func tableCell(content: String, role: MarkdownTextRole, fill: Color) -> some View {
+        MarkdownDocumentTextView(
+            attributedString: MarkdownAttributedStringBuilder.build(markdown: content, role: role),
+            backgroundColor: .clear
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(fill)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.secondary.opacity(0.12))
+                .frame(height: 1)
+        }
+    }
+}
+
+private struct MarkdownDocumentTextView: NSViewRepresentable {
+    let attributedString: NSAttributedString
+    let backgroundColor: NSColor
+
+    func makeNSView(context: Context) -> MarkdownIntrinsicTextView {
+        let textView = MarkdownIntrinsicTextView()
+        textView.drawsBackground = backgroundColor.alphaComponent > 0.001
+        textView.backgroundColor = backgroundColor
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.importsGraphics = false
+        textView.usesFindBar = false
+        textView.textContainerInset = NSSize(width: 0, height: 0)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: 1, height: CGFloat.greatestFiniteMagnitude)
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        textView.textStorage?.setAttributedString(attributedString)
+        return textView
+    }
+
+    func updateNSView(_ nsView: MarkdownIntrinsicTextView, context: Context) {
+        nsView.drawsBackground = backgroundColor.alphaComponent > 0.001
+        nsView.backgroundColor = backgroundColor
+        nsView.textStorage?.setAttributedString(attributedString)
+        nsView.invalidateIntrinsicContentSize()
+    }
+}
+
+private final class MarkdownIntrinsicTextView: NSTextView {
+    override var intrinsicContentSize: NSSize {
+        guard let textContainer, let layoutManager else {
+            return NSSize(width: NSView.noIntrinsicMetric, height: 0)
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        return NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: ceil(usedRect.height + textContainerInset.height * 2)
+        )
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        textContainer?.containerSize = NSSize(width: max(newSize.width, 1), height: CGFloat.greatestFiniteMagnitude)
+        invalidateIntrinsicContentSize()
     }
 }
 

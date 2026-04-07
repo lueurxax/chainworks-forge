@@ -1,6 +1,28 @@
 import SwiftUI
 import SwiftData
 
+enum ArtifactInspectorSkillTruthFormatter {
+    static func compactSummary(_ summary: String?) -> String? {
+        guard let summary else { return nil }
+        let normalized = summary
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+
+        let maxLength = 220
+        if normalized.count <= maxLength {
+            return normalized
+        }
+
+        let cutoffIndex = normalized.index(normalized.startIndex, offsetBy: maxLength)
+        return String(normalized[..<cutoffIndex]).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+}
+
 // MARK: - P005-OPS §9: Artifact Inspector V2
 
 /// Upgraded artifact inspector with:
@@ -17,7 +39,10 @@ struct ArtifactInspectorView: View {
 
     @Environment(\.modelContext) private var modelContext
     @State private var content: String?
+    @State private var isLoadingContent: Bool = false
     @State private var isPinned: Bool = false
+    @State private var isSkillTruthExpanded = false
+    @State private var isResolvedSkillContentExpanded = false
 
     var body: some View {
         ScrollView {
@@ -60,14 +85,6 @@ struct ArtifactInspectorView: View {
 
                 Divider()
 
-                if artifact.agentExecution?.skillRef != nil
-                    || artifact.agentExecution?.skillType != nil
-                    || artifact.agentExecution?.skillRole != nil
-                    || artifact.agentExecution?.skillSnapshotHash != nil {
-                    skillTruthSection
-                    Divider()
-                }
-
                 if shouldShowProposalLoopSummary, let summary = proposalLoopSummary {
                     GroupBox("Proposal-loop feedback summary (Proposal 022)") {
                         VStack(alignment: .leading, spacing: 4) {
@@ -109,7 +126,10 @@ struct ArtifactInspectorView: View {
                 }
 
                 // §9.1: Format-aware rendering
-                if let content {
+                if isLoadingContent {
+                    ProgressView("Loading artifact…")
+                        .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+                } else if let content {
                     ArtifactContentRenderer(
                         content: content,
                         context: .artifactBacked(artifact: artifact, run: run)
@@ -124,16 +144,23 @@ struct ArtifactInspectorView: View {
 
                 Divider()
 
+                if shouldShowSkillTruthSection {
+                    skillTruthSection
+                    Divider()
+                }
+
                 // §9.5: Open actions
                 openActions
             }
             .padding()
         }
-        .frame(minWidth: 640, minHeight: 480)
+        .frame(minWidth: 920, minHeight: 560)
         .accessibilityIdentifier("artifact-inspector-view")
         .navigationTitle("Artifact Inspector")
-        .task {
-            content = try? String(contentsOfFile: artifact.filePath, encoding: .utf8)
+        .task(id: artifact.id) {
+            isLoadingContent = true
+            content = await Self.loadArtifactContent(from: artifact.filePath)
+            isLoadingContent = false
             isPinned = artifact.isPinned
         }
     }
@@ -164,7 +191,7 @@ struct ArtifactInspectorView: View {
         HStack(spacing: 3) {
             Image(systemName: icon)
                 .font(.caption2)
-            Text("\(label): \(value)")
+            Text(verbatim: "\(label): \(value)")
                 .font(.caption2)
         }
         .padding(.horizontal, 8)
@@ -223,8 +250,8 @@ struct ArtifactInspectorView: View {
             let resolvedSkills = decodeResolvedSkills(from: run)
             let resolvedSkill = agentExecution.skillRef.flatMap { resolvedSkills[$0] }
 
-            GroupBox("Skill Truth") {
-                VStack(alignment: .leading, spacing: 4) {
+            DisclosureGroup(isExpanded: $isSkillTruthExpanded) {
+                VStack(alignment: .leading, spacing: 8) {
                     if let skillRef = agentExecution.skillRef {
                         LabeledContent("Skill Ref", value: skillRef)
                     }
@@ -234,32 +261,50 @@ struct ArtifactInspectorView: View {
                     if let skillRole = agentExecution.skillRole {
                         LabeledContent("Skill Role", value: skillRole)
                     }
-                    if let summary = agentExecution.skillContentSummary {
+                    if let hash = agentExecution.skillSnapshotHash {
+                        LabeledContent("Injected Skill Hash", value: hash)
+                    }
+                    if let summary = ArtifactInspectorSkillTruthFormatter.compactSummary(agentExecution.skillContentSummary) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Skill Summary")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(summary)
-                                .font(.caption.monospaced())
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                         }
                     }
-                    if let hash = agentExecution.skillSnapshotHash {
-                        LabeledContent("Injected Skill Hash", value: hash)
-                    }
                     if let resolvedSkill {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Resolved Skill Content")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        DisclosureGroup(isExpanded: $isResolvedSkillContentExpanded) {
                             ArtifactContentRenderer(
                                 content: resolvedSkill.resolvedContent,
                                 context: .explicit(format: .markdown)
                             )
+                            .padding(.top, 6)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Resolved Skill Content")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("Open only when you need to inspect injected skill instructions.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
+                .padding(.top, 8)
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Skill Truth")
+                        .font(.headline)
+                    Text("Related diagnostic metadata for the producing agent. Kept secondary so the artifact body stays primary.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
+            .accessibilityIdentifier("artifact-inspector-skill-truth")
         }
     }
 
@@ -306,6 +351,13 @@ struct ArtifactInspectorView: View {
         || artifact.name == "proposal_feedback_coverage"
     }
 
+    private var shouldShowSkillTruthSection: Bool {
+        artifact.agentExecution?.skillRef != nil
+            || artifact.agentExecution?.skillType != nil
+            || artifact.agentExecution?.skillRole != nil
+            || artifact.agentExecution?.skillSnapshotHash != nil
+    }
+
     private func decodeResolvedSkills(from run: Run) -> [String: ResolvedSkill] {
         guard let data = run.resolvedSkillsJSON else { return [:] }
         return (try? JSONDecoder().decode([String: ResolvedSkill].self, from: data)) ?? [:]
@@ -346,6 +398,12 @@ struct ArtifactInspectorView: View {
         case .diff: return .green
         case .report: return .purple
         }
+    }
+
+    private static func loadArtifactContent(from path: String) async -> String? {
+        await Task.detached(priority: .userInitiated) {
+            try? SecurityScopedAccess.loadString(from: URL(fileURLWithPath: path))
+        }.value
     }
 }
 
@@ -399,4 +457,121 @@ struct FlowLayout: Layout {
             positions: positions
         )
     }
+}
+
+#Preview("Artifact Inspector — Skill Truth Secondary") {
+    @MainActor
+    func seededContainer() -> ModelContainer {
+        PreviewSupport.makeModelContainer { context in
+            let idea = Idea(title: "Preview Idea", body: "Artifact inspector preview")
+            context.insert(idea)
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ArtifactInspectorPreview", isDirectory: true)
+            let artifactsRoot = root.appendingPathComponent("artifacts", isDirectory: true)
+            try? FileManager.default.createDirectory(at: artifactsRoot, withIntermediateDirectories: true)
+
+            let artifactURL = artifactsRoot.appendingPathComponent("proposal_review_architect.md")
+            try? """
+            # Review Triad
+
+            This is the primary artifact body and it should stay visually dominant.
+
+            - The document content must appear before related skill metadata.
+            - Related diagnostic payloads should be collapsed by default.
+
+            ## Notes
+
+            Long-form document rendering should remain readable.
+            """.write(to: artifactURL, atomically: true, encoding: .utf8)
+
+            let repo = RunRepository(context: context)
+            let run = try! repo.createRun(
+                for: idea,
+                workflowID: "proposal_loop_live",
+                workflowTitle: "Proposal Loop (Live)",
+                workflowSnapshotHash: "preview-workflow",
+                catalogSnapshotHash: "preview-catalog",
+                workflowSourcePath: "preview/workflow.yaml",
+                catalogSourcePath: "preview/agents.yaml",
+                workflowSnapshotJSON: Data(),
+                catalogSnapshotJSON: Data(),
+                workspaceRoot: root.path,
+                artifactRoot: artifactsRoot.path,
+                planCompilerVersion: 1
+            )
+
+            let stage = StageExecution(stageID: "state_4_proposal_reviewed", label: "Proposal reviewed", status: .completed)
+            stage.run = run
+            context.insert(stage)
+
+            let agentExecution = AgentExecution(
+                agentID: "proposal_reviewer_architect",
+                agentTitle: "Architect Reviewer",
+                taskName: "Review proposal",
+                status: .completed,
+                provider: "codex",
+                effort: "high"
+            )
+            agentExecution.stageExecution = stage
+            agentExecution.skillRef = "proposal_review_triad"
+            agentExecution.skillType = SkillType.external.rawValue
+            agentExecution.skillRole = "architecture-only"
+            agentExecution.skillSnapshotHash = "preview-skill-hash"
+            agentExecution.skillContentSummary = """
+            ---
+            name: proposal-review-triad
+
+            description: Review repo-local proposals with evidence-first architecture critique.
+
+            Use architecture-only mode.
+            """
+
+            let resolvedSkill = ResolvedSkill(
+                id: "proposal_review_triad",
+                type: .external,
+                resolvedContent: """
+                # Proposal Review Triad
+
+                This diagnostic payload is related metadata, not the primary artifact body.
+                """,
+                contentHash: "content-hash",
+                injectedContent: "Injected skill content",
+                injectedContentHash: "injected-hash",
+                sourcePath: "/preview/SKILL.md",
+                sourceDescription: "Preview skill",
+                bundleManifest: nil,
+                role: "architecture-only",
+                specializationSummary: nil,
+                injectionPolicy: .prependToSystemPrompt
+            )
+            run.resolvedSkillsJSON = try? JSONEncoder().encode(["proposal_review_triad": resolvedSkill])
+
+            let artifact = Artifact(
+                name: "proposal_review_architect",
+                contractID: "proposal_review_architect_v1",
+                format: .markdown,
+                filePath: artifactURL.path,
+                runID: run.id,
+                stageID: stage.stageID,
+                agentID: agentExecution.agentID,
+                provider: agentExecution.provider
+            )
+            artifact.agentExecution = agentExecution
+
+            context.insert(run)
+            context.insert(agentExecution)
+            context.insert(artifact)
+        }
+    }
+
+    let container = seededContainer()
+    let context = container.mainContext
+    let run = try! context.fetch(FetchDescriptor<Run>()).first!
+    let artifact = try! context.fetch(FetchDescriptor<Artifact>()).first!
+
+    return ArtifactInspectorView(artifact: artifact, run: run)
+        .environment(\.modelContext, context)
+        .modelContainer(container)
+        .frame(width: 920, height: 560)
 }

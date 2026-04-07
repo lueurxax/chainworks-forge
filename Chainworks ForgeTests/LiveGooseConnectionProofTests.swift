@@ -220,12 +220,12 @@ struct LiveGooseConnectionProofTests {
 
         // Step 1: Create session via POST /agent/start + POST /agent/update_provider
         let sessionCreateStart = Date()
-        let sessionRequest = GooseSessionRequest(
+        let sessionRequest = RuntimeSessionRequest(
             systemPrompt: "You are a test agent for Chainworks Forge integration proof. Respond with exactly: CHAINWORKS_PROOF_OK",
             workingDirectory: FileManager.default.temporaryDirectory.path,
             model: "default",
             provider: "claude-code",
-            executionPolicy: GooseExecutionPolicy(
+            executionPolicy: RuntimeExecutionPolicy(
                 permissionProfileID: "SAFE_READONLY",
                 workspaceMode: "read_only",
                 gitOperationsAllowed: false,
@@ -238,7 +238,7 @@ struct LiveGooseConnectionProofTests {
             ]
         )
 
-        let sessionResponse: GooseSessionResponse
+        let sessionResponse: RuntimeSessionResponse
         do {
             sessionResponse = try await transport.createSession(request: sessionRequest)
         } catch {
@@ -252,14 +252,14 @@ struct LiveGooseConnectionProofTests {
 
         // Step 2: Submit a prompt and collect SSE events
         let promptStart = Date()
-        let promptRequest = GoosePromptRequest(
+        let promptRequest = RuntimePromptRequest(
             content: """
             This is a Chainworks Forge integration proof test.
             Reply with a single line: CHAINWORKS_PROOF_OK
             Do not use any tools. Just reply with text.
             """,
             context: [
-                GooseContextAttachment(
+                RuntimeContextAttachment(
                     type: "text",
                     name: "test_context",
                     content: "Integration proof — \(ISO8601DateFormatter().string(from: testStart))",
@@ -424,7 +424,7 @@ struct LiveGooseConnectionProofTests {
             model: "default"
         )
 
-        let sessionRequest = GooseSessionRequest(
+        let sessionRequest = RuntimeSessionRequest(
             systemPrompt: "Auth verification test",
             workingDirectory: FileManager.default.temporaryDirectory.path,
             model: "default",
@@ -473,7 +473,7 @@ struct LiveGooseConnectionProofTests {
         print("[GooseRuntimeDiscovery] GOOSE_PORT=\(goosePort ?? "nil"), key length=\(gooseSecretKey?.count ?? 0)")
     }
 
-    /// PROOF: Full GooseAgentExecutor pipeline works against real Goose (session -> prompt -> events -> result).
+    /// PROOF: Full RuntimeAgentExecutor pipeline works against real Goose (session -> prompt -> events -> result).
     @Test("Full agent executor pipeline with real Goose",
           .disabled("Requires running Goose server; enable for manual validation"))
     func fullAgentExecutorPipelineWithRealGoose() async throws {
@@ -489,7 +489,7 @@ struct LiveGooseConnectionProofTests {
             model: "default"
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
 
         // Collect live execution events (uses SharedEventCollector per TEST-004)
         let collector = SharedEventCollector()

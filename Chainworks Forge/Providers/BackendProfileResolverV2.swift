@@ -11,6 +11,41 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
     let transport: String
     let adapterVersion: String
 
+    /// Proposal 026: Resolved runtime profile identifier.
+    let runtimeProfileID: String?
+    /// Proposal 026: Adapter family from the resolved runtime profile.
+    let adapterFamily: String?
+    /// Proposal 026: Capability class from the resolved runtime profile.
+    let capabilityClass: RuntimeCapabilityClass?
+
+    init(
+        agentID: String,
+        backendProfileID: String?,
+        configuredProviderID: UUID,
+        providerFamily: String,
+        providerIdentifier: String,
+        model: String,
+        effort: String,
+        transport: String,
+        adapterVersion: String,
+        runtimeProfileID: String? = nil,
+        adapterFamily: String? = nil,
+        capabilityClass: RuntimeCapabilityClass? = nil
+    ) {
+        self.agentID = agentID
+        self.backendProfileID = backendProfileID
+        self.configuredProviderID = configuredProviderID
+        self.providerFamily = providerFamily
+        self.providerIdentifier = providerIdentifier
+        self.model = model
+        self.effort = effort
+        self.transport = transport
+        self.adapterVersion = adapterVersion
+        self.runtimeProfileID = runtimeProfileID
+        self.adapterFamily = adapterFamily
+        self.capabilityClass = capabilityClass
+    }
+
     // MARK: - Proposal 011 (REQ-010): Cross-family coherence check
 
     /// Heuristic check for obvious cross-family provider/model mismatches.
@@ -60,7 +95,8 @@ struct BackendProfileResolverV2 {
 
     func resolveBindings(
         plan: RunPlan,
-        startOptions: RunStartOptions
+        startOptions: RunStartOptions,
+        runtimeProfiles: [String: RuntimeProfile] = [:]
     ) throws -> [String: ResolvedProviderBinding] {
         var bindings: [String: ResolvedProviderBinding] = [:]
 
@@ -87,6 +123,22 @@ struct BackendProfileResolverV2 {
                 throw BackendProfileResolverError.missingModel(agentID: agentID)
             }
 
+            // Proposal 026: Resolve runtime profile from agent's runtimeProfileID
+            let resolvedRuntimeProfileID: String?
+            let resolvedAdapterFamily: String
+            let resolvedCapabilityClass: RuntimeCapabilityClass
+            if let profileKey = agent.runtimeProfileID,
+               let profile = runtimeProfiles[profileKey] {
+                resolvedRuntimeProfileID = profileKey
+                resolvedAdapterFamily = profile.adapterFamily
+                resolvedCapabilityClass = profile.capabilityClass
+            } else {
+                // Default: legacy Goose runtime
+                resolvedRuntimeProfileID = agent.runtimeProfileID
+                resolvedAdapterFamily = "goose"
+                resolvedCapabilityClass = .legacyOperatorGrade
+            }
+
             bindings[agentID] = ResolvedProviderBinding(
                 agentID: agentID,
                 backendProfileID: agent.backendProfileID,
@@ -96,7 +148,10 @@ struct BackendProfileResolverV2 {
                 model: resolvedModel,
                 effort: override?.effort ?? agent.effort,
                 transport: configuredProvider.transport.rawValue,
-                adapterVersion: configuredProvider.adapterVersion
+                adapterVersion: configuredProvider.adapterVersion,
+                runtimeProfileID: resolvedRuntimeProfileID,
+                adapterFamily: resolvedAdapterFamily,
+                capabilityClass: resolvedCapabilityClass
             )
         }
 

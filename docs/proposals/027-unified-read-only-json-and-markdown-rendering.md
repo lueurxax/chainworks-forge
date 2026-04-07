@@ -118,7 +118,7 @@ This would produce decent rendering quality, but it makes document viewing heavi
 ### 5.3 Recommended: Native unified renderer with typed document views
 
 - Introduce one shared `ArtifactContentRenderer`
-- Route Markdown through a dedicated document renderer
+- Route Markdown through a dedicated AppKit/TextKit-backed document renderer
 - Route JSON through a dedicated tree renderer
 - Keep diff/report/plain-text paths explicit and separate
 
@@ -133,7 +133,7 @@ This is the recommended option because it fixes the product problem directly wit
 The app should define a reusable rendering stack:
 
 - `ArtifactContentRenderer`
-- `MarkdownDocumentView`
+- `MarkdownDocumentTextView`
 - `JSONTreeDocumentView`
 - `PlainTextArtifactView`
 - `DiffArtifactView`
@@ -171,6 +171,15 @@ Screens should stop owning formatting decisions such as:
 - whether JSON is pretty-printed or structured
 - which font to use for the same artifact type
 
+The shared renderer should resolve a presentation intent before choosing a concrete view.
+That intent layer must support three distinct cases:
+
+- true Markdown document content
+- true JSON structured content
+- payload-mismatch rescue, where declared Markdown or report content is actually valid top-level JSON and should therefore render as structured JSON without changing canonical artifact truth
+
+This keeps canonical format ownership intact while still letting the operator read malformed or mislabeled payloads sanely.
+
 ### 6.2 Markdown becomes a proper document renderer
 
 Markdown rendering must support normal document reading:
@@ -189,6 +198,9 @@ Markdown rendering must support normal document reading:
 Markdown in this proposal is a **presentation-intent** surface, not a source-editing surface.
 The renderer's job is to preserve document reading semantics and hierarchy for operators while leaving the underlying Markdown text unchanged on disk.
 
+The first acceptable implementation class for this renderer is a native AppKit/TextKit document surface, not a simple SwiftUI `Text(AttributedString)` fallback.
+The product quality bar is explicitly document-grade rendering, comparable to a notes/document reader rather than a payload dump.
+
 The renderer should preserve a document feel:
 
 - readable line height
@@ -196,9 +208,13 @@ The renderer should preserve a document feel:
 - stable spacing between blocks
 - code blocks that visually separate from prose
 - tables that remain legible without collapsing into plain text
+- paragraph spacing that makes dense technical prose readable
+- list indentation and continuation wrapping that still reads correctly under long technical lines
+- text selection, wrapping, and scrolling behavior consistent with a real document viewer
 
 Implementation note:
-the exact rendering engine can be native attributed markdown or a dedicated markdown rendering library, but the product contract is the same: Markdown must render as a document, not as source text.
+the exact parser can still be native markdown parsing or a dedicated markdown library, but the display surface should be a document-grade text system.
+For the first version, this proposal prefers an AppKit/TextKit-backed read-only renderer over `Text(AttributedString)` because the latter does not meet the layout-quality bar for long technical documents.
 
 Image/source policy for v1 is fail-closed:
 
@@ -220,14 +236,23 @@ Raw HTML inside Markdown is fallback-only in v1:
 JSON rendering should parse into a structured value tree and render recursively with disclosure controls.
 The preferred native implementation shape is a recursive SwiftUI tree built from `DisclosureGroup`-style nodes, or `OutlineGroup` where it cleanly matches the interaction model.
 
+This JSON lane is also the canonical rescue path for payload-mismatch cases:
+
+- declared `.json` artifacts render as JSON tree by default
+- declared `.markdown` or `.report` artifacts that are actually valid top-level JSON object/array should render as JSON tree with presentation-level rescue
+- this rescue does not rewrite `Artifact.format` and does not open a second format-truth owner
+
 The viewer should support:
 
 - collapse and expand per node
 - stable key ordering based on source order where possible
+- if the chosen parser cannot preserve source member order, object keys must fall back to a deterministic ascending string sort for presentation rather than leaving ordering implementation-defined
 - arrays and objects with visible counts
 - compact previews for collapsed nodes
 - scalar rendering for strings, numbers, booleans, and null
 - indentation that clearly shows depth
+
+This fallback is presentation-only. It does not redefine artifact truth on disk and does not introduce RFC-8785-style canonicalization as a storage contract.
 
 Recommended interaction defaults:
 
@@ -286,6 +311,8 @@ That means:
 - lists retain indentation and bullet clarity
 - links are visually distinct
 - tables are rendered as tables, not plaintext approximations
+- long technical paragraphs still read cleanly because paragraph spacing and wrapping are document-grade
+- the result should feel closer to Notes/TextEdit document reading than to log text inside a `ScrollView`
 
 ### 7.2 JSON
 
@@ -371,22 +398,25 @@ This proposal is complete when all of the following are true:
 2. JSON artifacts render as collapsible trees in every existing artifact/report/comparison surface.
 3. There is one shared rendering entry point rather than multiple local format heuristics.
 4. Artifact-backed surfaces consume canonical `Artifact.format` truth and do not re-detect format per screen.
-5. Markdown image handling is fail-closed and local-only in v1.
-6. Malformed Markdown and malformed JSON fall back safely without crashing.
-7. No editing affordances are introduced.
-8. Existing artifact truth and report truth remain text-first and unchanged on disk.
+5. Declared Markdown/report payloads that are actually valid top-level JSON object/array render as structured JSON without mutating canonical artifact metadata.
+6. Markdown image handling is fail-closed and local-only in v1.
+7. Malformed Markdown and malformed JSON fall back safely without crashing.
+8. No editing affordances are introduced.
+9. Existing artifact truth and report truth remain text-first and unchanged on disk.
 
 ---
 
 ## 11. Open Decisions
 
-Implementation should explicitly choose one Markdown backend:
+Implementation should explicitly choose one Markdown parser/backend, but the v1 Markdown display surface is not open-ended: it should use an AppKit/TextKit-backed native read-only document presentation surface rather than a weak `Text(...)` fallback.
 
-- native attributed markdown with custom block styling, or
+Allowed parser/backend choices include:
+
+- native attributed markdown with custom block extraction/styling, or
 - a dedicated markdown rendering dependency
 
-The proposal does not require one specific implementation library, but it does require the resulting UX contract.
-If native rendering cannot meet the document-quality bar for tables, fenced code blocks, and images, the implementation should prefer a dedicated renderer rather than shipping another weak plaintext compromise.
+The parser choice remains open; the display-surface class does not.
+If a chosen parser cannot meet the document-quality bar for tables, fenced code blocks, long technical prose, and images when rendered through the AppKit/TextKit-backed surface, the implementation should prefer a stronger parser rather than shipping another weak plaintext compromise.
 
 The proposal does **not** leave image trust policy open:
 

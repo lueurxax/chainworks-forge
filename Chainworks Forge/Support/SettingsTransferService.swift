@@ -42,9 +42,7 @@ struct SettingsTransferService {
             ?? (appConfigurationStore.configuration.supportBundleExportPath.map {
                 URL(fileURLWithPath: $0, isDirectory: true)
             } ?? AppConfiguration.defaultSupportRoot().appendingPathComponent("exports", isDirectory: true))
-
-        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        let fileURL = outputDirectory.appendingPathComponent("chainworks-settings.json")
+        SecurityScopedAccess.remember(url: outputDirectory, kind: .supportBundleRoot)
 
         let placeholders: [String] = providerSettingsStore.settings.configuredProviders.compactMap { provider in
             switch provider.authMode {
@@ -67,15 +65,21 @@ struct SettingsTransferService {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(package).write(to: fileURL, options: .atomic)
-        return fileURL
+        let payload = try encoder.encode(package)
+        return try SecurityScopedAccess.withAccess(to: outputDirectory) { securedDirectory in
+            try FileManager.default.createDirectory(at: securedDirectory, withIntermediateDirectories: true)
+            let fileURL = securedDirectory.appendingPathComponent("chainworks-settings.json")
+            try payload.write(to: fileURL, options: .atomic)
+            return fileURL
+        }
     }
 
     @discardableResult
     func importSettings(from fileURL: URL) throws -> [String] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let package = try decoder.decode(ExportableSettingsPackage.self, from: Data(contentsOf: fileURL))
+        SecurityScopedAccess.remember(url: fileURL, kind: .settingsFile)
+        let package = try decoder.decode(ExportableSettingsPackage.self, from: SecurityScopedAccess.loadData(from: fileURL))
 
         guard package.transferSchemaVersion == Self.currentSchemaVersion else {
             throw SettingsTransferError.unsupportedSchema(package.transferSchemaVersion)

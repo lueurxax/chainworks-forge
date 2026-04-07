@@ -62,10 +62,53 @@ struct GooseExtensionDefinition: Codable, Equatable, Sendable {
         case bundled
         case availableTools = "available_tools"
     }
-}
 
-private struct GooseExtensionConfigFile: Codable {
-    let extensions: [String: GooseExtensionDefinition]
+    init(
+        enabled: Bool? = nil,
+        type: String? = nil,
+        name: String,
+        description: String? = nil,
+        displayName: String? = nil,
+        cmd: String? = nil,
+        args: [String]? = nil,
+        envs: [String: String]? = nil,
+        envKeys: [String]? = nil,
+        timeout: Int? = nil,
+        bundled: Bool? = nil,
+        availableTools: [String]? = nil
+    ) {
+        self.enabled = enabled
+        self.type = type
+        self.name = name
+        self.description = description
+        self.displayName = displayName
+        self.cmd = cmd
+        self.args = args
+        self.envs = envs
+        self.envKeys = envKeys
+        self.timeout = timeout
+        self.bundled = bundled
+        self.availableTools = availableTools
+    }
+
+    /// Initialise from a raw YAML dictionary (as returned by `Yams.load`).
+    /// Used by `GooseExtensionRegistryReader.snapshot()` to avoid
+    /// `Decodable` conformance actor-isolation issues in nonisolated contexts.
+    nonisolated fileprivate init?(rawYAML dict: [String: Any]) {
+        guard let name = dict["name"] as? String else { return nil }
+        self.name = name
+        self.enabled = dict["enabled"] as? Bool
+        self.type = dict["type"] as? String
+        self.description = dict["description"] as? String
+        self.displayName = dict["display_name"] as? String
+        self.cmd = dict["cmd"] as? String
+        self.args = dict["args"] as? [String]
+        self.envs = dict["envs"] as? [String: String]
+        self.envKeys = dict["env_keys"] as? [String]
+        self.timeout = (dict["timeout"] as? Int) ?? (dict["timeout"] as? Double).map(Int.init)
+        self.bundled = dict["bundled"] as? Bool
+        self.availableTools = dict["available_tools"] as? [String]
+    }
 }
 
 struct GooseExtensionRegistrySnapshot: Equatable, Sendable {
@@ -75,11 +118,11 @@ struct GooseExtensionRegistrySnapshot: Equatable, Sendable {
     let configsByRuntimeID: [String: GooseExtensionDefinition]
 }
 
-struct GooseExtensionRegistryReader: Sendable {
+struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
     static let environmentConfigPathKey = "CHAINWORKS_GOOSE_CONFIG_PATH"
     let configURL: URL
 
-    init(configURL: URL? = nil) {
+    nonisolated init(configURL: URL? = nil) {
         if let configURL {
             self.configURL = configURL
             return
@@ -88,15 +131,21 @@ struct GooseExtensionRegistryReader: Sendable {
         let environment = ProcessInfo.processInfo.environment
         let isTestHost = environment["XCTestConfigurationFilePath"] != nil
         let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
-        if (isTestHost || usesInMemoryStore),
-           let portableFixtureURL = AppConfiguration.preferredExampleURL(
-                repoRelativePath: "examples/goose/goose-config-fixture.yaml"
-           ) {
-            self.configURL = portableFixtureURL
-            return
+        if isTestHost || usesInMemoryStore {
+            // Nonisolated fixture URL resolution. Navigates 3 levels up from this
+            // source file to the repo root (Engine -> app target -> project -> repo).
+            let fixtureURL = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
+            if FileManager.default.isReadableFile(atPath: fixtureURL.path) {
+                self.configURL = fixtureURL
+                return
+            }
         }
 
-        if let environmentPath = ProcessInfo.processInfo.environment[Self.environmentConfigPathKey]?
+        if let environmentPath = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_CONFIG_PATH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !environmentPath.isEmpty {
             self.configURL = URL(fileURLWithPath: environmentPath)
@@ -107,19 +156,34 @@ struct GooseExtensionRegistryReader: Sendable {
             .appendingPathComponent(".config/goose/config.yaml")
     }
 
-    func snapshot() throws -> GooseExtensionRegistrySnapshot {
+    nonisolated func snapshot() throws -> GooseExtensionRegistrySnapshot {
         let contents = try String(contentsOf: configURL, encoding: .utf8)
-        let decoded = try YAMLDecoder().decode(GooseExtensionConfigFile.self, from: contents)
-        let installed = decoded.extensions.keys.sorted()
-        let enabled = decoded.extensions
+        // Use raw YAML load to avoid @MainActor-inferred Decodable conformance issues.
+        let extensions: [String: GooseExtensionDefinition]
+        if let root = try Yams.load(yaml: contents) as? [String: Any],
+           let rawExtensions = root["extensions"] as? [String: Any] {
+            extensions = rawExtensions.compactMapValues { value -> GooseExtensionDefinition? in
+                guard let dict = value as? [String: Any] else { return nil }
+                return GooseExtensionDefinition(rawYAML: dict)
+            }
+        } else {
+            extensions = [:]
+        }
+        let installed = extensions.keys.sorted()
+        let enabled = extensions
             .compactMap { key, value in value.enabled == true ? key : nil }
             .sorted()
         return GooseExtensionRegistrySnapshot(
             configURL: configURL,
             installedExtensionIDs: installed,
             enabledExtensionIDs: enabled,
-            configsByRuntimeID: decoded.extensions
+            configsByRuntimeID: extensions
         )
+    }
+
+    /// RuntimeExtensionRegistryProvider conformance.
+    nonisolated func registrySnapshot() throws -> GooseExtensionRegistrySnapshot {
+        try snapshot()
     }
 }
 

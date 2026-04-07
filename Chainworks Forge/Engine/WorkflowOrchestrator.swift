@@ -70,6 +70,8 @@ final class WorkflowOrchestrator {
     private(set) var isPaused: Bool = false
     private(set) var isCancelled: Bool = false
     private(set) var liveTimeline: [LiveExecutionTimelineEntry] = []
+    private var pendingLiveTextChunksByAgentID: [String: String] = [:]
+    private var suppressingStructuredOutputByAgentID: [String: Bool] = [:]
 
     /// Callback for approval requests (ARCH-028: published to a collection, not singleton)
     var onApprovalRequest: ((ApprovalRequest) -> Void)?
@@ -87,6 +89,8 @@ final class WorkflowOrchestrator {
     private var runtimeVariables: [String: AnyCodableValue]
     /// Tracks currently active agent executions for live event routing.
     private var liveAgentExecutionsByAgentID: [String: [AgentExecution]] = [:]
+    /// Coalesces high-frequency live text streaming so UI surfaces do not rebuild on every token.
+    private var lastRoutedLiveTextChunkAtByAgentID: [String: Date] = [:]
     /// Frozen provider bindings captured at run start.
     private let providerBindingsByAgentID: [String: ResolvedProviderBinding]
     private let contextStrategyProfileID: String?
@@ -614,6 +618,7 @@ final class WorkflowOrchestrator {
             inputArtifactPaths: inputArtifactPaths,
             variables: runtimeVariables,
             ideaBody: run.idea?.body ?? "",
+            ideaAttachmentPath: run.idea?.attachmentPath,
             providerBinding: primaryExecutionBinding,
             catalog: catalog,
             contextStrategyProfileID: contextStrategyProfileID,
@@ -671,6 +676,7 @@ final class WorkflowOrchestrator {
                     inputArtifactPaths: inputArtifactPaths,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? "",
+                    ideaAttachmentPath: run.idea?.attachmentPath,
                     providerBinding: escalatedBinding,
                     catalog: catalog,
                     contextStrategyProfileID: contextStrategyProfileID,
@@ -755,7 +761,7 @@ final class WorkflowOrchestrator {
         // Record sessionID from the executor (§6.1)
         if let sessionID = result.sessionID {
             agentExec.providerSessionID = sessionID
-            agentExec.gooseSessionID = sessionID
+            agentExec.runtimeSessionID = sessionID
         }
 
         if result.succeeded {
@@ -1519,6 +1525,7 @@ final class WorkflowOrchestrator {
                     inputArtifactPaths: inputArtifactPaths,
                     variables: runtimeVariables,
                     ideaBody: run.idea?.body ?? "",
+                    ideaAttachmentPath: run.idea?.attachmentPath,
                     providerBinding: primaryExecutionBinding,
                     catalog: catalog,
                     contextStrategyProfileID: contextStrategyProfileID,
@@ -1575,7 +1582,7 @@ final class WorkflowOrchestrator {
                 applyExecutionTruth(from: result, to: agentExec)
                 if let sessionID = result.sessionID {
                     agentExec.providerSessionID = sessionID
-                    agentExec.gooseSessionID = sessionID
+                    agentExec.runtimeSessionID = sessionID
                 }
                 agentExec.logSnippet = mergedLogSnippet(
                     existing: agentExec.logSnippet,
@@ -1985,6 +1992,7 @@ final class WorkflowOrchestrator {
             inputArtifactPaths: inputArtifactPaths,
             variables: runtimeVariables,
             ideaBody: run.idea?.body ?? "",
+            ideaAttachmentPath: run.idea?.attachmentPath,
             providerBinding: providerBindingsByAgentID[agent.id],
             catalog: catalog,
             contextStrategyProfileID: profileID,
@@ -2784,10 +2792,12 @@ final class WorkflowOrchestrator {
         agentExecution.skillContentSummary = resolvedSkill.contentSummary
     }
 
+    static let liveTextChunkCoalescingWindow: TimeInterval = 0.35
+
     // MARK: - Live Event Routing
 
     private func configureLiveEventBridge() {
-        guard let gooseExecutor = executor as? GooseAgentExecutor else { return }
+        guard let gooseExecutor = executor as? RuntimeAgentExecutor else { return }
 
         gooseExecutor.onExecutionEvent = { [weak self] agentID, event in
             Task { @MainActor [weak self] in
@@ -2808,14 +2818,62 @@ final class WorkflowOrchestrator {
         } else {
             liveAgentExecutionsByAgentID[agentID] = executions
         }
+        lastRoutedLiveTextChunkAtByAgentID.removeValue(forKey: agentID)
     }
 
-    private func recordLiveExecutionEvent(agentID: String, event: ExecutionEvent) {
+    func shouldRecordLiveExecutionEvent(
+        agentID: String,
+        event: ExecutionEvent,
+        now: Date = Date()
+    ) -> Bool {
+        switch event.type {
+        case .textChunk:
+            let trimmed = event.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty == false else { return false }
+            if let lastRoutedAt = lastRoutedLiveTextChunkAtByAgentID[agentID],
+               now.timeIntervalSince(lastRoutedAt) < Self.liveTextChunkCoalescingWindow {
+                return false
+            }
+            lastRoutedLiveTextChunkAtByAgentID[agentID] = now
+            return true
+        default:
+            lastRoutedLiveTextChunkAtByAgentID.removeValue(forKey: agentID)
+            return true
+        }
+    }
+
+    func injectTestingLiveExecutionEvent(agentID: String, event: ExecutionEvent, now: Date = Date()) {
+        recordLiveExecutionEvent(agentID: agentID, event: event, now: now)
+    }
+
+    private func recordLiveExecutionEvent(agentID: String, event: ExecutionEvent, now: Date = Date()) {
+        if event.type == .textChunk {
+            guard let visibleChunk = visibleLiveTextChunk(agentID: agentID, chunk: event.detail) else { return }
+            bufferLiveTextChunk(agentID: agentID, chunk: visibleChunk)
+            guard shouldRecordLiveExecutionEvent(agentID: agentID, event: event, now: now) else { return }
+            let mergedEvent = ExecutionEvent(
+                type: .textChunk,
+                timestamp: event.timestamp,
+                detail: consumeBufferedLiveTextChunk(for: agentID),
+                sessionID: event.sessionID,
+                requestID: event.requestID,
+                toolName: event.toolName
+            )
+            commitLiveExecutionEvent(agentID: agentID, event: mergedEvent)
+            return
+        }
+
+        flushBufferedLiveTextChunkIfNeeded(agentID: agentID, timestamp: event.timestamp)
+        guard shouldRecordLiveExecutionEvent(agentID: agentID, event: event, now: now) else { return }
+        commitLiveExecutionEvent(agentID: agentID, event: event)
+    }
+
+    private func commitLiveExecutionEvent(agentID: String, event: ExecutionEvent) {
         let agentExecution = resolvedAgentExecution(for: agentID)
 
         if let sessionID = event.sessionID {
             agentExecution?.providerSessionID = sessionID
-            agentExecution?.gooseSessionID = sessionID
+            agentExecution?.runtimeSessionID = sessionID
         }
         if let requestID = event.requestID {
             agentExecution?.providerRequestID = requestID
@@ -2834,7 +2892,31 @@ final class WorkflowOrchestrator {
 
         if event.type == .textChunk,
            let lastIndex = liveTimeline.lastIndex(where: { $0.agentID == agentID && $0.event.type == .textChunk }) {
-            liveTimeline[lastIndex] = entry
+            // Accumulate text chunks into a single rolling entry so the timeline card
+            // shows the full streamed text, not just the latest word.
+            let previousDetail = liveTimeline[lastIndex].event.detail
+            let newChunk = event.detail
+            let accumulated: String
+            if newChunk.isEmpty {
+                accumulated = previousDetail
+            } else {
+                let joined = previousDetail + newChunk
+                accumulated = joined.count > 2_000 ? String(joined.suffix(2_000)) : joined
+            }
+            let accumulatedEvent = ExecutionEvent(
+                type: .textChunk,
+                timestamp: event.timestamp,
+                detail: accumulated,
+                sessionID: event.sessionID
+            )
+            let stableEntry = LiveExecutionTimelineEntry(
+                id: liveTimeline[lastIndex].id,
+                agentID: entry.agentID,
+                agentTitle: entry.agentTitle,
+                stageID: entry.stageID,
+                event: accumulatedEvent
+            )
+            liveTimeline[lastIndex] = stableEntry
         } else {
             liveTimeline.append(entry)
             if liveTimeline.count > 40 {
@@ -2846,6 +2928,67 @@ final class WorkflowOrchestrator {
         if event.type == .sessionStarted || event.type == .sessionClosed || event.type == .error {
             updateSessionAuditTrail()
         }
+    }
+
+    private func bufferLiveTextChunk(agentID: String, chunk: String) {
+        guard chunk.isEmpty == false else { return }
+        pendingLiveTextChunksByAgentID[agentID, default: ""].append(chunk)
+    }
+
+    private func consumeBufferedLiveTextChunk(for agentID: String) -> String {
+        pendingLiveTextChunksByAgentID.removeValue(forKey: agentID) ?? ""
+    }
+
+    private func visibleLiveTextChunk(agentID: String, chunk: String) -> String? {
+        guard chunk.isEmpty == false else { return nil }
+
+        let startMarker = "<<<CHAINWORKS_OUTPUT:"
+        let endMarker = "<<<END_CHAINWORKS_OUTPUT>>>"
+        var suppressing = suppressingStructuredOutputByAgentID[agentID] ?? false
+        var remainder = chunk[...]
+        var visible = ""
+
+        while !remainder.isEmpty {
+            if suppressing {
+                if let endRange = remainder.range(of: endMarker) {
+                    remainder = remainder[endRange.upperBound...]
+                    suppressing = false
+                } else {
+                    suppressingStructuredOutputByAgentID[agentID] = true
+                    return nil
+                }
+            } else if let startRange = remainder.range(of: startMarker) {
+                visible += remainder[..<startRange.lowerBound]
+                remainder = remainder[startRange.lowerBound...]
+                suppressing = true
+            } else if let genericMarkerRange = remainder.range(of: "<<<") {
+                visible += remainder[..<genericMarkerRange.lowerBound]
+                suppressing = true
+                remainder = remainder[genericMarkerRange.lowerBound...]
+            } else {
+                visible += remainder
+                remainder = "".prefix(0)
+            }
+        }
+
+        suppressingStructuredOutputByAgentID[agentID] = suppressing
+        let trimmed = visible.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : visible
+    }
+
+    private func flushBufferedLiveTextChunkIfNeeded(agentID: String, timestamp: Date) {
+        guard let buffered = pendingLiveTextChunksByAgentID[agentID] else { return }
+        guard buffered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            pendingLiveTextChunksByAgentID.removeValue(forKey: agentID)
+            return
+        }
+
+        let event = ExecutionEvent(
+            type: .textChunk,
+            timestamp: timestamp,
+            detail: consumeBufferedLiveTextChunk(for: agentID)
+        )
+        commitLiveExecutionEvent(agentID: agentID, event: event)
     }
 
     /// Proposal 018: Final audit trail update on run completion.

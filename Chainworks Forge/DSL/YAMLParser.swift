@@ -53,11 +53,10 @@ struct YAMLParser: Sendable {
     }
 
     private nonisolated static func readFile(at url: URL) throws -> String {
-        guard FileManager.default.isReadableFile(atPath: url.path) else {
+        guard SecurityScopedAccess.fileExists(at: url) else {
             throw YAMLParserError.fileNotFound(url.path)
         }
-        guard let data = FileManager.default.contents(atPath: url.path),
-              let string = String(data: data, encoding: .utf8) else {
+        guard let string = try? SecurityScopedAccess.loadString(from: url) else {
             throw YAMLParserError.fileNotFound(url.path)
         }
         return string

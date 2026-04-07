@@ -465,6 +465,7 @@ struct ProviderSettingsView: View {
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
+            SecurityScopedAccess.remember(url: url, kind: .settingsFile)
             let transfer = SettingsTransferService(
                 appConfigurationStore: appConfigurationStore,
                 providerSettingsStore: providerSettingsStore,

@@ -1,14 +1,15 @@
 # ACP Runtime Candidate Comparison
 
-Status: **Comparative Evidence Snapshot** (2026-04-04)
+Status: **Comparative Evidence Snapshot** (2026-04-06)
 
 ## Purpose
 
-This note compares the seven ACP runtime candidates currently researched for
+This note compares the eight ACP runtime candidates currently researched for
 [`Proposal 026`](../proposals/026-acp-first-runtime-transport-and-goose-decoupling.md):
 
 - Claude Agent ACP
 - Gemini CLI ACP
+- Codex ACP
 - OpenCode ACP
 - Junie CLI ACP
 - Cline CLI ACP
@@ -26,16 +27,19 @@ Current ranking for `P026`:
 1. **Claude Agent ACP**: strongest current transport and observability
    candidate
 2. **Gemini CLI ACP**: strongest current native-style ACP runtime candidate
-3. **Auggie CLI ACP**: execution-proven with replay, permission callbacks,
+3. **Codex ACP**: execution-proven with strong replay, session listing,
+   live usage telemetry, and rich mode/model/config truth, but tool,
+   permission, and MCP execution proof are still incomplete
+4. **Auggie CLI ACP**: execution-proven with replay, permission callbacks,
    edit settlement, and real MCP execution, but durable mutation truth remains
    weak
-4. **Junie CLI ACP**: execution-proven and observability-capable, but weak on
+5. **Junie CLI ACP**: execution-proven and observability-capable, but weak on
    replay and persisted mutation truth
-5. **Cline CLI ACP**: execution-proven with live tool events, but replay truth
+6. **Cline CLI ACP**: execution-proven with live tool events, but replay truth
    and edit settlement are weaker
-6. **OpenCode ACP**: strongest broader runtime product surface, but ACP
+7. **OpenCode ACP**: strongest broader runtime product surface, but ACP
    observability is still too opaque
-7. **Goose ACP**: useful bridge reference only, not a strong direct cutover
+8. **Goose ACP**: useful bridge reference only, not a strong direct cutover
    target
 
 Why Claude currently leads:
@@ -56,6 +60,17 @@ Why Gemini still matters:
 - real ACP `fs/read_text_file` callback proof
 - real MCP attach and tool execution proof
 - but weaker persisted session-config truth than Claude
+
+Why Codex now ranks above Auggie, Junie, Cline, OpenCode, and Goose:
+
+- authenticated ACP usage through the local Codex CLI is real
+- `session/list` is real and returns real persisted sessions
+- `session/load` replay is strong for persisted sessions
+- `session/prompt` emits real `agent_message_chunk`
+- `session/prompt` emits real `usage_update`
+- `session/set_model` and `session/set_mode` emit real `config_option_update`
+- but tool-call, permission, edit-settlement, and real MCP execution proof are
+  still incomplete
 
 Why Auggie now ranks above Junie, Cline, and OpenCode:
 
@@ -99,31 +114,32 @@ Why Goose is no longer the lead candidate:
 
 ## Comparative Matrix
 
-| Capability | Claude Agent ACP | Gemini CLI ACP | OpenCode ACP | Junie CLI ACP | Cline CLI ACP | Auggie CLI ACP | Goose ACP |
-|---|---|---|---|---|---|---|---|
-| ACP server startup | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Stdio transport usability | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Stdio framing detail | NDJSON over stdio | NDJSON over stdio | Not material in probe | NDJSON over stdio | NDJSON over stdio | NDJSON over stdio | Not material in probe |
-| `session/new` | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| `session/load` | Yes | Yes | Yes | Yes | Advertised, but missing at runtime | Yes, with strict params | Yes |
-| `session/load` transcript replay | Partial | Yes | No | No | No | Yes | No |
-| Prompt `session/update` streaming | Yes | Yes | No | Yes | Partial | Yes | No |
-| Thought streaming | Yes | Yes | No | Yes | Not observed | Not observed | No |
-| Tool-call event visibility | Yes | Yes | No | Yes | Yes | Yes | No |
-| Permission callback proof | Yes | Yes | No | Yes | Not observed | Yes | No |
-| ACP file read callback proof | Not yet observed | Yes | Unknown | Not observed | Not proven | Not observed | Unknown |
-| ACP file write callback proof | Not yet observed | Not yet explicitly observed | Unknown | Not observed | Not proven | Not observed | Unknown |
-| MCP attach via `mcpServers` | Yes | Yes | Partial, healthier than Goose | Yes | Docs conflicted / not proven | Yes | Degraded/hangs on bad inputs |
-| Real MCP tool execution proof | Yes | Yes | No | Yes | No | Yes | No |
-| Prompt usage telemetry | Yes | Yes | Yes | Not observed | Not observed | Not observed | Weak / absent |
-| Usage update events | Yes | Not observed | No | No | Not observed | No | No |
-| Persisted model mutation truth | Yes | No | Yes | No | Not provable with current replay gap | No | No |
-| Persisted mode mutation truth | Yes | No | Yes | No | Not provable with current replay gap | No | Yes |
-| Fresh-session reloadability before prompt | Not proven | No | Not proven | Yes | Not proven | Not proven | Unknown |
-| Skills as runtime feature | Strong slash-command/runtime heritage | Not central in current evidence | Yes in runtime, ACP opaque | Yes in runtime/docs | Yes in runtime/docs | Yes in runtime/docs | Not a current strength |
-| Custom agents/subagents | Not central in current evidence | Not central in current evidence | Yes in runtime, ACP opaque | Yes in runtime/docs | Hooks/skills emphasized; subagents not proven | Personas/plugins strong; subagents not proven | Not a current strength |
-| Fit for Forge live timeline | Strongest current fit | Good | Poor-to-partial | Good-to-partial | Partial | Good-to-partial | Poor |
-| Fit for Forge report/recovery truth | Strongest current fit, with replay caveat | Strong, but persisted truth is weaker | Partial | Partial, but replay is weak | Weak-to-partial due to replay gap | Partial-to-good, but persisted truth is weak | Poor |
+| Capability | Claude Agent ACP | Gemini CLI ACP | Codex ACP | OpenCode ACP | Junie CLI ACP | Cline CLI ACP | Auggie CLI ACP | Goose ACP |
+|---|---|---|---|---|---|---|---|---|
+| ACP server startup | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Stdio transport usability | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Stdio framing detail | NDJSON over stdio | NDJSON over stdio | NDJSON over stdio | Not material in probe | NDJSON over stdio | NDJSON over stdio | NDJSON over stdio | Not material in probe |
+| `session/new` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| `session/list` | Yes | Unknown | Yes | Unknown | Unknown | Unknown | Yes | Yes |
+| `session/load` | Yes | Yes | Yes | Yes | Yes | Advertised, but missing at runtime | Yes, with strict params | Yes |
+| `session/load` transcript replay | Partial | Yes | Yes, for persisted sessions | No | No | No | Yes | No |
+| Prompt `session/update` streaming | Yes | Yes | Yes | No | Yes | Partial | Yes | No |
+| Thought streaming | Yes | Yes | Not observed | No | Yes | Not observed | Not observed | No |
+| Tool-call event visibility | Yes | Yes | Not proven | No | Yes | Yes | Yes | No |
+| Permission callback proof | Yes | Yes | Not observed | No | Yes | Not observed | Yes | No |
+| ACP file read callback proof | Not yet observed | Yes | Not observed | Unknown | Not observed | Not proven | Not observed | Unknown |
+| ACP file write callback proof | Not yet observed | Not yet explicitly observed | Not observed | Unknown | Not observed | Not proven | Not observed | Unknown |
+| MCP attach via `mcpServers` | Yes | Yes | Strict schema; live attach not fully proven | Partial, healthier than Goose | Yes | Docs conflicted / not proven | Yes | Degraded/hangs on bad inputs |
+| Real MCP tool execution proof | Yes | Yes | No | No | Yes | No | Yes | No |
+| Prompt usage telemetry | Yes | Yes | Yes | Yes | Not observed | Not observed | Not observed | Weak / absent |
+| Usage update events | Yes | Not observed | Yes | No | No | Not observed | No | No |
+| Persisted model mutation truth | Yes | No | Partial / not fully proven | Yes | No | Not provable with current replay gap | No | No |
+| Persisted mode mutation truth | Yes | No | Partial / not fully proven | Yes | No | Not provable with current replay gap | No | Yes |
+| Fresh-session reloadability before prompt | Not proven | No | No | Not proven | Yes | Not proven | Not proven | Unknown |
+| Skills as runtime feature | Strong slash-command/runtime heritage | Not central in current evidence | Strong Codex/skills/runtime heritage | Yes in runtime, ACP opaque | Yes in runtime/docs | Yes in runtime/docs | Yes in runtime/docs | Not a current strength |
+| Custom agents/subagents | Not central in current evidence | Not central in current evidence | Not central in current evidence | Yes in runtime, ACP opaque | Yes in runtime/docs | Hooks/skills emphasized; subagents not proven | Personas/plugins strong; subagents not proven | Not a current strength |
+| Fit for Forge live timeline | Strongest current fit | Good | Good-to-strong, pending tool/MCP proof | Poor-to-partial | Good-to-partial | Partial | Good-to-partial | Poor |
+| Fit for Forge report/recovery truth | Strongest current fit, with replay caveat | Strong, but persisted truth is weaker | Good, but operational proof is still incomplete | Partial | Partial, but replay is weak | Weak-to-partial due to replay gap | Partial-to-good, but persisted truth is weak | Poor |
 
 ## Candidate Notes
 
@@ -178,7 +194,38 @@ Primary evidence:
 
 - [gemini-cli-acp-research.md](./gemini-cli-acp-research.md)
 
-## 2. Junie CLI ACP
+## 2. Codex ACP
+
+Strengths:
+
+- official/public adapter surface is real and installable
+- local Codex CLI auth coupling is real
+- `session/new`, `session/list`, and `session/load` are real
+- `session/load` can replay persisted user and assistant chunks
+- `session/prompt` emits real chunk streaming and `usage_update`
+- live mode/model mutation truth is stronger than much of the field
+
+Weaknesses:
+
+- fresh-session reloadability before persistence is weak
+- persisted mutation truth after reload is not yet fully proven
+- tool-call visibility was not proven in this pass
+- permission callback proof was not observed
+- MCP attachment is schema-strict, but real MCP execution is not yet proven
+- startup inherits noisy local MCP warnings
+
+Practical role:
+
+- strong second-tier candidate for `P026`
+- stronger than Goose and OpenCode on ACP-visible replay/streaming truth
+- promising enough to keep in the active field, but not yet above Claude or
+  Gemini
+
+Primary evidence:
+
+- [codex-acp-research.md](./codex-acp-research.md)
+
+## 3. Junie CLI ACP
 
 Strengths:
 
@@ -208,7 +255,7 @@ Primary evidence:
 
 - [junie-cli-acp-research.md](./junie-cli-acp-research.md)
 
-## 3. Auggie CLI ACP
+## 4. Auggie CLI ACP
 
 Strengths:
 
@@ -337,6 +384,8 @@ Current decision signal:
 - Claude Agent ACP is currently the best direct migration target for the live
   execution slice
 - Gemini CLI ACP remains the strongest fallback/alternative candidate
+- Codex ACP is now a real upper-tier fallback candidate because replay,
+  session discovery, and usage telemetry are already strong
 - Auggie is now a real fallback-tier candidate with better replay and
   settlement truth than several peers, but durable mutation truth still lags
 - Junie remains strong if Forge values thought-stream richness and already-proven
@@ -371,6 +420,7 @@ The main unresolved questions are now narrower and more concrete:
 
 - [claude-agent-acp-research.md](./claude-agent-acp-research.md)
 - [gemini-cli-acp-research.md](./gemini-cli-acp-research.md)
+- [codex-acp-research.md](./codex-acp-research.md)
 - [opencode-acp-research.md](./opencode-acp-research.md)
 - [junie-cli-acp-research.md](./junie-cli-acp-research.md)
 - [cline-cli-acp-research.md](./cline-cli-acp-research.md)
@@ -379,6 +429,8 @@ The main unresolved questions are now narrower and more concrete:
 - [Claude Agent SDK overview](https://platform.claude.com/docs/en/agent-sdk/overview)
 - [@agentclientprotocol/claude-agent-acp](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
 - [Gemini CLI ACP Mode](https://geminicli.com/docs/cli/acp-mode/)
+- [@zed-industries/codex-acp](https://www.npmjs.com/package/@zed-industries/codex-acp)
+- [Zed External Agents](https://zed.dev/docs/ai/external-agents)
 - [Junie for ACP clients](https://junie.jetbrains.com/docs/junie-cli-acp.html)
 - [ACP: Editor Integrations - Cline](https://docs.cline.bot/cline-cli/acp-editor-integrations)
 - [OpenCode ACP Support](https://opencode.ai/docs/acp/)

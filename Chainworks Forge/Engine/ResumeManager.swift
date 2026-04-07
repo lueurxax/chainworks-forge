@@ -148,7 +148,7 @@ final class ResumeManager {
         // Check workflow source drift
         if !run.workflowSourcePath.isEmpty {
             let sourceURL = URL(fileURLWithPath: run.workflowSourcePath)
-            if FileManager.default.fileExists(atPath: sourceURL.path) {
+            if SecurityScopedAccess.fileExists(at: sourceURL) {
                 do {
                     let currentWorkflow = try YAMLParser.loadWorkflow(from: sourceURL)
                     let (_, currentHash) = try DefinitionHasher.hash(currentWorkflow)

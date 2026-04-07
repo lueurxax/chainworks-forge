@@ -49,7 +49,7 @@ struct MVPGoldenRunTests {
         )
         #expect(run.providerBindingSnapshotJSON != nil)
         let transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let liveConfiguration = LiveRuntimeConfiguration(
             baseURL: URL(string: "http://fixture.local")!,
             apiKey: nil,

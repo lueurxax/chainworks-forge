@@ -83,24 +83,29 @@ struct GooseServerTransportTests {
 
     // MARK: - Helpers
 
+    private struct StubRegistryProvider: RuntimeExtensionRegistryProvider, Sendable {
+        let snapshot: GooseExtensionRegistrySnapshot
+        func registrySnapshot() throws -> GooseExtensionRegistrySnapshot { snapshot }
+    }
+
     private func makeMockTransport(
         secretKey: String? = "test-secret",
         provider: String? = "claude-code",
         model: String? = "default",
-        gooseRegistryProvider: @escaping @Sendable () throws -> GooseExtensionRegistrySnapshot = {
-            GooseExtensionRegistrySnapshot(
-                configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
-                installedExtensionIDs: [],
-                enabledExtensionIDs: [],
-                configsByRuntimeID: [:]
-            )
-        },
+        extensionRegistryProvider: (any RuntimeExtensionRegistryProvider)? = nil,
         diagnosticsSink: @escaping @Sendable (GooseServerTransportDiagnosticEvent) -> Void = { _ in }
     ) -> GooseServerTransport {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 20
+
+        let registryProvider = extensionRegistryProvider ?? StubRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            installedExtensionIDs: [],
+            enabledExtensionIDs: [],
+            configsByRuntimeID: [:]
+        ))
 
         return GooseServerTransport(
             baseURL: URL(string: "https://127.0.0.1:51200")!,
@@ -109,7 +114,7 @@ struct GooseServerTransportTests {
             model: model,
             requestTimeout: 10,
             sessionConfiguration: config,
-            gooseExtensionRegistrySnapshotProvider: gooseRegistryProvider,
+            extensionRegistryProvider: registryProvider,
             diagnosticsSink: diagnosticsSink
         )
     }
@@ -172,7 +177,7 @@ struct GooseServerTransportTests {
         }
 
         _ = try await transport.createSession(
-            request: GooseSessionRequest(
+            request: RuntimeSessionRequest(
                 systemPrompt: "You are a test agent.",
                 workingDirectory: "/tmp/test-workspace",
                 model: nil,
@@ -217,7 +222,7 @@ struct GooseServerTransportTests {
         }
 
         _ = try await transport.createSession(
-            request: GooseSessionRequest(
+            request: RuntimeSessionRequest(
                 systemPrompt: "You are a test agent.",
                 workingDirectory: "/tmp/test-workspace",
                 model: nil,
@@ -288,7 +293,7 @@ struct GooseServerTransportTests {
         }
 
         let response = try await transport.createSession(
-            request: GooseSessionRequest(
+            request: RuntimeSessionRequest(
                 systemPrompt: "You are a test agent.",
                 workingDirectory: "/tmp/test-workspace",
                 model: nil,
@@ -320,29 +325,27 @@ struct GooseServerTransportTests {
         let transport = makeMockTransport(
             provider: "claude_code",
             model: "opus",
-            gooseRegistryProvider: {
-                GooseExtensionRegistrySnapshot(
-                    configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
-                    installedExtensionIDs: ["developer", "xcode", "context7"],
-                    enabledExtensionIDs: ["developer"],
-                    configsByRuntimeID: [
-                        "context7": GooseExtensionDefinition(
-                            enabled: false,
-                            type: "stdio",
-                            name: "context7",
-                            description: "Docs",
-                            displayName: "Context7",
-                            cmd: "npx",
-                            args: ["-y", "@upstash/context7-mcp"],
-                            envs: [:],
-                            envKeys: [],
-                            timeout: 300,
-                            bundled: nil,
-                            availableTools: []
-                        )
-                    ]
-                )
-            }
+            extensionRegistryProvider: StubRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+                configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+                installedExtensionIDs: ["developer", "xcode", "context7"],
+                enabledExtensionIDs: ["developer"],
+                configsByRuntimeID: [
+                    "context7": GooseExtensionDefinition(
+                        enabled: false,
+                        type: "stdio",
+                        name: "context7",
+                        description: "Docs",
+                        displayName: "Context7",
+                        cmd: "npx",
+                        args: ["-y", "@upstash/context7-mcp"],
+                        envs: [:],
+                        envKeys: [],
+                        timeout: 300,
+                        bundled: nil,
+                        availableTools: []
+                    )
+                ]
+            ))
         )
 
         MockURLProtocol.requestHandler = { request in
@@ -388,7 +391,7 @@ struct GooseServerTransportTests {
         }
 
         let response = try await transport.createSession(
-            request: GooseSessionRequest(
+            request: RuntimeSessionRequest(
                 systemPrompt: "You are a test agent.",
                 workingDirectory: "/tmp/test-workspace",
                 model: nil,
@@ -426,27 +429,27 @@ struct GooseServerTransportTests {
 
     // MARK: - Protocol Conformance
 
-    @Test("GooseServerTransport conforms to GooseTransportProtocol")
+    @Test("GooseServerTransport conforms to RuntimeTransportProtocol")
     func serverTransportConformsToProtocol() {
-        let transport: any GooseTransportProtocol = GooseServerTransport(
+        let transport: any RuntimeTransportProtocol = GooseServerTransport(
             baseURL: URL(string: "https://127.0.0.1:51200")!,
             secretKey: "test-secret"
         )
         #expect(transport != nil)
     }
 
-    @Test("GooseTransport (bespoke) conforms to GooseTransportProtocol")
+    @Test("GooseTransport (bespoke) conforms to RuntimeTransportProtocol")
     func bespokeTransportConformsToProtocol() {
-        let transport: any GooseTransportProtocol = GooseTransport(
+        let transport: any RuntimeTransportProtocol = GooseTransport(
             baseURL: URL(string: "http://localhost:3000")!,
             apiKey: "test-key"
         )
         #expect(transport != nil)
     }
 
-    @Test("FixtureGooseTransport conforms to GooseTransportProtocol")
+    @Test("FixtureGooseTransport conforms to RuntimeTransportProtocol")
     func fixtureTransportConformsToProtocol() {
-        let transport: any GooseTransportProtocol = FixtureGooseTransport(
+        let transport: any RuntimeTransportProtocol = FixtureGooseTransport(
             scenario: .proposalLoopSuccess
         )
         #expect(transport != nil)
@@ -514,7 +517,7 @@ struct GooseServerTransportTests {
             return (200, ["Content-Type": "text/event-stream"], Data(sseBody.utf8))
         }
 
-        let prompt = GoosePromptRequest(
+        let prompt = RuntimePromptRequest(
             content: "Test prompt for encoding verification",
             context: nil
         )
@@ -576,11 +579,11 @@ struct GooseServerTransportTests {
             return (200, ["Content-Type": "text/event-stream"], Data(sseBody.utf8))
         }
 
-        let prompt = GoosePromptRequest(
+        let prompt = RuntimePromptRequest(
             content: "Main task prompt",
             context: [
-                GooseContextAttachment(type: "text", name: "workspace_context", content: "Run ID: 123\nStage: state_1", path: nil),
-                GooseContextAttachment(type: "artifact", name: "input_artifact", content: "artifact content here", path: nil)
+                RuntimeContextAttachment(type: "text", name: "workspace_context", content: "Run ID: 123\nStage: state_1", path: nil),
+                RuntimeContextAttachment(type: "artifact", name: "input_artifact", content: "artifact content here", path: nil)
             ]
         )
 
@@ -624,7 +627,7 @@ struct GooseServerTransportTests {
             return (200, ["Content-Type": "application/json"], Data("{}".utf8))
         }
 
-        let session = try await transport.createSession(request: GooseSessionRequest(
+        let session = try await transport.createSession(request: RuntimeSessionRequest(
             systemPrompt: "Do not call xcode_mcp.",
             workingDirectory: "/tmp/test-workspace",
             model: nil,
@@ -635,7 +638,7 @@ struct GooseServerTransportTests {
 
         let stream = transport.submitPrompt(
             sessionID: session.sessionId,
-            prompt: GoosePromptRequest(content: "Reply with exactly ok", context: nil)
+            prompt: RuntimePromptRequest(content: "Reply with exactly ok", context: nil)
         )
         for try await _ in stream {}
 
@@ -666,7 +669,7 @@ struct GooseServerTransportTests {
             return (200, ["Content-Type": "text/event-stream"], Data(sseBody.utf8))
         }
 
-        let prompt = GoosePromptRequest(content: "test", context: nil)
+        let prompt = RuntimePromptRequest(content: "test", context: nil)
         let stream = transport.submitPrompt(sessionID: "test-session-auth", prompt: prompt)
         for try await _ in stream {}
 
@@ -730,7 +733,7 @@ struct GooseServerTransportTests {
         }
 
         // Step 1: Create session
-        let sessionRequest = GooseSessionRequest(
+        let sessionRequest = RuntimeSessionRequest(
             systemPrompt: "You are a test agent.",
             workingDirectory: "/tmp/test-workspace",
             model: nil,
@@ -775,13 +778,13 @@ struct GooseServerTransportTests {
         #expect(providerJSON["model"] as? String == "test-model")
 
         // Step 2: Submit prompt and collect events
-        let promptRequest = GoosePromptRequest(
+        let promptRequest = RuntimePromptRequest(
             content: "Write a hello world program",
             context: nil
         )
         let eventStream = transport.submitPrompt(sessionID: sessionResponse.sessionId, prompt: promptRequest)
 
-        var events: [GooseStreamEvent] = []
+        var events: [RuntimeStreamEvent] = []
         for try await event in eventStream {
             events.append(event)
         }
@@ -841,7 +844,7 @@ struct GooseServerTransportTests {
             return (500, [:], Data("Internal Server Error".utf8))
         }
 
-        let request = GooseSessionRequest(
+        let request = RuntimeSessionRequest(
             systemPrompt: "test",
             workingDirectory: "/tmp/test",
             model: nil,
@@ -853,7 +856,7 @@ struct GooseServerTransportTests {
         await #expect {
             _ = try await transport.createSession(request: request)
         } throws: { error in
-            guard let transportError = error as? GooseTransportError,
+            guard let transportError = error as? RuntimeTransportError,
                   case .httpError(let code, _) = transportError else {
                 return false
             }
@@ -896,7 +899,7 @@ struct GooseServerTransportTests {
             return (404, [:], Data("Not Found".utf8))
         }
 
-        _ = try await transport.createSession(request: GooseSessionRequest(
+        _ = try await transport.createSession(request: RuntimeSessionRequest(
             systemPrompt: "Diagnostic test agent",
             workingDirectory: "/tmp/diagnostic",
             model: nil,
@@ -922,8 +925,8 @@ struct GooseServerTransportTests {
 
         let providerEvent = try #require(events.first(where: { $0.kind == .updateProvider }))
         #expect(providerEvent.sessionID == "diagnostic-session-7")
-        #expect(providerEvent.provider == "codex")
-        #expect(providerEvent.model == "GPT-5.4")
+        #expect(providerEvent.provider == "chatgpt_codex")
+        #expect(providerEvent.model == "gpt-5.4")
         #expect(providerEvent.httpStatus == 200)
         #expect(providerEvent.agentID == "proposal_reviewer_architect")
     }
@@ -938,10 +941,10 @@ struct GooseServerTransportTests {
             return (200, ["Content-Type": "text/event-stream"], Data(sseBody.utf8))
         }
 
-        let prompt = GoosePromptRequest(content: "test", context: nil)
+        let prompt = RuntimePromptRequest(content: "test", context: nil)
         let stream = transport.submitPrompt(sessionID: "error-session", prompt: prompt)
 
-        var events: [GooseStreamEvent] = []
+        var events: [RuntimeStreamEvent] = []
         for try await event in stream {
             events.append(event)
         }
@@ -959,7 +962,7 @@ struct GooseServerTransportTests {
     @Test("FixtureGooseTransport createSession returns fixture session")
     func fixtureTransportCreateSession() async throws {
         let transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
-        let request = GooseSessionRequest(
+        let request = RuntimeSessionRequest(
             systemPrompt: "Test prompt",
             workingDirectory: "/tmp/test",
             model: nil,
@@ -977,7 +980,7 @@ struct GooseServerTransportTests {
     func fixtureTransportSubmitPrompt() async throws {
         let transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
 
-        let request = GooseSessionRequest(
+        let request = RuntimeSessionRequest(
             systemPrompt: "Test prompt",
             workingDirectory: "/tmp/test",
             model: nil,
@@ -987,13 +990,13 @@ struct GooseServerTransportTests {
         )
         let session = try await transport.createSession(request: request)
 
-        let promptRequest = GoosePromptRequest(
-            content: "## Task: normalize_idea_and_prepare_proposal_brief\n\n### Expected Outputs\n- idea_brief\n\nOutput directory: /tmp/test-output/",
+        let promptRequest = RuntimePromptRequest(
+            content: "## Task: normalize_idea_and_prepare_proposal_brief\n\n### Expected Outputs\n- idea_brief\n\n### Stop Condition\nComplete the task and produce all required outputs.",
             context: nil
         )
         let stream = transport.submitPrompt(sessionID: session.sessionId, prompt: promptRequest)
 
-        var events: [GooseStreamEvent] = []
+        var events: [RuntimeStreamEvent] = []
         for try await event in stream {
             events.append(event)
         }

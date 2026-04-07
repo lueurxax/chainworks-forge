@@ -1,8 +1,8 @@
 import Foundation
 
-// MARK: - GooseSessionBridge (ARCH-027: one session per AgentExecution)
+// MARK: - RuntimeSessionBridge (Proposal 026 — ACP-shaped session bridge, formerly GooseSessionBridge)
 
-/// Creates an isolated Goose session for a single AgentExecution.
+/// Creates an isolated runtime session for a single AgentExecution.
 /// Binds workspace, prompt packet, and input artifacts into a structured execution request.
 ///
 /// Invariants:
@@ -10,24 +10,23 @@ import Foundation
 /// - No session reuse across agents or iterations.
 /// - No reliance on session memory; state is reconstructed from artifacts (ARCH-030).
 /// - Workspace is passed explicitly; no implicit cwd.
-final class GooseSessionBridge: Sendable {
+final class RuntimeSessionBridge: Sendable {
 
     // MARK: - Dependencies
 
-    /// Proposal 005: depends on `GooseTransportProtocol`, not concrete `GooseTransport`.
-    let transport: any GooseTransportProtocol
-    private let gooseExtensionRegistrySnapshotProvider: @Sendable () throws -> GooseExtensionRegistrySnapshot
+    /// Proposal 026: depends on `RuntimeTransportProtocol`, not concrete `GooseTransport`.
+    let transport: any RuntimeTransportProtocol
+    /// Proposal 026 Phase 2: MCP realization abstracted behind a protocol.
+    private let extensionRegistryProvider: any RuntimeExtensionRegistryProvider
 
     // MARK: - Init
 
     nonisolated init(
-        transport: any GooseTransportProtocol,
-        gooseExtensionRegistrySnapshotProvider: @escaping @Sendable () throws -> GooseExtensionRegistrySnapshot = {
-            try GooseExtensionRegistryReader().snapshot()
-        }
+        transport: any RuntimeTransportProtocol,
+        extensionRegistryProvider: (any RuntimeExtensionRegistryProvider)? = nil
     ) {
         self.transport = transport
-        self.gooseExtensionRegistrySnapshotProvider = gooseExtensionRegistrySnapshotProvider
+        self.extensionRegistryProvider = extensionRegistryProvider ?? GooseExtensionRegistryReader()
     }
 
     // MARK: - Session Lifecycle
@@ -39,7 +38,7 @@ final class GooseSessionBridge: Sendable {
         task: AgentTask,
         context: ExecutionContext,
         override: LiveExecutionOverride?
-    ) async throws -> GooseSessionExecution {
+    ) async throws -> RuntimeSessionExecution {
         // Step 1: Build the structured execution packet
         let packet = Self.buildExecutionPacket(agent: agent, task: task, context: context)
 
@@ -65,15 +64,15 @@ final class GooseSessionBridge: Sendable {
             : readOnlyRoot
         let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
         if !mcpResolution.blockingIssues.isEmpty {
-            throw GooseSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
+            throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
         }
 
-        let sessionRequest = GooseSessionRequest(
+        let sessionRequest = RuntimeSessionRequest(
             systemPrompt: packet.systemPrompt,
             workingDirectory: workingDirectory,
             model: model,
             provider: provider,
-            executionPolicy: GooseExecutionPolicy(
+            executionPolicy: RuntimeExecutionPolicy(
                 permissionProfileID: agent.permissionProfile,
                 workspaceMode: useWorktree ? "read_write" : "read_only",
                 gitOperationsAllowed: useWorktree,
@@ -92,11 +91,11 @@ final class GooseSessionBridge: Sendable {
 
         let sessionResponse = try await transport.createSession(request: sessionRequest)
         guard sessionResponse.policyAcknowledgement?.accepted == true else {
-            throw GooseSessionBridgeError.policyAcknowledgementMissing
+            throw RuntimeSessionBridgeError.policyAcknowledgementMissing
         }
 
         // Step 4: Submit the task prompt and get streaming events
-        let promptRequest = GoosePromptRequest(
+        let promptRequest = RuntimePromptRequest(
             content: packet.taskDirective,
             context: packet.contextAttachments
         )
@@ -106,7 +105,7 @@ final class GooseSessionBridge: Sendable {
             prompt: promptRequest
         )
 
-        return GooseSessionExecution(
+        return RuntimeSessionExecution(
             sessionID: sessionResponse.sessionId,
             actualEnabledExtensions: sessionResponse.actualEnabledExtensions,
             startupLatencyMilliseconds: sessionResponse.startupLatencyMilliseconds,
@@ -135,7 +134,7 @@ final class GooseSessionBridge: Sendable {
             )
         }
 
-        let gooseRegistry = try? gooseExtensionRegistrySnapshotProvider()
+        let gooseRegistry = try? extensionRegistryProvider.registrySnapshot()
         return MCPPolicyResolver().resolve(
             agent: agent,
             catalog: catalog,
@@ -149,8 +148,8 @@ final class GooseSessionBridge: Sendable {
     func executeInExistingSession(
         sessionID: String,
         packet: ExecutionPacket
-    ) async throws -> GooseSessionExecution {
-        let promptRequest = GoosePromptRequest(
+    ) async throws -> RuntimeSessionExecution {
+        let promptRequest = RuntimePromptRequest(
             content: packet.taskDirective,
             context: packet.contextAttachments
         )
@@ -161,7 +160,7 @@ final class GooseSessionBridge: Sendable {
         )
         let runtimeState = try await transport.readSessionRuntimeState(sessionID: sessionID)
 
-        return GooseSessionExecution(
+        return RuntimeSessionExecution(
             sessionID: sessionID,
             actualEnabledExtensions: runtimeState?.enabledExtensions,
             startupLatencyMilliseconds: nil,
@@ -208,7 +207,7 @@ final class GooseSessionBridge: Sendable {
         )
 
         // 3. Context attachments (input artifacts + workspace info)
-        var attachments: [GooseContextAttachment] = []
+        var attachments: [RuntimeContextAttachment] = []
 
         // Workspace context attachment
         let projectRootDescription = context.projectRoot?.path ?? "not provided"
@@ -217,9 +216,9 @@ final class GooseSessionBridge: Sendable {
         let boundaryNote = useWorktree
             ? "IMPORTANT: This agent has write access to the worktree root. All file operations must use explicit absolute paths within the worktree root."
             : context.projectRoot != nil
-                ? "IMPORTANT: Treat the project root as the only source tree. Ignore any unexpected server cwd drift and use explicit absolute paths within the project root for reads, while writing outputs only into the artifact root."
+                ? "IMPORTANT: Treat the project root as the only source tree. Ignore any unexpected server cwd drift and use explicit absolute paths within the project root for reads. Return required outputs in the final response envelope; do not rely on direct writes into the artifact root."
                 : "IMPORTANT: No implicit working directory is allowed. All file operations must use explicit absolute paths within the workspace root."
-        attachments.append(GooseContextAttachment(
+        attachments.append(RuntimeContextAttachment(
             type: "text",
             name: "workspace_context",
             content: """
@@ -240,7 +239,7 @@ final class GooseSessionBridge: Sendable {
         if let handoff = handoffPacket {
             for (name, data) in handoff.mandatoryArtifacts.sorted(by: { $0.key < $1.key }) {
                 let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
-                attachments.append(GooseContextAttachment(
+                attachments.append(RuntimeContextAttachment(
                     type: "artifact",
                     name: name,
                     content: content,
@@ -249,7 +248,7 @@ final class GooseSessionBridge: Sendable {
             }
 
             for (name, summary) in handoff.summaries.sorted(by: { $0.key < $1.key }) {
-                attachments.append(GooseContextAttachment(
+                attachments.append(RuntimeContextAttachment(
                     type: "text",
                     name: "summary_\(name)",
                     content: summary,
@@ -258,13 +257,13 @@ final class GooseSessionBridge: Sendable {
             }
 
             if let lazyEvidenceToolAssets {
-                attachments.append(GooseContextAttachment(
+                attachments.append(RuntimeContextAttachment(
                     type: "file",
                     name: "LazyEvidenceTool",
                     content: "Executable helper for on-demand lazy artifact retrieval.",
                     path: lazyEvidenceToolAssets.executablePath
                 ))
-                attachments.append(GooseContextAttachment(
+                attachments.append(RuntimeContextAttachment(
                     type: "text",
                     name: "lazy_evidence_manifest",
                     content: buildLazyEvidenceToolManifest(handoff.lazyArtifactRefs),
@@ -274,14 +273,14 @@ final class GooseSessionBridge: Sendable {
 
             for (name, pointer) in handoff.lazyArtifactRefs.sorted(by: { $0.key < $1.key }) {
                 if let path = pointer.absolutePath {
-                    attachments.append(GooseContextAttachment(
+                    attachments.append(RuntimeContextAttachment(
                         type: "file",
                         name: "lazy_\(name)",
                         content: buildLazyArtifactAttachmentContent(pointer: pointer),
                         path: path
                     ))
                 } else {
-                    attachments.append(GooseContextAttachment(
+                    attachments.append(RuntimeContextAttachment(
                         type: "text",
                         name: "lazy_\(name)",
                         content: buildLazyArtifactAttachmentContent(pointer: pointer),
@@ -290,7 +289,7 @@ final class GooseSessionBridge: Sendable {
                 }
             }
 
-            attachments.append(GooseContextAttachment(
+            attachments.append(RuntimeContextAttachment(
                 type: "text",
                 name: "strategy_fingerprint",
                 content: handoff.fingerprintMaterial,
@@ -299,7 +298,7 @@ final class GooseSessionBridge: Sendable {
         } else {
             for (name, data) in context.inputArtifacts {
                 let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
-                attachments.append(GooseContextAttachment(
+                attachments.append(RuntimeContextAttachment(
                     type: "artifact",
                     name: name,
                     content: content,
@@ -310,12 +309,29 @@ final class GooseSessionBridge: Sendable {
 
         // Idea body attachment
         if !context.ideaBody.isEmpty {
-            attachments.append(GooseContextAttachment(
+            attachments.append(RuntimeContextAttachment(
                 type: "text",
                 name: "idea_body",
                 content: context.ideaBody,
                 path: nil
             ))
+        }
+
+        // Idea file attachment (e.g. prior proposal or reference material)
+        if let attachmentPath = context.ideaAttachmentPath,
+           !attachmentPath.isEmpty {
+            let fileURL = URL(fileURLWithPath: attachmentPath)
+            if FileManager.default.fileExists(atPath: attachmentPath),
+               let fileContent = try? String(contentsOf: fileURL, encoding: .utf8) {
+                attachments.append(RuntimeContextAttachment(
+                    type: "file",
+                    name: "idea_attachment",
+                    content: fileContent,
+                    path: attachmentPath
+                ))
+            } else {
+                print("[RuntimeSessionBridge] Idea attachment not readable, skipping: \(attachmentPath)")
+            }
         }
 
         return ExecutionPacket(
@@ -371,7 +387,7 @@ final class GooseSessionBridge: Sendable {
         // Boundaries
         parts.append("")
         parts.append("## Boundaries")
-        parts.append("- You must write output files to the artifact output directory provided.")
+        parts.append("- You must return required outputs in the final response using the Chainworks output envelope. The app persists artifacts; do not rely on direct writes to the run artifact directory.")
         parts.append("- Do not perform any git operations.")
         parts.append("- Do not rely on implicit working directory — use explicit absolute paths from the workspace context.")
         parts.append("- For read-only repo-backed stages, read source only from the Project Root provided in workspace_context.")
@@ -431,23 +447,28 @@ final class GooseSessionBridge: Sendable {
         // Expected outputs
         if !expectedOutputs.isEmpty {
             parts.append("### Expected Outputs")
-            parts.append("You MUST produce the following output files in the artifact directory:")
+            parts.append("You MUST return the following outputs in your final response:")
             for output in expectedOutputs {
                 parts.append("- \(output)")
             }
             parts.append("")
-            parts.append("Use the exact filenames listed above.")
+            parts.append("Use the exact output names listed above as envelope keys.")
+            parts.append("Return one or more blocks in this exact format and do not put narrative outside the blocks:")
+            parts.append("<<<CHAINWORKS_OUTPUT:output_name>>>")
+            parts.append("...content for that output...")
+            parts.append("<<<END_CHAINWORKS_OUTPUT>>>")
+            parts.append("For markdown/report outputs, place the full body between the tags.")
+            parts.append("For JSON-contract outputs, place exactly one top-level JSON object between the tags.")
             parts.append("Do not add file extensions like .md, .txt, or .json unless the filename above already includes that extension.")
-            parts.append("Output directory: \(context.workspace.artifactRoot.path)/\(context.stageID).\(context.iteration)/\(agent.id)/\(context.attemptNumber)/")
-            parts.append("Before stopping, verify that every required output file exists on disk in the output directory and is non-empty.")
-            parts.append("If any required output file is missing or empty, continue working and fix that before you stop.")
+            parts.append("Before stopping, verify that every required output name appears in the final response envelope and that every block is non-empty.")
+            parts.append("If any required output block is missing or empty, continue working and fix that before you stop.")
         }
 
         if task.task == "normalize_idea_and_open_run" {
             parts.append("")
             parts.append("### Task-Specific Guidance")
             parts.append("Use the `idea_body` attachment as the primary source of truth for normalization.")
-            parts.append("Do not stop after analysis or narration alone. The task is incomplete until all three required files exist on disk.")
+            parts.append("Do not stop after analysis or narration alone. The task is incomplete until all three required outputs are present in the final response envelope.")
             parts.append("`idea_brief` must be a concise, structured normalized brief that captures the problem, desired outcome, scope, risks, and next workflow step.")
             parts.append("`run_state` must be machine-readable workflow state for the new run. Initialize loop counters, register approval checkpoints if needed, and point to the next stage.")
             parts.append("`orchestrator_summary` must be a human-readable summary of what was normalized, which decisions were made, and why the run should proceed.")
@@ -713,13 +734,13 @@ final class GooseSessionBridge: Sendable {
     static func validateWorkspace(_ workspace: RunWorkspace) throws {
         let path = workspace.workspaceRoot.path
         guard !path.isEmpty else {
-            throw GooseSessionBridgeError.implicitCWDRejected
+            throw RuntimeSessionBridgeError.implicitCWDRejected
         }
         guard path != FileManager.default.currentDirectoryPath else {
-            throw GooseSessionBridgeError.implicitCWDRejected
+            throw RuntimeSessionBridgeError.implicitCWDRejected
         }
         guard path != "/" else {
-            throw GooseSessionBridgeError.implicitCWDRejected
+            throw RuntimeSessionBridgeError.implicitCWDRejected
         }
     }
 }
@@ -731,19 +752,19 @@ final class GooseSessionBridge: Sendable {
 struct ExecutionPacket: Sendable {
     let systemPrompt: String
     let taskDirective: String
-    let contextAttachments: [GooseContextAttachment]
+    let contextAttachments: [RuntimeContextAttachment]
 }
 
-// MARK: - GooseSessionExecution
+// MARK: - RuntimeSessionExecution
 
 /// Represents an in-flight execution within an isolated Goose session.
-/// Proposal 005: uses `GooseTransportProtocol` instead of concrete `GooseTransport`.
-struct GooseSessionExecution: Sendable {
+/// Proposal 026: uses `RuntimeTransportProtocol` instead of concrete `GooseTransport`.
+struct RuntimeSessionExecution: Sendable {
     let sessionID: String
     let actualEnabledExtensions: [String]?
     let startupLatencyMilliseconds: Int?
-    let eventStream: AsyncThrowingStream<GooseStreamEvent, Error>
-    let transport: any GooseTransportProtocol
+    let eventStream: AsyncThrowingStream<RuntimeStreamEvent, Error>
+    let transport: any RuntimeTransportProtocol
 
     /// Close the session after execution completes.
     func closeSession() async {
@@ -780,9 +801,9 @@ struct LiveExecutionOverride: Codable, Sendable {
     let effort: String
 }
 
-// MARK: - GooseSessionBridgeError
+// MARK: - RuntimeSessionBridgeError
 
-enum GooseSessionBridgeError: Error, LocalizedError {
+enum RuntimeSessionBridgeError: Error, LocalizedError {
     case implicitCWDRejected
     case workspaceRootMissing
     case sessionCreationFailed(reason: String)
@@ -804,3 +825,4 @@ enum GooseSessionBridgeError: Error, LocalizedError {
         }
     }
 }
+

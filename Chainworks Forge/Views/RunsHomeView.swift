@@ -406,11 +406,11 @@ struct RunsHomeRow: View {
         .contextMenu {
             Button("Open", systemImage: "arrow.right.circle") { onOpen() }
 
-            if let onOpenGate, run.status == .waitingApproval {
+            if let onOpenGate, run.presentationStatus == .waitingApproval {
                 Button("Open Gate", systemImage: "checkmark.seal") { onOpenGate() }
             }
 
-            if let onRecover, run.status == .blocked || run.status == .failed {
+            if let onRecover, run.presentationStatus == .blocked || run.presentationStatus == .failed {
                 Button("Recover", systemImage: "arrow.counterclockwise") { onRecover() }
             }
 
@@ -788,7 +788,7 @@ struct RunDetailPanel: View {
                     .accessibilityIdentifier("runs-home-stop-run-button")
                 }
 
-                if run.status == .blocked || run.status == .failed {
+                if run.presentationStatus == .blocked || run.presentationStatus == .failed {
                     Button("Recover", systemImage: "arrow.counterclockwise") {
                         onRecover()
                     }
@@ -987,10 +987,11 @@ struct RunDetailPanel: View {
 
     private var hasAnyAction: Bool {
         run.canBeCancelledByOperator
-            || run.status == .blocked || run.status == .failed
+            || run.presentationStatus == .blocked || run.presentationStatus == .failed
             || compatibilityChecker.hasCompatibleTargets(for: run)
             || run.latestImmutableReportArtifactID != nil
-            || (run.deliveryConfigurationJSON != nil && (run.status == .completed || run.status == .failed))
+            || (run.deliveryConfigurationJSON != nil
+                && (run.presentationStatus == .completed || run.presentationStatus == .failed))
     }
 
     private var flowSections: [WorkflowMapVisibleSection] {

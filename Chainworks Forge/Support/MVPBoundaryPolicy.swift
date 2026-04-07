@@ -47,15 +47,32 @@ enum MVPBoundaryPolicy {
         case rejected = "rejected"
     }
 
+    /// Result of attachment validation including a human-readable reason on rejection.
+    struct AttachmentValidationResult: Sendable {
+        let status: AttachmentStatus
+        /// Non-nil when `status == .rejected`. Explains why the file was rejected.
+        let rejectionReason: String?
+    }
+
     /// Validate an attachment path and return its status.
-    /// Unsupported paths/extensions produce a deterministic rejection.
-    static func validateAttachment(path: String) -> AttachmentStatus {
+    /// Unsupported paths/extensions produce a deterministic rejection with a reason.
+    static func validateAttachment(path: String) -> AttachmentValidationResult {
         let url = URL(fileURLWithPath: path)
         let ext = url.pathExtension.lowercased()
-        guard !ext.isEmpty, supportedAttachmentExtensions.contains(ext) else {
-            return .rejected
+        if ext.isEmpty {
+            return AttachmentValidationResult(
+                status: .rejected,
+                rejectionReason: "File has no extension. Rename it to include a supported extension (e.g. .md, .txt, .json)."
+            )
         }
-        return .referenceOnly
+        if !supportedAttachmentExtensions.contains(ext) {
+            let supported = supportedAttachmentExtensions.sorted().joined(separator: ", ")
+            return AttachmentValidationResult(
+                status: .rejected,
+                rejectionReason: "Unsupported extension .\(ext). Supported: \(supported)."
+            )
+        }
+        return AttachmentValidationResult(status: .referenceOnly, rejectionReason: nil)
     }
 
     // MARK: - Cost Granularity (§6.2)

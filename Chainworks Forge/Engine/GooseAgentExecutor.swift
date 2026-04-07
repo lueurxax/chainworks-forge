@@ -1,14 +1,14 @@
 import Foundation
 
-// MARK: - GooseAgentExecutor (concrete AgentExecutor via Goose — Section 8.1)
+// MARK: - RuntimeAgentExecutor (concrete AgentExecutor via Goose — Section 8.1)
 
 /// Concrete implementation of `AgentExecutor` using a Goose backend.
-/// Each execution creates an isolated session via `GooseSessionBridge` (ARCH-027).
-final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
+/// Each execution creates an isolated session via `RuntimeSessionBridge` (ARCH-027).
+final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     // MARK: - Dependencies
 
-    let sessionBridge: GooseSessionBridge
+    let sessionBridge: RuntimeSessionBridge
     let override: LiveExecutionOverride?
     let sessionManager: AgentSessionManager?
 
@@ -18,11 +18,11 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
     // MARK: - Init
 
     init(
-        transport: any GooseTransportProtocol,
+        transport: any RuntimeTransportProtocol,
         override: LiveExecutionOverride? = nil,
         sessionManager: AgentSessionManager? = nil
     ) {
-        self.sessionBridge = GooseSessionBridge(transport: transport)
+        self.sessionBridge = RuntimeSessionBridge(transport: transport)
         self.override = override
         self.sessionManager = sessionManager
     }
@@ -71,14 +71,16 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         context: ExecutionContext,
         attemptIndex: Int
     ) async throws -> AgentResult {
+        // Capture before task group so the nonisolated child task can read it safely.
+        let timeoutSeconds = Self.executionTimeoutSeconds
         do {
             return try await withThrowingTaskGroup(of: AgentResult.self) { group in
                 group.addTask {
                     try await self.executeAttempt(task: task, agent: agent, context: context, attemptIndex: attemptIndex)
                 }
                 group.addTask {
-                    try await Task.sleep(for: .seconds(Self.executionTimeoutSeconds))
-                    throw ExecutionError.timeout(agentID: agent.id, seconds: Int(Self.executionTimeoutSeconds))
+                    try await Task.sleep(for: .seconds(timeoutSeconds))
+                    throw ExecutionError.timeout(agentID: agent.id, seconds: Int(timeoutSeconds))
                 }
 
                 // Return whichever finishes first
@@ -89,7 +91,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         } catch is ExecutionError {
             // Watchdog timeout triggered
             return AgentResult.failure(
-                "Execution watchdog: agent '\(agent.id)' timed out after \(Int(Self.executionTimeoutSeconds))s (attempt \(attemptIndex))",
+                "Execution watchdog: agent '\(agent.id)' timed out after \(Int(timeoutSeconds))s (attempt \(attemptIndex))",
                 context: context,
                 override: override,
                 startedAt: Date()
@@ -105,9 +107,26 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         let isContractViolation = error.contains("Required outputs missing") || error.contains("output contract")
             || error.contains("not valid JSON") || error.contains("Missing required field")
         let isWatchdogTimeout = error.contains("Execution watchdog")
-        if isContractViolation {
+
+        // When outputs are missing but the agent's text reveals a provider-side session, limit,
+        // or crash error, the failure is recoverable with a fresh session — override the
+        // contract-violation classification.
+        if isContractViolation, let text = result.accumulatedText {
+            let lowered = text.lowercased()
+            let isProviderSessionError = lowered.contains("error resuming session")
+                || lowered.contains("invalid session identifier")
+                || lowered.contains("session not found")
+            let isProviderLimitError = isLimitExhaustionError(text)
+            let isProviderCrash = lowered.contains("heap out of memory")
+                || lowered.contains("fatal error")
+                || lowered.contains("allocation failed")
+                || lowered.contains("exit code")
+            if isProviderSessionError || isProviderLimitError || isProviderCrash {
+                return true
+            }
             return false
         }
+
         return isTransportError || isWatchdogTimeout
     }
 
@@ -122,7 +141,7 @@ final class GooseAgentExecutor: AgentExecutor, @unchecked Sendable {
         let startedAt = Date()
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
-        try GooseSessionBridge.validateWorkspace(context.workspace)
+        try RuntimeSessionBridge.validateWorkspace(context.workspace)
 
         // 1. Resolve Session (Proposal 018)
         let sessionInfo: SessionResolutionInfo
@@ -199,7 +218,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         )
 
         // 4. Extract Outputs & Finalize
-        let result = finalizeSuccessResult(
+        let result = await finalizeSuccessResult(
             streamResult: streamResult,
             sessionInfo: sessionInfo,
             checkpoint: checkpoint,
@@ -217,7 +236,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
     // MARK: - Internal Steps
 
     private struct SessionResolutionInfo {
-        let execution: GooseSessionExecution
+        let execution: RuntimeSessionExecution
         let lineageID: UUID?
         let generationID: UUID?
         let reuseDisposition: SessionReuseDisposition
@@ -231,7 +250,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> SessionResolutionInfo {
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
         let (workingDirectory, workspaceMode) = resolveWorkingDirectoryAndMode(agent: agent, context: context)
         let fingerprint = calculateFingerprint(agent: agent, context: context, systemPrompt: packet.systemPrompt, workingDirectory: workingDirectory, workspaceMode: workspaceMode)
         let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
@@ -437,7 +456,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         fingerprint: String,
         workingDirectory: String,
         workspaceMode: String
-    ) async throws -> GooseSessionExecution {
+    ) async throws -> RuntimeSessionExecution {
         guard let sessionManager else {
             return try await sessionBridge.executeInIsolatedSession(agent: agent, task: task, context: context, override: override)
         }
@@ -472,7 +491,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         }
 
         throw NSError(
-            domain: "GooseAgentExecutor",
+            domain: "RuntimeAgentExecutor",
             code: 409,
             userInfo: [
                 NSLocalizedDescriptionKey: "Provider session ID collision detected; refusing to attach session to the wrong lineage. \(lastCollisionDetails)"
@@ -493,6 +512,14 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         let completedAt = Date()
 
         var salvaged = salvageOutputs(expectedOutputs: expectedOutputs, context: context, agent: agent)
+        let returnedOutputs = parseReturnedOutputs(
+            expectedOutputs: expectedOutputs,
+            finalContent: nil,
+            accumulatedText: eventBridge.accumulatedText
+        )
+        for (name, data) in returnedOutputs where salvaged[name] == nil {
+            salvaged[name] = data
+        }
         let outputPresence: OutputPresence = salvaged.isEmpty ? .none : .durableOutput
         let rawErrorMessage = error.localizedDescription
         let surfacedErrorMessage = surfacedStreamFailureMessage(
@@ -533,7 +560,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         }
 
         let failureMsg = failureMessage(for: canonicalOutcome, fallback: surfacedErrorMessage)
-        salvaged = ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
+        salvaged = await ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
             existingOutputs: salvaged,
             expectedOutputs: expectedOutputs,
             agent: agent,
@@ -679,8 +706,16 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         eventBridge: ExecutionEventBridge,
         startedAt: Date,
         completedAt: Date
-    ) -> AgentResult {
+    ) async -> AgentResult {
         var outputs = salvageOutputs(expectedOutputs: expectedOutputs, context: context, agent: agent)
+        let returnedOutputs = parseReturnedOutputs(
+            expectedOutputs: expectedOutputs,
+            finalContent: streamResult.finalContent,
+            accumulatedText: streamResult.accumulatedText
+        )
+        for (name, data) in returnedOutputs where outputs[name] == nil {
+            outputs[name] = data
+        }
         if outputs.isEmpty, let content = streamResult.finalContent, !content.isEmpty {
             if let primary = expectedOutputs.first { outputs[primary] = content.data(using: .utf8) ?? Data() }
         }
@@ -689,7 +724,8 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         let canonicalOutcome = classifyCompletedStreamOutcome(
             outputPresence: initialOutputPresence,
             finishReason: streamResult.finishReason,
-            hadExplicitFinalOutput: streamResult.finalContent != nil
+            hadExplicitFinalOutput: streamResult.finalContent != nil,
+            accumulatedText: streamResult.accumulatedText
         )
 
         let initialMissingOutputs = expectedOutputs.filter { outputs[$0] == nil }
@@ -701,7 +737,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             nil
         }
 
-        outputs = ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
+        outputs = await ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
             existingOutputs: outputs,
             expectedOutputs: expectedOutputs,
             agent: agent,
@@ -749,6 +785,7 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             deniedMCPExtensions: sessionInfo.mcpResolution.deniedExtensions,
             mcpSessionStartupLatencyMilliseconds: sessionInfo.execution.startupLatencyMilliseconds,
             mcpServerMetrics: mcpServerMetrics,
+            accumulatedText: streamResult.accumulatedText,
             outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: finalOutcome, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, rawErrorMessage: finalError, rawFinishEvent: streamResult.finishRaw),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
@@ -791,6 +828,52 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
             }
         }
         return salvaged
+    }
+
+    private func parseReturnedOutputs(
+        expectedOutputs: [String],
+        finalContent: String?,
+        accumulatedText: String
+    ) -> [String: Data] {
+        let sources = [finalContent, accumulatedText.isEmpty ? nil : accumulatedText].compactMap { $0 }
+        for source in sources {
+            let parsed = parseReturnedOutputBlocks(from: source, expectedOutputs: expectedOutputs)
+            if !parsed.isEmpty {
+                return parsed
+            }
+        }
+        return [:]
+    }
+
+    private func parseReturnedOutputBlocks(
+        from content: String,
+        expectedOutputs: [String]
+    ) -> [String: Data] {
+        let pattern = #"<<<CHAINWORKS_OUTPUT:([A-Za-z0-9._-]+)>>>\s*([\s\S]*?)\s*<<<END_CHAINWORKS_OUTPUT>>>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [:]
+        }
+
+        let expectedNames = Set(expectedOutputs)
+        let nsRange = NSRange(content.startIndex..<content.endIndex, in: content)
+        var outputs: [String: Data] = [:]
+
+        for match in regex.matches(in: content, range: nsRange) {
+            guard match.numberOfRanges == 3,
+                  let nameRange = Range(match.range(at: 1), in: content),
+                  let bodyRange = Range(match.range(at: 2), in: content) else {
+                continue
+            }
+
+            let outputName = String(content[nameRange])
+            guard expectedNames.contains(outputName) else { continue }
+
+            let body = String(content[bodyRange]).trimmingCharacters(in: .newlines)
+            guard !body.isEmpty else { continue }
+            outputs[outputName] = Data(body.utf8)
+        }
+
+        return outputs
     }
 
     private func buildLogSnippet(agent: ResolvedAgent, sessionID: String, streamResult: ExecutionStreamResult, startedAt: Date, completedAt: Date) -> String {
@@ -912,9 +995,13 @@ print("[Session:Stream][\(sessionID)][Success] Duration: \(Int(completedAt.timeI
         .joined(separator: "; ")
     }
 
-    private func classifyCompletedStreamOutcome(outputPresence: OutputPresence, finishReason: String?, hadExplicitFinalOutput: Bool) -> AgentCanonicalOutcome {
+    private func classifyCompletedStreamOutcome(outputPresence: OutputPresence, finishReason: String?, hadExplicitFinalOutput: Bool, accumulatedText: String = "") -> AgentCanonicalOutcome {
         guard let finishReason else { return outputPresence == .durableOutput ? .completed : .failedBeforeOutput }
         if isLimitExhaustionReason(finishReason) { return outputPresence == .durableOutput ? .limitExhaustedAfterOutput : .limitExhaustedBeforeOutput }
+        // Rate limit errors surfaced as agent text (not as stream errors) still indicate limit exhaustion.
+        if outputPresence == .none, isLimitExhaustionError(accumulatedText) {
+            return .limitExhaustedBeforeOutput
+        }
         return (hadExplicitFinalOutput || outputPresence == .durableOutput) ? .completed : .failedBeforeOutput
     }
 
@@ -1010,7 +1097,7 @@ extension AgentResult {
     static func failure(_ msg: String, context: ExecutionContext, override: LiveExecutionOverride?, startedAt: Date) -> AgentResult {
         AgentResult(outputs: [:], logSnippet: msg, costCents: nil, succeeded: false, errorMessage: msg, sessionID: nil, durationSeconds: Date().timeIntervalSince(startedAt), providerReceipt: nil, resolvedModel: context.providerBinding?.model ?? override?.model, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion)
     }
-    
+
     static func minimal(_ outcome: AgentCanonicalOutcome, sessionID: String, duration: Double) -> AgentResult {
         AgentResult(outputs: [:], logSnippet: nil, costCents: nil, succeeded: outcome == .completed, errorMessage: nil, sessionID: sessionID, durationSeconds: duration, providerReceipt: nil, resolvedModel: nil, configuredProviderID: nil, adapterVersion: nil, canonicalOutcome: outcome)
     }

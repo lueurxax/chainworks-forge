@@ -1036,12 +1036,12 @@ struct OrchestratorTests {
             planCompilerVersion: 1
         )
 
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "live-session-001",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
@@ -1057,7 +1057,7 @@ struct OrchestratorTests {
                 .sessionClosed(raw: "{}")
             ]
         )
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let orchestrator = WorkflowOrchestrator(
             run: run, plan: plan, workspace: workspace,
             executor: executor, modelContext: context
@@ -1085,7 +1085,7 @@ struct OrchestratorTests {
         #expect(agentExecution?.providerSessionID == "live-session-001")
         #expect(agentExecution?.providerRequestID == "request-123")
         #expect(agentExecution?.resolvedBackendProfileID == "claude_writer_high")
-        #expect(agentExecution?.gooseSessionID == "live-session-001")
+        #expect(agentExecution?.runtimeSessionID == "live-session-001")
         #expect(agentExecution?.logSnippet?.contains("Final output") == true)
         #expect(agentExecution?.transcriptArtifactPath != nil)
         if let consumed = agentExecution?.consumedInputArtifactNamesJSON {
@@ -1203,6 +1203,246 @@ struct OrchestratorTests {
         #expect(envelope.providerStopReason == "end_turn")
         #expect(envelope.outputPresence == .durableOutput)
         #expect(envelope.rawFinishEvent == #"{"stop_reason":"end_turn"}"#)
+    }
+
+    @Test("Orchestrator coalesces rapid live text chunks before routing them into observable state")
+    func coalescesRapidLiveTextChunks() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = makeAgent(id: "agent_1")
+
+        let plan = RunPlan(
+            workflowID: "wf_live_chunk_coalescing",
+            workflowTitle: "Workflow Live Chunk Coalescing",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "hash",
+            catalogSnapshotHash: "catalog",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let result = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "unused",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: nil,
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context
+        )
+
+        let baseTime = Date()
+        let firstChunk = ExecutionEvent(type: .textChunk, timestamp: baseTime, detail: "chunk-1")
+        let secondChunk = ExecutionEvent(type: .textChunk, timestamp: baseTime.addingTimeInterval(0.05), detail: "chunk-2")
+        let laterChunk = ExecutionEvent(type: .textChunk, timestamp: baseTime.addingTimeInterval(0.60), detail: "chunk-3")
+        let finishEvent = ExecutionEvent(type: .finish, timestamp: baseTime.addingTimeInterval(0.61), detail: "Finish: stop")
+
+        #expect(orchestrator.shouldRecordLiveExecutionEvent(agentID: agent.id, event: firstChunk, now: baseTime))
+        #expect(
+            orchestrator.shouldRecordLiveExecutionEvent(
+                agentID: agent.id,
+                event: secondChunk,
+                now: baseTime.addingTimeInterval(0.05)
+            ) == false
+        )
+        #expect(
+            orchestrator.shouldRecordLiveExecutionEvent(
+                agentID: agent.id,
+                event: laterChunk,
+                now: baseTime.addingTimeInterval(0.60)
+            )
+        )
+        #expect(
+            orchestrator.shouldRecordLiveExecutionEvent(
+                agentID: agent.id,
+                event: finishEvent,
+                now: baseTime.addingTimeInterval(0.61)
+            )
+        )
+        #expect(
+            orchestrator.shouldRecordLiveExecutionEvent(
+                agentID: agent.id,
+                event: firstChunk,
+                now: baseTime.addingTimeInterval(0.62)
+            )
+        )
+    }
+
+    @Test("Buffered live text chunks flush into a single rolling timeline entry")
+    func bufferedLiveTextChunksFlushIntoSingleRollingTimelineEntry() {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = makeAgent(id: "agent_1")
+
+        let plan = RunPlan(
+            workflowID: "wf_live_chunk_buffering",
+            workflowTitle: "Workflow Live Chunk Buffering",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "hash",
+            catalogSnapshotHash: "catalog",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let result = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "unused",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: nil,
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context
+        )
+
+        let base = Date()
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base, detail: "Hello"),
+            now: base
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base.addingTimeInterval(0.05), detail: " "),
+            now: base.addingTimeInterval(0.05)
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base.addingTimeInterval(0.10), detail: "world"),
+            now: base.addingTimeInterval(0.10)
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .finish, timestamp: base.addingTimeInterval(0.11), detail: "Finish: stop"),
+            now: base.addingTimeInterval(0.11)
+        )
+
+        let textEntries = orchestrator.liveTimeline.filter { $0.event.type == .textChunk }
+        #expect(textEntries.count == 1)
+        #expect(textEntries.first?.event.detail == "Hello world")
+    }
+
+    @Test("Structured output envelopes do not leak into live timeline text")
+    func structuredOutputEnvelopesDoNotLeakIntoLiveTimelineText() {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = makeAgent(id: "agent_1")
+
+        let plan = RunPlan(
+            workflowID: "wf_structured_output_suppression",
+            workflowTitle: "WF Structured Output Suppression",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "hash",
+            catalogSnapshotHash: "catalog",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let result = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "unused",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: nil,
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context
+        )
+
+        let base = Date()
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base, detail: "Visible progress. "),
+            now: base
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base.addingTimeInterval(0.60), detail: "<<<CHAINWORKS_OUTPUT:implementation_progress>>>"),
+            now: base.addingTimeInterval(0.60)
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base.addingTimeInterval(1.20), detail: "{\"status\":\"in_progress\"}"),
+            now: base.addingTimeInterval(1.20)
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base.addingTimeInterval(1.80), detail: "<<<END_CHAINWORKS_OUTPUT>>>"),
+            now: base.addingTimeInterval(1.80)
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: agent.id,
+            event: ExecutionEvent(type: .textChunk, timestamp: base.addingTimeInterval(2.40), detail: "Next visible progress."),
+            now: base.addingTimeInterval(2.40)
+        )
+
+        let timelineText = orchestrator.liveTimeline
+            .filter { $0.event.type == .textChunk }
+            .map(\.event.detail)
+            .joined()
+
+        #expect(timelineText.contains("Visible progress."))
+        #expect(timelineText.contains("Next visible progress."))
+        #expect(timelineText.contains("CHAINWORKS_OUTPUT") == false)
+        #expect(timelineText.contains("\"status\":\"in_progress\"") == false)
     }
 
     @Test("Validation failure overrides provisional completed outcome with failed-after-output-validation")

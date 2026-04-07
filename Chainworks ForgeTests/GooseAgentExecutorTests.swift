@@ -4,12 +4,12 @@ import os
 import SwiftData
 @testable import Chainworks_Forge
 
-// MARK: - GooseAgentExecutorTests (Proposal 004, Section 12.1)
+// MARK: - RuntimeAgentExecutorTests (Proposal 004, Section 12.1)
 
-/// Unit tests for GooseAgentExecutor.
+/// Unit tests for RuntimeAgentExecutor.
 /// Tests session creation, streaming, receipt persistence, output validation, and result building.
-@Suite("GooseAgentExecutor")
-struct GooseAgentExecutorTests {
+@Suite("RuntimeAgentExecutor")
+struct RuntimeAgentExecutorTests {
 
     // MARK: - Helpers
 
@@ -46,22 +46,22 @@ struct GooseAgentExecutorTests {
         AgentTask(agent: agent, task: task, inputs: nil, outputs: nil)
     }
 
-    private final class PromptCaptureTransport: GooseTransportProtocol, @unchecked Sendable {
+    private final class PromptCaptureTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
-            var createSessionResult: GooseSessionResponse?
+            var createSessionResult: RuntimeSessionResponse?
             var createSessionError: Error?
-            var streamEvents: [GooseStreamEvent] = []
-            var lastSessionRequest: GooseSessionRequest?
-            var lastPromptRequest: GoosePromptRequest?
+            var streamEvents: [RuntimeStreamEvent] = []
+            var lastSessionRequest: RuntimeSessionRequest?
+            var lastPromptRequest: RuntimePromptRequest?
             var closeSessionCalled = false
         }
 
         private let state = OSAllocatedUnfairLock(initialState: State())
 
         func configure(
-            sessionResult: GooseSessionResponse? = nil,
+            sessionResult: RuntimeSessionResponse? = nil,
             sessionError: Error? = nil,
-            events: [GooseStreamEvent] = []
+            events: [RuntimeStreamEvent] = []
         ) async {
             state.withLock { state in
                 state.createSessionResult = sessionResult
@@ -73,16 +73,16 @@ struct GooseAgentExecutorTests {
             }
         }
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
-            let (result, error): (GooseSessionResponse?, Error?) = state.withLock { state in
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let (result, error): (RuntimeSessionResponse?, Error?) = state.withLock { state in
                 state.lastSessionRequest = request
                 return (state.createSessionResult, state.createSessionError)
             }
             if let error { throw error }
-            return result ?? GooseSessionResponse(
+            return result ?? RuntimeSessionResponse(
                 sessionId: "prompt-capture-\(UUID().uuidString.prefix(8))",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -92,8 +92,8 @@ struct GooseAgentExecutorTests {
 
         func submitPrompt(
             sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             let events = state.withLock { state in
                 state.lastPromptRequest = prompt
                 return state.streamEvents
@@ -107,11 +107,11 @@ struct GooseAgentExecutorTests {
             state.withLock { $0.closeSessionCalled = true }
         }
 
-        var lastSessionRequest: GooseSessionRequest? {
+        var lastSessionRequest: RuntimeSessionRequest? {
             get async { state.withLock { $0.lastSessionRequest } }
         }
 
-        var lastPromptRequest: GoosePromptRequest? {
+        var lastPromptRequest: RuntimePromptRequest? {
             get async { state.withLock { $0.lastPromptRequest } }
         }
 
@@ -120,7 +120,7 @@ struct GooseAgentExecutorTests {
         }
     }
 
-    private final class StaleReuseTransport: GooseTransportProtocol, @unchecked Sendable {
+    private final class StaleReuseTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
             var createSessionCallCount = 0
             var submitPromptCallCount = 0
@@ -130,17 +130,17 @@ struct GooseAgentExecutorTests {
 
         private let state = OSAllocatedUnfairLock(initialState: State())
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             let callCount = state.withLock { state -> Int in
                 state.createSessionCallCount += 1
                 return state.createSessionCallCount
             }
 
             let sessionID = callCount == 1 ? "session-reused" : "session-fresh-\(callCount)"
-            return GooseSessionResponse(
+            return RuntimeSessionResponse(
                 sessionId: sessionID,
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -150,8 +150,8 @@ struct GooseAgentExecutorTests {
 
         func submitPrompt(
             sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             let useCount = state.withLock { state -> Int in
                 state.submitPromptCallCount += 1
                 state.submittedSessionIDs.append(sessionID)
@@ -196,7 +196,7 @@ struct GooseAgentExecutorTests {
         }
     }
 
-    private final class StaleReuseSSEErrorTransport: GooseTransportProtocol, @unchecked Sendable {
+    private final class StaleReuseSSEErrorTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
             var createSessionCallCount = 0
             var submitPromptCallCount = 0
@@ -206,17 +206,17 @@ struct GooseAgentExecutorTests {
 
         private let state = OSAllocatedUnfairLock(initialState: State())
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             let callCount = state.withLock { state -> Int in
                 state.createSessionCallCount += 1
                 return state.createSessionCallCount
             }
 
             let sessionID = callCount == 1 ? "session-reused" : "session-fresh-\(callCount)"
-            return GooseSessionResponse(
+            return RuntimeSessionResponse(
                 sessionId: sessionID,
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -226,8 +226,8 @@ struct GooseAgentExecutorTests {
 
         func submitPrompt(
             sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             let useCount = state.withLock { state -> Int in
                 state.submitPromptCallCount += 1
                 state.submittedSessionIDs.append(sessionID)
@@ -268,18 +268,18 @@ struct GooseAgentExecutorTests {
         }
     }
 
-    private final class PersistentSessionUnavailableTransport: GooseTransportProtocol, @unchecked Sendable {
+    private final class PersistentSessionUnavailableTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private let counter = OSAllocatedUnfairLock(initialState: 0)
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             let sessionNumber = counter.withLock { value -> Int in
                 value += 1
                 return value
             }
-            return GooseSessionResponse(
+            return RuntimeSessionResponse(
                 sessionId: "session-\(sessionNumber)",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -289,8 +289,8 @@ struct GooseAgentExecutorTests {
 
         func submitPrompt(
             sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             AsyncThrowingStream { continuation in
                 Task {
                     continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
@@ -307,7 +307,7 @@ struct GooseAgentExecutorTests {
         func closeSession(sessionID: String) async throws {}
     }
 
-    private final class DuplicateFreshSessionTransport: GooseTransportProtocol, @unchecked Sendable {
+    private final class DuplicateFreshSessionTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
             var createSessionCallCount = 0
             var submittedSessionIDs: [String] = []
@@ -316,7 +316,7 @@ struct GooseAgentExecutorTests {
 
         private let state = OSAllocatedUnfairLock(initialState: State())
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             let callCount = state.withLock { state -> Int in
                 state.createSessionCallCount += 1
                 return state.createSessionCallCount
@@ -330,10 +330,10 @@ struct GooseAgentExecutorTests {
                 sessionID = "fresh-\(callCount)"
             }
 
-            return GooseSessionResponse(
+            return RuntimeSessionResponse(
                 sessionId: sessionID,
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -343,8 +343,8 @@ struct GooseAgentExecutorTests {
 
         func submitPrompt(
             sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             state.withLock { $0.submittedSessionIDs.append(sessionID) }
             return AsyncThrowingStream { continuation in
                 Task {
@@ -374,7 +374,7 @@ struct GooseAgentExecutorTests {
         }
     }
 
-    private final class RecycledCompletedSessionTransport: GooseTransportProtocol, @unchecked Sendable {
+    private final class RecycledCompletedSessionTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
             var createSessionCallCount = 0
             var submittedSessionIDs: [String] = []
@@ -382,16 +382,16 @@ struct GooseAgentExecutorTests {
 
         private let state = OSAllocatedUnfairLock(initialState: State())
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             let sessionID = state.withLock { state -> String in
                 state.createSessionCallCount += 1
                 return "recycled-session"
             }
 
-            return GooseSessionResponse(
+            return RuntimeSessionResponse(
                 sessionId: sessionID,
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -401,8 +401,8 @@ struct GooseAgentExecutorTests {
 
         func submitPrompt(
             sessionID: String,
-            prompt: GoosePromptRequest
-        ) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             state.withLock { $0.submittedSessionIDs.append(sessionID) }
             return AsyncThrowingStream { continuation in
                 Task {
@@ -492,7 +492,7 @@ struct GooseAgentExecutorTests {
         process.waitUntilExit()
     }
 
-    private func waitForSessionClose(_ transport: ObservableGooseTransport) async -> Bool {
+    private func waitForSessionClose(_ transport: ObservableRuntimeTransport) async -> Bool {
         for _ in 0..<20 {
             let closed = await transport.closeSessionCalled
             if closed { return true }
@@ -507,12 +507,12 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor creates session with correct policy and produces receipt/transcript artifacts")
     func gooseExecutorCreatesSession() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "session-abc123",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
@@ -526,7 +526,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["test_output.md"])
         let task = makeTask()
         let context = makeContext()
@@ -555,7 +555,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor streams events to event callback during execution")
     func gooseExecutorStreamsEvents() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -572,7 +572,7 @@ struct GooseAgentExecutorTests {
 
         // Use thread-safe collection to avoid concurrent mutation of captured var
         let eventCollector = SharedEventCollector()
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         executor.onExecutionEvent = { _, event in
             eventCollector.append(event)
         }
@@ -598,7 +598,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor persists receipt artifact with correct agent ID and version")
     func gooseExecutorPersistsReceiptArtifact() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -609,7 +609,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(id: "proposal_writer", outputs: ["proposal_current"])
         let task = makeTask(agent: "proposal_writer", task: "draft_initial_proposal")
         let context = makeContext()
@@ -633,12 +633,12 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor runtime truth prefers frozen provider binding over live override")
     func gooseExecutorPrefersFrozenProviderBindingForRuntimeTruth() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "session-bound-truth",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
@@ -653,7 +653,7 @@ struct GooseAgentExecutorTests {
         )
 
         let override = LiveExecutionOverride(enabled: true, provider: "claude-code", model: "default", effort: "medium")
-        let executor = GooseAgentExecutor(transport: transport, override: override)
+        let executor = RuntimeAgentExecutor(transport: transport, override: override)
         let configuredProviderID = UUID()
         let binding = ResolvedProviderBinding(
             agentID: "proposal_reviewer_ui",
@@ -732,7 +732,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor fails when required outputs are missing from stream")
     func gooseExecutorFailsWhenRequiredOutputsMissing() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         // Stream completes but no files are written and no final output
         await transport.configure(
             sessionResult: nil,
@@ -743,7 +743,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["required_output.json"])
         let task = makeTask()
         let context = makeContext()
@@ -757,9 +757,50 @@ struct GooseAgentExecutorTests {
     }
 
     @MainActor
+    @Test("Executor materializes multiple required outputs from returned output blocks without disk writes")
+    func gooseExecutorMaterializesReturnedOutputBlocks() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .finalOutput(content: """
+                <<<CHAINWORKS_OUTPUT:proposal_current>>>
+                # Proposal
+
+                This proposal came from the runtime response envelope.
+                <<<END_CHAINWORKS_OUTPUT>>>
+
+                <<<CHAINWORKS_OUTPUT:proposal_revision_summary>>>
+                Revision summary came from the runtime response envelope.
+                <<<END_CHAINWORKS_OUTPUT>>>
+                """),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "proposal_writer",
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let task = makeTask(agent: "proposal_writer", task: "refine_proposal")
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        let proposalCurrent = try #require(result.outputs["proposal_current"])
+        let proposalSummary = try #require(result.outputs["proposal_revision_summary"])
+        #expect(String(decoding: proposalCurrent, as: UTF8.self).contains("# Proposal"))
+        #expect(String(decoding: proposalSummary, as: UTF8.self).contains("Revision summary"))
+    }
+
+    @MainActor
     @Test("Executor synthesizes partial implementation artifacts when code writer fails before writing them")
     func gooseExecutorSynthesizesPartialImplementationArtifactsOnFailure() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -785,7 +826,7 @@ struct GooseAgentExecutorTests {
             encoding: .utf8
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(
             id: "code_writer",
             outputs: [
@@ -808,11 +849,43 @@ struct GooseAgentExecutorTests {
         #expect(result.outputs["tests_result"] != nil)
     }
 
+    @MainActor
+    @Test("Implementation artifact synthesis collects changed files off the main thread")
+    func implementationFailureSynthesisRunsCollectorOffMainThread() async throws {
+        let agent = makeAgent(
+            id: "code_writer",
+            outputs: [
+                "implementation_progress",
+                "implementation_self_assessment",
+                "changed_files_manifest",
+                "tests_result"
+            ],
+            worktreeWriteEnabled: true
+        )
+        let context = makeContext(worktreeRoot: FileManager.default.temporaryDirectory)
+
+        let outputs = await ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
+            existingOutputs: [:],
+            expectedOutputs: agent.outputs,
+            agent: agent,
+            context: context,
+            failureSummary: "Synthetic failure for test"
+        ) { _ in
+            #expect(!Thread.isMainThread)
+            return ["Sources/App.swift", "docs/plan.md"]
+        }
+
+        #expect(outputs["implementation_progress"] != nil)
+        #expect(outputs["implementation_self_assessment"] != nil)
+        #expect(outputs["changed_files_manifest"] != nil)
+        #expect(outputs["tests_result"] != nil)
+    }
+
     /// testGooseExecutorReturnsAgentResult — Section 12.1
     @MainActor
     @Test("Executor returns agent result with log snippet and cost estimate")
     func gooseExecutorReturnsAgentResult() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -825,7 +898,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["proposal_current"])
         let task = makeTask()
         let context = makeContext()
@@ -842,7 +915,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Neutral finish marker alone does not count as success")
     func neutralFinishMarkerDoesNotCountAsSuccess() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -853,7 +926,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["required_output.json"])
         let task = makeTask()
         let context = makeContext()
@@ -869,7 +942,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Limit exhaustion after output preserves artifacts and records canonical outcome")
     func limitExhaustionAfterOutputPreservesArtifacts() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -881,7 +954,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["proposal_current"])
         let task = makeTask()
         let context = makeContext()
@@ -906,7 +979,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Durable structured outputs with neutral stop are treated as completed and receipt reflects success")
     func durableStructuredOutputsWithNeutralStopUseDurableTruth() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -917,7 +990,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(id: "lead_orchestrator", outputs: ["proposal_review_summary"])
         let task = makeTask(agent: "lead_orchestrator", task: "aggregate_proposal_reviews")
         let context = makeContext()
@@ -957,17 +1030,17 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor handles session creation failure gracefully")
     func gooseExecutorSessionCreationFailure() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
-            sessionError: GooseTransportError.httpError(
+            sessionError: RuntimeTransportError.httpError(
                 statusCode: 500,
                 body: "Internal server error"
             ),
             events: []
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent()
         let task = makeTask()
         let context = makeContext()
@@ -983,10 +1056,10 @@ struct GooseAgentExecutorTests {
     func executorEmbedsSelectiveHandoffIntoPrompt() async throws {
         let transport = PromptCaptureTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "prompt-capture-session",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-token",
                     backendPolicyVersion: "mock-v1"
@@ -1000,7 +1073,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(
             id: "proposal_writer",
             outputs: ["proposal_current"]
@@ -1072,9 +1145,9 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor fails without policy acknowledgement in session response")
     func gooseExecutorFailsWithoutPolicyAcknowledgement() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "session-missing-ack",
                 status: "active",
                 policyAcknowledgement: nil
@@ -1083,7 +1156,7 @@ struct GooseAgentExecutorTests {
             events: []
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["proposal_current"])
         let task = makeTask()
         let context = makeContext()
@@ -1097,12 +1170,12 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor does not retry contract or missing-output failures as transport errors")
     func gooseExecutorDoesNotRetryContractFailures() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "session-contract-failure",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
@@ -1116,7 +1189,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(outputs: ["test_output.md"])
         let task = makeTask()
         let context = makeContext()
@@ -1132,12 +1205,12 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor records lazy evidence hits when on-demand helper is invoked")
     func gooseExecutorRecordsLazyEvidenceHits() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "session-lazy-hit",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
@@ -1159,7 +1232,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let agent = makeAgent(id: "proposal_writer", outputs: ["proposal_current"])
         let task = AgentTask(
             agent: "proposal_writer",
@@ -1228,11 +1301,11 @@ struct GooseAgentExecutorTests {
     @Test("Executor starts a fresh session after a prior successful generation settles")
     func gooseExecutorFallsBackWhenReusedSessionDisappearsMidStream() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
-        let config = ModelConfiguration("GooseAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let config = ModelConfiguration("RuntimeAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
         let sessionManager = AgentSessionManager(container: container)
         let transport = StaleReuseTransport()
-        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
 
         let runID = UUID()
         let firstContext = makeContext(runID: runID)
@@ -1294,11 +1367,11 @@ struct GooseAgentExecutorTests {
     @Test("Executor rejects duplicate fresh provider session IDs when another lineage is still active")
     func gooseExecutorRejectsDuplicateFreshProviderSessionIDsAcrossLineages() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
-        let config = ModelConfiguration("GooseAgentExecutorCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let config = ModelConfiguration("RuntimeAgentExecutorCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
         let sessionManager = AgentSessionManager(container: container)
         let transport = DuplicateFreshSessionTransport()
-        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
 
         let runID = UUID()
         let leadContext = makeContext(runID: runID)
@@ -1375,11 +1448,11 @@ struct GooseAgentExecutorTests {
     @Test("Executor does not treat a completed generation as an active provider-session collision")
     func gooseExecutorIgnoresCompletedGenerationDuringFreshCollisionCheck() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
-        let config = ModelConfiguration("GooseAgentExecutorCompletedCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let config = ModelConfiguration("RuntimeAgentExecutorCompletedCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
         let sessionManager = AgentSessionManager(container: container)
         let transport = RecycledCompletedSessionTransport()
-        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
 
         let runID = UUID()
         let writerContext = makeContext(runID: runID)
@@ -1464,11 +1537,11 @@ struct GooseAgentExecutorTests {
     @Test("Executor starts a fresh session after prior generation settles even if transport used SSE errors before")
     func gooseExecutorFallsBackWhenReusedSessionEndsWithSSEError() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
-        let config = ModelConfiguration("GooseAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let config = ModelConfiguration("RuntimeAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
         let sessionManager = AgentSessionManager(container: container)
         let transport = StaleReuseSSEErrorTransport()
-        let executor = GooseAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
 
         let runID = UUID()
         let firstContext = makeContext(runID: runID)
@@ -1529,7 +1602,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor maps quota stream errors to canonical limit exhaustion")
     func gooseExecutorMapsQuotaErrorToLimitExhaustion() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -1540,7 +1613,7 @@ struct GooseAgentExecutorTests {
             ]
         )
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let result = try await executor.execute(task: makeTask(), agent: makeAgent(), context: makeContext())
 
         #expect(!result.succeeded)
@@ -1551,7 +1624,7 @@ struct GooseAgentExecutorTests {
     @MainActor
     @Test("Executor maps Gemini capacity exhaustion to retryable limit failure after durable output")
     func gooseExecutorMapsGeminiCapacityErrorAfterOutput() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
             sessionError: nil,
@@ -1571,7 +1644,7 @@ struct GooseAgentExecutorTests {
         try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         try "durable output".data(using: .utf8)?.write(to: outputDir.appendingPathComponent("test_output.md"))
 
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let result = try await executor.execute(task: makeTask(), agent: agent, context: context)
 
         #expect(!result.succeeded)
@@ -1584,7 +1657,7 @@ struct GooseAgentExecutorTests {
     @Test("Executor surfaces session loss as provider-session unavailable instead of raw not-found text")
     func gooseExecutorSurfacesBoundedSessionUnavailableMessage() async throws {
         let transport = PersistentSessionUnavailableTransport()
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
 
         let result = try await executor.execute(task: makeTask(), agent: makeAgent(), context: makeContext())
 

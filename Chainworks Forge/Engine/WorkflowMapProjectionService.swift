@@ -19,7 +19,7 @@ final class WorkflowMapProjectionService {
 
         let topology = WorkflowMapTopologyBuilder(plan: plan)
         let orderedStateIDs = topology.orderedStateIDs()
-        let liveTimeline = Array(executionService.orchestrator(for: run.id)?.liveTimeline.reversed() ?? [])
+        let liveTimeline = executionService.orchestrator(for: run.id)?.liveTimeline ?? []
         let persistedTimeline = buildPersistedTimeline(run: run, plan: plan)
         let providerBindings = decodeProviderBindings(from: run.providerBindingSnapshotJSON)
 
@@ -195,7 +195,7 @@ final class WorkflowMapProjectionService {
                 executionCount: stageExecutions.flatMap(\.agentExecutions).filter { $0.agentID == descriptor.agentID && $0.taskName == descriptor.taskName }.count,
                 startedAt: execution?.startedAt,
                 completedAt: execution?.completedAt,
-                sessionID: execution?.providerSessionID ?? execution?.gooseSessionID,
+                sessionID: execution?.providerSessionID ?? execution?.runtimeSessionID,
                 requestID: execution?.providerRequestID,
                 logSnippet: execution?.logSnippet,
                 ordinal: index

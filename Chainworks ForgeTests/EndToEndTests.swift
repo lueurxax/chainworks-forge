@@ -300,7 +300,7 @@ struct EndToEndTests {
         let transport = FixtureGooseTransport(
             scenario: .proposalLoopSuccess
         )
-        let executor = GooseAgentExecutor(transport: transport)
+        let executor = RuntimeAgentExecutor(transport: transport)
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,

@@ -297,6 +297,7 @@ struct AgentCatalogView: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
+            SecurityScopedAccess.remember(url: url, kind: .catalogSource)
             overrideURL = url
             loadCatalog()
         }
@@ -304,8 +305,7 @@ struct AgentCatalogView: View {
     }
 
     private func rawExcerpt(at path: String) -> String? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let content = String(data: data, encoding: .utf8) else {
+        guard let content = try? SecurityScopedAccess.loadString(from: URL(fileURLWithPath: path)) else {
             return nil
         }
         let lines = content.components(separatedBy: .newlines)

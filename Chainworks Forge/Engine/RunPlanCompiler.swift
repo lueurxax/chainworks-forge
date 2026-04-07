@@ -248,7 +248,8 @@ final class RunPlanCompiler {
                 outputs: agentDef.outputs,
                 worktreeWriteEnabled: agentDef.worktreePolicy?.writeEnabled ?? false,
                 sessionReuseScope: SessionReuseScope(rawValue: agentDef.sessionReuseScope ?? "") ?? .same_invocation_owner,
-                sessionFamilyID: agentDef.sessionFamilyID
+                sessionFamilyID: agentDef.sessionFamilyID,
+                runtimeProfileID: backend.runtimeProfile
             )
         }
 

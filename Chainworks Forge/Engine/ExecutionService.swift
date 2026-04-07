@@ -95,6 +95,8 @@ private struct ApprovalResolutionDiagnostic: Codable, Sendable {
 @MainActor
 @Observable
 final class ExecutionService {
+    private static let stalledRunGraceInterval: TimeInterval = 30
+
     /// Active orchestrators keyed by run ID.
     private(set) var activeOrchestrators: [UUID: WorkflowOrchestrator] = [:]
 
@@ -360,7 +362,8 @@ final class ExecutionService {
 
     /// Whether any runs are active.
     var hasActiveRuns: Bool {
-        !activeOrchestrators.isEmpty
+        reconcileStalledOrchestratorsIfNeeded()
+        return !activeOrchestrators.isEmpty
     }
 
     /// Number of pending approvals.
@@ -370,17 +373,24 @@ final class ExecutionService {
 
     /// P005-OPS §10: Number of blocked runs requiring attention.
     var blockedRunCount: Int {
-        activeOrchestrators.values.filter { $0.run.status == .blocked }.count
+        reconcileStalledOrchestratorsIfNeeded()
+        return activeOrchestrators.values.filter { $0.run.status == .blocked }.count
     }
 
     /// P005-OPS §10: Number of failed runs requiring attention.
     var failedRunCount: Int {
-        activeOrchestrators.values.filter { $0.run.status == .failed }.count
+        reconcileStalledOrchestratorsIfNeeded()
+        return activeOrchestrators.values.filter { $0.run.status == .failed }.count
     }
 
     /// Get the orchestrator for a specific run.
     func orchestrator(for runID: UUID) -> WorkflowOrchestrator? {
-        activeOrchestrators[runID]
+        reconcileStalledOrchestratorsIfNeeded()
+        return activeOrchestrators[runID]
+    }
+
+    func registerTestingOrchestrator(_ orchestrator: WorkflowOrchestrator) {
+        activeOrchestrators[orchestrator.run.id] = orchestrator
     }
 
     private func fetchRun(id: UUID) -> Run? {
@@ -426,7 +436,11 @@ final class ExecutionService {
             // Proposal 018: Final audit trail update
             orchestrator.updateSessionAuditTrailOnCompletion()
             
-            try? self?.modelContext.save()
+            do {
+                try self?.modelContext.save()
+            } catch {
+                print("[ExecutionService] Failed to persist run completion state: \(error.localizedDescription)")
+            }
             self?.emitReportIfNeeded(for: run)
 
             if let modelContext = self?.modelContext {
@@ -452,6 +466,97 @@ final class ExecutionService {
         guard let idea = run.idea else { return }
         idea.synchronizePersistedStatusFromRuns()
         try? modelContext.save()
+    }
+
+    private func reconcileStalledOrchestratorsIfNeeded(now: Date = Date()) {
+        let stalledRunIDs = activeOrchestrators.compactMap { runID, orchestrator -> UUID? in
+            let hasPendingApproval = pendingApprovals.values.contains { $0.runID == runID }
+            let latestEvent = Self.latestMeaningfulEvent(in: orchestrator.liveTimeline)
+            let hasRunningAgents = orchestrator.run.stageExecutions
+                .flatMap(\.agentExecutions)
+                .contains { $0.status == .running }
+
+            guard Self.shouldReconcileStalledRun(
+                run: orchestrator.run,
+                hasPendingApproval: hasPendingApproval,
+                hasRunningAgents: hasRunningAgents,
+                latestLiveEvent: latestEvent,
+                now: now
+            ) else {
+                return nil
+            }
+
+            return runID
+        }
+
+        for runID in stalledRunIDs {
+            reconcileStalledRun(runID: runID, now: now)
+        }
+    }
+
+    private func reconcileStalledRun(runID: UUID, now: Date) {
+        guard let orchestrator = activeOrchestrators.removeValue(forKey: runID) else { return }
+
+        let run = orchestrator.run
+        let stage = stalledStage(for: run)
+
+        if let stage, stage.status == .running || stage.status == .ready || stage.status == .completed {
+            stage.status = .blocked
+            stage.completedAt = stage.completedAt ?? now
+        }
+
+        run.status = .blocked
+        if run.driftDetails?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            run.driftDetails = "Execution stalled after the last session closed before the workflow could transition. Resume the run to continue from the current stage."
+        }
+
+        pendingApprovals = pendingApprovals.filter { $0.value.runID != runID }
+        synchronizeIdeaStatus(for: run)
+        orchestrator.updateSessionAuditTrailOnCompletion()
+        emitReportIfNeeded(for: run)
+        fireCompletionNotification(for: run)
+        try? modelContext.save()
+    }
+
+    private func stalledStage(for run: Run) -> StageExecution? {
+        let sorted = run.stageExecutions.sorted { lhs, rhs in
+            if lhs.startedAt == rhs.startedAt {
+                if lhs.iteration == rhs.iteration {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.iteration < rhs.iteration
+            }
+            return lhs.startedAt < rhs.startedAt
+        }
+
+        if let currentStageID = run.currentStageID,
+           let match = sorted.last(where: { $0.stageID == currentStageID }) {
+            return match
+        }
+
+        return sorted.last
+    }
+
+    static func shouldReconcileStalledRun(
+        run: Run,
+        hasPendingApproval: Bool,
+        hasRunningAgents: Bool,
+        latestLiveEvent: ExecutionEvent?,
+        now: Date,
+        graceInterval: TimeInterval = 30
+    ) -> Bool {
+        guard run.status == .running || run.status == .ready || run.status == .pending else {
+            return false
+        }
+        guard !hasPendingApproval else { return false }
+        guard !hasRunningAgents else { return false }
+        guard let latestLiveEvent else { return false }
+        guard latestLiveEvent.type == .sessionClosed else { return false }
+        return now.timeIntervalSince(latestLiveEvent.timestamp) >= graceInterval
+    }
+
+    private static func latestMeaningfulEvent(in timeline: [LiveExecutionTimelineEntry]) -> ExecutionEvent? {
+        timeline.reversed().first(where: { $0.event.type != .textChunk })?.event ?? timeline.last?.event
     }
 
     var liveRuntimeReadiness: LiveRuntimeReadiness {
@@ -526,41 +631,57 @@ final class ExecutionService {
             return executor
         }
 
-        let transport: any GooseTransportProtocol
-        switch liveRuntimeConfiguration.transportMode {
-        case .network:
-            switch liveRuntimeConfiguration.transportAPI {
-            case .bespoke:
-                transport = GooseTransport(
-                    baseURL: liveRuntimeConfiguration.baseURL,
-                    apiKey: liveRuntimeConfiguration.apiKey
-                )
-            case .gooseServer:
-                // Proposal 005: use GooseServerTransport for real goosed API.
-                // apiKey maps to X-Secret-Key header in GooseServerTransport.
-                transport = GooseServerTransport(
-                    baseURL: liveRuntimeConfiguration.baseURL,
-                    secretKey: liveRuntimeConfiguration.apiKey,
-                    provider: liveRuntimeConfiguration.override?.provider,
-                    model: liveRuntimeConfiguration.override?.model
-                )
-            }
-        case .fixtureProposalLoopSuccess:
-            transport = FixtureGooseTransport(scenario: .proposalLoopSuccess)
-        case .fixtureProposal022FeedbackCycle:
-            transport = FixtureGooseTransport(scenario: .proposal022FeedbackCycle)
-        case .fixtureProposal013AggregateFailure:
-            transport = FixtureGooseTransport(scenario: .proposal013AggregateFailure)
-        case .fixtureFullMVPSuccess:
-            transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
+        let transport: any RuntimeTransportProtocol
+
+        // Proposal 026 Phase 3: ACP runtime selection by runtime profile ID.
+        // The runtime profile ID is frozen on ResolvedAgent at run start.
+        // Profile ID convention: "claude_agent_acp", "gemini_cli_acp", or nil (Goose default).
+        let runtimeProfileID = plan.agentBindings.values.first?.runtimeProfileID
+
+        switch runtimeProfileID {
+        case "claude_agent_acp":
+            transport = ClaudeAgentACPTransport()
+        case "gemini_cli_acp":
+            transport = GeminiCLIACPTransport()
+        default:
+            transport = resolveGooseTransport(liveRuntimeConfiguration)
         }
 
         let sessionManager = AgentSessionManager(container: modelContext.container)
-        return GooseAgentExecutor(
+        return RuntimeAgentExecutor(
             transport: transport,
             override: liveRuntimeConfiguration.override,
             sessionManager: sessionManager
         )
+    }
+
+    /// Proposal 026: Resolve Goose-backed transport from live runtime configuration.
+    private func resolveGooseTransport(_ config: LiveRuntimeConfiguration) -> any RuntimeTransportProtocol {
+        switch config.transportMode {
+        case .network:
+            switch config.transportAPI {
+            case .bespoke:
+                return GooseTransport(
+                    baseURL: config.baseURL,
+                    apiKey: config.apiKey
+                )
+            case .gooseServer:
+                return GooseServerTransport(
+                    baseURL: config.baseURL,
+                    secretKey: config.apiKey,
+                    provider: config.override?.provider,
+                    model: config.override?.model
+                )
+            }
+        case .fixtureProposalLoopSuccess:
+            return FixtureGooseTransport(scenario: .proposalLoopSuccess)
+        case .fixtureProposal022FeedbackCycle:
+            return FixtureGooseTransport(scenario: .proposal022FeedbackCycle)
+        case .fixtureProposal013AggregateFailure:
+            return FixtureGooseTransport(scenario: .proposal013AggregateFailure)
+        case .fixtureFullMVPSuccess:
+            return FixtureGooseTransport(scenario: .fullMVPSuccess)
+        }
     }
 
     // MARK: - Steward V1 Trigger Mechanism (Proposal 003)

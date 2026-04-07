@@ -132,7 +132,7 @@ struct Proposal015Tests {
             outputs: ["proposal"]
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(
+        let packet = RuntimeSessionBridge.buildExecutionPacket(
             agent: agent,
             task: makeTestTask(agent: "writer", task: "draft_proposal"),
             context: makeTestExecutionContext()
@@ -552,12 +552,12 @@ struct Proposal015Tests {
             outputs: ["proposal_review_architect"]
         )
 
-        let productPacket = GooseSessionBridge.buildExecutionPacket(
+        let productPacket = RuntimeSessionBridge.buildExecutionPacket(
             agent: productAgent,
             task: makeTestTask(agent: productAgent.id, task: "review_proposal_as_product_owner"),
             context: makeTestExecutionContext()
         )
-        let architectPacket = GooseSessionBridge.buildExecutionPacket(
+        let architectPacket = RuntimeSessionBridge.buildExecutionPacket(
             agent: architectAgent,
             task: makeTestTask(agent: architectAgent.id, task: "review_proposal_as_architect"),
             context: makeTestExecutionContext()

@@ -776,9 +776,82 @@ struct ResumeManagerTests {
             Issue.record("Expected live orchestrator to be created")
             return
         }
-        #expect(orchestrator.executor is GooseAgentExecutor)
+        #expect(orchestrator.executor is RuntimeAgentExecutor)
 
         await cancelAndAwaitSettled(service, runID: run.id)
+    }
+
+    @Test("ExecutionService reconciles stalled running run after session closed")
+    func executionServiceReconcilesStalledRunningRunAfterSessionClosed() throws {
+        let (run, plan, workspace) = try makeRunFromPlan()
+        let catalog = try loadCanonicalCatalog()
+        run.status = .running
+
+        let stage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+        try context.save()
+
+        let service = ExecutionService(modelContext: context, executor: FailingExecutor(), catalog: catalog)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: FailingExecutor(),
+            modelContext: context,
+            catalog: catalog
+        )
+
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: "test_agent",
+            event: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
+                detail: "Session closed"
+            )
+        )
+        service.registerTestingOrchestrator(orchestrator)
+
+        #expect(service.orchestrator(for: run.id) == nil)
+        #expect(run.status == .blocked)
+        #expect(run.presentationStatus == .blocked)
+        #expect(stage.status == .blocked)
+        #expect(run.driftDetails?.contains("Execution stalled after the last session closed") == true)
+    }
+
+    @Test("ExecutionService does not reconcile fresh post-session idle run")
+    func executionServiceDoesNotReconcileFreshPostSessionIdleRun() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-5),
+                detail: "Session closed"
+            ),
+            now: Date()
+        )
+
+        #expect(shouldReconcile == false)
     }
 
     @Test("ExecutionService blocks live workflow without runtime config")

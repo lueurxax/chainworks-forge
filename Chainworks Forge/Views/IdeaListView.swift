@@ -952,24 +952,29 @@ struct IdeaDetailView: View {
                             LabeledContent("Archived", value: archivedAt, format: .dateTime)
                         }
                         if let path = idea.attachmentPath {
+                            // Proposal 008 (REQ-009): Surface attachment validation state.
+                            let validation = MVPBoundaryPolicy.validateAttachment(path: path)
                             HStack {
                                 Text("Attachment")
                                 Spacer()
                                 Text(path)
                                     .foregroundStyle(.secondary)
-                                // Proposal 008 (REQ-009): Surface attachment validation state.
-                                let validationStatus = MVPBoundaryPolicy.validateAttachment(path: path)
-                                Text(validationStatus.rawValue)
+                                Text(validation.status.rawValue)
                                     .font(.caption2.bold())
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
                                     .background(
-                                        validationStatus == .referenceOnly
+                                        validation.status == .referenceOnly
                                             ? DesignTokens.Status.success.opacity(0.15)
                                             : DesignTokens.Status.error.opacity(0.15)
                                     )
-                                    .foregroundStyle(validationStatus == .referenceOnly ? DesignTokens.Status.success : DesignTokens.Status.error)
+                                    .foregroundStyle(validation.status == .referenceOnly ? DesignTokens.Status.success : DesignTokens.Status.error)
                                     .clipShape(Capsule())
+                            }
+                            if let reason = validation.rejectionReason {
+                                Text(reason)
+                                    .font(.caption)
+                                    .foregroundStyle(DesignTokens.Status.error)
                             }
                         }
                     }
@@ -1218,6 +1223,7 @@ struct IdeaDetailView: View {
 
     private func saveWorkspaceRoot() {
         let trimmed = editingWorkspacePath.trimmingCharacters(in: .whitespaces)
+        SecurityScopedAccess.remember(path: trimmed.isEmpty ? nil : trimmed, kind: .workspaceRoot)
         idea.workspaceRootPath = trimmed.isEmpty ? nil : trimmed
         try? modelContext.save()
     }
@@ -2369,6 +2375,7 @@ struct WorkflowStartRunSheet: View {
 struct WorkflowRunProgressView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
+    @Query private var runArtifacts: [Artifact]
 
     let run: Run
     private let forcedInitialPane: IdeaRunPane?
@@ -2384,6 +2391,13 @@ struct WorkflowRunProgressView: View {
         self.run = run
         self.forcedInitialPane = initialPane
         _selectedPane = State(initialValue: initialPane ?? .summary)
+        let runID = run.id
+        _runArtifacts = Query(
+            filter: #Predicate<Artifact> { artifact in
+                artifact.runID == runID
+            },
+            sort: [SortDescriptor(\Artifact.createdAt, order: .reverse)]
+        )
     }
 
     private var sortedStages: [StageExecution] {
@@ -2400,17 +2414,7 @@ struct WorkflowRunProgressView: View {
     }
 
     private var latestArtifacts: [Artifact] {
-        let descriptor = FetchDescriptor<Artifact>(
-            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
-        )
-
-        let artifacts = ((try? modelContext.fetch(descriptor)) ?? [])
-            .filter { $0.runID == run.id }
-        return artifacts.sorted { lhs, rhs in
-                if lhs.name == "final_feature_report" { return true }
-                if rhs.name == "final_feature_report" { return false }
-                return lhs.createdAt > rhs.createdAt
-        }
+        artifactSnapshot.latestArtifacts
     }
 
     private var activeAgents: [AgentExecution] {
@@ -2442,26 +2446,7 @@ struct WorkflowRunProgressView: View {
     }
 
     private var approvalContextArtifacts: [Artifact] {
-        let priority = [
-            "proposal_revision_summary",
-            "proposal_review_summary",
-            "score_lift_backlog",
-            "proposal_feedback_coverage",
-            "proposal_current",
-            "proposal_review_po",
-            "proposal_review_ux",
-            "proposal_review_ui",
-            "proposal_review_architect"
-        ]
-        var seen = Set<String>()
-        let indexed = Dictionary(uniqueKeysWithValues: priority.enumerated().map { ($1, $0) })
-
-        return latestArtifacts
-            .filter { indexed[$0.name] != nil }
-            .filter { seen.insert($0.name).inserted }
-            .sorted { (lhs, rhs) in
-                (indexed[lhs.name] ?? .max) < (indexed[rhs.name] ?? .max)
-            }
+        artifactSnapshot.approvalContextArtifacts
     }
 
     private var pendingApprovalTitle: String {
@@ -2473,16 +2458,11 @@ struct WorkflowRunProgressView: View {
     }
 
     private var latestDebugArtifacts: [Artifact] {
-        var seen = Set<String>()
-        return latestArtifacts
-            .filter {
-                $0.name.hasSuffix("_receipt.json")
-                || $0.name.hasSuffix("_transcript.md")
-                || $0.name.contains("approval_resolution_diagnostic_")
-            }
-            .filter { seen.insert($0.name).inserted }
-            .prefix(4)
-            .map { $0 }
+        artifactSnapshot.latestDebugArtifacts
+    }
+
+    private var artifactSnapshot: WorkflowRunArtifactSnapshot {
+        WorkflowRunArtifactSnapshot(artifacts: runArtifacts)
     }
 
     private var preferredPane: IdeaRunPane {
@@ -2799,7 +2779,9 @@ struct WorkflowRunProgressView: View {
             summaryMetricCard(
                 title: "Session",
                 value: latestLiveSessionID ?? "No live session",
-                detail: latestLiveSessionID == nil ? "Waiting for the next session to start" : "Most recent active Goose session",
+                detail: latestLiveSessionID == nil
+                    ? missingSessionDetail
+                    : "Most recent active Goose session",
                 symbol: "lanyardcard"
             )
         }
@@ -3078,6 +3060,19 @@ struct WorkflowRunProgressView: View {
         latestLiveEvent?.event.sessionID
     }
 
+    private var missingSessionDetail: String {
+        switch run.presentationStatus {
+        case .pending, .ready, .running:
+            return "Waiting for the next session to start"
+        case .waitingApproval:
+            return "No live session while the run is waiting at approval"
+        case .blocked:
+            return "No live session. Use recovery to resume from the blocked stage"
+        case .completed, .failed, .cancelled, .cancelling:
+            return "No active live session"
+        }
+    }
+
     @ViewBuilder
     private func artifactButton(_ artifact: Artifact) -> some View {
         Button {
@@ -3145,6 +3140,62 @@ struct WorkflowRunProgressView: View {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+struct WorkflowRunArtifactSnapshot {
+    let latestArtifacts: [Artifact]
+    let approvalContextArtifacts: [Artifact]
+    let latestDebugArtifacts: [Artifact]
+
+    init(artifacts: [Artifact]) {
+        self.latestArtifacts = Self.sortLatestArtifacts(artifacts)
+        self.approvalContextArtifacts = Self.makeApprovalContextArtifacts(from: latestArtifacts)
+        self.latestDebugArtifacts = Self.makeLatestDebugArtifacts(from: latestArtifacts)
+    }
+
+    private static func sortLatestArtifacts(_ artifacts: [Artifact]) -> [Artifact] {
+        artifacts.sorted { lhs, rhs in
+            if lhs.name == "final_feature_report" { return true }
+            if rhs.name == "final_feature_report" { return false }
+            return lhs.createdAt > rhs.createdAt
+        }
+    }
+
+    private static func makeApprovalContextArtifacts(from artifacts: [Artifact]) -> [Artifact] {
+        let priority = [
+            "proposal_revision_summary",
+            "proposal_review_summary",
+            "score_lift_backlog",
+            "proposal_feedback_coverage",
+            "proposal_current",
+            "proposal_review_po",
+            "proposal_review_ux",
+            "proposal_review_ui",
+            "proposal_review_architect"
+        ]
+        let indexed = Dictionary(uniqueKeysWithValues: priority.enumerated().map { ($1, $0) })
+        var seen = Set<String>()
+
+        return artifacts
+            .filter { indexed[$0.name] != nil }
+            .filter { seen.insert($0.name).inserted }
+            .sorted { lhs, rhs in
+                (indexed[lhs.name] ?? .max) < (indexed[rhs.name] ?? .max)
+            }
+    }
+
+    private static func makeLatestDebugArtifacts(from artifacts: [Artifact]) -> [Artifact] {
+        var seen = Set<String>()
+        return artifacts
+            .filter {
+                $0.name.hasSuffix("_receipt.json")
+                    || $0.name.hasSuffix("_transcript.md")
+                    || $0.name.contains("approval_resolution_diagnostic_")
+            }
+            .filter { seen.insert($0.name).inserted }
+            .prefix(4)
+            .map { $0 }
     }
 }
 
@@ -3306,12 +3357,12 @@ struct WorkflowStageDetailView: View {
 struct AttachmentStatusIcon: View {
     let path: String
 
-    private var status: MVPBoundaryPolicy.AttachmentStatus {
+    private var validation: MVPBoundaryPolicy.AttachmentValidationResult {
         MVPBoundaryPolicy.validateAttachment(path: path)
     }
 
     var body: some View {
-        let isValid = status == .referenceOnly
+        let isValid = validation.status == .referenceOnly
         Image(systemName: isValid ? "paperclip" : "exclamationmark.triangle")
             .font(.caption2)
             .foregroundStyle(isValid ? DesignTokens.Status.neutral : DesignTokens.Status.error)

@@ -2,23 +2,29 @@ import Testing
 import Foundation
 @testable import Chainworks_Forge
 
-// MARK: - GooseSessionBridgeTests (Proposal 004, Section 12.1)
+// MARK: - RuntimeSessionBridgeTests (Proposal 004, Section 12.1)
 
-/// Unit tests for GooseSessionBridge.
+/// Unit tests for RuntimeSessionBridge.
 /// Tests workspace validation, packet construction, and session isolation.
+/// Test-only stub for RuntimeExtensionRegistryProvider.
+private struct StubExtensionRegistryProvider: RuntimeExtensionRegistryProvider {
+    let snapshot: GooseExtensionRegistrySnapshot
+    func registrySnapshot() throws -> GooseExtensionRegistrySnapshot { snapshot }
+}
+
 @MainActor
-@Suite("GooseSessionBridge")
-struct GooseSessionBridgeTests {
-    final class CapturingTransport: GooseTransportProtocol, @unchecked Sendable {
-        var lastCreateRequest: GooseSessionRequest?
+@Suite("RuntimeSessionBridge")
+struct RuntimeSessionBridgeTests {
+    final class CapturingTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var lastCreateRequest: RuntimeSessionRequest?
         var mcpRuntimeNamespace: String? { "goose" }
 
-        func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             lastCreateRequest = request
-            return GooseSessionResponse(
+            return RuntimeSessionResponse(
                 sessionId: "session-1",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "token",
                     backendPolicyVersion: "v1"
@@ -27,7 +33,7 @@ struct GooseSessionBridgeTests {
             )
         }
 
-        func submitPrompt(sessionID: String, prompt: GoosePromptRequest) -> AsyncThrowingStream<GooseStreamEvent, Error> {
+        func submitPrompt(sessionID: String, prompt: RuntimePromptRequest) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
             AsyncThrowingStream { continuation in
                 continuation.finish()
             }
@@ -148,7 +154,7 @@ struct GooseSessionBridgeTests {
         defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
 
         // Should not throw for a valid workspace
-        #expect(throws: Never.self) { try GooseSessionBridge.validateWorkspace(workspace) }
+        #expect(throws: Never.self) { try RuntimeSessionBridge.validateWorkspace(workspace) }
     }
 
     /// testSessionBridgeRejectsImplicitCWD — Section 12.1
@@ -162,8 +168,8 @@ struct GooseSessionBridgeTests {
             worktreeRoot: nil
         )
 
-        #expect(throws: GooseSessionBridgeError.self) {
-            try GooseSessionBridge.validateWorkspace(cwdWorkspace)
+        #expect(throws: RuntimeSessionBridgeError.self) {
+            try RuntimeSessionBridge.validateWorkspace(cwdWorkspace)
         }
     }
 
@@ -177,8 +183,8 @@ struct GooseSessionBridgeTests {
             worktreeRoot: nil
         )
 
-        #expect(throws: GooseSessionBridgeError.self) {
-            try GooseSessionBridge.validateWorkspace(rootWorkspace)
+        #expect(throws: RuntimeSessionBridgeError.self) {
+            try RuntimeSessionBridge.validateWorkspace(rootWorkspace)
         }
     }
 
@@ -193,7 +199,7 @@ struct GooseSessionBridgeTests {
         )
 
         #expect(throws: (any Error).self) {
-            try GooseSessionBridge.validateWorkspace(emptyWorkspace)
+            try RuntimeSessionBridge.validateWorkspace(emptyWorkspace)
         }
     }
 
@@ -219,7 +225,7 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         // System prompt should contain agent info
         #expect(packet.systemPrompt.contains("Test Agent"))
@@ -234,31 +240,30 @@ struct GooseSessionBridgeTests {
     @Test("Session bridge resolves requested MCP extensions from per-agent profile")
     func sessionBridgeResolvesRequestedMCPExtensions() async throws {
         let transport = CapturingTransport()
-        let bridge = GooseSessionBridge(
-            transport: transport,
-            gooseExtensionRegistrySnapshotProvider: {
-                GooseExtensionRegistrySnapshot(
-                    configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
-                    installedExtensionIDs: ["context7"],
-                    enabledExtensionIDs: ["context7"],
-                    configsByRuntimeID: [
-                        "context7": GooseExtensionDefinition(
-                            enabled: true,
-                            type: "stdio",
-                            name: "Context7",
-                            description: nil,
-                            displayName: nil,
-                            cmd: "context7",
-                            args: [],
-                            envs: nil,
-                            envKeys: nil,
-                            timeout: nil,
-                            bundled: nil,
-                            availableTools: nil
-                        )
-                    ]
+        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            installedExtensionIDs: ["context7"],
+            enabledExtensionIDs: ["context7"],
+            configsByRuntimeID: [
+                "context7": GooseExtensionDefinition(
+                    enabled: true,
+                    type: "stdio",
+                    name: "Context7",
+                    description: nil,
+                    displayName: nil,
+                    cmd: "context7",
+                    args: [],
+                    envs: nil,
+                    envKeys: nil,
+                    timeout: nil,
+                    bundled: nil,
+                    availableTools: nil
                 )
-            }
+            ]
+        ))
+        let bridge = RuntimeSessionBridge(
+            transport: transport,
+            extensionRegistryProvider: registryProvider
         )
         let agent = ResolvedAgent(
             id: "test_agent",
@@ -318,31 +323,30 @@ struct GooseSessionBridgeTests {
     @Test("Session bridge resolves requested MCP extensions from transport runtime when frozen binding is absent")
     func sessionBridgeResolvesRequestedMCPExtensionsWithoutFrozenBinding() async throws {
         let transport = CapturingTransport()
-        let bridge = GooseSessionBridge(
-            transport: transport,
-            gooseExtensionRegistrySnapshotProvider: {
-                GooseExtensionRegistrySnapshot(
-                    configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
-                    installedExtensionIDs: ["context7"],
-                    enabledExtensionIDs: ["context7"],
-                    configsByRuntimeID: [
-                        "context7": GooseExtensionDefinition(
-                            enabled: true,
-                            type: "stdio",
-                            name: "Context7",
-                            description: nil,
-                            displayName: nil,
-                            cmd: "context7",
-                            args: [],
-                            envs: nil,
-                            envKeys: nil,
-                            timeout: nil,
-                            bundled: nil,
-                            availableTools: nil
-                        )
-                    ]
+        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            installedExtensionIDs: ["context7"],
+            enabledExtensionIDs: ["context7"],
+            configsByRuntimeID: [
+                "context7": GooseExtensionDefinition(
+                    enabled: true,
+                    type: "stdio",
+                    name: "Context7",
+                    description: nil,
+                    displayName: nil,
+                    cmd: "context7",
+                    args: [],
+                    envs: nil,
+                    envKeys: nil,
+                    timeout: nil,
+                    bundled: nil,
+                    availableTools: nil
                 )
-            }
+            ]
+        ))
+        let bridge = RuntimeSessionBridge(
+            transport: transport,
+            extensionRegistryProvider: registryProvider
         )
         let agent = ResolvedAgent(
             id: "test_agent",
@@ -409,7 +413,7 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         // Task directive should contain task name
         #expect(packet.taskDirective.contains("test_task"))
@@ -472,7 +476,7 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         #expect(packet.taskDirective.contains("Use the `idea_body` attachment as the primary source of truth for normalization."))
         #expect(packet.taskDirective.contains("`idea_brief` must be a concise, structured normalized brief"))
@@ -557,7 +561,7 @@ struct GooseSessionBridgeTests {
             )
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         #expect(packet.taskDirective.contains("Profile: selective_compression_and_escalation"))
         #expect(packet.contextAttachments.contains { $0.type == "artifact" && $0.name == "idea_brief" })
@@ -637,10 +641,10 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         #expect(packet.taskDirective.contains("proposal_review_architect"))
-        #expect(packet.taskDirective.contains("exact filenames"))
+        #expect(packet.taskDirective.contains("exact output names"))
         #expect(packet.taskDirective.contains("Do not add file extensions"))
         #expect(packet.taskDirective.contains("top-level JSON object"))
         #expect(packet.taskDirective.contains("Do not write markdown"))
@@ -700,10 +704,10 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         #expect(packet.taskDirective.contains("proposal_review_summary"))
-        #expect(packet.taskDirective.contains("exact filenames"))
+        #expect(packet.taskDirective.contains("exact output names"))
         #expect(packet.taskDirective.contains("Do not add file extensions"))
         #expect(packet.taskDirective.contains("top-level JSON object"))
         #expect(packet.taskDirective.contains("Do not write markdown"))
@@ -713,8 +717,8 @@ struct GooseSessionBridgeTests {
         #expect(packet.taskDirective.contains("decision: String"))
     }
 
-    @Test("Markdown output packet requires file existence verification before stop")
-    func markdownOutputPacketRequiresFileExistenceVerificationBeforeStop() {
+    @Test("Markdown output packet requires returned output blocks before stop")
+    func markdownOutputPacketRequiresReturnedOutputBlocksBeforeStop() {
         let agent = ResolvedAgent(
             id: "proposal_writer",
             title: "Proposal Writer",
@@ -754,12 +758,14 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         #expect(packet.taskDirective.contains("proposal_current"))
         #expect(packet.taskDirective.contains("proposal_revision_summary"))
-        #expect(packet.taskDirective.contains("verify that every required output file exists on disk"))
-        #expect(packet.taskDirective.contains("If any required output file is missing or empty, continue working"))
+        #expect(packet.taskDirective.contains("<<<CHAINWORKS_OUTPUT:output_name>>>"))
+        #expect(packet.taskDirective.contains("verify that every required output name appears in the final response envelope"))
+        #expect(packet.taskDirective.contains("If any required output block is missing or empty, continue working"))
+        #expect(packet.systemPrompt.contains("The app persists artifacts"))
     }
 
     @Test("Packet without input artifacts")
@@ -781,7 +787,7 @@ struct GooseSessionBridgeTests {
             providerBinding: nil
         )
 
-        let packet = GooseSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
 
         // Should still have workspace context
         #expect(packet.contextAttachments.contains { $0.name == "workspace_context" })
@@ -793,12 +799,12 @@ struct GooseSessionBridgeTests {
 
     @Test("Execution request carries read-only policy")
     func sessionBridgeExecutionRequestCarriesReadOnlyPolicy() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "bridge-session",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-read-only",
                     backendPolicyVersion: "mock-v1"
@@ -808,7 +814,7 @@ struct GooseSessionBridgeTests {
             events: []
         )
 
-        let bridge = GooseSessionBridge(transport: transport)
+        let bridge = RuntimeSessionBridge(transport: transport)
         let agent = makeAgent()
         let task = makeTask()
         let workspace = makeWorkspace()
@@ -843,12 +849,12 @@ struct GooseSessionBridgeTests {
 
     @Test("Read-only repo-backed execution uses project root as working directory")
     func sessionBridgeUsesProjectRootForReadOnlyRepoBackedExecution() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "bridge-project-root",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-project-root",
                     backendPolicyVersion: "mock-v1"
@@ -858,7 +864,7 @@ struct GooseSessionBridgeTests {
             events: []
         )
 
-        let bridge = GooseSessionBridge(transport: transport)
+        let bridge = RuntimeSessionBridge(transport: transport)
         let agent = makeAgent()
         let task = makeTask()
         let workspace = makeWorkspace()
@@ -892,12 +898,12 @@ struct GooseSessionBridgeTests {
 
     @Test("Writable execution prefers worktree root over project root")
     func sessionBridgePrefersWorktreeRootForWritableExecution() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "bridge-worktree-root",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-worktree-root",
                     backendPolicyVersion: "mock-v1"
@@ -907,7 +913,7 @@ struct GooseSessionBridgeTests {
             events: []
         )
 
-        let bridge = GooseSessionBridge(transport: transport)
+        let bridge = RuntimeSessionBridge(transport: transport)
         let agent = makeWriteAgent()
         let task = makeTask()
         let workspace = makeWorkspace()
@@ -950,12 +956,12 @@ struct GooseSessionBridgeTests {
 
     @Test("Frozen provider binding wins over live override during session creation")
     func frozenProviderBindingWinsOverLiveOverrideDuringSessionCreation() async throws {
-        let transport = ObservableGooseTransport()
+        let transport = ObservableRuntimeTransport()
         await transport.configure(
-            sessionResult: GooseSessionResponse(
+            sessionResult: RuntimeSessionResponse(
                 sessionId: "bridge-frozen-binding",
                 status: "active",
-                policyAcknowledgement: GoosePolicyAcknowledgement(
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
                     accepted: true,
                     capabilityToken: "mock-frozen-binding",
                     backendPolicyVersion: "mock-v1"
@@ -965,7 +971,7 @@ struct GooseSessionBridgeTests {
             events: []
         )
 
-        let bridge = GooseSessionBridge(transport: transport)
+        let bridge = RuntimeSessionBridge(transport: transport)
         let workspace = makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
         let projectRoot = AppConfiguration.defaultRepositoryRoot().appendingPathComponent(
@@ -1057,5 +1063,71 @@ struct GooseSessionBridgeTests {
         #expect(decoded.provider == "claude_code")
         #expect(decoded.model == "sonnet")
         #expect(decoded.effort == "high")
+    }
+
+    // MARK: - Idea Attachment Tests
+
+    @Test("Packet includes idea attachment when file exists")
+    func packetIncludesIdeaAttachment() throws {
+        let agent = makeAgent()
+        let task = makeTask()
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        // Write a temporary attachment file
+        let attachmentURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-idea-attachment-\(UUID().uuidString).md")
+        let attachmentContent = "# Prior Proposal\n\nDelete non-production code to unblock release."
+        try attachmentContent.write(to: attachmentURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: attachmentURL) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Gate features behind flags",
+            ideaAttachmentPath: attachmentURL.path,
+            providerBinding: nil
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        let attachmentNames = packet.contextAttachments.map(\.name)
+        #expect(attachmentNames.contains("idea_attachment"))
+
+        let ideaAttachment = packet.contextAttachments.first { $0.name == "idea_attachment" }
+        #expect(ideaAttachment?.type == "file")
+        #expect(ideaAttachment?.content == attachmentContent)
+        #expect(ideaAttachment?.path == attachmentURL.path)
+    }
+
+    @Test("Packet gracefully skips missing idea attachment")
+    func packetSkipsMissingIdeaAttachment() {
+        let agent = makeAgent()
+        let task = makeTask()
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_1",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Gate features behind flags",
+            ideaAttachmentPath: "/nonexistent/path/to/attachment.md",
+            providerBinding: nil
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        let attachmentNames = packet.contextAttachments.map(\.name)
+        #expect(!attachmentNames.contains("idea_attachment"))
     }
 }

@@ -437,9 +437,8 @@ struct PreflightService {
             )
         }
 
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: workspaceRootPath, isDirectory: &isDirectory)
-        guard exists, isDirectory.boolValue else {
+        let status = SecurityScopedAccess.itemStatus(atPath: workspaceRootPath)
+        guard status.exists, status.isDirectory else {
             return PreflightCheck(
                 category: "Workspace",
                 title: "Idea Workspace Root",

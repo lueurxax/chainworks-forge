@@ -1,5 +1,37 @@
 import Foundation
 
+// MARK: - Proposal 026: Runtime Profiles
+
+/// Proposal 026: Runtime capability classification for transport adapters.
+enum RuntimeCapabilityClass: String, Codable, Sendable {
+    case lifecycleCapable = "lifecycle_capable"
+    case controlCapable = "control_capable"
+    case operatorGrade = "operator_grade"
+    /// Legacy Goose REST/SSE runtime, operator-grade equivalent.
+    case legacyOperatorGrade = "legacy_operator_grade"
+}
+
+/// Proposal 026: Declares a runtime transport adapter's identity and capabilities.
+struct RuntimeProfile: Codable, Sendable {
+    let capabilityClass: RuntimeCapabilityClass
+    /// Adapter family identifier (e.g. "goose", "claude_agent_acp", "gemini_cli_acp").
+    let adapterFamily: String
+    /// Required runtime capabilities (e.g. ["streaming", "tools", "permission_callbacks"]).
+    let requires: [String]
+    /// Transport mechanism (e.g. "goose_server", "acp_stdio", "acp_http").
+    let transportKind: String
+    /// MCP realization strategy (e.g. "goose_extension", "acp_native", nil).
+    let mcpRealizationPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case capabilityClass = "capability_class"
+        case adapterFamily = "adapter_family"
+        case requires
+        case transportKind = "transport_kind"
+        case mcpRealizationPath = "mcp_realization_path"
+    }
+}
+
 // MARK: - Agent Catalog (top-level)
 
 struct AgentCatalog: Codable, Sendable {
@@ -14,6 +46,8 @@ struct AgentCatalog: Codable, Sendable {
     let contracts: [String: ArtifactContract]
     let backendProfiles: [String: BackendProfile]
     let permissionProfiles: [String: PermissionProfile]
+    /// Proposal 026: Catalog-owned runtime profile declarations.
+    let runtimeProfiles: [String: RuntimeProfile]
     let agents: [AgentDefinition]
 
     enum CodingKeys: String, CodingKey {
@@ -24,6 +58,7 @@ struct AgentCatalog: Codable, Sendable {
         case mcpProfiles = "mcp_profiles"
         case backendProfiles = "backend_profiles"
         case permissionProfiles = "permission_profiles"
+        case runtimeProfiles = "runtime_profiles"
     }
 
     init(
@@ -38,6 +73,7 @@ struct AgentCatalog: Codable, Sendable {
         contracts: [String: ArtifactContract],
         backendProfiles: [String: BackendProfile],
         permissionProfiles: [String: PermissionProfile],
+        runtimeProfiles: [String: RuntimeProfile] = [:],
         agents: [AgentDefinition]
     ) {
         self.schemaVersion = schemaVersion
@@ -51,6 +87,7 @@ struct AgentCatalog: Codable, Sendable {
         self.contracts = contracts
         self.backendProfiles = backendProfiles
         self.permissionProfiles = permissionProfiles
+        self.runtimeProfiles = runtimeProfiles
         self.agents = agents
     }
 
@@ -67,6 +104,7 @@ struct AgentCatalog: Codable, Sendable {
         contracts = try container.decode([String: ArtifactContract].self, forKey: .contracts)
         backendProfiles = try container.decode([String: BackendProfile].self, forKey: .backendProfiles)
         permissionProfiles = try container.decode([String: PermissionProfile].self, forKey: .permissionProfiles)
+        runtimeProfiles = try container.decodeIfPresent([String: RuntimeProfile].self, forKey: .runtimeProfiles) ?? [:]
         agents = try container.decode([AgentDefinition].self, forKey: .agents)
     }
 }
@@ -175,11 +213,43 @@ struct BackendProfile: Codable, Sendable {
     let temperature: Double
     let maxTurns: Int
     let structuredOutput: String
+    /// Proposal 026: References a key in AgentCatalog.runtimeProfiles.
+    let runtimeProfile: String?
 
     enum CodingKeys: String, CodingKey {
         case provider, model, effort, temperature
         case maxTurns = "max_turns"
         case structuredOutput = "structured_output"
+        case runtimeProfile = "runtime_profile"
+    }
+
+    init(
+        provider: String,
+        model: String,
+        effort: String,
+        temperature: Double,
+        maxTurns: Int,
+        structuredOutput: String,
+        runtimeProfile: String? = nil
+    ) {
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+        self.temperature = temperature
+        self.maxTurns = maxTurns
+        self.structuredOutput = structuredOutput
+        self.runtimeProfile = runtimeProfile
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(String.self, forKey: .provider)
+        model = try container.decode(String.self, forKey: .model)
+        effort = try container.decode(String.self, forKey: .effort)
+        temperature = try container.decode(Double.self, forKey: .temperature)
+        maxTurns = try container.decode(Int.self, forKey: .maxTurns)
+        structuredOutput = try container.decode(String.self, forKey: .structuredOutput)
+        runtimeProfile = try container.decodeIfPresent(String.self, forKey: .runtimeProfile)
     }
 }
 

@@ -248,7 +248,7 @@ struct LiveProposalWorkflowTests {
     func eventBridgeProcessesStream() async throws {
         let bridge = ExecutionEventBridge()
 
-        let stream = AsyncThrowingStream<GooseStreamEvent, Error> { continuation in
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
             continuation.yield(.sessionStarted(raw: "{}"))
             continuation.yield(.textChunk(text: "Hello "))
             continuation.yield(.textChunk(text: "World"))
@@ -277,7 +277,7 @@ struct LiveProposalWorkflowTests {
         let bridge = ExecutionEventBridge()
         let longChunk = String(repeating: "refine-proposal-context ", count: 20)
 
-        let stream = AsyncThrowingStream<GooseStreamEvent, Error> { continuation in
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
             continuation.yield(.sessionStarted(raw: "{}"))
             continuation.yield(.textChunk(text: longChunk))
             continuation.yield(.sessionClosed(raw: "{}"))
@@ -308,5 +308,64 @@ struct LiveProposalWorkflowTests {
         let transcriptText = try #require(String(data: transcriptData, encoding: .utf8))
 
         #expect(transcriptText.contains(longChunk))
+    }
+
+    @Test("Event bridge resolves tool name from raw payload when start event name is unknown")
+    func eventBridgeResolvesToolNameFromRawPayload() async throws {
+        let bridge = ExecutionEventBridge()
+
+        let startRaw = """
+        {"type":"toolRequest","id":"call_1","tool":{"name":"read_workspace","arguments":{"path":"/tmp"}}}
+        """
+        let finishRaw = """
+        {"type":"toolResponse","id":"call_1","tool_result":"ok"}
+        """
+
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.toolCallStarted(toolName: "unknown", raw: startRaw))
+            continuation.yield(.toolCallFinished(toolName: "call_1", raw: finishRaw))
+            continuation.finish()
+        }
+
+        var events: [ExecutionEvent] = []
+        _ = try await bridge.processStream(stream) { event in
+            events.append(event)
+        }
+
+        #expect(events.count == 2)
+        #expect(events[0].detail == "Tool: read_workspace")
+        #expect(events[0].toolName == "read_workspace")
+        #expect(events[1].detail == "Tool completed: read_workspace")
+        #expect(events[1].toolName == "read_workspace")
+        #expect(bridge.toolCalls.count == 1)
+        #expect(bridge.toolCalls.first?.toolName == "read_workspace")
+    }
+
+    @Test("Event bridge correlates finish event id back to started tool name")
+    func eventBridgeCorrelatesToolFinishByCallID() async throws {
+        let bridge = ExecutionEventBridge()
+
+        let startRaw = """
+        {"type":"toolRequest","id":"call_ZtXPFtI6eGoipm7jvqlq0svN","tool_name":"inspect_repo_context"}
+        """
+        let finishRaw = """
+        {"type":"toolResponse","id":"call_ZtXPFtI6eGoipm7jvqlq0svN","tool_result":{"status":"ok"}}
+        """
+
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.toolCallStarted(toolName: "unknown", raw: startRaw))
+            continuation.yield(.toolCallFinished(toolName: "call_ZtXPFtI6eGoipm7jvqlq0svN", raw: finishRaw))
+            continuation.finish()
+        }
+
+        var events: [ExecutionEvent] = []
+        _ = try await bridge.processStream(stream) { event in
+            events.append(event)
+        }
+
+        #expect(events.count == 2)
+        #expect(events[0].toolName == "inspect_repo_context")
+        #expect(events[1].toolName == "inspect_repo_context")
+        #expect(events[1].detail == "Tool completed: inspect_repo_context")
     }
 }

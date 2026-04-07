@@ -174,6 +174,9 @@ struct ResolvedAgent: Sendable {
     let sessionReuseScope: SessionReuseScope
     let sessionFamilyID: String?
 
+    // Proposal 026: Runtime profile reference (from BackendProfile.runtimeProfile)
+    let runtimeProfileID: String?
+
     init(
         id: String,
         title: String,
@@ -196,7 +199,8 @@ struct ResolvedAgent: Sendable {
         outputs: [String],
         worktreeWriteEnabled: Bool = false,
         sessionReuseScope: SessionReuseScope = .same_invocation_owner,
-        sessionFamilyID: String? = nil
+        sessionFamilyID: String? = nil,
+        runtimeProfileID: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -220,6 +224,7 @@ struct ResolvedAgent: Sendable {
         self.worktreeWriteEnabled = worktreeWriteEnabled
         self.sessionReuseScope = sessionReuseScope
         self.sessionFamilyID = sessionFamilyID
+        self.runtimeProfileID = runtimeProfileID
     }
 }
 

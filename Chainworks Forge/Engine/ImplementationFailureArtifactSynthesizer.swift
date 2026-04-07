@@ -13,18 +13,22 @@ struct ImplementationFailureArtifactSynthesizer {
         testsResultArtifactName,
     ]
 
-    static func supplementMissingOutputs(
+    nonisolated static func supplementMissingOutputs(
         existingOutputs: [String: Data],
         expectedOutputs: [String],
         agent: ResolvedAgent,
         context: ExecutionContext,
-        failureSummary: String
-    ) -> [String: Data] {
+        failureSummary: String,
+        changedFilesCollector: @escaping @Sendable (URL?) -> [String] = collectChangedFilesSync(in:)
+    ) async -> [String: Data] {
         guard shouldSynthesize(expectedOutputs: expectedOutputs, agent: agent, context: context) else {
             return existingOutputs
         }
 
-        let changedFiles = collectChangedFiles(in: context.workspace.worktreeRoot)
+        let changedFiles = await collectChangedFiles(
+            in: context.workspace.worktreeRoot,
+            collector: changedFilesCollector
+        )
         let docsImpacted = changedFiles.filter { $0.hasSuffix(".md") || $0.hasPrefix("docs/") }
         let missingOutputs = expectedOutputs.filter { existingOutputs[$0] == nil }
         let progressStatus = changedFiles.isEmpty ? "blocked" : "partial"
@@ -73,11 +77,11 @@ struct ImplementationFailureArtifactSynthesizer {
         return outputs
     }
 
-    static func containsRecoverableArtifactSet(_ outputs: [String: Data]) -> Bool {
+    nonisolated static func containsRecoverableArtifactSet(_ outputs: [String: Data]) -> Bool {
         supportedArtifactNames.allSatisfy { outputs[$0] != nil }
     }
 
-    private static func shouldSynthesize(
+    private nonisolated static func shouldSynthesize(
         expectedOutputs: [String],
         agent: ResolvedAgent,
         context: ExecutionContext
@@ -88,7 +92,7 @@ struct ImplementationFailureArtifactSynthesizer {
         return !supportedArtifactNames.isDisjoint(with: expectedOutputs)
     }
 
-    private static func remainingTasks(changedFiles: [String], missingOutputs: [String]) -> [String] {
+    private nonisolated static func remainingTasks(changedFiles: [String], missingOutputs: [String]) -> [String] {
         var tasks = missingOutputs.map { "Produce required artifact: \($0)" }
         if changedFiles.isEmpty {
             tasks.append("Resume implementation from a clean blocked state.")
@@ -99,7 +103,16 @@ struct ImplementationFailureArtifactSynthesizer {
         return tasks
     }
 
-    private static func collectChangedFiles(in worktreeRoot: URL?) -> [String] {
+    private nonisolated static func collectChangedFiles(
+        in worktreeRoot: URL?,
+        collector: @escaping @Sendable (URL?) -> [String]
+    ) async -> [String] {
+        await Task.detached(priority: .utility) {
+            collector(worktreeRoot)
+        }.value
+    }
+
+    private nonisolated static func collectChangedFilesSync(in worktreeRoot: URL?) -> [String] {
         guard let worktreeRoot else { return [] }
         guard FileManager.default.fileExists(atPath: worktreeRoot.path) else { return [] }
 
@@ -111,7 +124,7 @@ struct ImplementationFailureArtifactSynthesizer {
         }
     }
 
-    private static func runGitStatus(in directory: URL) throws -> String {
+    private nonisolated static func runGitStatus(in directory: URL) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["status", "--porcelain", "--untracked-files=all"]
@@ -137,7 +150,7 @@ struct ImplementationFailureArtifactSynthesizer {
         return String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     }
 
-    private static func parseStatusOutput(_ output: String) -> [String] {
+    private nonisolated static func parseStatusOutput(_ output: String) -> [String] {
         output
             .split(separator: "\n")
             .map { line -> String in
@@ -153,7 +166,7 @@ struct ImplementationFailureArtifactSynthesizer {
             .filter { !$0.isEmpty }
     }
 
-    private static func makeJSONData(_ object: [String: Any]) -> Data {
+    private nonisolated static func makeJSONData(_ object: [String: Any]) -> Data {
         (try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])) ?? Data("{}".utf8)
     }
 }
