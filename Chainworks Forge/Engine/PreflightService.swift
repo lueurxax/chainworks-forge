@@ -46,7 +46,8 @@ struct PreflightService {
         catalogURL: URL,
         plan: RunPlan?,
         startOptions: RunStartOptions,
-        idea: Idea? = nil
+        idea: Idea? = nil,
+        effectiveProjectRootPath: String? = nil
     ) async -> PreflightReport {
         var checks: [PreflightCheck] = []
         var warnings: [String] = []
@@ -118,7 +119,10 @@ struct PreflightService {
 
         // Proposal 011 (REQ-005, REQ-006): Workspace readiness — fail-closed when requiresProjectAccess is true.
         if let plan, plan.requiresProjectAccess {
-            checks.append(checkIdeaWorkspaceReadiness(idea: idea))
+            checks.append(checkIdeaWorkspaceReadiness(
+                idea: idea,
+                effectiveProjectRootPath: effectiveProjectRootPath
+            ))
         }
 
         let hasProviders = !providerRegistry.configuredProviders.isEmpty
@@ -301,14 +305,16 @@ struct PreflightService {
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
-        idea: Idea? = nil
+        idea: Idea? = nil,
+        effectiveProjectRootPath: String? = nil
     ) async -> PreflightReport {
         await runReport(
             workflowURL: workflowURL,
             catalogURL: catalogURL,
             plan: plan,
             startOptions: RunStartOptions(),
-            idea: idea
+            idea: idea,
+            effectiveProjectRootPath: effectiveProjectRootPath
         )
     }
 
@@ -417,23 +423,30 @@ struct PreflightService {
     }
 
     // Proposal 011 (REQ-005, REQ-006): Validate idea has a valid, accessible workspace root.
-    private func checkIdeaWorkspaceReadiness(idea: Idea?) -> PreflightCheck {
-        guard let idea else {
-            return PreflightCheck(
-                category: "Workspace",
-                title: "Idea Workspace Root",
-                status: .fail,
-                message: "Workflow requires project access but no idea was provided to preflight"
-            )
-        }
+    private func checkIdeaWorkspaceReadiness(
+        idea: Idea?,
+        effectiveProjectRootPath: String?
+    ) -> PreflightCheck {
+        let workspaceRootPath = ProjectRootPolicy.effectiveProjectRoot(
+            workspaceRootPath: idea?.workspaceRootPath,
+            deliveryRepoRootPath: effectiveProjectRootPath
+        )
 
-        guard let workspaceRootPath = idea.workspaceRootPath,
-              !workspaceRootPath.trimmingCharacters(in: .whitespaces).isEmpty else {
+        guard let workspaceRootPath else {
+            if idea == nil {
+                return PreflightCheck(
+                    category: "Workspace",
+                    title: "Project Root",
+                    status: .fail,
+                    message: "Workflow requires project access but no idea was provided to preflight"
+                )
+            }
+
             return PreflightCheck(
                 category: "Workspace",
-                title: "Idea Workspace Root",
+                title: "Project Root",
                 status: .fail,
-                message: "Workflow requires project access but idea has no workspace root path set"
+                message: "Workflow requires project access but no effective project root is configured"
             )
         }
 
@@ -441,15 +454,15 @@ struct PreflightService {
         guard status.exists, status.isDirectory else {
             return PreflightCheck(
                 category: "Workspace",
-                title: "Idea Workspace Root",
+                title: "Project Root",
                 status: .fail,
-                message: "Workspace root path is not a valid accessible directory: \(workspaceRootPath)"
+                message: "Project root path is not a valid accessible directory: \(workspaceRootPath)"
             )
         }
 
         return PreflightCheck(
             category: "Workspace",
-            title: "Idea Workspace Root",
+            title: "Project Root",
             status: .pass,
             message: workspaceRootPath
         )

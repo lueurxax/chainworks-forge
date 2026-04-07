@@ -71,6 +71,13 @@ import SwiftData
     var mcpSessionStartupLatencyMilliseconds: Int?
     var mcpServerTelemetryJSON: Data?
 
+    /// Proposal 026: Actual runtime profile used for this execution attempt.
+    var runtimeProfileID: String?
+    /// Proposal 026: Actual adapter family (e.g. "goose", "claude_agent_acp", "gemini_cli_acp").
+    var actualAdapterFamily: String?
+    /// Proposal 026: Actual capability class of the runtime used.
+    var actualCapabilityClass: String?
+
     // Proposal 007: Repo-backed execution tracking
     var repoRevisionBefore: String?
     var repoRevisionAfter: String?

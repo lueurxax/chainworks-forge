@@ -176,7 +176,10 @@ final class RunReportBuilder {
                 requestedMCPExtensions: decodeStringArray(from: agent.requestedMCPExtensionsJSON),
                 predictedMCPExtensions: mcpResolution?.predictedEffectiveRuntimeExtensionIDs ?? [],
                 actualMCPExtensions: decodeStringArray(from: agent.effectiveMCPRuntimeExtensionIDsJSON),
-                deniedMCPExtensions: decodeStringArray(from: agent.deniedMCPExtensionsJSON)
+                deniedMCPExtensions: decodeStringArray(from: agent.deniedMCPExtensionsJSON),
+                runtimeProfileID: agent.runtimeProfileID,
+                actualAdapterFamily: agent.actualAdapterFamily,
+                actualCapabilityClass: agent.actualCapabilityClass
             )
         }
 
@@ -982,6 +985,12 @@ struct RunReportPayload: Codable, Sendable {
         let predictedMCPExtensions: [String]
         let actualMCPExtensions: [String]
         let deniedMCPExtensions: [String]
+        /// Proposal 026 ARCH-001: Actual runtime profile used for this execution.
+        let runtimeProfileID: String?
+        /// Proposal 026 ARCH-001: Actual adapter family of the runtime used.
+        let actualAdapterFamily: String?
+        /// Proposal 026 ARCH-001: Actual capability class of the runtime used.
+        let actualCapabilityClass: String?
     }
 
     struct ApprovalEntry: Codable, Sendable {

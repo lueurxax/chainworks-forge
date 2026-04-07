@@ -312,6 +312,153 @@ struct ResumeManagerTests {
         }
     }
 
+    @Test("Classify run with live source drift still resumes from frozen snapshots")
+    func classifyRunWithLiveSourceDriftStillResumes() async throws {
+        let sourceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeDrift-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        let workflowURL = sourceRoot.appendingPathComponent("workflow.yaml")
+        let catalogURL = sourceRoot.appendingPathComponent("agents.yaml")
+        let workflowFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
+        let catalogFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
+        try FileManager.default.copyItem(at: workflowFixtureURL, to: workflowURL)
+        _ = try writePortableCatalogCopy(from: catalogFixtureURL, to: catalogURL)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
+
+        let idea = Idea(title: "Drift Resume", body: "Run should survive source drift")
+        context.insert(idea)
+
+        let runID = UUID()
+        let workspaceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeDriftWorkspace-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: workspaceRoot,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: workflowURL.path,
+            catalogSourcePath: catalogURL.path
+        )
+        run.status = .running
+        try context.save()
+
+        let mutatedCatalog = AgentCatalog(
+            schemaVersion: catalog.schemaVersion,
+            app: catalog.app,
+            paths: catalog.paths,
+            artifacts: catalog.artifacts,
+            skills: catalog.skills,
+            mcpPolicy: catalog.mcpPolicy,
+            mcpServerRegistry: catalog.mcpServerRegistry,
+            mcpProfiles: catalog.mcpProfiles,
+            contracts: catalog.contracts,
+            backendProfiles: catalog.backendProfiles,
+            permissionProfiles: catalog.permissionProfiles,
+            runtimeProfiles: catalog.runtimeProfiles,
+            agents: catalog.agents.map { agent in
+                if agent.id == "proposal_writer" {
+                    return AgentDefinition(
+                        id: agent.id,
+                        title: agent.title,
+                        mode: agent.mode,
+                        backendProfile: agent.backendProfile,
+                        permissionProfile: agent.permissionProfile,
+                        skillRef: agent.skillRef,
+                        skillRole: agent.skillRole,
+                        worktreePolicy: agent.worktreePolicy,
+                        requiredTools: agent.requiredTools,
+                        inputs: agent.inputs,
+                        outputs: agent.outputs,
+                        outputContract: agent.outputContract,
+                        requiresHumanApproval: agent.requiresHumanApproval,
+                        prompt: agent.prompt + "\nDrift mutation for resume test.",
+                        notes: agent.notes,
+                        sessionReuseScope: agent.sessionReuseScope,
+                        sessionFamilyID: agent.sessionFamilyID
+                    )
+                }
+                return agent
+            }
+        )
+        let mutatedCatalogData = try DefinitionHasher.hash(mutatedCatalog).data
+        try mutatedCatalogData.write(to: catalogURL, options: .atomic)
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(actions.count == 1)
+        switch actions[0] {
+        case .resume(let resumedRun, let resumedPlan, let resumedWorkspace):
+            #expect(resumedRun.id == run.id)
+            #expect(resumedPlan.catalogSnapshotHash == run.catalogSnapshotHash)
+            #expect(resumedWorkspace.runID == run.id)
+            #expect(resumedRun.driftDetails?.contains("Agent catalog source has changed") == true)
+        default:
+            Issue.record("Expected .resume for drifted source file, got \(actions[0])")
+        }
+    }
+
+    @Test("Run creation persists frozen workflow and catalog snapshot artifacts")
+    func runCreationPersistsFrozenSnapshotArtifacts() throws {
+        let sourceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RunSnapshotSources-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        let workflowURL = sourceRoot.appendingPathComponent("workflow.yaml")
+        let catalogURL = sourceRoot.appendingPathComponent("agents.yaml")
+        let workflowFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
+        let catalogFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
+        try FileManager.default.copyItem(at: workflowFixtureURL, to: workflowURL)
+        _ = try writePortableCatalogCopy(from: catalogFixtureURL, to: catalogURL)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+        let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog, catalogSourcePath: catalogURL.path)
+
+        let idea = Idea(title: "Snapshot Artifacts", body: "Run should persist frozen source artifacts")
+        context.insert(idea)
+
+        let (run, workspace) = try compiler.createRun(
+            for: idea,
+            plan: plan,
+            workflowSourcePath: workflowURL.path,
+            catalogSourcePath: catalogURL.path
+        )
+        try context.save()
+
+        let artifacts = try ArtifactManager(modelContext: context).artifacts(forRunID: run.id)
+        let workflowArtifact = try #require(artifacts.first(where: { $0.name == "workflow_snapshot_frozen.json" }))
+        let catalogArtifact = try #require(artifacts.first(where: { $0.name == "catalog_snapshot_frozen.json" }))
+
+        #expect(workflowArtifact.contractID == "run_workflow_snapshot_v1")
+        #expect(catalogArtifact.contractID == "run_catalog_snapshot_v1")
+        #expect(workflowArtifact.stageID == "run_start_snapshot")
+        #expect(catalogArtifact.stageID == "run_start_snapshot")
+
+        let workflowData = try Data(contentsOf: URL(fileURLWithPath: workflowArtifact.filePath))
+        let catalogData = try Data(contentsOf: URL(fileURLWithPath: catalogArtifact.filePath))
+        #expect(workflowData == plan.workflowSnapshotJSON)
+        #expect(catalogData == plan.catalogSnapshotJSON)
+        #expect(workflowArtifact.runID == workspace.runID)
+        #expect(catalogArtifact.runID == workspace.runID)
+    }
+
     // MARK: - Side-Effect Detection
 
     @Test("Side-effect stage detected")

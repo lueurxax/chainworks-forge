@@ -106,6 +106,8 @@ final class RunPlanCompiler {
             startSnapshot: startSnapshot
         )
 
+        try persistFrozenSnapshotArtifacts(for: run, plan: plan, workspace: workspace)
+
         return (run, workspace)
     }
 
@@ -254,6 +256,43 @@ final class RunPlanCompiler {
         }
 
         return bindings
+    }
+
+    @MainActor
+    private func persistFrozenSnapshotArtifacts(
+        for run: Run,
+        plan: RunPlan,
+        workspace: RunWorkspace
+    ) throws {
+        let artifactManager = ArtifactManager(modelContext: modelContext)
+        _ = try artifactManager.persistSystemArtifact(
+            name: "workflow_snapshot_frozen.json",
+            data: plan.workflowSnapshotJSON,
+            contractID: "run_workflow_snapshot_v1",
+            format: .json,
+            workspace: workspace,
+            stageID: "run_start_snapshot",
+            iteration: 1,
+            agentID: "system",
+            provider: "system",
+            model: nil,
+            effort: nil,
+            attemptNumber: 1
+        )
+        _ = try artifactManager.persistSystemArtifact(
+            name: "catalog_snapshot_frozen.json",
+            data: plan.catalogSnapshotJSON,
+            contractID: "run_catalog_snapshot_v1",
+            format: .json,
+            workspace: workspace,
+            stageID: "run_start_snapshot",
+            iteration: 1,
+            agentID: "system",
+            provider: "system",
+            model: nil,
+            effort: nil,
+            attemptNumber: 1
+        )
     }
 
     private func collectAgentIDs(from block: RunBlock?, into set: inout Set<String>) {

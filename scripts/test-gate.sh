@@ -108,6 +108,18 @@ PROPOSAL_025_TESTS=(
   "Chainworks ForgeTests/Chainworks_ForgeTests"
 )
 
+PROPOSAL_026_TESTS=(
+  "Chainworks ForgeTests/Proposal026Tests"
+  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeTests/GooseServerTransportTests"
+  "Chainworks ForgeTests/GooseAgentExecutorTests"
+  "Chainworks ForgeTests/ProviderPlatformTests"
+)
+
+PROPOSAL_027_TESTS=(
+  "Chainworks ForgeTests/Proposal027Tests"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 LAST_BUILD_DERIVED_DATA_PATH=""
 
@@ -564,7 +576,7 @@ run_build() {
     -scheme "$SCHEME_NAME" \
     -destination "$DESTINATION" \
     -derivedDataPath "$derived_data" \
-    "${signing_args[@]}" \
+    ${signing_args[@]+"${signing_args[@]}"} \
     build
 }
 
@@ -684,7 +696,7 @@ run_test_plan() {
     -maximum-parallel-testing-workers 1 \
     -derivedDataPath "$derived_data" \
     -resultBundlePath "$result_bundle" \
-    "${signing_args[@]}"
+    ${signing_args[@]+"${signing_args[@]}"}
   log "Result bundle: $result_bundle"
 }
 
@@ -725,13 +737,13 @@ run_targeted_tests() {
 
   if [[ $includes_ui -eq 0 ]]; then
     cmd+=("-resultBundlePath" "$result_bundle")
-    cmd+=("${signing_args[@]}")
+    cmd+=(${signing_args[@]+"${signing_args[@]}"})
     cmd+=("-skip-testing:Chainworks ForgeUITests")
   else
     automation_log_path="$TMP_BASE/${gate_name}-${stamp}-automation.log"
     previous_automation_log_path="${CHAINWORKS_UI_AUTOMATION_LOG_PATH:-}"
     export CHAINWORKS_UI_AUTOMATION_LOG_PATH="$automation_log_path"
-    cmd+=("${signing_args[@]}")
+    cmd+=(${signing_args[@]+"${signing_args[@]}"})
     cmd+=("-parallel-testing-enabled" "NO")
     cmd+=("-maximum-parallel-testing-workers" "1")
     if [[ "$gate_name" != "proposal-013-ui" ]]; then
@@ -951,7 +963,7 @@ run_full_suite() {
     -maximum-parallel-testing-workers 1 \
     -derivedDataPath "$derived_data" \
     -resultBundlePath "$result_bundle" \
-    "${signing_args[@]}"
+    ${signing_args[@]+"${signing_args[@]}"}
   log "Result bundle: $result_bundle"
 }
 
@@ -974,6 +986,8 @@ Available gates:
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
   proposal-024    Proposal 024 run-surface information architecture gate
   proposal-025    Proposal 025 per-agent MCP policy and runtime validation gate
+  proposal-026    Proposal 026 ACP-first runtime transport and Goose decoupling gate
+  proposal-027    Proposal 027 unified read-only JSON and markdown rendering gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1167,6 +1181,28 @@ case "$GATE" in
     guard_direct_run_insertion
     run_build "proposal-025"
     run_targeted_tests "proposal-025" "${PROPOSAL_025_TESTS[@]}"
+    ;;
+  proposal-026|p026)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-026"
+    run_targeted_tests "proposal-026" "${PROPOSAL_026_TESTS[@]}"
+    ;;
+  proposal-027|p027)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-027"
+    run_targeted_tests "proposal-027" "${PROPOSAL_027_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

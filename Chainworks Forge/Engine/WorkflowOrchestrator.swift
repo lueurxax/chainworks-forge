@@ -728,6 +728,12 @@ final class WorkflowOrchestrator {
         agentExec.configuredProviderID = result.configuredProviderID
         agentExec.adapterVersion = result.adapterVersion
         agentExec.providerReceiptJSON = encodeProviderReceipt(result.providerReceipt)
+
+        // Proposal 026 ARCH-001: Persist actual runtime settlement fields.
+        let settlementBinding = providerBindingsByAgentID[agent.id]
+        agentExec.runtimeProfileID = settlementBinding?.runtimeProfileID
+        agentExec.actualAdapterFamily = settlementBinding?.adapterFamily ?? "goose"
+        agentExec.actualCapabilityClass = settlementBinding?.capabilityClass?.rawValue ?? "legacy_operator_grade"
         agentExec.logSnippet = mergedLogSnippet(
             existing: agentExec.logSnippet,
             result: result.logSnippet
@@ -1578,6 +1584,12 @@ final class WorkflowOrchestrator {
                 agentExec.sessionLineageID = result.sessionLineageID
                 agentExec.sessionGenerationID = result.sessionGenerationID
                 agentExec.sessionReuseDisposition = result.sessionReuseDisposition
+
+                // Proposal 026 ARCH-001: Persist actual runtime settlement fields.
+                let settlementBinding = providerBindingsByAgentID[agent.id]
+                agentExec.runtimeProfileID = settlementBinding?.runtimeProfileID
+                agentExec.actualAdapterFamily = settlementBinding?.adapterFamily ?? "goose"
+                agentExec.actualCapabilityClass = settlementBinding?.capabilityClass?.rawValue ?? "legacy_operator_grade"
 
                 applyExecutionTruth(from: result, to: agentExec)
                 if let sessionID = result.sessionID {

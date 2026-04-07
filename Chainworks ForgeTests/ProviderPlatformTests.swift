@@ -1823,6 +1823,7 @@ struct ProviderPlatformTests {
         let bindings = try decoder.decode([String: ResolvedProviderBinding].self, from: try #require(run.providerBindingSnapshotJSON))
         #expect(!bindings.isEmpty)
         #expect(run.workflowID == "proposal_to_release")
+        #expect(run.frozenWorkspaceRootPath?.isEmpty == false)
     }
 
     @Test("Support bundle export includes artifact index and selected artifacts")

@@ -108,7 +108,10 @@ final class Proposal007DogfoodHarness {
             providerBindingSnapshotJSON: encode(bindings),
             bindingProvenanceJSON: encode(provenances),
             startOptionsJSON: encode(startOptions),
-            frozenWorkspaceRootPath: idea.workspaceRootPath,
+            frozenWorkspaceRootPath: ProjectRootPolicy.effectiveProjectRoot(
+                workspaceRootPath: idea.workspaceRootPath,
+                deliveryRepoRootPath: nil
+            ),
             deliveryConfiguration: deliveryConfig,
             deliveryPreflightJSON: try? JSONEncoder().encode(preflight),
             contextStrategyProfileID: strategySelection.profileID,

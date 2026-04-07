@@ -17,6 +17,7 @@ workflow:
   execution:
     single_active_run_per_idea: true
     resume_policy: automatic_on_launch
+    requires_project_access: true
   required_providers:
     - claude_code
 

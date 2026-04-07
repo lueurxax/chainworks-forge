@@ -1538,7 +1538,17 @@ struct WorkflowStartRunSheet: View {
     }
 
     private var effectiveDeliveryRepoRoot: String? {
-        normalizedWorkspaceRoot ?? deliveryRepoRoot.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        ProjectRootPolicy.effectiveProjectRoot(
+            workspaceRootPath: normalizedWorkspaceRoot,
+            deliveryRepoRootPath: deliveryRepoRoot
+        )
+    }
+
+    private var effectiveProjectRoot: String? {
+        ProjectRootPolicy.effectiveProjectRoot(
+            workspaceRootPath: normalizedWorkspaceRoot,
+            deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
+        )
     }
 
     private var effectiveDeliveryWorktreeBasePath: String {
@@ -2144,15 +2154,13 @@ struct WorkflowStartRunSheet: View {
 
         // Proposal 011 (REQ-005, REQ-007): Fail-closed workspace check — no ambient cwd fallback.
         if compiledPlan.requiresProjectAccess {
-            guard let workspacePath = idea.workspaceRootPath,
-                  !workspacePath.trimmingCharacters(in: .whitespaces).isEmpty else {
-                compileState = .error("Workflow requires project access but idea has no workspace root path. Set it in the idea detail view.")
-                return
-            }
-            var isDirectory: ObjCBool = false
-            let exists = FileManager.default.fileExists(atPath: workspacePath, isDirectory: &isDirectory)
-            guard exists, isDirectory.boolValue else {
-                compileState = .error("Workspace root path is not a valid directory: \(workspacePath)")
+            do {
+                _ = try ProjectRootPolicy.requireAccessibleProjectRoot(
+                    workspaceRootPath: normalizedWorkspaceRoot,
+                    deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
+                )
+            } catch {
+                compileState = .error(error.localizedDescription)
                 return
             }
         }
@@ -2203,7 +2211,8 @@ struct WorkflowStartRunSheet: View {
             catalogURL: catalogURL,
             plan: compiledPlan,
             startOptions: startOptions,
-            idea: idea
+            idea: idea,
+            effectiveProjectRootPath: effectiveProjectRoot
         )
         if preflightReport?.status != .warn {
             allowWarnStart = false
@@ -2329,6 +2338,11 @@ struct WorkflowStartRunSheet: View {
             deliveryPreflightJSON = nil
         }
 
+        let frozenProjectRoot = ProjectRootPolicy.effectiveProjectRoot(
+            workspaceRootPath: normalizedWorkspaceRoot,
+            deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
+        )
+
         return RunStartSnapshot(
             providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
             bindingProvenanceJSON: encodeProvenances(provenances),
@@ -2337,7 +2351,12 @@ struct WorkflowStartRunSheet: View {
             skillInjectedContentHashesJSON: encodeSkillHashes(skillInjectedContentHashes),
             resolvedMCPPoliciesJSON: encodeMCPPolicies(resolvedMCPPolicies),
             startOptionsJSON: encodeStartOptions(startOptions),
-            frozenWorkspaceRootPath: normalizedWorkspaceRoot,
+            frozenWorkspaceRootPath: adjustedPlan.requiresProjectAccess
+                ? try ProjectRootPolicy.requireProjectRoot(
+                    workspaceRootPath: frozenProjectRoot,
+                    deliveryRepoRootPath: nil
+                )
+                : frozenProjectRoot,
             deliveryConfiguration: deliveryConfig,
             deliveryPreflightJSON: deliveryPreflightJSON,
             contextStrategyProfileID: strategySelection.profileID,

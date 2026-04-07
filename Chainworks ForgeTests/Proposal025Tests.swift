@@ -134,11 +134,18 @@ struct Proposal025Tests {
         try "repo".write(to: repoCopy, atomically: true, encoding: .utf8)
         try "bundle".write(to: bundledCopy, atomically: true, encoding: .utf8)
 
+        // sourceFilePath must resolve so that repositoryRootDerivedFromSourcePath
+        // walks up 3 levels to tempRoot — matching currentDirectoryPath and passing
+        // the SecurityScopedAccess guard on currentDirectoryURL.
+        let syntheticSourceFile = tempRoot
+            .appendingPathComponent("Chainworks Forge/Support/Fake.swift").path
+
         let resolved = AppConfiguration.preferredExampleURL(
             repoRelativePath: "examples/agents/agents.yaml",
             bundledURL: bundledCopy,
             currentDirectoryPath: tempRoot.path,
-            allowsDocumentsFallback: false
+            allowsDocumentsFallback: false,
+            sourceFilePath: syntheticSourceFile
         )
 
         #expect(resolved?.path == repoCopy.path)

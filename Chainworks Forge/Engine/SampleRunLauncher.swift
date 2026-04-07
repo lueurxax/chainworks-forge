@@ -21,6 +21,25 @@ struct SampleRunLauncher {
             catalogSourcePath: catalogURL.path
         )
 
+        let sampleWorkspaceRoot: String?
+        if compiledPlan.requiresProjectAccess {
+            sampleWorkspaceRoot = AppConfiguration.defaultRepositoryRoot(
+                currentDirectoryPath: FileManager.default.currentDirectoryPath,
+                bundleURL: Bundle.main.bundleURL,
+                allowsDocumentsFallback: false,
+                sourceFilePath: #filePath
+            ).path
+        } else {
+            sampleWorkspaceRoot = nil
+        }
+
+        let idea = Idea(
+            title: sampleIdeaTitle(),
+            body: sampleIdeaBody(for: compiledPlan),
+            attachmentPath: nil,
+            workspaceRootPath: sampleWorkspaceRoot
+        )
+
         let preflight = PreflightService(
             appConfigurationStore: appConfigurationStore,
             providerRegistry: providerRegistry
@@ -28,7 +47,9 @@ struct SampleRunLauncher {
         let report = await preflight.runReport(
             workflowURL: workflowURL,
             catalogURL: catalogURL,
-            plan: compiledPlan
+            plan: compiledPlan,
+            idea: idea,
+            effectiveProjectRootPath: sampleWorkspaceRoot
         )
         guard report.status != .fail else {
             throw SampleRunLauncherError.preflightFailed(report.blockingIssues)
@@ -44,11 +65,6 @@ struct SampleRunLauncher {
                 cohortID: nil
             )
 
-        let idea = Idea(
-            title: sampleIdeaTitle(),
-            body: sampleIdeaBody(for: adjustedPlan),
-            attachmentPath: nil
-        )
         modelContext.insert(idea)
 
         let (run, workspace) = try compiler.createRun(
@@ -60,7 +76,10 @@ struct SampleRunLauncher {
                 providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
                 bindingProvenanceJSON: encodeProvenances(provenances),
                 startOptionsJSON: encodeStartOptions(.empty),
-                frozenWorkspaceRootPath: idea.workspaceRootPath,
+                frozenWorkspaceRootPath: ProjectRootPolicy.effectiveProjectRoot(
+                    workspaceRootPath: idea.workspaceRootPath,
+                    deliveryRepoRootPath: nil
+                ),
                 deliveryConfiguration: nil,
                 deliveryPreflightJSON: nil,
                 contextStrategyProfileID: strategySelection.profileID,
