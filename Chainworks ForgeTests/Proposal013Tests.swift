@@ -826,6 +826,39 @@ struct Proposal013Tests {
         #expect(!StructuredOutputSchemaGate.hasBlockingViolations(catalog: catalog))
     }
 
+    @Test("StructuredOutputSchemaGate honors runtime profile transport instead of raw provider family")
+    func structuredOutputGateHonorsRuntimeProfile() {
+        let catalog = makeTestCatalog(
+            withContracts: [:],
+            backendProfiles: [
+                "gemini_acp_profile": BackendProfile(
+                    provider: "unknown_provider",
+                    model: "gemini-2.5-pro",
+                    effort: "medium",
+                    temperature: 0,
+                    maxTurns: 8,
+                    structuredOutput: "required",
+                    runtimeProfile: "gemini_cli_acp"
+                )
+            ],
+            runtimeProfiles: [
+                "gemini_cli_acp": RuntimeProfile(
+                    capabilityClass: .operatorGrade,
+                    adapterFamily: "gemini_cli_acp",
+                    requires: ["streaming", "tools"],
+                    transportKind: "acp_stdio",
+                    mcpRealizationPath: "acp_native"
+                )
+            ]
+        )
+
+        let result = try! #require(StructuredOutputSchemaGate.validate(catalog: catalog).first)
+        #expect(result.runtimeProfileID == "gemini_cli_acp")
+        #expect(result.effectiveTransportKind == "acp_stdio")
+        #expect(result.transportSupportsStructured == true)
+        #expect(result.isBlocking == false)
+    }
+
     // MARK: - Layer Q: Output Contract Declarative Bridge
 
     @Test("OutputContractDeclarativeBridge verifies V1-V2 binding parity")
@@ -1807,6 +1840,7 @@ struct Proposal013Tests {
 private func makeTestCatalog(
     withContracts contracts: [String: ArtifactContract],
     backendProfiles: [String: BackendProfile] = ["test_profile": BackendProfile(provider: "claude_code", model: "opus", effort: "high", temperature: 0.1, maxTurns: 20, structuredOutput: "required")],
+    runtimeProfiles: [String: RuntimeProfile] = [:],
     agents: [AgentDefinition] = []
 ) -> AgentCatalog {
     AgentCatalog(
@@ -1827,6 +1861,7 @@ private func makeTestCatalog(
         contracts: contracts,
         backendProfiles: backendProfiles,
         permissionProfiles: [:],
+        runtimeProfiles: runtimeProfiles,
         agents: agents
     )
 }

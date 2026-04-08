@@ -383,9 +383,13 @@ struct RunReportView: View {
     }
 
     private var proposalLoopSummary: ProposalLoopFeedbackSummary? {
-        let artifacts = run.stageExecutions
-            .flatMap { $0.agentExecutions }
-            .flatMap { $0.artifacts }
+        let runID = run.id
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.runID == runID
+            }
+        )
+        let artifacts = (try? modelContext.fetch(descriptor)) ?? []
         return ProposalLoopFeedbackParser.parseSummary(from: artifacts)
     }
 

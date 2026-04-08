@@ -17,7 +17,13 @@ private struct StubExtensionRegistryProvider: RuntimeExtensionRegistryProvider {
 struct RuntimeSessionBridgeTests {
     final class CapturingTransport: RuntimeTransportProtocol, @unchecked Sendable {
         var lastCreateRequest: RuntimeSessionRequest?
-        var mcpRuntimeNamespace: String? { "goose" }
+        private let runtimeNamespace: String?
+
+        init(runtimeNamespace: String? = "goose") {
+            self.runtimeNamespace = runtimeNamespace
+        }
+
+        var mcpRuntimeNamespace: String? { runtimeNamespace }
 
         func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             lastCreateRequest = request
@@ -29,7 +35,7 @@ struct RuntimeSessionBridgeTests {
                     capabilityToken: "token",
                     backendPolicyVersion: "v1"
                 ),
-                actualEnabledExtensions: request.requestedExtensions
+                actualEnabledExtensions: request.requestedExtensions ?? request.mcpServers?.map(\.name)
             )
         }
 
@@ -124,7 +130,21 @@ struct RuntimeSessionBridgeTests {
             mcpPolicy: .defaultDeny,
             mcpServerRegistry: [
                 "context7": MCPServerRegistryEntry(
-                    runtimeIDs: ["goose": "context7"],
+                    runtimeIDs: [
+                        "goose": "context7",
+                        "claude_agent": "context7"
+                    ],
+                    sessionScoped: true,
+                    assignmentPolicy: "explicit_opt_in",
+                    riskClass: "normal",
+                    notes: nil
+                ),
+                "xcode": MCPServerRegistryEntry(
+                    runtimeIDs: [
+                        "goose": "xcode",
+                        "claude_agent": "xcode",
+                        "gemini_cli": "xcode"
+                    ],
                     sessionScoped: true,
                     assignmentPolicy: "explicit_opt_in",
                     riskClass: "normal",
@@ -134,6 +154,11 @@ struct RuntimeSessionBridgeTests {
             mcpProfiles: [
                 "docs_reference": MCPProfile(
                     requiredExtensions: ["context7"],
+                    optionalExtensions: [],
+                    fallbackPolicy: "fail_if_required_missing"
+                ),
+                "review_visual": MCPProfile(
+                    requiredExtensions: ["xcode"],
                     optionalExtensions: [],
                     fallbackPolicy: "fail_if_required_missing"
                 )
@@ -393,6 +418,171 @@ struct RuntimeSessionBridgeTests {
         #expect(transport.lastCreateRequest?.requestedExtensions == ["context7"])
     }
 
+    @Test("Session bridge realizes Gemini ACP MCP servers from local registry")
+    func sessionBridgeRealizesGeminiACPMCPServersFromLocalRegistry() async throws {
+        let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
+        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            installedExtensionIDs: ["xcode"],
+            enabledExtensionIDs: ["xcode"],
+            configsByRuntimeID: [
+                "xcode": GooseExtensionDefinition(
+                    enabled: true,
+                    type: "stdio",
+                    name: "xcode",
+                    description: nil,
+                    displayName: nil,
+                    cmd: "xcrun",
+                    args: ["mcpbridge"],
+                    envs: [:],
+                    envKeys: nil,
+                    timeout: nil,
+                    bundled: nil,
+                    availableTools: nil
+                )
+            ]
+        ))
+        let bridge = RuntimeSessionBridge(
+            transport: transport,
+            extensionRegistryProvider: registryProvider
+        )
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ui",
+            title: "Proposal Reviewer / UI",
+            mode: "autonomous",
+            provider: "gemini-cli",
+            model: "gemini-2.5-flash",
+            effort: "medium",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            mcpProfileID: "review_visual",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a UI reviewer.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_ui"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: ResolvedProviderBinding(
+                agentID: "proposal_reviewer_ui",
+                backendProfileID: "gemini_review_flash",
+                configuredProviderID: UUID(),
+                providerFamily: "gemini",
+                providerIdentifier: "gemini-cli",
+                model: "gemini-2.5-flash",
+                effort: "medium",
+                transport: "acp_stdio",
+                adapterVersion: "v1",
+                runtimeProfileID: "gemini_cli_acp",
+                adapterFamily: "gemini_cli_acp",
+                capabilityClass: .controlCapable
+            ),
+            catalog: makeCatalog()
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: AgentTask(agent: "proposal_reviewer_ui", task: "review_ui", inputs: ["proposal_current"], outputs: ["proposal_review_ui"]),
+            context: context,
+            override: nil
+        )
+
+        #expect(transport.lastCreateRequest?.requestedExtensions == nil)
+        #expect(transport.lastCreateRequest?.mcpServers == [
+            RuntimeMCPServerDefinition(
+                name: "xcode",
+                command: "xcrun",
+                args: ["mcpbridge"],
+                env: []
+            )
+        ])
+    }
+
+    @Test("Session bridge blocks Gemini ACP session when required MCP server is unavailable locally")
+    func sessionBridgeBlocksGeminiACPWhenRequiredMCPServerMissingLocally() async throws {
+        let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
+        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            installedExtensionIDs: [],
+            enabledExtensionIDs: [],
+            configsByRuntimeID: [:]
+        ))
+        let bridge = RuntimeSessionBridge(
+            transport: transport,
+            extensionRegistryProvider: registryProvider
+        )
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ui",
+            title: "Proposal Reviewer / UI",
+            mode: "autonomous",
+            provider: "gemini-cli",
+            model: "gemini-2.5-flash",
+            effort: "medium",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            mcpProfileID: "review_visual",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a UI reviewer.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_ui"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: ResolvedProviderBinding(
+                agentID: "proposal_reviewer_ui",
+                backendProfileID: "gemini_review_flash",
+                configuredProviderID: UUID(),
+                providerFamily: "gemini",
+                providerIdentifier: "gemini-cli",
+                model: "gemini-2.5-flash",
+                effort: "medium",
+                transport: "acp_stdio",
+                adapterVersion: "v1",
+                runtimeProfileID: "gemini_cli_acp",
+                adapterFamily: "gemini_cli_acp",
+                capabilityClass: .controlCapable
+            ),
+            catalog: makeCatalog()
+        )
+
+        await #expect(throws: RuntimeSessionBridgeError.self) {
+            _ = try await bridge.executeInIsolatedSession(
+                agent: agent,
+                task: AgentTask(agent: "proposal_reviewer_ui", task: "review_ui", inputs: ["proposal_current"], outputs: ["proposal_review_ui"]),
+                context: context,
+                override: nil
+            )
+        }
+    }
+
     @Test("Packet contains task directive")
     func packetContainsTaskDirective() {
         let agent = makeAgent()
@@ -472,7 +662,7 @@ struct RuntimeSessionBridgeTests {
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
-            ideaBody: "Сделать полный UX аудит приложения и исправить основные проблемы.",
+            ideaBody: "Perform a full UX audit of the app and fix the main issues.",
             providerBinding: nil
         )
 
@@ -1023,8 +1213,11 @@ struct RuntimeSessionBridgeTests {
                 providerIdentifier: "gemini",
                 model: "gemini-2.5-pro",
                 effort: "medium",
-                transport: "goose_server",
-                adapterVersion: "test"
+                transport: "acp_stdio",
+                adapterVersion: "test",
+                runtimeProfileID: "gemini_cli_acp",
+                adapterFamily: "gemini_cli_acp",
+                capabilityClass: .operatorGrade
             )
         )
 

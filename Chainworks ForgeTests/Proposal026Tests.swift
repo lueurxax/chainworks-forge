@@ -103,6 +103,7 @@ struct Proposal026Tests {
         #expect(binding.runtimeProfileID == "claude_agent_acp")
         #expect(binding.adapterFamily == "claude_agent_acp")
         #expect(binding.capabilityClass == .operatorGrade)
+        #expect(binding.transport == "acp_stdio")
     }
 
     // MARK: - Test 2: ResolvedProviderBinding round-trip encoding
@@ -117,7 +118,7 @@ struct Proposal026Tests {
             providerIdentifier: "claude_code",
             model: "sonnet",
             effort: "high",
-            transport: "goose_server",
+            transport: "acp_stdio",
             adapterVersion: "v1",
             runtimeProfileID: "claude_agent_acp",
             adapterFamily: "claude_agent_acp",
@@ -328,20 +329,78 @@ struct Proposal026Tests {
 
     // MARK: - Test 8: Executed canonical ACP proposal loop proof
 
-    @Test("ACP-backed canonical proposal loop completes without downgrading runtime truth")
-    func acpBackedCanonicalProposalLoopProof() async throws {
+    @Test("Claude Agent ACP-backed canonical proposal loop completes without downgrading runtime truth")
+    func claudeACPBackedCanonicalProposalLoopProof() async throws {
+        try await assertCanonicalProposalLoopProof(
+            runtimeProfileID: "claude_agent_acp",
+            transportFactory: { ClaudeAgentACPTransport(executablePath: $0) }
+        )
+    }
+
+    @Test("Canonical catalog routes all Claude backends through Claude Agent ACP and limits Claude MCP to ACP-materializable lanes")
+    func canonicalCatalogClaudeACPIntent() throws {
+        let catalog = try loadTestCanonicalCatalog()
+
+        let claudeBackendProfiles = catalog.backendProfiles.filter { $0.value.provider == "claude_code" }
+        #expect(!claudeBackendProfiles.isEmpty)
+        #expect(claudeBackendProfiles.values.allSatisfy { $0.runtimeProfile == "claude_agent_acp" })
+
+        let claudeBackendIDs = Set(claudeBackendProfiles.keys)
+        let supportedClaudeMCP = Set(["xcode", "context7"])
+
+        for agent in catalog.agents where claudeBackendIDs.contains(agent.backendProfile) {
+            let profileID = agent.mcpProfile ?? catalog.mcpPolicy.defaultProfile
+            guard let profile = catalog.mcpProfiles[profileID] else {
+                continue
+            }
+            #expect(Set(profile.allRequestedExtensions).isSubset(of: supportedClaudeMCP))
+        }
+    }
+
+    @Test("Gemini CLI ACP-backed canonical proposal loop completes without downgrading runtime truth")
+    func geminiACPBackedCanonicalProposalLoopProof() async throws {
+        try await assertCanonicalProposalLoopProof(
+            runtimeProfileID: "gemini_cli_acp",
+            transportFactory: { GeminiCLIACPTransport(executablePath: $0) }
+        )
+    }
+
+    // MARK: - Test 9: Executed canonical ACP implementation proof
+
+    @Test("Claude Agent ACP-backed implementation path reaches manual release gate without downgrading runtime truth")
+    func claudeACPBackedImplementationPathProof() async throws {
+        try await assertImplementationPathProof(
+            runtimeProfileID: "claude_agent_acp",
+            transportFactory: { ClaudeAgentACPTransport(executablePath: $0) }
+        )
+    }
+
+    @Test("Gemini CLI ACP-backed implementation path reaches manual release gate without downgrading runtime truth")
+    func geminiACPBackedImplementationPathProof() async throws {
+        try await assertImplementationPathProof(
+            runtimeProfileID: "gemini_cli_acp",
+            transportFactory: { GeminiCLIACPTransport(executablePath: $0) }
+        )
+    }
+
+    // MARK: - Helpers
+
+    private func assertCanonicalProposalLoopProof(
+        runtimeProfileID: String,
+        transportFactory: (String) -> any RuntimeTransportProtocol
+    ) async throws {
         let (container, context) = try makeTestModelContainer()
         _ = container
         let compiler = RunPlanCompiler(modelContext: context)
         let workflow = try loadTestLiveWorkflow()
         let catalog = try loadTestCanonicalCatalog()
         let basePlan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
-        let plan = forceACPProfile(on: basePlan, runtimeProfileID: "claude_agent_acp")
+        let plan = forceACPProfile(on: basePlan, runtimeProfileID: runtimeProfileID)
 
         let fixture = try makeACPFixture(plan: plan, catalog: catalog)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        let repoRoot = try makeMinimalRepository(prefix: "P026-ProposalLoop")
+        let repoRoot = try makeMinimalRepository(prefix: "P026-ProposalLoop-\(runtimeProfileID)")
         defer { try? FileManager.default.removeItem(at: repoRoot) }
 
         let idea = Idea(title: "P026 Proposal Loop", body: "Executed ACP-backed proposal loop proof.")
@@ -353,7 +412,7 @@ struct Proposal026Tests {
             workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml").path,
             catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path,
             startSnapshot: RunStartSnapshot(
-                providerBindingSnapshotJSON: try encodeACPBindings(for: plan),
+                providerBindingSnapshotJSON: try encodeACPBindings(for: plan, runtimeProfileID: runtimeProfileID),
                 bindingProvenanceJSON: nil,
                 startOptionsJSON: Data("{}".utf8),
                 frozenWorkspaceRootPath: repoRoot.path
@@ -361,7 +420,7 @@ struct Proposal026Tests {
         )
 
         let executor = RuntimeAgentExecutor(
-            transport: ClaudeAgentACPTransport(executablePath: fixture.executablePath)
+            transport: transportFactory(fixture.executablePath)
         )
         let orchestrator = WorkflowOrchestrator(
             run: run,
@@ -393,34 +452,43 @@ struct Proposal026Tests {
         expectRunCompleted(run)
         let agentExecutions = run.stageExecutions.flatMap(\.agentExecutions)
         #expect(!agentExecutions.isEmpty)
-        #expect(agentExecutions.allSatisfy { $0.runtimeProfileID == "claude_agent_acp" })
-        #expect(agentExecutions.allSatisfy { $0.actualAdapterFamily == "claude_agent_acp" })
+        #expect(agentExecutions.allSatisfy { $0.runtimeProfileID == runtimeProfileID })
+        #expect(agentExecutions.allSatisfy { $0.actualAdapterFamily == runtimeProfileID })
         #expect(agentExecutions.allSatisfy { $0.actualCapabilityClass == RuntimeCapabilityClass.operatorGrade.rawValue })
 
         let report = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 1)
         let reportAgents = report.agentsUsed.filter { !$0.agentID.isEmpty }
         #expect(!reportAgents.isEmpty)
-        #expect(reportAgents.allSatisfy { $0.runtimeProfileID == "claude_agent_acp" })
-        #expect(reportAgents.allSatisfy { $0.actualAdapterFamily == "claude_agent_acp" })
+        #expect(reportAgents.allSatisfy { $0.runtimeProfileID == runtimeProfileID })
+        #expect(reportAgents.allSatisfy { $0.actualAdapterFamily == runtimeProfileID })
         #expect(reportAgents.allSatisfy { $0.actualCapabilityClass == RuntimeCapabilityClass.operatorGrade.rawValue })
+        if runtimeProfileID == "gemini_cli_acp" {
+            let visualReviewExecutions = agentExecutions.filter { ["proposal_reviewer_ui", "proposal_reviewer_ux"].contains($0.agentID) }
+            #expect(!visualReviewExecutions.isEmpty)
+            #expect(visualReviewExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("xcode") })
+        } else if runtimeProfileID == "claude_agent_acp" {
+            let productReviewerExecutions = agentExecutions.filter { $0.agentID == "proposal_reviewer_product_owner" }
+            #expect(!productReviewerExecutions.isEmpty)
+            #expect(productReviewerExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("xcode") })
+        }
     }
 
-    // MARK: - Test 9: Executed canonical ACP implementation proof
-
-    @Test("ACP-backed implementation path reaches manual release gate without downgrading runtime truth")
-    func acpBackedImplementationPathProof() async throws {
+    private func assertImplementationPathProof(
+        runtimeProfileID: String,
+        transportFactory: (String) -> any RuntimeTransportProtocol
+    ) async throws {
         let (container, context) = try makeTestModelContainer()
         _ = container
         let compiler = RunPlanCompiler(modelContext: context)
         let workflow = try loadTestFullMVPLiveWorkflow()
         let catalog = try loadTestCanonicalCatalog()
         let basePlan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
-        let plan = forceACPProfile(on: basePlan, runtimeProfileID: "claude_agent_acp")
+        let plan = forceACPProfile(on: basePlan, runtimeProfileID: runtimeProfileID)
 
         let fixture = try makeACPFixture(plan: plan, catalog: catalog)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        let repoRoot = try makeMinimalRepository(prefix: "P026-ImplementationPath")
+        let repoRoot = try makeMinimalRepository(prefix: "P026-ImplementationPath-\(runtimeProfileID)")
         defer { try? FileManager.default.removeItem(at: repoRoot) }
 
         let idea = Idea(title: "P026 Implementation Path", body: "Executed ACP-backed implementation proof.")
@@ -447,7 +515,7 @@ struct Proposal026Tests {
             workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml").path,
             catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path,
             startSnapshot: RunStartSnapshot(
-                providerBindingSnapshotJSON: try encodeACPBindings(for: plan),
+                providerBindingSnapshotJSON: try encodeACPBindings(for: plan, runtimeProfileID: runtimeProfileID),
                 bindingProvenanceJSON: nil,
                 startOptionsJSON: Data("{}".utf8),
                 frozenWorkspaceRootPath: repoRoot.path,
@@ -457,7 +525,7 @@ struct Proposal026Tests {
         )
 
         let executor = RuntimeAgentExecutor(
-            transport: ClaudeAgentACPTransport(executablePath: fixture.executablePath)
+            transport: transportFactory(fixture.executablePath)
         )
         let orchestrator = WorkflowOrchestrator(
             run: run,
@@ -500,19 +568,25 @@ struct Proposal026Tests {
         let agentExecutions = run.stageExecutions.flatMap(\.agentExecutions)
         #expect(!agentExecutions.isEmpty)
         #expect(agentExecutions.contains { $0.agentID == "code_writer" })
-        #expect(agentExecutions.allSatisfy { $0.runtimeProfileID == "claude_agent_acp" })
-        #expect(agentExecutions.allSatisfy { $0.actualAdapterFamily == "claude_agent_acp" })
+        #expect(agentExecutions.allSatisfy { $0.runtimeProfileID == runtimeProfileID })
+        #expect(agentExecutions.allSatisfy { $0.actualAdapterFamily == runtimeProfileID })
         #expect(agentExecutions.allSatisfy { $0.actualCapabilityClass == RuntimeCapabilityClass.operatorGrade.rawValue })
 
         let report = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 1)
         let reportAgents = report.agentsUsed.filter { !$0.agentID.isEmpty }
         #expect(reportAgents.contains { $0.agentID == "code_writer" })
-        #expect(reportAgents.allSatisfy { $0.runtimeProfileID == "claude_agent_acp" })
-        #expect(reportAgents.allSatisfy { $0.actualAdapterFamily == "claude_agent_acp" })
+        #expect(reportAgents.allSatisfy { $0.runtimeProfileID == runtimeProfileID })
+        #expect(reportAgents.allSatisfy { $0.actualAdapterFamily == runtimeProfileID })
         #expect(reportAgents.allSatisfy { $0.actualCapabilityClass == RuntimeCapabilityClass.operatorGrade.rawValue })
+        if runtimeProfileID == "claude_agent_acp" {
+            let securityExecutions = agentExecutions.filter { $0.agentID == "security_checker" }
+            let prepushExecutions = agentExecutions.filter { $0.agentID == "prepush_code_reviewer" }
+            #expect(!securityExecutions.isEmpty)
+            #expect(!prepushExecutions.isEmpty)
+            #expect(securityExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("context7") })
+            #expect(prepushExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("xcode") })
+        }
     }
-
-    // MARK: - Helpers
 
     private struct ACPFixture {
         let root: URL
@@ -572,7 +646,7 @@ struct Proposal026Tests {
         )
     }
 
-    private func encodeACPBindings(for plan: RunPlan) throws -> Data {
+    private func encodeACPBindings(for plan: RunPlan, runtimeProfileID: String) throws -> Data {
         let bindings = Dictionary(uniqueKeysWithValues: plan.agentBindings.map { key, agent in
             let providerFamily = ProviderFamily.from(runtimeIdentifier: agent.provider)?.rawValue ?? agent.provider
             return (
@@ -587,8 +661,8 @@ struct Proposal026Tests {
                     effort: agent.effort,
                     transport: "acp_stdio",
                     adapterVersion: "proposal-026-proof",
-                    runtimeProfileID: "claude_agent_acp",
-                    adapterFamily: "claude_agent_acp",
+                    runtimeProfileID: runtimeProfileID,
+                    adapterFamily: runtimeProfileID,
                     capabilityClass: .operatorGrade
                 )
             )
@@ -681,12 +755,17 @@ struct Proposal026Tests {
                 continue
 
             if method == "session/new":
+                enabled_extensions = []
+                for server in params.get("mcpServers") or []:
+                    name = server.get("name")
+                    if isinstance(name, str) and name:
+                        enabled_extensions.append(name)
                 send({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
                         "sessionId": SESSION_ID,
-                        "enabledExtensions": []
+                        "enabledExtensions": sorted(set(enabled_extensions))
                     },
                 })
                 continue
@@ -770,6 +849,11 @@ struct Proposal026Tests {
         }
 
         return payloads
+    }
+
+    private func decodeStringArray(_ data: Data?) -> [String] {
+        guard let data else { return [] }
+        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
     }
 
     private func tasks(in runBlock: ExecutableRunBlock) -> [AgentTask] {

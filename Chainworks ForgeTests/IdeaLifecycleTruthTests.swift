@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import Chainworks_Forge
 
+@MainActor
 @Suite("Idea Lifecycle Truth")
 struct IdeaLifecycleTruthTests {
     @Test("Cancelled latest run is shown as cancelled instead of active")

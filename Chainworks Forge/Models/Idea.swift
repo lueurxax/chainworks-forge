@@ -49,7 +49,7 @@ import SwiftData
         runs.contains { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
     }
 
-    var lifecycleStatusLabel: String {
+    @MainActor var lifecycleStatusLabel: String {
         if isArchived { return "Archived" }
         guard let latestRun else { return status.rawValue.capitalized }
 
@@ -75,7 +75,33 @@ import SwiftData
         }
     }
 
-    var latestRunIsTerminal: Bool {
+    @MainActor var sidebarLifecycleStatusLabel: String {
+        if isArchived { return "Archived" }
+        guard let latestRun else { return status.rawValue.capitalized }
+
+        switch latestRun.listPresentationStatus {
+        case .pending:
+            return status == .draft ? "Draft" : "Pending"
+        case .ready:
+            return "Ready"
+        case .running:
+            return "Running"
+        case .waitingApproval:
+            return "Waiting Approval"
+        case .blocked:
+            return "Blocked"
+        case .completed:
+            return "Completed"
+        case .failed:
+            return "Failed"
+        case .cancelled:
+            return "Cancelled"
+        case .cancelling:
+            return "Cancelling"
+        }
+    }
+
+    @MainActor var latestRunIsTerminal: Bool {
         guard let latestRun else { return false }
         switch latestRun.presentationStatus {
         case .completed, .failed, .cancelled:
@@ -85,13 +111,13 @@ import SwiftData
         }
     }
 
-    var archiveLifecycleStatus: String {
+    @MainActor var archiveLifecycleStatus: String {
         lifecycleStatusLabel
     }
 
     /// Keeps the persisted legacy idea status aligned with the latest run without
     /// forcing the UI to collapse terminal run truth into the old four-state enum.
-    func synchronizePersistedStatusFromRuns() {
+    @MainActor func synchronizePersistedStatusFromRuns() {
         guard !isArchived else { return }
 
         guard let latestRun else {

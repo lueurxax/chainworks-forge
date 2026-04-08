@@ -75,7 +75,9 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
 
         // Step 2: Send `session/new` with session configuration
         // mcpServers is required by the ACP adapter (must be an array, even if empty)
-        var sessionParams: [String: Any] = ["mcpServers": [] as [[String: Any]]]
+        var sessionParams: [String: Any] = [
+            "mcpServers": request.mcpServers?.map { $0.acpJSONObject() } ?? ([] as [[String: Any]])
+        ]
         if let workingDirectory = request.workingDirectory {
             sessionParams["cwd"] = workingDirectory
         }

@@ -235,7 +235,7 @@ struct MCPPolicyResolver: Sendable {
             if runtimeNamespace == nil {
                 blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
             }
-            if gooseRegistry == nil {
+            if runtimeNamespace == "goose", gooseRegistry == nil {
                 blockingIssues.append("Goose extension registry is unavailable; cannot validate MCP profile '\(profileID)' for agent '\(agent.id)'.")
             }
         }
@@ -294,8 +294,7 @@ struct MCPPolicyResolver: Sendable {
     }
 
     private func runtimeNamespace(for providerBinding: ResolvedProviderBinding?) -> String? {
-        guard let providerBinding else { return nil }
-        return providerBinding.transport == ProviderTransport.gooseServer.rawValue ? "goose" : nil
+        providerBinding?.effectiveRuntimeNamespace
     }
 
     private func resolveServer(
@@ -313,11 +312,13 @@ struct MCPPolicyResolver: Sendable {
         guard let runtimeID = entry.runtimeIDs[runtimeNamespace], !runtimeID.isEmpty else {
             return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
         }
-        guard let gooseRegistry else {
-            return .missing("MCP server '\(serverID)' cannot be validated because Goose extension registry is unavailable.")
-        }
-        guard gooseRegistry.configsByRuntimeID[runtimeID] != nil else {
-            return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in Goose.")
+        if runtimeNamespace == "goose" {
+            guard let gooseRegistry else {
+                return .missing("MCP server '\(serverID)' cannot be validated because Goose extension registry is unavailable.")
+            }
+            guard gooseRegistry.configsByRuntimeID[runtimeID] != nil else {
+                return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in Goose.")
+            }
         }
         return .available(runtimeID: runtimeID)
     }

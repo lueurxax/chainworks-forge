@@ -89,9 +89,7 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         if let model = request.model {
             sessionParams["model"] = model
         }
-        // Note: requestedExtensions from Forge are Goose extension IDs — not applicable for ACP.
-        // Gemini CLI ACP handles MCP through its own config or mcpServers param.
-        sessionParams["mcpServers"] = [] as [[String: Any]]
+        sessionParams["mcpServers"] = request.mcpServers?.map { $0.acpJSONObject() } ?? ([] as [[String: Any]])
 
         let sessionNewRequest = makeJSONRPCRequest(
             method: "session/new",

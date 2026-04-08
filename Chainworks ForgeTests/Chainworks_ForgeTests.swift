@@ -347,6 +347,139 @@ struct RunTests {
         #expect(run.currentStageID == "state_4_proposal_reviewed")
     }
 
+    @Test func resumeContinuationStateIDMatchesLatestInterruptibleStageWithoutSnapshotLoader() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+
+        let completedStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .completed
+        )
+        completedStage.run = run
+        context.insert(completedStage)
+
+        let blockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        #expect(run.currentStageID == "state_4_proposal_reviewed")
+        #expect(run.resumeContinuationStateID == "state_4_proposal_reviewed")
+    }
+
+    @Test func resumeContinuationStateIDPrefersPreviousRunStateNextStageWhenLatestBlockedStageHasNoArtifacts() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chainworks-run-state-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let completedStage = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        completedStage.run = run
+        context.insert(completedStage)
+
+        let orchestrator = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead Orchestrator",
+            taskName: "aggregate_review",
+            startedAt: Date(timeIntervalSince1970: 11),
+            status: .completed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        orchestrator.stageExecution = completedStage
+        context.insert(orchestrator)
+
+        let runStateURL = tempDirectory.appendingPathComponent("run_state.json")
+        try Data("""
+        {
+          "current_stage": "state_9_implementation_reviewed",
+          "next_stage": "state_7_implementation_started",
+          "next_stage_reason": "loop back to implementation"
+        }
+        """.utf8).write(to: runStateURL, options: .atomic)
+
+        let runStateArtifact = Artifact(
+            name: "run_state",
+            contractID: "run_state",
+            format: .json,
+            filePath: runStateURL.path,
+            runID: run.id,
+            stageID: completedStage.stageID,
+            agentID: "lead_orchestrator",
+            provider: "claude_code"
+        )
+        runStateArtifact.agentExecution = orchestrator
+        context.insert(runStateArtifact)
+
+        let blockedStage = StageExecution(
+            stageID: "state_10_implementation_refined",
+            label: "Implementation refined",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "refine_implementation",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedAgent.stageExecution = blockedStage
+        context.insert(failedAgent)
+
+        try context.save()
+
+        #expect(run.currentStageID == "state_10_implementation_refined")
+        #expect(run.resumeContinuationStateID == "state_7_implementation_started")
+    }
+
+    @Test func listPresentationStatusLabelUsesStoredListTruth() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+        run.status = .running
+
+        let blockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        #expect(run.presentationStatusLabel == "blocked")
+        #expect(run.listPresentationStatusLabel == "running")
+    }
+
     @Test func presentationStatusPrefersLatestBlockedStageWhenRunStatusIsStaleRunning() throws {
         let context = try makeContext()
         let idea = Idea(title: "Test", body: "Body")
@@ -374,6 +507,56 @@ struct RunTests {
 
         #expect(run.presentationStatus == .blocked)
         #expect(run.presentationStatusLabel == "blocked")
+    }
+
+    @Test func listPresentationStatusStaysOnStoredRunStatusWhenStageTruthIsHeavierThanSidebarNeeds() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+        run.status = .running
+
+        let staleRunningStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .running
+        )
+        staleRunningStage.run = run
+        context.insert(staleRunningStage)
+
+        let latestBlockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        latestBlockedStage.run = run
+        context.insert(latestBlockedStage)
+
+        #expect(run.presentationStatus == .blocked)
+        #expect(run.listPresentationStatus == .running)
+    }
+
+    @Test func sidebarLifecycleStatusLabelUsesLightweightRunTruth() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+        run.status = .running
+
+        let blockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        #expect(run.presentationStatus == .blocked)
+        #expect(idea.lifecycleStatusLabel == "Blocked")
+        #expect(idea.sidebarLifecycleStatusLabel == "Running")
     }
 
     @Test func operatorStopAvailabilityMatchesNonTerminalRunTruth() throws {

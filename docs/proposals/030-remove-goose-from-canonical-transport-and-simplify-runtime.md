@@ -5,7 +5,7 @@
 | Date | 2026-04-07 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [026-acp-runtime-plan-additive-profiles.md](026-acp-runtime-plan-additive-profiles.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/goose-server-transport.md](../reference/goose-server-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
+| Depends on | [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/goose-server-transport.md](../reference/goose-server-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
 | Scope | Remove Goose as the canonical runtime transport implementation after second-wave ACP providers are proven, and simplify runtime dispatch to an ACP-first core with Goose retained only as explicit optional compatibility adapter. |
 | Goal | Replace the current multi-implementation transport shape with a single canonical ACP execution seam and capability-gated provider adapters. |
 
@@ -46,13 +46,13 @@ This proposal includes:
 - removal of Goose-only lifecycle assumptions from execution orchestration and transport abstractions
 - explicit “compatibility adapter” retention for Goose where needed
 - migration of any remaining runtime-profile references away from `goose_rest_sse` as default mandatory path
+- canonical MCP ownership simplification so backend runtime intent is declared in `backend_profile`, while machine-local MCP realization moves out of repo YAML
 - updating failure evidence and proof expectations for transport simplification
 
 This proposal does not include:
 
 - removing Goose app support from operator workflows entirely
 - deleting Goose binary launch tooling from all system-level settings
-- changing provider-specific policy semantics or MCP truth model
 - relaxing execution/recovery/report truth guarantees
 
 ---
@@ -112,6 +112,28 @@ After this proposal:
 
 Update evidence and proposal-index docs to mark this as “Goose transport canonical path retired.”
 
+### 4.6 Future canonical MCP contract
+
+This proposal also fixes the MCP ownership target for the post-Goose world.
+
+After Proposal 030:
+
+- `backend_profile` is the only repo-owned execution contract for runtime selection and MCP intent
+- `backend_profile` declares one explicit MCP set for that runtime/backend combination
+- `mcp_profile` is removed from the canonical repo model
+- `mcp_server_registry` is removed from the canonical repo model
+- machine-local MCP realization lives outside repo YAML in provider-platform or local runtime configuration
+
+Canonical ownership becomes:
+
+- repo YAML owns `provider`, `model`, `effort`, `runtime_profile`, and required MCP intent
+- machine-local configuration owns install-specific launch details, env/auth/bootstrap, and runtime compatibility for each locally available MCP server
+- preflight compares backend-declared MCP intent against machine-local runtime capability and blocks on any missing required server
+- runtime transport receives only already-materialized ACP `mcpServers`, never Goose-shaped extension IDs or repo-owned launch commands
+
+This intentionally removes the current layered MCP indirection from the long-term design.
+Current additive ACP rollout may keep bridge-era compatibility structures while Proposal 026 and Proposal 029 are still in flight, but those structures are transitional only and are not part of the target architecture after Proposal 030.
+
 ---
 
 ## 5. Rollout Sequence
@@ -139,6 +161,7 @@ Proposal 030 is complete when:
 5. Canonical execution truth (`RunStartSnapshot`, `AgentExecution`, report/recovery readers) remains unchanged in semantics and fidelity.
 6. Test and proof lanes pass for the post-removal transport shape with explicit, documented fallback if Goose adapter remains enabled for compatibility.
 7. Operator-facing docs and onboarding no longer imply Goose is the canonical runtime shape.
+8. Canonical repo YAML no longer depends on `mcp_profile` or `mcp_server_registry`; backend-declared MCP intent is validated directly against machine-local MCP capability and realized as ACP-native `mcpServers`.
 
 ---
 

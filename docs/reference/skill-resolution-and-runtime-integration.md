@@ -229,11 +229,8 @@ That means skill functionality is not a sidecar feature. It is part of:
 
 Current stable verification for this slice is:
 
-- approved-host focused gate:
-  - `proposal-015`
-  - non-UI summary `15/15` passed
+- dedicated skill-resolution capability regression coverage on the current tree
+- approved-host non-UI verification summary `15/15` passed
 - canonical app-proof export on the approved host
 - same-tree approved-host `full` green basis:
   - `full-20260408-101540.xcresult`
-
-The historical gate name remains for reproducibility, but the capability described here is now part of the permanent system documentation.

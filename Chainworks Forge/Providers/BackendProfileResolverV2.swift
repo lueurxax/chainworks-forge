@@ -46,6 +46,25 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
         self.capabilityClass = capabilityClass
     }
 
+    var effectiveRuntimeNamespace: String? {
+        switch adapterFamily {
+        case nil, "", "goose":
+            return transport == ProviderTransport.gooseServer.rawValue ? "goose" : nil
+        case "claude_agent_acp":
+            return "claude_agent"
+        case "gemini_cli_acp":
+            return "gemini_cli"
+        case "codex_acp":
+            return "codex"
+        default:
+            return nil
+        }
+    }
+
+    var usesGooseExecutionPath: Bool {
+        effectiveRuntimeNamespace == "goose"
+    }
+
     // MARK: - Proposal 011 (REQ-010): Cross-family coherence check
 
     /// Heuristic check for obvious cross-family provider/model mismatches.
@@ -127,16 +146,19 @@ struct BackendProfileResolverV2 {
             let resolvedRuntimeProfileID: String?
             let resolvedAdapterFamily: String
             let resolvedCapabilityClass: RuntimeCapabilityClass
+            let resolvedTransportKind: String
             if let profileKey = agent.runtimeProfileID,
                let profile = runtimeProfiles[profileKey] {
                 resolvedRuntimeProfileID = profileKey
                 resolvedAdapterFamily = profile.adapterFamily
                 resolvedCapabilityClass = profile.capabilityClass
+                resolvedTransportKind = profile.transportKind
             } else {
                 // Default: legacy Goose runtime
                 resolvedRuntimeProfileID = agent.runtimeProfileID
                 resolvedAdapterFamily = "goose"
                 resolvedCapabilityClass = .legacyOperatorGrade
+                resolvedTransportKind = configuredProvider.transport.rawValue
             }
 
             bindings[agentID] = ResolvedProviderBinding(
@@ -147,7 +169,7 @@ struct BackendProfileResolverV2 {
                 providerIdentifier: configuredProvider.family.runtimeProviderIdentifier,
                 model: resolvedModel,
                 effort: override?.effort ?? agent.effort,
-                transport: configuredProvider.transport.rawValue,
+                transport: resolvedTransportKind,
                 adapterVersion: configuredProvider.adapterVersion,
                 runtimeProfileID: resolvedRuntimeProfileID,
                 adapterFamily: resolvedAdapterFamily,

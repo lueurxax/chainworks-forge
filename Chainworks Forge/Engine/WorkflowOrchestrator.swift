@@ -188,6 +188,7 @@ final class WorkflowOrchestrator {
         // Resume if we were waiting
         if isPaused && granted {
             isPaused = false
+            isRunning = true
             run.status = .running
 
             // Mark the stage execution as completed
@@ -3259,7 +3260,10 @@ final class WorkflowOrchestrator {
             model: resolvedModel,
             effort: baseBinding.effort,
             transport: baseBinding.transport,
-            adapterVersion: baseBinding.adapterVersion
+            adapterVersion: baseBinding.adapterVersion,
+            runtimeProfileID: baseBinding.runtimeProfileID,
+            adapterFamily: baseBinding.adapterFamily,
+            capabilityClass: baseBinding.capabilityClass
         )
     }
 

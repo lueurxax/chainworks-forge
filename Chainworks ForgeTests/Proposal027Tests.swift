@@ -419,6 +419,74 @@ struct Proposal027Tests {
         #expect(compacted.count <= 221)
     }
 
+    @Test("Artifact inspector downstream lookup survives sibling-context stage deletion")
+    func artifactInspectorDownstreamLookupSurvivesSiblingContextStageDeletion() throws {
+        let workspace = makeTestWorkspace(tempDir: tempDirectory)
+        let run = try makeTestRun(workspace: workspace, context: context)
+
+        let stage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            status: .completed
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let producer = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "Draft proposal",
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        producer.stageExecution = stage
+        context.insert(producer)
+
+        let consumer = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead Orchestrator",
+            taskName: "Review proposal",
+            status: .completed,
+            provider: "claude-code",
+            effort: "medium"
+        )
+        consumer.stageExecution = stage
+        consumer.inputBindingsJSON = try JSONEncoder().encode([
+            InputBinding(inputName: "proposal", artifactName: "proposal_current", producingAgentID: "proposal_writer")
+        ])
+        context.insert(consumer)
+
+        let artifact = Artifact(
+            name: "proposal_current",
+            contractID: "proposal_current",
+            format: .markdown,
+            filePath: workspace.artifactRoot.appendingPathComponent("proposal_current.md").path,
+            runID: run.id,
+            stageID: stage.stageID,
+            agentID: producer.agentID,
+            provider: producer.provider
+        )
+        artifact.agentExecution = producer
+        context.insert(artifact)
+        try context.save()
+
+        let siblingContext = ModelContext(container)
+        let siblingStages = try siblingContext.fetch(FetchDescriptor<StageExecution>())
+            .filter { $0.run?.id == run.id }
+        let doomedStage = try #require(siblingStages.first)
+        siblingContext.delete(doomedStage)
+        try siblingContext.save()
+
+        let consumers = ArtifactInspectorTraceabilityResolver.downstreamConsumers(
+            artifact: artifact,
+            run: run,
+            modelContext: context
+        )
+
+        #expect(consumers.isEmpty)
+    }
+
     @Test("Timeline error presentation summarizes verbose runtime errors")
     func timelineErrorPresentationSummarizesVerboseRuntimeErrors() {
         let raw = """

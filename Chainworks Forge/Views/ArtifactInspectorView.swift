@@ -23,6 +23,51 @@ enum ArtifactInspectorSkillTruthFormatter {
     }
 }
 
+enum ArtifactInspectorTraceabilityResolver {
+    @MainActor
+    static func downstreamConsumers(
+        artifact: Artifact,
+        run: Run,
+        modelContext: ModelContext
+    ) -> [AgentExecution] {
+        let freshContext = ModelContext(modelContext.container)
+        let stageSnapshots = RunStageSnapshotLoader.load(for: run.id, modelContext: freshContext)
+        let allowedAgentExecutionIDs = Set(stageSnapshots.flatMap(\.agentExecutions).map(\.id))
+        let artifactID = artifact.id
+
+        let producingAgentExecutionID: UUID? = {
+            let descriptor = FetchDescriptor<Artifact>(
+                predicate: #Predicate<Artifact> { candidate in
+                    candidate.id == artifactID
+                }
+            )
+            let freshArtifact = try? freshContext.fetch(descriptor).first
+            return freshArtifact?.agentExecution?.id
+        }()
+
+        let descriptor = FetchDescriptor<AgentExecution>()
+        let runAgents = ((try? freshContext.fetch(descriptor)) ?? []).filter { agent in
+            allowedAgentExecutionIDs.contains(agent.id)
+        }
+
+        return runAgents.filter { agent in
+            guard agent.id != producingAgentExecutionID else { return false }
+
+            if let bindingsData = agent.inputBindingsJSON,
+               let bindings = try? JSONDecoder().decode([InputBinding].self, from: bindingsData) {
+                return bindings.contains { $0.artifactName == artifact.name }
+            }
+
+            if let inputData = agent.consumedInputArtifactNamesJSON,
+               let inputNames = try? JSONDecoder().decode([String].self, from: inputData) {
+                return inputNames.contains(artifact.name)
+            }
+
+            return false
+        }
+    }
+}
+
 // MARK: - P005-OPS §9: Artifact Inspector V2
 
 /// Upgraded artifact inspector with:
@@ -153,8 +198,9 @@ struct ArtifactInspectorView: View {
                 openActions
             }
             .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minWidth: 920, minHeight: 560)
+        .frame(maxWidth: .infinity, minHeight: 560, alignment: .topLeading)
         .accessibilityIdentifier("artifact-inspector-view")
         .navigationTitle("Artifact Inspector")
         .task(id: artifact.id) {
@@ -309,9 +355,13 @@ struct ArtifactInspectorView: View {
     }
 
     private var proposalLoopSummary: ProposalLoopFeedbackSummary? {
-        let stages = run.stageExecutions
-        let agentExecutions = stages.flatMap(\.agentExecutions)
-        let allArtifacts = agentExecutions.flatMap(\.artifacts)
+        let runID = run.id
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { candidate in
+                candidate.runID == runID
+            }
+        )
+        let allArtifacts = (try? modelContext.fetch(descriptor)) ?? []
         let relevantNames: Set<String> = [
             "score_lift_backlog",
             "proposal_feedback_coverage",
@@ -324,25 +374,11 @@ struct ArtifactInspectorView: View {
     /// P005-OPS §9.3: Find downstream consumers via inputBindingsJSON (preferred)
     /// with consumedInputArtifactNamesJSON as fallback.
     private var downstreamConsumers: [AgentExecution] {
-        let allAgents = run.stageExecutions.flatMap { $0.agentExecutions }
-        return allAgents.filter { agent in
-            // Exclude the producing agent itself
-            guard agent.id != artifact.agentExecution?.id else { return false }
-
-            // Preferred: use structured inputBindingsJSON (§9.3 contract)
-            if let bindingsData = agent.inputBindingsJSON,
-               let bindings = try? JSONDecoder().decode([InputBinding].self, from: bindingsData) {
-                return bindings.contains { $0.artifactName == artifact.name }
-            }
-
-            // Fallback: legacy consumedInputArtifactNamesJSON
-            if let inputData = agent.consumedInputArtifactNamesJSON,
-               let inputNames = try? JSONDecoder().decode([String].self, from: inputData) {
-                return inputNames.contains(artifact.name)
-            }
-
-            return false
-        }
+        ArtifactInspectorTraceabilityResolver.downstreamConsumers(
+            artifact: artifact,
+            run: run,
+            modelContext: modelContext
+        )
     }
 
     private var shouldShowProposalLoopSummary: Bool {

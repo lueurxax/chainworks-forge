@@ -276,6 +276,73 @@ struct ResumeManagerTests {
         }
     }
 
+    @Test("startup normalization blocks stale running runs for manual resume")
+    func startupNormalizationBlocksStaleRunningRuns() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .running
+
+        let stageExecution = StageExecution(
+            stageID: "state_1",
+            label: "Draft",
+            startedAt: Date().addingTimeInterval(-30),
+            status: .running
+        )
+        stageExecution.run = run
+        run.stageExecutions.append(stageExecution)
+        context.insert(stageExecution)
+
+        let agentExecution = AgentExecution(
+            agentID: "test_agent",
+            agentTitle: "Test Agent",
+            taskName: "draft",
+            startedAt: Date().addingTimeInterval(-20),
+            status: .running,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agentExecution.stageExecution = stageExecution
+        stageExecution.agentExecutions.append(agentExecution)
+        context.insert(agentExecution)
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        let normalizedCount = try manager.normalizeInterruptedRunsForManualResume()
+
+        #expect(normalizedCount == 1)
+        #expect(run.status == .blocked)
+        #expect(stageExecution.status == .blocked)
+        #expect(stageExecution.settlementKind == .blocked)
+        #expect(agentExecution.status == .failed)
+        #expect(agentExecution.canonicalOutcome == .failedBeforeOutput)
+        #expect(agentExecution.providerStopReason == "interrupted_on_app_restart")
+        #expect(agentExecution.logSnippet?.contains("Manual resume required") == true)
+    }
+
+    @Test("startup normalization preserves waiting approval runs")
+    func startupNormalizationPreservesWaitingApprovalRuns() throws {
+        let (run, _, _) = try makeRunFromPlan()
+        run.status = .waitingApproval
+
+        let stageExecution = StageExecution(
+            stageID: "approval_stage",
+            label: "Approval",
+            startedAt: Date().addingTimeInterval(-30),
+            status: .waitingApproval
+        )
+        stageExecution.run = run
+        run.stageExecutions.append(stageExecution)
+        context.insert(stageExecution)
+        try context.save()
+
+        let manager = ResumeManager(modelContext: context)
+        let normalizedCount = try manager.normalizeInterruptedRunsForManualResume()
+
+        #expect(normalizedCount == 0)
+        #expect(run.status == .waitingApproval)
+        #expect(run.driftDetails == nil)
+        #expect(stageExecution.status == .waitingApproval)
+    }
+
     // MARK: - Classification
 
     @Test("Classify resumeable run")
@@ -461,6 +528,222 @@ struct ResumeManagerTests {
         #expect(catalogData == plan.catalogSnapshotJSON)
         #expect(workflowArtifact.runID == workspace.runID)
         #expect(catalogArtifact.runID == workspace.runID)
+    }
+
+    @Test("Run repository cleanup removes terminal runs and owned directories")
+    func runRepositoryCleanupRemovesTerminalRunsAndOwnedDirectories() async throws {
+        let idea = Idea(title: "Cleanup", body: "cleanup")
+        context.insert(idea)
+
+        let removableRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RunCleanup-\(UUID().uuidString)", isDirectory: true)
+        let removableArtifacts = removableRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: removableArtifacts, withIntermediateDirectories: true)
+        let reportURL = removableArtifacts.appendingPathComponent("report.md")
+        try Data("report".utf8).write(to: reportURL)
+
+        let removableRun = Run(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            workflowSnapshotHash: "wf-hash",
+            catalogSnapshotHash: "cat-hash",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: removableRoot.path,
+            artifactRoot: removableArtifacts.path
+        )
+        removableRun.idea = idea
+        removableRun.status = .completed
+        removableRun.completedAt = Date(timeIntervalSince1970: 100)
+        context.insert(removableRun)
+
+        let activeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RunCleanupActive-\(UUID().uuidString)", isDirectory: true)
+        let activeArtifacts = activeRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: activeArtifacts, withIntermediateDirectories: true)
+
+        let activeRun = Run(
+            workflowID: "wf-active",
+            workflowTitle: "WF Active",
+            workflowSnapshotHash: "wf-active-hash",
+            catalogSnapshotHash: "cat-active-hash",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: activeRoot.path,
+            artifactRoot: activeArtifacts.path
+        )
+        activeRun.idea = idea
+        activeRun.status = .running
+        context.insert(activeRun)
+        try context.save()
+
+        let repository = RunRepository(context: context)
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+        let removedDirectoryCount = await RunRepository.removeFilesystemRoots(cleanupPlan)
+
+        let remainingRuns = try context.fetch(FetchDescriptor<Run>())
+        #expect(cleanupPlan.deletedRunCount == 1)
+        #expect(cleanupPlan.deletedRunIDs == [removableRun.id])
+        #expect(removedDirectoryCount >= 1)
+        #expect(remainingRuns.count == 1)
+        #expect(remainingRuns.first?.id == activeRun.id)
+        #expect(!FileManager.default.fileExists(atPath: removableRoot.path))
+        #expect(FileManager.default.fileExists(atPath: activeRoot.path))
+    }
+
+    @Test("Run repository cleanup ignores active and blocked runs")
+    func runRepositoryCleanupIgnoresActiveAndBlockedRuns() async throws {
+        let idea = Idea(title: "No Cleanup", body: "still active")
+        context.insert(idea)
+
+        let blockedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RunCleanupBlocked-\(UUID().uuidString)", isDirectory: true)
+        let blockedArtifacts = blockedRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockedArtifacts, withIntermediateDirectories: true)
+
+        let blockedRun = Run(
+            workflowID: "wf-blocked",
+            workflowTitle: "WF Blocked",
+            workflowSnapshotHash: "wf-blocked-hash",
+            catalogSnapshotHash: "cat-blocked-hash",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: blockedRoot.path,
+            artifactRoot: blockedArtifacts.path
+        )
+        blockedRun.idea = idea
+        blockedRun.status = .blocked
+        context.insert(blockedRun)
+        try context.save()
+
+        let repository = RunRepository(context: context)
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+        let removedDirectoryCount = await RunRepository.removeFilesystemRoots(cleanupPlan)
+
+        let remainingRuns = try context.fetch(FetchDescriptor<Run>())
+        #expect(cleanupPlan.deletedRunCount == 0)
+        #expect(cleanupPlan.deletedRunIDs.isEmpty)
+        #expect(removedDirectoryCount == 0)
+        #expect(remainingRuns.count == 1)
+        #expect(remainingRuns.first?.id == blockedRun.id)
+        #expect(FileManager.default.fileExists(atPath: blockedRoot.path))
+    }
+
+    @Test("Run repository cleanup migrates referenced attachment into idea workspace")
+    func runRepositoryCleanupMigratesReferencedAttachmentIntoIdeaWorkspace() async throws {
+        let repository = RunRepository(context: context)
+
+        let repoRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IdeaRepo-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+
+        let idea = Idea(
+            title: "Referenced attachment",
+            body: "Uses a prior run artifact",
+            workspaceRootPath: repoRoot.path,
+            status: .active
+        )
+        context.insert(idea)
+
+        let runRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CleanupReferencedRun-\(UUID().uuidString)", isDirectory: true)
+        let artifactRoot = runRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let attachmentURL = artifactRoot.appendingPathComponent("proposal_current.md")
+        try Data("# proposal".utf8).write(to: attachmentURL)
+
+        let run = Run(
+            workflowID: "cleanup_test",
+            workflowTitle: "Cleanup Test",
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSourcePath: "test/workflow.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: runRoot.path,
+            artifactRoot: artifactRoot.path,
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+        run.status = .completed
+        run.idea = idea
+        idea.runs.append(run)
+        idea.attachmentPath = attachmentURL.path
+        context.insert(run)
+        try context.save()
+
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+        let migratedPath = try #require(idea.attachmentPath)
+
+        #expect(cleanupPlan.deletedRunCount == 1)
+        #expect(cleanupPlan.migratedAttachmentCount == 1)
+        #expect(cleanupPlan.protectedRunCount == 0)
+        #expect(cleanupPlan.deletedRunIDs.contains(run.id))
+        #expect(migratedPath != attachmentURL.path)
+        #expect(migratedPath.contains("/.chainworks/idea-attachments/"))
+        #expect(FileManager.default.fileExists(atPath: migratedPath))
+        #expect(try String(contentsOfFile: migratedPath) == "# proposal")
+
+        let removedDirectoryCount = await RunRepository.removeFilesystemRoots(cleanupPlan)
+        #expect(removedDirectoryCount >= 1)
+        #expect(FileManager.default.fileExists(atPath: attachmentURL.path) == false)
+        #expect(FileManager.default.fileExists(atPath: migratedPath))
+    }
+
+    @Test("Run repository cleanup protects referenced terminal run without idea workspace root")
+    func runRepositoryCleanupProtectsReferencedRunWithoutWorkspaceRoot() throws {
+        let repository = RunRepository(context: context)
+
+        let idea = Idea(
+            title: "Missing workspace root",
+            body: "Attachment still points into terminal run",
+            status: .active
+        )
+        context.insert(idea)
+
+        let runRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CleanupProtectedRun-\(UUID().uuidString)", isDirectory: true)
+        let artifactRoot = runRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let attachmentURL = artifactRoot.appendingPathComponent("review.md")
+        try Data("keep".utf8).write(to: attachmentURL)
+
+        let run = Run(
+            workflowID: "cleanup_test",
+            workflowTitle: "Cleanup Test",
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSourcePath: "test/workflow.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: runRoot.path,
+            artifactRoot: artifactRoot.path,
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+        run.status = .completed
+        run.idea = idea
+        idea.runs.append(run)
+        idea.attachmentPath = attachmentURL.path
+        context.insert(run)
+        try context.save()
+
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+
+        #expect(cleanupPlan.deletedRunCount == 0)
+        #expect(cleanupPlan.migratedAttachmentCount == 0)
+        #expect(cleanupPlan.protectedRunCount == 1)
+        #expect(cleanupPlan.protectedRunIDs == [run.id])
+        #expect(idea.attachmentPath == attachmentURL.path)
+        #expect(try context.fetch(FetchDescriptor<Run>()).contains(where: { $0.id == run.id }))
     }
 
     // MARK: - Side-Effect Detection
@@ -976,6 +1259,112 @@ struct ResumeManagerTests {
         #expect(run.driftDetails?.contains("Execution stalled after the last session closed") == true)
     }
 
+    @Test("ExecutionService maintenance tick reconciles stalled run without query access")
+    func executionServiceMaintenanceTickReconcilesStalledRunWithoutQueryAccess() throws {
+        let (run, plan, workspace) = try makeRunFromPlan()
+        let catalog = try loadCanonicalCatalog()
+        run.status = .running
+
+        let stage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+        try context.save()
+
+        let service = ExecutionService(modelContext: context, executor: FailingExecutor(), catalog: catalog)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: FailingExecutor(),
+            modelContext: context,
+            catalog: catalog
+        )
+
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: "test_agent",
+            event: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
+                detail: "Session closed"
+            )
+        )
+        service.registerTestingOrchestrator(orchestrator)
+
+        service.runMaintenanceTick()
+
+        #expect(run.status == .blocked)
+        #expect(run.presentationStatus == .blocked)
+        #expect(stage.status == .blocked)
+        #expect(service.orchestrator(for: run.id) == nil)
+    }
+
+    @Test("ExecutionService reconciles stalled run even when agent rows remain running after session closed")
+    func executionServiceReconcilesStalledRunWithStaleRunningAgentRows() throws {
+        let (run, plan, workspace) = try makeRunFromPlan()
+        let catalog = try loadCanonicalCatalog()
+        run.status = .running
+
+        let stage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let agentExecution = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "refine_implementation",
+            startedAt: Date().addingTimeInterval(-60),
+            status: .running,
+            provider: "codex",
+            effort: "high"
+        )
+        agentExecution.stageExecution = stage
+        stage.agentExecutions.append(agentExecution)
+        context.insert(agentExecution)
+        try context.save()
+
+        let service = ExecutionService(modelContext: context, executor: FailingExecutor(), catalog: catalog)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: FailingExecutor(),
+            modelContext: context,
+            catalog: catalog
+        )
+
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: "code_writer",
+            event: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
+                detail: "Session closed"
+            )
+        )
+        service.registerTestingOrchestrator(orchestrator)
+
+        service.runMaintenanceTick()
+
+        #expect(run.status == .blocked)
+        #expect(stage.status == .blocked)
+        #expect(agentExecution.status == .failed)
+        #expect(agentExecution.canonicalOutcome == .failedBeforeOutput)
+        #expect(agentExecution.providerStopReason == "session_closed_without_transition")
+        #expect(agentExecution.logSnippet?.contains("Resume required") == true)
+        #expect(service.orchestrator(for: run.id) == nil)
+    }
+
     @Test("ExecutionService does not reconcile fresh post-session idle run")
     func executionServiceDoesNotReconcileFreshPostSessionIdleRun() {
         let run = Run(
@@ -1408,6 +1797,194 @@ struct ResumeManagerTests {
             $0.stageID == "state_3_initial_proposal_approval" && $0.decision == .rejected
         }))
         #expect(fetchedApproval.decision == .rejected)
+        #expect(fetchedApproval.decidedAt != nil)
+    }
+
+    @Test("ExecutionService resolves persisted approval after relaunch without explicit resume")
+    func executionServiceResolvesPersistedApprovalAfterRelaunchWithoutExplicitResume() async throws {
+        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
+        let config = ModelConfiguration("ResumeManagerApprovalHydration-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let localContainer = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(localContainer)
+        let localContext = localContainer.mainContext
+        let localCompiler = RunPlanCompiler(modelContext: localContext)
+
+        let workflow = WorkflowDefinition(
+            schemaVersion: 1,
+            workflow: WorkflowMeta(
+                id: "approval_hydration",
+                name: "Approval Hydration",
+                usesAgentCatalog: nil,
+                description: "Approval should hydrate and resolve after relaunch",
+                ideaInput: nil,
+                execution: ExecutionConfig(singleActiveRunPerIdea: true, resumePolicy: "automatic_on_launch"),
+                requiredProviders: []
+            ),
+            variables: nil,
+            failurePolicy: nil,
+            scoring: nil,
+            initialState: "state_1",
+            states: [
+                "state_1": WorkflowState(
+                    label: "Draft",
+                    type: "start",
+                    owner: "test_agent",
+                    approval: nil,
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: [Transition(to: "state_2_gate", when: "true")]
+                ),
+                "state_2_gate": WorkflowState(
+                    label: "Approval Gate",
+                    type: "normal",
+                    owner: "test_agent",
+                    approval: "required",
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: [Transition(to: "state_3_done", when: "approval.granted == true")]
+                ),
+                "state_3_done": WorkflowState(
+                    label: "Done",
+                    type: "end",
+                    owner: "test_agent",
+                    approval: nil,
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: []
+                )
+            ]
+        )
+
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Approval hydration test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: "Test Skill", description: "Test")],
+            contracts: [:],
+            backendProfiles: [
+                "test_profile": BackendProfile(
+                    provider: "claude_code",
+                    model: "test-model",
+                    effort: "high",
+                    temperature: 0,
+                    maxTurns: 4,
+                    structuredOutput: "none"
+                )
+            ],
+            permissionProfiles: [
+                "TEST": PermissionProfile(
+                    filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                    git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                    shell: ShellPermissions(allow: nil, deny: nil),
+                    network: NetworkPermissions(allow: nil),
+                    mcp: MCPPermissions(allow: nil)
+                )
+            ],
+            agents: [
+                AgentDefinition(
+                    id: "test_agent",
+                    title: "Test Agent",
+                    mode: "tool_use",
+                    backendProfile: "test_profile",
+                    permissionProfile: "TEST",
+                    skillRef: "test_skill",
+                    skillRole: nil,
+                    worktreePolicy: nil,
+                    requiredTools: nil,
+                    inputs: [],
+                    outputs: [],
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    prompt: "Wait for approval",
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
+                )
+            ]
+        )
+
+        let plan = try localCompiler.previewCompile(workflow: workflow, catalog: catalog)
+        let idea = Idea(title: "Hydrate Approval", body: "Approval should survive relaunch without manual resume")
+        localContext.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HydrateApproval-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: localContext).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+        run.status = .waitingApproval
+        let persistedRunID = run.id
+
+        let stageExec = StageExecution(
+            stageID: "state_2_gate",
+            label: "Approval Gate",
+            status: .waitingApproval,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stageExec.run = run
+        localContext.insert(stageExec)
+
+        let approval = Approval(stageID: "state_2_gate", decision: .requested)
+        approval.run = run
+        localContext.insert(approval)
+        try localContext.save()
+
+        let service = ExecutionService(
+            modelContext: localContext,
+            executor: SimulatedAgentExecutor(),
+            catalog: catalog
+        )
+
+        #expect(service.pendingApprovalCount == 1)
+        let requestID = try #require(service.pendingApprovals.keys.first)
+
+        service.resolveApproval(approvalID: requestID, granted: true, comment: "resume from persisted approval")
+
+        await awaitCondition("Hydrated approval should clear after approval", timeout: 3.0) {
+            service.pendingApprovalCount == 0
+        }
+        await awaitCondition("Hydrated approval should complete the run", timeout: 3.0) {
+            run.status == .completed
+        }
+        await awaitCondition("Hydrated approval completion should detach orchestrator", timeout: 3.0) {
+            service.orchestrator(for: persistedRunID) == nil
+        }
+
+        let freshContext = ModelContext(localContainer)
+        let fetchedApproval = try #require(
+            freshContext.fetch(FetchDescriptor<Approval>()).first(where: {
+                $0.stageID == "state_2_gate" && $0.decision == .granted
+            })
+        )
         #expect(fetchedApproval.decidedAt != nil)
     }
 }

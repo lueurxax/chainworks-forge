@@ -69,6 +69,10 @@ final class RuntimeSessionBridge: Sendable {
         if !mcpResolution.blockingIssues.isEmpty && !isACPRuntime {
             throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
         }
+        let acpMCPServers = try resolveACPMCPServers(
+            report: mcpResolution,
+            transportNamespace: transport.mcpRuntimeNamespace
+        )
 
         let sessionRequest = RuntimeSessionRequest(
             systemPrompt: packet.systemPrompt,
@@ -90,7 +94,8 @@ final class RuntimeSessionBridge: Sendable {
                 "attempt": String(context.attemptNumber)
             ],
             // Proposal 026: ACP runtimes handle MCP natively — don't pass Goose extension IDs.
-            requestedExtensions: isACPRuntime ? nil : mcpResolution.predictedEffectiveRuntimeExtensionIDs
+            requestedExtensions: isACPRuntime ? nil : mcpResolution.predictedEffectiveRuntimeExtensionIDs,
+            mcpServers: acpMCPServers.isEmpty ? nil : acpMCPServers
         )
 
         let sessionResponse = try await transport.createSession(request: sessionRequest)
@@ -145,6 +150,89 @@ final class RuntimeSessionBridge: Sendable {
             providerBinding: context.providerBinding,
             gooseRegistry: gooseRegistry,
             runtimeNamespaceOverride: transport.mcpRuntimeNamespace
+        )
+    }
+
+    private func resolveACPMCPServers(
+        report: MCPPolicyResolutionReport,
+        transportNamespace: String?
+    ) throws -> [RuntimeMCPServerDefinition] {
+        guard let transportNamespace, transportNamespace != "goose" else {
+            return []
+        }
+        guard !(report.requiredRuntimeExtensionIDs + report.optionalRuntimeExtensionIDs).isEmpty else {
+            return []
+        }
+
+        let registry = try extensionRegistryProvider.registrySnapshot()
+        var realizedServers: [RuntimeMCPServerDefinition] = []
+        var blockingIssues: [String] = []
+
+        for runtimeID in report.requiredRuntimeExtensionIDs.sorted() {
+            do {
+                if let server = try Self.realizeACPServer(
+                    runtimeID: runtimeID,
+                    registry: registry,
+                    transportNamespace: transportNamespace
+                ) {
+                    realizedServers.append(server)
+                }
+            } catch {
+                blockingIssues.append(error.localizedDescription)
+            }
+        }
+
+        for runtimeID in report.optionalRuntimeExtensionIDs.sorted() {
+            if let server = try? Self.realizeACPServer(
+                runtimeID: runtimeID,
+                registry: registry,
+                transportNamespace: transportNamespace
+            ) {
+                realizedServers.append(server)
+            }
+        }
+
+        if !blockingIssues.isEmpty {
+            throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(blockingIssues.joined(separator: "; "))
+        }
+
+        return Array(
+            Dictionary(uniqueKeysWithValues: realizedServers.map { ($0.name, $0) }).values
+        ).sorted { $0.name < $1.name }
+    }
+
+    private static func realizeACPServer(
+        runtimeID: String,
+        registry: GooseExtensionRegistrySnapshot,
+        transportNamespace: String
+    ) throws -> RuntimeMCPServerDefinition? {
+        guard let definition = registry.configsByRuntimeID[runtimeID] else {
+            throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(
+                "Required MCP server '\(runtimeID)' is not installed in the local extension registry for runtime '\(transportNamespace)'."
+            )
+        }
+
+        let normalizedType = definition.type?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "stdio"
+        guard normalizedType == "stdio" else {
+            throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(
+                "Required MCP server '\(runtimeID)' uses unsupported transport '\(normalizedType)' for runtime '\(transportNamespace)'."
+            )
+        }
+        guard let command = definition.cmd, !command.isEmpty else {
+            throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(
+                "Required MCP server '\(runtimeID)' has no launch command in the local extension registry."
+            )
+        }
+
+        let env = (definition.envs ?? [:])
+            .map { RuntimeNameValue(name: $0.key, value: $0.value) }
+            .sorted { $0.name < $1.name }
+
+        return RuntimeMCPServerDefinition(
+            name: runtimeID.replacingOccurrences(of: "_", with: "-"),
+            command: command,
+            args: definition.args ?? [],
+            env: env
         )
     }
 
@@ -829,4 +917,3 @@ enum RuntimeSessionBridgeError: Error, LocalizedError {
         }
     }
 }
-

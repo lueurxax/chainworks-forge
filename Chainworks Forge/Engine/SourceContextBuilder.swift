@@ -53,21 +53,25 @@ struct SourceContextBuilder: Sendable {
     }
 
     private static func runGit(_ arguments: [String], in directory: URL) async throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = directory
+        let argumentsCopy = arguments
+        let directoryCopy = directory
 
-        let pipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = errorPipe
+        return try await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = argumentsCopy
+            process.currentDirectoryURL = directoryCopy
 
-        try process.run()
-        process.waitUntilExit()
+            let pipe = Pipe()
+            let errorPipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = errorPipe
 
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            try process.run()
+            process.waitUntilExit()
 
-        return output
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return output
+        }.value
     }
 }

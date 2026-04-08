@@ -482,31 +482,56 @@ struct PreflightService {
         warnings: inout [String],
         blockingIssues: inout [String]
     ) async {
+        let effectiveBindings = bindings.values
+            .filter { $0.configuredProviderID == provider.id }
+        let usesConfiguredTransport = effectiveBindings.contains { $0.transport == provider.transport.rawValue }
+        let runtimeSummary = Array(Set(
+            effectiveBindings.map { binding in
+                binding.runtimeProfileID ?? binding.adapterFamily ?? binding.transport
+            }
+        )).sorted().joined(separator: ", ")
+
         let snapshot = providerRegistry.healthSnapshot(for: provider.id)
         if provider.transport == .gooseServer {
-            let reachabilityIssue = snapshot.flatMap { ProviderAdapterSupport.gooseServerReachabilityIssue(from: $0.blockingIssues) }
             let title = "\(provider.displayName) Reachability"
-            if let reachabilityIssue {
+            if usesConfiguredTransport {
+                let reachabilityIssue = snapshot.flatMap { ProviderAdapterSupport.gooseServerReachabilityIssue(from: $0.blockingIssues) }
+                if let reachabilityIssue {
+                    checks.append(PreflightCheck(
+                        category: "Providers",
+                        title: title,
+                        status: .fail,
+                        message: reachabilityIssue
+                    ))
+                    blockingIssues.append(reachabilityIssue)
+                } else if let endpoint = provider.endpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !endpoint.isEmpty {
+                    checks.append(PreflightCheck(
+                        category: "Providers",
+                        title: title,
+                        status: snapshot == nil ? .warn : .pass,
+                        message: snapshot == nil
+                            ? "Reachability has not been checked yet"
+                            : "Goose server is reachable at \(ProviderAdapterSupport.gooseStatusURLString(for: endpoint))"
+                    ))
+                }
+            } else if !effectiveBindings.isEmpty {
                 checks.append(PreflightCheck(
                     category: "Providers",
                     title: title,
-                    status: .fail,
-                    message: reachabilityIssue
-                ))
-                blockingIssues.append(reachabilityIssue)
-            } else if let endpoint = provider.endpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !endpoint.isEmpty {
-                checks.append(PreflightCheck(
-                    category: "Providers",
-                    title: title,
-                    status: snapshot == nil ? .warn : .pass,
-                    message: snapshot == nil
-                        ? "Reachability has not been checked yet"
-                        : "Goose server is reachable at \(ProviderAdapterSupport.gooseStatusURLString(for: endpoint))"
+                    status: .pass,
+                    message: "Effective bindings use runtime-managed transport (\(runtimeSummary)); configured Goose reachability is not on the execution path."
                 ))
             }
         }
-        let healthStatus = mapProviderStatus(snapshot)
-        let healthMessage = snapshot?.summary ?? "Health not yet verified"
+        let healthStatus: PreflightCheckStatus
+        let healthMessage: String
+        if usesConfiguredTransport || effectiveBindings.isEmpty {
+            healthStatus = mapProviderStatus(snapshot)
+            healthMessage = snapshot?.summary ?? "Health not yet verified"
+        } else {
+            healthStatus = .pass
+            healthMessage = "Effective bindings use runtime-managed transport (\(runtimeSummary)); configured provider transport health is informational only."
+        }
         checks.append(PreflightCheck(
             category: "Providers",
             title: "\(provider.displayName) Health",
@@ -531,6 +556,15 @@ struct PreflightService {
             }
         )
         for model in boundModels.sorted() {
+            if !usesConfiguredTransport && !effectiveBindings.isEmpty {
+                checks.append(PreflightCheck(
+                    category: "Providers",
+                    title: "\(provider.displayName) Model",
+                    status: .pass,
+                    message: "Model \(model) is bound through runtime-managed transport (\(runtimeSummary)); configured provider inventory is not authoritative on this path."
+                ))
+                continue
+            }
             let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let isAvailable = normalizedAvailableModels.isEmpty || normalizedAvailableModels.contains(normalizedModel)
             let message = isAvailable

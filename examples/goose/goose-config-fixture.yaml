@@ -13,12 +13,25 @@ extensions:
     name: todo
   xcode:
     enabled: false
-    type: builtin
+    type: stdio
     name: xcode
+    cmd: xcrun
+    args:
+    - mcpbridge
+    envs: {}
+    env_keys: []
+    timeout: 300
   context7:
     enabled: false
-    type: builtin
+    type: stdio
     name: context7
+    cmd: npx
+    args:
+    - -y
+    - '@upstash/context7-mcp'
+    envs: {}
+    env_keys: []
+    timeout: 300
   summarize:
     enabled: false
     type: builtin

@@ -13,6 +13,8 @@ import SwiftData
 @MainActor
 struct RunRepository {
     private let context: ModelContext
+    private static let terminalCleanupStatuses: Set<RunStatus> = [.completed, .failed, .cancelled]
+    private static let preservedIdeaAttachmentFolder = ".chainworks/idea-attachments"
 
     init(context: ModelContext) {
         self.context = context
@@ -168,7 +170,201 @@ struct RunRepository {
         return idea.runs.first(where: { activeStatuses.contains($0.status) })
     }
 
+    func terminalRunsEligibleForCleanup() -> [Run] {
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let allRuns = (try? context.fetch(descriptor)) ?? []
+        return allRuns.filter { Self.terminalCleanupStatuses.contains($0.status) }
+    }
+
+    func prepareTerminalRunCleanup() throws -> RunCleanupPlan {
+        let candidateRuns = terminalRunsEligibleForCleanup()
+        let migrationResult = try preserveIdeaAttachmentReferences(for: candidateRuns)
+        let runs = candidateRuns.filter { !migrationResult.protectedRunIDs.contains($0.id) }
+        let paths = runs.flatMap(Self.cleanupPaths(for:))
+        let deletedRunIDs = runs.map(\.id)
+
+        for run in runs {
+            context.delete(run)
+        }
+
+        if context.hasChanges {
+            try context.save()
+        }
+
+        return RunCleanupPlan(
+            deletedRunCount: runs.count,
+            deletedRunIDs: deletedRunIDs,
+            filesystemPaths: Array(Set(paths)).sorted { $0.count > $1.count },
+            migratedAttachmentCount: migrationResult.migratedAttachmentCount,
+            protectedRunCount: migrationResult.protectedRunIDs.count,
+            protectedRunIDs: migrationResult.protectedRunIDs.sorted { $0.uuidString < $1.uuidString }
+        )
+    }
+
+    nonisolated static func removeFilesystemRoots(_ plan: RunCleanupPlan) async -> Int {
+        guard !plan.filesystemPaths.isEmpty else { return 0 }
+
+        return await Task.detached(priority: .utility) {
+            let fileManager = FileManager.default
+            var removedCount = 0
+
+            for path in plan.filesystemPaths where shouldRemoveOwnedPath(path) {
+                guard fileManager.fileExists(atPath: path) else { continue }
+                do {
+                    try fileManager.removeItem(atPath: path)
+                    removedCount += 1
+                } catch {
+                    await ForgeLogger.app.error("Run cleanup failed to remove path \(path): \(error.localizedDescription)")
+                }
+            }
+
+            return removedCount
+        }.value
+    }
+
     // MARK: - Cohort Metadata Derivation (Proposal 003 — REQ-002)
+
+    private static func cleanupPaths(for run: Run) -> [String] {
+        let workspaceRoot = normalizedCleanupPath(run.workspaceRoot)
+        let artifactRoot = normalizedCleanupPath(run.artifactRoot)
+        let worktreeRoot = normalizedCleanupPath(run.worktreeRoot)
+
+        var paths: [String] = []
+        if let workspaceRoot {
+            paths.append(workspaceRoot)
+        }
+
+        if let artifactRoot,
+           paths.contains(where: { artifactRoot.hasPrefix($0 + "/") || artifactRoot == $0 }) == false {
+            paths.append(artifactRoot)
+        }
+
+        if let worktreeRoot,
+           paths.contains(where: { worktreeRoot.hasPrefix($0 + "/") || worktreeRoot == $0 }) == false {
+            paths.append(worktreeRoot)
+        }
+
+        return paths
+    }
+
+    private func preserveIdeaAttachmentReferences(for runs: [Run]) throws -> AttachmentMigrationResult {
+        guard !runs.isEmpty else {
+            return AttachmentMigrationResult(migratedAttachmentCount: 0, protectedRunIDs: [])
+        }
+
+        let runCleanupRoots = Dictionary(uniqueKeysWithValues: runs.map { run in
+            (run.id, Self.cleanupPaths(for: run))
+        })
+        let runByID = Dictionary(uniqueKeysWithValues: runs.map { ($0.id, $0) })
+
+        let descriptor = FetchDescriptor<Idea>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+        let ideas = try context.fetch(descriptor)
+
+        var migratedAttachmentCount = 0
+        var protectedRunIDs = Set<UUID>()
+        let fileManager = FileManager.default
+
+        for idea in ideas {
+            guard let attachmentPath = Self.normalizedCleanupPath(idea.attachmentPath) else { continue }
+            guard let runID = owningCleanupRunID(for: attachmentPath, cleanupRootsByRunID: runCleanupRoots) else { continue }
+            guard protectedRunIDs.contains(runID) == false else { continue }
+
+            guard let run = runByID[runID] else { continue }
+            guard let workspaceRootPath = Self.normalizedCleanupPath(idea.workspaceRootPath) else {
+                protectedRunIDs.insert(runID)
+                continue
+            }
+
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: workspaceRootPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+                protectedRunIDs.insert(runID)
+                continue
+            }
+
+            guard fileManager.fileExists(atPath: attachmentPath) else {
+                continue
+            }
+
+            let destinationURL = uniqueIdeaAttachmentDestination(
+                ideaID: idea.id,
+                workspaceRootPath: workspaceRootPath,
+                sourcePath: attachmentPath
+            )
+            try fileManager.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fileManager.copyItem(at: URL(fileURLWithPath: attachmentPath), to: destinationURL)
+
+            idea.attachmentPath = destinationURL.path
+            run.driftDetails = mergedPreservedAttachmentNote(existing: run.driftDetails, destinationPath: destinationURL.path)
+            migratedAttachmentCount += 1
+        }
+
+        return AttachmentMigrationResult(
+            migratedAttachmentCount: migratedAttachmentCount,
+            protectedRunIDs: Array(protectedRunIDs)
+        )
+    }
+
+    private func owningCleanupRunID(
+        for attachmentPath: String,
+        cleanupRootsByRunID: [UUID: [String]]
+    ) -> UUID? {
+        cleanupRootsByRunID.first { _, roots in
+            roots.contains(where: { root in
+                attachmentPath == root || attachmentPath.hasPrefix(root + "/")
+            })
+        }?.key
+    }
+
+    private func uniqueIdeaAttachmentDestination(
+        ideaID: UUID,
+        workspaceRootPath: String,
+        sourcePath: String
+    ) -> URL {
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+        let baseDirectory = URL(fileURLWithPath: workspaceRootPath, isDirectory: true)
+            .appendingPathComponent(Self.preservedIdeaAttachmentFolder, isDirectory: true)
+            .appendingPathComponent(ideaID.uuidString, isDirectory: true)
+
+        let rawBaseName = sourceURL.deletingPathExtension().lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseName = rawBaseName.isEmpty ? "attachment" : rawBaseName
+        let ext = sourceURL.pathExtension
+        var candidate = baseDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+        var suffix = 1
+
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let nextName = ext.isEmpty ? "\(baseName)-\(suffix)" : "\(baseName)-\(suffix).\(ext)"
+            candidate = baseDirectory.appendingPathComponent(nextName)
+            suffix += 1
+        }
+
+        return candidate
+    }
+
+    private func mergedPreservedAttachmentNote(existing: String?, destinationPath: String) -> String {
+        let note = "Referenced attachment preserved at \(destinationPath) before terminal run cleanup."
+        let existing = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !existing.isEmpty else { return note }
+        guard !existing.localizedCaseInsensitiveContains("attachment preserved at") else { return existing }
+        return "\(existing) \(note)"
+    }
+
+    private static func normalizedCleanupPath(_ rawPath: String?) -> String? {
+        guard let rawPath else { return nil }
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(fileURLWithPath: trimmed).standardizedFileURL.path
+    }
+
+    nonisolated private static func shouldRemoveOwnedPath(_ path: String) -> Bool {
+        guard path != "/", path.isEmpty == false else { return false }
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let tempRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        if standardized.hasPrefix(tempRoot + "/") {
+            return true
+        }
+        return standardized.contains("/Library/Application Support/Chainworks Forge/runs/")
+            || standardized.contains("/Library/Application Support/Chainworks Forge/worktrees/")
+    }
 
     /// Derive `workflowFamily` from the workflow ID.
     /// e.g. "proposal_to_release_v1" → "proposal_to_release".
@@ -194,6 +390,20 @@ struct RunRepository {
             .replacingOccurrences(of: " ", with: "_")
         return title.isEmpty ? "untagged" : title
     }
+}
+
+struct RunCleanupPlan: Sendable {
+    let deletedRunCount: Int
+    let deletedRunIDs: [UUID]
+    let filesystemPaths: [String]
+    let migratedAttachmentCount: Int
+    let protectedRunCount: Int
+    let protectedRunIDs: [UUID]
+}
+
+private struct AttachmentMigrationResult: Sendable {
+    let migratedAttachmentCount: Int
+    let protectedRunIDs: [UUID]
 }
 
 enum RunRepositoryError: Error, LocalizedError {

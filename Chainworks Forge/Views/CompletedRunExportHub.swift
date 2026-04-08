@@ -21,6 +21,10 @@ struct CompletedRunExportHub: View {
     @State private var signOffSnapshot: MVPSignOffDecisionSnapshot?
     @State private var selectedArtifact: Artifact?
 
+    private var stageSnapshots: [RunStageSnapshot] {
+        RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
+    }
+
     /// Evidence-pack lifecycle status per §7.5.
     enum EvidencePackStatus: String {
         case missing = "Missing"
@@ -107,6 +111,7 @@ struct CompletedRunExportHub: View {
             NavigationStack {
                 ArtifactInspectorView(artifact: artifact, run: run)
             }
+            .frame(minWidth: 960, minHeight: 640)
         }
         .task {
             loadRunData()
@@ -154,7 +159,7 @@ struct CompletedRunExportHub: View {
                     Divider().frame(height: 44)
                     metricCell(
                         label: "Stages",
-                        value: "\(completedStageCount)/\(run.stageExecutions.count)",
+                        value: "\(completedStageCount)/\(stageSnapshots.count)",
                         icon: "rectangle.stack.fill",
                         tint: .purple
                     )
@@ -425,9 +430,9 @@ struct CompletedRunExportHub: View {
                 let receiptArtifacts = allArtifacts.filter {
                     $0.name.localizedCaseInsensitiveContains("receipt")
                 }
-                let providerReceipts = run.stageExecutions
+                let providerReceipts = stageSnapshots
                     .flatMap(\.agentExecutions)
-                    .filter { $0.providerReceiptJSON != nil }
+                    .filter { $0.providerReceiptPresent }
 
                 HStack(spacing: 16) {
                     HStack(spacing: 4) {
@@ -477,7 +482,7 @@ struct CompletedRunExportHub: View {
 
     private var perStageReceiptBreakdown: some View {
         GroupBox {
-            let sortedStages = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
+            let sortedStages = stageSnapshots
 
             if sortedStages.isEmpty {
                 Text("No stage data available.")
@@ -507,7 +512,7 @@ struct CompletedRunExportHub: View {
                             .font(.caption)
 
                             // Per-agent breakdown
-                            ForEach(stage.agentExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { agent in
+                            ForEach(stage.agentExecutions) { agent in
                                 VStack(alignment: .leading, spacing: 3) {
                                     HStack {
                                         Image(systemName: "person.circle")
@@ -538,7 +543,7 @@ struct CompletedRunExportHub: View {
                                         Text("\(agent.provider) / \(agent.resolvedModel ?? "default")")
                                             .font(.caption2.monospaced())
                                             .foregroundStyle(.secondary)
-                                        if agent.providerReceiptJSON != nil {
+                                        if agent.providerReceiptPresent {
                                             Image(systemName: "checkmark.circle.fill")
                                                 .font(.caption2)
                                                 .foregroundStyle(.green)
@@ -926,7 +931,7 @@ struct CompletedRunExportHub: View {
     }
 
     private var completedStageCount: Int {
-        run.stageExecutions.filter { $0.status == .completed }.count
+        stageSnapshots.filter { $0.status == .completed }.count
     }
 
     // MARK: - Helpers
@@ -939,8 +944,8 @@ struct CompletedRunExportHub: View {
         return "\(secs)s"
     }
 
-    private func stageArtifactCount(_ stage: StageExecution) -> Int {
-        allArtifacts.filter { $0.stageID == stage.stageID }.count
+    private func stageArtifactCount(_ stage: RunStageSnapshot) -> Int {
+        allArtifacts.filter { $0.stageID == stage.stageID && $0.attemptNumber == stage.attemptNumber }.count
     }
 
     private func artifact(named name: String) -> Artifact? {

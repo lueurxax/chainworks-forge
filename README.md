@@ -9,6 +9,28 @@ Chainworks Forge is a macOS SwiftUI control plane for agent-driven engineering w
 It is built around one idea: the primary object is not a chat thread. It is a **Run**.
 A run takes one idea, compiles a frozen workflow snapshot, routes work through specialized agents, pauses at explicit approval gates, stores durable artifacts, and leaves behind a truthful report of what happened.
 
+## Why This Project Exists
+
+Chainworks Forge did not start as a generic AI chat app.
+It started from a practical frustration: too much engineering work was still happening through repetitive manual steps.
+
+The first version of the idea was much closer to "a workflow orchestrator on top of `goosed`."
+After experimenting with Goose and seeing how interesting multi-agent coordination could become when different agents had different roles, parameters, and responsibilities, the project expanded from a thin wrapper into a real operator-facing workflow system.
+
+The turning point was simple: once the workflows became useful, too many important actions still depended on manual coordination.
+That pushed the project toward a stricter model:
+
+- workflows instead of ad hoc prompt chains
+- explicit agent roles instead of one general-purpose assistant
+- durable artifacts and reports instead of ephemeral chat history
+- approval gates instead of invisible autonomous continuation
+- runtime abstraction instead of hard-coding one backend forever
+
+That is why the runtime story changed as well.
+The project originally leaned on Goose and `goosed` as the practical execution substrate.
+Today, the product is moving away from Goose as the canonical transport model and toward a set of ACP-backed runtimes such as Codex, Claude Code, and Gemini.
+Goose still matters as legacy and compatibility infrastructure, but it is no longer the long-term center of the design.
+
 ## What The App Does
 
 - captures ideas as units of engineering work
@@ -20,6 +42,19 @@ A run takes one idea, compiles a frozen workflow snapshot, routes work through s
 - keeps repo-backed delivery and release work behind explicit gates
 
 In practice, Chainworks Forge sits between ad hoc AI chats and heavyweight orchestration systems: local-first, inspectable, and built for one engineer running governed multi-agent workflows from a desktop app.
+
+## Product Direction
+
+The current direction is:
+
+- ACP-first runtime transport
+- frozen run truth and operator-visible recovery
+- backend-specific agent tuning through catalog-defined workflows
+- local-first execution with explicit provider/runtime diagnostics
+- compatibility retained where useful, but not treated as the long-term architecture
+
+The project is intentionally opinionated.
+It assumes that workflow truth, artifacts, approvals, and recovery matter more than "just keep chatting," especially once multiple agents, repos, and delivery steps are involved.
 
 ## Core Concepts
 
@@ -57,7 +92,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
 - operator-facing run, approval, report, recovery, and comparison surfaces
-- provider configuration, remediation, and live Goose-backed execution slices
+- provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
@@ -91,7 +126,8 @@ The repository is no longer a scaffold. It already contains the core control-pla
 - provider platform slices:
   - provider settings
   - pilot readiness
-  - Goose-backed diagnostics and remediation
+  - ACP-oriented runtime dispatch and provider bindings
+  - Goose compatibility diagnostics and remediation
   - frozen provider/model provenance truth
 - repo-backed delivery slice:
   - worktree provisioning
@@ -131,6 +167,7 @@ Chainworks Forge/
 - macOS compatible with the app target (`MACOSX_DEPLOYMENT_TARGET = 26.2`)
 - Xcode `26.3` or newer
 - a configured provider runtime if you want live agent execution (`Codex`, `Claude Code`, or `Gemini`)
+- provider CLIs and ACP-capable runtimes where required by the selected backend profiles
 - optional: an approved remote UI host if you need canonical UI smoke or full sign-off gates
 
 ### Clone The Repository
@@ -152,7 +189,7 @@ open "Chainworks Forge.xcodeproj"
 ./scripts/test-gate.sh build
 ```
 
-Then run the app from Xcode. On first launch, use `Settings` to configure providers, diagnostics, and remediation. If you want live execution, make sure the selected provider is reachable and any required local services are running.
+Then run the app from Xcode. On first launch, use `Settings` to configure providers, diagnostics, and remediation. If you want live execution, make sure the selected ACP/provider runtime is installed and authenticated, and that any compatibility services you still rely on are running.
 
 ### Default Engineering Gate
 
@@ -196,6 +233,8 @@ Start here:
 - [`docs/reference/current-system-baseline.md`](docs/reference/current-system-baseline.md) — current-head subsystem map and baseline
 - [`docs/ps/chainworks-forge-mvp.md`](docs/ps/chainworks-forge-mvp.md) — MVP scope and requirements
 - [`docs/research/chainworks_core_idea.md`](docs/research/chainworks_core_idea.md) — product vision and positioning
+- [`docs/proposals/026-acp-first-runtime-transport-and-goose-decoupling.md`](docs/proposals/026-acp-first-runtime-transport-and-goose-decoupling.md) — additive ACP runtime rollout
+- [`docs/proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md`](docs/proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md) — target architecture after Goose stops being canonical
 
 Implemented-system references:
 

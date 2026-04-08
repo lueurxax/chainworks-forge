@@ -193,11 +193,8 @@ That means MCP policy is not a background adapter detail. It is part of the prod
 
 Current stable verification for this slice is:
 
-- focused same-tree gate:
-  - `proposal-025`
-  - `36/36` passed on the current tree
-- focused gate still re-proves the portability-sensitive MCP assertions
+- dedicated MCP capability regression coverage on the current tree
+- current focused verification summary `36/36` passed
+- capability verification still re-proves the portability-sensitive MCP assertions
 - same-tree approved-host `full` green basis:
   - `full-20260408-101540.xcresult`
-
-The historical gate name remains for reproducibility, but the MCP functionality described here is part of the permanent application baseline.

@@ -16,11 +16,13 @@ final class WorkflowMapProjectionService {
         guard let (plan, _) = try? compiler.rebuildPlanFromSnapshot(run: run) else {
             return nil
         }
+        let persistedStages = RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
+        let persistedApprovals = PersistedRunGraph.approvals(for: run)
 
         let topology = WorkflowMapTopologyBuilder(plan: plan)
         let orderedStateIDs = topology.orderedStateIDs()
         let liveTimeline = executionService.orchestrator(for: run.id)?.liveTimeline ?? []
-        let persistedTimeline = buildPersistedTimeline(run: run, plan: plan)
+        let persistedTimeline = buildPersistedTimeline(stages: persistedStages, approvals: persistedApprovals, plan: plan)
         let providerBindings = decodeProviderBindings(from: run.providerBindingSnapshotJSON)
 
         let stages: [WorkflowMapStageProjection] = orderedStateIDs.enumerated().compactMap { index, stateID in
@@ -29,6 +31,8 @@ final class WorkflowMapProjectionService {
                 run: run,
                 plan: plan,
                 topology: topology,
+                persistedStages: persistedStages,
+                currentStageID: run.currentStageID,
                 stateID: stateID,
                 state: state,
                 order: index,
@@ -71,10 +75,14 @@ final class WorkflowMapProjectionService {
         )
     }
 
-    private func buildPersistedTimeline(run: Run, plan: RunPlan) -> [WorkflowMapPersistedTimelineEntry] {
+    private func buildPersistedTimeline(
+        stages: [RunStageSnapshot],
+        approvals: [Approval],
+        plan: RunPlan
+    ) -> [WorkflowMapPersistedTimelineEntry] {
         var entries: [WorkflowMapPersistedTimelineEntry] = []
 
-        for stage in run.stageExecutions {
+        for stage in stages {
             let timestamp = stage.completedAt ?? stage.startedAt
             let stageLabel = plan.states[stage.stageID]?.label ?? stage.label
             entries.append(
@@ -87,7 +95,7 @@ final class WorkflowMapProjectionService {
             )
         }
 
-        for approval in run.approvals {
+        for approval in approvals {
             let timestamp = approval.decidedAt ?? approval.requestedAt
             let stageLabel = plan.states[approval.stageID]?.label ?? approval.stageID
             entries.append(
@@ -107,12 +115,14 @@ final class WorkflowMapProjectionService {
         run: Run,
         plan: RunPlan,
         topology: WorkflowMapTopologyBuilder,
+        persistedStages: [RunStageSnapshot],
+        currentStageID: String?,
         stateID: String,
         state: ExecutableState,
         order: Int,
         providerBindings: [String: ResolvedProviderBinding]
     ) -> WorkflowMapStageProjection? {
-        let stageExecutions = run.stageExecutions
+        let stageExecutions = persistedStages
             .filter { $0.stageID == stateID }
             .sorted {
                 if $0.iteration == $1.iteration {
@@ -127,8 +137,8 @@ final class WorkflowMapProjectionService {
         let latestAttempt = latestStageExecution?.attemptNumber ?? 0
 
         let occurrences = buildOccurrences(
-            run: run,
             plan: plan,
+            persistedStages: persistedStages,
             stateID: stateID,
             state: state,
             providerBindings: providerBindings
@@ -155,7 +165,7 @@ final class WorkflowMapProjectionService {
             iteration: latestIteration,
             attemptNumber: latestAttempt,
             approvalRequired: state.approvalRequired,
-            isCurrent: run.currentStageID == stateID,
+            isCurrent: currentStageID == stateID,
             occurrences: occurrences,
             handoffs: handoffs,
             transitions: transitions,
@@ -164,14 +174,14 @@ final class WorkflowMapProjectionService {
     }
 
     private func buildOccurrences(
-        run: Run,
         plan: RunPlan,
+        persistedStages: [RunStageSnapshot],
         stateID: String,
         state: ExecutableState,
         providerBindings: [String: ResolvedProviderBinding]
     ) -> [WorkflowMapOccurrenceProjection] {
         let descriptors = makeDescriptors(for: state)
-        let stageExecutions = run.stageExecutions.filter { $0.stageID == stateID }
+        let stageExecutions = persistedStages.filter { $0.stageID == stateID }
 
         return descriptors.enumerated().map { index, descriptor in
             let execution = findExecution(
@@ -195,8 +205,8 @@ final class WorkflowMapProjectionService {
                 executionCount: stageExecutions.flatMap(\.agentExecutions).filter { $0.agentID == descriptor.agentID && $0.taskName == descriptor.taskName }.count,
                 startedAt: execution?.startedAt,
                 completedAt: execution?.completedAt,
-                sessionID: execution?.providerSessionID ?? execution?.runtimeSessionID,
-                requestID: execution?.providerRequestID,
+                sessionID: nil,
+                requestID: nil,
                 logSnippet: execution?.logSnippet,
                 ordinal: index
             )
@@ -400,8 +410,8 @@ final class WorkflowMapProjectionService {
 
     private func findExecution(
         for descriptor: TaskDescriptor,
-        in stageExecutions: [StageExecution]
-    ) -> AgentExecution? {
+        in stageExecutions: [RunStageSnapshot]
+    ) -> RunStageAgentSnapshot? {
         let candidates = stageExecutions.flatMap { $0.agentExecutions }
             .filter { $0.agentID == descriptor.agentID && $0.taskName == descriptor.taskName }
             .sorted {

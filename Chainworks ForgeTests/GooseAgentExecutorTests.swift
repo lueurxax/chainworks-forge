@@ -663,8 +663,11 @@ struct RuntimeAgentExecutorTests {
             providerIdentifier: "gemini",
             model: "gemini-2.5-pro",
             effort: "medium",
-            transport: "gooseServer",
-            adapterVersion: "v1"
+            transport: "acp_stdio",
+            adapterVersion: "v1",
+            runtimeProfileID: "gemini_cli_acp",
+            adapterFamily: "gemini_cli_acp",
+            capabilityClass: .operatorGrade
         )
         let agent = ResolvedAgent(
             id: "proposal_reviewer_ui",
@@ -716,6 +719,7 @@ struct RuntimeAgentExecutorTests {
         #expect(result.resolvedModel == "gemini-2.5-pro")
         #expect(result.providerReceipt?.providerFamily == "gemini")
         #expect(result.providerReceipt?.model == "gemini-2.5-pro")
+        #expect(result.providerReceipt?.transport == "acp_stdio")
         #expect(result.configuredProviderID == configuredProviderID)
 
         let receiptKey = try #require(result.outputs.keys.first { $0.hasSuffix("_receipt.json") })

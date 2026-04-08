@@ -49,6 +49,8 @@ struct RuntimeSessionRequest: Codable, Sendable {
     let metadata: [String: String]?
     /// Requested session-scoped MCP / extension set for runtimes that support reconciliation.
     let requestedExtensions: [String]?
+    /// Concrete ACP-native MCP server definitions for runtimes that accept per-session server injection.
+    let mcpServers: [RuntimeMCPServerDefinition]?
 
     init(
         systemPrompt: String,
@@ -57,7 +59,8 @@ struct RuntimeSessionRequest: Codable, Sendable {
         provider: String?,
         executionPolicy: RuntimeExecutionPolicy?,
         metadata: [String: String]?,
-        requestedExtensions: [String]? = nil
+        requestedExtensions: [String]? = nil,
+        mcpServers: [RuntimeMCPServerDefinition]? = nil
     ) {
         self.systemPrompt = systemPrompt
         self.workingDirectory = workingDirectory
@@ -66,6 +69,73 @@ struct RuntimeSessionRequest: Codable, Sendable {
         self.executionPolicy = executionPolicy
         self.metadata = metadata
         self.requestedExtensions = requestedExtensions
+        self.mcpServers = mcpServers
+    }
+}
+
+// MARK: - RuntimeMCPServerDefinition
+
+/// Machine-local MCP server definition materialized for ACP `session/new`.
+/// Repo YAML never owns these launch details; the bridge derives them from the
+/// local extension registry after MCP policy resolution selects logical server IDs.
+struct RuntimeMCPServerDefinition: Codable, Equatable, Sendable {
+    let name: String
+    let type: String?
+    let command: String?
+    let args: [String]
+    let env: [RuntimeNameValue]
+    let url: String?
+    let headers: [RuntimeNameValue]
+
+    init(
+        name: String,
+        type: String? = nil,
+        command: String? = nil,
+        args: [String] = [],
+        env: [RuntimeNameValue] = [],
+        url: String? = nil,
+        headers: [RuntimeNameValue] = []
+    ) {
+        self.name = name
+        self.type = type
+        self.command = command
+        self.args = args
+        self.env = env
+        self.url = url
+        self.headers = headers
+    }
+
+    func acpJSONObject() -> [String: Any] {
+        var object: [String: Any] = [
+            "name": name
+        ]
+        if let type, !type.isEmpty {
+            object["type"] = type
+        }
+        if let command, !command.isEmpty {
+            object["command"] = command
+            object["args"] = args
+            object["env"] = env.map(\.jsonObject)
+        }
+        if let url, !url.isEmpty {
+            object["url"] = url
+            if !headers.isEmpty {
+                object["headers"] = headers.map(\.jsonObject)
+            }
+        }
+        return object
+    }
+}
+
+struct RuntimeNameValue: Codable, Equatable, Sendable {
+    let name: String
+    let value: String
+
+    var jsonObject: [String: String] {
+        [
+            "name": name,
+            "value": value
+        ]
     }
 }
 

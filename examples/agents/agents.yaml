@@ -125,16 +125,11 @@ mcp_server_registry:
     assignment_policy: explicit_opt_in
     risk_class: normal
     notes: Bounded analysis lane for steward and audit-style work.
-  todo:
-    runtime_ids:
-      goose: todo
-    session_scoped: true
-    assignment_policy: explicit_opt_in
-    risk_class: normal
-    notes: Narrow task-structuring aid.
   xcode:
     runtime_ids:
       goose: xcode
+      claude_agent: xcode
+      gemini_cli: xcode
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
@@ -142,6 +137,7 @@ mcp_server_registry:
   context7:
     runtime_ids:
       goose: context7
+      claude_agent: context7
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
@@ -153,13 +149,6 @@ mcp_server_registry:
     assignment_policy: opt_in_high_burn
     risk_class: broad
     notes: Broad summarization lane; disabled by default.
-  summon:
-    runtime_ids:
-      goose: summon
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Parallelization/coordination helper with burn risk if overused.
   autovisualiser:
     runtime_ids:
       goose: autovisualiser
@@ -573,6 +562,7 @@ backend_profiles:
     temperature: 0.15
     max_turns: 18
     structured_output: preferred
+    runtime_profile: claude_agent_acp
   codex_writer_high:
     provider: codex
     model: GPT-5.4
@@ -587,6 +577,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 14
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_design_medium:
     provider: claude_code
     model: opus
@@ -594,6 +585,7 @@ backend_profiles:
     temperature: 0.2
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex
     model: GPT-5.4
@@ -622,6 +614,7 @@ backend_profiles:
     temperature: 0.0
     max_turns: 16
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_prepush_medium:
     provider: claude_code
     model: opus
@@ -629,6 +622,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   codex_ops_low:
     provider: codex
     model: GPT-5.4
@@ -643,6 +637,7 @@ backend_profiles:
     temperature: 0.2
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_steward_high:
     provider: claude_code
     model: opus
@@ -650,6 +645,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 16
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_auditor_medium:
     provider: claude_code
     model: opus
@@ -657,6 +653,7 @@ backend_profiles:
     temperature: 0.0
     max_turns: 14
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_retrospective_medium:
     provider: claude_code
     model: opus
@@ -664,6 +661,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   gemini_3_1_pro_preview_high:
     provider: gemini
     model: gemini-3.1-pro-preview
@@ -1551,10 +1549,8 @@ mcp_profiles:
     optional_extensions: []
     fallback_policy: allow_without_extensions
   orchestrator_coordination:
-    required_extensions:
-    - todo
-    optional_extensions:
-    - summon
+    required_extensions: []
+    optional_extensions: []
     fallback_policy: fail_if_required_missing
   proposal_product_visual:
     required_extensions:
@@ -1584,8 +1580,6 @@ mcp_profiles:
     - developer
     optional_extensions:
     - context7
-    - todo
-    - summon
     fallback_policy: fail_if_required_missing
   audit_rich:
     required_extensions:
@@ -1596,24 +1590,21 @@ mcp_profiles:
     fallback_policy: fail_if_required_missing
   security_rich:
     required_extensions:
-    - developer
-    optional_extensions:
-    - analyze
     - context7
+    optional_extensions: []
     fallback_policy: fail_if_required_missing
   prepush_rich:
     required_extensions:
-    - developer
-    optional_extensions:
     - xcode
+    optional_extensions: []
     fallback_policy: fail_if_required_missing
   steward_analysis:
-    required_extensions:
-    - analyze
-    optional_extensions: []
+    required_extensions: []
+    optional_extensions:
+    - context7
     fallback_policy: fail_if_required_missing
   retrospective_analysis:
-    required_extensions:
-    - analyze
-    optional_extensions: []
+    required_extensions: []
+    optional_extensions:
+    - context7
     fallback_policy: fail_if_required_missing

@@ -14,13 +14,18 @@ struct RunsHomeView: View {
     @Query(sort: \Run.startedAt, order: .reverse)
     private var allRuns: [Run]
 
-    @State private var selectedRun: Run?
+    @State private var selectedRunID: UUID?
     @State private var showRecoverySheet = false
     @State private var showComparisonPicker = false
     @State private var comparisonTargetRun: Run?
     @State private var showReportView = false
     // Proposal 008 (§7.1–7.2): Blocked run recovery deep-link
     @State private var showBlockedRecovery = false
+    @State private var showCleanupConfirmation = false
+    @State private var maintenanceInFlight = false
+    @State private var maintenanceNotice: String?
+    @State private var maintenanceErrorMessage: String?
+    @State private var showMaintenanceError = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
@@ -48,8 +53,16 @@ struct RunsHomeView: View {
             .padding(.horizontal, DesignTokens.Spacing.section)
             .padding(.top, DesignTokens.Spacing.compact)
 
+            if let maintenanceNotice {
+                Text(maintenanceNotice)
+                    .font(.caption)
+                    .foregroundStyle(DesignTokens.Status.neutral)
+                    .padding(.horizontal, DesignTokens.Spacing.section)
+                    .accessibilityIdentifier("runs-home-maintenance-notice")
+            }
+
             NavigationSplitView {
-                List(selection: $selectedRun) {
+                List(selection: $selectedRunID) {
                 // §5.2: Waiting Approval
                 if !waitingApprovalRuns.isEmpty {
                     Text("Waiting Approval")
@@ -62,14 +75,14 @@ struct RunsHomeView: View {
                             RunsHomeRow(
                                 run: run,
                                 attentionLevel: .high,
-                                onOpen: { selectedRun = run },
+                                onOpen: { selectedRunID = run.id },
                                 onOpenGate: { resolveApprovalGate(for: run) },
-                                onRecover: { selectedRun = run; showRecoverySheet = true },
-                                onCompare: { selectedRun = run; showComparisonPicker = true },
-                                onViewReport: { selectedRun = run; showReportView = true },
+                                onRecover: { selectedRunID = run.id; showRecoverySheet = true },
+                                onCompare: { selectedRunID = run.id; showComparisonPicker = true },
+                                onViewReport: { selectedRunID = run.id; showReportView = true },
                                 compatibilityChecker: compatibilityChecker
                             )
-                            .tag(run)
+                            .tag(Optional.some(run.id))
                         }
                     } header: {
                         Label("Waiting Approval", systemImage: "checkmark.seal")
@@ -84,14 +97,14 @@ struct RunsHomeView: View {
                             RunsHomeRow(
                                 run: run,
                                 attentionLevel: .critical,
-                                onOpen: { selectedRun = run },
+                                onOpen: { selectedRunID = run.id },
                                 onOpenGate: nil,
-                                onRecover: { selectedRun = run; showRecoverySheet = true },
-                                onCompare: { selectedRun = run; showComparisonPicker = true },
-                                onViewReport: { selectedRun = run; showReportView = true },
+                                onRecover: { selectedRunID = run.id; showRecoverySheet = true },
+                                onCompare: { selectedRunID = run.id; showComparisonPicker = true },
+                                onViewReport: { selectedRunID = run.id; showReportView = true },
                                 compatibilityChecker: compatibilityChecker
                             )
-                            .tag(run)
+                            .tag(Optional.some(run.id))
                         }
                     } header: {
                         Label("Blocked", systemImage: "exclamationmark.triangle")
@@ -106,14 +119,14 @@ struct RunsHomeView: View {
                             RunsHomeRow(
                                 run: run,
                                 attentionLevel: .normal,
-                                onOpen: { selectedRun = run },
+                                onOpen: { selectedRunID = run.id },
                                 onOpenGate: nil,
                                 onRecover: nil,
-                                onCompare: { selectedRun = run; showComparisonPicker = true },
-                                onViewReport: { selectedRun = run; showReportView = true },
+                                onCompare: { selectedRunID = run.id; showComparisonPicker = true },
+                                onViewReport: { selectedRunID = run.id; showReportView = true },
                                 compatibilityChecker: compatibilityChecker
                             )
-                            .tag(run)
+                            .tag(Optional.some(run.id))
                         }
                     } header: {
                         Label("Running", systemImage: "play.fill")
@@ -128,14 +141,14 @@ struct RunsHomeView: View {
                             RunsHomeRow(
                                 run: run,
                                 attentionLevel: .low,
-                                onOpen: { selectedRun = run },
+                                onOpen: { selectedRunID = run.id },
                                 onOpenGate: nil,
-                                onRecover: (run.status == .failed) ? { selectedRun = run; showRecoverySheet = true } : nil,
-                                onCompare: { selectedRun = run; showComparisonPicker = true },
-                                onViewReport: { selectedRun = run; showReportView = true },
+                                onRecover: (run.status == .failed) ? { selectedRunID = run.id; showRecoverySheet = true } : nil,
+                                onCompare: { selectedRunID = run.id; showComparisonPicker = true },
+                                onViewReport: { selectedRunID = run.id; showReportView = true },
                                 compatibilityChecker: compatibilityChecker
                             )
-                            .tag(run)
+                            .tag(Optional.some(run.id))
                         }
                     } header: {
                         Label("Recently Completed", systemImage: "checkmark.circle")
@@ -173,6 +186,31 @@ struct RunsHomeView: View {
                         systemImage: "sidebar.left",
                         description: "Choose a run from the sidebar to view details."
                     )
+                }
+            }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if maintenanceInFlight {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityIdentifier("runs-home-maintenance-progress")
+                }
+
+                if interruptedRunCount > 0 {
+                    Button("Resume Interrupted") {
+                        resumeInterruptedRunsManually()
+                    }
+                    .disabled(maintenanceInFlight)
+                    .accessibilityIdentifier("runs-home-resume-interrupted")
+                }
+
+                if cleanupCandidateCount > 0 {
+                    Button("Clear Old Runs", role: .destructive) {
+                        showCleanupConfirmation = true
+                    }
+                    .disabled(maintenanceInFlight)
+                    .accessibilityIdentifier("runs-home-clear-old-runs")
                 }
             }
         }
@@ -221,6 +259,23 @@ struct RunsHomeView: View {
                 .frame(minWidth: 600, minHeight: 500)
             }
         }
+        .confirmationDialog(
+            "Clear Old Runs?",
+            isPresented: $showCleanupConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear \(cleanupCandidateCount) Terminal Runs", role: .destructive) {
+                clearOldRuns()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This removes completed, failed, and cancelled runs plus their owned run directories. Active, blocked, and waiting approval runs stay intact.")
+        }
+        .alert("Runs Maintenance Failed", isPresented: $showMaintenanceError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(maintenanceErrorMessage ?? "Unknown maintenance error.")
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(runsHomeAccessibilityLabel)
         .accessibilityValue(runsHomeAccessibilityValue)
@@ -230,8 +285,8 @@ struct RunsHomeView: View {
                 let runIDString = notification.userInfo?["runID"] as? String,
                 let runID = UUID(uuidString: runIDString)
             else { return }
-            if let run = allRuns.first(where: { $0.id == runID }) {
-                selectedRun = run
+            if allRuns.contains(where: { $0.id == runID }) {
+                selectedRunID = runID
             }
         }
     }
@@ -239,31 +294,55 @@ struct RunsHomeView: View {
     // MARK: - Grouped Runs (§5.2)
 
     private var waitingApprovalRuns: [Run] {
-        allRuns.filter { $0.presentationStatus == .waitingApproval }
+        allRuns.filter { $0.listPresentationStatus == .waitingApproval }
     }
 
     private var blockedRuns: [Run] {
-        allRuns.filter { $0.presentationStatus == .blocked }
+        allRuns.filter { $0.listPresentationStatus == .blocked }
     }
 
     private var runningRuns: [Run] {
         allRuns.filter {
-            $0.presentationStatus == .running
-                || $0.presentationStatus == .ready
-                || $0.presentationStatus == .pending
+            $0.listPresentationStatus == .running
+                || $0.listPresentationStatus == .ready
+                || $0.listPresentationStatus == .pending
         }
     }
 
     private var recentlyCompletedRuns: [Run] {
         allRuns.filter {
-            $0.presentationStatus == .completed
-                || $0.presentationStatus == .failed
-                || $0.presentationStatus == .cancelled
+            $0.listPresentationStatus == .completed
+                || $0.listPresentationStatus == .failed
+                || $0.listPresentationStatus == .cancelled
         }
     }
 
     private var runsHomeAccessibilitySummary: String {
         "Waiting approval \(waitingApprovalRuns.count), blocked \(blockedRuns.count), recent completed \(recentlyCompletedRuns.count)"
+    }
+
+    private var selectedRun: Run? {
+        guard let selectedRunID else { return nil }
+        return allRuns.first(where: { $0.id == selectedRunID })
+    }
+
+    private var interruptedRunCount: Int {
+        allRuns.reduce(into: 0) { count, run in
+            if run.status == .running || run.status == .waitingApproval {
+                count += 1
+            }
+        }
+    }
+
+    private var cleanupCandidateCount: Int {
+        allRuns.reduce(into: 0) { count, run in
+            switch run.status {
+            case .completed, .failed, .cancelled:
+                count += 1
+            default:
+                break
+            }
+        }
     }
 
     private var runsHomeAccessibilityLabel: String {
@@ -284,7 +363,7 @@ struct RunsHomeView: View {
         let modeSummary = modes.isEmpty ? "standard accessibility display settings" : modes.joined(separator: ", ")
         if let featuredRun = waitingApprovalRuns.first ?? blockedRuns.first ?? runningRuns.first ?? recentlyCompletedRuns.first {
             let featuredTitle = featuredRun.idea?.title ?? "Unknown Idea"
-            return "\(modeSummary). Featured run: \(featuredTitle), \(featuredRun.presentationStatusLabel)."
+            return "\(modeSummary). Featured run: \(featuredTitle), \(featuredRun.listPresentationStatusLabel)."
         }
         return modeSummary
     }
@@ -302,6 +381,62 @@ struct RunsHomeView: View {
         // Find the pending approval for this run and resolve it via ExecutionService
         if let approvalEntry = executionService.pendingApprovals.first(where: { $0.value.runID == run.id }) {
             executionService.resolveApproval(approvalID: approvalEntry.key, granted: true)
+        }
+    }
+
+    private func resumeInterruptedRunsManually() {
+        maintenanceInFlight = true
+        maintenanceNotice = "Resuming interrupted runs manually."
+
+        Task { @MainActor in
+            let compiler = RunPlanCompiler(modelContext: modelContext)
+            executionService.resumeInterruptedRuns(compiler: compiler)
+            maintenanceInFlight = false
+            maintenanceNotice = interruptedRunCount == 0
+                ? "Interrupted runs reconciled."
+                : "Interrupted runs reconciliation finished. Remaining items may still need operator recovery."
+        }
+    }
+
+    private func clearOldRuns() {
+        maintenanceInFlight = true
+        maintenanceNotice = "Clearing old terminal runs."
+
+        Task { @MainActor in
+            do {
+                let repository = RunRepository(context: modelContext)
+                let cleanupPlan = try repository.prepareTerminalRunCleanup()
+
+                if let selectedRunID, cleanupPlan.deletedRunIDs.contains(selectedRunID) {
+                    self.selectedRunID = nil
+                }
+
+                let removedDirectoryCount = await RunRepository.removeFilesystemRoots(cleanupPlan)
+                if cleanupPlan.deletedRunCount == 0, cleanupPlan.protectedRunCount == 0 {
+                    maintenanceNotice = "No terminal runs needed cleanup."
+                } else {
+                    var parts: [String] = []
+                    if cleanupPlan.deletedRunCount > 0 {
+                        parts.append("Cleared \(cleanupPlan.deletedRunCount) terminal runs")
+                    }
+                    if removedDirectoryCount > 0 {
+                        parts.append("removed \(removedDirectoryCount) owned directories")
+                    }
+                    if cleanupPlan.migratedAttachmentCount > 0 {
+                        parts.append("migrated \(cleanupPlan.migratedAttachmentCount) referenced attachments into idea workspaces")
+                    }
+                    if cleanupPlan.protectedRunCount > 0 {
+                        parts.append("kept \(cleanupPlan.protectedRunCount) referenced runs because their ideas do not have a valid project directory")
+                    }
+                    maintenanceNotice = parts.joined(separator: "; ").capitalized + "."
+                }
+            } catch {
+                maintenanceErrorMessage = error.localizedDescription
+                showMaintenanceError = true
+                maintenanceNotice = "Run cleanup failed."
+            }
+
+            maintenanceInFlight = false
         }
     }
 }
@@ -326,6 +461,7 @@ struct CompatibilityChecker {
 // MARK: - Run Row (§5.3)
 
 struct RunsHomeRow: View {
+    @Environment(\.modelContext) private var modelContext
     @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
 
     let run: Run
@@ -380,17 +516,11 @@ struct RunsHomeRow: View {
             // Line 2: Status capsule + elapsed time
             HStack(spacing: DesignTokens.Spacing.small) {
                 StatusCapsule(
-                    text: run.presentationStatusLabel,
+                    text: run.listPresentationStatusLabel,
                     color: statusColor,
                     size: .small,
                     accessibilityIdentifier: "run-row-status-\(sanitizedRunTitle)"
                 )
-                if let stageLabel = currentStageLabel {
-                    Text(stageLabel)
-                        .font(DesignTokens.Typography.micro)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
                 Spacer()
                 Text(elapsedTimeString)
                     .font(DesignTokens.Typography.micro)
@@ -428,7 +558,7 @@ struct RunsHomeRow: View {
 
     // Proposal 012 (M-02): Semantic status colors
     private var statusColor: Color {
-        switch run.presentationStatus {
+        switch run.listPresentationStatus {
         case .completed: return DesignTokens.Status.success
         case .failed: return DesignTokens.Status.error
         case .blocked: return DesignTokens.Status.error
@@ -438,11 +568,6 @@ struct RunsHomeRow: View {
         case .cancelling: return DesignTokens.Status.warning
         case .pending, .ready: return DesignTokens.Status.neutral
         }
-    }
-
-    private var currentStageLabel: String? {
-        guard let stageID = run.currentStageID else { return nil }
-        return run.stageExecutions.first(where: { $0.stageID == stageID })?.label
     }
 
     private var sanitizedRunTitle: String {
@@ -466,10 +591,7 @@ struct RunsHomeRow: View {
     }
 
     private var rowAccessibilityLabel: String {
-        var parts = [run.idea?.title ?? "Unknown Idea", run.presentationStatusLabel]
-        if let currentStageLabel {
-            parts.append(currentStageLabel)
-        }
+        var parts = [run.idea?.title ?? "Unknown Idea", run.listPresentationStatusLabel]
         parts.append(elapsedTimeString)
         return parts.joined(separator: ", ")
     }
@@ -480,14 +602,6 @@ struct RunsHomeRow: View {
         let secs = Int(elapsed) % 60
         if mins > 0 { return "\(mins)m \(secs)s" }
         return "\(secs)s"
-    }
-
-    private var lastProgressString: String {
-        let sorted = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
-        let lastDate = sorted.last?.completedAt ?? sorted.last?.startedAt ?? run.startedAt
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: lastDate, relativeTo: Date())
     }
 }
 
@@ -1187,7 +1301,7 @@ private struct RunArtifactLeafInspectorSheet: View {
                 }
             }
         }
-        .frame(minWidth: 640, minHeight: 480)
+        .frame(minWidth: 960, minHeight: 640)
     }
 
     private var artifact: Artifact? {

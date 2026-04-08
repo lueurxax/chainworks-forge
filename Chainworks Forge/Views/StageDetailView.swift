@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct StageDetailView: View {
-    let stageExecution: StageExecution
+    let stageExecution: RunStageSnapshot
     let run: Run
 
     var body: some View {

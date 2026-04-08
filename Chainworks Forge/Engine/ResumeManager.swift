@@ -11,6 +11,8 @@ import SwiftData
 @MainActor
 final class ResumeManager {
     private let modelContext: ModelContext
+    private static let startupInterruptionReason =
+        "Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
@@ -25,6 +27,49 @@ final class ResumeManager {
         case needsDecision(Run, reason: String)
         /// Cannot resume — compiler version mismatch or snapshot corruption.
         case cannotResume(Run, reason: String)
+    }
+
+    // MARK: - Startup Normalization
+
+    /// Normalizes stale in-flight runs after a fresh app launch when auto-resume is disabled.
+    /// Runs that still appear `.pending`, `.ready`, or `.running` cannot be truthful after a new
+    /// process start, so they become recoverable `.blocked` runs that require explicit operator resume.
+    @discardableResult
+    func normalizeInterruptedRunsForManualResume() throws -> Int {
+        let interruptedRuns = try findInterruptedRuns()
+        let now = Date()
+        var normalizedCount = 0
+
+        for run in interruptedRuns {
+            guard [.pending, .ready, .running].contains(run.status) else { continue }
+
+            run.status = .blocked
+            run.driftDetails = mergedInterruptionReason(existing: run.driftDetails)
+
+            for stageExecution in run.stageExecutions where [.pending, .ready, .running].contains(stageExecution.status) {
+                stageExecution.status = .blocked
+                stageExecution.settlementKind = .blocked
+                stageExecution.settledAt = stageExecution.settledAt ?? now
+
+                for agentExecution in stageExecution.agentExecutions where [.pending, .ready, .running].contains(agentExecution.status) {
+                    agentExecution.status = .failed
+                    agentExecution.completedAt = agentExecution.completedAt ?? now
+                    agentExecution.settledAt = agentExecution.settledAt ?? now
+                    agentExecution.canonicalOutcome = agentExecution.canonicalOutcome ?? .failedBeforeOutput
+                    agentExecution.transportErrorKind = agentExecution.transportErrorKind ?? .unknown
+                    agentExecution.providerStopReason = agentExecution.providerStopReason ?? "interrupted_on_app_restart"
+                    agentExecution.logSnippet = mergedAgentInterruptionLog(existing: agentExecution.logSnippet)
+                }
+            }
+
+            normalizedCount += 1
+        }
+
+        if normalizedCount > 0 {
+            try modelContext.save()
+        }
+
+        return normalizedCount
     }
 
     // MARK: - Classify Interrupted Runs
@@ -251,5 +296,20 @@ final class ResumeManager {
             .map(\.stageID)
 
         return runningStageIDs.contains { isSideEffectState($0, plan: plan) }
+    }
+
+    private func mergedInterruptionReason(existing: String?) -> String {
+        let existing = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !existing.isEmpty else { return Self.startupInterruptionReason }
+        guard !existing.localizedCaseInsensitiveContains("interrupted by app restart") else { return existing }
+        return "\(existing) \(Self.startupInterruptionReason)"
+    }
+
+    private func mergedAgentInterruptionLog(existing: String?) -> String {
+        let note = "Interrupted by app restart before settlement. Manual resume required."
+        let existing = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !existing.isEmpty else { return note }
+        guard !existing.localizedCaseInsensitiveContains("manual resume required") else { return existing }
+        return "\(existing) \(note)"
     }
 }

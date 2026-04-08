@@ -126,9 +126,8 @@ This slice is treated as implemented when all of the following remain true:
 
 Current stable verification for this slice is:
 
-- focused renderer gate:
-  - `proposal-027`
-- the gate covers:
+- dedicated renderer capability regression coverage on the current tree
+- capability verification covers:
   - markdown document rendering,
   - JSON tree rendering,
   - payload-mismatch rescue,

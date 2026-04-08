@@ -6,7 +6,7 @@ struct RunArtifactHierarchyBuilder {
     func build(for run: Run) -> RunArtifactHierarchy {
         let artifacts = persistedArtifacts(for: run)
         let promotedNames = decodePromotedArtifactNames(from: run.promotedHandoffArtifactsJSON)
-        let stageExecutions = run.stageExecutions.sorted { lhs, rhs in
+        let stageExecutions = RunStageSnapshotLoader.load(for: run).sorted { lhs, rhs in
             if lhs.startedAt == rhs.startedAt {
                 return lhs.attemptNumber > rhs.attemptNumber
             }
@@ -65,7 +65,7 @@ struct RunArtifactHierarchyBuilder {
 
     private func persistedArtifacts(for run: Run) -> [Artifact] {
         guard let modelContext = run.modelContext else {
-            return run.stageExecutions
+            return PersistedRunGraph.stageExecutions(for: run)
                 .flatMap(\.agentExecutions)
                 .flatMap(\.artifacts)
         }
@@ -205,13 +205,9 @@ struct RunArtifactHierarchyBuilder {
 }
 
 private struct StageExecutionLookup {
-    let stageExecutions: [StageExecution]
+    let stageExecutions: [RunStageSnapshot]
 
     func resolve(for artifact: Artifact) -> ResolvedStageExecution? {
-        if let stageExecution = artifact.agentExecution?.stageExecution {
-            return ResolvedStageExecution(stageExecution)
-        }
-
         if let exact = stageExecutions.first(where: {
             $0.stageID == artifact.stageID && $0.attemptNumber == artifact.attemptNumber
         }) {
@@ -232,7 +228,7 @@ private struct ResolvedStageExecution {
     let iteration: Int
     let attemptNumber: Int
 
-    init(_ stageExecution: StageExecution) {
+    init(_ stageExecution: RunStageSnapshot) {
         id = stageExecution.id
         label = stageExecution.label
         iteration = stageExecution.iteration

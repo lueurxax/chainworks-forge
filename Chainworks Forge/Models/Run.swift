@@ -97,8 +97,8 @@ import SwiftData
     var approvals: [Approval] = []
 
     // Derived current stage (ARCH-PA-002)
-    var currentStageID: String? {
-        let sorted = stageExecutions.sorted { $0.startedAt < $1.startedAt }
+    @MainActor var currentStageID: String? {
+        let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
         return sorted.last(where: {
             $0.status == .running
                 || $0.status == .waitingApproval
@@ -168,7 +168,17 @@ enum RunStatus: String, Codable {
 
 // MARK: - Run Presentation Status (Proposal 011 — REQ-002)
 
+@MainActor
 extension Run {
+    /// Lightweight list/sidebar truth that never loads stage snapshots.
+    /// Use this on hot SwiftUI list paths where stored run status is enough.
+    var listPresentationStatus: RunStatus {
+        if cancellationRequestedAt != nil && cancellationSettledAt == nil {
+            return .cancelling
+        }
+        return status
+    }
+
     /// Whether operator surfaces should expose a stop/cancel action for this run.
     var canBeCancelledByOperator: Bool {
         switch presentationStatus {
@@ -186,7 +196,7 @@ extension Run {
             return .cancelling
         }
         if status == .pending || status == .ready || status == .running {
-            let sorted = stageExecutions.sorted { $0.startedAt < $1.startedAt }
+            let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
             if let latestStage = sorted.last {
                 switch latestStage.status {
                 case .waitingApproval:
@@ -206,6 +216,25 @@ extension Run {
     /// Human-readable label for the current presentation status.
     var presentationStatusLabel: String {
         presentationStatus.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// Human-readable label for list/sidebar status without loading stage snapshots.
+    var listPresentationStatusLabel: String {
+        listPresentationStatus.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// Lightweight continuation state for resume/start paths.
+    /// Uses already-related stage executions instead of rebuilding snapshots.
+    var resumeContinuationStateID: String? {
+        let sorted = stageExecutions.sorted { $0.startedAt < $1.startedAt }
+        return sorted.last(where: {
+            $0.status == .running
+                || $0.status == .waitingApproval
+                || $0.status == .blocked
+                || $0.status == .failed
+                || $0.status == .ready
+        })?.stageID
+            ?? sorted.last(where: { $0.status == .completed })?.stageID
     }
 }
 

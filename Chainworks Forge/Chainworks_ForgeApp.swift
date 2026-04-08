@@ -579,14 +579,29 @@ struct AppBootstrapView: View {
         Self.seedWaitingApprovalRunIfRequested(modelContext: modelContext, catalog: catalog)
         Self.seedWorkflowMapRunIfRequested(modelContext: modelContext)
         Self.seedReleaseGateRunIfRequested(modelContext: modelContext)
+        service.rebuildPersistedPendingApprovals()
+
+        if !isUnitTestHost &&
+            !isUIAutomationHost &&
+            !isProposal007DogfoodHarness &&
+            !isProposal015AppProofAutorun &&
+            !isProposal022AppProofAutorun {
+            do {
+                let normalizedCount = try ResumeManager(modelContext: modelContext)
+                    .normalizeInterruptedRunsForManualResume()
+                if normalizedCount > 0 {
+                    ForgeLogger.app.info("Normalized \(normalizedCount) interrupted runs for manual resume after app launch")
+                }
+            } catch {
+                ForgeLogger.app.error("Failed to normalize interrupted runs at startup: \(error.localizedDescription)")
+            }
+            service.rebuildPersistedPendingApprovals()
+        }
 
         if !isUnitTestHost &&
             !isProposal015AppProofAutorun &&
             !isProposal022AppProofAutorun &&
             !skipBackgroundBootstrap {
-            let compiler = RunPlanCompiler(modelContext: modelContext)
-            service.resumeInterruptedRuns(compiler: compiler)
-
             // Proposal 003 — REQ-008: Check if config has changed since last analysis.
             service.checkForConfigChange()
         }

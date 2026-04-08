@@ -1,170 +1,170 @@
 # Chainworks Forge — Design Kit v1
 
-## 1. Зачем это нужно
+## 1. Why This Exists
 
-Этот документ фиксирует базовую визуальную систему Chainworks Forge: знак, цвет, типографику, иконки, правила интерфейса и готовые промпты для дальнейшей генерации и полировки. Цель простая: чтобы продукт выглядел как инструмент с характером, а не как ещё один AI-чат с красивой обложкой.
+This document defines the baseline visual system for Chainworks Forge: the mark, colors, typography, iconography, interface rules, and ready-made prompts for further generation and refinement. The goal is simple: the product should look like a tool with character, not like just another AI chat app with a polished cover.
 
-Главная метафора бренда:
+The core brand metaphor is:
 
-> **Согласованное движение нескольких специализированных агентов под управлением лидера.**
+> **Coordinated motion by several specialized agents under the guidance of a leader.**
 
-Отсюда и знак:
+That leads directly to the mark:
 
-- **клин из трёх гусей** — workflow и командное движение;
-- **лидирующий гусь** — orchestrator / run;
-- **плавная траектория** — flow, chain, execution path;
-- **отсутствие буквальной цепи** — меньше шума, больше продукта.
+- **a wedge of three geese** for workflow and coordinated movement;
+- **the lead goose** for the orchestrator / run;
+- **a soft trajectory line** for flow, chain, and the execution path;
+- **no literal chain** to reduce noise and keep the product message clear.
 
 ---
 
-## 2. Бренд-ядро
+## 2. Brand Core
 
-### Название
+### Name
 
 **Chainworks Forge**
 
-### Характер
+### Character
 
-- инженерный;
-- собранный;
-- живой, но не шумный;
-- строгий без корпоративной стерильности;
-- не «магический AI», а понятный control plane.
+- engineered;
+- deliberate;
+- alive, but not noisy;
+- disciplined without corporate sterility;
+- not "magical AI," but a clear control plane.
 
-### Что бренд должен передавать
+### What The Brand Should Convey
 
 - orchestration;
-- движение вперёд;
-- согласованную работу ролей;
-- контроль над сложным процессом;
-- превращение сырой идеи в результат.
+- forward motion;
+- coordinated roles working together;
+- control over a complex process;
+- transformation of a raw idea into a result.
 
-### Чего бренд не должен передавать
+### What The Brand Should Not Convey
 
-- болтовню про AI;
-- ощущение чат-бота;
-- fantasy ради fantasy;
-- тяжёлую “металлическую” буквальность;
-- стартапную глянцевость с бессмысленными градиентами.
+- generic AI marketing chatter;
+- chatbot vibes;
+- fantasy for its own sake;
+- heavy-handed "metal" literalism;
+- startup gloss built on meaningless gradients.
 
 ---
 
-## 3. Логотип
+## 3. Logo
 
-## 3.1 Основная идея
+## 3.1 Core Idea
 
-Основной знак — **три гуся в клине**, летящие по восходящей траектории слева снизу направо вверх.
+The primary mark is **three geese in a wedge**, flying upward along a rising trajectory from lower left to upper right.
 
-### Семантика
+### Semantics
 
-- первый гусь: лидер, orchestrator, run control;
-- два следующих: специализированные агенты;
-- общая форма: workflow / chain of execution;
-- линия под птицами: направленность и траектория выполнения.
+- the first goose is the leader, orchestrator, and run control;
+- the following two geese are specialized agents;
+- the overall form communicates workflow / chain of execution;
+- the line beneath the birds expresses direction and execution trajectory.
 
-## 3.2 Базовые правила
+## 3.2 Core Rules
 
-### Обязательные свойства знака
+### Required Properties Of The Mark
 
-- 3 гуся, не 4 и не 5;
-- форма клина должна читаться даже в маленьком размере;
-- лидер должен быть немного впереди;
-- линия движения должна быть мягкой и вторичной, не главнее птиц;
-- силуэты должны быть чистыми, без мелкой иллюстративной детализации.
+- exactly 3 geese, not 4 or 5;
+- the wedge form must remain legible even at small sizes;
+- the leader should sit slightly ahead;
+- the motion line should stay soft and secondary, never overpowering the birds;
+- silhouettes must stay clean, without tiny illustrative details.
 
-### Что нельзя делать
+### What Not To Do
 
-- добавлять буквальные звенья цепи;
-- превращать знак в сложную иллюстрацию;
-- делать из птиц реалистичный орнитологический рисунок;
-- перегружать крылья мелкими перьями;
-- использовать несколько акцентных цветов одновременно.
+- do not add literal chain links;
+- do not turn the mark into a complex illustration;
+- do not render the birds as realistic ornithological drawings;
+- do not overload the wings with tiny feathers;
+- do not use multiple accent colors at the same time.
 
-## 3.3 Версии логотипа
+## 3.3 Logo Variants
 
-### Основная горизонтальная версия
+### Primary Horizontal Version
 
-Использование:
+Usage:
 - README;
-- сайт;
+- website;
 - splash / launch screen;
-- документация;
-- презентации.
+- documentation;
+- presentations.
 
-Состав:
-- знак слева;
-- wordmark справа;
-- интервал между знаком и названием свободный и «дышащий».
+Composition:
+- mark on the left;
+- wordmark on the right;
+- spacing between mark and wordmark should feel open and breathable.
 
 ### App icon version
 
-Использование:
+Usage:
 - `Assets.xcassets`;
 - macOS app icon;
 - internal build previews.
 
-Состав:
-- квадратная композиция;
-- знак центрирован;
-- фон тёмный;
-- без текста.
+Composition:
+- square composition;
+- centered mark;
+- dark background;
+- no text.
 
 ### Monochrome version
 
-Использование:
+Usage:
 - toolbar;
 - sidebar;
 - small-size UI;
-- печать / single-color use cases.
+- print / single-color use cases.
 
-Состав:
-- один цвет;
-- без внутренних бликов;
-- максимально чистый силуэт.
+Composition:
+- single color;
+- no internal highlights;
+- the cleanest possible silhouette.
 
-## 3.4 Минимальные размеры
+## 3.4 Minimum Sizes
 
-- **до 24 px** — использовать упрощённый силуэт без линии траектории;
-- **24–64 px** — знак с тремя гусями, но без мелких внутренних деталей;
-- **64 px и больше** — можно использовать полную версию с линией движения.
+- **up to 24 px** use a simplified silhouette without the trajectory line;
+- **24–64 px** use the three-geese mark without small internal details;
+- **64 px and above** the full version with the motion line is acceptable.
 
 ## 3.5 Safe area
 
-Вокруг знака должен быть свободный отступ не меньше высоты головы среднего гуся. Ничто не должно прижиматься к клюву лидера или к внешней дуге траектории.
+Keep a clear margin around the mark of at least the height of the middle goose's head. Nothing should crowd the leader's beak or the outer arc of the trajectory line.
 
 ---
 
-## 4. Цветовая система
+## 4. Color System
 
-## 4.1 Основная палитра
+## 4.1 Primary Palette
 
 ### Primary
 
-| Token | Hex | Назначение |
+| Token | Hex | Purpose |
 |---|---|---|
-| `ForgeBlue` | `#0B1F2A` | основной тёмный фон, ключевые акценты интерфейса |
-| `ForgeBlueSoft` | `#132F3F` | вторичный тёмный тон, hover / panels / depth |
+| `ForgeBlue` | `#0B1F2A` | primary dark background, key interface accents |
+| `ForgeBlueSoft` | `#132F3F` | secondary dark tone, hover / panels / depth |
 
 ### Accent
 
-| Token | Hex | Назначение |
+| Token | Hex | Purpose |
 |---|---|---|
-| `ForgeAccent` | `#FF8A00` | клювы в логотипе, CTA, approval / attention highlights |
-| `ForgeAccentSoft` | `#FFB347` | мягкие акценты, выделения, secondary emphasis |
+| `ForgeAccent` | `#FF8A00` | beaks in the logo, CTAs, approval / attention highlights |
+| `ForgeAccentSoft` | `#FFB347` | softer accents, highlights, secondary emphasis |
 
 ### Neutrals
 
-| Token | Hex | Назначение |
+| Token | Hex | Purpose |
 |---|---|---|
-| `ForgeBackgroundLight` | `#F5F7FA` | светлый фон |
-| `ForgeBackgroundDark` | `#0A0F14` | тёмный фон |
-| `ForgeSurfaceLight` | `#FFFFFF` | карточки и поверхности на светлом фоне |
-| `ForgeSurfaceDark` | `#111821` | карточки и поверхности на тёмном фоне |
-| `ForgeTextPrimary` | `#1A1A1A` | основной текст на светлом фоне |
-| `ForgeTextSecondary` | `#6B7280` | вторичный текст |
-| `ForgeTextOnDark` | `#E8EDF2` | основной текст на тёмном фоне |
+| `ForgeBackgroundLight` | `#F5F7FA` | light background |
+| `ForgeBackgroundDark` | `#0A0F14` | dark background |
+| `ForgeSurfaceLight` | `#FFFFFF` | cards and surfaces on light backgrounds |
+| `ForgeSurfaceDark` | `#111821` | cards and surfaces on dark backgrounds |
+| `ForgeTextPrimary` | `#1A1A1A` | primary text on light backgrounds |
+| `ForgeTextSecondary` | `#6B7280` | secondary text |
+| `ForgeTextOnDark` | `#E8EDF2` | primary text on dark backgrounds |
 
-## 4.2 Статусы
+## 4.2 Statuses
 
 | Status | Token | Hex |
 |---|---|---|
@@ -175,28 +175,28 @@
 | completed | `RunGreen` | `#16A34A` |
 | pending / idle | `RunGray` | `#9CA3AF` |
 
-## 4.3 Правила цвета
+## 4.3 Color Rules
 
-- оранжевый использовать скупо;
-- оранжевый не должен быть базовым цветом больших поверхностей;
-- логотип может жить без оранжевого в monochrome-версии;
-- интерфейс не должен быть похож на «чёрный терминал с неоновыми кнопками»;
-- status color важнее декоративного цвета.
+- use orange sparingly;
+- orange should not become the default color for large surfaces;
+- the logo should still work without orange in monochrome form;
+- the interface should not feel like a "black terminal with neon buttons";
+- status color matters more than decorative color.
 
 ---
 
-## 5. Типографика
+## 5. Typography
 
-## 5.1 Основной шрифт
+## 5.1 Primary Typeface
 
-Использовать системный стек Apple:
+Use Apple's system stack:
 
-- **SF Pro Display** — заголовки;
-- **SF Pro Text** — основной интерфейс и контент.
+- **SF Pro Display** for headings;
+- **SF Pro Text** for primary interface text and content.
 
-## 5.2 Размеры
+## 5.2 Sizes
 
-| Назначение | Размер |
+| Purpose | Size |
 |---|---|
 | App Title / hero | 24–28 |
 | Section title | 18–20 |
@@ -204,110 +204,110 @@
 | Body text | 13–14 |
 | Meta / helper | 11–12 |
 
-## 5.3 Веса
+## 5.3 Weights
 
-| Назначение | Weight |
+| Purpose | Weight |
 |---|---|
 | Hero / big section titles | Semibold / Bold |
 | Primary UI labels | Medium |
 | Body copy | Regular |
 | Secondary info | Regular / Medium |
 
-## 5.4 Типографические правила
+## 5.4 Typography Rules
 
-- не использовать жирность как замену иерархии;
-- не ставить весь интерфейс в uppercase;
-- uppercase допустим только в служебных малых лейблах и status chips;
-- spacing важнее «красивых шрифтовых эффектов».
+- do not use bold as a substitute for hierarchy;
+- do not set the entire interface in uppercase;
+- uppercase is acceptable only in small utility labels and status chips;
+- spacing matters more than "pretty type effects."
 
 ---
 
-## 6. Иконография
+## 6. Iconography
 
-Иконки должны продолжать язык логотипа, а не спорить с ним.
+Icons should continue the language of the logo, not compete with it.
 
-## 6.1 Базовый атом
+## 6.1 Base Atom
 
-**Гусь** — атомарный знак движения и исполнения.
+**The goose** is the atomic symbol of motion and execution.
 
-## 6.2 Иконки системы
+## 6.2 System Icons
 
-| Иконка | Значение | Идея |
+| Icon | Meaning | Idea |
 |---|---|---|
-| `run` | run execution | один гусь, направленный вперёд |
-| `workflow` | workflow | три гуся клином |
-| `stage` | stage | гусь + точка впереди |
-| `approval` | gate / approval | гусь + check |
-| `blocked` | blocked state | гусь + разрыв траектории |
-| `failed` | failure | гусь + cross |
-| `completed` | success | гусь + круг / finish mark |
-| `artifact` | artifact | лист / слой + мягкая траектория |
+| `run` | run execution | a single goose facing forward |
+| `workflow` | workflow | three geese in a wedge |
+| `stage` | stage | goose + forward point |
+| `approval` | gate / approval | goose + check |
+| `blocked` | blocked state | goose + broken trajectory |
+| `failed` | failure | goose + cross |
+| `completed` | success | goose + circle / finish mark |
+| `artifact` | artifact | sheet / layer + soft trajectory |
 
-## 6.3 Правила для small icons
+## 6.3 Rules For Small Icons
 
-- до 16 px — не рисовать трёх птиц, только абстрагированный силуэт;
-- до 20 px — не использовать тонкие хвостовые линии;
-- small icons должны быть монохромными.
+- below 16 px, do not draw three birds; use only an abstracted silhouette;
+- below 20 px, avoid thin trailing lines;
+- small icons should be monochrome.
 
 ---
 
-## 7. UI-принципы
+## 7. UI Principles
 
-## 7.1 Главная иерархия продукта
+## 7.1 Product Hierarchy
 
-В интерфейсе всегда должна читаться такая цепочка:
+The interface should always make this sequence obvious:
 
 ```text
 Run → Stage → Agent → Artifact
 ```
 
-### Что это значит визуально
+### What This Means Visually
 
-- **Run** — главный объект, крупный и самый заметный;
-- **Stage** — основной контекст внутри run;
-- **Agent** — исполнитель внутри stage;
-- **Artifact** — результат, доступный для инспекции.
+- **Run** is the primary object, large and most visually prominent;
+- **Stage** is the primary context within a run;
+- **Agent** is the executor within a stage;
+- **Artifact** is the result available for inspection.
 
-## 7.2 Чего не делать
+## 7.2 What Not To Do
 
-- не строить интерфейс как чат;
-- не смешивать progress, logs, approvals и artifacts в один слой;
-- не прятать важные действия за декоративной сеткой карточек;
-- не делать интерфейс «технологичным» ценой ясности.
+- do not build the interface like a chat app;
+- do not collapse progress, logs, approvals, and artifacts into one layer;
+- do not hide important actions behind decorative card grids;
+- do not make the interface look "technical" at the expense of clarity.
 
-## 7.3 Правило главного экрана
+## 7.3 Main Screen Rule
 
-На любом ключевом экране пользователь должен быстро понимать:
+On any key screen, the user should quickly understand:
 
-1. где сейчас находится run;
-2. что требует внимания;
-3. что уже произошло;
-4. что можно открыть и проверить.
+1. where the run is now;
+2. what needs attention;
+3. what has already happened;
+4. what can be opened and checked.
 
 ---
 
 ## 8. Motion
 
-Motion должен помогать ориентироваться, а не развлекать.
+Motion should help with orientation, not entertainment.
 
-## 8.1 Разрешённые эффекты
+## 8.1 Allowed Effects
 
-- мягкий fade / slide для перехода между stage;
-- subtle pulse для running agent;
-- краткий pop-in для approval gate;
-- мягкий status transition для run chips.
+- a soft fade / slide between stages;
+- subtle pulse for a running agent;
+- brief pop-in for an approval gate;
+- soft status transitions for run chips.
 
-## 8.2 Запреты
+## 8.2 Prohibitions
 
-- никакого «летящего логотипа» на каждом экране;
-- никакой бесконечной декоративной анимации;
-- никакой тяжёлой spring-анимации для служебного UI.
+- no "flying logo" on every screen;
+- no endless decorative animation;
+- no heavy spring animation for utility UI.
 
 ---
 
-## 9. Ассеты и структура
+## 9. Assets And Structure
 
-Рекомендуемая структура:
+Recommended structure:
 
 ```text
 Design/
@@ -339,7 +339,7 @@ Design/
 
 ## 10. SwiftUI design tokens
 
-Ниже — базовая стартовая схема для кодовой дизайн-системы.
+Below is a basic starter structure for the code-side design system.
 
 ```swift
 import SwiftUI
@@ -378,29 +378,29 @@ enum ForgeTypography {
 
 ---
 
-## 11. Правила для app icon
+## 11. App Icon Rules
 
-## 11.1 Композиция
+## 11.1 Composition
 
-- знак центрируется;
-- гуси не должны упираться в края;
-- линия траектории не должна касаться скруглений иконки;
-- background лучше тёмный, чтобы силуэт жил контрастно.
+- center the mark;
+- the geese should not press against the edges;
+- the trajectory line should not touch the icon's rounded corners;
+- a dark background is preferable so the silhouette keeps its contrast.
 
-## 11.2 Что важно проверить руками
+## 11.2 What To Check Manually
 
-- читается ли знак на 32 px;
-- не сливается ли линия траектории с фоном;
-- не становится ли средний гусь визуальным шумом;
-- не выглядит ли знак как авиакомпания вместо control plane.
+- does the mark stay legible at 32 px;
+- does the trajectory line remain distinct from the background;
+- does the middle goose become visual noise;
+- does the mark accidentally look like an airline instead of a control plane.
 
 ---
 
 ## 12. Prompt pack
 
-Ниже — набор готовых промптов, если понадобится ещё раз генерировать или полировать логотип через image model или передавать задачу дизайнеру.
+Below is a set of ready-made prompts in case the logo needs to be generated or refined again with an image model, or handed off to a designer.
 
-## 12.1 Главный prompt: production logo refinement
+## 12.1 Primary Prompt: Production Logo Refinement
 
 ```text
 Create a production-ready logo for a macOS developer tool called “Chainworks Forge”.
@@ -522,26 +522,26 @@ Style:
 
 ---
 
-## 13. Практический next step
+## 13. Practical Next Step
 
-Если превращать это в рабочий пакет, порядок я бы держал такой:
+If this turns into a real working package, the order should be:
 
-1. зафиксировать **основной знак**;
-2. сделать **app icon 1024×1024**;
-3. сделать **monochrome SVG / vector version**;
-4. собрать `Colors.swift`, `Typography.swift`, `Theme.swift`;
-5. ввести эту систему в 2–3 ключевых SwiftUI-экрана;
-6. только потом допиливать мелкие декоративные различия.
+1. lock the **primary mark**;
+2. build the **1024×1024 app icon**;
+3. produce the **monochrome SVG / vector version**;
+4. assemble `Colors.swift`, `Typography.swift`, and `Theme.swift`;
+5. roll the system into 2-3 key SwiftUI screens;
+6. only then refine smaller decorative differences.
 
-Иначе очень легко наделать много красивых мелочей раньше, чем появится основной костяк.
+Otherwise it becomes too easy to produce lots of attractive details before the structural backbone exists.
 
 ---
 
-## 14. Короткая формула
+## 14. Short Formula
 
-> **Chainworks Forge выглядит не как AI-игрушка, а как собранный рабочий инструмент.**
+> **Chainworks Forge should feel less like an AI toy and more like a disciplined working tool.**
 >
-> Визуально это выражается через три вещи:
-> - согласованное движение,
-> - лидерство внутри системы,
-> - и чистую инженерную форму без лишней магии.
+> Visually, that comes from three things:
+> - coordinated motion,
+> - leadership within the system,
+> - and a clean engineering form without unnecessary magic.

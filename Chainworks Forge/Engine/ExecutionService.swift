@@ -96,6 +96,7 @@ private struct ApprovalResolutionDiagnostic: Codable, Sendable {
 @Observable
 final class ExecutionService {
     private static let stalledRunGraceInterval: TimeInterval = 30
+    private static let maintenanceTickInterval: Duration = .seconds(5)
 
     /// Active orchestrators keyed by run ID.
     private(set) var activeOrchestrators: [UUID: WorkflowOrchestrator] = [:]
@@ -136,6 +137,7 @@ final class ExecutionService {
 
     /// REQ-008: Flag set when a config change is detected and analysis should run after next completed run.
     private var configChangeAnalysisScheduled: Bool = false
+    private var maintenanceTask: Task<Void, Never>?
 
     init(
         modelContext: ModelContext,
@@ -157,10 +159,16 @@ final class ExecutionService {
         self.notificationService = notificationService ?? MainActor.assumeIsolated {
             NotificationService()
         }
+        rebuildPersistedPendingApprovals()
+        startMaintenanceLoop()
     }
 
     var liveRuntimeConfiguration: LiveRuntimeConfiguration? {
         fixedLiveRuntimeConfiguration ?? gooseServerManager?.liveRuntimeConfiguration
+    }
+
+    func runMaintenanceTick(now: Date = Date()) {
+        reconcileStalledOrchestratorsIfNeeded(now: now)
     }
 
     // MARK: - Start Run
@@ -194,7 +202,7 @@ final class ExecutionService {
             return
         }
 
-        let resumeStateID = run.currentStageID
+        let resumeStateID = run.resumeContinuationStateID
         ForgeLogger.execution.info("Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id)")
         synchronizeIdeaStatus(for: run)
 
@@ -205,7 +213,7 @@ final class ExecutionService {
 
     // MARK: - Resume Interrupted Runs
 
-    /// Resume all interrupted runs on app launch (ARCH-029).
+    /// Resume interrupted runs on explicit operator action.
     /// Uses ResumeManager to classify which runs can be resumed.
     func resumeInterruptedRuns(compiler: RunPlanCompiler) {
         let resumeManager = ResumeManager(modelContext: modelContext)
@@ -219,7 +227,7 @@ final class ExecutionService {
                         continue
                     }
 
-                    let resumeStateID = run.currentStageID
+                    let resumeStateID = run.resumeContinuationStateID
                     Task { @MainActor in
                         await orchestrator.start(from: resumeStateID)
                     }
@@ -248,6 +256,7 @@ final class ExecutionService {
 
     /// Resolve a pending approval.
     func resolveApproval(approvalID: UUID, granted: Bool, comment: String? = nil) {
+        rebuildPersistedPendingApprovals()
         guard let request = pendingApprovals[approvalID] else { return }
         let descriptor = FetchDescriptor<Run>()
         guard let run = (try? modelContext.fetch(descriptor))?.first(where: { $0.id == request.runID }) else { return }
@@ -295,6 +304,52 @@ final class ExecutionService {
             )
             try? persistApprovalResolutionDiagnostic(diagnostic, for: run)
             try? modelContext.save()
+            refreshDockBadge()
+            return
+        }
+
+        guard run.status == .waitingApproval else {
+            refreshDockBadge()
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: run)
+                guard let orchestrator = prepareOrchestrator(run: run, plan: plan, workspace: workspace) else {
+                    pendingApprovals[approvalID] = request
+                    refreshDockBadge()
+                    return
+                }
+
+                await orchestrator.start(from: request.stageID)
+                pendingApprovals.removeValue(forKey: approvalID)
+                orchestrator.resolveApproval(stageID: request.stageID, granted: granted, comment: comment)
+
+                let updatedApproval = run.approvals.first(where: { $0.id == approvalID || $0.stageID == request.stageID })
+                let diagnostic = ApprovalResolutionDiagnostic(
+                    runID: run.id,
+                    workflowID: run.workflowID,
+                    approvalRequestID: approvalID,
+                    stageID: request.stageID,
+                    granted: granted,
+                    recordedAt: Date(),
+                    runStatusBefore: beforeDiagnostic.runStatusBefore,
+                    runStatusAfter: run.status.rawValue,
+                    currentStageBefore: beforeDiagnostic.currentStageBefore,
+                    currentStageAfter: run.currentStageID,
+                    stageStatusBefore: beforeDiagnostic.stageStatusBefore,
+                    stageStatusAfter: run.stageExecutions.first(where: { $0.stageID == request.stageID })?.status.rawValue,
+                    approvalBefore: beforeDiagnostic.approvalBefore,
+                    approvalAfter: updatedApproval.map(Self.makeApprovalSnapshot)
+                )
+                try? persistApprovalResolutionDiagnostic(diagnostic, for: run)
+                try? modelContext.save()
+            } catch {
+                pendingApprovals[approvalID] = request
+                ForgeLogger.execution.error("Failed to resolve persisted approval \(approvalID): \(error.localizedDescription)")
+            }
             refreshDockBadge()
         }
     }
@@ -468,6 +523,62 @@ final class ExecutionService {
         try? modelContext.save()
     }
 
+    private func startMaintenanceLoop() {
+        maintenanceTask?.cancel()
+        maintenanceTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.maintenanceTickInterval)
+                guard !Task.isCancelled else { return }
+                guard let self else { return }
+                self.runMaintenanceTick()
+            }
+        }
+    }
+
+    func rebuildPersistedPendingApprovals() {
+        let runDescriptor = FetchDescriptor<Run>()
+        let artifactDescriptor = FetchDescriptor<Artifact>()
+
+        let allRuns = (try? modelContext.fetch(runDescriptor)) ?? []
+        let allArtifacts = (try? modelContext.fetch(artifactDescriptor)) ?? []
+        let artifactNamesByRunID = Dictionary(grouping: allArtifacts, by: \.runID)
+            .mapValues { artifacts in
+                Array(Set(artifacts.map(\.name))).sorted()
+            }
+
+        var rebuilt: [UUID: ApprovalRequest] = [:]
+        for run in allRuns where run.status == .waitingApproval {
+            guard let stage = run.stageExecutions
+                .filter({ $0.status == .waitingApproval })
+                .sorted(by: Self.compareStageExecutions)
+                .last else {
+                continue
+            }
+
+            guard let approval = run.approvals
+                .filter({ $0.stageID == stage.stageID && $0.decision == .requested })
+                .sorted(by: { $0.requestedAt < $1.requestedAt })
+                .last else {
+                continue
+            }
+
+            rebuilt[approval.id] = ApprovalRequest(
+                id: approval.id,
+                runID: run.id,
+                stageID: stage.stageID,
+                stageLabel: stage.label,
+                precedingArtifacts: artifactNamesByRunID[run.id] ?? [],
+                requestedAt: approval.requestedAt,
+                approvalPolicy: nil
+            )
+        }
+
+        pendingApprovals = rebuilt.merging(pendingApprovals) { persisted, active in
+            active
+        }
+        refreshDockBadge()
+    }
+
     private func reconcileStalledOrchestratorsIfNeeded(now: Date = Date()) {
         let stalledRunIDs = activeOrchestrators.compactMap { runID, orchestrator -> UUID? in
             let hasPendingApproval = pendingApprovals.values.contains { $0.runID == runID }
@@ -503,6 +614,16 @@ final class ExecutionService {
         if let stage, stage.status == .running || stage.status == .ready || stage.status == .completed {
             stage.status = .blocked
             stage.completedAt = stage.completedAt ?? now
+
+            for agentExecution in stage.agentExecutions where [.pending, .ready, .running].contains(agentExecution.status) {
+                agentExecution.status = .failed
+                agentExecution.completedAt = agentExecution.completedAt ?? now
+                agentExecution.settledAt = agentExecution.settledAt ?? now
+                agentExecution.canonicalOutcome = agentExecution.canonicalOutcome ?? .failedBeforeOutput
+                agentExecution.transportErrorKind = agentExecution.transportErrorKind ?? .unknown
+                agentExecution.providerStopReason = agentExecution.providerStopReason ?? "session_closed_without_transition"
+                agentExecution.logSnippet = mergedStalledExecutionLog(existing: agentExecution.logSnippet)
+            }
         }
 
         run.status = .blocked
@@ -520,13 +641,7 @@ final class ExecutionService {
 
     private func stalledStage(for run: Run) -> StageExecution? {
         let sorted = run.stageExecutions.sorted { lhs, rhs in
-            if lhs.startedAt == rhs.startedAt {
-                if lhs.iteration == rhs.iteration {
-                    return lhs.attemptNumber < rhs.attemptNumber
-                }
-                return lhs.iteration < rhs.iteration
-            }
-            return lhs.startedAt < rhs.startedAt
+            Self.compareStageExecutions(lhs, rhs)
         }
 
         if let currentStageID = run.currentStageID,
@@ -535,6 +650,16 @@ final class ExecutionService {
         }
 
         return sorted.last
+    }
+
+    private static func compareStageExecutions(_ lhs: StageExecution, _ rhs: StageExecution) -> Bool {
+        if lhs.startedAt == rhs.startedAt {
+            if lhs.iteration == rhs.iteration {
+                return lhs.attemptNumber < rhs.attemptNumber
+            }
+            return lhs.iteration < rhs.iteration
+        }
+        return lhs.startedAt < rhs.startedAt
     }
 
     static func shouldReconcileStalledRun(
@@ -549,14 +674,25 @@ final class ExecutionService {
             return false
         }
         guard !hasPendingApproval else { return false }
-        guard !hasRunningAgents else { return false }
         guard let latestLiveEvent else { return false }
         guard latestLiveEvent.type == .sessionClosed else { return false }
+        if hasRunningAgents {
+            ForgeLogger.execution.info("Reconciling stalled run \(run.id) even though agent rows still appear running because the latest live event is sessionClosed")
+        }
         return now.timeIntervalSince(latestLiveEvent.timestamp) >= graceInterval
     }
 
     private static func latestMeaningfulEvent(in timeline: [LiveExecutionTimelineEntry]) -> ExecutionEvent? {
         timeline.reversed().first(where: { $0.event.type != .textChunk })?.event ?? timeline.last?.event
+    }
+
+    private func mergedStalledExecutionLog(existing: String?) -> String {
+        let note = "Execution stalled after the runtime session closed before the workflow could transition. Resume required."
+        guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return note
+        }
+        if existing.contains(note) { return existing }
+        return existing + "\n" + note
     }
 
     var liveRuntimeReadiness: LiveRuntimeReadiness {

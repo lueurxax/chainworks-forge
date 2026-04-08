@@ -55,4 +55,57 @@ struct WorkflowMapProjectionTests {
         #expect(!projection.persistedTimeline.isEmpty)
         #expect(projection.persistedTimeline.contains { $0.detail.contains("Persisted") })
     }
+
+    @Test("Projection ignores deleted stage rows that still linger in relationship memory")
+    mutating func projectionIgnoresDeletedStageRows() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        let runDescriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(runDescriptor).first)
+
+        let stageDescriptor = FetchDescriptor<StageExecution>()
+        let stages = try container.mainContext.fetch(stageDescriptor).filter { $0.run?.id == run.id }
+        let originalCount = stages.count
+        let doomedStage = try #require(stages.last)
+
+        container.mainContext.delete(doomedStage)
+        try container.mainContext.save()
+
+        let projection = try #require(service.projection(for: run))
+        let persistedStageEntries = projection.persistedTimeline.filter { $0.id.hasPrefix("stage::") }
+        #expect(persistedStageEntries.count == originalCount - 1)
+    }
+
+    @Test("Projection survives stage deletion from a sibling model context")
+    mutating func projectionSurvivesSiblingContextStageDeletion() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        let runDescriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(runDescriptor).first)
+
+        let siblingContext = ModelContext(container)
+        let siblingStages = try siblingContext.fetch(FetchDescriptor<StageExecution>())
+            .filter { $0.run?.id == run.id }
+        let doomedStage = try #require(siblingStages.last)
+        siblingContext.delete(doomedStage)
+        try siblingContext.save()
+
+        let projection = try #require(service.projection(for: run))
+        let persistedStageEntries = projection.persistedTimeline.filter { $0.id.hasPrefix("stage::") }
+        #expect(!persistedStageEntries.isEmpty)
+    }
 }

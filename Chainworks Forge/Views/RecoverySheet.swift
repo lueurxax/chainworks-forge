@@ -23,6 +23,22 @@ struct RecoverySheet: View {
     @State private var showEvidencePanel = false
     @State private var evidencePacket: FailedStageEvidencePacket?
 
+    private var stageSnapshots: [RunStageSnapshot] {
+        RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
+    }
+
+    private var preservedReceiptArtifacts: [Artifact] {
+        let runID = run.id
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.runID == runID
+            },
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        return ((try? modelContext.fetch(descriptor)) ?? [])
+            .filter { $0.name.contains("receipt") || $0.contractID == "provider_receipt" || $0.contractID == "delivery_receipt" }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 16) {
@@ -125,7 +141,7 @@ struct RecoverySheet: View {
                     // Proposal 008 (§7.2): Stage history disclosure
                     DisclosureGroup("Stage History", isExpanded: $showStageHistory) {
                         VStack(alignment: .leading, spacing: 4) {
-                            ForEach(run.stageExecutions.sorted(by: { $0.startedAt < $1.startedAt })) { stage in
+                            ForEach(stageSnapshots) { stage in
                                 HStack {
                                     Image(systemName: stageStatusIcon(stage.status))
                                         .foregroundStyle(stageStatusColor(stage.status))
@@ -150,14 +166,10 @@ struct RecoverySheet: View {
                     }
 
                     // Proposal 008 (§7.2): Preserved receipts disclosure
-                    let receiptArtifacts = run.stageExecutions
-                        .flatMap(\.agentExecutions)
-                        .flatMap(\.artifacts)
-                        .filter { $0.name.contains("receipt") || $0.contractID == "provider_receipt" || $0.contractID == "delivery_receipt" }
-                    if !receiptArtifacts.isEmpty {
-                        DisclosureGroup("Preserved Receipts (\(receiptArtifacts.count))", isExpanded: $showPreservedReceipts) {
+                    if !preservedReceiptArtifacts.isEmpty {
+                        DisclosureGroup("Preserved Receipts (\(preservedReceiptArtifacts.count))", isExpanded: $showPreservedReceipts) {
                             VStack(alignment: .leading, spacing: 4) {
-                                ForEach(receiptArtifacts) { receipt in
+                                ForEach(preservedReceiptArtifacts) { receipt in
                                     HStack {
                                         Image(systemName: "doc.text.fill")
                                             .foregroundStyle(DesignTokens.Status.success)

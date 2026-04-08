@@ -11,6 +11,11 @@ It describes the current fixture-backed live runtime contract, the app surfaces 
 - Backing workflow: `examples/workflows/proposal-loop-live.yaml`
 - Live transport: runtime-profile-selected `RuntimeTransportProtocol` adapter, including Goose compatibility transport, ACP-native adapters, or deterministic fixture transport
 
+Current repo-backed ACP families in this slice are:
+
+- `claude_agent_acp`
+- `gemini_cli_acp`
+
 ## Related Docs
 
 - [runtime-contract.md](runtime-contract.md)

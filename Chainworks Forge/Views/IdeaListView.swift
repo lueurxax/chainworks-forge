@@ -390,7 +390,7 @@ struct IdeaListView: View {
     }
 
     private func statusLabel(for idea: Idea) -> String {
-        idea.lifecycleStatusLabel
+        idea.sidebarLifecycleStatusLabel
     }
 
     @MainActor
@@ -439,7 +439,7 @@ struct IdeaListView: View {
 
     private func ideaPriority(_ idea: Idea) -> Int {
         if let latestRun = idea.latestRun {
-            switch latestRun.presentationStatus {
+            switch latestRun.listPresentationStatus {
             case .waitingApproval:
                 return 0
             case .blocked:
@@ -489,7 +489,7 @@ private struct IdeaSidebarRow: View {
                 }
                 Spacer(minLength: 8)
                 StatusCapsule(
-                    text: idea.lifecycleStatusLabel,
+                    text: idea.sidebarLifecycleStatusLabel,
                     color: primaryStatusColor,
                     icon: primaryStatusIcon,
                     size: .small
@@ -534,7 +534,7 @@ private struct IdeaSidebarRow: View {
 
     private var primaryStatusColor: Color {
         if let latestRun = idea.latestRun {
-            switch latestRun.presentationStatus {
+            switch latestRun.listPresentationStatus {
             case .pending, .ready:
                 return DesignTokens.Status.neutral
             case .running:
@@ -566,7 +566,7 @@ private struct IdeaSidebarRow: View {
         guard let latestRun = idea.latestRun else {
             return idea.status == .draft ? "pencil" : "lightbulb.fill"
         }
-        switch latestRun.presentationStatus {
+        switch latestRun.listPresentationStatus {
         case .pending, .ready:
             return "clock"
         case .running:
@@ -588,7 +588,7 @@ private struct IdeaSidebarRow: View {
 
     private var attentionLabel: String? {
         guard let latestRun = idea.latestRun else { return nil }
-        switch latestRun.presentationStatus {
+        switch latestRun.listPresentationStatus {
         case .waitingApproval:
             return "Needs approval"
         case .blocked:
@@ -602,7 +602,7 @@ private struct IdeaSidebarRow: View {
 
     private var attentionIcon: String {
         guard let latestRun = idea.latestRun else { return "exclamationmark.circle.fill" }
-        switch latestRun.presentationStatus {
+        switch latestRun.listPresentationStatus {
         case .waitingApproval:
             return "checkmark.seal"
         case .blocked:
@@ -616,7 +616,7 @@ private struct IdeaSidebarRow: View {
 
     private var attentionColor: Color {
         guard let latestRun = idea.latestRun else { return DesignTokens.Status.warning }
-        switch latestRun.presentationStatus {
+        switch latestRun.listPresentationStatus {
         case .failed:
             return DesignTokens.Status.error
         default:
@@ -645,10 +645,11 @@ private struct IdeaSidebarRow: View {
     }
 }
 
+@MainActor
 private extension Idea {
     var requiresAttention: Bool {
         guard let latestRun else { return false }
-        switch latestRun.presentationStatus {
+        switch latestRun.listPresentationStatus {
         case .waitingApproval, .blocked, .failed:
             return true
         default:
@@ -2400,7 +2401,6 @@ struct WorkflowRunProgressView: View {
     private let forcedInitialPane: IdeaRunPane?
 
     @State private var selectedPane: IdeaRunPane = .summary
-    @State private var selectedStage: StageExecution?
     @State private var selectedArtifact: Artifact?
     @State private var approvalComment = ""
     @State private var showStopConfirmation = false
@@ -2419,13 +2419,8 @@ struct WorkflowRunProgressView: View {
         )
     }
 
-    private var sortedStages: [StageExecution] {
-        run.stageExecutions.sorted {
-            if $0.startedAt == $1.startedAt {
-                return $0.iteration < $1.iteration
-            }
-            return $0.startedAt < $1.startedAt
-        }
+    private var sortedStages: [RunStageSnapshot] {
+        RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
     }
 
     private var artifactHierarchy: RunArtifactHierarchy {
@@ -2436,7 +2431,7 @@ struct WorkflowRunProgressView: View {
         artifactSnapshot.latestArtifacts
     }
 
-    private var activeAgents: [AgentExecution] {
+    private var activeAgents: [RunStageAgentSnapshot] {
         sortedStages.flatMap(\.agentExecutions).filter { $0.status == .running }
     }
 
@@ -2460,7 +2455,7 @@ struct WorkflowRunProgressView: View {
         executionService.pendingApprovals.values.first { $0.runID == run.id }
     }
 
-    private var currentStageExecution: StageExecution? {
+    private var currentStageExecution: RunStageSnapshot? {
         sortedStages.last
     }
 
@@ -2489,7 +2484,7 @@ struct WorkflowRunProgressView: View {
     }
 
     private var latestPersistedCheckpointText: String? {
-        let latestApproval = run.approvals.max {
+        let latestApproval = PersistedRunGraph.approvals(for: run).max {
             ($0.decidedAt ?? $0.requestedAt) < ($1.decidedAt ?? $1.requestedAt)
         }
         let latestStage = sortedStages.max {
@@ -2560,11 +2555,16 @@ struct WorkflowRunProgressView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .accessibilityIdentifier("run-progress-view")
-        .sheet(item: $selectedStage) { stage in
-            WorkflowStageDetailView(stageExecution: stage, run: run)
-        }
         .sheet(item: $selectedArtifact) { artifact in
-            ArtifactInspectorView(artifact: artifact, run: run)
+            NavigationStack {
+                ArtifactInspectorView(artifact: artifact, run: run)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { selectedArtifact = nil }
+                        }
+                    }
+            }
+            .frame(minWidth: 960, minHeight: 640)
         }
         .sheet(isPresented: $showTimelineInspector) {
             NavigationStack {
@@ -3221,14 +3221,10 @@ struct WorkflowRunArtifactSnapshot {
 // MARK: - WorkflowStageDetailView
 
 struct WorkflowStageDetailView: View {
-    let stageExecution: StageExecution
+    let stageExecution: RunStageSnapshot
     let run: Run
 
-    @State private var selectedArtifact: Artifact?
-
-    private var sortedAgentExecutions: [AgentExecution] {
-        stageExecution.agentExecutions.sorted { $0.startedAt < $1.startedAt }
-    }
+    private var sortedAgentExecutions: [RunStageAgentSnapshot] { stageExecution.agentExecutions }
 
     var body: some View {
         List {
@@ -3264,19 +3260,6 @@ struct WorkflowStageDetailView: View {
                                     .font(.caption2)
                                     .foregroundStyle(.tertiary)
                             }
-                            if !execution.artifacts.isEmpty {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 8) {
-                                        ForEach(execution.artifacts.sorted { $0.createdAt > $1.createdAt }) { artifact in
-                                            Button(artifact.name) {
-                                                selectedArtifact = artifact
-                                            }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.small)
-                                        }
-                                    }
-                                }
-                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -3285,9 +3268,6 @@ struct WorkflowStageDetailView: View {
         }
         .frame(minWidth: 560, minHeight: 420)
         .accessibilityIdentifier("stage-detail-view")
-        .sheet(item: $selectedArtifact) { artifact in
-            ArtifactInspectorView(artifact: artifact, run: run)
-        }
     }
 
     /// Decode frozen provenances from the run's snapshot (Proposal 011 — REQ-009).
@@ -3305,7 +3285,7 @@ struct WorkflowStageDetailView: View {
     }
 
     @ViewBuilder
-    private func agentMetadataRow(for execution: AgentExecution) -> some View {
+    private func agentMetadataRow(for execution: RunStageAgentSnapshot) -> some View {
         let frozen = frozenBinding(for: execution.agentID)
         let provenance = frozenProvenance(for: execution.agentID)
         VStack(alignment: .leading, spacing: 4) {
@@ -3338,26 +3318,10 @@ struct WorkflowStageDetailView: View {
                 if let cost = execution.costCents {
                     Text("\(cost) cents")
                 }
-                if let adapterVersion = execution.adapterVersion, !adapterVersion.isEmpty {
-                    Text(adapterVersion)
-                }
             }
             .font(.caption2)
             .foregroundStyle(.tertiary)
-
-            if receiptArtifact(for: execution) != nil {
-                Button("Open Provider Receipt") {
-                    selectedArtifact = receiptArtifact(for: execution)
-                }
-                .buttonStyle(.borderless)
-                .font(.caption2)
-            }
         }
-    }
-
-    private func receiptArtifact(for execution: AgentExecution) -> Artifact? {
-        execution.artifacts.first { $0.name.hasSuffix("_receipt.json") }
-            ?? execution.artifacts.first { $0.contractID == "provider_receipt" }
     }
 
     private func durationString(from start: Date, to end: Date) -> String {

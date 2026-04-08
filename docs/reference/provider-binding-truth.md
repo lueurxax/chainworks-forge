@@ -39,7 +39,9 @@ The run snapshot stores resolved binding data such as:
 - resolved model,
 - effort,
 - configured provider instance,
-- adapter/runtime metadata.
+- adapter/runtime metadata,
+- runtime profile identifier when present,
+- resolved adapter family.
 
 Run-centric surfaces must prefer this frozen snapshot over mutable current provider settings.
 
@@ -77,6 +79,7 @@ Run-centric surfaces should make these facts legible:
 - resolved provider family,
 - resolved model,
 - effort,
+- runtime profile / adapter family when they materially differ from Goose default execution,
 - provenance source,
 - mismatch warning state when applicable.
 

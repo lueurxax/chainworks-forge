@@ -269,6 +269,55 @@ struct RunArtifactHierarchyBuilderTests {
         #expect(firstGroup.stageBuckets.flatMap(\.artifacts).map(\.name) == ["review_debug_log"])
     }
 
+    @Test("Builder tolerates deleted stage rows and falls back to artifact-owned stage metadata")
+    func builderIgnoresDeletedStageRows() throws {
+        let context = try makeTestModelContext()
+        let workspace = makeTestWorkspace()
+        let run = makeTestRun(
+            workspace: workspace,
+            context: context,
+            workflowID: "deleted_stage_workflow",
+            workflowTitle: "Deleted Stage Workflow"
+        )
+
+        let stage = StageExecution(
+            id: UUID(),
+            stageID: "review",
+            label: "Review",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        run.stageExecutions.append(stage)
+        context.insert(stage)
+
+        let artifact = makeArtifact(
+            name: "proposal_review_summary",
+            contractID: "run_summary",
+            format: .markdown,
+            filePath: workspace.artifactRoot.appendingPathComponent("proposal_review_summary.md").path,
+            createdAt: Date(timeIntervalSince1970: 120),
+            runID: run.id,
+            stageID: "review",
+            agentID: "system",
+            provider: "system",
+            attemptNumber: 1
+        )
+        context.insert(artifact)
+        try context.save()
+
+        context.delete(stage)
+        try context.save()
+
+        let hierarchy = RunArtifactHierarchyBuilder().build(for: run)
+        let group = try #require(hierarchy.stageGroups.first)
+        #expect(group.stageID == "review")
+        #expect(group.stageExecutionID == nil)
+        #expect(group.allArtifacts.map(\.name) == ["proposal_review_summary"])
+    }
+
     private func makeArtifact(
         name: String,
         contractID: String,

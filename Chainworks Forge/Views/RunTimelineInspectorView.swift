@@ -65,7 +65,7 @@ struct RunTimelineInspectorView: View {
                         .animation(.spring(response: 0.45, dampingFraction: 0.82), value: projection.liveTimeline.map(\.id))
                     }
 
-                    // Невидимый якорь для автопрокрутки к последней записи
+                    // Invisible anchor used to auto-scroll to the latest entry
                     Color.clear
                         .frame(height: 1)
                         .id("live-timeline-bottom")

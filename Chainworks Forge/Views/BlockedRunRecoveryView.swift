@@ -27,6 +27,10 @@ struct BlockedRunRecoveryView: View {
     @State private var showSessionInspector = false
     @State private var selectedLineage: AgentSessionLineage?
 
+    private var stageSnapshots: [RunStageSnapshot] {
+        RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
+    }
+
     // MARK: - Recovery Path Classification
 
     enum RecoveryPath: String {
@@ -257,7 +261,7 @@ struct BlockedRunRecoveryView: View {
     private var stageHistorySection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 0) {
-                let sortedStages = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
+                let sortedStages = stageSnapshots
                 if sortedStages.isEmpty {
                     Text("No stage history available.")
                         .font(.caption)
@@ -318,9 +322,9 @@ struct BlockedRunRecoveryView: View {
                                                 .lineLimit(2)
                                             
                                             Spacer()
-                                            
+
                                             // Proposal 018: Session reuse badge
-                                            SessionReuseBadge(disposition: agent.sessionReuseDisposition)
+                                            SessionReuseBadge(disposition: nil)
 
                                             if let lid = agent.sessionLineageID {
                                                 Button {
@@ -538,8 +542,8 @@ struct BlockedRunRecoveryView: View {
         }
 
         // Derive from stage status
-        let failedStages = run.stageExecutions.filter { $0.status == .failed }
-        let blockedStages = run.stageExecutions.filter { $0.status == .blocked }
+        let failedStages = stageSnapshots.filter { $0.status == .failed }
+        let blockedStages = stageSnapshots.filter { $0.status == .blocked }
 
         if !failedStages.isEmpty {
             let stageNames = failedStages.map(\.label).joined(separator: ", ")
@@ -583,7 +587,7 @@ struct BlockedRunRecoveryView: View {
 
     private var currentStageName: String {
         guard let stageID = run.currentStageID else { return "None" }
-        return run.stageExecutions.first(where: { $0.stageID == stageID })?.label ?? stageID
+        return stageSnapshots.first(where: { $0.stageID == stageID })?.label ?? stageID
     }
 
     private var recoveryPathDescription: String {
@@ -691,10 +695,10 @@ struct BlockedRunRecoveryView: View {
         case .waitingApproval:
             recoveryPath = .resume
         case .failed:
-            let hasRetryableStage = run.stageExecutions.contains { $0.status == .failed }
+            let hasRetryableStage = stageSnapshots.contains { $0.status == .failed }
             recoveryPath = hasRetryableStage ? .retry : .clone
         case .blocked:
-            let hasRetryableStage = run.stageExecutions.contains { $0.status == .blocked || $0.status == .failed }
+            let hasRetryableStage = stageSnapshots.contains { $0.status == .blocked || $0.status == .failed }
             recoveryPath = hasRetryableStage ? .retry : .clone
         case .cancelled:
             recoveryPath = .cancel

@@ -27,6 +27,7 @@ struct ReleaseGateView: View {
     let run: Run
     let onApprove: () -> Void
     let onReject: () -> Void
+    @Environment(\.modelContext) private var modelContext
 
     @FocusState private var focusedTarget: FocusTarget?
 
@@ -36,9 +37,13 @@ struct ReleaseGateView: View {
     }
 
     private var allArtifacts: [Artifact] {
-        run.stageExecutions
-            .flatMap(\.agentExecutions)
-            .flatMap(\.artifacts)
+        let runID = run.id
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.runID == runID
+            }
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
     }
 
     private var focusProofEnabled: Bool {
@@ -293,12 +298,10 @@ struct ReleaseGateView: View {
                 Label("Change Summary", systemImage: "chart.bar.doc.horizontal")
                     .font(.headline)
 
-                let allArtifacts = run.stageExecutions
-                    .flatMap(\.agentExecutions)
-                    .flatMap(\.artifacts)
+                let artifacts = allArtifacts
 
                 // Diff stat
-                if let changedFiles = allArtifacts.first(where: { $0.name == "changed_files_manifest" }) {
+                if let changedFiles = artifacts.first(where: { $0.name == "changed_files_manifest" }) {
                     LabeledContent("Changed Files") {
                         Text("Available")
                             .font(.caption)
