@@ -96,6 +96,17 @@ final class FixtureGooseTransport: RuntimeTransportProtocol, @unchecked Sendable
         let agentID = request?.metadata?["agent_id"] ?? "unknown_agent"
         let outputNames = parseOutputNames(from: prompt.content)
         let invocation = nextInvocation(for: taskName)
+        let outputDirectory = resolveOutputDirectory(from: prompt.content, request: request)
+
+        if let outputDirectory {
+            materializeOutputs(
+                taskName: taskName,
+                agentID: agentID,
+                invocation: invocation,
+                outputNames: outputNames,
+                outputDirectory: outputDirectory
+            )
+        }
 
         let finalOutput = makeFinalOutput(
             taskName: taskName,
@@ -173,6 +184,52 @@ final class FixtureGooseTransport: RuntimeTransportProtocol, @unchecked Sendable
             }
         }
         return names
+    }
+
+    private func resolveOutputDirectory(
+        from prompt: String,
+        request: RuntimeSessionRequest?
+    ) -> URL? {
+        let prefix = "Output directory:"
+        if let line = prompt.components(separatedBy: .newlines)
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .first(where: { $0.hasPrefix(prefix) }) {
+            let rawPath = line.replacingOccurrences(of: prefix, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if rawPath.hasPrefix("/") {
+                return URL(fileURLWithPath: rawPath, isDirectory: true)
+            }
+            if let workingDirectory = request?.workingDirectory {
+                return URL(fileURLWithPath: workingDirectory, isDirectory: true)
+                    .appendingPathComponent(rawPath, isDirectory: true)
+            }
+        }
+
+        return request?.workingDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+
+    private func materializeOutputs(
+        taskName: String,
+        agentID: String,
+        invocation: Int,
+        outputNames: [String],
+        outputDirectory: URL
+    ) {
+        guard !outputNames.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        for outputName in outputNames {
+            let body = makeOutputContent(
+                taskName: taskName,
+                agentID: agentID,
+                outputName: outputName,
+                invocation: invocation
+            )
+            try? body.write(
+                to: outputDirectory.appendingPathComponent(outputName),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
     }
 
     private func makeFinalOutput(taskName: String, agentID: String, invocation: Int, outputNames: [String]) -> String {

@@ -73,6 +73,8 @@ struct ResumeManagerTests {
             planCompilerVersion: plan.planCompilerVersion
         ) // RunRepository-exempt
         run.idea = idea
+        idea.workspaceRootPath = tempDir.path
+        run.frozenWorkspaceRootPath = tempDir.path
         context.insert(run)
         try context.save()
 
@@ -356,6 +358,8 @@ struct ResumeManagerTests {
             workflowSourcePath: workflowURL.path,
             catalogSourcePath: catalogURL.path
         )
+        idea.workspaceRootPath = sourceRoot.path
+        run.frozenWorkspaceRootPath = sourceRoot.path
         run.status = .running
         try context.save()
 
@@ -1001,8 +1005,8 @@ struct ResumeManagerTests {
         #expect(shouldReconcile == false)
     }
 
-    @Test("ExecutionService blocks live workflow without runtime config")
-    func executionServiceBlocksLiveWorkflowWithoutRuntimeConfig() async throws {
+    @Test("ExecutionService starts ACP-backed live workflow without Goose runtime config")
+    func executionServiceStartsACPBackedLiveWorkflowWithoutGooseRuntimeConfig() async throws {
         let workflow = try loadLiveWorkflow()
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -1040,9 +1044,11 @@ struct ResumeManagerTests {
 
         service.startRun(run: run, plan: plan, workspace: workspace)
 
-        #expect(service.orchestrator(for: run.id) == nil)
-        #expect(run.status == .blocked)
-        #expect(run.driftDetails?.contains("Live runtime is not configured") == true)
+        #expect(service.orchestrator(for: run.id) != nil)
+        #expect(run.status == .pending || run.status == .running)
+        #expect(run.driftDetails == nil)
+
+        await cancelAndAwaitSettled(service, runID: run.id)
     }
 
     @Test("ExecutionService resume waiting approval restores pending approval without re-executing stage")

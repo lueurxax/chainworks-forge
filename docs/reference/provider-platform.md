@@ -22,6 +22,8 @@ Related stable doc:
 - [goose-provider-remediation.md](goose-provider-remediation.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
 - [project-workspace-contract.md](project-workspace-contract.md)
+- [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
+- [acp-runtime-transport.md](acp-runtime-transport.md)
 
 ## Supported MVP provider families
 
@@ -32,6 +34,11 @@ The current MVP provider set is:
 3. `gemini`
 
 The operator should reason about provider family, configured installation/account, model, effort, capabilities, and current health without needing to care about transport internals.
+
+Runtime transport selection and per-agent MCP policy are adjacent contracts, but they are not owned here:
+
+- transport-family and ACP/Goose adapter truth live in [acp-runtime-transport.md](acp-runtime-transport.md),
+- per-agent MCP policy and requested/predicted/actual runtime truth live in [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md).
 
 ## Core components
 

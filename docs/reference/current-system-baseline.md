@@ -23,7 +23,10 @@ At the current baseline, the product includes:
 
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
+- catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live Goose-backed execution for real provider sessions,
+- ACP-shaped runtime transport with ACP-native adapters and Goose compatibility transport,
+- per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
 - an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
@@ -47,6 +50,9 @@ Use these reference docs as the current source of truth:
 | YAML and catalog parsing | [yaml-dsl-parser.md](yaml-dsl-parser.md) |
 | Execution engine | [workflow-execution-engine.md](workflow-execution-engine.md) |
 | Frozen runtime and resume truth | [runtime-contract.md](runtime-contract.md) |
+| Skill resolution and runtime injection | [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) |
+| Per-agent MCP policy and runtime validation | [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) |
+| ACP runtime transport and Goose compatibility | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
@@ -148,7 +154,7 @@ When reviewing a proposal or implementation on the current repository, start fro
 2. provider/settings/remediation are already baseline features,
 3. repo-backed delivery is already baseline behavior,
 4. MVP sign-off is already a stable reference layer,
-5. removed proposal files should not be treated as active dependencies if their truth has been promoted into `docs/reference/`.
+5. removed proposal files should not be treated as active dependencies once their truth has been promoted into `docs/reference/`.
 
 In other words:
 
@@ -163,11 +169,7 @@ It does not restate every field, type, or UI detail from each subsystem doc.
 
 Use it to orient review and planning work quickly, then jump to the subsystem references above for detailed contracts.
 
-## Adjacent proof docs
+## Verification posture
 
-For current proof status rather than system-contract truth, use:
-
-- [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md)
-- [../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md)
-- [../evidence/mvp-sign-off-proof.md](../evidence/mvp-sign-off-proof.md)
-- [../evidence/goose-server-transport-verification.md](../evidence/goose-server-transport-verification.md)
+Subsystem-level verification baselines are summarized inside the subsystem reference docs.
+Use those documents as the current verification and contract source of truth rather than older proposal, audit, review, or evidence trails.

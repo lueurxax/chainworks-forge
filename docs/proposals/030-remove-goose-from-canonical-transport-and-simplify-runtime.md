@@ -5,7 +5,7 @@
 | Date | 2026-04-07 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [026-acp-first-runtime-transport-and-goose-decoupling.md](026-acp-first-runtime-transport-and-goose-decoupling.md), [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [026-acp-runtime-plan-additive-profiles.md](026-acp-runtime-plan-additive-profiles.md), [../reference/goose-server-transport.md](../reference/goose-server-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
+| Depends on | [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [026-acp-runtime-plan-additive-profiles.md](026-acp-runtime-plan-additive-profiles.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/goose-server-transport.md](../reference/goose-server-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
 | Scope | Remove Goose as the canonical runtime transport implementation after second-wave ACP providers are proven, and simplify runtime dispatch to an ACP-first core with Goose retained only as explicit optional compatibility adapter. |
 | Goal | Replace the current multi-implementation transport shape with a single canonical ACP execution seam and capability-gated provider adapters. |
 
@@ -13,7 +13,7 @@
 
 ## 1. Context and Motivation
 
-Proposal 026 established ACP-shaped transport as the canonical model but kept Goose as the default runtime.
+The current runtime baseline established ACP-shaped transport as the canonical model but kept Goose as the default runtime.
 Proposal 029 introduces the next runtime expansion: Codex ACP, Auggie CLI ACP, and Junie CLI ACP.
 
 Once those providers are implemented and proven, we should complete the migration by removing Goose
@@ -121,7 +121,7 @@ Update evidence and proposal-index docs to mark this as “Goose transport canon
 3. Refactor core transport factory and remove Goose-specific path from canonical interfaces.
 4. Promote Goose adapter modules to compatibility-only packaging and guard behind explicit compatibility selection.
 5. Run focused proof gates:
-   - Proposal 026 canonical transport lane stability
+   - current canonical transport-lane stability
    - MCP runtime-policy and execution truth lane
    - proposal-focused regression for new second-wave adapters
 6. Decommission Goose-as-default in tests and examples that depend on it as the canonical path.

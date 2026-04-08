@@ -112,6 +112,9 @@ Report content includes:
 - elapsed time and total cost,
 - workflow/catalog provenance,
 - runtime trust level,
+- runtime profile / adapter-family truth,
+- skill provenance,
+- MCP requested / predicted / actual / denied truth,
 - stage and approval summary,
 - agent/provider/model/effort usage,
 - pinned artifacts,
@@ -177,6 +180,12 @@ Compatible runs compare:
 
 Comparison does not claim repo-backed or release-specific diff support.
 
+It does include current runtime-facing explanation lanes such as:
+
+- skill truth drift,
+- runtime profile drift,
+- MCP requested/predicted/actual drift.
+
 ## Artifact inspector
 
 The operator artifact surface supports:
@@ -198,6 +207,8 @@ Displayed provenance includes:
 - provider,
 - model,
 - effort,
+- runtime profile when available,
+- skill reference / role / frozen snapshot hash when available,
 - attempt,
 - runtime trust level.
 

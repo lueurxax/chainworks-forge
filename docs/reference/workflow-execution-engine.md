@@ -8,6 +8,12 @@ It handles sequential and parallel agent execution, human approval gates, bounde
 loops, artifact persistence, transition evaluation, and safe resume after app
 interruption. All engine code lives under `Chainworks Forge/Engine/`.
 
+Related stable docs:
+
+- [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md)
+- [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
+- [acp-runtime-transport.md](acp-runtime-transport.md)
+
 ---
 
 ## Components
@@ -44,11 +50,13 @@ A `@MainActor` two-phase compiler (ARCH-021).
 
 1. Validate via `YAMLValidator.validateAll`.
 2. Resolve agent references against the catalog; resolve backend profiles.
-3. Parse transition `when` clauses into `TransitionCondition` variants.
-4. Resolve loop budgets -- `vars.*` references substituted at compile time.
-5. Build `ExecutableState` instances with run blocks, transitions, and loops.
-6. Compute provenance hashes via `DefinitionHasher`.
-7. Assemble and return an in-memory `RunPlan`.
+3. Resolve skills and role-specific injected content for each agent.
+4. Freeze MCP-profile intent on resolved agents.
+5. Parse transition `when` clauses into `TransitionCondition` variants.
+6. Resolve loop budgets -- `vars.*` references substituted at compile time.
+7. Build `ExecutableState` instances with run blocks, transitions, and loops.
+8. Compute provenance hashes via `DefinitionHasher`.
+9. Assemble and return an in-memory `RunPlan`.
 
 A `previewCompileCompact` variant normalizes compact workflow definitions through
 `CompactNormalizer` before delegating to `previewCompile`.
@@ -62,6 +70,14 @@ A `previewCompileCompact` variant normalizes compact workflow definitions throug
 
 **Resume path -- `rebuildPlanFromSnapshot`**: Decodes frozen JSON snapshots stored
 on a `Run` record and re-runs `previewCompile`. Rejects compiler version mismatches.
+
+### Skill and MCP compilation
+
+`RunPlanCompiler` also owns the compile-time resolution that turns catalog declarations into runtime-authoritative agent bindings:
+
+- `skill_ref` / `skill_role` -> frozen `ResolvedSkill`
+- `mcp_profile` -> frozen MCP intent on the resolved agent
+- `backend_profile` / `runtime_profile` -> transport-ready provider binding truth
 
 ### Workflow Orchestrator (`WorkflowOrchestrator.swift`)
 
@@ -104,6 +120,12 @@ protocol AgentExecutor: Sendable {
 
 Executors return `[String: Data]` (in-memory), never file URLs. The
 `ArtifactManager` is the sole disk writer (ARCH-030).
+
+The executor path consumes:
+
+- frozen skill truth,
+- frozen MCP intent,
+- and resolved runtime transport selection.
 
 - **`ExecutionContext`** -- workspace, stageID, iteration, attempt number, input
   artifacts, runtime variables, idea body.
@@ -201,8 +223,9 @@ Responsibilities:
 - **Approval resolution** -- routes approval decisions to the correct orchestrator.
 - **Cancellation** -- cancels the orchestrator and cleans up state.
 - **Executor selection** -- for live workflows (`proposal_loop_live`), selects a
-  `GooseAgentExecutor` with the configured transport (bespoke `GooseTransport` or
-  `GooseServerTransport`) and optional provider/model override.
+  `GooseAgentExecutor` backed by the selected `RuntimeTransportProtocol`
+  implementation (Goose compatibility or ACP-native adapter) and optional
+  provider/model override.
 - **Post-run hooks** -- triggers Steward analysis and emits run reports on completion.
 
 ---

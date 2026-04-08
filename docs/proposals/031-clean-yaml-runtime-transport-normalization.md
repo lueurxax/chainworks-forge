@@ -5,7 +5,7 @@
 | Date | 2026-04-07 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [026-acp-first-runtime-transport-and-goose-decoupling.md](026-acp-first-runtime-transport-and-goose-decoupling.md), [030-remove-goose-from-canonical-transport-and-simplify-runtime.md](030-remove-goose-from-canonical-transport-and-simplify-runtime.md), [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md) |
+| Depends on | [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [030-remove-goose-from-canonical-transport-and-simplify-runtime.md](030-remove-goose-from-canonical-transport-and-simplify-runtime.md), [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md) |
 | Scope | Identify and eliminate stale runtime transport selection defaults and duplicate normalization layers between YAML definitions, provider binding resolution, MCP policy, and receipts. |
 
 ## 1) Problem statement

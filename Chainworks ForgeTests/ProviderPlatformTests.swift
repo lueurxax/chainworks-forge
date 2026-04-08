@@ -534,6 +534,9 @@ struct ProviderPlatformTests {
     mutating func managedGooseServerClearsHandleForSleepAndReconcilesOnWake() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
+        let stubBinary = tempDirectory.appendingPathComponent("goosed-stub")
+        try "#!/bin/sh\nsleep 60\n".write(to: stubBinary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubBinary.path)
 
         let store = retain(AppConfigurationStore(
             fileURL: tempDirectory.appendingPathComponent("app-config.json"),
@@ -544,7 +547,7 @@ struct ProviderPlatformTests {
                 agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
                 supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
                 gooseServerAutostart: true,
-                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
+                gooseServerBinaryPath: stubBinary.path,
                 gooseServerSecretKey: "dev-secret",
                 activeConfigurationSource: .persistedSettings
             )

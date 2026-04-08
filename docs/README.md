@@ -16,8 +16,8 @@ If you are new to the repo, read these in order:
 ## Status
 
 - Owner: single-engineer working repo
-- Last updated: 2026-04-03
-- State: active — foundation, execution engine, execution-truth baseline, output-contract and failure-evidence slice, session-lineage reuse slice, context-strategy framework slice, proposal-loop feedback-fidelity slice, live Goose transport, UI quality slice, design-system adoption slice, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
+- Last updated: 2026-04-08
+- State: active — foundation, execution engine, skill runtime integration, MCP policy/runtime validation, ACP-shaped transport, execution-truth baseline, output-contract and failure-evidence slice, session-lineage reuse slice, context-strategy framework slice, proposal-loop feedback-fidelity slice, live transport layer, UI quality slice, design-system adoption slice, unified artifact rendering, full MVP delivery slice, MVP sign-off layer, and Steward V1 implemented
 
 ## Implemented Reference Docs
 
@@ -25,6 +25,9 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/current-system-baseline.md](reference/current-system-baseline.md) — current-head subsystem map for review and planning work
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
+- [reference/skill-resolution-and-runtime-integration.md](reference/skill-resolution-and-runtime-integration.md) — Stable skill resolution, specialization, runtime injection, and frozen skill truth
+- [reference/per-agent-mcp-policy-and-runtime-validation.md](reference/per-agent-mcp-policy-and-runtime-validation.md) — Stable per-agent MCP intent, runtime validation, and persisted MCP truth
+- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — Stable ACP-shaped transport contract, adapter families, and Goose compatibility role
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Stable canonical outcome, recovery, and report/read-truth contract
 - [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Stable output-contract authority, failed-stage evidence, narrow recovery, and declarative contract enforcement
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Stable per-run session reuse, generation history, checkpoint refresh, and shell-owned reset contract
@@ -57,13 +60,10 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 Active work that is not yet fully promoted into `reference/` lives under [`proposals/`](proposals):
 
-- [proposals/015-skill-resolution-and-runtime-injection.md](proposals/015-skill-resolution-and-runtime-injection.md)
 - [proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [proposals/020-dynamic-cycle-addition.md](proposals/020-dynamic-cycle-addition.md)
 - [proposals/021-run-transition-notifications-and-attention-routing.md](proposals/021-run-transition-notifications-and-attention-routing.md)
 - [proposals/023-loop-improvement-analytics-and-iteration-progression.md](proposals/023-loop-improvement-analytics-and-iteration-progression.md)
-- [proposals/025-per-agent-mcp-policy-and-runtime-validation.md](proposals/025-per-agent-mcp-policy-and-runtime-validation.md)
-- [proposals/026-acp-first-runtime-transport-and-goose-decoupling.md](proposals/026-acp-first-runtime-transport-and-goose-decoupling.md)
 - [proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md)
 - [proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md](proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md)
 
@@ -89,7 +89,6 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 - [evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md) -- consolidated implementation/proof status for segmented run surfaces, focused timeline, and hierarchical artifact browsing
 - [evidence/ui-quality-and-polish-proof.md](evidence/ui-quality-and-polish-proof.md) -- consolidated implementation/proof status for the UI quality and visual polish slice
 - [evidence/design-system-and-brand-application-proof.md](evidence/design-system-and-brand-application-proof.md) -- consolidated implementation/proof status for the design-system and brand-application slice
-- [evidence/artifact-content-rendering-proof.md](evidence/artifact-content-rendering-proof.md) -- consolidated implementation/proof status for unified read-only markdown/json artifact rendering
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
 - [evidence/mvp-sign-off-proof.md](evidence/mvp-sign-off-proof.md) -- consolidated implementation/proof status for MVP hardening and sign-off
 - [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON
@@ -105,4 +104,5 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 
 ## Historical Reviews
 
-Historical proposal reviews, audit reports, and evidence packs live under [`reviews/`](reviews). They are useful as decision history, but they are not the canonical source of truth for current behavior. For current behavior, prefer `reference/` and `evidence/`.
+Historical reviews remain only for work that has not yet been fully promoted into `reference/`.
+For current implemented behavior, prefer `reference/`.

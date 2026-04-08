@@ -1,6 +1,6 @@
 # Live Provider Execution Slice
 
-This document is the permanent reference for the implemented live proposal-loop slice that was originally introduced as Proposal 004.
+This document is the permanent reference for the implemented live proposal-loop slice.
 
 It describes the current fixture-backed live runtime contract, the app surfaces that make the slice usable, the artifact and safety guarantees, and the boundary between the implemented slice and later follow-on work.
 
@@ -9,7 +9,7 @@ It describes the current fixture-backed live runtime contract, the app surfaces 
 - State: implemented and proven against real Goose.app (2026-03-24)
 - Scope owner: current app runtime and UI shell
 - Backing workflow: `examples/workflows/proposal-loop-live.yaml`
-- Live transport: GooseServerTransport (real goosed API) or FixtureGooseTransport (deterministic tests)
+- Live transport: runtime-profile-selected `RuntimeTransportProtocol` adapter, including Goose compatibility transport, ACP-native adapters, or deterministic fixture transport
 
 ## Related Docs
 
@@ -18,6 +18,9 @@ It describes the current fixture-backed live runtime contract, the app surfaces 
 - [architecture-decisions.md](architecture-decisions.md)
 - [workflow-execution-engine.md](workflow-execution-engine.md)
 - [goose-server-transport.md](goose-server-transport.md)
+- [acp-runtime-transport.md](acp-runtime-transport.md)
+- [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md)
+- [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
 
 ## 1. Purpose
 
@@ -51,8 +54,7 @@ This slice proves the control-plane model without introducing writable repo side
 - writable implementation worktrees
 - git, release, or publish side effects
 - code-writing stages
-- per-agent provider routing
-- ACP as the primary transport
+- second-wave runtime expansion beyond the currently implemented adapter families
 
 ## 3. Runtime Shape
 
@@ -62,12 +64,13 @@ SwiftUI App
     -> WorkflowOrchestrator
       -> GooseAgentExecutor
         -> GooseSessionBridge
-          -> GooseServerTransport, GooseTransport, or FixtureGooseTransport
+          -> selected RuntimeTransportProtocol adapter
       -> ArtifactManager / ArtifactStorage
       -> Approval flow
 ```
 
-The app remains the control plane. Goose is the execution substrate, not the source of truth.
+The app remains the control plane. Goose is one execution substrate, not the source of truth.
+The same control-plane rules also apply when the selected runtime is ACP-native.
 
 Control-plane responsibilities stay in app code:
 
@@ -274,12 +277,10 @@ The live slice is proven at two levels:
 - At least one non-happy path is proven
 - Waiting-approval restore is proven on relaunch
 
-**Real Goose proof (2026-03-24):**
-- `GooseServerTransport` connected to real Goose.app on `https://127.0.0.1:51200`
-- Session `20260324_28` created via `/agent/start` + `/agent/update_provider`
-- Prompt submitted, SSE response received: `CHAINWORKS_PROOF_OK`
-- Full `GooseAgentExecutor` pipeline executed with receipt generation
-- Evidence: `docs/evidence/live_goose_connection_proof.json`
+**Current verification baseline:**
+- focused live/runtime slices remain covered by repository test gates and subsystem suites
+- same-tree approved-host `full` is green on the current baseline
+- adapter-specific details now live in the transport references instead of a separate proposal trail
 
 See [goose-server-transport.md](goose-server-transport.md) for transport details.
 
@@ -287,4 +288,4 @@ See [goose-server-transport.md](goose-server-transport.md) for transport details
 
 This document covers the implemented live runtime contract for the proposal loop.
 
-The transport layer supports both fixture-backed and real Goose server execution. Later operator-shell, provider-settings, and delivery-slice work builds on top of this baseline rather than redefining it.
+The transport layer supports Goose compatibility execution, ACP-native execution, and deterministic fixtures. Later operator-shell, provider-settings, and delivery-slice work builds on top of this baseline rather than redefining it.

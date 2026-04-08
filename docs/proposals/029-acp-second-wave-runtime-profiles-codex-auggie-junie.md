@@ -5,15 +5,15 @@
 | Date | 2026-04-07 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [026-acp-first-runtime-transport-and-goose-decoupling.md](026-acp-first-runtime-transport-and-goose-decoupling.md), [026-acp-runtime-plan-additive-profiles.md](026-acp-runtime-plan-additive-profiles.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md), [../evidence/acp-runtime-candidate-comparison.md](../evidence/acp-runtime-candidate-comparison.md), [../evidence/codex-acp-research.md](../evidence/codex-acp-research.md), [../evidence/auggie-cli-acp-research.md](../evidence/auggie-cli-acp-research.md), [../evidence/junie-cli-acp-research.md](../evidence/junie-cli-acp-research.md) |
-| Scope | Add a second-wave runtime profile and adapter expansion: Codex ACP, Auggie CLI ACP, Junie CLI ACP, while keeping Proposal 026 invariants. |
+| Depends on | [026-acp-runtime-plan-additive-profiles.md](026-acp-runtime-plan-additive-profiles.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
+| Scope | Add a second-wave runtime profile and adapter expansion: Codex ACP, Auggie CLI ACP, Junie CLI ACP, while keeping the current ACP runtime transport invariants. |
 | Goal | Expand runtime choice through catalog-backed profiles with strict preservation of execution truth and existing operator surfaces. |
 
 ---
 
 ## 1. Context and Motivation
 
-Proposal 026 completed the first structural migration:
+The current ACP runtime transport baseline already completed the first structural migration:
 
 - ACP-shaped core transport vocabulary
 - Goose preserved as default continuity path
@@ -21,7 +21,7 @@ Proposal 026 completed the first structural migration:
 
 Research has now advanced enough to justify one clearly bounded second expansion wave.
 
-From the latest [ACP candidate comparison](../evidence/acp-runtime-candidate-comparison.md), the top viable candidates for this wave are:
+From the current runtime-transport baseline, the top intended candidates for this wave are:
 
 1. **Codex ACP** (ranked above Auggie and Junie by current replay/session evidence)
 2. **Auggie CLI ACP**
@@ -35,11 +35,11 @@ This proposal makes those three explicit second-wave providers and sets the roll
 
 After implementation, the system should be able to answer:
 
-1. Can catalog/runtime-profile selection support at least three additional real ACP runtimes without changing the Proposal 026 transport seam?
+1. Can catalog/runtime-profile selection support at least three additional real ACP runtimes without changing the current transport seam?
 2. Can `runtime_profile` and `backend_profile` ownership stay in one catalog truth model for all three providers?
 3. Can preflight classify these providers with capability classes instead of claiming uniform parity?
 4. Can reports/recovery/mcp-truth continue to use persisted Forge truth while adapter-specific details vary by provider family?
-5. Can the second-wave add-on be done without altering the default Goose runtime behavior from Proposal 026?
+5. Can the second-wave add-on be done without altering the current default Goose runtime behavior?
 
 ---
 
@@ -52,7 +52,7 @@ This proposal includes:
   - `auggie_cli_acp`
   - `junie_cli_acp`
 - add backend-profile variants that target these runtime profiles and preserve existing provider model/mode fields
-- add adapter-specific realization contracts in the same style as Proposal 026 (ACP-shaped runtime contract + vendor-specific layer)
+- add adapter-specific realization contracts in the same style as the current ACP runtime transport baseline (ACP-shaped runtime contract + vendor-specific layer)
 - add provider-specific capability declarations to support safe rollout and preflight gating
 - extend test/proof expectation language for each provider profile
 - document rollout order and blocking criteria for operator-grade claims
@@ -110,7 +110,7 @@ Rollout may be stopped if:
 
 - canonical run/report/recovery truth degrades
 - probe evidence shows a provider no longer satisfies basic load/update/prompt requirements
-- provider-specific proof shows destructive MCP resolution mismatch compared with Proposal 026 contract
+- provider-specific proof shows destructive MCP resolution mismatch compared with the current runtime contract
 
 ### 4.4 Preflight and policy interaction
 
@@ -120,7 +120,7 @@ For each provider:
 - required MCP and optional MCP are preserved in separate requested/predicted/actual layers
 - successful capability checks do not imply operator-grade classification
 
-This keeps the proposal faithful to Proposal 026’s core invariant: transport-neutral Forge truth above vendor runtime details.
+This keeps the proposal faithful to the current core invariant: transport-neutral Forge truth above vendor runtime details.
 
 ### 4.5 Catalog configuration direction
 
@@ -182,7 +182,7 @@ backend_profiles:
     runtime_profile: junie_cli_acp
 ```
 
-The example names are placeholders; final IDs remain implementation-driven but follow the existing `*_acp` profile naming convention established in Proposal 026.
+The example names are placeholders; final IDs remain implementation-driven but follow the existing `*_acp` profile naming convention established in the current runtime baseline.
 
 ---
 
@@ -192,7 +192,7 @@ Proposal 029 is complete when:
 
 1. Three new second-wave runtime profiles exist and are selected via backend profiles.
 2. No new transport semantics leak into orchestration/core beyond adapter boundaries.
-3. The default Goose path remains operational under Proposal 026 behavior.
+3. The default Goose path remains operational under the current baseline behavior.
 4. Capability classes are respected in preflight so the UI/operator surface cannot assume operator-grade behavior for these profiles unless evidence grows.
 5. Run snapshots and execution reports preserve persisted truth consistently across default/second-wave profiles.
 6. Preflight blocks unsafe MCP contracts based on provider-specific capability declarations.

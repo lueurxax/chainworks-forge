@@ -1,6 +1,6 @@
 # Artifact Content Rendering
 
-Stable reference for the unified read-only rendering slice for Markdown and JSON artifacts that was implemented through Proposal 027.
+Stable reference for the unified read-only rendering slice for Markdown and JSON artifacts.
 
 ## Purpose
 
@@ -122,15 +122,22 @@ This slice is treated as implemented when all of the following remain true:
 - local image and parse-fallback safety remain fail-closed,
 - local tree state stays ephemeral.
 
-## Current status
+## Verification baseline
 
-The canonical implementation proof and status is maintained in:
+Current stable verification for this slice is:
 
-- [../evidence/artifact-content-rendering-proof.md](../evidence/artifact-content-rendering-proof.md)
+- focused renderer gate:
+  - `proposal-027`
+- the gate covers:
+  - markdown document rendering,
+  - JSON tree rendering,
+  - payload-mismatch rescue,
+  - safe image-source fallback,
+  - timeline/provider-error presentation polish,
+- same-tree `full` remains the repository-level regression backstop.
 
 ## Adjacent references
 
 - [operator-experience.md](operator-experience.md)
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
-- [../proposals/027-unified-read-only-json-and-markdown-rendering.md](../proposals/027-unified-read-only-json-and-markdown-rendering.md) (historical proposal text)

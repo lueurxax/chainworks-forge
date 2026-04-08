@@ -22,13 +22,6 @@
         "identifier" : "CE8913472F6FC30A006EC77C",
         "name" : "Chainworks ForgeTests"
       }
-    },
-    {
-      "target" : {
-        "containerPath" : "container:Chainworks Forge.xcodeproj",
-        "identifier" : "CE8913512F6FC30A006EC77C",
-        "name" : "Chainworks ForgeUITests"
-      }
     }
   ],
   "version" : 1

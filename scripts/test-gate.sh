@@ -1363,7 +1363,7 @@ case "$GATE" in
     fi
     guard_direct_run_insertion
     run_build "full"
-    if [[ "${USE_TEST_PLANS:-}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/FullGate.xctestplan" ]]; then
+    if [[ "${USE_TEST_PLANS:-1}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/FullGate.xctestplan" ]]; then
       run_test_plan "full" "FullGate"
     else
       run_full_suite

@@ -1,6 +1,6 @@
 # Goose Server Transport
 
-Status: **Implemented** (proven against real Goose.app -- 2026-03-24)
+Status: **Implemented**
 
 ## Purpose
 
@@ -8,9 +8,10 @@ The Goose server transport adapter connects Chainworks Forge to a locally
 running `goosed agent` instance, enabling live LLM execution through the
 real goosed API. Fixture-backed execution remains unchanged for testing.
 
-This document is the canonical reference for the transport protocol
-abstraction, the `GooseServerTransport` adapter, the SSE event mapper, the
-goosed API contract, configuration, and operational setup.
+This document is the canonical reference for the Goose compatibility adapter
+inside the current runtime transport stack, including the `GooseServerTransport`
+implementation, the goosed API contract, SSE mapping behavior, configuration,
+and operational setup.
 
 ---
 
@@ -31,6 +32,7 @@ goosed API contract, configuration, and operational setup.
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) -- fixture-backed transport baseline
 - [runtime-contract.md](runtime-contract.md)
+- [acp-runtime-transport.md](acp-runtime-transport.md)
 - [architecture-decisions.md](architecture-decisions.md)
 - [workspace-isolation-risk.md](workspace-isolation-risk.md)
 
@@ -38,12 +40,12 @@ goosed API contract, configuration, and operational setup.
 
 ## 1. Transport Protocol
 
-All transport implementations conform to a single protocol:
+The current transport stack is built around one shared runtime protocol:
 
 ```swift
-protocol GooseTransportProtocol: Sendable {
-    func createSession(request: GooseSessionRequest) async throws -> GooseSessionResponse
-    func submitPrompt(sessionID: String, prompt: GoosePromptRequest) -> AsyncThrowingStream<GooseStreamEvent, Error>
+protocol RuntimeTransportProtocol: Sendable {
+    func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse
+    func submitPrompt(sessionID: String, prompt: RuntimePromptRequest) -> AsyncThrowingStream<RuntimeStreamEvent, Error>
     func closeSession(sessionID: String) async throws
 }
 ```
@@ -52,13 +54,12 @@ Three conforming implementations exist:
 
 | Transport | API Contract | Auth | Use Case |
 |---|---|---|---|
-| `GooseServerTransport` | `/agent/start` + `/reply` (real goosed) | `X-Secret-Key` | Live LLM execution |
+| `GooseServerTransport` | `/agent/start` + `/reply` (real goosed) | `X-Secret-Key` | Goose compatibility runtime |
 | `FixtureGooseTransport` | In-memory | None | Deterministic testing |
-| `GooseTransport` | `/api/sessions` (bespoke) | `Authorization: Bearer` | Legacy, not server-implemented |
+| `GooseTransport` | `/api/sessions` (bespoke) | `Authorization: Bearer` | Legacy compatibility path |
 
-All consumers (`GooseSessionBridge`, `GooseAgentExecutor`, `ExecutionService`)
-depend on the protocol, not concrete types. No `if/else` branching on transport
-type exists in the engine.
+ACP-native adapters are documented in [acp-runtime-transport.md](acp-runtime-transport.md).
+The engine depends on the shared runtime protocol, not on Goose-specific endpoint semantics as canonical truth.
 
 ---
 

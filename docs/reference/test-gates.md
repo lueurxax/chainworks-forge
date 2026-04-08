@@ -388,8 +388,7 @@ Command:
 
 Important:
 
-- the stable documentation source of truth for this slice is now [artifact-content-rendering.md](../reference/artifact-content-rendering.md), not the old proposal file
-- the consolidated proof summary is in [artifact-content-rendering-proof.md](../evidence/artifact-content-rendering-proof.md)
+- the stable documentation source of truth for this slice is now [artifact-content-rendering.md](../reference/artifact-content-rendering.md)
 
 ### `full`
 
