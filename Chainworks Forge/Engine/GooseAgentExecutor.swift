@@ -48,6 +48,11 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         (transportFactory as? DefaultRuntimeTransportFactory)?.gooseTransport
     }
 
+    func prepareForAppTermination() {
+        (transportFactory as? RuntimeTransportFactoryTerminationControlling)?
+            .terminateActiveTransportsForAppShutdown()
+    }
+
     /// Resolve the session bridge for a specific agent using the transport factory.
     private func sessionBridge(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> RuntimeSessionBridge {
         let transport = try transportFactory.transport(for: agent, binding: binding)
@@ -372,7 +377,7 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
                 return SessionResolutionInfo(execution: execution, lineageID: lid, generationID: generation.id, reuseDisposition: .reused, ownerKey: ownerKey, fingerprint: fingerprint, mcpResolution: mcpResolution)
             } catch {
                 let errorDesc = error.localizedDescription
-                if errorDesc.contains("Session not found") || errorDesc.contains("session not found") || errorDesc.contains("404") || errorDesc.contains("No active session") {
+                if isSessionMissingError(errorDesc) || errorDesc.contains("No active session") {
                     // Session expired — invalidate the stale generation and create a fresh session
                     ForgeLogger.session.info("[\(lid)] Expired session fallback: \(errorDesc)")
                     try? await sessionManager.invalidateGeneration(generationID: generation.id, reason: "Stale session: \(errorDesc)")
@@ -1030,20 +1035,23 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
         accumulatedText: String
     ) -> [String: Data] {
         let sources = [finalContent, accumulatedText.isEmpty ? nil : accumulatedText].compactMap { $0 }
+        var mergedOutputs: [String: Data] = [:]
         for source in sources {
             let parsed = parseReturnedOutputBlocks(from: source, expectedOutputs: expectedOutputs)
-            if !parsed.isEmpty {
-                return parsed
+            for outputName in expectedOutputs where mergedOutputs[outputName] == nil {
+                if let data = parsed[outputName] {
+                    mergedOutputs[outputName] = data
+                }
             }
         }
-        return [:]
+        return mergedOutputs
     }
 
     private func parseReturnedOutputBlocks(
         from content: String,
         expectedOutputs: [String]
     ) -> [String: Data] {
-        let pattern = #"<<<CHAINWORKS_OUTPUT:([A-Za-z0-9._-]+)>>>\s*([\s\S]*?)\s*<<<END_CHAINWORKS_OUTPUT>>>"#
+        let pattern = #"<<<CHAINWORKS_OUTPUT:([A-Za-z0-9._-]+)>>>\s*([\s\S]*?)\s*<<<END_CHAINWORKS_OUTPUT\s*>{2,3}"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return [:]
         }
@@ -1204,6 +1212,7 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
         return lowercased.contains("session not found")
             || lowercased.contains("failed to read session")
             || lowercased.contains("404")
+            || (lowercased.contains("no active ") && lowercased.contains(" session"))
     }
 
     private func isLimitExhaustionReason(_ reason: String) -> Bool {

@@ -396,3 +396,18 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         try? subprocess.sendJSON(response)
     }
 }
+
+extension AuggieCLIACPTransport: RuntimeTransportTerminationControlling {
+    func terminateActiveSessionsForAppShutdown() {
+        lock.lock()
+        let subprocesses = Array(activeSessions.values)
+        activeSessions.removeAll()
+        requestCounters.removeAll()
+        sessionSystemPrompts.removeAll()
+        lock.unlock()
+
+        for subprocess in subprocesses {
+            subprocess.terminate()
+        }
+    }
+}

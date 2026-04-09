@@ -1,8 +1,8 @@
-# Proposal 032: Atomic Transition Settlement and Durable Resume Cursor Multi-Lens Audit R1
+# Proposal 035: Atomic Transition Settlement and Durable Resume Cursor Multi-Lens Audit R1
 
 | Field | Value |
 |---|---|
-| Proposal | `docs/proposals/032-atomic-transition-settlement-and-durable-resume-cursor.md` |
+| Proposal | `docs/proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md` |
 | Repository Root | `/Users/user/Documents/Chainworks Forge` |
 | Git SHA | `8d79a35` |
 | Working Tree | clean |
@@ -15,7 +15,7 @@
 
 ## Executive Verdict
 
-Proposal 032 is partially implemented, not complete. The repository now has a real run-owned `TransitionCursor`, cursor-first resume/recovery behavior, and live reconciliation protection for scheduled-but-not-started boundaries, but the implementation still fails the proposal’s harder closure conditions: transition settlement is not fail-closed, major shell/read-model surfaces still project heuristic `run.currentStageID` truth, and the proposal-required focused same-tree interrupted-transition proof for the `EA93E855` class is still missing. Proposal 029 was inspected only as adjacent runtime context; it did not change this verdict.
+Proposal 035 is partially implemented, not complete. The repository now has a real run-owned `TransitionCursor`, cursor-first resume/recovery behavior, and live reconciliation protection for scheduled-but-not-started boundaries, but the implementation still fails the proposal’s harder closure conditions: transition settlement is not fail-closed, major shell/read-model surfaces still project heuristic `run.currentStageID` truth, and the proposal-required focused same-tree interrupted-transition proof for the `EA93E855` class is still missing. Proposal 030 was inspected only as adjacent runtime context; it did not change this verdict.
 
 ## Lens Scorecard
 
@@ -26,7 +26,7 @@ Proposal 032 is partially implemented, not complete. The repository now has a re
 | Product | At Risk | Resume/recovery truth improved, but operator shell can still show stale single-stage truth | High |
 | UI | At Risk | Runs Home, Idea detail, and blocked recovery still read heuristic stage labels | High |
 | UX | At Risk | Interrupted transition is not explained consistently across shell surfaces | Medium |
-| Readiness | Not Ready | No focused `proposal-032` gate or `EA93E855`-class same-tree proof | High |
+| Readiness | Not Ready | No focused `proposal-035` gate or `EA93E855`-class same-tree proof | High |
 
 ## Proposal Contract
 
@@ -99,7 +99,7 @@ The proposal requires:
 - Atomic settlement is not fail-closed: `WorkflowOrchestrator` ignores `modelContext.save()` failure and still advances the state machine.
 - Shell summary surfaces still read `run.currentStageID`, which is still stage-row heuristic truth.
 - Report artifacts are still stamped with `run.currentStageID`, not explicit cursor-derived interrupted-transition truth.
-- The proposal-required focused `EA93E855` proof scenario and dedicated `proposal-032` gate are absent.
+- The proposal-required focused `EA93E855` proof scenario and dedicated `proposal-035` gate are absent.
 
 ### Ambiguities / Evidence Gaps
 
@@ -206,11 +206,11 @@ The proposal requires:
 - Status: Missing
 - Evidence Type: tests-found, inference
 - Evidence:
-  - `docs/proposals/032-atomic-transition-settlement-and-durable-resume-cursor.md:451-468`
+  - `docs/proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md:451-468`
   - `scripts/test-gate.sh:1136-1144`
   - `scripts/test-gate.sh:1362-1371`
   - `rg -n "EA93E855-3BEA-4D86-B287-205A7A32AA1C|EA93E855" /Users/user/Documents/Chainworks Forge`
-- Gap / Note: I found proposal text and adjacent test fixtures involving the state-9/state-10 loop, but no dedicated `proposal-032` gate, no named same-tree `EA93E855` proof artifact, and no proof test that explicitly closes the proposal’s acceptance criterion.
+- Gap / Note: I found proposal text and adjacent test fixtures involving the state-9/state-10 loop, but no dedicated `proposal-035` gate, no named same-tree `EA93E855` proof artifact, and no proof test that explicitly closes the proposal’s acceptance criterion.
 
 ## Architecture Review
 
@@ -225,7 +225,7 @@ The proposal requires:
 - Evidence:
   - `Chainworks Forge/Engine/WorkflowOrchestrator.swift:274-281`
   - `Chainworks Forge/Engine/WorkflowOrchestrator.swift:2794-2804`
-- Why It Matters: Proposal 032 is explicitly about eliminating heuristic boundary reconstruction with one durable atomic checkpoint. If the orchestrator can ignore save failure and still advance `currentStateID`, the system can still observe the very half-settled state the proposal was meant to remove.
+- Why It Matters: Proposal 035 is explicitly about eliminating heuristic boundary reconstruction with one durable atomic checkpoint. If the orchestrator can ignore save failure and still advance `currentStateID`, the system can still observe the very half-settled state the proposal was meant to remove.
 - Recommended Action: Make settlement save explicit and fail-closed. If the save fails, do not advance the state machine; surface terminal recovery truth instead of continuing on an uncommitted transition.
 
 ### ARCH-002 Compatibility-stage heuristics still leak into canonical readers
@@ -255,7 +255,7 @@ The proposal requires:
   - `Chainworks Forge/Views/IdeaListView.swift:2644-2645`
   - `Chainworks Forge/Views/IdeaListView.swift:2745-2764`
   - `Chainworks Forge/Views/BlockedRunRecoveryView.swift:588-590`
-- Why It Matters: Product-wise, Proposal 032 only pays off if operators stop being told one misleading “current stage” when the real truth is “stage N completed, stage N+1 scheduled, stage N+1 maybe not started”. The recovery engine can be right while the shell is still telling the wrong story.
+- Why It Matters: Product-wise, Proposal 035 only pays off if operators stop being told one misleading “current stage” when the real truth is “stage N completed, stage N+1 scheduled, stage N+1 maybe not started”. The recovery engine can be right while the shell is still telling the wrong story.
 - Recommended Action: Introduce one operator-facing summary contract for interrupted transition truth and migrate list/detail/recovery surfaces to it.
 
 ### PROD-002 Report metadata still anchors immutable artifacts to heuristic stage truth
@@ -309,7 +309,7 @@ The proposal requires:
 
 **Summary:** Weak
 
-### READY-001 Proposal 032 does not have a focused same-tree proof gate
+### READY-001 Proposal 035 does not have a focused same-tree proof gate
 
 - Severity: Critical
 - Confidence: High
@@ -318,8 +318,8 @@ The proposal requires:
 - Evidence:
   - `scripts/test-gate.sh:1136-1144`
   - `scripts/test-gate.sh:1362-1371`
-- Why It Matters: The proposal explicitly requires a focused interrupted-transition proof set and a same-tree `EA93E855`-class scenario. The canonical gate script has proposal gates through `proposal-029`, but no `proposal-032` lane at all.
-- Recommended Action: Add a dedicated `proposal-032` gate with the non-UI interrupted-transition lane plus the focused `EA93E855` scenario.
+- Why It Matters: The proposal explicitly requires a focused interrupted-transition proof set and a same-tree `EA93E855`-class scenario. The canonical gate script has proposal gates through `proposal-030`, but no `proposal-035` lane at all.
+- Recommended Action: Add a dedicated `proposal-035` gate with the non-UI interrupted-transition lane plus the focused `EA93E855` scenario.
 
 ### READY-002 Same-tree proof is real but still narrower than the proposal contract
 
@@ -344,4 +344,4 @@ The proposal requires:
 - `Overall Readiness: Not Ready`
 - `Audit Confidence: High`
 
-Proposal 032 has real implementation progress and meaningful same-tree proof for the cursor-first non-UI lane, but it is not complete. The remaining blockers are concrete implementation gaps, not audit noise: settlement still is not fail-closed, shell/read-model migration is incomplete, and the required focused same-tree proof scenario is still missing.
+Proposal 035 has real implementation progress and meaningful same-tree proof for the cursor-first non-UI lane, but it is not complete. The remaining blockers are concrete implementation gaps, not audit noise: settlement still is not fail-closed, shell/read-model migration is incomplete, and the required focused same-tree proof scenario is still missing.

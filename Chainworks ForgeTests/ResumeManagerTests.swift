@@ -1551,6 +1551,7 @@ struct ResumeManagerTests {
             hasPendingApproval: false,
             hasRunningAgents: false,
             stalledStageStatus: nil,
+            stalledStageStartedAt: nil,
             latestLiveEvent: ExecutionEvent(
                 type: .sessionClosed,
                 timestamp: Date().addingTimeInterval(-5),
@@ -1581,12 +1582,45 @@ struct ResumeManagerTests {
             hasPendingApproval: false,
             hasRunningAgents: false,
             stalledStageStatus: .completed,
+            stalledStageStartedAt: nil,
             latestLiveEvent: ExecutionEvent(
                 type: .sessionClosed,
                 timestamp: Date().addingTimeInterval(-31),
                 detail: "Session closed"
             ),
             now: Date()
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService does not reconcile newly started stage from previous stage session close")
+    func executionServiceDoesNotReconcileNewlyStartedStageFromPreviousSessionClose() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-2),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-45),
+                detail: "Previous stage session closed"
+            ),
+            now: now
         )
 
         #expect(shouldReconcile == false)

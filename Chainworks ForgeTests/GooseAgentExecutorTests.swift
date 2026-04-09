@@ -313,6 +313,80 @@ struct RuntimeAgentExecutorTests {
         }
     }
 
+    private final class StaleReuseNoActiveCodexSessionTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+            var sessionUseCounts: [String: Int] = [:]
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            let sessionID = callCount == 1 ? "session-reused" : "session-fresh-\(callCount)"
+            return RuntimeSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            let useCount = state.withLock { state -> Int in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+                state.sessionUseCounts[sessionID, default: 0] += 1
+                return state.sessionUseCounts[sessionID] ?? 0
+            }
+
+            return AsyncThrowingStream { continuation in
+                Task {
+                    if sessionID == "session-reused" && useCount == 2 {
+                        continuation.finish(throwing: NSError(
+                            domain: "CodexACPTest",
+                            code: 404,
+                            userInfo: [NSLocalizedDescriptionKey: "Streaming failed: No active Codex session for ID: session-reused"]
+                        ))
+                        return
+                    }
+
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.finalOutput(content: sessionID == "session-reused" ? "first pass output" : "fresh fallback output"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
     private final class ACPReadLoopStallTransport: RuntimeTransportProtocol, @unchecked Sendable {
         func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             RuntimeSessionResponse(
@@ -977,6 +1051,95 @@ struct RuntimeAgentExecutorTests {
         let proposalSummary = try #require(result.outputs["proposal_revision_summary"])
         #expect(String(decoding: proposalCurrent, as: UTF8.self).contains("# Proposal"))
         #expect(String(decoding: proposalSummary, as: UTF8.self).contains("Revision summary"))
+    }
+
+    @MainActor
+    @Test("Executor merges required output blocks across final output and accumulated text")
+    func gooseExecutorMergesReturnedOutputBlocksAcrossSources() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .textChunk(text: """
+                <<<CHAINWORKS_OUTPUT:proposal_current>>>
+                # Proposal
+
+                Full proposal body.
+                <<<END_CHAINWORKS_OUTPUT>>>
+
+                <<<CHAINWORKS_OUTPUT:proposal_revision_summary>>>
+                Revision summary from accumulated text.
+                <<<END_CHAINWORKS_OUTPUT>>>
+                """),
+                .finalOutput(content: """
+                <<<CHAINWORKS_OUTPUT:proposal_current>>>
+                # Proposal
+
+                Full proposal body.
+                <<<END_CHAINWORKS_OUTPUT>>>
+                """),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "proposal_writer",
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let task = makeTask(agent: "proposal_writer", task: "refine_proposal")
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        let proposalCurrent = try #require(result.outputs["proposal_current"])
+        let proposalSummary = try #require(result.outputs["proposal_revision_summary"])
+        #expect(String(decoding: proposalCurrent, as: UTF8.self).contains("# Proposal"))
+        #expect(String(decoding: proposalSummary, as: UTF8.self).contains("Revision summary from accumulated text"))
+    }
+
+    @MainActor
+    @Test("Executor tolerates degraded returned output end markers in accumulated text")
+    func gooseExecutorToleratesDegradedReturnedOutputEndMarkers() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .textChunk(text: """
+                <<<CHAINWORKS_OUTPUT:proposal_current>>>
+                # Proposal
+
+                Full proposal body.
+                <<<END_CHAINWORKS_OUTPUT>>
+
+                <<<CHAINWORKS_OUTPUT:proposal_revision_summary>>>
+                Revision summary from accumulated text.
+                <<<END_CHAINWORKS_OUTPUT>>
+                """),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "proposal_writer",
+            outputs: ["proposal_current", "proposal_revision_summary"]
+        )
+        let task = makeTask(agent: "proposal_writer", task: "refine_proposal")
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        let proposalCurrent = try #require(result.outputs["proposal_current"])
+        let proposalSummary = try #require(result.outputs["proposal_revision_summary"])
+        #expect(String(decoding: proposalCurrent, as: UTF8.self).contains("# Proposal"))
+        #expect(String(decoding: proposalSummary, as: UTF8.self).contains("Revision summary from accumulated text"))
     }
 
     @MainActor
@@ -1835,6 +1998,56 @@ struct RuntimeAgentExecutorTests {
         #expect(!result.succeeded)
         #expect(result.canonicalOutcome == .limitExhaustedBeforeOutput)
         #expect(result.errorMessage == "Provider or app limit exhausted")
+    }
+
+    @MainActor
+    @Test("Executor falls back to fresh session when reused Codex session is no longer active")
+    func gooseExecutorFallsBackFromNoActiveCodexSession() async throws {
+        let transport = StaleReuseNoActiveCodexSessionTransport()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: AgentSessionManager(container: makeContext().modelContext.container))
+
+        let baseContext = makeContext()
+        let runID = baseContext.workspace.runID
+        let context1 = makeContext(runID: runID, iteration: 1)
+        let context2 = makeContext(runID: runID, iteration: 2)
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_current"],
+            sessionReuseScope: .same_agent_family_within_run,
+            sessionFamilyID: "proposal_authoring_loop"
+        )
+        let task = AgentTask(
+            agent: "proposal_writer",
+            task: "draft_initial_proposal",
+            inputs: nil,
+            outputs: ["proposal_current"]
+        )
+
+        let firstResult = try await executor.execute(task: task, agent: agent, context: context1)
+        #expect(firstResult.succeeded)
+        #expect(firstResult.sessionReuseDisposition == .fresh)
+
+        let secondResult = try await executor.execute(task: task, agent: agent, context: context2)
+        #expect(secondResult.succeeded)
+        #expect(secondResult.sessionReuseDisposition == .fresh_after_transport_error)
+        #expect(secondResult.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
     }
 
     @MainActor

@@ -1,11 +1,11 @@
-# Proposal 030: Remove Goose From Canonical Transport And Simplify Runtime Dispatch
+# Proposal 033: Remove Goose From Canonical Transport And Simplify Runtime Dispatch
 
 | Field | Value |
 |---|---|
 | Date | 2026-04-07 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](029-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/goose-server-transport.md](../reference/goose-server-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
+| Depends on | [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](030-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/goose-server-transport.md](../reference/goose-server-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
 | Scope | Remove Goose as the canonical runtime transport implementation after second-wave ACP providers are proven, and simplify runtime dispatch to an ACP-first core with Goose retained only as explicit optional compatibility adapter. |
 | Goal | Replace the current multi-implementation transport shape with a single canonical ACP execution seam and capability-gated provider adapters. |
 
@@ -14,7 +14,7 @@
 ## 1. Context and Motivation
 
 The current runtime baseline established ACP-shaped transport as the canonical model but kept Goose as the default runtime.
-Proposal 029 introduces the next runtime expansion: Codex ACP, Auggie CLI ACP, and Junie CLI ACP.
+Proposal 030 introduces the next runtime expansion: Codex ACP, Auggie CLI ACP, and Junie CLI ACP.
 
 Once those providers are implemented and proven, we should complete the migration by removing Goose
 from the canonical runtime path so that:
@@ -116,7 +116,7 @@ Update evidence and proposal-index docs to mark this as “Goose transport canon
 
 This proposal also fixes the MCP ownership target for the post-Goose world.
 
-After Proposal 030:
+After Proposal 033:
 
 - `backend_profile` is the only repo-owned execution contract for runtime selection and MCP intent
 - `backend_profile` declares one explicit MCP set for that runtime/backend combination
@@ -132,13 +132,13 @@ Canonical ownership becomes:
 - runtime transport receives only already-materialized ACP `mcpServers`, never Goose-shaped extension IDs or repo-owned launch commands
 
 This intentionally removes the current layered MCP indirection from the long-term design.
-Current additive ACP rollout may keep bridge-era compatibility structures while Proposal 026 and Proposal 029 are still in flight, but those structures are transitional only and are not part of the target architecture after Proposal 030.
+Current additive ACP rollout may keep bridge-era compatibility structures while Proposal 026 and Proposal 030 are still in flight, but those structures are transitional only and are not part of the target architecture after Proposal 033.
 
 ---
 
 ## 5. Rollout Sequence
 
-1. Complete Proposal 029 proof lane for all second-wave providers and capture pass/fail evidence.
+1. Complete Proposal 030 proof lane for all second-wave providers and capture pass/fail evidence.
 2. Freeze default runtime selection against non-Goose ACP profile in the catalog.
 3. Refactor core transport factory and remove Goose-specific path from canonical interfaces.
 4. Promote Goose adapter modules to compatibility-only packaging and guard behind explicit compatibility selection.
@@ -152,7 +152,7 @@ Current additive ACP rollout may keep bridge-era compatibility structures while 
 
 ## 6. Acceptance Criteria
 
-Proposal 030 is complete when:
+Proposal 033 is complete when:
 
 1. Core orchestration transport has no Goose-shaped canonical assumptions.
 2. Runtime dispatch is uniform and ACP-first.

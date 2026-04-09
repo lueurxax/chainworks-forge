@@ -588,6 +588,9 @@ struct AppBootstrapView: View {
             gooseServerManager: gooseServerManager
         )
         executionService = service
+        #if os(macOS)
+        (NSApp.delegate as? AppTerminationCoordinator)?.executionTerminationController = service
+        #endif
 
         Self.seedIdeaIfRequested(modelContext: modelContext)
         Self.seedWaitingApprovalRunIfRequested(modelContext: modelContext, catalog: catalog)

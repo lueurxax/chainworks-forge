@@ -49,30 +49,12 @@ enum ACPStreamEventMapper {
 
         switch type {
         case "agent_message_chunk":
-            // content may be String or structured. Try String first, fall back to nested text.
-            if let rawContent = payload["content"], !(rawContent is String) {
-                ForgeLogger.bridge.info("agent_message_chunk content is NOT String, actual: \(Swift.type(of: rawContent)), value: \(String(describing: rawContent).prefix(200))")
-            }
-            let content: String
-            if let str = payload["content"] as? String {
-                content = str
-            } else if let dict = payload["content"] as? [String: Any], let text = dict["text"] as? String {
-                content = text
-            } else {
-                content = ""
-            }
+            let content = extractChunkText(from: payload["content"], logPrefix: "agent_message_chunk")
             guard !content.isEmpty else { return nil }
             return .textChunk(text: content)
 
         case "agent_thought_chunk":
-            let content: String
-            if let str = payload["content"] as? String {
-                content = str
-            } else if let dict = payload["content"] as? [String: Any], let text = dict["text"] as? String {
-                content = text
-            } else {
-                content = ""
-            }
+            let content = extractChunkText(from: payload["content"], logPrefix: "agent_thought_chunk")
             guard !content.isEmpty else { return nil }
             return .textChunk(text: "[thinking] \(content)")
 
@@ -226,6 +208,48 @@ enum ACPStreamEventMapper {
             return name
         }
         return "unknown"
+    }
+
+    private static func extractChunkText(from rawContent: Any?, logPrefix: String) -> String {
+        guard let rawContent else { return "" }
+
+        if let str = rawContent as? String {
+            return str
+        }
+
+        if let dict = rawContent as? [String: Any] {
+            if let text = dict["text"] as? String {
+                return text
+            }
+
+            if let content = dict["content"] {
+                let nested = extractChunkText(from: content, logPrefix: logPrefix)
+                if !nested.isEmpty { return nested }
+            }
+
+            if let parts = dict["parts"] as? [Any] {
+                let joined = parts
+                    .map { extractChunkText(from: $0, logPrefix: logPrefix) }
+                    .joined()
+                if !joined.isEmpty { return joined }
+            }
+
+            if let items = dict["items"] as? [Any] {
+                let joined = items
+                    .map { extractChunkText(from: $0, logPrefix: logPrefix) }
+                    .joined()
+                if !joined.isEmpty { return joined }
+            }
+        }
+
+        if let array = rawContent as? [Any] {
+            return array
+                .map { extractChunkText(from: $0, logPrefix: logPrefix) }
+                .joined()
+        }
+
+        ForgeLogger.bridge.info("\(logPrefix) content is NOT String, actual: \(Swift.type(of: rawContent)), value: \(String(describing: rawContent).prefix(200))")
+        return ""
     }
 
     /// Extract tool name from a `session/request_permission` payload.

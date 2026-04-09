@@ -39,6 +39,11 @@ final class WorkflowMapProjectionService {
         let persistedTimeline = buildPersistedTimeline(stages: persistedStages, approvals: persistedApprovals, plan: plan)
         let providerBindings = decodeProviderBindings(from: run.providerBindingSnapshotJSON)
         let currentStageID = deriveCurrentStageID(for: run, from: persistedStages)
+        let projectionStages = suppressStaleFutureStageExecutions(
+            in: persistedStages,
+            currentStageID: currentStageID,
+            orderedStateIDs: orderedStateIDs
+        )
         let runStatus = deriveRunStatus(for: run, persistedStages: persistedStages)
 
         let stages: [WorkflowMapStageProjection] = orderedStateIDs.enumerated().compactMap { index, stateID in
@@ -47,7 +52,7 @@ final class WorkflowMapProjectionService {
                 run: run,
                 plan: plan,
                 topology: topology,
-                persistedStages: persistedStages,
+                persistedStages: projectionStages,
                 currentStageID: currentStageID,
                 stateID: stateID,
                 state: state,
@@ -167,6 +172,51 @@ final class WorkflowMapProjectionService {
         }
 
         return run.status
+    }
+
+    private func suppressStaleFutureStageExecutions(
+        in persistedStages: [RunStageSnapshot],
+        currentStageID: String?,
+        orderedStateIDs: [String]
+    ) -> [RunStageSnapshot] {
+        guard
+            let currentStageID,
+            let currentStageOrder = orderedStateIDs.firstIndex(of: currentStageID),
+            let currentStageExecution = persistedStages
+                .filter({ $0.stageID == currentStageID })
+                .sorted(by: compareStageSnapshots)
+                .last
+        else {
+            return persistedStages
+        }
+
+        let currentStageIsNonTerminal: Bool = {
+            switch currentStageExecution.status {
+            case .pending, .ready, .running, .waitingApproval, .blocked, .failed:
+                return true
+            case .completed, .skipped:
+                return false
+            }
+        }()
+
+        guard currentStageIsNonTerminal else { return persistedStages }
+
+        return persistedStages.filter { stage in
+            guard
+                let stageOrder = orderedStateIDs.firstIndex(of: stage.stageID),
+                stageOrder > currentStageOrder,
+                stage.startedAt < currentStageExecution.startedAt
+            else {
+                return true
+            }
+
+            switch stage.status {
+            case .pending, .ready, .running, .waitingApproval, .blocked, .failed:
+                return false
+            case .completed, .skipped:
+                return true
+            }
+        }
     }
 
 #if DEBUG
@@ -589,5 +639,15 @@ final class WorkflowMapProjectionService {
     private func decodeProviderBindings(from data: Data?) -> [String: ResolvedProviderBinding] {
         guard let data else { return [:] }
         return (try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)) ?? [:]
+    }
+
+    private func compareStageSnapshots(_ lhs: RunStageSnapshot, _ rhs: RunStageSnapshot) -> Bool {
+        if lhs.startedAt == rhs.startedAt {
+            if lhs.iteration == rhs.iteration {
+                return lhs.attemptNumber < rhs.attemptNumber
+            }
+            return lhs.iteration < rhs.iteration
+        }
+        return lhs.startedAt < rhs.startedAt
     }
 }

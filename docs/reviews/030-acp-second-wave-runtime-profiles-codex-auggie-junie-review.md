@@ -4,13 +4,13 @@
 - Mode used: `proposal-readiness`
 - Evidence completeness: `Complete`
 - Proposal / docs reviewed:
-  - `/Users/user/Documents/Chainworks Forge/docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md`
   - `/Users/user/Documents/Chainworks Forge/.review-baselines/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/provider-platform.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/acp-runtime-transport.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/per-agent-mcp-policy-and-runtime-validation.md`
-  - `/Users/user/Documents/Chainworks Forge/docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie_IMPLEMENTATION_AUDIT_R2.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie_IMPLEMENTATION_AUDIT_R2.md`
 - Reusable baseline used:
   - `/Users/user/Documents/Chainworks Forge/.review-baselines/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/current-system-baseline.md`
@@ -18,7 +18,7 @@
   - repo-level current-system map
   - stable provider-platform, ACP transport, and MCP validation references
 - Baseline refreshed:
-  - targeted code refresh for provider families, settings/selection, runtime transport, MCP registry ownership, canonical catalog entries, and `proposal-029` proof gate
+  - targeted code refresh for provider families, settings/selection, runtime transport, MCP registry ownership, canonical catalog entries, and `proposal-030` proof gate
 - Baseline freshness: `Partially refreshed`
 - Proposal-specific integration context:
   - none present
@@ -30,7 +30,7 @@
 - Sources reused:
   - stable reference docs and existing baseline artifacts
 - Sources refreshed:
-  - current provider/runtime/MCP code paths and existing `P029` implementation audit
+  - current provider/runtime/MCP code paths and existing `P030` implementation audit
 - Time-sensitive external guidance:
   - none
 - Code areas inspected:
@@ -61,7 +61,7 @@
 - Provenance of key evidence:
   - local proposal/docs + stable baseline + current code inspection + adjacent implementation-audit artifact
 - Remaining assumptions:
-  - `P029` is reviewed as a delta proposal over current stable refs
+  - `P030` is reviewed as a delta proposal over current stable refs
 - Remaining blockers:
   - proposal scope/phase ownership is internally inconsistent
   - second-wave registry/MCP contract is still underspecified for Auggie and Junie
@@ -72,11 +72,11 @@
 - Confidence: `High`
 - Proposal completeness signal: `Mixed`
 - Top risks:
-  1. `P029` says all three live second-wave transports are in scope, but the rollout-order section still labels only the structural slice as “this proposal”.
+  1. `P030` says all three live second-wave transports are in scope, but the rollout-order section still labels only the structural slice as “this proposal”.
   2. MCP registry work is aimed at the right seam, but the proposal still does not lock the concrete runtime-registry authority or explicit zero-MCP policy for `auggie` and `junie`.
   3. Verification remains uneven: acceptance covers all three transports, while the proof section only requires one successful Codex path and looser expectations for the other two.
 - Top opportunities:
-  1. Convert `P029` into one unambiguous delta plan over current HEAD instead of a mixed “already landed + maybe later phases” document.
+  1. Convert `P030` into one unambiguous delta plan over current HEAD instead of a mixed “already landed + maybe later phases” document.
   2. Lock one adapter-family matrix for runtime registry source, MCP lane availability, and preflight behavior.
   3. Strengthen the proof gate so implementation cannot claim completion with only partial second-wave execution evidence.
 
@@ -87,14 +87,14 @@
   - fail-closed transport selection
   - MCP registry ownership and runtime validation
   - capability enforcement through `ProviderCapabilities`
-  - focused `proposal-029` proof gate
+  - focused `proposal-030` proof gate
 - Out of scope:
   - Goose removal
   - hard cutover away from Goose
   - operator-grade claims for second-wave providers
   - generic cross-provider MCP parity
 - Deferred intentionally:
-  - transport simplification in `P030`
+  - transport simplification in `P031`
 - Most important baseline refreshes performed:
   - provider-platform owner chain
   - first-wave ACP transport baseline
@@ -102,7 +102,7 @@
   - current canonical catalog/runtime-profile state
   - current focused proof gate
 - Most important contradictions with current repo:
-  - `P029` is correctly written as a delta over current HEAD, but it still mixes already-landed structural work with future live-transport phases ambiguously
+  - `P030` is correctly written as a delta over current HEAD, but it still mixes already-landed structural work with future live-transport phases ambiguously
   - current repo preserves Codex MCP mappings, while Auggie/Junie MCP lane behavior remains undefined
 - Most important missing or partial states:
   - one shared operator-facing taxonomy for `disabled`, `misconfigured`, `missing registry`, and `healthy`
@@ -122,7 +122,7 @@
 - Finding ID: `UI-029-001`
   Severity: `Medium`
   Evidence IDs: `DOC-04`, `NAV-01`, `NAV-02`, `NAV-03`, `INT-01`
-  Why it matters: `P029` changes a user-facing provider platform that already has `ProviderSettingsView`, `PilotReadinessView`, troubleshooting, and run-start preflight. The proposal explicitly names a Settings toggle and a preflight/report distinction for disabled providers, but it still does not lock one shared status/copy contract across the full provider shell for `disabled`, `misconfigured`, `missing runtime registry`, and `healthy`. That leaves room for implementation drift and mixed operator messaging.
+  Why it matters: `P030` changes a user-facing provider platform that already has `ProviderSettingsView`, `PilotReadinessView`, troubleshooting, and run-start preflight. The proposal explicitly names a Settings toggle and a preflight/report distinction for disabled providers, but it still does not lock one shared status/copy contract across the full provider shell for `disabled`, `misconfigured`, `missing runtime registry`, and `healthy`. That leaves room for implementation drift and mixed operator messaging.
   Recommended fix: add one cross-surface provider-status contract covering Settings, Pilot Readiness, troubleshooting, and preflight for second-wave providers.
   Acceptance criteria:
   - `disabled`, `misconfigured`, `missing registry`, and `healthy` are defined as distinct operator-visible states
@@ -146,18 +146,18 @@
 - Finding ID: `ARCH-029-001`
   Severity: `High`
   Evidence IDs: `DOC-01`, `REAL-02`, `REAL-04`, `M`
-  Why it matters: sections `3`, `3.2`, and acceptance `11` say that `P029` includes end-to-end execution for `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp`. But section `4.7` still labels only “Phase 1 — Structural prerequisites” as “this proposal”, with Codex and Auggie/Junie execution deferred into later phases. That is an internal scope contradiction. It reintroduces exactly the kind of unsafe staged rollout confusion that earlier reviews flagged.
-  Recommended fix: make the ownership model explicit. Either keep all three executable transports inside `P029` and rewrite `4.7` accordingly, or split later transport phases into new proposals and remove the all-three execution commitments from `P029`.
+  Why it matters: sections `3`, `3.2`, and acceptance `11` say that `P030` includes end-to-end execution for `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp`. But section `4.7` still labels only “Phase 1 — Structural prerequisites” as “this proposal”, with Codex and Auggie/Junie execution deferred into later phases. That is an internal scope contradiction. It reintroduces exactly the kind of unsafe staged rollout confusion that earlier reviews flagged.
+  Recommended fix: make the ownership model explicit. Either keep all three executable transports inside `P030` and rewrite `4.7` accordingly, or split later transport phases into new proposals and remove the all-three execution commitments from `P030`.
   Acceptance criteria:
   - rollout-order text and acceptance criteria describe the same in-scope surface
-  - there is no interpretation where structural scaffolding lands while live transport work is “later” but still counted as `P029` complete
+  - there is no interpretation where structural scaffolding lands while live transport work is “later” but still counted as `P030` complete
   - Codex/Auggie/Junie execution commitments are either all in or explicitly out with new proposal ownership
   Confidence: `High`
 
 - Finding ID: `ARCH-029-002`
   Severity: `High`
   Evidence IDs: `DOC-05`, `DOC-06`, `MAP-05`, `MAP-07`, `INT-03`, `INT-04`, `REAL-03`, `REAL-06`
-  Why it matters: `P029` correctly targets the remaining Goose-owned registry seam, but it still does not fully lock the second-wave MCP contract. The proposal says each second-wave provider gets a runtime namespace and new registry conformers, yet only Codex runtime mappings are explicitly preserved in the canonical catalog. It never decides whether `auggie` and `junie` ship with real MCP lanes, or intentionally remain zero-MCP-only and must fail MCP-dependent preflight by design. Without that decision, implementation can invent incompatible registry readers and lane behavior.
+  Why it matters: `P030` correctly targets the remaining Goose-owned registry seam, but it still does not fully lock the second-wave MCP contract. The proposal says each second-wave provider gets a runtime namespace and new registry conformers, yet only Codex runtime mappings are explicitly preserved in the canonical catalog. It never decides whether `auggie` and `junie` ship with real MCP lanes, or intentionally remain zero-MCP-only and must fail MCP-dependent preflight by design. Without that decision, implementation can invent incompatible registry readers and lane behavior.
   Recommended fix: add one adapter-family matrix covering runtime namespace, registry source, install/readiness owner, and whether MCP lanes are supported, absent by design, or future work for each of `codex`, `auggie`, and `junie`.
   Acceptance criteria:
   - each second-wave family has an explicit MCP policy stance: mapped lanes or zero-MCP-only
@@ -181,7 +181,7 @@
   Decision: pick one ownership model and reflect it consistently across scope, rollout order, and acceptance.
   Owner: proposal author
 
-- Conflict: stable references still describe a Goose-first registry world, while `P029` is meant to finish the transport-neutral second-wave MCP path.
+- Conflict: stable references still describe a Goose-first registry world, while `P030` is meant to finish the transport-neutral second-wave MCP path.
   Tradeoff: keeping the proposal high-level leaves flexibility, but it also leaves too much room for inconsistent per-runtime behavior.
   Decision: add one explicit adapter-family MCP matrix before implementation starts.
   Owner: proposal author
@@ -189,7 +189,7 @@
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P0 | Resolve the internal scope/phase contradiction and decide whether all three executable transports are truly in `P029` | iOS Architecture | Proposal author | Before implementation | current proposal draft | scope, rollout order, and acceptance criteria all describe the same surface | `ARCH-029-001` |
+| P0 | Resolve the internal scope/phase contradiction and decide whether all three executable transports are truly in `P030` | iOS Architecture | Proposal author | Before implementation | current proposal draft | scope, rollout order, and acceptance criteria all describe the same surface | `ARCH-029-001` |
 | P0 | Add an adapter-family MCP and runtime-registry authority matrix for Codex, Auggie, and Junie | iOS Architecture | Proposal author | Before implementation | current provider/MCP baseline | no ambiguity remains about lanes, registry source, or preflight behavior per family | `ARCH-029-002` |
 | P1 | Strengthen the proof contract so it matches the actual in-scope transport set | iOS Architecture | Proposal author | Before implementation | P0 scope decision | same-tree proof requirements cannot be satisfied by partial execution evidence | `ARCH-029-003` |
 | P1 | Lock one operator-facing state/remediation contract for disabled vs broken vs registry-missing second-wave providers | UI/UX | Proposal author | Before implementation | P0/P0 | Settings, Pilot Readiness, troubleshooting, and preflight use one consistent state model | `UI-029-001`, `UX-029-001` |
@@ -197,7 +197,7 @@
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Proposal scope integrity | alignment between scope, rollout order, and acceptance criteria | no contradictory in-scope vs later-phase wording | no structural-only interpretation remains when live transports are claimed in scope | next proposal rereview | hold if `P029` still allows multiple ownership readings |
+| Proposal scope integrity | alignment between scope, rollout order, and acceptance criteria | no contradictory in-scope vs later-phase wording | no structural-only interpretation remains when live transports are claimed in scope | next proposal rereview | hold if `P030` still allows multiple ownership readings |
 | Second-wave MCP contract | per-family clarity for lanes, registry source, and blocked behavior | explicit matrix for Codex/Auggie/Junie | no ad hoc runtime-specific registry behavior is needed during implementation | next proposal rereview | hold if Auggie/Junie MCP behavior is still implicit |
 | Proof strategy | proof obligations for each in-scope transport | same-tree gate and per-provider proof rows are named | no provider remains in-scope without an explicit proof threshold | next proposal rereview | hold if closure can still be claimed with only partial live execution proof |
 
@@ -207,6 +207,6 @@
 - GAP-01: No blocking local evidence gap remains. The readiness blockers are proposal-text contradictions and omissions, not missing repo evidence.
 
 ### Open Questions
-- QUESTION-01: Should `P029` remain the owner for all three live second-wave transports, or should only the structural/Codex slice remain here with Auggie/Junie split later?
+- QUESTION-01: Should `P030` remain the owner for all three live second-wave transports, or should only the structural/Codex slice remain here with Auggie/Junie split later?
 - QUESTION-02: Are `auggie` and `junie` intended to support any MCP lanes in this proposal, or are they intentionally zero-MCP-only until a later slice?
 - QUESTION-03: If second-wave runtimes require registry validation, what is the canonical registry source and readiness owner per adapter family?

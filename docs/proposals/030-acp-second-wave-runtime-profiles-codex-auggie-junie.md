@@ -1,4 +1,4 @@
-# Proposal 029: Second-Wave ACP Runtime Profiles — Codex, Auggie, Junie
+# Proposal 030: Second-Wave ACP Runtime Profiles — Codex, Auggie, Junie
 
 | Field | Value |
 |---|---|
@@ -129,7 +129,7 @@ This proposal now explicitly includes the implementation work required to make t
 
 #### Required remaining implementation
 
-The following work is in scope for Proposal 029 and must be completed before the proposal can be considered fully implemented:
+The following work is in scope for Proposal 030 and must be completed before the proposal can be considered fully implemented:
 
 1. Implement `CodexACPTransport` end-to-end.
    - Session creation must succeed.
@@ -261,15 +261,15 @@ Preflight resolves the registry provider per binding. If no registry exists for 
 
 ### 4.3.1 Second-Wave MCP Policy Matrix
 
-To remove ambiguity, `P029` fixes the MCP stance per second-wave family as follows:
+To remove ambiguity, `P030` fixes the MCP stance per second-wave family as follows:
 
-| Family | Runtime Namespace | MCP stance in `P029` | Canonical runtime mappings in `P029` | Registry source / readiness owner | Preflight behavior |
+| Family | Runtime Namespace | MCP stance in `P030` | Canonical runtime mappings in `P030` | Registry source / readiness owner | Preflight behavior |
 |---|---|---|---|---|---|
 | `codex_acp` | `codex` | **Mapped lanes supported** | `developer`, `analyze`, `xcode`, `context7` | adapter-family-aware runtime registry provider for Codex ACP; until that provider exists, MCP-dependent Codex agents are blocked rather than silently downgraded | MCP-dependent agents must pass against Codex mappings or fail preflight |
-| `auggie_cli_acp` | `auggie` | **Zero-MCP-only by design in `P029`** | none | no runtime registry source required in `P029` | any MCP-dependent Auggie agent fails preflight deterministically |
-| `junie_cli_acp` | `junie` | **Zero-MCP-only by design in `P029`** | none | no runtime registry source required in `P029` | any MCP-dependent Junie agent fails preflight deterministically |
+| `auggie_cli_acp` | `auggie` | **Zero-MCP-only by design in `P030`** | none | no runtime registry source required in `P030` | any MCP-dependent Auggie agent fails preflight deterministically |
+| `junie_cli_acp` | `junie` | **Zero-MCP-only by design in `P030`** | none | no runtime registry source required in `P030` | any MCP-dependent Junie agent fails preflight deterministically |
 
-This proposal therefore does **not** require rich MCP lane parity for Auggie or Junie. Their runtime namespaces still exist so the system can reason about them explicitly, but the accepted `P029` rollout contract is zero-MCP-only for those two families unless a later proposal expands their lane surface.
+This proposal therefore does **not** require rich MCP lane parity for Auggie or Junie. Their runtime namespaces still exist so the system can reason about them explicitly, but the accepted `P030` rollout contract is zero-MCP-only for those two families unless a later proposal expands their lane surface.
 
 ### 4.4 Capability Enforcement
 
@@ -374,7 +374,7 @@ backend_profiles:
 
 ### 4.7 Rollout Order
 
-The phases below are sequencing inside **one proposal**. `P029` is not complete until all phases listed here are complete.
+The phases below are sequencing inside **one proposal**. `P030` is not complete until all phases listed here are complete.
 
 1. **Phase 1 — Structural prerequisites**:
    - Fail-closed transport factory
@@ -397,7 +397,7 @@ The phases below are sequencing inside **one proposal**. `P029` is not complete 
 
 - no new adapter family may be added without fail-closed factory registration;
 - no existing ACP profile or mapping introduced by this rollout may be reverted back to Goose merely to accommodate unfinished structural work.
-- no phase listed above may be treated as “future work outside `P029`” while the proposal still claims all-three executable transports in scope.
+- no phase listed above may be treated as “future work outside `P030`” while the proposal still claims all-three executable transports in scope.
 
 ### 4.8 Disabled-Provider Rollout Semantics
 
@@ -435,7 +435,7 @@ The phases below are sequencing inside **one proposal**. `P029` is not complete 
 6. Default Goose path remains operational.
 7. Run snapshots and execution reports preserve truth consistently across all provider families.
 8. Rollout enablement uses `ConfiguredProvider.isEnabled` as single owner: `preferredProvider(for:)` filters by `isEnabled`, preflight distinguishes "not enabled" from "capability mismatch", and preferred-provider repair respects disabled state. Second-wave families seed as disabled by default.
-9. A focused `proposal-029` gate in `test-gate.sh` passes on the canonical tree.
+9. A focused `proposal-030` gate in `test-gate.sh` passes on the canonical tree.
 10. The canonical catalog continues to preserve the current rollout decisions:
     - `codex_writer_high` resolves through `codex_acp`
     - Gemini proposal reviewers resolve through `gemini_review_pro`
@@ -444,7 +444,7 @@ The phases below are sequencing inside **one proposal**. `P029` is not complete 
 11. Runs routed to `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp` no longer fail with transport stub errors such as `"... is not yet implemented"`.
 12. MCP behavior is deterministic per second-wave family:
     - Codex ACP supports the declared `codex` runtime mappings and blocks when its registry/readiness source cannot satisfy them
-    - Auggie and Junie are zero-MCP-only in `P029`, and MCP-dependent agents targeting them fail preflight by design
+    - Auggie and Junie are zero-MCP-only in `P030`, and MCP-dependent agents targeting them fail preflight by design
 13. Proof requirements match scope: same-tree verification includes one successful execution proof path for each in-scope second-wave transport family (`codex_acp`, `auggie_cli_acp`, `junie_cli_acp`).
 
 ---

@@ -3,7 +3,7 @@
 ## A. Repo-Local Proposal / Document Inventory
 | Evidence ID | Source / Path / Artifact | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
 |---|---|---|---|---|---|---|
-| DOC-01 | `docs/proposals/032-atomic-transition-settlement-and-durable-resume-cursor.md` | 2026-04-08 | High | Updated `P032` now explicitly covers live stalled-run reconciliation (`§5.5`, `§6.5`), honest interrupted-transition reporting (`§5.6`), shell/read-model rebinding (`§6.6`), pre-cursor fallback (`§6.8`), notification ordering (`§6.10`), rollout (`§7`), and acceptance (`§8`). | Review could judge against a stale draft and preserve already-closed findings. | Core proposal |
+| DOC-01 | `docs/proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md` | 2026-04-08 | High | Updated `P035` now explicitly covers live stalled-run reconciliation (`§5.5`, `§6.5`), honest interrupted-transition reporting (`§5.6`), shell/read-model rebinding (`§6.6`), pre-cursor fallback (`§6.8`), notification ordering (`§6.10`), rollout (`§7`), and acceptance (`§8`). | Review could judge against a stale draft and preserve already-closed findings. | Core proposal |
 | DOC-02 | `docs/reference/execution-truth-and-recovery.md` | 2026-04-08 | High | Current recovery/report readers must prefer persisted truth over heuristic reconstruction, but the reference still does not already provide a transition cursor. | Proposal must extend the current truth hierarchy without breaking it. | Core dependency |
 | DOC-03 | `docs/reference/runtime-contract.md` | 2026-04-08 | High | Stable runtime status machines remain `RunStatus`, `StageStatus`, and related enums; resume/retry policy already exists as baseline truth. | Proposal could open a parallel progression state machine unless it maps cleanly to current runtime truth. | Core dependency |
 | DOC-04 | `docs/reference/domain-model.md` | 2026-04-08 | High | `Run.currentStageID` is currently a computed property derived from `StageExecution` ordering, and that behavior is treated as baseline persistence-model truth. | Proposal must explicitly rebind or constrain this current derived owner. | Core dependency |
@@ -14,8 +14,8 @@
 | Evidence ID | Artifact / Slice | Status (`Reused | Partially refreshed | Missing`) | Covered Surfaces | Verified On | Confidence | Freshness Notes | Relevance |
 |---|---|---|---|---|---|---|---|
 | BASE-01 | `.review-baselines/current-system-baseline.md` | Reused | repo shape, operator shell, execution model, reference-doc map | 2026-04-08 | High | Still valid as accelerator; execution/recovery/read-model slices required direct code refresh. | Review setup |
-| BASE-02 | Proposal-specific integration context | Missing | none | 2026-04-08 | High | No existing `032-atomic-transition-settlement-and-durable-resume-cursor.review/integration-context.md` was present. | None blocking |
-| BASE-03 | Prior `P032` review/evidence artifacts | Partially refreshed | prior red-pass findings | 2026-04-08 | High | Previous review/evidence were used as stale-basis comparators and superseded after the proposal changed. | Freshness check |
+| BASE-02 | Proposal-specific integration context | Missing | none | 2026-04-08 | High | No existing `035-atomic-transition-settlement-and-durable-resume-cursor.review/integration-context.md` was present. | None blocking |
+| BASE-03 | Prior `P035` review/evidence artifacts | Partially refreshed | prior red-pass findings | 2026-04-08 | High | Previous review/evidence were used as stale-basis comparators and superseded after the proposal changed. | Freshness check |
 
 ## C. Scope, Out-of-Scope, and Intentional Deferrals
 - In scope:
@@ -70,7 +70,7 @@
 | DATA-02 | Stage truth and recovery evidence | `StageExecution.swift`, `execution-truth-and-recovery.md` | Persisted stage truth | 2026-04-08 | High | Stage records own stage settlement, evidence packets, and recovery snapshots. The proposal keeps stage truth stage-owned while making continuation cursor run-owned. | Ownership split is now explicit and coherent. | Ownership boundary |
 | DATA-03 | Restart normalization and live interruption handling | `ResumeManager.swift`, `ExecutionService.swift` | Runtime mutation | 2026-04-08 | High | Current restart and live `sessionClosed` flows both mutate runs/stages/agents into blocked/failed truth. The updated proposal now explicitly covers both paths. | Implementation must keep both paths on one owner chain. | Former blocker, now specified |
 | DATA-04 | Workflow-authored `run_state` artifacts | `GooseSessionBridge.swift`, tests, proposal text | Artifact evidence | 2026-04-08 | High | `run_state` is still present as workflow evidence and current tests already guard stale-override behavior. `§6.7` now explicitly keeps it secondary. | Evidence-only boundary must stay intact. | Evidence-only boundary |
-| DATA-05 | Pre-cursor historical runs | `P032 §6.8` | Fallback behavior | 2026-04-08 | High | The updated proposal now explicitly specifies degraded-trust fallback for runs that lack the new cursor field. | Historical readability/resumability is no longer undefined. | Migration completeness |
+| DATA-05 | Pre-cursor historical runs | `P035 §6.8` | Fallback behavior | 2026-04-08 | High | The updated proposal now explicitly specifies degraded-trust fallback for runs that lack the new cursor field. | Historical readability/resumability is no longer undefined. | Migration completeness |
 
 ## G. Current Host-System Integration Surfaces
 | Evidence ID | Surface / Seam / Owner | Source (`Baseline | Targeted refresh | Current repo`) | Verified On | Confidence | Key Fact | Conflict / Proposal Risk | Relevance |
@@ -108,7 +108,7 @@ No new feature-flag owner is proposed. Rollout is handled through the explicit m
 |---|---|---|---|---|---|---|---|
 | TEST-01 | Model/read-model | current derived continuation heuristics | `Chainworks_ForgeTests` already lock `currentStageID` and `resumeContinuationStateID` behavior, including materialized `ready` stage vs stale `run_state` | 2026-04-08 | High | Implementation must replace or rebind those tests/surfaces under the cursor-first contract. |
 | TEST-02 | Resume | restart normalization | `ResumeManagerTests` already prove that stale running runs are blocked and agents are failed on startup normalization | 2026-04-08 | High | `§6.3` now explicitly retargets this proof surface. |
-| TEST-03 | Focused proposal gate | interrupted transition settlement | no current `proposal-032` gate exists | focused non-UI proof for restart and live `sessionClosed` interruption paths, report generation, and shell projection boundaries | 2026-04-08 | High | The updated rollout and acceptance language now explicitly names both restart and live variants. |
+| TEST-03 | Focused proposal gate | interrupted transition settlement | no current `proposal-035` gate exists | focused non-UI proof for restart and live `sessionClosed` interruption paths, report generation, and shell projection boundaries | 2026-04-08 | High | The updated rollout and acceptance language now explicitly names both restart and live variants. |
 
 ## L. Current Repo Reality / Contradictions
 | Evidence ID | Repo Surface | Proposal Claim | Current Repo Reality | Verified On | Confidence | Implication |

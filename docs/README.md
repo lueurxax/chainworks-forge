@@ -64,8 +64,12 @@ Active work that is not yet fully promoted into `reference/` lives under [`propo
 - [proposals/020-dynamic-cycle-addition.md](proposals/020-dynamic-cycle-addition.md)
 - [proposals/021-run-transition-notifications-and-attention-routing.md](proposals/021-run-transition-notifications-and-attention-routing.md)
 - [proposals/023-loop-improvement-analytics-and-iteration-progression.md](proposals/023-loop-improvement-analytics-and-iteration-progression.md)
-- [proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md](proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md)
-- [proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md](proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md)
+- [proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md)
+- [proposals/031-thin-ui-rewrite-over-projections-and-mcp.md](proposals/031-thin-ui-rewrite-over-projections-and-mcp.md)
+- [proposals/032-polish-stabilization-and-productization-backlog.md](proposals/032-polish-stabilization-and-productization-backlog.md)
+- [proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md](proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md)
+- [proposals/034-clean-yaml-runtime-transport-normalization.md](proposals/034-clean-yaml-runtime-transport-normalization.md)
+- [proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md](proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md)
 
 ## Examples
 

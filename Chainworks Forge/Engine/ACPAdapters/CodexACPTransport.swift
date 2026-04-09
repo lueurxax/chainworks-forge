@@ -7,9 +7,14 @@ import Foundation
 ///
 /// Executable: `codex`
 /// Model catalog: `gpt-5`, `gpt-5-codex`, `o4-mini` pass through; others default to `gpt-5`.
-/// Mode catalog: `full-auto` (repoWritesAllowed), `suggest` (default).
+/// Mode catalog: `full-access` (repoWritesAllowed), `read-only` (default).
 /// Session params: ACP JSON-RPC with `session/new` using `cwd`, `model`, `mode`. No `_meta` block.
 final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
+
+    private struct SessionHandle {
+        let subprocess: ACPSubprocessManager
+        let runtimeHomeURL: URL?
+    }
 
     // MARK: - Configuration
 
@@ -19,7 +24,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     // MARK: - Internal State
 
-    private var activeSessions: [String: ACPSubprocessManager] = [:]
+    private var activeSessions: [String: SessionHandle] = [:]
     private var requestCounters: [String: Int] = [:]
     private var sessionSystemPrompts: [String: String] = [:]
     private let lock = NSLock()
@@ -35,14 +40,20 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
         ForgeLogger.execution.debug("CodexACPTransport.createSession called, executablePath=\(executablePath), workingDir=\(request.workingDirectory ?? "nil")")
         let startTime = Date()
+        let runtimeHomeURL = try Self.prepareRuntimeHome(workingDirectory: request.workingDirectory)
         let subprocess = ACPSubprocessManager(
             executablePath: executablePath,
             arguments: [],
-            environment: [:],
+            environment: Self.makeSessionEnvironment(runtimeHomeURL: runtimeHomeURL),
             workingDirectory: request.workingDirectory
         )
 
-        try subprocess.launch()
+        do {
+            try subprocess.launch()
+        } catch {
+            Self.cleanupRuntimeHomeIfPresent(runtimeHomeURL)
+            throw error
+        }
 
         // Step 1: Send `initialize` JSON-RPC request
         let initializeRequest = makeJSONRPCRequest(
@@ -62,6 +73,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         let initResponse = try await readNextResult(from: subprocess)
         guard initResponse != nil else {
             subprocess.terminate()
+            Self.cleanupRuntimeHomeIfPresent(runtimeHomeURL)
             throw RuntimeTransportError.sessionCreationFailed(reason: "No response to ACP initialize request from Codex")
         }
 
@@ -76,15 +88,8 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         if let model = request.model {
             sessionParams["model"] = Self.mapModelForCodexCatalog(model)
         }
-        // Map execution policy to Codex mode.
-        // Codex uses `full-auto` for autonomous execution, `suggest` for interactive.
-        if let policy = request.executionPolicy {
-            if policy.repoWritesAllowed {
-                sessionParams["mode"] = "full-auto"
-            } else {
-                sessionParams["mode"] = "suggest"
-            }
-        }
+        // Map execution policy to the current Codex ACP mode catalog.
+        sessionParams["mode"] = Self.mapModeForCodexCatalog(request.executionPolicy)
 
         // No _meta block — Codex does not use Claude-specific plugin/MCP options.
 
@@ -99,12 +104,13 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         guard let sessionResult = try await readNextResult(from: subprocess),
               let sessionId = sessionResult["sessionId"] as? String else {
             subprocess.terminate()
+            Self.cleanupRuntimeHomeIfPresent(runtimeHomeURL)
             throw RuntimeTransportError.sessionCreationFailed(reason: "Invalid session/new response from Codex ACP")
         }
 
         // Register the active session and store systemPrompt for later prepending
         lock.lock()
-        activeSessions[sessionId] = subprocess
+        activeSessions[sessionId] = SessionHandle(subprocess: subprocess, runtimeHomeURL: runtimeHomeURL)
         requestCounters[sessionId] = 2 // initialize=1, session/new=2
         if !request.systemPrompt.isEmpty {
             sessionSystemPrompts[sessionId] = request.systemPrompt
@@ -144,7 +150,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                 }
 
                 self.lock.lock()
-                let subprocess = self.activeSessions[sessionID]
+                let subprocess = self.activeSessions[sessionID]?.subprocess
                 self.lock.unlock()
 
                 guard let subprocess else {
@@ -281,14 +287,15 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     func closeSession(sessionID: String) async throws {
         lock.lock()
-        let subprocess = activeSessions.removeValue(forKey: sessionID)
+        let handle = activeSessions.removeValue(forKey: sessionID)
         requestCounters.removeValue(forKey: sessionID)
         sessionSystemPrompts.removeValue(forKey: sessionID)
         lock.unlock()
 
-        guard let subprocess else {
+        guard let handle else {
             throw RuntimeTransportError.sessionCloseFailed(reason: "No active Codex session for ID: \(sessionID)")
         }
+        let subprocess = handle.subprocess
 
         // Send session/close request before terminating
         let closeRequest = makeJSONRPCRequest(
@@ -301,6 +308,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         // Brief wait for clean shutdown, then terminate
         try? await Task.sleep(for: .milliseconds(200))
         subprocess.terminate()
+        Self.cleanupRuntimeHomeIfPresent(handle.runtimeHomeURL)
     }
 
     // MARK: - Private: Model Mapping
@@ -319,6 +327,57 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
             if lowered.contains("o4-mini") { return "o4-mini" }
             return "gpt-5"
         }
+    }
+
+    private static func mapModeForCodexCatalog(_ policy: RuntimeExecutionPolicy?) -> String {
+        guard let policy else { return "read-only" }
+        return policy.repoWritesAllowed ? "full-access" : "read-only"
+    }
+
+    private static func makeSessionEnvironment(runtimeHomeURL: URL?) -> [String: String] {
+        guard let runtimeHomeURL else { return [:] }
+        return [
+            "CODEX_HOME": runtimeHomeURL.path
+        ]
+    }
+
+    static func prepareRuntimeHome(
+        workingDirectory: String?,
+        fileManager: FileManager = .default,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        tempRootURL: URL? = nil
+    ) throws -> URL {
+        let tempRoot = tempRootURL ?? fileManager.temporaryDirectory
+        let runtimeHomeURL = tempRoot
+            .appendingPathComponent("forge-codex-acp", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: runtimeHomeURL, withIntermediateDirectories: true)
+
+        let sourceHomeURL = sourceCodexHomeURL(environment: environment)
+        let sourceAuthURL = sourceHomeURL.appendingPathComponent("auth.json", isDirectory: false)
+        let runtimeAuthURL = runtimeHomeURL.appendingPathComponent("auth.json", isDirectory: false)
+
+        if fileManager.fileExists(atPath: sourceAuthURL.path) {
+            try fileManager.copyItem(at: sourceAuthURL, to: runtimeAuthURL)
+        } else {
+            ForgeLogger.execution.info("CodexACPTransport: auth.json not found at \(sourceAuthURL.path); starting isolated runtime home without copied auth")
+        }
+
+        ForgeLogger.execution.debug("CodexACPTransport: prepared isolated CODEX_HOME at \(runtimeHomeURL.path) for workingDir=\(workingDirectory ?? "nil")")
+        return runtimeHomeURL
+    }
+
+    private static func sourceCodexHomeURL(environment: [String: String]) -> URL {
+        if let explicit = environment["CODEX_HOME"], !explicit.isEmpty {
+            return URL(fileURLWithPath: explicit, isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    static func cleanupRuntimeHomeIfPresent(_ runtimeHomeURL: URL?, fileManager: FileManager = .default) {
+        guard let runtimeHomeURL else { return }
+        try? fileManager.removeItem(at: runtimeHomeURL)
     }
 
     // MARK: - Private: JSON-RPC Request Construction
@@ -412,5 +471,21 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         ]
 
         try? subprocess.sendJSON(response)
+    }
+}
+
+extension CodexACPTransport: RuntimeTransportTerminationControlling {
+    func terminateActiveSessionsForAppShutdown() {
+        lock.lock()
+        let handles = Array(activeSessions.values)
+        activeSessions.removeAll()
+        requestCounters.removeAll()
+        sessionSystemPrompts.removeAll()
+        lock.unlock()
+
+        for handle in handles {
+            handle.subprocess.terminate()
+            Self.cleanupRuntimeHomeIfPresent(handle.runtimeHomeURL)
+        }
     }
 }

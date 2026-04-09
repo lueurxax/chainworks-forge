@@ -1,8 +1,8 @@
-# Proposal 029: Second-Wave ACP Runtime Profiles Multi-Lens Audit R3
+# Proposal 030: Second-Wave ACP Runtime Profiles Multi-Lens Audit R3
 
 | Field | Value |
 |---|---|
-| Proposal | `docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md` |
+| Proposal | `docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md` |
 | Repository Root | `.` |
 | Git SHA | `ab1d8df` |
 | Working Tree | dirty |
@@ -15,7 +15,7 @@
 
 ## Executive Verdict
 
-Proposal 029 is stronger than in `R2`: the focused same-tree `proposal-029` gate is now green, second-wave provider families/adapters/settings are in place, and rollout gating via `isEnabled` is materially implemented. But the proposal is still not implemented on the current tree because the amended contract now explicitly owns real executable second-wave transports plus one successful proof path for each in-scope family, and the current tree still ships stub `CodexACPTransport`, `AuggieCLIACPTransport`, and `JunieCLIACPTransport`. MCP registry ownership is also only partially transport-neutral, so the Codex ACP rich-MCP branch is not yet fail-closed on the promised adapter-aware registry/readiness owner.
+Proposal 030 is stronger than in `R2`: the focused same-tree `proposal-030` gate is now green, second-wave provider families/adapters/settings are in place, and rollout gating via `isEnabled` is materially implemented. But the proposal is still not implemented on the current tree because the amended contract now explicitly owns real executable second-wave transports plus one successful proof path for each in-scope family, and the current tree still ships stub `CodexACPTransport`, `AuggieCLIACPTransport`, and `JunieCLIACPTransport`. MCP registry ownership is also only partially transport-neutral, so the Codex ACP rich-MCP branch is not yet fail-closed on the promised adapter-aware registry/readiness owner.
 
 ## Lens Scorecard
 
@@ -41,13 +41,13 @@ Proposal 029 is stronger than in `R2`: the focused same-tree `proposal-029` gate
 
 ### Locked Decisions
 
-- `P029` is not “catalog-only”; it owns provider-platform and runtime execution work.
+- `P030` is not “catalog-only”; it owns provider-platform and runtime execution work.
 - Unknown `adapterFamily` values must never silently fall back to Goose.
 - `RuntimeProfile.requires` extends `ProviderCapabilities`; it does not create a second authority.
 - Codex ACP keeps the `codex` MCP namespace and rich lane mappings.
-- Auggie and Junie are zero-MCP-only by design in `P029`.
+- Auggie and Junie are zero-MCP-only by design in `P030`.
 - `ConfiguredProvider.isEnabled` is the single rollout gate.
-- The phase list is sequencing inside one proposal, not deferred future work outside `P029`.
+- The phase list is sequencing inside one proposal, not deferred future work outside `P030`.
 
 ### Primary User Flows
 
@@ -80,7 +80,7 @@ The proposal requires:
 6. Goose default path preserved;
 7. run snapshots and reports preserve truth across provider families;
 8. rollout enablement stays owned by `ConfiguredProvider.isEnabled`;
-9. focused same-tree `proposal-029` gate passes;
+9. focused same-tree `proposal-030` gate passes;
 10. canonical catalog preserves the landed rollout decisions;
 11. runs routed to `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp` no longer fail with stub transport errors;
 12. MCP behavior is deterministic per second-wave family;
@@ -88,7 +88,7 @@ The proposal requires:
 
 ### Test / Evidence Requirements
 
-- Same-tree focused `proposal-029` gate.
+- Same-tree focused `proposal-030` gate.
 - Code/test evidence for second-wave provider platform expansion, transport routing, MCP policy behavior, rollout gating, and truthful runtime/report persistence.
 - Successful execution proof for each in-scope second-wave family.
 
@@ -96,7 +96,7 @@ The proposal requires:
 
 - No hard cutover away from Goose.
 - No operator-grade claim for second-wave providers beyond the evidence.
-- No cross-provider MCP parity requirement beyond the family-specific contract locked in `P029`.
+- No cross-provider MCP parity requirement beyond the family-specific contract locked in `P030`.
 
 ## Proposal Fidelity / Divergence
 
@@ -108,7 +108,7 @@ The proposal requires:
 - Preflight enforces `RuntimeProfile.requires` through `ProviderCapabilities`.
 - Disabled-provider rollout semantics are now wired through resolver, preflight, seeded defaults, preferred-provider selection, and preferred-provider repair.
 - The canonical catalog preserves `codex_writer_high -> codex_acp`, `gemini_review_pro` for proposal UI/UX reviewers, second-wave ACP orchestrator profiles, and Codex MCP mappings.
-- The focused same-tree `proposal-029` gate now passes.
+- The focused same-tree `proposal-030` gate now passes.
 - Runtime namespaces exist for `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp`.
 
 ### Divergences
@@ -232,15 +232,15 @@ The proposal requires:
   - `Chainworks ForgeTests/Proposal029Tests.swift:137-188`
 - Gap / Note: The old preferred-provider repair gap is closed on the current tree: repair now filters to enabled same-family providers, and preflight distinguishes rollout gating from capability mismatch.
 
-### REQ-009 Focused same-tree `proposal-029` gate passes
+### REQ-009 Focused same-tree `proposal-030` gate passes
 - Proposal Source: `§5.9`
 - Status: Implemented
 - Evidence Type: tests-run
 - Evidence:
   - `scripts/test-gate.sh:128-132`
   - `scripts/test-gate.sh:1370-1379`
-  - Command: `bash 'scripts/test-gate.sh' proposal-029`
-  - Result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-029-20260409-164538.xcresult`
+  - Command: `bash 'scripts/test-gate.sh' proposal-030`
+  - Result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-030-20260409-164538.xcresult`
   - Outcome: `Test run with 59 tests in 3 suites passed after 25.373 seconds. ** TEST SUCCEEDED **`
 - Gap / Note: This closes the earlier red-gate blocker from `R2`, but it does not by itself satisfy the now-expanded execution-proof contract in `REQ-013`.
 
@@ -286,8 +286,8 @@ The proposal requires:
   - `Chainworks ForgeTests/Proposal026Tests.swift:353-405`
   - `Chainworks ForgeTests/Proposal029Tests.swift:11-200`
   - `scripts/test-gate.sh:128-132`
-  - Command: `bash 'scripts/test-gate.sh' proposal-029`
-- Gap / Note: The current gate executes first-wave ACP proof tests for Claude/Gemini and structural tests for `P029`, but it does not run a successful Codex/Auggie/Junie execution proof. Because the second-wave transports are still stubs, the proposal’s per-family proof requirement cannot yet be satisfied.
+  - Command: `bash 'scripts/test-gate.sh' proposal-030`
+- Gap / Note: The current gate executes first-wave ACP proof tests for Claude/Gemini and structural tests for `P030`, but it does not run a successful Codex/Auggie/Junie execution proof. Because the second-wave transports are still stubs, the proposal’s per-family proof requirement cannot yet be satisfied.
 
 ## Architecture Review
 
@@ -321,9 +321,9 @@ The proposal requires:
   - `Chainworks Forge/Engine/ACPAdapters/CodexACPTransport.swift:8-41`
   - `Chainworks Forge/Engine/ACPAdapters/AuggieCLIACPTransport.swift:8-41`
   - `Chainworks Forge/Engine/ACPAdapters/JunieCLIACPTransport.swift:8-41`
-  - `bash 'scripts/test-gate.sh' proposal-029`
+  - `bash 'scripts/test-gate.sh' proposal-030`
 - Why It Matters: The amended proposal no longer treats second-wave ACP as structural scaffolding only. It explicitly owns executable Codex/Auggie/Junie transports and successful proof per family. Current catalog/runtime resolution can route work toward these transports, but the transports still fail immediately with stub errors, so the core user value is still unavailable.
-- Recommended Action: Implement real session creation, streaming, and close semantics for all three transports and add executed proof tests for each family to the `proposal-029` gate.
+- Recommended Action: Implement real session creation, streaming, and close semantics for all three transports and add executed proof tests for each family to the `proposal-030` gate.
 
 ### PROD-002 Codex ACP rich-MCP readiness remains weaker than the proposal contract
 - Severity: Major
@@ -385,20 +385,20 @@ The proposal requires:
   - `Chainworks Forge/Engine/ACPAdapters/JunieCLIACPTransport.swift:8-41`
   - `Chainworks ForgeTests/Proposal026Tests.swift:353-405`
   - `Chainworks ForgeTests/Proposal029Tests.swift:11-200`
-  - `bash 'scripts/test-gate.sh' proposal-029`
-- Why It Matters: `P029` now explicitly says it is incomplete until all listed phases are complete and requires one successful execution proof path per in-scope second-wave family. The current tree has a passing focused gate, but that gate still proves first-wave execution plus second-wave structure, not successful second-wave transport execution.
-- Recommended Action: Add Codex/Auggie/Junie proof tests that actually execute the second-wave transport path and keep them in the focused `proposal-029` gate.
+  - `bash 'scripts/test-gate.sh' proposal-030`
+- Why It Matters: `P030` now explicitly says it is incomplete until all listed phases are complete and requires one successful execution proof path per in-scope second-wave family. The current tree has a passing focused gate, but that gate still proves first-wave execution plus second-wave structure, not successful second-wave transport execution.
+- Recommended Action: Add Codex/Auggie/Junie proof tests that actually execute the second-wave transport path and keep them in the focused `proposal-030` gate.
 
 ## Readiness Checklist
 
 | Check | Status | Evidence / Note |
 |---|---|---|
-| Build succeeds on targeted platform(s) | Pass | `bash 'scripts/test-gate.sh' proposal-029` built and tested successfully on macOS |
+| Build succeeds on targeted platform(s) | Pass | `bash 'scripts/test-gate.sh' proposal-030` built and tested successfully on macOS |
 | Core user flow runtime-validated | Partial | first-wave ACP execution proof runs under the focused gate; second-wave execution proof is still missing |
 | Empty/loading/error states covered | Partial | rollout/preflight error paths exist in code, but the proposal is runtime-platform-first rather than UI-state-first |
 | Accessibility risk acceptable | Not Checked | not a primary audit axis for this runtime slice |
 | Localization risk acceptable | Not Checked | not reviewed in this pass |
-| Critical tests executed | Pass | `proposal-029` focused gate passed on the same tree/HEAD |
+| Critical tests executed | Pass | `proposal-030` focused gate passed on the same tree/HEAD |
 | Full regression suite / canonical full gate passed on same tree/HEAD | Not Checked | no full `scripts/test-gate.sh full` run in this audit |
 | Privacy/permissions/entitlements reviewed | Not Checked | not a primary proposal claim in this pass |
 
@@ -406,14 +406,14 @@ The proposal requires:
 
 - `git status --short`
 - `date '+%Y-%m-%dT%H:%M:%S%z'`
-- `python3 '/Users/user/.agents/skills/proposal-implementation-audit/scripts/report_path.py' '/Users/user/Documents/Chainworks Forge/docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md'`
-- `rg -n "superseded|deprecated|replaced by|obsolete" 'docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md' 'docs/proposals' 'docs/reviews' 'docs/reference'`
-- `rg -n "not yet implemented|mcp_server_registry:|runtime_profiles:|codex_acp|auggie_cli_acp|junie_cli_acp|GooseExtensionRegistryReader|Runtime Extension Registry|supportsMCPReconciliation|removeProvider\\(|preferredProvider\\(|providerNotEnabled\\(|effectiveRuntimeNamespace|proposal-029|Claude Agent ACP-backed canonical proposal loop|Gemini CLI ACP-backed canonical proposal loop|implementation path reaches manual release gate" 'Chainworks Forge' 'Chainworks ForgeTests' 'examples/agents/agents.yaml' 'scripts/test-gate.sh'`
-- `bash 'scripts/test-gate.sh' proposal-029`
+- `python3 '/Users/user/.agents/skills/proposal-implementation-audit/scripts/report_path.py' '/Users/user/Documents/Chainworks Forge/docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md'`
+- `rg -n "superseded|deprecated|replaced by|obsolete" 'docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md' 'docs/proposals' 'docs/reviews' 'docs/reference'`
+- `rg -n "not yet implemented|mcp_server_registry:|runtime_profiles:|codex_acp|auggie_cli_acp|junie_cli_acp|GooseExtensionRegistryReader|Runtime Extension Registry|supportsMCPReconciliation|removeProvider\\(|preferredProvider\\(|providerNotEnabled\\(|effectiveRuntimeNamespace|proposal-030|Claude Agent ACP-backed canonical proposal loop|Gemini CLI ACP-backed canonical proposal loop|implementation path reaches manual release gate" 'Chainworks Forge' 'Chainworks ForgeTests' 'examples/agents/agents.yaml' 'scripts/test-gate.sh'`
+- `bash 'scripts/test-gate.sh' proposal-030`
 
 ## Recommended Next Actions
 
 1. Implement `CodexACPTransport`, `AuggieCLIACPTransport`, and `JunieCLIACPTransport` end-to-end and replace the current stub errors in create/stream/close.
 2. Finish adapter-family-aware runtime registry ownership so Codex ACP fails closed when its registry/readiness provider is unavailable, and remove the remaining direct `GooseExtensionRegistryReader()` construction from bridge/executor/preflight/snapshot paths.
 3. Add explicit `AC-12` / `AC-13` proof tests: Codex rich-MCP blocking on missing registry provider, Auggie/Junie zero-MCP-only preflight behavior, and one successful execution proof per second-wave family.
-4. Re-run `bash 'scripts/test-gate.sh' proposal-029` after the above and only then consider broader regression sign-off.
+4. Re-run `bash 'scripts/test-gate.sh' proposal-030` after the above and only then consider broader regression sign-off.

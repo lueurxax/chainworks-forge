@@ -1,8 +1,8 @@
-# Proposal 029: ACP Second-Wave Runtime Profiles Multi-Lens Audit R2
+# Proposal 030: ACP Second-Wave Runtime Profiles Multi-Lens Audit R2
 
 | Field | Value |
 |---|---|
-| Proposal | `docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md` |
+| Proposal | `docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md` |
 | Repository Root | `/Users/user/Documents/Chainworks Forge` |
 | Git SHA | `bc924c3` |
 | Working Tree | dirty |
@@ -15,13 +15,13 @@
 
 ## Executive Verdict
 
-Proposal 029 is materially closer to implemented than in R1, but it is still not proposal-complete on the current tree. The second-wave provider platform, capability mapping, disabled-provider rollout gate, and canonical catalog/runtime-profile data are now substantially in place. The remaining blockers are concentrated in two areas: MCP registry migration is still only partially transport-neutral, and the proposal-required focused `proposal-029` gate is red on the current tree because the test target fails to build. That keeps the slice out of `Implemented` / `Ready` status.
+Proposal 030 is materially closer to implemented than in R1, but it is still not proposal-complete on the current tree. The second-wave provider platform, capability mapping, disabled-provider rollout gate, and canonical catalog/runtime-profile data are now substantially in place. The remaining blockers are concentrated in two areas: MCP registry migration is still only partially transport-neutral, and the proposal-required focused `proposal-030` gate is red on the current tree because the test target fails to build. That keeps the slice out of `Implemented` / `Ready` status.
 
 ## Lens Scorecard
 
 | Lens | Assessment | Top Risk | Confidence |
 |---|---|---|---|
-| Conformance | Not Implemented | same-tree `proposal-029` gate is red | High |
+| Conformance | Not Implemented | same-tree `proposal-030` gate is red | High |
 | Architecture | At Risk | registry abstraction stops at type rename and still has a Goose-first owner chain | High |
 | Product | At Risk | second-wave ACP profiles still cannot claim rich MCP parity from the canonical catalog | High |
 | UI | At Risk | operator-facing MCP/readiness language is still Goose-first in preflight | Medium |
@@ -76,11 +76,11 @@ The proposal requires:
 6. Goose path remains operational;
 7. run snapshots and reports preserve truth across provider families;
 8. rollout enablement uses `ConfiguredProvider.isEnabled`, including distinct "not enabled" handling and disabled-safe repair;
-9. focused `proposal-029` gate passes on the same tree.
+9. focused `proposal-030` gate passes on the same tree.
 
 ### Test / Evidence Requirements
 
-- Same-tree focused `proposal-029` gate.
+- Same-tree focused `proposal-030` gate.
 - Code/test evidence for provider platform expansion, namespace migration, capability enforcement, and rollout semantics.
 
 ### Explicit Exclusions
@@ -107,7 +107,7 @@ The proposal requires:
 - MCP registry migration is incomplete: the type rename happened, but the concrete owner chain is still Goose-first.
 - Canonical `mcp_server_registry` still does not map rich MCP lanes for second-wave runtime namespaces like `codex`, `auggie`, or `junie`.
 - `ProviderSettingsStore.removeProvider(...)` still repairs preferred-provider IDs without filtering disabled entries.
-- The focused `proposal-029` gate is red on the current tree.
+- The focused `proposal-030` gate is red on the current tree.
 
 ### Ambiguities / Evidence Gaps
 
@@ -208,13 +208,13 @@ The proposal requires:
   - `Chainworks Forge/Providers/ProviderSettingsStore.swift:55-64`
 - Gap / Note: Filtering and explicit `providerNotEnabled` semantics now exist, but preferred-provider repair still picks the next same-family provider without checking `isEnabled`.
 
-### REQ-009 Focused `proposal-029` gate passes on the same tree
+### REQ-009 Focused `proposal-030` gate passes on the same tree
 - Proposal Source: §5.9
 - Status: Missing
 - Evidence Type: tests-run
 - Evidence:
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029`
-  - Result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-029-20260409-153926.xcresult`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030`
+  - Result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-030-20260409-153926.xcresult`
   - Failure text: `Cannot find 'YAMLAgentCatalogLoader' in scope`; `Failed to produce diagnostic for expression`; `** TEST FAILED **`
 - Gap / Note: The proposal’s required same-tree proof gate is red on the current tree, so the proposal cannot roll up to `Implemented` or `Ready`.
 
@@ -242,7 +242,7 @@ The proposal requires:
 - Evidence Type: code
 - Evidence:
   - `Chainworks Forge/Providers/ProviderSettingsStore.swift:55-64`
-- Why It Matters: Proposal 029 explicitly extended rollout ownership beyond selection into repair semantics. The current remove/repair path can still select a disabled provider as the new preferred provider for a family.
+- Why It Matters: Proposal 030 explicitly extended rollout ownership beyond selection into repair semantics. The current remove/repair path can still select a disabled provider as the new preferred provider for a family.
 - Recommended Action: Filter repair candidates by `isEnabled` the same way `ProviderRegistry.preferredProvider(for:)` does.
 
 ## Product Review
@@ -299,12 +299,12 @@ The proposal requires:
 - Related Proposal Items / Requirements: `REQ-009`
 - Evidence Type: tests-run
 - Evidence:
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029`
-  - `Result bundle: /var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-029-20260409-153926.xcresult`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030`
+  - `Result bundle: /var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-030-20260409-153926.xcresult`
   - `Cannot find 'YAMLAgentCatalogLoader' in scope`
   - `Failed to produce diagnostic for expression`
   - `** TEST FAILED **`
-- Why It Matters: Proposal 029 explicitly requires a green focused gate on the same tree. The current tree fails before the tests can certify the slice.
+- Why It Matters: Proposal 030 explicitly requires a green focused gate on the same tree. The current tree fails before the tests can certify the slice.
 - Recommended Action: Fix the broken `Proposal029Tests` build lane first, then rerun the focused gate before making any stronger readiness claim.
 
 ### READY-002 Current proof only reaches partial implementation confidence
@@ -315,15 +315,15 @@ The proposal requires:
 - Evidence:
   - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:121-187`
   - `examples/agents/agents.yaml:113-144`
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030`
 - Why It Matters: Even after the current implementation progress, the remaining gaps are not cosmetic. They affect proofability and the operator-facing rollout path.
-- Recommended Action: Treat Proposal 029 as a near-complete but still blocked implementation slice, not as sign-off-ready work.
+- Recommended Action: Treat Proposal 030 as a near-complete but still blocked implementation slice, not as sign-off-ready work.
 
 ## Readiness Checklist
 
 | Check | Status | Evidence / Note |
 |---|---|---|
-| Build succeeds on targeted platform(s) | Pass | `proposal-029` build gate reached `** BUILD SUCCEEDED **` before test phase |
+| Build succeeds on targeted platform(s) | Pass | `proposal-030` build gate reached `** BUILD SUCCEEDED **` before test phase |
 | Core provider/runtime flow validated | Partial | code paths inspected; targeted gate failed before certifying the slice |
 | Empty/loading/error states covered | Not Checked | outside this proposal’s main scope |
 | Accessibility risk acceptable | Not Checked | not a primary scope area for this audit |
@@ -337,7 +337,7 @@ The proposal requires:
 - `git rev-parse --short HEAD`
 - `git status --short`
 - `date +%Y-%m-%dT%H:%M:%S%z`
-- `python3 '/Users/user/.agents/skills/proposal-implementation-audit/scripts/report_path.py' '/Users/user/Documents/Chainworks Forge/docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md'`
+- `python3 '/Users/user/.agents/skills/proposal-implementation-audit/scripts/report_path.py' '/Users/user/Documents/Chainworks Forge/docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md'`
 - `rg -n "superseded|deprecated|replaced by|obsolete" ...`
 - focused code inspection across:
   - `Chainworks Forge/Providers/ConfiguredProvider.swift`
@@ -353,12 +353,12 @@ The proposal requires:
   - `examples/agents/agents.yaml`
   - `Chainworks ForgeTests/Proposal029Tests.swift`
 - same-tree gate execution:
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029`
-  - result: build phase green, test phase red, result bundle at `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-029-20260409-153926.xcresult`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030`
+  - result: build phase green, test phase red, result bundle at `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-030-20260409-153926.xcresult`
 
 ## Recommended Next Actions
 
-1. Fix the broken `Proposal029Tests` build lane and get `proposal-029` green on the current tree.
+1. Fix the broken `Proposal029Tests` build lane and get `proposal-030` green on the current tree.
 2. Complete the registry-owner migration so MCP readiness is genuinely runtime-neutral rather than Goose-first with renamed types.
 3. Add second-wave runtime-ID mappings in `mcp_server_registry` for the MCP lanes the product intends to support, then prove them in the focused gate.
 4. Update `ProviderSettingsStore.removeProvider(...)` so preferred-provider repair respects `isEnabled`.

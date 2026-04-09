@@ -195,6 +195,19 @@ struct Proposal026Tests {
             Issue.record("Expected .textChunk with thinking prefix, got \(String(describing: thoughtChunk))")
         }
 
+        let structuredMessageChunk = ACPStreamEventMapper.mapSessionUpdate([
+            "type": "agent_message_chunk",
+            "content": [
+                "type": "text",
+                "text": "Using "
+            ]
+        ])
+        if case .textChunk(let text) = structuredMessageChunk {
+            #expect(text == "Using ")
+        } else {
+            Issue.record("Expected .textChunk from structured chunk, got \(String(describing: structuredMessageChunk))")
+        }
+
         let permissionEvents = ACPStreamEventMapper.mapNotificationEvents(
             method: "session/request_permission",
             params: [

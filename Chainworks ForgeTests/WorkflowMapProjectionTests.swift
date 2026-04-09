@@ -153,4 +153,94 @@ struct WorkflowMapProjectionTests {
         let persistedStageEntries = projection.persistedTimeline.filter { $0.id.hasPrefix("stage::") }
         #expect(!persistedStageEntries.isEmpty)
     }
+
+    @Test("Projection suppresses stale downstream running stages after the run rewinds to an earlier stage")
+    mutating func projectionSuppressesStaleFutureRunningStagesAfterRewind() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        let runDescriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(runDescriptor).first)
+
+        let existingStages = try container.mainContext.fetch(FetchDescriptor<StageExecution>())
+            .filter { $0.run?.id == run.id }
+        for stage in existingStages {
+            container.mainContext.delete(stage)
+        }
+
+        let now = Date()
+
+        let firstIdeaPass = StageExecution(
+            stageID: "state_1_idea_received",
+            label: "Idea received",
+            startedAt: now.addingTimeInterval(-600),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        firstIdeaPass.run = run
+        firstIdeaPass.completedAt = now.addingTimeInterval(-540)
+
+        let staleProposalStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: now.addingTimeInterval(-530),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        staleProposalStage.run = run
+
+        let staleWriter = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: now.addingTimeInterval(-528),
+            status: .running,
+            provider: "codex",
+            effort: "high"
+        )
+        staleWriter.stageExecution = staleProposalStage
+        staleProposalStage.agentExecutions.append(staleWriter)
+
+        let rewoundIdeaPass = StageExecution(
+            stageID: "state_1_idea_received",
+            label: "Idea received",
+            startedAt: now.addingTimeInterval(-120),
+            status: .running,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        rewoundIdeaPass.run = run
+
+        let liveLead = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "normalize_idea_and_prepare_proposal_brief",
+            startedAt: now.addingTimeInterval(-118),
+            status: .running,
+            provider: "claude_code",
+            effort: "high"
+        )
+        liveLead.stageExecution = rewoundIdeaPass
+        rewoundIdeaPass.agentExecutions.append(liveLead)
+
+        run.stageExecutions.append(contentsOf: [firstIdeaPass, staleProposalStage, rewoundIdeaPass])
+        try container.mainContext.save()
+
+        let projection = try #require(service.projection(for: run))
+        let currentStage = try #require(projection.stages.first(where: { $0.id == "state_1_idea_received" }))
+        let futureStage = try #require(projection.stages.first(where: { $0.id == "state_2_proposal_drafted" }))
+
+        #expect(projection.currentStageID == "state_1_idea_received")
+        #expect(currentStage.status == .running)
+        #expect(futureStage.status != .running)
+        #expect(futureStage.occurrences.contains(where: { $0.state == .thinking }) == false)
+    }
 }

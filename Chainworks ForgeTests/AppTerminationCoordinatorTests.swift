@@ -11,15 +11,26 @@ struct AppTerminationCoordinatorTests {
         }
     }
 
+    private final class ExecutionTerminationControllerSpy: ExecutionTerminationControlling {
+        private(set) var prepareForTerminationCallCount = 0
+
+        func prepareForTermination() {
+            prepareForTerminationCallCount += 1
+        }
+    }
+
     @Test("App termination coordinator stops managed Goose server on termination")
     func coordinatorStopsManagedGooseServer() {
         let spy = ManagedGooseServerControllerSpy()
+        let executionSpy = ExecutionTerminationControllerSpy()
         let coordinator = AppTerminationCoordinator()
         coordinator.gooseServerManager = spy
+        coordinator.executionTerminationController = executionSpy
 
         coordinator.prepareForTermination()
 
         #expect(spy.stopManagedServerCallCount == 1)
+        #expect(executionSpy.prepareForTerminationCallCount == 1)
     }
 
     @Test("App termination coordinator tolerates missing Goose server manager")
@@ -45,5 +56,16 @@ struct AppTerminationCoordinatorTests {
         coordinator.prepareForTermination()
 
         #expect(weakSpy?.stopManagedServerCallCount == 1)
+    }
+
+    @Test("App termination coordinator tolerates missing execution service")
+    func coordinatorAllowsMissingExecutionService() {
+        let spy = ManagedGooseServerControllerSpy()
+        let coordinator = AppTerminationCoordinator()
+        coordinator.gooseServerManager = spy
+
+        coordinator.prepareForTermination()
+
+        #expect(spy.stopManagedServerCallCount == 1)
     }
 }

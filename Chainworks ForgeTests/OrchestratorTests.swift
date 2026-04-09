@@ -1096,6 +1096,112 @@ struct OrchestratorTests {
         }
     }
 
+    @Test("Orchestrator creates the cursor-scheduled stage iteration instead of reusing a stale running stage")
+    func scheduledIterationBeatsStaleRunningStageReuse() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let staleStage = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        staleStage.run = run
+        context.insert(staleStage)
+
+        run.persistTransitionCursor(
+            TransitionCursor.initial().settlingTransition(
+                completedStateID: "state_1_idea_received",
+                completedStageExecutionID: nil,
+                nextStateID: "state_2_proposal_drafted",
+                nextIteration: 2,
+                nextAttemptNumber: 1
+            )
+        )
+
+        let plan = RunPlan(
+            workflowID: "proposal_loop_live", workflowTitle: "Proposal Loop (Live)",
+            states: [
+                "state_2_proposal_drafted": ExecutableState(
+                    id: "state_2_proposal_drafted",
+                    label: "Proposal drafted",
+                    type: .start,
+                    ownerAgentID: "proposal_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "proposal_writer", task: "draft_initial_proposal", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "proposal_writer",
+                    runBlock: nil, runAfterApproval: nil, transitions: [],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "state_2_proposal_drafted",
+            agentBindings: [
+                "proposal_writer": makeAgent(
+                    id: "proposal_writer",
+                    backendProfileID: "codex_writer_high",
+                    outputs: ["proposal_current"]
+                )
+            ],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let result = AgentResult(
+            outputs: ["proposal_current": Data("ok".utf8)],
+            logSnippet: "done",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "scheduled-stage-session",
+            durationSeconds: 0,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: StaticResultExecutor(result: result),
+            modelContext: context
+        )
+
+        await orchestrator.start(from: "state_2_proposal_drafted")
+
+        let draftedStages = run.stageExecutions
+            .filter { $0.stageID == "state_2_proposal_drafted" }
+            .sorted { $0.iteration < $1.iteration }
+
+        #expect(draftedStages.count == 2)
+        #expect(draftedStages.first?.iteration == 1)
+        #expect(draftedStages.last?.iteration == 2)
+        #expect(draftedStages.first?.agentExecutions.isEmpty == true)
+        #expect(draftedStages.last?.status == .completed)
+        #expect(draftedStages.last?.agentExecutions.first?.providerSessionID == "scheduled-stage-session")
+    }
+
     @Test("Orchestrator persists canonical execution truth on successful agent execution")
     func persistsCanonicalExecutionTruthOnSuccess() async throws {
         let workspace = makeWorkspace()

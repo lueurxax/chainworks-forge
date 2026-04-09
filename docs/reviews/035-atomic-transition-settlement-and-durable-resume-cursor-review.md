@@ -4,20 +4,20 @@
 - Mode used: `proposal-readiness`
 - Evidence completeness: `Complete`
 - Proposal / docs reviewed:
-  - `/Users/user/Documents/Chainworks Forge/docs/proposals/032-atomic-transition-settlement-and-durable-resume-cursor.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/execution-truth-and-recovery.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/runtime-contract.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/domain-model.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/proposals/021-run-transition-notifications-and-attention-routing.md`
-  - `/Users/user/Documents/Chainworks Forge/docs/reviews/032-atomic-transition-settlement-and-durable-resume-cursor-review.md`
-  - `/Users/user/Documents/Chainworks Forge/docs/reviews/032-atomic-transition-settlement-and-durable-resume-cursor-evidence-pack.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/reviews/035-atomic-transition-settlement-and-durable-resume-cursor-review.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/reviews/035-atomic-transition-settlement-and-durable-resume-cursor-evidence-pack.md`
 - Reusable baseline used:
   - `/Users/user/Documents/Chainworks Forge/.review-baselines/current-system-baseline.md`
 - Baseline reused:
   - repo-level baseline shape
   - stable reference docs for execution truth, runtime contract, and persistence model
-  - prior `P032` red-pass review/evidence as a stale basis check
+  - prior `P035` red-pass review/evidence as a stale basis check
 - Baseline refreshed:
   - targeted reread of the updated proposal text
   - targeted code refresh for `Run`, `ResumeManager`, `ExecutionService`, `WorkflowOrchestrator`, `RunReportBuilder`, `RecoveryCoordinator`, and workflow-map/read-model surfaces
@@ -31,7 +31,7 @@
   - none
 - Sources reused:
   - stable reference docs and current baseline
-  - prior `P032` review/evidence artifacts as stale-basis comparators
+  - prior `P035` review/evidence artifacts as stale-basis comparators
 - Sources refreshed:
   - current proposal text and focused current code paths
 - Time-sensitive external guidance:
@@ -70,7 +70,7 @@
   2. `run.currentStageID` must stay non-canonical or cursor-derived during migration so shell/read-model surfaces do not regress to heuristic stage authority.
   3. Pre-cursor fallback must remain visibly degraded so historical runs do not silently masquerade as cursor-backed truth.
 - Top opportunities:
-  1. Keep the focused `proposal-032` proof lane aligned to both restart and live `.sessionClosed` interruption paths.
+  1. Keep the focused `proposal-035` proof lane aligned to both restart and live `.sessionClosed` interruption paths.
   2. Make the shell/read-model migration explicit in implementation exactly as the draft now does in `§6.6`.
   3. Preserve `Proposal 021` notification subordination by firing only after settlement commit.
 
@@ -123,14 +123,14 @@
 ## 6. Cross-Discipline Conflicts and Decisions
 - Previously live conflict: the earlier draft fixed restart/manual-resume truth but left live `ExecutionService` reconciliation and broader shell projections implicit.
   Resolution: the updated draft now assigns both paths to the same cursor-first owner chain and explicitly demotes heuristic `currentStageID` authority.
-- Decision: `P032` is now implementation-ready for proposal-readiness purposes.
+- Decision: `P035` is now implementation-ready for proposal-readiness purposes.
   Owner: proposal author
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
 | P2 | Keep `run.currentStageID` cursor-derived or explicitly non-canonical throughout implementation | iOS Architecture | Implementation owner | During implementation | cursor persistence + shell migration | no shell surface regresses to heuristic single-stage authority | `—` |
-| P2 | Keep the focused proof lane covering both restart and live `.sessionClosed` interruption paths | Cross-discipline | Implementation owner | During implementation | `proposal-032` test gate | same-tree proof stays green for restart, live reconciliation, report, and shell projection cases | `—` |
+| P2 | Keep the focused proof lane covering both restart and live `.sessionClosed` interruption paths | Cross-discipline | Implementation owner | During implementation | `proposal-035` test gate | same-tree proof stays green for restart, live reconciliation, report, and shell projection cases | `—` |
 | P2 | Preserve degraded-trust fallback for pre-cursor runs | UX | Implementation owner | During implementation | migration / fallback path | historical runs stay readable without being misrepresented as cursor-backed truth | `—` |
 
 ## 8. Validation and Measurement Plan

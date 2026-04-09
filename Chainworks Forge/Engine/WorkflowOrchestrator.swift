@@ -405,6 +405,7 @@ final class WorkflowOrchestrator {
             }
 
             RuntimeDiagnostics.log("executeStateMachine transition from=\(state.id) to=\(transition.to)")
+            healPrematureBlockedStateIfNeeded()
             currentStateID = transition.to
         }
     }
@@ -435,7 +436,25 @@ final class WorkflowOrchestrator {
         }
 
         let stageExec: StageExecution
-        if let resumableStage = resumableStageExecution(for: state.id) {
+        if let scheduledSelection = scheduledStageSelection(for: state.id) {
+            if let scheduledStage = scheduledSelection.execution,
+               scheduledStage.status == .running || scheduledStage.status == .ready {
+                stageExec = scheduledStage
+                stageExec.status = .running
+                stageExec.completedAt = nil
+            } else {
+                let freshStage = StageExecution(
+                    stageID: state.id,
+                    label: state.label,
+                    status: .running,
+                    iteration: scheduledSelection.iteration,
+                    attemptNumber: scheduledSelection.attemptNumber
+                )
+                freshStage.run = run
+                modelContext.insert(freshStage)
+                stageExec = freshStage
+            }
+        } else if let resumableStage = resumableStageExecution(for: state.id) {
             stageExec = resumableStage
             stageExec.status = .running
             stageExec.completedAt = nil
@@ -525,6 +544,7 @@ final class WorkflowOrchestrator {
                 handleLoopBudgetExhausted(state: state, counter: loop.counter, count: newCount)
                 stageExec.status = .completed
                 stageExec.completedAt = Date()
+                healPrematureBlockedStateIfNeeded()
                 return .succeeded // Let transition evaluator decide next state
             }
 
@@ -534,6 +554,7 @@ final class WorkflowOrchestrator {
 
         stageExec.status = .completed
         stageExec.completedAt = Date()
+        healPrematureBlockedStateIfNeeded()
         RuntimeDiagnostics.log("executeState completed stateID=\(state.id)")
         return .succeeded
     }
@@ -2013,7 +2034,35 @@ final class WorkflowOrchestrator {
     private func currentIteration(for stageID: String) -> Int {
         guard !run.isDeleted, run.modelContext != nil else { return 1 }
         let existing = run.stageExecutions.filter { $0.stageID == stageID }
-        return existing.count + 1
+        return (existing.map(\.iteration).max() ?? 0) + 1
+    }
+
+    private func scheduledStageSelection(for stageID: String) -> (iteration: Int, attemptNumber: Int, execution: StageExecution?)? {
+        guard
+            let cursor = run.transitionCursor,
+            cursor.nextScheduledStateID == stageID
+        else {
+            return nil
+        }
+
+        let iteration = cursor.nextScheduledIteration ?? currentIteration(for: stageID)
+        let attemptNumber = cursor.nextScheduledAttemptNumber ?? 1
+        let candidates = run.stageExecutions.filter {
+            $0.stageID == stageID &&
+            $0.iteration == iteration &&
+            $0.attemptNumber == attemptNumber
+        }
+
+        if let scheduledID = cursor.scheduledStageExecutionID,
+           let exact = candidates.first(where: { $0.id == scheduledID }) {
+            return (iteration, attemptNumber, exact)
+        }
+
+        let execution = candidates.sorted {
+            if $0.startedAt != $1.startedAt { return $0.startedAt < $1.startedAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }.last
+        return (iteration, attemptNumber, execution)
     }
 
     private func resumableStageExecution(for stageID: String) -> StageExecution? {
@@ -3883,5 +3932,16 @@ final class WorkflowOrchestrator {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(T.self, from: data)
+    }
+
+    private func healPrematureBlockedStateIfNeeded() {
+        guard run.status == .blocked, !isCancelled, !isPaused else { return }
+
+        run.status = .running
+
+        if let details = run.driftDetails,
+           details.localizedCaseInsensitiveContains("execution stalled after") {
+            run.driftDetails = nil
+        }
     }
 }

@@ -1,4 +1,4 @@
-# Proposal 032: Atomic Transition Settlement and Durable Resume Cursor
+# Proposal 035: Atomic Transition Settlement and Durable Resume Cursor
 
 | Field | Value |
 |---|---|
@@ -36,7 +36,7 @@ It is a persistence and truth-ownership bug:
 - so recovery falls back to heuristics,
 - and those heuristics disagree once the persisted graph is even slightly polluted.
 
-Proposal 032 fixes that boundary directly.
+Proposal 035 fixes that boundary directly.
 
 ---
 
@@ -231,7 +231,7 @@ Current code already contains an in-process stalled-run reconciliation path that
 - infers a stall from the current stage,
 - and can block the run plus fail stage and agent rows before relaunch ever happens.
 
-Proposal 032 must explicitly rebind that live path as well.
+Proposal 035 must explicitly rebind that live path as well.
 
 After this proposal:
 
@@ -286,7 +286,7 @@ Those remain derived or supporting evidence.
 - mutates `currentStateID`,
 - and later re-enters execution.
 
-Proposal 032 requires an explicit atomic settlement step between transition evaluation and subsequent execution:
+Proposal 035 requires an explicit atomic settlement step between transition evaluation and subsequent execution:
 
 ```swift
 settleTransition(
@@ -363,7 +363,7 @@ That is no longer sufficient once the system distinguishes:
 - next scheduled stage,
 - and actually started stage.
 
-Proposal 032 therefore requires explicit read-model migration for:
+Proposal 035 therefore requires explicit read-model migration for:
 
 - `WorkflowMapProjectionService`,
 - `RunsHomeView`,
@@ -391,7 +391,7 @@ Without this migration, implementation could fix resume and recovery while leavi
 
 For clarity, this refers to the existing `run_state` artifact contract emitted by orchestrator review/aggregation tasks.
 
-But after Proposal 032 it must no longer be able to override the engine's own persisted continuation cursor for resume targeting.
+But after Proposal 035 it must no longer be able to override the engine's own persisted continuation cursor for resume targeting.
 
 ### 6.8 Migration and fallback for pre-cursor runs
 
@@ -403,7 +403,7 @@ The migration contract must therefore be explicit:
 - that fallback must be visibly degraded in trust and log that cursor truth is unavailable,
 - and implementation may opportunistically backfill a cursor from the best available persisted stage truth when safe to do so.
 
-Proposal 032 does not require bulk migration of all historical runs.
+Proposal 035 does not require bulk migration of all historical runs.
 It does require that pre-cursor runs remain readable and resumable through an explicit fallback path rather than undefined behavior.
 
 ### 6.9 Concurrency and cancellation
@@ -454,7 +454,7 @@ Therefore:
 
 ## 8. Acceptance Criteria
 
-Proposal 032 is complete when:
+Proposal 035 is complete when:
 
 1. A successful `state N -> state N+1` transition is durably represented by one run-owned cursor.
 2. Manual resume and relaunch resume choose the same `nextScheduledStateID` without consulting `run_state` as primary authority.

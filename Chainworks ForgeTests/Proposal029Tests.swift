@@ -210,6 +210,36 @@ struct Proposal029Tests {
         }
     }
 
+    @Test("CodexACPTransport prepares isolated CODEX_HOME with auth only")
+    func codexTransportPreparesIsolatedRuntimeHome() throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-home-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let sourceHome = tempRoot.appendingPathComponent("source-home", isDirectory: true)
+        try fileManager.createDirectory(at: sourceHome, withIntermediateDirectories: true)
+        let authURL = sourceHome.appendingPathComponent("auth.json", isDirectory: false)
+        let configURL = sourceHome.appendingPathComponent("config.toml", isDirectory: false)
+        let stateURL = sourceHome.appendingPathComponent("state_5.sqlite", isDirectory: false)
+        try Data("{\"token\":\"abc\"}".utf8).write(to: authURL)
+        try Data("[profiles]\n".utf8).write(to: configURL)
+        try Data("sqlite".utf8).write(to: stateURL)
+
+        let runtimeHome = try CodexACPTransport.prepareRuntimeHome(
+            workingDirectory: "/tmp/work",
+            fileManager: fileManager,
+            environment: ["CODEX_HOME": sourceHome.path],
+            tempRootURL: tempRoot
+        )
+        defer { CodexACPTransport.cleanupRuntimeHomeIfPresent(runtimeHome, fileManager: fileManager) }
+
+        #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("auth.json").path))
+        #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("config.toml").path))
+        #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("state_5.sqlite").path))
+    }
+
     // MARK: - Test 10: AuggieCLIACPTransport session creation fails with subprocess error, not stub error
 
     @Test("AuggieCLIACPTransport session creation fails with subprocess error, not stub error")

@@ -11,6 +11,11 @@ protocol ManagedGooseServerControlling: AnyObject {
     func reconcileAfterSystemWake() async
 }
 
+@MainActor
+protocol ExecutionTerminationControlling: AnyObject {
+    func prepareForTermination()
+}
+
 extension ManagedGooseServerControlling {
     func prepareForSystemSleep() {}
     func reconcileAfterSystemWake() async {}
@@ -25,6 +30,7 @@ class AppTerminationCoordinator: NSObject {
     #endif
 
     var gooseServerManager: ManagedGooseServerControlling?
+    weak var executionTerminationController: ExecutionTerminationControlling?
 
     #if os(macOS)
     override init() {
@@ -54,6 +60,7 @@ class AppTerminationCoordinator: NSObject {
     #endif
 
     func prepareForTermination() {
+        executionTerminationController?.prepareForTermination()
         gooseServerManager?.stopManagedServer()
     }
 

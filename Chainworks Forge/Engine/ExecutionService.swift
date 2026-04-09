@@ -171,6 +171,16 @@ final class ExecutionService {
         reconcileStalledOrchestratorsIfNeeded(now: now)
     }
 
+    func prepareForTermination() {
+        maintenanceTask?.cancel()
+        maintenanceTask = nil
+
+        for orchestrator in activeOrchestrators.values {
+            guard let runtimeExecutor = orchestrator.executor as? RuntimeAgentExecutor else { continue }
+            runtimeExecutor.prepareForAppTermination()
+        }
+    }
+
     // MARK: - Start Run
 
     /// Start a new workflow run. Creates an orchestrator and begins execution.
@@ -604,6 +614,7 @@ final class ExecutionService {
                 hasPendingApproval: hasPendingApproval,
                 hasRunningAgents: hasRunningAgents,
                 stalledStageStatus: stalledStage?.status,
+                stalledStageStartedAt: stalledStage?.startedAt,
                 latestLiveEvent: latestEventEntry?.event,
                 hasLaterLiveActivityAfterLatestEvent: hasLaterLiveActivity,
                 now: now
@@ -681,6 +692,7 @@ final class ExecutionService {
         hasPendingApproval: Bool,
         hasRunningAgents: Bool,
         stalledStageStatus: StageStatus?,
+        stalledStageStartedAt: Date?,
         latestLiveEvent: ExecutionEvent?,
         hasLaterLiveActivityAfterLatestEvent: Bool = false,
         now: Date,
@@ -704,10 +716,41 @@ final class ExecutionService {
         if stalledStageStatus == .completed || stalledStageStatus == .skipped {
             return false
         }
+
+        // If a new stage has already started after the last meaningful live event,
+        // treat that stage start as the new stall baseline instead of immediately
+        // reconciling off a stale sessionClosed from the previous stage.
+        if let stalledStageStartedAt, stalledStageStartedAt > latestLiveEvent.timestamp {
+            return now.timeIntervalSince(stalledStageStartedAt) >= graceInterval
+        }
+
         if hasRunningAgents {
             ForgeLogger.execution.info("Reconciling stalled run \(run.id) even though agent rows still appear running because the latest live event is sessionClosed")
         }
         return now.timeIntervalSince(latestLiveEvent.timestamp) >= graceInterval
+    }
+
+    static func shouldReconcileStalledRun(
+        run: Run,
+        hasPendingApproval: Bool,
+        hasRunningAgents: Bool,
+        stalledStageStatus: StageStatus?,
+        latestLiveEvent: ExecutionEvent?,
+        hasLaterLiveActivityAfterLatestEvent: Bool = false,
+        now: Date,
+        graceInterval: TimeInterval = 30
+    ) -> Bool {
+        shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: hasPendingApproval,
+            hasRunningAgents: hasRunningAgents,
+            stalledStageStatus: stalledStageStatus,
+            stalledStageStartedAt: nil,
+            latestLiveEvent: latestLiveEvent,
+            hasLaterLiveActivityAfterLatestEvent: hasLaterLiveActivityAfterLatestEvent,
+            now: now,
+            graceInterval: graceInterval
+        )
     }
 
     private static func latestMeaningfulTimelineEntry(in timeline: [LiveExecutionTimelineEntry]) -> LiveExecutionTimelineEntry? {
@@ -1062,6 +1105,8 @@ final class ExecutionService {
     }
 }
 
+extension ExecutionService: ExecutionTerminationControlling {}
+
 // MARK: - DefaultRuntimeTransportFactory (Proposal 026 — per-agent transport resolution)
 
 /// Resolves the correct transport for each agent based on adapter family from its provider binding.
@@ -1111,5 +1156,17 @@ final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked 
         }
         transportsByFamily[family] = created
         return created
+    }
+}
+
+extension DefaultRuntimeTransportFactory: RuntimeTransportFactoryTerminationControlling {
+    func terminateActiveTransportsForAppShutdown() {
+        lock.lock()
+        let transports = Array(transportsByFamily.values)
+        lock.unlock()
+
+        for transport in transports {
+            (transport as? RuntimeTransportTerminationControlling)?.terminateActiveSessionsForAppShutdown()
+        }
     }
 }

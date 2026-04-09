@@ -284,6 +284,18 @@ protocol RuntimeTransportFactory: Sendable {
     func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol
 }
 
+/// Optional lifecycle hook for factories that cache live runtime transports and need
+/// explicit app-termination cleanup beyond normal per-session settlement.
+protocol RuntimeTransportFactoryTerminationControlling: Sendable {
+    func terminateActiveTransportsForAppShutdown()
+}
+
+/// Optional lifecycle hook for transports that own live runtime sessions/processes and
+/// need immediate teardown during app termination.
+protocol RuntimeTransportTerminationControlling: Sendable {
+    func terminateActiveSessionsForAppShutdown()
+}
+
 /// Trivial factory wrapping a single transport — backward compatibility for tests
 /// and runs where all agents share one transport.
 struct SingleTransportFactory: RuntimeTransportFactory {

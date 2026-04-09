@@ -1,8 +1,8 @@
-# Proposal 029: ACP Second-Wave Runtime Profiles Multi-Lens Audit R1
+# Proposal 030: ACP Second-Wave Runtime Profiles Multi-Lens Audit R1
 
 | Field | Value |
 |---|---|
-| Proposal | `docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md` |
+| Proposal | `docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md` |
 | Repository Root | `/Users/user/Documents/Chainworks Forge` |
 | Git SHA | `8d79a35` |
 | Working Tree | dirty |
@@ -15,7 +15,7 @@
 
 ## Executive Verdict
 
-Proposal 029 is not implemented end-to-end on the current tree. The repository now has the second-wave `ProviderFamily` cases, disabled-by-default seeded providers, explicit runtime namespaces for Codex/Auggie/Junie, a fail-closed transport factory, and a focused `proposal-029` gate that passes on the same tree. But the proposal’s harder contract is still open in three direct ways: the MCP registry layer remains Goose-specific instead of transport-neutral, the second-wave provider diagnostics/readiness path is not wired because `ProviderAdapterFactory` still only registers first-wave adapters, and the canonical catalog YAML still ships only `claude_agent_acp` and `gemini_cli_acp`. The result is a slice that can prove narrow routing behavior in tests while still failing the proposal’s authoritative platform, catalog, and operator-readiness promises.
+Proposal 030 is not implemented end-to-end on the current tree. The repository now has the second-wave `ProviderFamily` cases, disabled-by-default seeded providers, explicit runtime namespaces for Codex/Auggie/Junie, a fail-closed transport factory, and a focused `proposal-030` gate that passes on the same tree. But the proposal’s harder contract is still open in three direct ways: the MCP registry layer remains Goose-specific instead of transport-neutral, the second-wave provider diagnostics/readiness path is not wired because `ProviderAdapterFactory` still only registers first-wave adapters, and the canonical catalog YAML still ships only `claude_agent_acp` and `gemini_cli_acp`. The result is a slice that can prove narrow routing behavior in tests while still failing the proposal’s authoritative platform, catalog, and operator-readiness promises.
 
 ## Lens Scorecard
 
@@ -77,7 +77,7 @@ The proposal requires:
 6. Goose path remains working;
 7. run snapshots and reports preserve truth across provider families;
 8. rollout enablement is owned by `ConfiguredProvider.isEnabled`, including distinct "not enabled" handling;
-9. a focused `proposal-029` gate passes on the canonical tree.
+9. a focused `proposal-030` gate passes on the canonical tree.
 
 ### Explicit Exclusions
 
@@ -93,7 +93,7 @@ The proposal requires:
 - `ProviderRegistry.preferredProvider(for:)` filters by `isEnabled`.
 - Runtime namespace mapping exists for `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp`.
 - `DefaultRuntimeTransportFactory` throws for unknown adapter families.
-- Focused same-tree `proposal-029` gate passes.
+- Focused same-tree `proposal-030` gate passes.
 
 ### Divergences
 
@@ -149,7 +149,7 @@ The proposal requires:
   - `Chainworks Forge/Engine/ExecutionService.swift:1071-1106`
   - `Chainworks Forge/Engine/PreflightService.swift:611-645`
   - `Chainworks ForgeTests/Proposal029Tests.swift:9-35`
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029` -> `** TEST SUCCEEDED **`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030` -> `** TEST SUCCEEDED **`
 - Gap / Note: The transport factory now throws `RuntimeTransportError.unknownAdapterFamily`, and the focused proposal gate passed on the same tree. The preflight implementation is still somewhat manual/list-based, but the fail-closed behavior exists.
 
 ### REQ-004 MCP registry ownership is transport-neutral, not Goose-specific
@@ -176,7 +176,7 @@ The proposal requires:
   - `Chainworks Forge/Providers/ConfiguredProvider.swift:241-299`
   - `Chainworks Forge/Engine/PreflightService.swift:611-645`
   - `Chainworks ForgeTests/Proposal029Tests.swift:120-132`
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029` -> `** TEST SUCCEEDED **`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030` -> `** TEST SUCCEEDED **`
 - Gap / Note: The owner chain is real: `ProviderCapabilities.satisfies(...)` is called from preflight, and the focused gate covers the basic token mapping. But the proposal promised a new `supportsMCPReconciliation` field/token mapping and a fully locked vocabulary; that field is not present, so the mapping is incomplete against the proposal contract.
 
 ### REQ-006 Goose execution path remains working for legacy / non-second-wave execution
@@ -222,7 +222,7 @@ The proposal requires:
   - `Chainworks Forge/Engine/RunReportBuilder.swift:595-632`
 - Gap / Note: The run model persists frozen provider-binding snapshots and provenance, agent executions record `runtimeProfileID` and adapter-family truth, and report payload/markdown surfaces those fields.
 
-### REQ-010 Focused `proposal-029` gate passes on the canonical tree
+### REQ-010 Focused `proposal-030` gate passes on the canonical tree
 
 - Proposal Source: §5.9
 - Status: Implemented
@@ -231,7 +231,7 @@ The proposal requires:
   - `scripts/test-gate.sh:128-131`
   - `scripts/test-gate.sh:1143`
   - `scripts/test-gate.sh:1362-1371`
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029` -> `56 tests in 3 suites`, `TEST SUCCEEDED`, result bundle `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-029-20260409-112620.xcresult`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030` -> `56 tests in 3 suites`, `TEST SUCCEEDED`, result bundle `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-030-20260409-112620.xcresult`
 - Gap / Note: The focused gate is real and green on the same tree. It proves the currently implemented slice, but not the full proposal contract.
 
 ## Architecture Review
@@ -249,7 +249,7 @@ The proposal requires:
   - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:37-121`
   - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:190-325`
   - `Chainworks Forge/Engine/GooseSessionBridge.swift:24-30`
-- Why It Matters: Proposal 029 explicitly moved MCP ownership from Goose-first naming into transport-neutral runtime ownership. The current abstraction only renamed the outer protocol; the core types, resolver parameters, bridge plumbing, and preflight still depend on Goose snapshots. That leaves second-wave ACP support architecturally half-migrated.
+- Why It Matters: Proposal 030 explicitly moved MCP ownership from Goose-first naming into transport-neutral runtime ownership. The current abstraction only renamed the outer protocol; the core types, resolver parameters, bridge plumbing, and preflight still depend on Goose snapshots. That leaves second-wave ACP support architecturally half-migrated.
 - Recommended Action: Complete the type/owner migration to a real runtime-neutral registry contract and add per-adapter registry-provider ownership instead of passing Goose types through a generic wrapper.
 
 ### ARCH-002 Provider diagnostics remain first-wave only
@@ -307,7 +307,7 @@ The proposal requires:
   - `Chainworks Forge/Providers/BackendProfileResolverV2.swift:106-107`
   - `Chainworks Forge/Engine/PreflightService.swift:611-645`
   - `Chainworks Forge/Engine/PreflightService.swift:670-690`
-- Why It Matters: Proposal 029 turned rollout state into an operator-facing contract. But the current UI/readiness owner chain has no real second-wave health adapters and no dedicated disabled-provider messaging. That means Settings / Preflight / readiness surfaces cannot present the states the proposal promised.
+- Why It Matters: Proposal 030 turned rollout state into an operator-facing contract. But the current UI/readiness owner chain has no real second-wave health adapters and no dedicated disabled-provider messaging. That means Settings / Preflight / readiness surfaces cannot present the states the proposal promised.
 - Recommended Action: Add explicit disabled-provider preflight/readiness presentation and back it with second-wave health adapters so the UI can distinguish disabled, unavailable, unhealthy, and capability-mismatched states.
 
 ## UX Review
@@ -342,7 +342,7 @@ The proposal requires:
   - `scripts/test-gate.sh:1362-1371`
   - `examples/agents/agents.yaml:531-552`
   - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:114-121`
-- Why It Matters: `proposal-029` can pass while the authoritative catalog still lacks second-wave profiles and the registry layer is still Goose-specific. That makes the gate useful but insufficient as a readiness signal.
+- Why It Matters: `proposal-030` can pass while the authoritative catalog still lacks second-wave profiles and the registry layer is still Goose-specific. That makes the gate useful but insufficient as a readiness signal.
 - Recommended Action: Expand the focused gate to assert canonical catalog presence, registry-neutral ownership, and disabled-provider semantics rather than only factory/routing/capability fragments.
 
 ### READY-002 Working tree is dirty, so this audit should not be treated as a pristine-release certification
@@ -352,21 +352,21 @@ The proposal requires:
 - Related Proposal Items / Requirements: none
 - Evidence Type: inference
 - Evidence:
-  - `git status --short` at audit start showed `M "Chainworks ForgeTests/Proposal013Tests.swift"` and `?? docs/proposals/032-atomic-transition-settlement-and-durable-resume-cursor_IMPLEMENTATION_AUDIT_R1.md`
+  - `git status --short` at audit start showed `M "Chainworks ForgeTests/Proposal013Tests.swift"` and `?? docs/proposals/035-atomic-transition-settlement-and-durable-resume-cursor_IMPLEMENTATION_AUDIT_R1.md`
 - Why It Matters: Same-tree proof still matters, but a dirty tree reduces handoff clarity and can hide unrelated drift around a proposal-readiness claim.
-- Recommended Action: Re-run the focused gate on a clean tree before treating Proposal 029 as sign-off-ready.
+- Recommended Action: Re-run the focused gate on a clean tree before treating Proposal 030 as sign-off-ready.
 
 ## Verification Evidence
 
 - `rg` / file inspection across provider platform, runtime transport, MCP policy, catalog YAML, report builder, and test-gate definitions.
 - Same-tree gate execution:
-  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-029`
+  - `bash '/Users/user/Documents/Chainworks Forge/scripts/test-gate.sh' proposal-030`
   - Result: `56 tests in 3 suites passed`, `TEST SUCCEEDED`
-  - Result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-029-20260409-112620.xcresult`
+  - Result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-030-20260409-112620.xcresult`
 - Additional Goose-path spot check:
   - `xcodebuild test -project '/Users/user/Documents/Chainworks Forge/Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -only-testing:'Chainworks ForgeTests/ResumeManagerTests/ExecutionService uses live executor for live workflow' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=`
   - Result: selector resolved to `0 tests`; this audit therefore used direct code + tests-found evidence for Goose-path continuity instead of counting that command as runtime proof.
 
 ## Final Assessment
 
-Proposal 029 has meaningful implementation progress, but it is still a partial platform slice rather than a finished second-wave ACP rollout. The factory safety work and proof gate are real. The proposal-owned transport-neutral registry migration, second-wave provider diagnostics/readiness ownership, and canonical catalog adoption are not. That keeps `Overall Conformance = Not Implemented` and `Overall Readiness = Not Ready`.
+Proposal 030 has meaningful implementation progress, but it is still a partial platform slice rather than a finished second-wave ACP rollout. The factory safety work and proof gate are real. The proposal-owned transport-neutral registry migration, second-wave provider diagnostics/readiness ownership, and canonical catalog adoption are not. That keeps `Overall Conformance = Not Implemented` and `Overall Readiness = Not Ready`.

@@ -3,14 +3,14 @@
 ## A. Repo-Local Proposal / Document Inventory
 | Evidence ID | Source / Path / Artifact | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
 |---|---|---|---|---|---|---|
-| DOC-01 | `docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie.md` | 2026-04-09 | High | `P029` is now an implementation-aligned delta proposal over current HEAD, not a greenfield runtime-profile draft. It explicitly records already-landed catalog/provider work and the remaining transport, MCP, and proof tasks. | Review could judge stale intent instead of the current proposal contract. | Primary proposal source. |
+| DOC-01 | `docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md` | 2026-04-09 | High | `P030` is now an implementation-aligned delta proposal over current HEAD, not a greenfield runtime-profile draft. It explicitly records already-landed catalog/provider work and the remaining transport, MCP, and proof tasks. | Review could judge stale intent instead of the current proposal contract. | Primary proposal source. |
 | DOC-02 | `.review-baselines/current-system-baseline.md` | 2026-04-09 | High | The reusable baseline says proposal review should start from stable reference docs and only refresh the affected runtime/provider slice. | Review could redo full-system archaeology instead of a narrow delta review. | Baseline intake. |
-| DOC-03 | `docs/reference/current-system-baseline.md` | 2026-04-09 | High | Current HEAD already has ACP transport, per-agent MCP truth, provider platform, operator shell, and design-system baselines. `P029` must therefore behave as a delta over implemented system truth. | Proposal could be judged as if those subsystem owners were still undefined. | Current host-system truth. |
+| DOC-03 | `docs/reference/current-system-baseline.md` | 2026-04-09 | High | Current HEAD already has ACP transport, per-agent MCP truth, provider platform, operator shell, and design-system baselines. `P030` must therefore behave as a delta over implemented system truth. | Proposal could be judged as if those subsystem owners were still undefined. | Current host-system truth. |
 | DOC-04 | `docs/reference/provider-platform.md` | 2026-04-09 | High | Provider/platform is already a product surface with `ProviderSettingsView`, `PilotReadinessView`, diagnostics, troubleshooting, and machine-local configuration owners. | Proposal could under-specify operator-facing rollout and remediation behavior. | Provider/UI baseline. |
 | DOC-05 | `docs/reference/acp-runtime-transport.md` | 2026-04-09 | High | Stable ACP transport baseline still describes first-wave adapters only and treats future second-wave expansion as separate work. | Proposal could blur baseline truth with future-state intent. | Transport baseline. |
 | DOC-06 | `docs/reference/per-agent-mcp-policy-and-runtime-validation.md` | 2026-04-09 | High | MCP truth is catalog-owned and operator-visible, but current runtime realization still distinguishes Goose-backed registry validation from ACP-native realization. | Proposal could overclaim transport-neutral MCP behavior without a concrete owner plan. | MCP baseline. |
-| DOC-07 | `docs/proposals/029-acp-second-wave-runtime-profiles-codex-auggie-junie_IMPLEMENTATION_AUDIT_R2.md` | 2026-04-09 | High | Same-tree implementation audit says second-wave provider platform/capabilities mostly landed, while transports are still stubs and registry ownership remains only partially generalized. | Proposal review could miss current repo contradictions that the proposal now needs to absorb cleanly. | Current repo reality check. |
-| DOC-08 | `docs/reviews/029-acp-second-wave-runtime-profiles-codex-auggie-junie-review.md` and `docs/reviews/029-acp-second-wave-runtime-profiles-codex-auggie-junie-evidence-pack.md` | 2026-04-09 | High | Prior local review artifacts called the proposal Green, but they predate the 2026-04-09 implementation-aligned amendments and are now stale for readiness judgment. | Review could inherit an outdated Green call. | Continuity and staleness check. |
+| DOC-07 | `docs/proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie_IMPLEMENTATION_AUDIT_R2.md` | 2026-04-09 | High | Same-tree implementation audit says second-wave provider platform/capabilities mostly landed, while transports are still stubs and registry ownership remains only partially generalized. | Proposal review could miss current repo contradictions that the proposal now needs to absorb cleanly. | Current repo reality check. |
+| DOC-08 | `docs/reviews/030-acp-second-wave-runtime-profiles-codex-auggie-junie-review.md` and `docs/reviews/030-acp-second-wave-runtime-profiles-codex-auggie-junie-evidence-pack.md` | 2026-04-09 | High | Prior local review artifacts called the proposal Green, but they predate the 2026-04-09 implementation-aligned amendments and are now stale for readiness judgment. | Review could inherit an outdated Green call. | Continuity and staleness check. |
 
 ## B. Reusable Baseline Inputs
 | Evidence ID | Artifact / Slice | Status (`Reused | Partially refreshed | Missing`) | Covered Surfaces | Verified On | Confidence | Freshness Notes | Relevance |
@@ -28,29 +28,29 @@
   - fail-closed transport selection
   - MCP registry ownership and runtime-namespace alignment
   - capability enforcement through `ProviderCapabilities`
-  - focused proof gate for `proposal-029`
+  - focused proof gate for `proposal-030`
 - Out of scope:
   - Goose removal as canonical transport
   - hard cutover away from Goose
   - operator-grade claims for second-wave providers
   - generic cross-provider MCP parity
 - Deferred intentionally:
-  - transport simplification in `P030`
+  - transport simplification in `P031`
 - Assumptions:
-  - `P029` is judged as a delta over current stable refs, not as a replacement for them
+  - `P030` is judged as a delta over current stable refs, not as a replacement for them
   - the user requested proposal readiness only, not a product overlay
 - Open questions:
   - whether Auggie/Junie are meant to ship with actual MCP lanes or intentionally remain zero-MCP-only in this proposal
-  - whether `P029` is one proposal for all three live transports or a structural slice plus later execution phases
+  - whether `P030` is one proposal for all three live transports or a structural slice plus later execution phases
 - Blockers:
   - none at evidence-gate level
 
 ## D. Affected Screens / Navigation / Entry-Point Slice
 | Evidence ID | Screen / Surface / Entry Point | Source (`Baseline | Targeted refresh | Proposal`) | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
 |---|---|---|---|---|---|---|---|
-| NAV-01 | `ProviderSettingsView` | Targeted refresh | 2026-04-09 | High | Provider family is already a first-class operator axis and current provider entries surface troubleshooting and preference controls. `P029` adds more families to this existing shell-owned surface. | Proposal could under-specify how staged second-wave providers appear in Settings. | UI fit for enablement. |
-| NAV-02 | `PilotReadinessView` and `ProviderTroubleshootingPanel` | Baseline + targeted refresh | 2026-04-09 | High | Provider platform already owns readiness and troubleshooting UX. `P029` touches rollout and MCP readiness, so these surfaces need a shared state taxonomy, not only Settings toggles. | Proposal could leave rollout/remediation semantics fragmented. | UX/readiness fit. |
-| NAV-03 | Run-start preflight | Baseline + targeted refresh | 2026-04-09 | High | `PreflightService` already surfaces provider binding, capability checks, and runtime registry status. `P029` makes preflight a primary operator-facing gate for second-wave runtimes. | Proposal could stop at internal owner changes without a coherent operator-facing outcome model. | Core run-start journey. |
+| NAV-01 | `ProviderSettingsView` | Targeted refresh | 2026-04-09 | High | Provider family is already a first-class operator axis and current provider entries surface troubleshooting and preference controls. `P030` adds more families to this existing shell-owned surface. | Proposal could under-specify how staged second-wave providers appear in Settings. | UI fit for enablement. |
+| NAV-02 | `PilotReadinessView` and `ProviderTroubleshootingPanel` | Baseline + targeted refresh | 2026-04-09 | High | Provider platform already owns readiness and troubleshooting UX. `P030` touches rollout and MCP readiness, so these surfaces need a shared state taxonomy, not only Settings toggles. | Proposal could leave rollout/remediation semantics fragmented. | UX/readiness fit. |
+| NAV-03 | Run-start preflight | Baseline + targeted refresh | 2026-04-09 | High | `PreflightService` already surfaces provider binding, capability checks, and runtime registry status. `P030` makes preflight a primary operator-facing gate for second-wave runtimes. | Proposal could stop at internal owner changes without a coherent operator-facing outcome model. | Core run-start journey. |
 
 ## E. Impacted Modules / Code-Path Map
 | Evidence ID | File Path / Module / Symbol | Layer | Role in Flow | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
@@ -62,7 +62,7 @@
 | MAP-05 | `Chainworks Forge/Engine/MCPPolicyRuntime.swift`, `GooseSessionBridge.swift`, and `PreflightService.swift` | MCP / runtime validation | runtime registry provider selection and operator-facing validation | 2026-04-09 | High | Type rename landed, but live registry loading still resolves through `GooseExtensionRegistryReader`, and preflight still loads one runtime registry path. | Proposal must lock the missing registry owner contract precisely. | Main architecture risk. |
 | MAP-06 | `Chainworks Forge/Engine/ACPAdapters/CodexACPTransport.swift`, `AuggieCLIACPTransport.swift`, `JunieCLIACPTransport.swift` | ACP transports | end-to-end second-wave execution | 2026-04-09 | High | All three transports still throw `"is not yet implemented"` on create/stream/close. | Proposal completeness depends on clear scope and proof rules for these adapters. | Main implementation gap. |
 | MAP-07 | `examples/agents/agents.yaml` | Catalog/runtime intent | canonical runtime profiles, backend profiles, and MCP server registry | 2026-04-09 | High | `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp` runtime profiles already exist, but rich MCP runtime mappings are currently present for `codex` only. | Proposal must say whether Auggie/Junie ship with MCP lanes or intentionally without them. | Catalog contract. |
-| MAP-08 | `Chainworks ForgeTests/Proposal029Tests.swift` and `scripts/test-gate.sh` | Verification | focused proof lane and proposal-owned regression slice | 2026-04-09 | High | `proposal-029` gate exists and the focused test suite exists. | Proposal proof contract must align with what the gate is supposed to prove. | Verification contract. |
+| MAP-08 | `Chainworks ForgeTests/Proposal029Tests.swift` and `scripts/test-gate.sh` | Verification | focused proof lane and proposal-owned regression slice | 2026-04-09 | High | `proposal-030` gate exists and the focused test suite exists. | Proposal proof contract must align with what the gate is supposed to prove. | Verification contract. |
 
 ## F. Data / API / Persistence / Auth Touchpoints
 | Evidence ID | Touchpoint | File / Module / Doc | Direction | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
@@ -70,7 +70,7 @@
 | DATA-01 | Machine-local rollout state | `ProviderSettingsStore.swift`, `provider-platform.md` | Persisted config | 2026-04-09 | High | `ConfiguredProvider.isEnabled` is already persisted locally and used in selection. | Proposal should not invent a second rollout owner. | Rollout boundary. |
 | DATA-02 | Runtime registry snapshot | `MCPPolicyRuntime.swift`, `PreflightService.swift`, `GooseSessionBridge.swift` | Runtime validation | 2026-04-09 | High | Registry abstraction name is generalized, but the concrete source remains Goose-centric. | Proposal must specify concrete owner/source rules for second-wave runtimes. | Registry boundary. |
 | DATA-03 | Frozen runtime/provider truth | `provider-binding-truth.md`, `execution-truth-and-recovery.md`, `RunReportBuilder` via stable refs | Persisted run truth | 2026-04-09 | High | Existing run/report truth should remain authoritative regardless of new adapter families. | Proposal cannot weaken persisted truth while expanding transports. | Report/recovery continuity. |
-| DATA-04 | Provider setup and auth readiness | `provider-platform.md`, provider adapters | Setup/readiness | 2026-04-09 | Medium | Provider platform already owns health and troubleshooting, but `P029` stays high-level on second-wave executable/auth readiness specifics. | Implementation may improvise auth/remediation UX. | Readiness completeness. |
+| DATA-04 | Provider setup and auth readiness | `provider-platform.md`, provider adapters | Setup/readiness | 2026-04-09 | Medium | Provider platform already owns health and troubleshooting, but `P030` stays high-level on second-wave executable/auth readiness specifics. | Implementation may improvise auth/remediation UX. | Readiness completeness. |
 
 ## G. Current Host-System Integration Surfaces
 | Evidence ID | Surface / Seam / Owner | Source (`Baseline | Targeted refresh | Current repo`) | Verified On | Confidence | Key Fact | Conflict / Proposal Risk | Relevance |
@@ -91,7 +91,7 @@
 | Validation error | Specified | DOC-01, MAP-03, MAP-04, MAP-05 | resolver, preflight, factory | Provider-not-enabled and unknown-adapter flows are explicit. |
 | Backend error | Partial | DOC-01, MAP-05, MAP-06 | registry failure, transport stub, auth/readiness | Proposal does not yet unify broken transport, missing registry, and provider misconfiguration remediation. |
 | Offline / degraded | Partial | DOC-04, NAV-02, DATA-04 | readiness/troubleshooting | Provider health exists in baseline, but second-wave degraded/offline handling remains high-level. |
-| Retry / recovery | Deferred intentionally | DOC-03, DATA-03 | existing run truth / recovery docs | `P029` extends runtime truth but does not own a new recovery model. |
+| Retry / recovery | Deferred intentionally | DOC-03, DATA-03 | existing run truth / recovery docs | `P030` extends runtime truth but does not own a new recovery model. |
 | Auth / permission expiry | Partial | DOC-04, DATA-04 | provider setup/readiness | Proposal does not lock second-wave auth/remediation specifics. |
 | Rollback / cancellation | Specified | DOC-01, DATA-01 | disable provider / repair preference | Rollback path is disable-and-repair, but cross-surface operator copy remains partial. |
 
@@ -103,19 +103,19 @@
 ## J. Analytics / Instrumentation
 | Evidence ID | Event / Signal | Purpose | Trigger Point | Verified On | Confidence | Gap / Risk |
 |---|---|---|---|---|---|---|
-| METRIC-01 | Focused `proposal-029` gate | proposal-owned readiness proof | same-tree gate in `scripts/test-gate.sh` | 2026-04-09 | High | Proposal still needs a clearer statement of what this gate proves for each second-wave transport. |
+| METRIC-01 | Focused `proposal-030` gate | proposal-owned readiness proof | same-tree gate in `scripts/test-gate.sh` | 2026-04-09 | High | Proposal still needs a clearer statement of what this gate proves for each second-wave transport. |
 
 ## K. Testing Strategy
 | Evidence ID | Layer | Covered Surface | Current Coverage | Proposed Additions | Verified On | Confidence | Gap / Risk |
 |---|---|---|---|---|---|---|---|
-| TEST-01 | Focused proposal gate | provider/runtime/MCP regression slice | `proposal-029` gate exists | keep same-tree focused gate and align it to final proposal scope | 2026-04-09 | High | Proof scope is currently weaker than full proposal scope. |
+| TEST-01 | Focused proposal gate | provider/runtime/MCP regression slice | `proposal-030` gate exists | keep same-tree focused gate and align it to final proposal scope | 2026-04-09 | High | Proof scope is currently weaker than full proposal scope. |
 | TEST-02 | Unit / integration | families, factory, namespace, capability, disabled-provider filtering, catalog mappings | `Proposal029Tests.swift` exists | extend tests to the final chosen MCP and execution completion contract | 2026-04-09 | High | Current tests prove structural pieces, not full end-to-end execution for all three transports. |
 | TEST-03 | Execution proof | real second-wave adapter execution | current code still has stub transports | define exact proof requirement for Codex/Auggie/Junie | 2026-04-09 | High | Proposal currently mixes one-provider proof with three-provider scope. |
 
 ## L. Current Repo Reality / Contradictions
 | Evidence ID | Repo Surface | Proposal Claim | Current Repo Reality | Verified On | Confidence | Implication |
 |---|---|---|---|---|---|---|
-| REAL-01 | provider platform and catalog | `P029` is an expansion slice that must preserve already-landed cutovers and capability enforcement | second-wave families, disabled providers, capability enforcement, and catalog entries are already in repo | 2026-04-09 | High | Proposal is correctly a delta over current HEAD, not a greenfield slice. |
+| REAL-01 | provider platform and catalog | `P030` is an expansion slice that must preserve already-landed cutovers and capability enforcement | second-wave families, disabled providers, capability enforcement, and catalog entries are already in repo | 2026-04-09 | High | Proposal is correctly a delta over current HEAD, not a greenfield slice. |
 | REAL-02 | second-wave execution | scope and AC-11 imply all three transports become executable | `CodexACPTransport`, `AuggieCLIACPTransport`, and `JunieCLIACPTransport` are still stubs | 2026-04-09 | High | Proposal must be precise about what remains in this proposal and what proof is required. |
 | REAL-03 | MCP registry ownership | proposal wants transport-neutral registry ownership | concrete registry provider path still resolves through `GooseExtensionRegistryReader` and one runtime-registry load | 2026-04-09 | High | Proposal still needs a clearer second-wave registry authority contract. |
 | REAL-04 | rollout order | scope and `3.2` say second-wave transports are in this proposal | `4.7` says only structural prerequisites are “this proposal”, while Codex/Auggie/Junie adapters live in later phases | 2026-04-09 | High | Internal proposal ownership is contradictory. |
@@ -140,9 +140,9 @@
 | Dependencies / integration points | Partial | INT-02, INT-03, INT-04, REAL-03, REAL-06 | Core seams are mapped, but not fully resolved in proposal text. |
 
 ## N. Assumptions, Open Questions, and Blockers
-- ASSUMP-01: `P029` should be judged against current stable refs plus current HEAD, not against the original R1 framing.
+- ASSUMP-01: `P030` should be judged against current stable refs plus current HEAD, not against the original R1 framing.
 - ASSUMP-02: No hidden provider-remediation or MCP-registry framework exists outside the checked-in repo.
-- QUESTION-01: Is `P029` intentionally one proposal for all three executable transports, or should only the structural slice stay here with Codex/Auggie/Junie execution split later?
+- QUESTION-01: Is `P030` intentionally one proposal for all three executable transports, or should only the structural slice stay here with Codex/Auggie/Junie execution split later?
 - QUESTION-02: Are Auggie and Junie meant to ship with any MCP lanes in this proposal, or is zero-MCP-only behavior the intended rollout state?
 - QUESTION-03: If second-wave runtimes need registry validation, what is the canonical registry source per adapter family?
 - BLOCKER-01: None at the evidence gate level. The remaining issues are proposal-text readiness gaps, not missing local evidence.
