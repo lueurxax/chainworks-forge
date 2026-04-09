@@ -519,12 +519,25 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
         var lastCollisionDetails = ""
 
         for attempt in 0...Self.maxFreshSessionCollisionRetries {
-            let execution = try await bridge.executeInIsolatedSession(
-                agent: agent,
-                task: task,
-                context: context,
-                override: override
-            )
+            let execution: RuntimeSessionExecution
+            do {
+                execution = try await bridge.executeInIsolatedSession(
+                    agent: agent,
+                    task: task,
+                    context: context,
+                    override: override
+                )
+            } catch {
+                let errorDesc = error.localizedDescription
+                if isSessionMissingError(errorDesc) {
+                    ForgeLogger.session.info("[\(lineageID)] Fresh session became unavailable before prompt submission; retrying fresh session. Error=\(errorDesc)")
+                    if attempt == Self.maxFreshSessionCollisionRetries {
+                        throw error
+                    }
+                    continue
+                }
+                throw error
+            }
 
             let conflicts = try await sessionManager.providerSessionConflicts(
                 runID: context.workspace.runID,
@@ -725,12 +738,11 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
         )
         let transportKind = classifyTransportErrorKind(rawErrorMessage)
         let canonicalOutcome = classifyStreamFailureOutcome(errorMessage: rawErrorMessage, outputPresence: outputPresence)
-        let staleReusedSessionFailedMidStream = isSessionMissingError(rawErrorMessage)
-            && (sessionInfo.reuseDisposition == .reused || sessionInfo.reuseDisposition == .reused_after_resume)
+        let sessionBecameUnavailableMidStream = isSessionMissingError(rawErrorMessage)
 
         var checkpoint: AgentSessionCheckpoint?
         if let gid = sessionInfo.generationID, let sessionManager = sessionManager {
-            if staleReusedSessionFailedMidStream {
+            if sessionBecameUnavailableMidStream {
                 try? await sessionManager.invalidateGeneration(
                     generationID: gid,
                     reason: "transport stream failure: \(rawErrorMessage)"

@@ -22,6 +22,7 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
     private var activeSessions: [String: ACPSubprocessManager] = [:]
     private var requestCounters: [String: Int] = [:]
     private var sessionSystemPrompts: [String: String] = [:]
+    private var sessionEnabledExtensions: [String: [String]] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -118,6 +119,10 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
         if let extensions = sessionResult["enabledExtensions"] as? [String] {
             enabledExtensions = extensions
         }
+
+        lock.lock()
+        sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
+        lock.unlock()
 
         return RuntimeSessionResponse(
             sessionId: sessionId,
@@ -284,6 +289,7 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
         let subprocess = activeSessions.removeValue(forKey: sessionID)
         requestCounters.removeValue(forKey: sessionID)
         sessionSystemPrompts.removeValue(forKey: sessionID)
+        sessionEnabledExtensions.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let subprocess else {
@@ -301,6 +307,18 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
         // Brief wait for clean shutdown, then terminate
         try? await Task.sleep(for: .milliseconds(200))
         subprocess.terminate()
+    }
+
+    func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+        lock.lock()
+        let subprocess = activeSessions[sessionID]
+        let enabledExtensions = sessionEnabledExtensions[sessionID] ?? []
+        lock.unlock()
+
+        guard subprocess != nil else {
+            throw RuntimeTransportError.streamingFailed(reason: "No active Junie session for ID: \(sessionID)")
+        }
+        return RuntimeSessionRuntimeState(enabledExtensions: enabledExtensions)
     }
 
     // MARK: - Private: JSON-RPC Request Construction
@@ -404,6 +422,7 @@ extension JunieCLIACPTransport: RuntimeTransportTerminationControlling {
         activeSessions.removeAll()
         requestCounters.removeAll()
         sessionSystemPrompts.removeAll()
+        sessionEnabledExtensions.removeAll()
         lock.unlock()
 
         for subprocess in subprocesses {

@@ -27,6 +27,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     private var activeSessions: [String: SessionHandle] = [:]
     private var requestCounters: [String: Int] = [:]
     private var sessionSystemPrompts: [String: String] = [:]
+    private var sessionEnabledExtensions: [String: [String]] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -108,22 +109,23 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
             throw RuntimeTransportError.sessionCreationFailed(reason: "Invalid session/new response from Codex ACP")
         }
 
+        // Extract enabled extensions from the session result
+        var enabledExtensions: [String]?
+        if let extensions = sessionResult["enabledExtensions"] as? [String] {
+            enabledExtensions = extensions
+        }
+
         // Register the active session and store systemPrompt for later prepending
         lock.lock()
         activeSessions[sessionId] = SessionHandle(subprocess: subprocess, runtimeHomeURL: runtimeHomeURL)
         requestCounters[sessionId] = 2 // initialize=1, session/new=2
+        sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
         if !request.systemPrompt.isEmpty {
             sessionSystemPrompts[sessionId] = request.systemPrompt
         }
         lock.unlock()
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
-
-        // Extract enabled extensions from the session result
-        var enabledExtensions: [String]?
-        if let extensions = sessionResult["enabledExtensions"] as? [String] {
-            enabledExtensions = extensions
-        }
 
         return RuntimeSessionResponse(
             sessionId: sessionId,
@@ -290,6 +292,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         let handle = activeSessions.removeValue(forKey: sessionID)
         requestCounters.removeValue(forKey: sessionID)
         sessionSystemPrompts.removeValue(forKey: sessionID)
+        sessionEnabledExtensions.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let handle else {
@@ -309,6 +312,18 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         try? await Task.sleep(for: .milliseconds(200))
         subprocess.terminate()
         Self.cleanupRuntimeHomeIfPresent(handle.runtimeHomeURL)
+    }
+
+    func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+        lock.lock()
+        let handle = activeSessions[sessionID]
+        let enabledExtensions = sessionEnabledExtensions[sessionID] ?? []
+        lock.unlock()
+
+        guard handle != nil else {
+            throw RuntimeTransportError.streamingFailed(reason: "No active Codex session for ID: \(sessionID)")
+        }
+        return RuntimeSessionRuntimeState(enabledExtensions: enabledExtensions)
     }
 
     // MARK: - Private: Model Mapping
@@ -481,6 +496,7 @@ extension CodexACPTransport: RuntimeTransportTerminationControlling {
         activeSessions.removeAll()
         requestCounters.removeAll()
         sessionSystemPrompts.removeAll()
+        sessionEnabledExtensions.removeAll()
         lock.unlock()
 
         for handle in handles {

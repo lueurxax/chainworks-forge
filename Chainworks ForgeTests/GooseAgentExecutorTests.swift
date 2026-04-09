@@ -318,7 +318,7 @@ struct RuntimeAgentExecutorTests {
             var createSessionCallCount = 0
             var submitPromptCallCount = 0
             var submittedSessionIDs: [String] = []
-            var sessionUseCounts: [String: Int] = [:]
+            var runtimeStateReadsBySessionID: [String: Int] = [:]
         }
 
         private let state = OSAllocatedUnfairLock(initialState: State())
@@ -345,24 +345,13 @@ struct RuntimeAgentExecutorTests {
             sessionID: String,
             prompt: RuntimePromptRequest
         ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
-            let useCount = state.withLock { state -> Int in
+            state.withLock { state in
                 state.submitPromptCallCount += 1
                 state.submittedSessionIDs.append(sessionID)
-                state.sessionUseCounts[sessionID, default: 0] += 1
-                return state.sessionUseCounts[sessionID] ?? 0
             }
 
             return AsyncThrowingStream { continuation in
                 Task {
-                    if sessionID == "session-reused" && useCount == 2 {
-                        continuation.finish(throwing: NSError(
-                            domain: "CodexACPTest",
-                            code: 404,
-                            userInfo: [NSLocalizedDescriptionKey: "Streaming failed: No active Codex session for ID: session-reused"]
-                        ))
-                        return
-                    }
-
                     continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
                     continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
                     continuation.yield(.finalOutput(content: sessionID == "session-reused" ? "first pass output" : "fresh fallback output"))
@@ -370,6 +359,88 @@ struct RuntimeAgentExecutorTests {
                     continuation.finish()
                 }
             }
+        }
+
+        func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+            let readCount = state.withLock { state -> Int in
+                state.runtimeStateReadsBySessionID[sessionID, default: 0] += 1
+                return state.runtimeStateReadsBySessionID[sessionID] ?? 0
+            }
+
+            if sessionID == "session-reused" && readCount == 2 {
+                throw RuntimeTransportError.streamingFailed(reason: "No active Codex session for ID: \(sessionID)")
+            }
+
+            return RuntimeSessionRuntimeState(enabledExtensions: [])
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
+    private final class FreshSessionMissingTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            let sessionID = callCount == 1 ? "session-initial" : "session-fresh-\(callCount)"
+            return RuntimeSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { state in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+            }
+
+            return AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.finalOutput(content: "fresh retry output"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+            if sessionID == "session-initial" {
+                throw RuntimeTransportError.streamingFailed(reason: "No active session for ID: \(sessionID)")
+            }
+            return RuntimeSessionRuntimeState(enabledExtensions: [])
         }
 
         func closeSession(sessionID: String) async throws {}
@@ -635,7 +706,18 @@ struct RuntimeAgentExecutorTests {
         }
     }
 
-    private func makeContext(runID: UUID = UUID()) -> ExecutionContext {
+    private func makeSessionManager() throws -> AgentSessionManager {
+        let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
+        let config = ModelConfiguration(
+            "RuntimeAgentExecutorTests-\(UUID().uuidString)",
+            schema: schema,
+            isStoredInMemoryOnly: true
+        )
+        let container = try ModelContainer(for: schema, configurations: [config])
+        return AgentSessionManager(container: container)
+    }
+
+    private func makeContext(runID: UUID = UUID(), iteration: Int = 1) -> ExecutionContext {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("test-\(runID.uuidString)", isDirectory: true)
         let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
@@ -655,7 +737,7 @@ struct RuntimeAgentExecutorTests {
             stageID: "state_1",
             stageLineageID: "state_1",
             ownerExecutionLineageID: UUID(),
-            iteration: 1,
+            iteration: iteration,
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
@@ -664,7 +746,7 @@ struct RuntimeAgentExecutorTests {
         )
     }
 
-    private func makeContext(runID: UUID = UUID(), worktreeRoot: URL?) -> ExecutionContext {
+    private func makeContext(runID: UUID = UUID(), iteration: Int = 1, worktreeRoot: URL?) -> ExecutionContext {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("test-\(runID.uuidString)", isDirectory: true)
         let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
@@ -683,7 +765,7 @@ struct RuntimeAgentExecutorTests {
             stageID: "state_1",
             stageLineageID: "state_1",
             ownerExecutionLineageID: UUID(),
-            iteration: 1,
+            iteration: iteration,
             attemptNumber: 1,
             inputArtifacts: [:],
             variables: [:],
@@ -2004,7 +2086,7 @@ struct RuntimeAgentExecutorTests {
     @Test("Executor falls back to fresh session when reused Codex session is no longer active")
     func gooseExecutorFallsBackFromNoActiveCodexSession() async throws {
         let transport = StaleReuseNoActiveCodexSessionTransport()
-        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: AgentSessionManager(container: makeContext().modelContext.container))
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
 
         let baseContext = makeContext()
         let runID = baseContext.workspace.runID
@@ -2039,15 +2121,59 @@ struct RuntimeAgentExecutorTests {
 
         let firstResult = try await executor.execute(task: task, agent: agent, context: context1)
         #expect(firstResult.succeeded)
-        #expect(firstResult.sessionReuseDisposition == .fresh)
+        #expect(firstResult.sessionReuseDisposition == SessionReuseDisposition.fresh)
 
         let secondResult = try await executor.execute(task: task, agent: agent, context: context2)
         #expect(secondResult.succeeded)
-        #expect(secondResult.sessionReuseDisposition == .fresh_after_transport_error)
+        #expect(secondResult.sessionReuseDisposition == SessionReuseDisposition.fresh)
         #expect(secondResult.errorMessage == nil)
         #expect(await transport.createSessionCallCount == 2)
         #expect(await transport.submitPromptCallCount == 2)
         #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
+    }
+
+    @MainActor
+    @Test("Executor retries with a fresh session when a just-created ACP session is already inactive")
+    func gooseExecutorRecoversWhenFreshSessionImmediatelyDisappears() async throws {
+        let transport = FreshSessionMissingTransport()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
+
+        let runID = UUID()
+        let context1 = makeContext(runID: runID, iteration: 1)
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_product_owner",
+            title: "Proposal Reviewer / Product Owner",
+            mode: "proposal_review.product_owner",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: "product_owner",
+            prompt: "Review the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_po"],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let task = AgentTask(
+            agent: agent.id,
+            task: "review_proposal_as_product_owner",
+            inputs: nil,
+            outputs: ["proposal_review_po"]
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context1)
+
+        #expect(result.succeeded)
+        #expect(result.sessionReuseDisposition == SessionReuseDisposition.fresh_after_transport_error)
+        #expect(result.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 1)
+        #expect(await transport.submittedSessionIDs == ["session-fresh-2"])
     }
 
     @MainActor

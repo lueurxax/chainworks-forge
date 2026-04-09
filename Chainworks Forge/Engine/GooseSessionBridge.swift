@@ -103,6 +103,9 @@ final class RuntimeSessionBridge: Sendable {
             throw RuntimeSessionBridgeError.policyAcknowledgementMissing
         }
 
+        let runtimeState = try await transport.readSessionRuntimeState(sessionID: sessionResponse.sessionId)
+        let actualEnabledExtensions = runtimeState?.enabledExtensions ?? sessionResponse.actualEnabledExtensions
+
         // Step 4: Submit the task prompt and get streaming events
         let promptRequest = RuntimePromptRequest(
             content: packet.taskDirective,
@@ -116,7 +119,7 @@ final class RuntimeSessionBridge: Sendable {
 
         return RuntimeSessionExecution(
             sessionID: sessionResponse.sessionId,
-            actualEnabledExtensions: sessionResponse.actualEnabledExtensions,
+            actualEnabledExtensions: actualEnabledExtensions,
             startupLatencyMilliseconds: sessionResponse.startupLatencyMilliseconds,
             eventStream: eventStream,
             transport: transport
@@ -241,6 +244,7 @@ final class RuntimeSessionBridge: Sendable {
         sessionID: String,
         packet: ExecutionPacket
     ) async throws -> RuntimeSessionExecution {
+        let runtimeState = try await transport.readSessionRuntimeState(sessionID: sessionID)
         let promptRequest = RuntimePromptRequest(
             content: packet.taskDirective,
             context: packet.contextAttachments
@@ -250,7 +254,6 @@ final class RuntimeSessionBridge: Sendable {
             sessionID: sessionID,
             prompt: promptRequest
         )
-        let runtimeState = try await transport.readSessionRuntimeState(sessionID: sessionID)
 
         return RuntimeSessionExecution(
             sessionID: sessionID,
