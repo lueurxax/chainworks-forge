@@ -16,163 +16,125 @@
 - Reusable baseline used:
   - `/Users/user/Documents/Chainworks Forge/.review-baselines/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/current-system-baseline.md`
-- Baseline reused:
-  - repo-level current-system map
-  - stable transport, MCP, provider-platform, engine, and operator-shell references
 - Baseline refreshed:
-  - targeted code refresh for current MCP contract richness
-  - targeted code refresh for Goose owner inventory and operator surfaces
-  - targeted code refresh for runtime-trust readers and persisted legacy values
+  - targeted code refresh for MCP dual-path behavior in `RuntimeSessionBridge`
+  - targeted code refresh for ACP adapter MCP injection
+  - targeted code refresh for current `mcp_server_registry` ownership and trust readers
 - Baseline freshness: `Partially refreshed`
-- Proposal-specific integration context:
-  - none present
-- Targeted context refresh performed:
-  - yes, repo-local only
 - External research used: `None`
-- Sources refreshed:
-  - current transport/provider/MCP code paths
-  - current trust readers and fixture/preview references
-  - prerequisite `P030` implementation audit state
 - Runtime evidence used: `None`
 - Current repo tensions found:
-  - `P033` now correctly hard-gates on `P030`, but `P030` is still red today
-  - the current canonical MCP contract is richer than the proposal's current `mcp_intent` description
-  - the repo still has more Goose-owned files and surfaces than the proposal explicitly inventories
-  - historical shell/report/previews still use legacy `server_unverified` / `server_verified` trust values
+  - `P033` now correctly fail-closes the `P030` dependency, but `P030` is still red today
+  - proposal Phase 1 still narrows legacy MCP path to Goose-backed runs, while current ACP runtimes also consume that path
+  - proposal Phase 3 still leaves final `mcp_server_registry` authority ambiguous
+  - proposal-owned `proposal-033` gate is still not operationally specified enough
 
 ## 1. Executive Summary
-- Overall readiness: `Red`
+- Overall readiness: `Amber`
 - Confidence: `High`
-- Proposal completeness signal: `Improved but still blocked`
-- Top improvements since the prior pass:
-  1. `P033` now fail-closes the `P030` dependency instead of treating it as narrative only.
-  2. The proposal no longer deletes MCP structures in one step; it now defines a three-phase migration.
-  3. The proposal now introduces an explicit operator-surface migration table and a post-Goose trust vocabulary.
-- Remaining blockers:
-  1. The new `mcp_intent` contract is still too thin compared with the current required/optional/fallback/runtime-mapping MCP model and frozen report truth.
-  2. The “every Goose-touching file/surface” inventory is still incomplete; important current owners are missing from the proposal.
-  3. The trust-vocabulary rewrite does not yet define how historical `server_unverified` / `server_verified` runs keep rendering correctly.
+- Proposal completeness signal: `Substantially improved`
+- What improved:
+  1. Hard prerequisite gating is now explicit and fail-closed.
+  2. MCP migration is no longer a one-step deletion.
+  3. Operator-surface migration and legacy trust fallback are now explicitly addressed.
+- What still blocks `Green`:
+  1. The dual-path MCP migration is still mis-scoped versus current ACP runtime reality.
+  2. The final owner of runtime-namespace MCP mapping is still ambiguous.
+  3. The focused proof gate is still not defined concretely enough to verify the slice end-to-end.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
   - ACP-first runtime dispatch
   - Goose compatibility-only packaging
-  - default runtime migration away from Goose
   - phased MCP ownership migration
-  - operator-surface migration and trust vocabulary
-  - proof/doc updates for the simplified runtime
+  - operator-surface migration
+  - trust-vocabulary normalization with legacy fallback
+  - proposal-specific proof gating
 - Out of scope:
   - removing Goose support entirely
   - deleting Goose tooling from all system-level settings
   - weakening execution/recovery/report truth
-- Most important baseline refreshes performed:
-  - richer current MCP schema and runtime semantics
-  - current Goose file/surface inventory
-  - current persisted trust values and shell/report readers
-- Most important remaining proposal gaps:
-  - exact `backend_profile.mcp_intent` schema and semantics
-  - exhaustive core/compatibility inventory for Goose files and surfaces
-  - explicit migration/read fallback for historical trust values
+- External hold:
+  - `P030` is still red, so implementation cannot start yet even if `P033` proposal quality improves
 
 ## 4. Discipline Scorecard
 | Discipline | Readiness | Confidence | Evidence Completeness | Critical | High | Medium | Low |
 |---|---|---|---|---:|---:|---:|---:|
-| UI | Amber | High | Complete | 0 | 1 | 0 | 0 |
-| UX | Amber | High | Complete | 0 | 1 | 0 | 0 |
-| iOS Architecture | Red | High | Complete | 1 | 1 | 0 | 0 |
+| UI | Green | High | Complete | 0 | 0 | 0 | 0 |
+| UX | Green | High | Complete | 0 | 0 | 0 | 0 |
+| iOS Architecture | Amber | High | Complete | 0 | 2 | 1 | 0 |
 
 ## 5. Findings by Discipline
 
-### 5.1 UI Findings
-- Finding ID: `UI-033-001`
-  Severity: `High`
-  Evidence IDs: `DOC-01`, `NAV-01`, `NAV-02`, `NAV-03`, `NAV-04`, `NAV-05`, `NAV-06`, `REAL-02`
-  Why it matters: The proposal now has an operator-surface migration table, but it still does not cover the full current Goose-first shell. `PilotReadinessView`, `GooseProviderConnectionAssistantView`, and the runtime-provenance badge/history surfaces are live product surfaces today, and the proposal’s acceptance criteria say every Goose-first surface should be migrated. As written, implementation could finish with a clean settings/setup story but still leave Goose-first affordances in readiness, assistant, and shell history surfaces.
-  Recommended fix: expand the surface matrix into one exhaustive operator inventory that includes setup, readiness, assistant, live start-run copy, runtime provenance/history badges, and any compatibility-only destinations that remain operator-visible.
-  Acceptance criteria:
-  - every currently Goose-first operator surface is named explicitly
-  - each named surface says whether it becomes ACP-default, compatibility-only, or removed
-  - shell/history surfaces are included, not only setup flows
-  Confidence: `High`
-
-### 5.2 UX Findings
-- Finding ID: `UX-033-001`
-  Severity: `High`
-  Evidence IDs: `DOC-01`, `DOC-09`, `MAP-05`, `NAV-06`, `INT-04`, `REAL-03`
-  Why it matters: The new trust vocabulary is directionally correct, but the proposal does not define how historical runs with `server_unverified` / `server_verified` continue to render in the shell, reports, comparison, previews, and recovery surfaces. Without an explicit forward-mapping or reader fallback, the operator can lose trust continuity the moment the vocabulary changes.
-  Recommended fix: add a trust-migration contract covering stored `Run.runtimeTrustLevel` values, reader fallback rules, preview fixtures, and compatibility labels for historical runs.
-  Acceptance criteria:
-  - legacy `server_unverified` / `server_verified` values have an explicit forward mapping or reader fallback
-  - `RunsHomeView`, report/comparison surfaces, previews, and recovery all share the same mapping
-  - the proposal states whether old values are migrated in storage, mapped on read, or both
-  Confidence: `High`
-
-### 5.3 iOS Architecture Findings
+### 5.1 iOS Architecture Findings
 - Finding ID: `ARCH-033-001`
-  Severity: `Critical`
-  Evidence IDs: `DOC-01`, `DOC-06`, `MAP-04`, `MAP-05`, `MAP-06`, `DATA-01`, `DATA-02`, `REAL-01`
-  Why it matters: `P033` correctly switched from one-step deletion to a phased MCP migration, but the replacement contract is still too thin to implement safely. The proposal currently says `backend_profile` gets an optional `mcp_intent` field declaring required MCP servers, while current repo truth still depends on `required_extensions`, `optional_extensions`, `fallback_policy`, runtime namespace mappings, and frozen requested/predicted/actual/denied MCP truth. Without an explicit replacement schema and freeze/report mapping, Phase 1 cannot be implemented without guessing which current semantics survive.
-  Recommended fix: define the exact `mcp_intent` schema and its compatibility rules before implementation. The proposal needs to specify how required vs optional MCP intent, fallback behavior, runtime mappings, and frozen report truth migrate through Phases 1-3.
+  Severity: `High`
+  Evidence IDs: `DOC-01`, `MAP-01`, `MAP-02`, `MAP-03`, `REAL-01`
+  Why it matters: Phase 1 is still too narrow for the current runtime. The proposal says the old `mcp_profile` / `mcp_server_registry` path continues unchanged for Goose-backed runs, but current runtime flow resolves MCP policy before the transport split and then feeds ACP adapters through `mcpServers`. That means the legacy MCP path is still part of the current ACP path too, not only Goose compatibility. As written, the proposal can still be implemented as a non-incremental break instead of a true dual-path migration.
+  Recommended fix: rewrite Phase 1 so the old path remains valid for all current cataloged agents, including ACP-backed agents, until their `backend_profile` explicitly carries `mcp_intent`. Also define precedence when both `agent.mcp_profile` and `backend_profile.mcp_intent` exist.
   Acceptance criteria:
-  - `backend_profile.mcp_intent` has an explicit schema, not only a name
-  - the schema covers required vs optional MCP intent and fallback behavior, or explicitly defines what replaces them
-  - compile-time freezing, persisted run/execution truth, report/comparison readers, and machine-local realization all have explicit migration rules
-  - Phase 1 and Phase 3 both preserve operator-visible MCP truth semantics without guesswork
+  - Phase 1 explicitly preserves legacy MCP declaration for both Goose and ACP-backed agents
+  - precedence between `mcp_intent` and `mcp_profile` is explicit
+  - the proposal requires proof for ACP + Goose dual-path behavior before Phase 2 deprecation starts
   Confidence: `High`
 
 - Finding ID: `ARCH-033-002`
   Severity: `High`
-  Evidence IDs: `DOC-01`, `MAP-02`, `MAP-03`, `MAP-07`, `MAP-08`, `REAL-02`
-  Why it matters: Section `5.3` says every Goose-touching file will be classified as core or compatibility, but the current proposal inventory is still incomplete. The repo still has `FixtureGooseTransport.swift`, `GooseProviderConnectionAssistant.swift`, `GooseProviderConnectionAssistantView.swift`, and other Goose-named or Goose-owned surfaces outside the current table. That leaves room for a partial refactor where “canonical Goose” is removed from the main transport path but retained accidentally in fixtures, assistants, or proof tooling.
-  Recommended fix: expand the core/compatibility owner matrix to include every current Goose-owned file and explicitly state what happens to fixtures, assistant services, preview/test support, and legacy proof helpers.
+  Evidence IDs: `DOC-01`, `DOC-06`, `MAP-04`, `MAP-05`, `MAP-06`, `REAL-02`
+  Why it matters: Phase 3 still does not lock the final authority for runtime-namespace MCP mapping. The proposal says `mcp_server_registry` stays if adapters still need runtime mapping, otherwise it moves to machine-local config. Current baseline treats that registry as repo-owned canonical truth. Without explicitly deciding the end state, `P033` can finish in two different architectures, and acceptance `8` cannot be judged deterministically.
+  Recommended fix: lock one canonical end state for `mcp_server_registry` at the end of `P033`, or explicitly defer registry relocation to a later proposal and keep repo-owned registry authoritative throughout this slice.
   Acceptance criteria:
-  - the file inventory includes all current Goose-owned files, not just transport classes
-  - fixture/proof/test support has an explicit classification
-  - provider-assistant service/view ownership is explicit
-  - no Goose-named owner remains unclassified after rereview
+  - the post-`P033` owner of runtime-namespace MCP mapping is explicit
+  - the condition for keeping versus relocating registry truth is explicit and testable
+  - acceptance `8` can be evaluated without interpretive choice by implementers
   Confidence: `High`
 
+- Finding ID: `ARCH-033-003`
+  Severity: `Medium`
+  Evidence IDs: `DOC-01`, `MAP-07`, `TEST-01`, `TEST-02`, `REAL-03`
+  Why it matters: The proposal now owns a `proposal-033` gate, but the gate is still only conceptual. It does not name the exact same-tree suites or evidence outputs that prove the dual-path MCP migration, legacy trust fallback, and Goose compatibility behavior. For a slice that changes transport truth, MCP truth, and operator trust vocabulary together, that leaves too much room for a “green” gate with incomplete coverage.
+  Recommended fix: define the concrete gate composition, including named test targets or gate groups and the expected evidence outputs for prereq, dual-path MCP, trust-reader fallback, and Goose-compatibility proof.
+  Acceptance criteria:
+  - `proposal-033` names concrete test suites or gate groups
+  - the gate explicitly covers P030 prerequisite, ACP/Goose dual-path MCP behavior, and legacy trust-value fallback
+  - the proposal names the proof artifacts that will demonstrate success
+  Confidence: `Medium`
+
 ## 6. Cross-Discipline Conflicts and Decisions
-- Conflict: the proposal wants a simpler ACP-first MCP model while current repo truth exposes a richer per-agent MCP contract to runtime, reports, and comparison.
-  Tradeoff: simplification is valuable, but a thinner replacement contract would silently remove current semantics.
-  Decision: specify the replacement MCP schema and frozen-truth compatibility before implementation starts.
+- Conflict: the proposal wants a safe dual-path MCP migration, but its current wording still limits the old path to Goose-backed runs while current ACP execution still depends on that path.
+  Tradeoff: narrowing the old path would simplify the story, but it would make the migration non-incremental and inconsistent with current runtime behavior.
+  Decision: keep the old path alive for both Goose and ACP until explicit backend-profile migration is proven.
   Owner: proposal author
 
-- Conflict: the proposal wants Goose to remain as compatibility-only while the current shell and helper layers still expose Goose-specific journeys, fixtures, and history labels.
-  Tradeoff: a smaller matrix is easier to read, but an incomplete inventory will leave canonical-Goose leftovers in operator experience and proof tooling.
-  Decision: expand the owner/surface inventory to every current Goose-owned file and operator-visible surface.
-  Owner: proposal author
-
-- Conflict: the proposal introduces better trust vocabulary, but current persisted runs and shell readers still use legacy `server_*` values.
-  Tradeoff: renaming the vocabulary improves future clarity, but without a migration/read policy it breaks historical continuity.
-  Decision: add a reader-compatible trust migration contract.
+- Conflict: the proposal wants to simplify canonical runtime truth, but its Phase 3 MCP registry owner is still conditional rather than fixed.
+  Tradeoff: leaving the choice open preserves flexibility, but it weakens architectural closure and acceptance testing.
+  Decision: lock the end-state owner now or defer registry relocation out of this proposal.
   Owner: proposal author
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P0 | Define the exact `backend_profile.mcp_intent` schema and all freeze/report/realization compatibility rules | iOS Architecture | Proposal author | Before implementation | current MCP contract and report truth | no MCP migration step requires inference from implementers | `ARCH-033-001` |
-| P0 | Expand the Goose owner inventory to every current file/surface, including fixtures and assistant flows | UI/Architecture | Proposal author | Before implementation | current Goose file/surface set | every current Goose-owned file and operator-visible surface is classified | `UI-033-001`, `ARCH-033-002` |
-| P0 | Add legacy trust-value migration/read rules for historical runs and shell/report/previews | UX/Architecture | Proposal author | Before implementation | current `runtimeTrustLevel` readers | historical runs remain legible under the new trust vocabulary | `UX-033-001` |
-| P1 | Name the exact `proposal-033` suites/evidence outputs expected in the focused gate | iOS Architecture | Proposal author | Before implementation | `P030` prerequisite gate | proof ownership is operational, not only conceptual | follow-up to `TEST-02`, `TEST-03` |
+| P0 | Rewrite Phase 1 MCP dual-path so legacy `mcp_profile` remains valid for ACP-backed agents too, with explicit precedence over/under `mcp_intent` | iOS Architecture | Proposal author | Before implementation | current ACP runtime behavior | no implementer has to guess whether legacy MCP survives for ACP agents | `ARCH-033-001` |
+| P0 | Lock the final authority for `mcp_server_registry` at the end of `P033`, or explicitly defer relocation to a later slice | iOS Architecture | Proposal author | Before implementation | current repo-owned MCP truth | Phase 3 has one deterministic end state | `ARCH-033-002` |
+| P1 | Define exact `proposal-033` gate composition and proof outputs | iOS Architecture | Proposal author | Before implementation | P030 prerequisite semantics | focused proof lane is operationally testable, not just conceptually named | `ARCH-033-003` |
 
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| MCP migration | completeness of replacement MCP schema and truth preservation | explicit schema, fallback semantics, run/report compatibility, runtime mapping | no current MCP truth is dropped silently | next rereview of `P033` | hold if any phase still requires inference |
-| Goose owner migration | completeness of core/compatibility inventory | all current Goose-owned files and surfaces are classified | no Goose-owned path remains “implicit” | next rereview of `P033` | hold if fixtures/assistants/history surfaces remain unnamed |
-| Trust migration | historical trust continuity | explicit mapping for legacy stored values and readers | no historical run/report surface breaks or becomes ambiguous | next rereview of `P033` | hold if shell/report/previews still rely on undefined legacy mapping |
-| Dependency closure | `P030` readiness | all-family second-wave proof and adapter-aware MCP readiness are green | no `P033` implementation starts early | next rereview of `P033` | hold if `P030` remains red |
+| Dual-path MCP migration | ACP and Goose both survive Phase 1 without truth loss | explicit precedence and dual-path proof | no current ACP flow is broken by early agent-level removal | next rereview of `P033` | hold if Phase 1 still reads Goose-only |
+| MCP registry authority | end-state ownership is deterministic | explicit final owner and phase boundary | no split repo/local truth is left implicit | next rereview of `P033` | hold if Phase 3 can still end in two architectures |
+| Focused proof lane | proposal-specific verification is concrete | named suites and evidence outputs | no acceptance criterion depends on unspecified proof | next rereview of `P033` | hold if `proposal-033` remains conceptual only |
+| External dependency | `P030` readiness | all-family ACP proof green | `P033` implementation does not start early | next rereview of `P033` | hold if `P030` remains red |
 
 ## 9. Evidence Gaps and Open Questions
 
 ### Evidence Gaps
-- GAP-01: No blocking evidence gap remains. The review has enough local proposal/docs/code/baseline evidence; the blockers are proposal-text and dependency-readiness issues.
+- GAP-01: No blocking evidence gap remains. The review has enough local proposal/docs/code/baseline evidence; the remaining issues are proposal-text and dependency-state issues.
 
 ### Open Questions
-- QUESTION-01: what exact schema replaces the current richer per-agent MCP contract?
-- QUESTION-02: which Goose compatibility surfaces remain operator-visible after migration?
-- QUESTION-03: how are historical trust values preserved across shell, report, comparison, and preview readers?
+- QUESTION-01: when both `agent.mcp_profile` and `backend_profile.mcp_intent` are present, which one wins during Phase 1?
+- QUESTION-02: does `P033` intend to keep `mcp_server_registry` repo-owned through the whole slice, or is registry relocation a separate future change?
+- QUESTION-03: what exact same-tree gate composition proves this proposal complete?
 
 ## 10. Evidence Gap Review Fallback
 
