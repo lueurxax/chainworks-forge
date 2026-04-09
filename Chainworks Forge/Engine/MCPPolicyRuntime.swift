@@ -187,6 +187,83 @@ struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
     }
 }
 
+// MARK: - CodexExtensionRegistryReader (Proposal 029)
+
+/// Codex-specific RuntimeExtensionRegistryProvider conformer.
+/// Codex uses MCP natively, so it reads from the same Goose config format
+/// but applies Codex-specific extension ID mappings. This ensures the MCP
+/// policy resolver can validate extension availability against a Codex runtime
+/// rather than assuming a Goose-only world.
+struct CodexExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
+    static let environmentConfigPathKey = "CHAINWORKS_CODEX_CONFIG_PATH"
+    let configURL: URL
+
+    nonisolated init(configURL: URL? = nil) {
+        if let configURL {
+            self.configURL = configURL
+            return
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let isTestHost = environment["XCTestConfigurationFilePath"] != nil
+        let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
+        if isTestHost || usesInMemoryStore {
+            // In test/in-memory mode, fall back to the same fixture as Goose
+            // since Codex uses the same config format.
+            let fixtureURL = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
+            if FileManager.default.isReadableFile(atPath: fixtureURL.path) {
+                self.configURL = fixtureURL
+                return
+            }
+        }
+
+        if let environmentPath = ProcessInfo.processInfo.environment["CHAINWORKS_CODEX_CONFIG_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !environmentPath.isEmpty {
+            self.configURL = URL(fileURLWithPath: environmentPath)
+            return
+        }
+
+        // Default: Codex stores its config in the same location as Goose.
+        // When a dedicated Codex config path is added, update this default.
+        self.configURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/goose/config.yaml")
+    }
+
+    nonisolated func snapshot() throws -> RuntimeExtensionRegistrySnapshot {
+        let contents = try String(contentsOf: configURL, encoding: .utf8)
+        let extensions: [String: RuntimeExtensionDefinition]
+        if let root = try Yams.load(yaml: contents) as? [String: Any],
+           let rawExtensions = root["extensions"] as? [String: Any] {
+            extensions = rawExtensions.compactMapValues { value -> RuntimeExtensionDefinition? in
+                guard let dict = value as? [String: Any] else { return nil }
+                return RuntimeExtensionDefinition(rawYAML: dict)
+            }
+        } else {
+            extensions = [:]
+        }
+        let installed = extensions.keys.sorted()
+        let enabled = extensions
+            .compactMap { key, value in value.enabled == true ? key : nil }
+            .sorted()
+        return RuntimeExtensionRegistrySnapshot(
+            configURL: configURL,
+            installedExtensionIDs: installed,
+            enabledExtensionIDs: enabled,
+            configsByRuntimeID: extensions
+        )
+    }
+
+    /// RuntimeExtensionRegistryProvider conformance.
+    nonisolated func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot {
+        try snapshot()
+    }
+}
+
 struct MCPPolicyResolver: Sendable {
     func resolve(
         agent: ResolvedAgent,

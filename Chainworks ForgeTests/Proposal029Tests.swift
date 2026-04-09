@@ -187,6 +187,75 @@ struct Proposal029Tests {
         #expect(!store.settings.configuredProviders.isEmpty)
     }
 
+    // MARK: - Test 9: CodexACPTransport session creation fails with subprocess error, not stub error
+
+    @Test("CodexACPTransport session creation fails with subprocess error, not stub error")
+    func codexTransportIsNotStubbed() async {
+        let transport = CodexACPTransport(executablePath: "/nonexistent/codex")
+        do {
+            _ = try await transport.createSession(request: RuntimeSessionRequest(
+                systemPrompt: "test",
+                workingDirectory: nil,
+                model: "gpt-5",
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil,
+                requestedExtensions: nil
+            ))
+            Issue.record("Expected error")
+        } catch {
+            let message = error.localizedDescription
+            // Should NOT contain "not yet implemented"
+            #expect(!message.contains("not yet implemented"), "Transport is still stubbed: \(message)")
+        }
+    }
+
+    // MARK: - Test 10: AuggieCLIACPTransport session creation fails with subprocess error, not stub error
+
+    @Test("AuggieCLIACPTransport session creation fails with subprocess error, not stub error")
+    func auggieTransportIsNotStubbed() async {
+        let transport = AuggieCLIACPTransport(executablePath: "/nonexistent/auggie")
+        do {
+            _ = try await transport.createSession(request: RuntimeSessionRequest(
+                systemPrompt: "test",
+                workingDirectory: nil,
+                model: "default",
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil,
+                requestedExtensions: nil
+            ))
+            Issue.record("Expected error")
+        } catch {
+            let message = error.localizedDescription
+            // Should NOT contain "not yet implemented"
+            #expect(!message.contains("not yet implemented"), "Transport is still stubbed: \(message)")
+        }
+    }
+
+    // MARK: - Test 11: JunieCLIACPTransport session creation fails with subprocess error, not stub error
+
+    @Test("JunieCLIACPTransport session creation fails with subprocess error, not stub error")
+    func junieTransportIsNotStubbed() async {
+        let transport = JunieCLIACPTransport(executablePath: "/nonexistent/junie")
+        do {
+            _ = try await transport.createSession(request: RuntimeSessionRequest(
+                systemPrompt: "test",
+                workingDirectory: nil,
+                model: "default",
+                provider: nil,
+                executionPolicy: nil,
+                metadata: nil,
+                requestedExtensions: nil
+            ))
+            Issue.record("Expected error")
+        } catch {
+            let message = error.localizedDescription
+            // Should NOT contain "not yet implemented"
+            #expect(!message.contains("not yet implemented"), "Transport is still stubbed: \(message)")
+        }
+    }
+
     @Test("Example catalog maps codex runtime namespace for rich MCP servers")
     func exampleCatalogMapsCodexRuntimeNamespaceForRichMCPServers() throws {
         let repoRoot = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true)

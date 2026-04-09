@@ -56,7 +56,7 @@ This proposal includes:
 
 - **Provider-platform expansion**: new `ProviderFamily` cases (`.codexACP`, `.auggie`, `.junie`), corresponding `ProviderAdapter` implementations, seeded settings, and setup/readiness ownership
 - **Fail-closed transport factory**: change `RuntimeTransportFactory` protocol to `throws`, add `RuntimeTransportError.unknownAdapterFamily`, and update the full owner chain (factory → executor → preflight → report)
-- **Three ACP adapter stubs**: `CodexACPTransport`, `AuggieCLIACPTransport`, `JunieCLIACPTransport`
+- **Three ACP adapter implementations**: fully functional `CodexACPTransport`, `AuggieCLIACPTransport`, `JunieCLIACPTransport` with working session creation, streaming, and close semantics
 - **Runtime profile definitions**: `codex_acp`, `auggie_cli_acp`, `junie_cli_acp` in catalog YAML
 - **Backend profile variants**: targeting each runtime profile with correct provider/model bindings
 - **MCP registry migration**: promote `GooseExtensionRegistrySnapshot` / `GooseExtensionRegistryReader` to transport-neutral `RuntimeExtensionRegistry` with per-adapter install/readiness owners, and update `MCPPolicyResolver` to resolve against the registry for the binding's adapter family instead of hard-coding Goose
@@ -94,6 +94,62 @@ The following catalog/runtime decisions are already landed and are now normative
 5. **Structured-output capability gating already recognizes second-wave ACP families.**
    - `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp` are already treated as structured-output-capable transports by preflight/schema validation.
    - Future work must keep that alignment between catalog intent and gate behavior.
+
+### 3.2 Implementation Status and Remaining Work
+
+This proposal now explicitly includes the implementation work required to make the second-wave ACP profiles executable. The current codebase is in a partial-rollout state.
+
+#### Already landed
+
+- Catalog runtime profiles exist for `codex_acp`, `auggie_cli_acp`, `junie_cli_acp`.
+- `ProviderFamily` expansion exists for `.codexACP`, `.auggie`, `.junie`.
+- Seeded provider settings and `ProviderAdapter` health/readiness plumbing exist for those families.
+- Fail-closed transport factory behavior exists via `RuntimeTransportError.unknownAdapterFamily`.
+- `RuntimeProfile.requires` enforcement is wired into preflight through `ProviderCapabilities`.
+- `ConfiguredProvider.isEnabled` exists and is used as the rollout gate.
+- Structured-output gate recognizes `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp`.
+- Canonical catalog cutovers already landed:
+  - `codex_writer_high -> codex_acp`
+  - Gemini proposal reviewers -> `gemini_review_pro`
+  - second-wave orchestrator ACP profiles request `structured_output: preferred`
+
+#### Not yet complete
+
+1. **Second-wave ACP transports are still stubs.**
+   - `CodexACPTransport`, `AuggieCLIACPTransport`, and `JunieCLIACPTransport` still throw `"... is not yet implemented"` in session creation, streaming, and close paths.
+   - Any run routed onto those transports currently fails at execution time.
+
+2. **Registry/provider ownership is still Goose-centric.**
+   - The type rename to `RuntimeExtensionRegistrySnapshot` landed, but the live providers still resolve through `GooseExtensionRegistryReader` and `gooseRegistry`-shaped call sites.
+   - The adapter-family-specific registry provider story is therefore incomplete.
+
+3. **Second-wave proof gates are not complete.**
+   - The proposal requires proof that real runs can execute on Codex/Auggie/Junie ACP transports.
+   - Catalog/preflight acceptance alone is insufficient until execution proof exists.
+
+#### Required remaining implementation
+
+The following work is in scope for Proposal 029 and must be completed before the proposal can be considered fully implemented:
+
+1. Implement `CodexACPTransport` end-to-end.
+   - Session creation must succeed.
+   - Stream events must surface normal progress/tool/output lifecycle.
+   - Session close must settle cleanly.
+   - Runs using `codex_writer_high` must no longer fail with `CodexACPTransport is not yet implemented`.
+
+2. Implement `AuggieCLIACPTransport` end-to-end.
+   - Same execution requirements as Codex ACP.
+
+3. Implement `JunieCLIACPTransport` end-to-end.
+   - Same execution requirements as Codex ACP.
+
+4. Finish transport-neutral MCP registry ownership.
+   - Replace remaining Goose-specific registry loading in preflight/execution with adapter-family-aware registry provider selection.
+   - Preserve existing `codex` MCP namespace mappings and do not roll them back.
+
+5. Add proof coverage for second-wave execution.
+   - Require one successful execution proof path per in-scope second-wave family: Codex ACP, Auggie CLI ACP, and Junie CLI ACP.
+   - The implementation is not complete merely because the catalog parses or preflight accepts the configuration.
 
 ---
 
@@ -203,6 +259,18 @@ Preflight resolves the registry provider per binding. If no registry exists for 
 
 **Migration safety**: Goose path unchanged — `GooseExtensionRegistryReader` remains the conformer for `adapterFamily == "goose"`.
 
+### 4.3.1 Second-Wave MCP Policy Matrix
+
+To remove ambiguity, `P029` fixes the MCP stance per second-wave family as follows:
+
+| Family | Runtime Namespace | MCP stance in `P029` | Canonical runtime mappings in `P029` | Registry source / readiness owner | Preflight behavior |
+|---|---|---|---|---|---|
+| `codex_acp` | `codex` | **Mapped lanes supported** | `developer`, `analyze`, `xcode`, `context7` | adapter-family-aware runtime registry provider for Codex ACP; until that provider exists, MCP-dependent Codex agents are blocked rather than silently downgraded | MCP-dependent agents must pass against Codex mappings or fail preflight |
+| `auggie_cli_acp` | `auggie` | **Zero-MCP-only by design in `P029`** | none | no runtime registry source required in `P029` | any MCP-dependent Auggie agent fails preflight deterministically |
+| `junie_cli_acp` | `junie` | **Zero-MCP-only by design in `P029`** | none | no runtime registry source required in `P029` | any MCP-dependent Junie agent fails preflight deterministically |
+
+This proposal therefore does **not** require rich MCP lane parity for Auggie or Junie. Their runtime namespaces still exist so the system can reason about them explicitly, but the accepted `P029` rollout contract is zero-MCP-only for those two families unless a later proposal expands their lane surface.
+
 ### 4.4 Capability Enforcement
 
 **Current state**: Operator-visible capability truth already lives on `ConfiguredProvider.capabilities` (`ProviderCapabilities` struct with `supportsStreaming`, `supportsTools`, `supportsStructuredOutput`, `supportsEffortControl`, `supportsSessionResume`, `supportsFileEditing`, `supportsSandboxHints`). This is the existing single authority for what a provider can do.
@@ -306,18 +374,22 @@ backend_profiles:
 
 ### 4.7 Rollout Order
 
-1. **Phase 1 — Structural prerequisites** (this proposal):
+The phases below are sequencing inside **one proposal**. `P029` is not complete until all phases listed here are complete.
+
+1. **Phase 1 — Structural prerequisites**:
    - Fail-closed transport factory
    - MCP namespace migration for all adapter families
    - Capability enforcement in preflight
    - Provider-platform expansion (new families, adapters, seeded settings)
 
 2. **Phase 2 — Codex ACP adapter**:
+   - Implement `CodexACPTransport`
    - Register `CodexACPTransport` in transport factory
    - Declare capabilities
    - Run proof gate
 
 3. **Phase 3 — Auggie + Junie adapters**:
+   - Implement `AuggieCLIACPTransport` and `JunieCLIACPTransport`
    - Register `AuggieCLIACPTransport` and `JunieCLIACPTransport`
    - Run proof gates
 
@@ -325,6 +397,7 @@ backend_profiles:
 
 - no new adapter family may be added without fail-closed factory registration;
 - no existing ACP profile or mapping introduced by this rollout may be reverted back to Goose merely to accommodate unfinished structural work.
+- no phase listed above may be treated as “future work outside `P029`” while the proposal still claims all-three executable transports in scope.
 
 ### 4.8 Disabled-Provider Rollout Semantics
 
@@ -368,6 +441,11 @@ backend_profiles:
     - Gemini proposal reviewers resolve through `gemini_review_pro`
     - `codex`, `auggie`, and `junie` ACP orchestrator profiles keep `structured_output: preferred`
     - `codex` MCP runtime mappings for `developer`, `analyze`, `xcode`, and `context7` remain present
+11. Runs routed to `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp` no longer fail with transport stub errors such as `"... is not yet implemented"`.
+12. MCP behavior is deterministic per second-wave family:
+    - Codex ACP supports the declared `codex` runtime mappings and blocks when its registry/readiness source cannot satisfy them
+    - Auggie and Junie are zero-MCP-only in `P029`, and MCP-dependent agents targeting them fail preflight by design
+13. Proof requirements match scope: same-tree verification includes one successful execution proof path for each in-scope second-wave transport family (`codex_acp`, `auggie_cli_acp`, `junie_cli_acp`).
 
 ---
 

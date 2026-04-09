@@ -474,7 +474,19 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
             )
         }
 
-        let runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
+        // Dispatch registry provider by adapter family (Proposal 029).
+        // - goose / nil: GooseExtensionRegistryReader (original path)
+        // - codex_acp: CodexExtensionRegistryReader (Codex uses MCP natively)
+        // - auggie_cli_acp, junie_cli_acp: nil (zero-MCP — no registry needed)
+        let runtimeRegistry: RuntimeExtensionRegistrySnapshot?
+        switch context.providerBinding?.adapterFamily {
+        case "codex_acp":
+            runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
+        case "auggie_cli_acp", "junie_cli_acp":
+            runtimeRegistry = nil
+        default:
+            runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
+        }
         return MCPPolicyResolver().resolve(
             agent: agent,
             catalog: catalog,
