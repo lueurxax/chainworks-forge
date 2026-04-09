@@ -84,8 +84,8 @@ struct GooseServerTransportTests {
     // MARK: - Helpers
 
     private struct StubRegistryProvider: RuntimeExtensionRegistryProvider, Sendable {
-        let snapshot: GooseExtensionRegistrySnapshot
-        func registrySnapshot() throws -> GooseExtensionRegistrySnapshot { snapshot }
+        let snapshot: RuntimeExtensionRegistrySnapshot
+        func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot { snapshot }
     }
 
     private func makeMockTransport(
@@ -100,7 +100,7 @@ struct GooseServerTransportTests {
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 20
 
-        let registryProvider = extensionRegistryProvider ?? StubRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+        let registryProvider = extensionRegistryProvider ?? StubRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
             installedExtensionIDs: [],
             enabledExtensionIDs: [],
@@ -325,12 +325,12 @@ struct GooseServerTransportTests {
         let transport = makeMockTransport(
             provider: "claude_code",
             model: "opus",
-            extensionRegistryProvider: StubRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+            extensionRegistryProvider: StubRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
                 configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
                 installedExtensionIDs: ["developer", "xcode", "context7"],
                 enabledExtensionIDs: ["developer"],
                 configsByRuntimeID: [
-                    "context7": GooseExtensionDefinition(
+                    "context7": RuntimeExtensionDefinition(
                         enabled: false,
                         type: "stdio",
                         name: "context7",

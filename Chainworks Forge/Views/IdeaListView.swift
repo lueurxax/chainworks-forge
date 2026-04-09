@@ -2641,8 +2641,8 @@ struct WorkflowRunProgressView: View {
                         Label(stage.label, systemImage: "square.stack.3d.up")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else if let currentStageID = run.currentStageID {
-                        Label(currentStageID, systemImage: "square.stack.3d.up")
+                    } else {
+                        Label(run.cursorDerivedStageLabel, systemImage: "square.stack.3d.up")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -2742,7 +2742,7 @@ struct WorkflowRunProgressView: View {
                 VStack(alignment: .leading, spacing: ForgeSpacing.small) {
                     Text("Run Overview")
                         .font(ForgeTypography.sectionHeader)
-                    Text(currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                    Text(currentStageExecution?.label ?? run.cursorDerivedStageLabel)
                         .font(.title3.weight(.semibold))
                     Text(nextActionText)
                         .font(ForgeTypography.body)
@@ -2760,8 +2760,8 @@ struct WorkflowRunProgressView: View {
 
             VStack(alignment: .leading, spacing: ForgeSpacing.small) {
                 summaryRow(label: "Workflow", value: run.workflowTitle)
-                summaryRow(label: "Current Stage", value: run.currentStageID ?? "None")
-                summaryRow(label: "Latest Phase", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                summaryRow(label: "Current Stage", value: run.cursorDerivedStageLabel)
+                summaryRow(label: "Latest Phase", value: currentStageExecution?.label ?? run.cursorDerivedStageLabel)
                 summaryRow(label: "Latest Event", value: latestMeaningfulEventText)
             }
         }

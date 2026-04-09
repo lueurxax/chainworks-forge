@@ -245,7 +245,7 @@ enum RuntimeStreamEvent: Sendable {
 /// Abstracts MCP / extension registry access so core runtime code
 /// does not depend on the concrete Goose config reader.
 protocol RuntimeExtensionRegistryProvider: Sendable {
-    func registrySnapshot() throws -> GooseExtensionRegistrySnapshot
+    func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot
 }
 
 // MARK: - RuntimeTransportError

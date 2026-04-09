@@ -25,7 +25,10 @@ enum ProviderAdapterFactory {
         [
             .codex: CodexProviderAdapter(),
             .claude: ClaudeProviderAdapter(),
-            .gemini: GeminiProviderAdapter()
+            .gemini: GeminiProviderAdapter(),
+            .codexACP: CodexACPProviderAdapter(),
+            .auggie: AuggieProviderAdapter(),
+            .junie: JunieProviderAdapter()
         ]
     }
 }

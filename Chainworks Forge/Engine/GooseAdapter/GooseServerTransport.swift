@@ -480,7 +480,7 @@ final class GooseServerTransport: RuntimeTransportProtocol, @unchecked Sendable 
     }
 
     private func addExtension(
-        _ extensionConfig: GooseExtensionDefinition,
+        _ extensionConfig: RuntimeExtensionDefinition,
         to sessionID: String
     ) async throws {
         let url = baseURL.appendingPathComponent("agent/add_extension")
@@ -651,7 +651,7 @@ private struct GooseServerRemoveExtension: Codable {
 
 private struct GooseServerAddExtension: Codable {
     let sessionID: String
-    let config: GooseExtensionDefinition
+    let config: RuntimeExtensionDefinition
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"

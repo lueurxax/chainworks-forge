@@ -546,6 +546,31 @@ runtime_profiles:
       - tools
     transport_kind: acp_stdio
     mcp_realization_path: acp_native
+  codex_acp:
+    capability_class: control_capable
+    adapter_family: codex_acp
+    requires:
+      - streaming
+      - tools
+      - session_resume
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
+  auggie_cli_acp:
+    capability_class: control_capable
+    adapter_family: auggie_cli_acp
+    requires:
+      - streaming
+      - tools
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
+  junie_cli_acp:
+    capability_class: control_capable
+    adapter_family: junie_cli_acp
+    requires:
+      - streaming
+      - tools
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_code
@@ -710,6 +735,30 @@ backend_profiles:
     temperature: 0.0
     max_turns: 8
     structured_output: required
+  codex_orchestrator_acp:
+    provider: codex_acp
+    model: gpt-5
+    effort: medium
+    temperature: 0.1
+    max_turns: 12
+    structured_output: preferred
+    runtime_profile: codex_acp
+  auggie_orchestrator_acp:
+    provider: auggie
+    model: auggie-default
+    effort: medium
+    temperature: 0.1
+    max_turns: 12
+    structured_output: none
+    runtime_profile: auggie_cli_acp
+  junie_orchestrator_acp:
+    provider: junie
+    model: junie-default
+    effort: medium
+    temperature: 0.1
+    max_turns: 12
+    structured_output: none
+    runtime_profile: junie_cli_acp
 permission_profiles:
   ORCH:
     filesystem:

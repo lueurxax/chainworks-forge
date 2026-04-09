@@ -101,8 +101,20 @@ import SwiftData
     @Relationship(deleteRule: .cascade)
     var approvals: [Approval] = []
 
-    // Derived current stage (ARCH-PA-002)
+    // Derived current stage (ARCH-PA-002), cursor-first (Proposal 032).
     @MainActor var currentStageID: String? {
+        // Proposal 032: Prefer the durable cursor for current-stage derivation.
+        if let cursor = transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled, .transitionStarted:
+                if let next = cursor.nextScheduledStateID { return next }
+            case .terminal:
+                if let last = cursor.lastCompletedStateID { return last }
+            case .awaitingFirstState:
+                break
+            }
+        }
+        // Fallback for pre-P032 runs or initial state.
         let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
         return sorted.last(where: {
             $0.status == .running
@@ -112,6 +124,28 @@ import SwiftData
                 || $0.status == .ready
         })?.stageID
             ?? sorted.last(where: { $0.status == .completed })?.stageID
+    }
+
+    /// Proposal 032: Cursor-derived stage label for shell surfaces.
+    /// Returns a label that distinguishes interrupted-transition states
+    /// (e.g. "Scheduled: review" vs. just "review").
+    @MainActor var cursorDerivedStageLabel: String {
+        guard let cursor = transitionCursor else {
+            return currentStageID ?? "None"
+        }
+        switch cursor.settlementPhase {
+        case .transitionSettled:
+            if let next = cursor.nextScheduledStateID {
+                return "Scheduled: \(next)"
+            }
+            return cursor.lastCompletedStateID ?? "None"
+        case .transitionStarted:
+            return cursor.nextScheduledStateID ?? "None"
+        case .terminal:
+            return cursor.lastCompletedStateID ?? "None"
+        case .awaitingFirstState:
+            return currentStageID ?? "Not started"
+        }
     }
 
     init(

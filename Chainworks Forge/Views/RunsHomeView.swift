@@ -957,7 +957,7 @@ struct RunDetailPanel: View {
             GroupBox("Summary") {
                 VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
                     LabeledContent("Status", value: run.presentationStatusLabel)
-                    LabeledContent("Current Stage", value: run.currentStageID ?? "None")
+                    LabeledContent("Current Stage", value: run.cursorDerivedStageLabel)
                     LabeledContent("Next Action", value: nextActionText)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -969,7 +969,7 @@ struct RunDetailPanel: View {
                     if let idea = run.idea {
                         LabeledContent("Idea", value: idea.title)
                     }
-                    LabeledContent("Current Stage", value: run.currentStageID ?? "None")
+                    LabeledContent("Current Stage", value: run.cursorDerivedStageLabel)
                     LabeledContent("Status", value: run.presentationStatusLabel)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

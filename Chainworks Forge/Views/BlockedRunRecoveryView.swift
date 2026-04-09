@@ -586,6 +586,26 @@ struct BlockedRunRecoveryView: View {
     }
 
     private var currentStageName: String {
+        // Proposal 032: Use cursor-derived label for interrupted-transition clarity.
+        if let cursor = run.transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled:
+                if let next = cursor.nextScheduledStateID {
+                    let label = stageSnapshots.first(where: { $0.stageID == next })?.label ?? next
+                    return "Scheduled: \(label)"
+                }
+            case .transitionStarted:
+                if let next = cursor.nextScheduledStateID {
+                    return stageSnapshots.first(where: { $0.stageID == next })?.label ?? next
+                }
+            case .terminal:
+                if let last = cursor.lastCompletedStateID {
+                    return stageSnapshots.first(where: { $0.stageID == last })?.label ?? last
+                }
+            case .awaitingFirstState:
+                break
+            }
+        }
         guard let stageID = run.currentStageID else { return "None" }
         return stageSnapshots.first(where: { $0.stageID == stageID })?.label ?? stageID
     }

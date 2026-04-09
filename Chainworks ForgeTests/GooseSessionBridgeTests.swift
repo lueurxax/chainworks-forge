@@ -8,8 +8,8 @@ import Foundation
 /// Tests workspace validation, packet construction, and session isolation.
 /// Test-only stub for RuntimeExtensionRegistryProvider.
 private struct StubExtensionRegistryProvider: RuntimeExtensionRegistryProvider {
-    let snapshot: GooseExtensionRegistrySnapshot
-    func registrySnapshot() throws -> GooseExtensionRegistrySnapshot { snapshot }
+    let snapshot: RuntimeExtensionRegistrySnapshot
+    func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot { snapshot }
 }
 
 @MainActor
@@ -265,12 +265,12 @@ struct RuntimeSessionBridgeTests {
     @Test("Session bridge resolves requested MCP extensions from per-agent profile")
     func sessionBridgeResolvesRequestedMCPExtensions() async throws {
         let transport = CapturingTransport()
-        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+        let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
             installedExtensionIDs: ["context7"],
             enabledExtensionIDs: ["context7"],
             configsByRuntimeID: [
-                "context7": GooseExtensionDefinition(
+                "context7": RuntimeExtensionDefinition(
                     enabled: true,
                     type: "stdio",
                     name: "Context7",
@@ -348,12 +348,12 @@ struct RuntimeSessionBridgeTests {
     @Test("Session bridge resolves requested MCP extensions from transport runtime when frozen binding is absent")
     func sessionBridgeResolvesRequestedMCPExtensionsWithoutFrozenBinding() async throws {
         let transport = CapturingTransport()
-        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+        let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
             installedExtensionIDs: ["context7"],
             enabledExtensionIDs: ["context7"],
             configsByRuntimeID: [
-                "context7": GooseExtensionDefinition(
+                "context7": RuntimeExtensionDefinition(
                     enabled: true,
                     type: "stdio",
                     name: "Context7",
@@ -421,12 +421,12 @@ struct RuntimeSessionBridgeTests {
     @Test("Session bridge realizes Gemini ACP MCP servers from local registry")
     func sessionBridgeRealizesGeminiACPMCPServersFromLocalRegistry() async throws {
         let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
-        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+        let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
             installedExtensionIDs: ["xcode"],
             enabledExtensionIDs: ["xcode"],
             configsByRuntimeID: [
-                "xcode": GooseExtensionDefinition(
+                "xcode": RuntimeExtensionDefinition(
                     enabled: true,
                     type: "stdio",
                     name: "xcode",
@@ -515,7 +515,7 @@ struct RuntimeSessionBridgeTests {
     @Test("Session bridge blocks Gemini ACP session when required MCP server is unavailable locally")
     func sessionBridgeBlocksGeminiACPWhenRequiredMCPServerMissingLocally() async throws {
         let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
-        let registryProvider = StubExtensionRegistryProvider(snapshot: GooseExtensionRegistrySnapshot(
+        let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
             installedExtensionIDs: [],
             enabledExtensionIDs: [],

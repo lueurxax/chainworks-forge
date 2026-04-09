@@ -266,16 +266,25 @@ final class WorkflowOrchestrator {
             return
         }
 
-        // Proposal 032: Atomic settlement for approval-resume transition.
+        // Proposal 032: Atomic settlement for approval-resume transition (fail-closed).
         let completedStageExec = run.stageExecutions
             .filter { $0.stageID == stageID && $0.status == .completed }
             .sorted { $0.startedAt < $1.startedAt }
             .last
-        settleTransition(
+        let settled = settleTransition(
             completedStateID: stageID,
             completedStageExecutionID: completedStageExec?.id,
             nextStateID: transition.to
         )
+
+        guard settled else {
+            RuntimeDiagnostics.log("resumeAfterApproval settlementFailed stageID=\(stageID) to=\(transition.to)")
+            run.status = .blocked
+            run.driftDetails = "Transition settlement failed after approval: could not durably persist continuation from '\(stageID)' to '\(transition.to)'. Manual resume required."
+            isRunning = false
+            onComplete?(false)
+            return
+        }
 
         RuntimeDiagnostics.log("resumeAfterApproval transition stageID=\(stageID) to=\(transition.to)")
         currentStateID = transition.to
@@ -372,19 +381,28 @@ final class WorkflowOrchestrator {
                 return
             }
 
-            // Proposal 032: Atomic transition settlement.
+            // Proposal 032: Atomic transition settlement (fail-closed).
             // Persist the completed state and scheduled next state in one save boundary
-            // before advancing the state machine. This ensures resume/recovery surfaces
-            // always see a durable continuation point even if the process exits now.
+            // before advancing the state machine. If the save fails, the state machine
+            // must NOT advance — block instead to prevent half-settled state.
             let completedStageExec = run.stageExecutions
                 .filter { $0.stageID == state.id && $0.status == .completed }
                 .sorted { $0.startedAt < $1.startedAt }
                 .last
-            settleTransition(
+            let settled = settleTransition(
                 completedStateID: state.id,
                 completedStageExecutionID: completedStageExec?.id,
                 nextStateID: transition.to
             )
+
+            guard settled else {
+                RuntimeDiagnostics.log("executeStateMachine settlementFailed from=\(state.id) to=\(transition.to)")
+                run.status = .blocked
+                run.driftDetails = "Transition settlement failed: could not durably persist continuation from '\(state.id)' to '\(transition.to)'. Manual resume required."
+                isRunning = false
+                onComplete?(false)
+                return
+            }
 
             RuntimeDiagnostics.log("executeStateMachine transition from=\(state.id) to=\(transition.to)")
             currentStateID = transition.to
@@ -2786,11 +2804,15 @@ final class WorkflowOrchestrator {
     /// Atomically settle a transition from a completed state to the next scheduled state.
     /// Persists the cursor and saves the model context in one boundary, ensuring that
     /// resume/recovery surfaces always see a durable continuation point.
+    ///
+    /// Returns `true` if the save succeeded. Callers must NOT advance the state machine
+    /// when this returns `false` — the transition is not durably committed.
+    @discardableResult
     private func settleTransition(
         completedStateID: String,
         completedStageExecutionID: UUID?,
         nextStateID: String
-    ) {
+    ) -> Bool {
         let currentCursor = run.transitionCursor ?? .initial()
         let iteration = currentIteration(for: nextStateID)
         let newCursor = currentCursor.settlingTransition(
@@ -2800,8 +2822,14 @@ final class WorkflowOrchestrator {
             nextIteration: iteration
         )
         run.persistTransitionCursor(newCursor)
-        try? modelContext.save()
-        RuntimeDiagnostics.log("settleTransition seq=\(newCursor.sequenceNumber) completed=\(completedStateID) next=\(nextStateID)")
+        do {
+            try modelContext.save()
+            RuntimeDiagnostics.log("settleTransition seq=\(newCursor.sequenceNumber) completed=\(completedStateID) next=\(nextStateID)")
+            return true
+        } catch {
+            RuntimeDiagnostics.log("settleTransition FAILED seq=\(newCursor.sequenceNumber) completed=\(completedStateID) next=\(nextStateID) error=\(error.localizedDescription)")
+            return false
+        }
     }
 
     /// Mark the cursor as terminal (completed, failed, blocked, or cancelled).

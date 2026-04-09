@@ -203,7 +203,7 @@ final class RuntimeSessionBridge: Sendable {
 
     private static func realizeACPServer(
         runtimeID: String,
-        registry: GooseExtensionRegistrySnapshot,
+        registry: RuntimeExtensionRegistrySnapshot,
         transportNamespace: String
     ) throws -> RuntimeMCPServerDefinition? {
         guard let definition = registry.configsByRuntimeID[runtimeID] else {

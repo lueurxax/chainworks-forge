@@ -34,7 +34,7 @@ struct MCPPolicyResolutionReport: Codable, Equatable, Sendable {
     )
 }
 
-struct GooseExtensionDefinition: Codable, Equatable, Sendable {
+struct RuntimeExtensionDefinition: Codable, Equatable, Sendable {
     let enabled: Bool?
     let type: String?
     let name: String
@@ -111,11 +111,11 @@ struct GooseExtensionDefinition: Codable, Equatable, Sendable {
     }
 }
 
-struct GooseExtensionRegistrySnapshot: Equatable, Sendable {
+struct RuntimeExtensionRegistrySnapshot: Equatable, Sendable {
     let configURL: URL
     let installedExtensionIDs: [String]
     let enabledExtensionIDs: [String]
-    let configsByRuntimeID: [String: GooseExtensionDefinition]
+    let configsByRuntimeID: [String: RuntimeExtensionDefinition]
 }
 
 struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
@@ -156,15 +156,15 @@ struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
             .appendingPathComponent(".config/goose/config.yaml")
     }
 
-    nonisolated func snapshot() throws -> GooseExtensionRegistrySnapshot {
+    nonisolated func snapshot() throws -> RuntimeExtensionRegistrySnapshot {
         let contents = try String(contentsOf: configURL, encoding: .utf8)
         // Use raw YAML load to avoid @MainActor-inferred Decodable conformance issues.
-        let extensions: [String: GooseExtensionDefinition]
+        let extensions: [String: RuntimeExtensionDefinition]
         if let root = try Yams.load(yaml: contents) as? [String: Any],
            let rawExtensions = root["extensions"] as? [String: Any] {
-            extensions = rawExtensions.compactMapValues { value -> GooseExtensionDefinition? in
+            extensions = rawExtensions.compactMapValues { value -> RuntimeExtensionDefinition? in
                 guard let dict = value as? [String: Any] else { return nil }
-                return GooseExtensionDefinition(rawYAML: dict)
+                return RuntimeExtensionDefinition(rawYAML: dict)
             }
         } else {
             extensions = [:]
@@ -173,7 +173,7 @@ struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
         let enabled = extensions
             .compactMap { key, value in value.enabled == true ? key : nil }
             .sorted()
-        return GooseExtensionRegistrySnapshot(
+        return RuntimeExtensionRegistrySnapshot(
             configURL: configURL,
             installedExtensionIDs: installed,
             enabledExtensionIDs: enabled,
@@ -182,7 +182,7 @@ struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
     }
 
     /// RuntimeExtensionRegistryProvider conformance.
-    nonisolated func registrySnapshot() throws -> GooseExtensionRegistrySnapshot {
+    nonisolated func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot {
         try snapshot()
     }
 }
@@ -192,7 +192,7 @@ struct MCPPolicyResolver: Sendable {
         agent: ResolvedAgent,
         catalog: AgentCatalog,
         providerBinding: ResolvedProviderBinding?,
-        gooseRegistry: GooseExtensionRegistrySnapshot?,
+        gooseRegistry: RuntimeExtensionRegistrySnapshot?,
         runtimeNamespaceOverride: String? = nil
     ) -> MCPPolicyResolutionReport {
         let defaultProfile = catalog.mcpPolicy.defaultProfile
@@ -301,7 +301,7 @@ struct MCPPolicyResolver: Sendable {
         serverID: String,
         runtimeNamespace: String?,
         registry: [String: MCPServerRegistryEntry],
-        gooseRegistry: GooseExtensionRegistrySnapshot?
+        gooseRegistry: RuntimeExtensionRegistrySnapshot?
     ) -> MCPServerResolution {
         guard let entry = registry[serverID] else {
             return .missing("MCP server '\(serverID)' is not declared in mcp_server_registry.")

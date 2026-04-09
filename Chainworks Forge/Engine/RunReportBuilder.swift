@@ -31,7 +31,7 @@ final class RunReportBuilder {
             format: .markdown,
             filePath: reportFilePath(run: run, name: "run_report_v\(nextVersion).md"),
             runID: run.id,
-            stageID: run.currentStageID ?? "unknown",
+            stageID: cursorDerivedReportStageID(for: run),
             agentID: "system",
             provider: "system"
         )
@@ -49,7 +49,7 @@ final class RunReportBuilder {
             format: .json,
             filePath: reportFilePath(run: run, name: "run_report_v\(nextVersion).json"),
             runID: run.id,
-            stageID: run.currentStageID ?? "unknown",
+            stageID: cursorDerivedReportStageID(for: run),
             agentID: "system",
             provider: "system"
         )
@@ -101,7 +101,7 @@ final class RunReportBuilder {
                 format: .markdown,
                 filePath: mdPath,
                 runID: run.id,
-                stageID: run.currentStageID ?? "unknown",
+                stageID: cursorDerivedReportStageID(for: run),
                 agentID: "system",
                 provider: "system"
             )
@@ -110,6 +110,26 @@ final class RunReportBuilder {
             modelContext.insert(summaryArtifact)
             run.latestSummaryArtifactID = summaryArtifact.id
         }
+    }
+
+    // MARK: - Proposal 032: Cursor-Derived Report Stage ID
+
+    /// Derive the stageID for report artifact metadata from the durable cursor.
+    /// Falls back to `run.currentStageID` for pre-P032 runs without a cursor.
+    private func cursorDerivedReportStageID(for run: Run) -> String {
+        if let cursor = run.transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled:
+                return cursor.nextScheduledStateID ?? cursor.lastCompletedStateID ?? "unknown"
+            case .transitionStarted:
+                return cursor.nextScheduledStateID ?? "unknown"
+            case .terminal:
+                return cursor.lastCompletedStateID ?? "unknown"
+            case .awaitingFirstState:
+                break
+            }
+        }
+        return run.currentStageID ?? "unknown"
     }
 
     // MARK: - Should Emit Check
@@ -229,9 +249,12 @@ final class RunReportBuilder {
             .flatMap(\.agentExecutions)
             .compactMap { $0.retryReason }
 
+        let interruptedContinuationStage = interruptedContinuationStage(for: run, historicalStages: historicalStages)
+
         let failureEvidenceSummaries: [RunReportPayload.FailureEvidenceSummary] = historicalStages
             .filter { stage in
                 stage.status == .failed || stage.status == .blocked || stage.status == .waitingApproval
+                    || stage.id == interruptedContinuationStage?.id
             }
             .compactMap { stage in
             guard let packet = failureEvidencePacket(for: stage, run: run) else { return nil }
@@ -246,16 +269,19 @@ final class RunReportBuilder {
             )
         }
 
-        let currentRecoveryStage = historicalStages.last {
+        let currentRecoveryStage = interruptedContinuationStage ?? historicalStages.last {
             $0.status == .failed || $0.status == .blocked || $0.status == .waitingApproval
         }
-        let currentRecoverySnapshot = currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
+        let currentRecoverySnapshot = interruptedContinuationStage == nil
+            ? currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
+            : nil
         let blockedReason = currentRecoveryStage.flatMap { failureEvidencePacket(for: $0, run: run)?.failureSummary } ?? run.driftDetails
-        let retryPath = retryPathDescription(from: currentRecoverySnapshot)
+        let retryPath = interruptedContinuationStage == nil ? retryPathDescription(from: currentRecoverySnapshot) : nil
         let resumePath = resumePathDescription(
             run: run,
             waitingApprovalStage: historicalStages.last(where: { $0.status == .waitingApproval }),
-            snapshot: currentRecoverySnapshot
+            snapshot: currentRecoverySnapshot,
+            interruptedContinuationStage: interruptedContinuationStage
         )
         let contextStrategyProfileID = strategyProfileID(for: run)
         let strategyAssignmentMode = strategyAssignmentMode(for: run)
@@ -375,6 +401,26 @@ final class RunReportBuilder {
         )
     }
 
+    private func interruptedContinuationStage(for run: Run, historicalStages: [StageExecution]) -> StageExecution? {
+        guard run.presentationStatus == .blocked || run.presentationStatus == .failed else { return nil }
+        guard let cursor = run.transitionCursor,
+              cursor.settlementPhase == .transitionStarted || cursor.settlementPhase == .transitionSettled,
+              let nextStateID = cursor.nextScheduledStateID else { return nil }
+
+        let matchingStages = historicalStages
+            .filter { $0.stageID == nextStateID }
+            .sorted { $0.startedAt < $1.startedAt }
+
+        return matchingStages.last(where: { stage in
+            switch stage.status {
+            case .pending, .ready, .running, .waitingApproval, .blocked, .failed:
+                return true
+            case .completed, .skipped:
+                return failureEvidencePacket(for: stage, run: run) != nil
+            }
+        })
+    }
+
     private func recoverySnapshot(for run: Run, stage: StageExecution) -> RecoveryActionSnapshot? {
         if let data = stage.recoverySnapshotJSON,
            let snapshot = try? JSONDecoder().decode(RecoveryActionSnapshot.self, from: data) {
@@ -459,12 +505,17 @@ final class RunReportBuilder {
     private func resumePathDescription(
         run: Run,
         waitingApprovalStage: StageExecution?,
-        snapshot: RecoveryActionSnapshot?
+        snapshot: RecoveryActionSnapshot?,
+        interruptedContinuationStage: StageExecution?
     ) -> String? {
         let presentationStatus = run.presentationStatus
 
         if presentationStatus == .waitingApproval, let gateStage = waitingApprovalStage {
             return "Resume from approval gate '\(gateStage.label)'"
+        }
+
+        if interruptedContinuationStage != nil {
+            return "Use Resume Interrupted to continue from the transition cursor continuation state; clone run is fallback only."
         }
 
         guard presentationStatus == .failed || presentationStatus == .blocked else { return nil }

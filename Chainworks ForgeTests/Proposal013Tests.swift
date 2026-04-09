@@ -1839,6 +1839,128 @@ struct Proposal013Tests {
         #expect(payload.retryPath == "Retry agent 'proposal_reviewer_product_owner' in stage 'state_4_proposal_reviewed'")
     }
 
+    @MainActor
+    @Test("RunReportBuilder prefers interrupted continuation cursor over stale historical blocked retry snapshot")
+    func runReportPrefersInterruptedContinuationCursorOverStaleHistoricalRetrySnapshot() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        run.driftDetails = "Workflow source has changed (hash mismatch); Agent catalog source has changed (hash mismatch) Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
+        context.insert(run)
+
+        let implementationReviewed = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed against proposal",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        implementationReviewed.run = run
+        context.insert(implementationReviewed)
+
+        let staleBlockedStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        staleBlockedStage.run = run
+        context.insert(staleBlockedStage)
+
+        let staleFailedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "implement",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "chatgpt_codex",
+            effort: "high"
+        )
+        staleFailedAgent.completedAt = Date(timeIntervalSince1970: 30)
+        staleFailedAgent.logSnippet = "Finish: stop\nExecution stalled after the runtime session closed before the workflow could transition. Resume required."
+        staleFailedAgent.stageExecution = staleBlockedStage
+        context.insert(staleFailedAgent)
+
+        let staleRetryAgent = RecoveryActionDetail(
+            action: .retryFailedAgent,
+            stageID: staleBlockedStage.stageID,
+            agentID: staleFailedAgent.agentID,
+            explanation: "Retry the failed code writer attempt.",
+            staysInSameRun: true,
+            reusesSiblingOutputs: false,
+            reExecutesWholeStage: false
+        )
+        let staleSnapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 31),
+            runID: run.id,
+            recommendedAction: staleRetryAgent,
+            availableActions: [
+                staleRetryAgent,
+                RecoveryActionDetail(
+                    action: .cloneRunFrozenSnapshot,
+                    stageID: nil,
+                    agentID: nil,
+                    explanation: "Clone fallback.",
+                    staysInSameRun: false,
+                    reusesSiblingOutputs: false,
+                    reExecutesWholeStage: false
+                )
+            ],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        staleBlockedStage.recoverySnapshotJSON = try JSONEncoder().encode(staleSnapshot)
+
+        let interruptedContinuationStage = StageExecution(
+            stageID: "state_10_implementation_refined",
+            label: "Implementation refined",
+            startedAt: Date(timeIntervalSince1970: 40),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        interruptedContinuationStage.run = run
+        context.insert(interruptedContinuationStage)
+
+        let interruptedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "refine_implementation",
+            startedAt: Date(timeIntervalSince1970: 41),
+            status: .failed,
+            provider: "chatgpt_codex",
+            effort: "high"
+        )
+        interruptedAgent.completedAt = Date(timeIntervalSince1970: 50)
+        interruptedAgent.logSnippet = "Finish: stop\nExecution stalled after the runtime session closed before the workflow could transition. Resume required."
+        interruptedAgent.stageExecution = interruptedContinuationStage
+        context.insert(interruptedAgent)
+
+        run.persistTransitionCursor(
+            TransitionCursor.initial()
+                .settlingTransition(
+                    completedStateID: implementationReviewed.stageID,
+                    completedStageExecutionID: nil,
+                    nextStateID: interruptedContinuationStage.stageID,
+                    nextIteration: interruptedContinuationStage.iteration,
+                    nextAttemptNumber: interruptedContinuationStage.attemptNumber
+                )
+                .markingTransitionStarted()
+        )
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 16)
+
+        #expect(payload.transitionCursorNextScheduledStateID == "state_10_implementation_refined")
+        #expect(payload.transitionCursorSettlementPhase == "transition_started")
+        #expect(payload.blockedReason?.contains("Execution stalled") == true)
+        #expect(payload.retryPath == nil)
+        #expect(payload.resumePath == "Use Resume Interrupted to continue from the transition cursor continuation state; clone run is fallback only.")
+        #expect(payload.failureEvidenceSummaries.contains { $0.stageID == "state_10_implementation_refined" })
+    }
+
     @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
     func proposal013AppProofCanonicalPassRule() {
         let packet = FailedStageEvidencePacket(

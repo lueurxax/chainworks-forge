@@ -153,13 +153,24 @@ struct Chainworks_ForgeApp: App {
             AgentSessionGeneration.self,
             AgentSessionEvent.self,
         ])
-        let modelConfiguration = ModelConfiguration(
-            schema: schema,
-            isStoredInMemoryOnly: environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" || isUIAutomationHost
-        )
+        let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" || isUIAutomationHost
         PersistentStoreRepair.repairDefaultStoreIfNeeded(
-            isStoredInMemoryOnly: modelConfiguration.isStoredInMemoryOnly
+            isStoredInMemoryOnly: usesInMemoryStore
         )
+
+        let modelConfiguration: ModelConfiguration
+        if usesInMemoryStore {
+            modelConfiguration = ModelConfiguration(
+                schema: schema,
+                isStoredInMemoryOnly: true
+            )
+        } else {
+            modelConfiguration = ModelConfiguration(
+                "Chainworks Forge",
+                schema: schema,
+                url: PersistentStoreRepair.canonicalStoreURL()
+            )
+        }
 
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])

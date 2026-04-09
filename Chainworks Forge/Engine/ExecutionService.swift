@@ -467,13 +467,14 @@ final class ExecutionService {
         }
 
         let resolvedExecutor = executorForRun(plan: plan)
+        let orchestratorCatalog = resolvedCatalog(for: plan)
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
             workspace: workspace,
             executor: resolvedExecutor,
             modelContext: modelContext,
-            catalog: catalog
+            catalog: orchestratorCatalog
         )
 
         orchestrator.onApprovalRequest = { [weak self] request in
@@ -511,6 +512,13 @@ final class ExecutionService {
 
         activeOrchestrators[run.id] = orchestrator
         return orchestrator
+    }
+
+    private func resolvedCatalog(for plan: RunPlan) -> AgentCatalog? {
+        if let catalog {
+            return catalog
+        }
+        return try? JSONDecoder().decode(AgentCatalog.self, from: plan.catalogSnapshotJSON)
     }
 
     var supportsLiveExecution: Bool {

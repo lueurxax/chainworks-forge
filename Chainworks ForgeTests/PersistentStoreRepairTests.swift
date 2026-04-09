@@ -17,6 +17,39 @@ struct PersistentStoreRepairTests {
         let columns = try fetchColumns(from: tempURL, tableName: "ZAGENTEXECUTION")
         #expect(columns.contains("ZACTUALADAPTERFAMILY"))
         #expect(columns.contains("ZACTUALCAPABILITYCLASS"))
+        #expect(columns.contains("ZRUNTIMEPROFILEID"))
+    }
+
+    @Test("Prepare migrates legacy default.store into canonical app support location")
+    func prepareMigratesLegacyStoreIntoCanonicalLocation() throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let legacyStoreURL = rootURL.appendingPathComponent("default.store")
+        try createLegacyAgentExecutionTable(at: legacyStoreURL)
+
+        let canonicalStoreURL = PersistentStoreRepair._canonicalStoreURLForTests(applicationSupportURL: rootURL)
+        try FileManager.default.createDirectory(
+            at: canonicalStoreURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        FileManager.default.createFile(atPath: canonicalStoreURL.path, contents: Data())
+
+        let preparedStoreURL = try PersistentStoreRepair._prepareStoreForTests(applicationSupportURL: rootURL)
+        try PersistentStoreRepairTestHarness.repairStore(at: preparedStoreURL)
+
+        #expect(preparedStoreURL == canonicalStoreURL)
+        #expect(FileManager.default.fileExists(atPath: canonicalStoreURL.path))
+        #expect(fileSize(at: canonicalStoreURL) > 0)
+        #expect(fileSize(at: canonicalStoreURL) == fileSize(at: legacyStoreURL))
+
+        let columns = try fetchColumns(from: canonicalStoreURL, tableName: "ZAGENTEXECUTION")
+        #expect(columns.contains("ZACTUALADAPTERFAMILY"))
+        #expect(columns.contains("ZACTUALCAPABILITYCLASS"))
+        #expect(columns.contains("ZRUNTIMEPROFILEID"))
     }
 
     private func createLegacyAgentExecutionTable(at url: URL) throws {
@@ -61,6 +94,11 @@ struct PersistentStoreRepairTests {
             }
         }
         return columns
+    }
+
+    private func fileSize(at url: URL) -> Int64 {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+        return Int64(values?.fileSize ?? 0)
     }
 }
 

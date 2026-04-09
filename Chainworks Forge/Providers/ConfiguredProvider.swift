@@ -246,6 +246,7 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
     var supportsSessionResume: Bool
     var supportsFileEditing: Bool
     var supportsSandboxHints: Bool
+    var supportsMCPReconciliation: Bool
 
     static func `default`(for family: ProviderFamily) -> ProviderCapabilities {
         switch family {
@@ -257,7 +258,8 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
                 supportsEffortControl: true,
                 supportsSessionResume: true,
                 supportsFileEditing: false,
-                supportsSandboxHints: true
+                supportsSandboxHints: true,
+                supportsMCPReconciliation: true
             )
         case .gemini:
             return ProviderCapabilities(
@@ -267,7 +269,8 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
                 supportsEffortControl: true,
                 supportsSessionResume: false,
                 supportsFileEditing: false,
-                supportsSandboxHints: true
+                supportsSandboxHints: true,
+                supportsMCPReconciliation: true
             )
         case .codexACP, .auggie, .junie:
             return ProviderCapabilities(
@@ -277,7 +280,8 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
                 supportsEffortControl: false,
                 supportsSessionResume: family == .codexACP,
                 supportsFileEditing: true,
-                supportsSandboxHints: false
+                supportsSandboxHints: false,
+                supportsMCPReconciliation: false
             )
         }
     }
@@ -292,6 +296,7 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
         case "session_resume": return supportsSessionResume
         case "file_editing": return supportsFileEditing
         case "sandbox_hints": return supportsSandboxHints
+        case "mcp_reconciliation": return supportsMCPReconciliation
         case "permission_callbacks": return supportsTools  // permission callbacks are available wherever tools are
         default: return false
         }

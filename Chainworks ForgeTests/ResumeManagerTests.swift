@@ -946,6 +946,38 @@ struct ResumeManagerTests {
         await cancelAndAwaitSettled(service, runID: run.id)
     }
 
+    @Test("ExecutionService resume uses frozen snapshot catalog when live catalog is unavailable")
+    func executionServiceResumeUsesFrozenSnapshotCatalogWhenLiveCatalogUnavailable() async throws {
+        let (run, plan, _) = try makeRunFromPlan()
+        run.status = .failed
+
+        let failedStage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: plan.initialStateID)
+
+        let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
+        let service = ExecutionService(modelContext: context, executor: executor, catalog: nil)
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        let orchestrator = try #require(service.orchestrator(for: run.id))
+        let orchestratorCatalog = try #require(orchestrator.catalog)
+        #expect(orchestratorCatalog.backendProfiles.isEmpty == false)
+        #expect(orchestratorCatalog.agents.isEmpty == false)
+
+        await cancelAndAwaitSettled(service, runID: run.id)
+    }
+
     @Test("ExecutionService resumes agent retry by attaching an orchestrator")
     func executionServiceResumeRunAfterAgentRetryAttachesOrchestrator() async throws {
         let (run, plan, _) = try makeRunFromPlan()

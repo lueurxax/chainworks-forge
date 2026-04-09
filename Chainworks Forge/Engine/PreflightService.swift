@@ -145,6 +145,27 @@ struct PreflightService {
                     status: .pass,
                     message: "Resolved \(providerBindings.count) provider binding(s)"
                 ))
+            } catch let resolverError as BackendProfileResolverError {
+                providerBindings = [:]
+                if case .providerNotEnabled(let family) = resolverError {
+                    let message = "Provider family \(family.displayName) is configured but not enabled. Enable it in Settings to use this runtime profile."
+                    checks.append(PreflightCheck(
+                        category: "Rollout",
+                        title: "Provider Not Enabled — \(family.displayName)",
+                        status: .fail,
+                        message: message
+                    ))
+                    blockingIssues.append(message)
+                } else {
+                    let message = resolverError.localizedDescription
+                    checks.append(PreflightCheck(
+                        category: "Providers",
+                        title: "Provider Binding Resolution",
+                        status: .fail,
+                        message: message
+                    ))
+                    blockingIssues.append(message)
+                }
             } catch {
                 providerBindings = [:]
                 let message = error.localizedDescription
