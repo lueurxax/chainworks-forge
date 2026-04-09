@@ -1869,6 +1869,83 @@ struct OrchestratorTests {
         #expect(run.status == .blocked)
     }
 
+    @Test("Orchestrator heals premature blocked state after successful stage completion")
+    func healsPrematureBlockedStateAfterSuccessfulStageCompletion() async {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "a1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a1", task: "write", inputs: nil, outputs: ["output_1"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["a1": makeAgent(id: "a1")],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        final class PrematureBlockExecutor: @unchecked Sendable, AgentExecutor {
+            let run: Run
+
+            init(run: Run) {
+                self.run = run
+            }
+
+            func execute(
+                task: AgentTask,
+                agent: ResolvedAgent,
+                context: ExecutionContext
+            ) async throws -> AgentResult {
+                run.status = .blocked
+                run.driftDetails = "Execution stalled after the last session closed before the workflow could transition. Resume the run to continue from the current stage."
+                return AgentResult(
+                    outputs: ["output_1": Data("ok".utf8)],
+                    logSnippet: "completed after false block",
+                    costCents: nil,
+                    succeeded: true,
+                    errorMessage: nil,
+                    sessionID: "sim-heal",
+                    durationSeconds: 0.01,
+                    providerReceipt: nil,
+                    resolvedModel: "test-model",
+                    configuredProviderID: nil,
+                    adapterVersion: nil,
+                    canonicalOutcome: .completed,
+                    sessionReuseDisposition: .fresh
+                )
+            }
+        }
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run, plan: plan, workspace: workspace,
+            executor: PrematureBlockExecutor(run: run), modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+        #expect(run.driftDetails == nil)
+        #expect(run.stageExecutions.contains { $0.stageID == "start" && $0.status == .completed })
+    }
+
     // MARK: - Cancellation
 
     @Test("Cancellation stops the run")

@@ -222,7 +222,11 @@ struct RunReportView: View {
                 ForEach(reportArtifacts.sorted(by: {
                     ($0.reportVersion ?? 0) > ($1.reportVersion ?? 0)
                 })) { artifact in
-                    ReportVersionRow(artifact: artifact, isSelected: selectedReportContent != nil)
+                    ReportVersionRow(
+                        artifact: artifact,
+                        isSelected: selectedReportArtifact?.id == artifact.id,
+                        isSuperseded: RunReportSupersedence.notice(for: artifact, run: run) != nil
+                    )
                         .onTapGesture {
                             loadReportContent(artifact)
                         }
@@ -230,6 +234,14 @@ struct RunReportView: View {
 
                 if let content = selectedReportContent {
                     Divider()
+                    if let artifact = selectedReportArtifact,
+                       let notice = RunReportSupersedence.notice(for: artifact, run: run) {
+                        Label(notice, systemImage: "arrow.trianglehead.clockwise")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal)
+                            .padding(.top, 4)
+                    }
                     ArtifactContentRenderer(
                         content: content,
                         context: selectedReportArtifact.map { .artifactBacked(artifact: $0, run: run) } ?? .explicit(format: .report)
@@ -544,6 +556,7 @@ struct RunReportView: View {
 struct ReportVersionRow: View {
     let artifact: Artifact
     let isSelected: Bool
+    let isSuperseded: Bool
 
     var body: some View {
         HStack {
@@ -556,11 +569,36 @@ struct ReportVersionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if isSuperseded {
+                Text("Superseded")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.orange.opacity(0.12), in: Capsule())
+            }
             Spacer()
             Image(systemName: "chevron.right")
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+        )
+    }
+}
+
+enum RunReportSupersedence {
+    @MainActor
+    static func notice(for artifact: Artifact, run: Run) -> String? {
+        guard artifact.reportKind == "immutable_history",
+              let version = artifact.reportVersion,
+              version < run.latestReportVersion else {
+            return nil
+        }
+
+        return "Superseded by later run progress. This report is a historical snapshot; the run continued after it was emitted."
     }
 }

@@ -1626,6 +1626,70 @@ struct ResumeManagerTests {
         #expect(shouldReconcile == false)
     }
 
+    @Test("ExecutionService does not reconcile while parallel stage still has running agents inside extended grace")
+    func executionServiceDoesNotReconcileWhileParallelStageAgentsAreStillRunning() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-177),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-177),
+                detail: "One reviewer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService reconciles truly stale running-agent stage after extended grace expires")
+    func executionServiceReconcilesTrulyStaleRunningAgentStageAfterExtendedGrace() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-301),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-301),
+                detail: "One reviewer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == true)
+    }
+
     @Test("ExecutionService starts ACP-backed live workflow without Goose runtime config")
     func executionServiceStartsACPBackedLiveWorkflowWithoutGooseRuntimeConfig() async throws {
         let workflow = try loadLiveWorkflow()

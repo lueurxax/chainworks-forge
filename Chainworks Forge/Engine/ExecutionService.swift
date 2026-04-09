@@ -696,7 +696,8 @@ final class ExecutionService {
         latestLiveEvent: ExecutionEvent?,
         hasLaterLiveActivityAfterLatestEvent: Bool = false,
         now: Date,
-        graceInterval: TimeInterval = 30
+        graceInterval: TimeInterval = 30,
+        runningAgentsGraceInterval: TimeInterval = 300
     ) -> Bool {
         guard run.status == .running || run.status == .ready || run.status == .pending else {
             return false
@@ -725,7 +726,8 @@ final class ExecutionService {
         }
 
         if hasRunningAgents {
-            ForgeLogger.execution.info("Reconciling stalled run \(run.id) even though agent rows still appear running because the latest live event is sessionClosed")
+            let stallBaseline = max(latestLiveEvent.timestamp, stalledStageStartedAt ?? .distantPast)
+            return now.timeIntervalSince(stallBaseline) >= max(graceInterval, runningAgentsGraceInterval)
         }
         return now.timeIntervalSince(latestLiveEvent.timestamp) >= graceInterval
     }

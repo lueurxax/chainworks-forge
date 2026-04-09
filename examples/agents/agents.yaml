@@ -1,8 +1,8 @@
 schema_version: 1
 app:
   name: Chainworks
-  runtime: goose
-  transport: rest_sse
+  runtime: acp
+  transport: acp_stdio
   description: Multi-agent catalog for a single-engineer workflow constructor/executor.
   idea_input_mode: text_with_optional_file
   single_active_run_per_idea: true
@@ -113,7 +113,6 @@ mcp_policy:
 mcp_server_registry:
   developer:
     runtime_ids:
-      goose: developer
       codex: developer
     session_scoped: true
     assignment_policy: explicit_opt_in
@@ -121,7 +120,6 @@ mcp_server_registry:
     notes: Code-oriented MCP lane for developer workflows.
   analyze:
     runtime_ids:
-      goose: analyze
       codex: analyze
     session_scoped: true
     assignment_policy: explicit_opt_in
@@ -129,7 +127,6 @@ mcp_server_registry:
     notes: Bounded analysis lane for steward and audit-style work.
   xcode:
     runtime_ids:
-      goose: xcode
       codex: xcode
       claude_agent: xcode
       gemini_cli: xcode
@@ -139,97 +136,12 @@ mcp_server_registry:
     notes: High-value visual/build/reference lane for Apple-platform work.
   context7:
     runtime_ids:
-      goose: context7
       codex: context7
       claude_agent: context7
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
     notes: Documentation/reference lane.
-  summarize:
-    runtime_ids:
-      goose: summarize
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Broad summarization lane; disabled by default.
-  autovisualiser:
-    runtime_ids:
-      goose: autovisualiser
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Visual interpretation aid; useful but expensive and easy to over-assign.
-  tom:
-    runtime_ids:
-      goose: tom
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Broad platform extension, not assigned by default.
-  extensionmanager:
-    runtime_ids:
-      goose: extensionmanager
-    session_scoped: true
-    assignment_policy: control_plane_only
-    risk_class: high_risk
-    notes: Control-plane extension; not assigned to normal workflow agents.
-  apps:
-    runtime_ids:
-      goose: apps
-    session_scoped: true
-    assignment_policy: opt_in_high_risk
-    risk_class: high_risk
-    notes: Broad side-effect surface.
-  chatrecall:
-    runtime_ids:
-      goose: chatrecall
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Hidden-context inflation risk.
-  code_execution:
-    runtime_ids:
-      goose: code_execution
-    session_scoped: true
-    assignment_policy: opt_in_high_risk
-    risk_class: high_risk
-    notes: Extra execution lane; not part of default workflow.
-  computercontroller:
-    runtime_ids:
-      goose: computercontroller
-    session_scoped: true
-    assignment_policy: opt_in_high_risk
-    risk_class: high_risk
-    notes: Wide side-effect surface.
-  memory:
-    runtime_ids:
-      goose: memory
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Hidden persistent context.
-  tutorial:
-    runtime_ids:
-      goose: tutorial
-    session_scoped: true
-    assignment_policy: opt_in_high_burn
-    risk_class: broad
-    notes: Broad helper lane with unclear ROI for normal workflow agents.
-  chromedevtools:
-    runtime_ids:
-      goose: chromedevtools
-    session_scoped: true
-    assignment_policy: opt_in_high_risk
-    risk_class: high_risk
-    notes: Browser-control lane; keep off unless explicitly justified.
-  orchestrator:
-    runtime_ids:
-      goose: orchestrator
-    session_scoped: true
-    assignment_policy: control_plane_only
-    risk_class: high_risk
-    notes: Internal orchestration/control-plane extension, not for normal workflow assignment.
 contracts:
   proposal_review_v1:
     format: json
@@ -623,6 +535,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 16
     structured_output: required
+    runtime_profile: codex_acp
   codex_builder_high:
     provider: codex
     model: GPT-5.4
@@ -630,6 +543,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 24
     structured_output: required
+    runtime_profile: codex_acp
   codex_audit_high:
     provider: codex
     model: GPT-5.4
@@ -637,6 +551,7 @@ backend_profiles:
     temperature: 0.0
     max_turns: 18
     structured_output: required
+    runtime_profile: codex_acp
   claude_security_high:
     provider: claude_code
     model: opus
@@ -660,6 +575,7 @@ backend_profiles:
     temperature: 0.0
     max_turns: 8
     structured_output: required
+    runtime_profile: codex_acp
   claude_docs_medium:
     provider: claude_code
     model: opus

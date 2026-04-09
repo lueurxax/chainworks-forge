@@ -503,7 +503,7 @@ struct RunsHomeRow: View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
             // Line 1: Title + attention icon
             HStack {
-                Text(run.idea?.title ?? "Unknown Idea")
+                Text(displayTitle)
                     .font(DesignTokens.Typography.cardTitle)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -571,7 +571,7 @@ struct RunsHomeRow: View {
     }
 
     private var sanitizedRunTitle: String {
-        (run.idea?.title ?? "unknown-idea")
+        displayTitle
             .lowercased()
             .replacingOccurrences(of: " ", with: "-")
     }
@@ -591,9 +591,13 @@ struct RunsHomeRow: View {
     }
 
     private var rowAccessibilityLabel: String {
-        var parts = [run.idea?.title ?? "Unknown Idea", run.listPresentationStatusLabel]
+        var parts = [displayTitle, run.listPresentationStatusLabel]
         parts.append(elapsedTimeString)
         return parts.joined(separator: ", ")
+    }
+
+    private var displayTitle: String {
+        run.workflowTitle.isEmpty ? "Unknown Idea" : run.workflowTitle
     }
 
     private var elapsedTimeString: String {

@@ -45,10 +45,30 @@ struct WorkflowMapProjectionTests {
         let run = try #require(container.mainContext.fetch(descriptor).first)
 
         RunStageSnapshotLoader.resetLoadInvocationCountForTesting()
+        RunStageSnapshotLoader.resetCacheForTesting()
 
         _ = try #require(service.projection(for: run))
 
         #expect(RunStageSnapshotLoader.loadInvocationCountForTesting == 1)
+    }
+
+    @Test("Snapshot loader reuses hot cache for repeated run status reads")
+    mutating func snapshotLoaderReusesHotCacheForRepeatedRunReads() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(descriptor).first)
+
+        RunStageSnapshotLoader.resetLoadInvocationCountForTesting()
+        RunStageSnapshotLoader.resetCacheForTesting()
+
+        _ = RunStageSnapshotLoader.load(for: run)
+        _ = RunStageSnapshotLoader.load(for: run)
+
+        #expect(RunStageSnapshotLoader.loadInvocationCountForTesting == 1)
+        #expect(RunStageSnapshotLoader.cacheEntryCountForTesting == 1)
     }
 
     @Test("Projection derives topology, handoffs, loops, and agent panels from frozen snapshot")

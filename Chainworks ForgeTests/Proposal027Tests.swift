@@ -521,4 +521,45 @@ struct Proposal027Tests {
         #expect(presentation.summary.localizedCaseInsensitiveContains("node"))
         #expect(presentation.shouldOfferRawDisclosure)
     }
+
+    @Test("Run report supersedence marks older immutable reports after later recovery or progress")
+    func runReportSupersedenceMarksOlderImmutableReports() throws {
+        let workspace = makeTestWorkspace(tempDir: tempDirectory)
+        let run = try makeTestRun(workspace: workspace, context: context)
+        run.latestReportVersion = 10
+        run.status = .running
+
+        let supersededArtifact = Artifact(
+            name: "run_report_v9.md",
+            contractID: "run_report",
+            format: .report,
+            filePath: workspace.artifactRoot.appendingPathComponent("reports/run_report_v9.md").path,
+            runID: run.id,
+            stageID: "state_4_proposal_reviewed",
+            agentID: "system",
+            provider: "system"
+        )
+        supersededArtifact.reportKind = "immutable_history"
+        supersededArtifact.reportVersion = 9
+
+        let latestArtifact = Artifact(
+            name: "run_report_v10.md",
+            contractID: "run_report",
+            format: .report,
+            filePath: workspace.artifactRoot.appendingPathComponent("reports/run_report_v10.md").path,
+            runID: run.id,
+            stageID: "state_5_proposal_refined",
+            agentID: "system",
+            provider: "system"
+        )
+        latestArtifact.reportKind = "immutable_history"
+        latestArtifact.reportVersion = 10
+
+        let supersededNotice = RunReportSupersedence.notice(for: supersededArtifact, run: run)
+        let latestNotice = RunReportSupersedence.notice(for: latestArtifact, run: run)
+
+        #expect(supersededNotice?.localizedCaseInsensitiveContains("superseded") == true)
+        #expect(supersededNotice?.localizedCaseInsensitiveContains("continued") == true)
+        #expect(latestNotice == nil)
+    }
 }

@@ -32,15 +32,30 @@ struct RunStageSnapshot: Identifiable, Sendable {
 
 @MainActor
 enum RunStageSnapshotLoader {
+    private struct CacheEntry {
+        let snapshots: [RunStageSnapshot]
+        let cachedAt: TimeInterval
+    }
+
+    private static let cacheTTL: TimeInterval = 0.25
+    private static var cache: [UUID: CacheEntry] = [:]
+
     #if DEBUG
     private static var loadInvocationCount = 0
     #endif
 
     static func load(for runID: UUID, modelContext: ModelContext) -> [RunStageSnapshot] {
+        if let cached = cachedSnapshots(for: runID) {
+            return cached
+        }
+
         #if DEBUG
         loadInvocationCount += 1
         #endif
         let descriptor = FetchDescriptor<StageExecution>(
+            predicate: #Predicate<StageExecution> { stage in
+                stage.run?.id == runID
+            },
             sortBy: [
                 SortDescriptor(\.startedAt, order: .forward),
                 SortDescriptor(\.iteration, order: .forward),
@@ -48,8 +63,9 @@ enum RunStageSnapshotLoader {
             ]
         )
 
-        let stages = ((try? modelContext.fetch(descriptor)) ?? []).filter { $0.run?.id == runID }
-        return stages.map(makeSnapshot)
+        let snapshots = ((try? modelContext.fetch(descriptor)) ?? []).map(makeSnapshot)
+        storeSnapshots(snapshots, for: runID)
+        return snapshots
     }
 
     static func load(for run: Run, modelContext: ModelContext) -> [RunStageSnapshot] {
@@ -57,6 +73,10 @@ enum RunStageSnapshotLoader {
     }
 
     static func load(for run: Run) -> [RunStageSnapshot] {
+        if let cached = cachedSnapshots(for: run.id) {
+            return cached
+        }
+
         if let modelContext = run.modelContext {
             let freshContext = ModelContext(modelContext.container)
             let persisted = load(for: run.id, modelContext: freshContext)
@@ -65,7 +85,7 @@ enum RunStageSnapshotLoader {
             }
         }
 
-        return run.stageExecutions
+        let snapshots = run.stageExecutions
             .sorted {
                 if $0.startedAt == $1.startedAt {
                     if $0.iteration == $1.iteration {
@@ -76,6 +96,8 @@ enum RunStageSnapshotLoader {
                 return $0.startedAt < $1.startedAt
             }
             .map(makeSnapshot)
+        storeSnapshots(snapshots, for: run.id)
+        return snapshots
     }
 
     #if DEBUG
@@ -86,7 +108,32 @@ enum RunStageSnapshotLoader {
     static var loadInvocationCountForTesting: Int {
         loadInvocationCount
     }
+
+    static func resetCacheForTesting() {
+        cache.removeAll()
+    }
+
+    static var cacheEntryCountForTesting: Int {
+        cache.count
+    }
     #endif
+
+    private static func cachedSnapshots(for runID: UUID) -> [RunStageSnapshot]? {
+        guard let entry = cache[runID] else { return nil }
+        let age = Date().timeIntervalSinceReferenceDate - entry.cachedAt
+        guard age <= cacheTTL else {
+            cache.removeValue(forKey: runID)
+            return nil
+        }
+        return entry.snapshots
+    }
+
+    private static func storeSnapshots(_ snapshots: [RunStageSnapshot], for runID: UUID) {
+        cache[runID] = CacheEntry(
+            snapshots: snapshots,
+            cachedAt: Date().timeIntervalSinceReferenceDate
+        )
+    }
 
     private static func makeSnapshot(_ stage: StageExecution) -> RunStageSnapshot {
         let sortedAgents = stage.agentExecutions.sorted { lhs, rhs in
