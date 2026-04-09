@@ -15,7 +15,7 @@ struct CodexACPProviderAdapter: ProviderAdapter {
         switch provider.transport {
         case .cli:
             return await ProviderAdapterSupport.verifyCLIProvider(
-                executable: "codex",
+                executable: "codex-acp",
                 provider: provider,
                 summaryPrefix: "Codex ACP",
                 secretStore: secretStore

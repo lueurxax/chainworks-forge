@@ -26,7 +26,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     // MARK: - Init
 
-    init(executablePath: String = "codex") {
+    init(executablePath: String = "codex-acp") {
         self.executablePath = executablePath
     }
 

@@ -191,7 +191,7 @@ struct Proposal029Tests {
 
     @Test("CodexACPTransport session creation fails with subprocess error, not stub error")
     func codexTransportIsNotStubbed() async {
-        let transport = CodexACPTransport(executablePath: "/nonexistent/codex")
+        let transport = CodexACPTransport(executablePath: "/nonexistent/codex-acp")
         do {
             _ = try await transport.createSession(request: RuntimeSessionRequest(
                 systemPrompt: "test",
