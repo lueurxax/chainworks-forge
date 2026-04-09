@@ -121,18 +121,60 @@ Every Goose-touching file must be classified as either **core** (stays, renamed 
 | `GooseStreamEventMapper.swift` | Goose SSE parsing | **Compatibility** — stays in `GooseAdapter/` |
 | `GooseTransport.swift` | Bespoke Goose transport | **Compatibility** — remove or archive |
 | `MCPPolicyRuntime.swift` (GooseExtensionRegistryReader) | Goose MCP reader | **Compatibility** — stays as Goose-specific conformer |
+| `FixtureGooseTransport.swift` | Test fixture transport | **Core** — rename to `FixtureRuntimeTransport.swift`, remove Goose naming |
+| `GooseProviderConnectionAssistant.swift` | Goose setup assistant | **Compatibility** — move to `GooseCompat/`, guard behind Goose family check |
+| `GooseProviderConnectionAssistantView.swift` | Goose setup UI | **Compatibility** — move to `GooseCompat/`, only shown when Goose family selected |
+| `GooseAgentExecutorTests.swift` | Executor tests | **Core** — rename to `RuntimeAgentExecutorTests.swift` |
+| `GooseSessionBridgeTests.swift` | Bridge tests | **Core** — rename to `RuntimeSessionBridgeTests.swift` |
+| `GooseServerTransportTests.swift` | Goose transport tests | **Compatibility** — stays alongside Goose transport |
+| `GooseStreamEventMapperTests.swift` | Goose mapper tests | **Compatibility** — stays alongside Goose mapper |
+| `GooseServerLiveIntegrationTests.swift` | Live Goose proof | **Compatibility** — guard behind Goose availability |
+| `PilotReadinessView.swift` (Goose readiness) | Goose-first readiness | **Core** — migrate to adapter-neutral readiness language |
+| `RunsHomeView.swift` (trust rendering) | `server_verified` display | **Core** — update to read new + legacy trust values |
 
 ### 5.4 MCP Schema Migration
 
-**Current state**: `mcp_profile` and `mcp_server_registry` are defined in `AgentCatalog.swift`, validated in `YAMLValidator.swift`, resolved in `RunPlanCompiler.swift`, and reported in `RunReportBuilder.swift`.
+**Current state**: The MCP contract is richer than just "required servers." Current canonical truth includes:
 
-**This proposal does NOT delete them in one step.** Instead, it defines a three-phase migration:
+- `mcp_profile` per agent — declares required and optional extensions, fallback policy (`AgentCatalog.swift:395`)
+- `mcp_server_registry` — maps server IDs to runtime-specific extension IDs per namespace (`AgentCatalog.swift`)
+- Resolved MCP report with requested/predicted/actual/denied layers (`MCPPolicyRuntime.swift:267`)
+- Frozen `resolvedMCPPoliciesJSON` on `Run` for immutable provenance
+- Report surfaces that render the four-layer MCP truth (`RunReportBuilder.swift:196`)
 
-**Phase 1 — Dual-path**: `backend_profile` gains an optional `mcp_intent` field declaring required MCP servers. Preflight validates `mcp_intent` against machine-local capability. Old `mcp_profile`/`mcp_server_registry` continues to work for Goose-backed runs.
+**This proposal does NOT delete them in one step.** The replacement must preserve the same truth granularity.
 
-**Phase 2 — Deprecation**: New catalog entries use `mcp_intent` only. Old paths emit deprecation warnings in preflight. `mcp_profile` and `mcp_server_registry` are marked deprecated in `AgentCatalog.swift`.
+**Phase 1 — `mcp_intent` on `backend_profile` (dual-path)**:
 
-**Phase 3 — Removal**: After all catalog entries are migrated, remove `mcp_profile`, `mcp_server_registry`, and their validation/compilation/reporting paths.
+`mcp_intent` is not just "required servers." It carries the same contract as current `mcp_profile`:
+
+```yaml
+backend_profiles:
+  codex_orchestrator_acp:
+    provider: codex_acp
+    model: gpt-5
+    runtime_profile: codex_acp
+    mcp_intent:
+      required: [context7, filesystem]
+      optional: [web_search]
+      fallback_policy: fail_if_required_missing
+```
+
+Preflight validates `mcp_intent.required` against machine-local capability (adapter-specific registry provider). The resolved four-layer truth (requested → predicted → actual → denied) continues to be computed by `MCPPolicyResolver` and frozen on `Run`.
+
+Old `mcp_profile` / `mcp_server_registry` path continues working unchanged for Goose-backed runs.
+
+**Phase 1 survival contract** — these pieces stay intact:
+- `MCPPolicyResolutionReport` with all four layers
+- Frozen `resolvedMCPPoliciesJSON` on `Run`
+- Report/comparison surfaces rendering MCP truth
+- `mcp_server_registry` for runtime-namespace-to-extension-ID mapping
+
+Only the **input declaration point** moves from agent-level `mcp_profile` to backend-profile-level `mcp_intent`.
+
+**Phase 2 — Deprecation**: New catalog entries use `mcp_intent` only. Old paths emit deprecation warnings. Validator warns if `mcp_profile` is used on agents whose backend profile already declares `mcp_intent`.
+
+**Phase 3 — Removal**: After all catalog entries migrated, remove `mcp_profile` from agent schema. `mcp_server_registry` stays if any adapter still needs runtime-namespace mapping; otherwise it moves to machine-local config.
 
 Each phase has its own acceptance test in the `proposal-033` gate.
 
@@ -167,6 +209,8 @@ Each Goose-first UI surface must change. Explicit migration plan:
 | `ProviderSettingsView.swift` | Goose transport as primary setup path | ACP-first setup wizard; Goose under "Advanced / Compatibility" |
 | `FirstRunSetupWizard.swift` | Goose server configuration as default | ACP provider selection as default; Goose as optional |
 | `IdeaListView.swift` (runtime readiness) | "Goose server" readiness language | "Runtime" readiness language; adapter-family-specific status |
+| `PilotReadinessView.swift` | Goose-first readiness checks | Adapter-neutral readiness; per-family health status |
+| `RunsHomeView.swift` (trust/provenance) | `server_verified` / `server_unverified` display | Normalized trust vocabulary with legacy fallback |
 | `operator-experience.md` | Goose-first onboarding docs | ACP-first onboarding; Goose in compatibility section |
 | Preflight messages | "Goose extension registry" | "Runtime extension registry" (already done in P029) |
 | Error remediation | Goose-specific recovery suggestions | Adapter-family-specific recovery (e.g., "Check codex-acp binary") |
@@ -183,6 +227,19 @@ Current provenance vocabulary uses `fixture_verified | server_unverified | serve
 | `compatibility_fallback` | Run used Goose compatibility adapter | Goose-backed runs post-P033 |
 
 `runtimeTrustLevel` on `Run` is updated to use these states. Report/recovery surfaces read the trust level to provide appropriate remediation language.
+
+**Forward compatibility for historical runs**: Existing persisted runs use `server_unverified` and `server_verified`. These values must not become ambiguous. The migration adds a reader fallback:
+
+| Persisted Value | Post-P033 Interpretation |
+|----------------|-------------------------|
+| `fixture_verified` | `fixture_verified` (unchanged) |
+| `server_unverified` | `runtime_unverified` (Goose-era, equivalent meaning) |
+| `server_verified` | `runtime_verified` (Goose-era, equivalent meaning) |
+| `nil` | `nil` (pre-trust-level runs, no change) |
+
+Implementation: `Run.runtimeTrustLevel` getter normalizes legacy values on read. The raw persisted string is not mutated — only the reader maps old → new. Shell/report surfaces (`RunsHomeView.swift:637`, preview fixtures) use the normalized value.
+
+This ensures old runs display correctly in the new vocabulary without a data migration.
 
 ### 5.9 Documentation and evidence
 

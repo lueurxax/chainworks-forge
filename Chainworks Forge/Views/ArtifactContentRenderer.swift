@@ -1031,19 +1031,39 @@ private struct MarkdownDocumentTextView: NSViewRepresentable {
             .foregroundColor: NSColor.linkColor,
             .underlineStyle: NSUnderlineStyle.single.rawValue
         ]
-        textView.textStorage?.setAttributedString(attributedString)
+        textView.applyAttributedStringIfNeeded(attributedString)
         return textView
     }
 
     func updateNSView(_ nsView: MarkdownIntrinsicTextView, context: Context) {
         nsView.drawsBackground = backgroundColor.alphaComponent > 0.001
         nsView.backgroundColor = backgroundColor
-        nsView.textStorage?.setAttributedString(attributedString)
-        nsView.invalidateIntrinsicContentSize()
+        if nsView.applyAttributedStringIfNeeded(attributedString) {
+            nsView.scheduleIntrinsicSizeInvalidation()
+        }
+    }
+}
+
+enum MarkdownTextViewUpdatePolicy {
+    static func needsAttributedStringUpdate(current: NSAttributedString?, incoming: NSAttributedString) -> Bool {
+        guard let current else { return true }
+        return current.isEqual(to: incoming) == false
+    }
+
+    static func shouldInvalidateLayout(
+        previousWidth: CGFloat?,
+        newWidth: CGFloat,
+        tolerance: CGFloat = 0.5
+    ) -> Bool {
+        guard let previousWidth else { return true }
+        return abs(previousWidth - newWidth) > tolerance
     }
 }
 
 private final class MarkdownIntrinsicTextView: NSTextView {
+    private var lastMeasuredWidth: CGFloat?
+    private var intrinsicInvalidationScheduled = false
+
     override var intrinsicContentSize: NSSize {
         guard let textContainer, let layoutManager else {
             return NSSize(width: NSView.noIntrinsicMetric, height: 0)
@@ -1059,7 +1079,30 @@ private final class MarkdownIntrinsicTextView: NSTextView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         textContainer?.containerSize = NSSize(width: max(newSize.width, 1), height: CGFloat.greatestFiniteMagnitude)
-        invalidateIntrinsicContentSize()
+        if MarkdownTextViewUpdatePolicy.shouldInvalidateLayout(previousWidth: lastMeasuredWidth, newWidth: newSize.width) {
+            lastMeasuredWidth = newSize.width
+            scheduleIntrinsicSizeInvalidation()
+        }
+    }
+
+    @discardableResult
+    func applyAttributedStringIfNeeded(_ attributedString: NSAttributedString) -> Bool {
+        let current = textStorage?.copy() as? NSAttributedString
+        guard MarkdownTextViewUpdatePolicy.needsAttributedStringUpdate(current: current, incoming: attributedString) else {
+            return false
+        }
+        textStorage?.setAttributedString(attributedString)
+        return true
+    }
+
+    func scheduleIntrinsicSizeInvalidation() {
+        guard intrinsicInvalidationScheduled == false else { return }
+        intrinsicInvalidationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.intrinsicInvalidationScheduled = false
+            self.invalidateIntrinsicContentSize()
+        }
     }
 }
 
