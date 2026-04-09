@@ -215,14 +215,30 @@ proposal-033|p033)
 **Implementation**: `ProviderSettingsStore` gains a `migrateFromGooseEra()` method that runs once on load:
 
 1. Parse existing JSON.
-2. Remove all providers with `family == "codex"` and `transport == "goose_server"`.
-3. Rewrite `family: "claude"` → `family: "claudeACP"`, `family: "gemini"` → `family: "geminiACP"`.
-4. Rewrite `transport: "goose_server"` → `transport: "cli"` on any surviving provider.
-5. Rewrite `preferredProviderIDsByFamily` keys per table above.
-6. Persist migrated JSON.
-7. Write a `migration_version` field to prevent re-running.
+2. **Delete Goose-only rows entirely**: Remove all providers where `family == "codex"` AND `transport == "goose_server"`. These were Goose-backed Codex — there is no ACP equivalent with the same identity. The row (including its `displayName`, `endpoint`, `authMode`, `capabilities`, `adapterVersion`) is discarded. Operator gets fresh seeded `.codexACP` entry instead.
+3. **Migrate surviving Claude/Gemini rows** with full field semantics:
+   - `family: "claude"` → `"claudeACP"`, `family: "gemini"` → `"geminiACP"`
+   - `transport: "goose_server"` → `"cli"` (ACP adapters are subprocess-based)
+   - `endpoint`: **clear to nil** — Goose endpoint (`https://127.0.0.1:51200`) is meaningless for ACP subprocess
+   - `authMode`: **keep as-is** — API key auth remains valid for ACP
+   - `displayName`: rewrite `"Claude Goose"` → `"Claude ACP"`, `"Gemini Goose"` → `"Gemini ACP"`. Other custom names keep as-is.
+   - `capabilities`: **replace with `ProviderCapabilities.default(for: .claudeACP)`** / `.geminiACP` — Goose-era capability flags may not match ACP reality
+   - `adapterVersion`: rewrite `"v1"` → `"acp-v1"`
+   - `isEnabled`: set to `true` (these were active Goose providers, keep them active as ACP)
+4. Rewrite `preferredProviderIDsByFamily` keys per migration table above.
+5. Persist migrated JSON.
+6. Write `"migration_version": 1` field to prevent re-running.
 
-Same migration applies to `SettingsTransferService` import/export and `BootstrapConfigurationResolver` env var handling.
+**SettingsTransferService**: Import path runs the same migration on imported JSON before merging. Export path writes current (already-migrated) state — no special handling.
+
+**Canonical outcome for each Goose-era row**:
+
+| Goose-era Row | Outcome |
+|---------------|---------|
+| Codex Goose (`family: "codex"`, `transport: "goose_server"`) | **Deleted** — replaced by seeded `.codexACP` |
+| Claude Goose (`family: "claude"`, `transport: "goose_server"`) | **Migrated** → `.claudeACP`, `transport: "cli"`, endpoint cleared, capabilities reset |
+| Gemini Goose (`family: "gemini"`, `transport: "goose_server"`) | **Migrated** → `.geminiACP`, `transport: "cli"`, endpoint cleared, capabilities reset |
+| Any non-Goose provider (already ACP) | **Unchanged** |
 
 **YAML/provider identifiers in catalog**: `agents.yaml` `provider` fields use string identifiers (`codex`, `claude_code`, `gemini`). These are `runtimeProviderIdentifier` mapped from `ProviderFamily`, not the rawValue itself. Migration:
 
@@ -277,6 +293,11 @@ Same migration applies to `SettingsTransferService` import/export and `Bootstrap
 | `reference/current-system-baseline.md` | Update provider vocabulary from `codex/claude_code/gemini` to ACP families |
 | `reference/README.md` | Remove Goose transport references |
 | `reference/chainworks_forge_design_kit_v1.md` | **No change** — brand/design uses geese as visual metaphor, not runtime reference |
+| `reference/goose-provider-remediation.md` | **Delete** — Goose remediation no longer applicable |
+| `reference/live-provider-execution-slice.md` | Rewrite to describe ACP-only execution; remove Goose transport path |
+| `reference/workflow-execution-engine.md` | Remove Goose transport assumptions; describe ACP-only executor |
+| `reference/per-agent-mcp-policy-and-runtime-validation.md` | Remove Goose extension registry references; ACP registries only |
+| `reference/test-suite-architecture.md` | Remove Goose fixture/test references; describe ACP fixture strategy |
 | `.review-baselines/current-system-baseline.md` | Update baseline provider vocabulary to ACP-only |
 
 **Scope clarification**: "Zero Goose runtime references" means zero in Swift source, configuration files, environment variable names, and operator-facing UI strings. Brand/design assets (`chainworks_forge_design_kit_v1.md`) that use geese as visual metaphor are explicitly out of scope.

@@ -605,6 +605,7 @@ final class ExecutionService {
             let hasRunningAgents = orchestrator.run.stageExecutions
                 .flatMap(\.agentExecutions)
                 .contains { $0.status == .running }
+            let hasSettledParallelFanout = Self.hasSettledParallelFanout(stage: stalledStage)
             let hasLaterLiveActivity = latestEventEntry.map {
                 Self.hasLaterLiveActivity(in: orchestrator.liveTimeline, after: $0)
             } ?? false
@@ -613,6 +614,7 @@ final class ExecutionService {
                 run: orchestrator.run,
                 hasPendingApproval: hasPendingApproval,
                 hasRunningAgents: hasRunningAgents,
+                hasSettledParallelFanout: hasSettledParallelFanout,
                 stalledStageStatus: stalledStage?.status,
                 stalledStageStartedAt: stalledStage?.startedAt,
                 latestLiveEvent: latestEventEntry?.event,
@@ -691,6 +693,7 @@ final class ExecutionService {
         run: Run,
         hasPendingApproval: Bool,
         hasRunningAgents: Bool,
+        hasSettledParallelFanout: Bool = false,
         stalledStageStatus: StageStatus?,
         stalledStageStartedAt: Date?,
         latestLiveEvent: ExecutionEvent?,
@@ -718,16 +721,21 @@ final class ExecutionService {
             return false
         }
 
+        let extendedTransitionGraceRequired = hasRunningAgents || hasSettledParallelFanout
+        let effectiveGraceInterval = extendedTransitionGraceRequired
+            ? max(graceInterval, runningAgentsGraceInterval)
+            : graceInterval
+
         // If a new stage has already started after the last meaningful live event,
         // treat that stage start as the new stall baseline instead of immediately
         // reconciling off a stale sessionClosed from the previous stage.
         if let stalledStageStartedAt, stalledStageStartedAt > latestLiveEvent.timestamp {
-            return now.timeIntervalSince(stalledStageStartedAt) >= graceInterval
+            return now.timeIntervalSince(stalledStageStartedAt) >= effectiveGraceInterval
         }
 
-        if hasRunningAgents {
+        if extendedTransitionGraceRequired {
             let stallBaseline = max(latestLiveEvent.timestamp, stalledStageStartedAt ?? .distantPast)
-            return now.timeIntervalSince(stallBaseline) >= max(graceInterval, runningAgentsGraceInterval)
+            return now.timeIntervalSince(stallBaseline) >= effectiveGraceInterval
         }
         return now.timeIntervalSince(latestLiveEvent.timestamp) >= graceInterval
     }
@@ -746,6 +754,7 @@ final class ExecutionService {
             run: run,
             hasPendingApproval: hasPendingApproval,
             hasRunningAgents: hasRunningAgents,
+            hasSettledParallelFanout: false,
             stalledStageStatus: stalledStageStatus,
             stalledStageStartedAt: nil,
             latestLiveEvent: latestLiveEvent,
@@ -753,6 +762,20 @@ final class ExecutionService {
             now: now,
             graceInterval: graceInterval
         )
+    }
+
+    private static func hasSettledParallelFanout(stage: StageExecution?) -> Bool {
+        guard let stage else { return false }
+        let agentExecutions = stage.agentExecutions
+        guard agentExecutions.count > 1 else { return false }
+        return agentExecutions.allSatisfy { execution in
+            switch execution.status {
+            case .completed, .failed, .cancelled, .skipped:
+                return true
+            case .pending, .ready, .running:
+                return false
+            }
+        }
     }
 
     private static func latestMeaningfulTimelineEntry(in timeline: [LiveExecutionTimelineEntry]) -> LiveExecutionTimelineEntry? {

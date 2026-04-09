@@ -1594,6 +1594,70 @@ struct ResumeManagerTests {
         #expect(shouldReconcile == false)
     }
 
+    @Test("ExecutionService does not reconcile immediately after all fan-out reviewers settle")
+    func executionServiceDoesNotReconcileFreshPostFanoutSettlement() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: Date().addingTimeInterval(-240),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
+                detail: "Session closed"
+            ),
+            now: Date()
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService reconciles stalled run after extended post-fanout settlement grace window")
+    func executionServiceReconcilesExpiredPostFanoutSettlement() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: Date().addingTimeInterval(-480),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-301),
+                detail: "Session closed"
+            ),
+            now: Date()
+        )
+
+        #expect(shouldReconcile == true)
+    }
+
     @Test("ExecutionService does not reconcile newly started stage from previous stage session close")
     func executionServiceDoesNotReconcileNewlyStartedStageFromPreviousSessionClose() {
         let run = Run(
