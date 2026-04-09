@@ -2009,6 +2009,147 @@ struct Proposal013Tests {
         #expect(payload.failureEvidenceSummaries.contains { $0.stageID == "state_10_implementation_refined" })
     }
 
+    @MainActor
+    @Test("RunReportBuilder suppresses superseded historical failures after later stage completions")
+    func runReportSuppressesSupersededHistoricalFailuresAfterLaterCompletions() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let oldDraftFailure = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        oldDraftFailure.run = run
+        context.insert(oldDraftFailure)
+
+        let oldDraftAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        oldDraftAgent.completedAt = Date(timeIntervalSince1970: 30)
+        oldDraftAgent.logSnippet = "Agent 'proposal_writer' timed out after 1800s"
+        oldDraftAgent.stageExecution = oldDraftFailure
+        context.insert(oldDraftAgent)
+
+        let completedDraft = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 40),
+            status: .completed,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        completedDraft.run = run
+        context.insert(completedDraft)
+
+        let completedDraftAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSince1970: 41),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        completedDraftAgent.completedAt = Date(timeIntervalSince1970: 55)
+        completedDraftAgent.stageExecution = completedDraft
+        context.insert(completedDraftAgent)
+
+        let oldRefineFailure = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 60),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        oldRefineFailure.run = run
+        context.insert(oldRefineFailure)
+
+        let oldRefineAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "revise_proposal",
+            startedAt: Date(timeIntervalSince1970: 61),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        oldRefineAgent.completedAt = Date(timeIntervalSince1970: 70)
+        oldRefineAgent.logSnippet = "Interrupted by app restart before settlement. Manual resume required."
+        oldRefineAgent.stageExecution = oldRefineFailure
+        context.insert(oldRefineAgent)
+
+        let completedRefine = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 80),
+            status: .completed,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        completedRefine.run = run
+        context.insert(completedRefine)
+
+        let completedRefineAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "revise_proposal",
+            startedAt: Date(timeIntervalSince1970: 81),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        completedRefineAgent.completedAt = Date(timeIntervalSince1970: 90)
+        completedRefineAgent.stageExecution = completedRefine
+        context.insert(completedRefineAgent)
+
+        let currentReviewFailure = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .failed,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        currentReviewFailure.run = run
+        context.insert(currentReviewFailure)
+
+        let architect = AgentExecution(
+            agentID: "proposal_reviewer_architect",
+            agentTitle: "Proposal Reviewer / Architect",
+            taskName: "review_proposal_as_architect",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .failed,
+            provider: "codex",
+            effort: "extra high"
+        )
+        architect.completedAt = Date(timeIntervalSince1970: 110)
+        architect.logSnippet = "Session creation failed (attempt 0): Live execution blocked: MCP policy could not be honored. MCP server 'xcode' has no runtime mapping for 'goose'."
+        architect.stageExecution = currentReviewFailure
+        context.insert(architect)
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 10)
+
+        #expect(payload.failureEvidenceSummaries.count == 1)
+        #expect(payload.failureEvidenceSummaries.first?.stageID == "state_4_proposal_reviewed")
+        #expect(payload.failureEvidenceSummaries.first?.failureSummary.contains("no runtime mapping for 'goose'") == true)
+        #expect(payload.blockedReason?.contains("no runtime mapping for 'goose'") == true)
+        #expect(payload.retryPath == "Retry agent 'proposal_reviewer_architect' in stage 'state_4_proposal_reviewed'")
+        #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_2_proposal_drafted" })
+        #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_5_proposal_refined" })
+    }
+
     @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
     func proposal013AppProofCanonicalPassRule() {
         let packet = FailedStageEvidencePacket(

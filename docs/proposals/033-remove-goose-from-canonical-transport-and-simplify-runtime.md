@@ -6,8 +6,8 @@
 | Status | Draft |
 | Author | Andrey Khasanov |
 | Depends on | [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](030-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
-| Scope | Remove all Goose code and refactor transport, MCP, session, configuration, and provider platform layers to ACP-only architecture. |
-| Goal | Zero Goose references in the codebase. Every runtime path is ACP. |
+| Scope | Remove all Goose runtime code and refactor transport, MCP, session, configuration, and provider platform layers to ACP-only architecture. |
+| Goal | Zero Goose runtime references in Swift source, configuration, and operator-facing surfaces. Brand/design assets that use geese as visual metaphor are out of scope. Every runtime path is ACP. |
 
 ---
 
@@ -26,9 +26,44 @@ This proposal removes Goose completely and refactors each layer to be ACP-native
 
 ---
 
-## 2. Hard Prerequisite Gate
+## 2. Hard Prerequisite Gate and Proof Lane
 
-Implementation cannot begin until P030 passes audit to `Implemented / Ready`. The `proposal-033` gate asserts P030 green before running any P033 tests.
+Implementation cannot begin until P030 passes audit to `Implemented / Ready`.
+
+**Gate definition for `test-gate.sh`**:
+
+```bash
+PROPOSAL_033_TESTS=(
+  "Chainworks ForgeTests/Proposal033Tests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"    # renamed from GooseSessionBridgeTests
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests"     # renamed from GooseAgentExecutorTests
+  "Chainworks ForgeTests/MVPGoldenRunTests"
+  "Chainworks ForgeTests/ProviderPlatformTests"
+)
+```
+
+```bash
+proposal-033|p033)
+  check_idle_environment allow_app
+  guard_direct_run_insertion
+  # Prerequisite: P030 must be green
+  log "Prerequisite: proposal-030 gate"
+  run_targeted_tests "proposal-030-prereq" "${PROPOSAL_030_TESTS[@]}"
+  # P033-specific proof
+  run_build "proposal-033"
+  run_targeted_tests "proposal-033" "${PROPOSAL_033_TESTS[@]}"
+  ;;
+```
+
+**`Proposal033Tests` must prove**:
+
+1. `ProviderSettingsStore.migrateFromGooseEra()` correctly migrates persisted Goose-era JSON.
+2. `DefaultRuntimeTransportFactory` has no `gooseTransport` field and throws for `"goose"` family.
+3. `MCPPolicyResolver` has no `"goose"` namespace branches.
+4. `ResumeManager` blocks Goose-bound runs with explicit error.
+5. `FixtureACPTransport` produces valid execution proof (replaces `FixtureGooseTransport` scenarios).
+6. `effectiveRuntimeNamespace` has no `"goose"` case.
+7. Zero `"Goose"` in operator-facing preflight messages.
 
 ---
 
@@ -144,6 +179,61 @@ Implementation cannot begin until P030 passes audit to `Implemented / Ready`. Th
 
 **Result**: Provider platform has five ACP families, no Goose.
 
+### 3.6a Durable Settings Migration
+
+`ProviderFamily` and `ProviderTransport` are `Codable` enums with `rawValue` serialization. Operator machines have persisted `provider-settings.json` and `chainworks-settings.json` containing Goose-era raw values. Deleting enum cases without migration breaks deserialization.
+
+**Migration table for `ProviderFamily.rawValue`**:
+
+| Persisted rawValue | Action | New rawValue |
+|--------------------|--------|-------------|
+| `"codex"` | Delete provider entry | — (Goose-backed Codex removed) |
+| `"claude"` | Migrate → `.claudeACP` | `"claudeACP"` |
+| `"gemini"` | Migrate → `.geminiACP` | `"geminiACP"` |
+| `"codexACP"` | Keep | `"codexACP"` |
+| `"auggie"` | Keep | `"auggie"` |
+| `"junie"` | Keep | `"junie"` |
+
+**Migration table for `ProviderTransport.rawValue`**:
+
+| Persisted rawValue | Action | New rawValue |
+|--------------------|--------|-------------|
+| `"goose_server"` | Migrate → `.cli` | `"cli"` |
+| `"cli"` | Keep | `"cli"` |
+| `"httpAPI"` | Keep | `"httpAPI"` |
+| `"localBridge"` | Keep | `"localBridge"` |
+
+**Migration table for `preferredProviderIDsByFamily` keys**:
+
+| Persisted key | Action | New key |
+|---------------|--------|---------|
+| `"codex"` | Delete entry | — |
+| `"claude"` | Rename key → `"claudeACP"` | `"claudeACP"` |
+| `"gemini"` | Rename key → `"geminiACP"` | `"geminiACP"` |
+| Other keys | Keep | Same |
+
+**Implementation**: `ProviderSettingsStore` gains a `migrateFromGooseEra()` method that runs once on load:
+
+1. Parse existing JSON.
+2. Remove all providers with `family == "codex"` and `transport == "goose_server"`.
+3. Rewrite `family: "claude"` → `family: "claudeACP"`, `family: "gemini"` → `family: "geminiACP"`.
+4. Rewrite `transport: "goose_server"` → `transport: "cli"` on any surviving provider.
+5. Rewrite `preferredProviderIDsByFamily` keys per table above.
+6. Persist migrated JSON.
+7. Write a `migration_version` field to prevent re-running.
+
+Same migration applies to `SettingsTransferService` import/export and `BootstrapConfigurationResolver` env var handling.
+
+**YAML/provider identifiers in catalog**: `agents.yaml` `provider` fields use string identifiers (`codex`, `claude_code`, `gemini`). These are `runtimeProviderIdentifier` mapped from `ProviderFamily`, not the rawValue itself. Migration:
+
+| YAML `provider` | Action | New value |
+|-----------------|--------|-----------|
+| `"codex"` | Migrate → `"codex_acp"` | `"codex_acp"` |
+| `"claude_code"` | Migrate → `"claude_acp"` | `"claude_acp"` |
+| `"gemini"` | Migrate → `"gemini_acp"` | `"gemini_acp"` |
+
+**Baseline vocabulary** (`current-system-baseline.md`): Update `codex / claude_code / gemini` → `codex_acp / claude_acp / gemini_acp / auggie / junie`.
+
 ### 3.7 Fixture / Test Layer
 
 **Current**: `FixtureGooseTransport` provides test scenarios. Many tests use it.
@@ -180,9 +270,16 @@ Implementation cannot begin until P030 passes audit to `Implemented / Ready`. Th
 | Doc | Change |
 |-----|--------|
 | `reference/goose-server-transport.md` | **Delete** |
-| `reference/operator-experience.md` | Remove all Goose mentions |
-| `reference/provider-platform.md` | Rewrite for ACP-only |
+| `reference/operator-experience.md` | Remove all Goose runtime mentions |
+| `reference/provider-platform.md` | Rewrite for ACP-only; update provider vocabulary |
 | `reference/test-gates.md` | Remove Goose gates |
+| `reference/acp-runtime-transport.md` | Remove Goose comparison/migration narrative; ACP is the only transport |
+| `reference/current-system-baseline.md` | Update provider vocabulary from `codex/claude_code/gemini` to ACP families |
+| `reference/README.md` | Remove Goose transport references |
+| `reference/chainworks_forge_design_kit_v1.md` | **No change** — brand/design uses geese as visual metaphor, not runtime reference |
+| `.review-baselines/current-system-baseline.md` | Update baseline provider vocabulary to ACP-only |
+
+**Scope clarification**: "Zero Goose runtime references" means zero in Swift source, configuration files, environment variable names, and operator-facing UI strings. Brand/design assets (`chainworks_forge_design_kit_v1.md`) that use geese as visual metaphor are explicitly out of scope.
 
 ---
 

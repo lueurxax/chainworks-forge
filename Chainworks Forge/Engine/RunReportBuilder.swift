@@ -251,11 +251,13 @@ final class RunReportBuilder {
 
         let interruptedContinuationStage = interruptedContinuationStage(for: run, historicalStages: historicalStages)
 
-        let failureEvidenceSummaries: [RunReportPayload.FailureEvidenceSummary] = historicalStages
-            .filter { stage in
-                stage.status == .failed || stage.status == .blocked || stage.status == .waitingApproval
-                    || stage.id == interruptedContinuationStage?.id
-            }
+        let unresolvedFailureStages = unresolvedFailureStages(
+            from: canonicalStages,
+            run: run,
+            interruptedContinuationStage: interruptedContinuationStage
+        )
+
+        let failureEvidenceSummaries: [RunReportPayload.FailureEvidenceSummary] = unresolvedFailureStages
             .compactMap { stage in
             guard let packet = failureEvidencePacket(for: stage, run: run) else { return nil }
             return RunReportPayload.FailureEvidenceSummary(
@@ -269,9 +271,8 @@ final class RunReportBuilder {
             )
         }
 
-        let currentRecoveryStage = interruptedContinuationStage ?? historicalStages.last {
-            $0.status == .failed || $0.status == .blocked || $0.status == .waitingApproval
-        }
+        let currentRecoveryStage = interruptedContinuationStage
+            ?? unresolvedFailureStages.last
         let currentRecoverySnapshot = interruptedContinuationStage == nil
             ? currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
             : nil
@@ -353,6 +354,51 @@ final class RunReportBuilder {
             }
         }
         .sorted { $0.startedAt < $1.startedAt }
+    }
+
+    private func unresolvedFailureStages(
+        from canonicalStages: [StageExecution],
+        run: Run,
+        interruptedContinuationStage: StageExecution?
+    ) -> [StageExecution] {
+        let latestByStateID = Dictionary(grouping: canonicalStages, by: \.stageID)
+            .compactMapValues { stages in
+                stages.max { lhs, rhs in
+                    if lhs.startedAt != rhs.startedAt {
+                        return lhs.startedAt < rhs.startedAt
+                    }
+                    if lhs.iteration != rhs.iteration {
+                        return lhs.iteration < rhs.iteration
+                    }
+                    if lhs.attemptNumber != rhs.attemptNumber {
+                        return lhs.attemptNumber < rhs.attemptNumber
+                    }
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+            }
+
+        var unresolved = latestByStateID.values.filter { stage in
+            stage.status == .failed || stage.status == .blocked || stage.status == .waitingApproval
+        }
+
+        if let interruptedContinuationStage,
+           !unresolved.contains(where: { $0.id == interruptedContinuationStage.id }),
+           failureEvidencePacket(for: interruptedContinuationStage, run: run) != nil {
+            unresolved.append(interruptedContinuationStage)
+        }
+
+        return unresolved.sorted { lhs, rhs in
+            if lhs.startedAt != rhs.startedAt {
+                return lhs.startedAt < rhs.startedAt
+            }
+            if lhs.iteration != rhs.iteration {
+                return lhs.iteration < rhs.iteration
+            }
+            if lhs.attemptNumber != rhs.attemptNumber {
+                return lhs.attemptNumber < rhs.attemptNumber
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
     }
 
     private func canonicalAgents(for stage: StageExecution) -> [AgentExecution] {
