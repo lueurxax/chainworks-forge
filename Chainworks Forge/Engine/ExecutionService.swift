@@ -582,16 +582,22 @@ final class ExecutionService {
     private func reconcileStalledOrchestratorsIfNeeded(now: Date = Date()) {
         let stalledRunIDs = activeOrchestrators.compactMap { runID, orchestrator -> UUID? in
             let hasPendingApproval = pendingApprovals.values.contains { $0.runID == runID }
-            let latestEvent = Self.latestMeaningfulEvent(in: orchestrator.liveTimeline)
+            let latestEventEntry = Self.latestMeaningfulTimelineEntry(in: orchestrator.liveTimeline)
+            let stalledStage = stalledStage(for: orchestrator.run)
             let hasRunningAgents = orchestrator.run.stageExecutions
                 .flatMap(\.agentExecutions)
                 .contains { $0.status == .running }
+            let hasLaterLiveActivity = latestEventEntry.map {
+                Self.hasLaterLiveActivity(in: orchestrator.liveTimeline, after: $0)
+            } ?? false
 
             guard Self.shouldReconcileStalledRun(
                 run: orchestrator.run,
                 hasPendingApproval: hasPendingApproval,
                 hasRunningAgents: hasRunningAgents,
-                latestLiveEvent: latestEvent,
+                stalledStageStatus: stalledStage?.status,
+                latestLiveEvent: latestEventEntry?.event,
+                hasLaterLiveActivityAfterLatestEvent: hasLaterLiveActivity,
                 now: now
             ) else {
                 return nil
@@ -666,7 +672,9 @@ final class ExecutionService {
         run: Run,
         hasPendingApproval: Bool,
         hasRunningAgents: Bool,
+        stalledStageStatus: StageStatus?,
         latestLiveEvent: ExecutionEvent?,
+        hasLaterLiveActivityAfterLatestEvent: Bool = false,
         now: Date,
         graceInterval: TimeInterval = 30
     ) -> Bool {
@@ -676,14 +684,35 @@ final class ExecutionService {
         guard !hasPendingApproval else { return false }
         guard let latestLiveEvent else { return false }
         guard latestLiveEvent.type == .sessionClosed else { return false }
+        guard !hasLaterLiveActivityAfterLatestEvent else { return false }
+
+        // Proposal 032: If the durable cursor shows the transition was settled
+        // (next state scheduled but no agent work started), this run has a clean
+        // resumable continuation and must NOT be reconciled into blocked/failed.
+        if let cursor = run.transitionCursor, cursor.settlementPhase == .transitionSettled {
+            return false
+        }
+
+        if stalledStageStatus == .completed || stalledStageStatus == .skipped {
+            return false
+        }
         if hasRunningAgents {
             ForgeLogger.execution.info("Reconciling stalled run \(run.id) even though agent rows still appear running because the latest live event is sessionClosed")
         }
         return now.timeIntervalSince(latestLiveEvent.timestamp) >= graceInterval
     }
 
-    private static func latestMeaningfulEvent(in timeline: [LiveExecutionTimelineEntry]) -> ExecutionEvent? {
-        timeline.reversed().first(where: { $0.event.type != .textChunk })?.event ?? timeline.last?.event
+    private static func latestMeaningfulTimelineEntry(in timeline: [LiveExecutionTimelineEntry]) -> LiveExecutionTimelineEntry? {
+        timeline.reversed().first(where: { $0.event.type != .textChunk }) ?? timeline.last
+    }
+
+    private static func hasLaterLiveActivity(
+        in timeline: [LiveExecutionTimelineEntry],
+        after latestEntry: LiveExecutionTimelineEntry
+    ) -> Bool {
+        timeline.contains { entry in
+            entry.event.timestamp > latestEntry.event.timestamp
+        }
     }
 
     private func mergedStalledExecutionLog(existing: String?) -> String {
@@ -1039,11 +1068,11 @@ final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked 
         self.gooseTransport = gooseTransport
     }
 
-    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> any RuntimeTransportProtocol {
+    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol {
         let family = binding?.adapterFamily ?? "goose"
         guard family != "goose" && !family.isEmpty else {
             guard let gooseTransport else {
-                fatalError("[DefaultRuntimeTransportFactory] Goose transport required but not configured. Agent '\(agent.id)' needs Goose but liveRuntimeConfiguration is absent.")
+                throw RuntimeTransportError.sessionCreationFailed(reason: "Goose transport required but not configured. Agent '\(agent.id)' needs Goose but liveRuntimeConfiguration is absent.")
             }
             return gooseTransport
         }
@@ -1060,12 +1089,17 @@ final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked 
         case "gemini_cli_acp":
             print("[TransportFactory] Creating GeminiCLIACPTransport for family '\(family)'")
             created = GeminiCLIACPTransport()
+        case "codex_acp":
+            print("[TransportFactory] Creating CodexACPTransport for family '\(family)'")
+            created = CodexACPTransport()
+        case "auggie_cli_acp":
+            print("[TransportFactory] Creating AuggieCLIACPTransport for family '\(family)'")
+            created = AuggieCLIACPTransport()
+        case "junie_cli_acp":
+            print("[TransportFactory] Creating JunieCLIACPTransport for family '\(family)'")
+            created = JunieCLIACPTransport()
         default:
-            print("[TransportFactory] Unknown adapter family '\(family)', falling back to Goose")
-            guard let gooseTransport else {
-                fatalError("[DefaultRuntimeTransportFactory] Goose fallback required but not configured for unknown family '\(family)'.")
-            }
-            return gooseTransport
+            throw RuntimeTransportError.unknownAdapterFamily(family)
         }
         transportsByFamily[family] = created
         return created

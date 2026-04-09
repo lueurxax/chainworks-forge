@@ -32,7 +32,14 @@ struct RunStageSnapshot: Identifiable, Sendable {
 
 @MainActor
 enum RunStageSnapshotLoader {
+    #if DEBUG
+    private static var loadInvocationCount = 0
+    #endif
+
     static func load(for runID: UUID, modelContext: ModelContext) -> [RunStageSnapshot] {
+        #if DEBUG
+        loadInvocationCount += 1
+        #endif
         let descriptor = FetchDescriptor<StageExecution>(
             sortBy: [
                 SortDescriptor(\.startedAt, order: .forward),
@@ -52,7 +59,10 @@ enum RunStageSnapshotLoader {
     static func load(for run: Run) -> [RunStageSnapshot] {
         if let modelContext = run.modelContext {
             let freshContext = ModelContext(modelContext.container)
-            return load(for: run.id, modelContext: freshContext)
+            let persisted = load(for: run.id, modelContext: freshContext)
+            if !persisted.isEmpty || run.stageExecutions.isEmpty {
+                return persisted
+            }
         }
 
         return run.stageExecutions
@@ -67,6 +77,16 @@ enum RunStageSnapshotLoader {
             }
             .map(makeSnapshot)
     }
+
+    #if DEBUG
+    static func resetLoadInvocationCountForTesting() {
+        loadInvocationCount = 0
+    }
+
+    static var loadInvocationCountForTesting: Int {
+        loadInvocationCount
+    }
+    #endif
 
     private static func makeSnapshot(_ stage: StageExecution) -> RunStageSnapshot {
         let sortedAgents = stage.agentExecutions.sorted { lhs, rhs in

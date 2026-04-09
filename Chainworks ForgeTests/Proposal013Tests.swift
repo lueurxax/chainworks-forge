@@ -1796,6 +1796,49 @@ struct Proposal013Tests {
         #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == completedStage.stageID })
     }
 
+    @MainActor
+    @Test("RunReportBuilder prefers persisted blocked stage truth over stale running run status")
+    func runReportPrefersPersistedBlockedStageTruthOverStaleRunningStatus() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .running)
+        run.driftDetails = "Execution stalled after the last session closed before the workflow could transition. Resume the run to continue from the current stage."
+        context.insert(run)
+
+        let blockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "proposal_reviewer_product_owner",
+            agentTitle: "Proposal Reviewer / Product Owner",
+            taskName: "review_proposal_as_product_owner",
+            startedAt: Date(timeIntervalSince1970: 201),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        failedAgent.completedAt = Date(timeIntervalSince1970: 220)
+        failedAgent.logSnippet = "Execution stalled after the runtime session closed before the workflow could transition. Resume required."
+        failedAgent.stageExecution = blockedStage
+        context.insert(failedAgent)
+
+        let builder = RunReportBuilder(modelContext: context)
+        let payload = builder.buildReportPayload(for: run, version: 11)
+
+        #expect(payload.runStatus == "blocked")
+        #expect(payload.failureEvidenceSummaries.count == 1)
+        #expect(payload.failureEvidenceSummaries.first?.stageID == blockedStage.stageID)
+        #expect(payload.blockedReason?.contains("Execution stalled") == true)
+        #expect(payload.retryPath == "Retry agent 'proposal_reviewer_product_owner' in stage 'state_4_proposal_reviewed'")
+    }
+
     @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
     func proposal013AppProofCanonicalPassRule() {
         let packet = FailedStageEvidencePacket(

@@ -87,6 +87,11 @@ import SwiftData
     var contextStrategySnapshotJSON: Data?
     var promotedHandoffArtifactsJSON: Data?
 
+    // Proposal 032: Atomic transition settlement and durable resume cursor.
+    // Serialized TransitionCursor — the single canonical continuation truth for resume,
+    // recovery, and report surfaces. Nil for pre-P032 runs (fallback to heuristic path).
+    var transitionCursorJSON: Data?
+
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?
 
@@ -224,9 +229,55 @@ extension Run {
     }
 
     /// Lightweight continuation state for resume/start paths.
-    /// Uses already-related stage executions instead of rebuilding snapshots.
+    ///
+    /// Proposal 032: Prefers the durable transition cursor when available.
+    /// Falls back to heuristic reconstruction for pre-P032 runs (cursor == nil).
     var resumeContinuationStateID: String? {
-        let sorted = stageExecutions.sorted { $0.startedAt < $1.startedAt }
+        // Proposal 032 §5.4: Read the durable cursor first.
+        if let cursor = transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled:
+                // Next state was scheduled but not started — resume from there.
+                if let nextState = cursor.nextScheduledStateID {
+                    return nextState
+                }
+            case .transitionStarted:
+                // Next state had started execution — resume from it.
+                if let nextState = cursor.nextScheduledStateID {
+                    return nextState
+                }
+            case .awaitingFirstState:
+                // No state ever completed — start from the beginning (nil = initial).
+                return nil
+            case .terminal:
+                // Terminal runs shouldn't be resumed, but if called, return last completed.
+                return cursor.lastCompletedStateID
+            }
+        }
+
+        // Fallback: heuristic reconstruction for pre-P032 runs without a cursor.
+        return heuristicResumeContinuationStateID
+    }
+
+    /// Pre-P032 heuristic resume targeting. Retained as fallback for runs that
+    /// were created before the durable transition cursor existed.
+    private var heuristicResumeContinuationStateID: String? {
+        let persistedStages = PersistedRunGraph.stageExecutions(for: self)
+        let sourceStages = persistedStages.isEmpty ? stageExecutions : persistedStages
+        let sorted = sourceStages.sorted { lhs, rhs in
+            if lhs.startedAt == rhs.startedAt {
+                if lhs.iteration == rhs.iteration {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.iteration < rhs.iteration
+            }
+            return lhs.startedAt < rhs.startedAt
+        }
+
+        if let interruptedTransitionStateID = interruptedTransitionResumeStateID(from: sorted) {
+            return interruptedTransitionStateID
+        }
+
         return sorted.last(where: {
             $0.status == .running
                 || $0.status == .waitingApproval
@@ -235,6 +286,35 @@ extension Run {
                 || $0.status == .ready
         })?.stageID
             ?? sorted.last(where: { $0.status == .completed })?.stageID
+    }
+
+    private func interruptedTransitionResumeStateID(from stages: [StageExecution]) -> String? {
+        guard let latestCompletedIndex = stages.lastIndex(where: { $0.status == .completed }) else {
+            return nil
+        }
+
+        let trailingStages = Array(stages.suffix(from: stages.index(after: latestCompletedIndex)))
+
+        if let materializedReadyStage = trailingStages.first(where: {
+            $0.status == .ready && !$0.agentExecutions.contains(where: { !$0.artifacts.isEmpty })
+        }) {
+            return materializedReadyStage.stageID
+        }
+
+        guard let latestInterruptibleStage = trailingStages.last(where: {
+            $0.status == .running
+                || $0.status == .waitingApproval
+                || $0.status == .blocked
+                || $0.status == .failed
+                || $0.status == .ready
+        }) else {
+            return nil
+        }
+
+        let hasPersistedArtifacts = latestInterruptibleStage.agentExecutions.contains { !$0.artifacts.isEmpty }
+        guard !hasPersistedArtifacts else { return nil }
+
+        return latestInterruptibleStage.stageID
     }
 }
 

@@ -125,6 +125,12 @@ PROPOSAL_027_TESTS=(
   "Chainworks ForgeTests/Proposal027Tests"
 )
 
+PROPOSAL_029_TESTS=(
+  "Chainworks ForgeTests/Proposal029Tests"
+  "Chainworks ForgeTests/Proposal026Tests"
+  "Chainworks ForgeTests/ProviderPlatformTests"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 LAST_BUILD_DERIVED_DATA_PATH=""
 
@@ -1134,6 +1140,7 @@ Available gates:
   proposal-025    Proposal 025 per-agent MCP policy and runtime validation gate
   proposal-026    Proposal 026 ACP-first runtime transport and Goose decoupling gate
   proposal-027    Proposal 027 unified read-only JSON and markdown rendering gate
+  proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1351,6 +1358,17 @@ case "$GATE" in
     guard_direct_run_insertion
     run_build "proposal-027"
     run_targeted_tests "proposal-027" "${PROPOSAL_027_TESTS[@]}"
+    ;;
+  proposal-029|p029)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-029"
+    run_targeted_tests "proposal-029" "${PROPOSAL_029_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

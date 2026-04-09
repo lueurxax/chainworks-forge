@@ -539,6 +539,24 @@ contracts:
     - evidence_refs
     - suggested_changes
     - confidence
+runtime_profiles:
+  claude_agent_acp:
+    capability_class: operator_grade
+    adapter_family: claude_agent_acp
+    requires:
+      - streaming
+      - tools
+      - permission_callbacks
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
+  gemini_cli_acp:
+    capability_class: control_capable
+    adapter_family: gemini_cli_acp
+    requires:
+      - streaming
+      - tools
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_code
@@ -547,6 +565,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 20
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_writer_high:
     provider: claude_code
     model: opus
@@ -554,6 +573,7 @@ backend_profiles:
     temperature: 0.15
     max_turns: 18
     structured_output: preferred
+    runtime_profile: claude_agent_acp
   codex_writer_high:
     provider: codex
     model: GPT-5.4
@@ -568,6 +588,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 14
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_design_medium:
     provider: claude_code
     model: opus
@@ -575,6 +596,7 @@ backend_profiles:
     temperature: 0.2
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex
     model: GPT-5.4
@@ -603,6 +625,7 @@ backend_profiles:
     temperature: 0.0
     max_turns: 16
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_prepush_medium:
     provider: claude_code
     model: opus
@@ -610,6 +633,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   codex_ops_low:
     provider: codex
     model: GPT-5.4
@@ -624,6 +648,7 @@ backend_profiles:
     temperature: 0.2
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_steward_high:
     provider: claude_code
     model: opus
@@ -631,6 +656,7 @@ backend_profiles:
     temperature: 0.1
     max_turns: 16
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_auditor_medium:
     provider: claude_code
     model: opus
@@ -638,6 +664,7 @@ backend_profiles:
     temperature: 0.0
     max_turns: 14
     structured_output: required
+    runtime_profile: claude_agent_acp
   claude_retrospective_medium:
     provider: claude_code
     model: opus
@@ -645,8 +672,10 @@ backend_profiles:
     temperature: 0.1
     max_turns: 12
     structured_output: required
+    runtime_profile: claude_agent_acp
   gemini_3_1_pro_preview_high:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-3.1-pro-preview
     effort: high
     temperature: 0.1
@@ -654,6 +683,7 @@ backend_profiles:
     structured_output: required
   gemini_3_flash_preview_medium:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-3-flash-preview
     effort: medium
     temperature: 0.2
@@ -661,13 +691,15 @@ backend_profiles:
     structured_output: required
   gemini_reasoning_pro_high:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-2.5-pro
     effort: high
     temperature: 0.1
     max_turns: 16
     structured_output: required
-  gemini_review_flash:
+  gemini_review_pro:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-2.5-pro
     effort: medium
     temperature: 0.2
@@ -675,6 +707,7 @@ backend_profiles:
     structured_output: required
   gemini_docs_flash:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-2.5-flash
     effort: medium
     temperature: 0.2
@@ -682,6 +715,7 @@ backend_profiles:
     structured_output: required
   gemini_ops_flash_lite:
     provider: gemini
+    runtime_profile: gemini_cli_acp
     model: gemini-2.5-flash
     effort: low
     temperature: 0.0
@@ -1105,7 +1139,7 @@ agents:
 - id: proposal_reviewer_ux
   title: Proposal Reviewer / UX
   mode: proposal_review.ux
-  backend_profile: gemini_review_flash
+  backend_profile: gemini_review_pro
   permission_profile: RO_REVIEW
   skill_ref: proposal_review_triad
   skill_role: ux_designer
@@ -1132,7 +1166,7 @@ agents:
 - id: proposal_reviewer_ui
   title: Proposal Reviewer / UI
   mode: proposal_review.ui
-  backend_profile: gemini_review_flash
+  backend_profile: gemini_review_pro
   permission_profile: RO_REVIEW
   skill_ref: proposal_review_triad
   skill_role: ui_designer

@@ -198,6 +198,12 @@ enum ProviderAdapterSupport {
             familyModels = ["sonnet", "opus"]
         case .gemini:
             familyModels = ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+        case .codexACP:
+            familyModels = ["gpt-5", "codex-acp"]
+        case .auggie:
+            familyModels = ["auggie-default"]
+        case .junie:
+            familyModels = ["junie-default"]
         }
 
         guard let defaultModel = provider.defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines),

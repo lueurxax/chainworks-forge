@@ -602,7 +602,7 @@ struct ProviderDraft {
         ) ?? defaultModel
         let resolvedTransport: ProviderTransport
         switch family {
-        case .codex, .claude:
+        case .codex, .claude, .codexACP, .auggie, .junie:
             resolvedTransport = .gooseServer
         case .gemini:
             resolvedTransport = .httpAPI

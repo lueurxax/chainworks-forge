@@ -34,8 +34,9 @@ final class ProviderRegistry {
     @MainActor
     func preferredProvider(for family: ProviderFamily) -> ConfiguredProvider? {
         let preferredID = settingsStore.settings.preferredProviderIDsByFamily[family.rawValue]
-        return configuredProviders.first(where: { $0.id == preferredID })
-            ?? configuredProviders.first(where: { $0.family == family })
+        let enabled = configuredProviders.filter { $0.isEnabled }
+        return enabled.first(where: { $0.id == preferredID })
+            ?? enabled.first(where: { $0.family == family })
     }
 
     @MainActor

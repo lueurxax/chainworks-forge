@@ -375,7 +375,7 @@ struct RunTests {
         #expect(run.resumeContinuationStateID == "state_4_proposal_reviewed")
     }
 
-    @Test func resumeContinuationStateIDPrefersPreviousRunStateNextStageWhenLatestBlockedStageHasNoArtifacts() throws {
+    @Test func resumeContinuationStateIDPrefersMaterializedReadyStageOverOlderRunStateFallback() throws {
         let context = try makeContext()
         let idea = Idea(title: "Test", body: "Body")
         context.insert(idea)
@@ -409,6 +409,17 @@ struct RunTests {
         orchestrator.stageExecution = completedStage
         context.insert(orchestrator)
 
+        let readyNextStage = StageExecution(
+            stageID: "state_10_implementation_refined",
+            label: "Implementation refined",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .ready,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        readyNextStage.run = run
+        context.insert(readyNextStage)
+
         let runStateURL = tempDirectory.appendingPathComponent("run_state.json")
         try Data("""
         {
@@ -431,33 +442,33 @@ struct RunTests {
         runStateArtifact.agentExecution = orchestrator
         context.insert(runStateArtifact)
 
-        let blockedStage = StageExecution(
-            stageID: "state_10_implementation_refined",
-            label: "Implementation refined",
-            startedAt: Date(timeIntervalSince1970: 20),
+        let pollutedBlockedStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 30),
             status: .blocked,
-            iteration: 1,
-            attemptNumber: 2
+            iteration: 3,
+            attemptNumber: 1
         )
-        blockedStage.run = run
-        context.insert(blockedStage)
+        pollutedBlockedStage.run = run
+        context.insert(pollutedBlockedStage)
 
         let failedAgent = AgentExecution(
             agentID: "code_writer",
             agentTitle: "Code Writer",
             taskName: "refine_implementation",
-            startedAt: Date(timeIntervalSince1970: 21),
+            startedAt: Date(timeIntervalSince1970: 31),
             status: .failed,
             provider: "codex",
             effort: "high"
         )
-        failedAgent.stageExecution = blockedStage
+        failedAgent.stageExecution = pollutedBlockedStage
         context.insert(failedAgent)
 
         try context.save()
 
-        #expect(run.currentStageID == "state_10_implementation_refined")
-        #expect(run.resumeContinuationStateID == "state_7_implementation_started")
+        #expect(run.currentStageID == "state_7_implementation_started")
+        #expect(run.resumeContinuationStateID == "state_10_implementation_refined")
     }
 
     @Test func listPresentationStatusLabelUsesStoredListTruth() throws {
@@ -868,6 +879,39 @@ struct YAMLParserTests {
             let reviewVisual = try #require(catalog.mcpProfiles["review_visual"])
             #expect(reviewVisual.requiredExtensions == ["xcode"])
             #expect(reviewVisual.optionalExtensions.isEmpty)
+        }
+    }
+
+    @Test func exampleCatalogRoutesClaudeAndGeminiThroughACPAndUsesGeminiReviewPro() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let catalogURLs = [
+            repoRoot.appendingPathComponent("examples/agents/agents.yaml"),
+            repoRoot.appendingPathComponent("examples/agents/agents_mcp_profiles_v2.yaml")
+        ]
+
+        for url in catalogURLs {
+            let catalog = try YAMLParser.loadAgentCatalog(from: url)
+
+            #expect(catalog.runtimeProfiles["claude_agent_acp"] != nil)
+            #expect(catalog.runtimeProfiles["gemini_cli_acp"] != nil)
+
+            for (id, profile) in catalog.backendProfiles where profile.provider == "claude_code" {
+                #expect(profile.runtimeProfile == "claude_agent_acp", "Expected \(id) to use claude_agent_acp in \(url.lastPathComponent)")
+            }
+
+            for (id, profile) in catalog.backendProfiles where profile.provider == "gemini" {
+                #expect(profile.runtimeProfile == "gemini_cli_acp", "Expected \(id) to use gemini_cli_acp in \(url.lastPathComponent)")
+            }
+
+            #expect(catalog.backendProfiles["gemini_review_pro"]?.model == "gemini-2.5-pro")
+            #expect(catalog.backendProfiles["gemini_review_flash"] == nil)
+
+            let uxReviewer = try #require(catalog.agents.first(where: { $0.id == "proposal_reviewer_ux" }))
+            let uiReviewer = try #require(catalog.agents.first(where: { $0.id == "proposal_reviewer_ui" }))
+            #expect(uxReviewer.backendProfile == "gemini_review_pro")
+            #expect(uiReviewer.backendProfile == "gemini_review_pro")
         }
     }
 

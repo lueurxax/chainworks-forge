@@ -8,20 +8,21 @@ import SwiftData
 
 /// Unit tests for RuntimeAgentExecutor.
 /// Tests session creation, streaming, receipt persistence, output validation, and result building.
-@Suite("RuntimeAgentExecutor")
+@Suite("RuntimeAgentExecutor", .serialized)
 struct RuntimeAgentExecutorTests {
 
     // MARK: - Helpers
 
     private func makeAgent(
         id: String = "test_agent",
+        mode: String = "autonomous",
         outputs: [String] = ["test_output.md"],
         worktreeWriteEnabled: Bool = false
     ) -> ResolvedAgent {
         ResolvedAgent(
             id: id,
             title: "Test Agent",
-            mode: "autonomous",
+            mode: mode,
             provider: "test_provider",
             model: "test_model",
             effort: "high",
@@ -118,6 +119,50 @@ struct RuntimeAgentExecutorTests {
         var closeSessionCalled: Bool {
             get async { state.withLock { $0.closeSessionCalled } }
         }
+    }
+
+    private final class StalledACPReviewTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "claude_agent" }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "stalled-acp-review",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.textChunk(text: "[thinking] Let me load the lazy artifacts first."))
+                    continuation.yield(.toolCallStarted(toolName: "read", raw: "{}"))
+                    continuation.yield(.toolCallStarted(toolName: "permission:read", raw: "{}"))
+                    continuation.yield(.toolCallStarted(toolName: "read", raw: "{}"))
+                    continuation.yield(.toolCallStarted(toolName: "permission:read", raw: "{}"))
+
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
     }
 
     private final class StaleReuseTransport: RuntimeTransportProtocol, @unchecked Sendable {
@@ -268,6 +313,38 @@ struct RuntimeAgentExecutorTests {
         }
     }
 
+    private final class ACPReadLoopStallTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "acp-stall-session",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"acp-stall-session"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"acp-stall-session"}"#))
+                    continuation.yield(.textChunk(text: "Need to read the proposal and idea brief before I can review."))
+                    continuation.yield(.toolCallStarted(toolName: "read", raw: #"{"tool_name":"read","tool_call_id":"call-read-1"}"#))
+                    continuation.yield(.toolCallStarted(toolName: "permission:read", raw: #"{"tool_name":"permission:read","tool_call_id":"call-perm-1"}"#))
+                    try? await Task.sleep(for: .seconds(5))
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
+
     private final class PersistentSessionUnavailableTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private let counter = OSAllocatedUnfairLock(initialState: 0)
 
@@ -305,6 +382,64 @@ struct RuntimeAgentExecutorTests {
         }
 
         func closeSession(sessionID: String) async throws {}
+    }
+
+    private final class WatchdogTimeoutTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var closeSessionCallCount = 0
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let sessionNumber = state.withLock { value -> Int in
+                value.createSessionCallCount += 1
+                return value.createSessionCallCount
+            }
+            return RuntimeSessionResponse(
+                sessionId: "watchdog-timeout-\(sessionNumber)",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.textChunk(text: "Starting a long-running non-ACP execution."))
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {
+            state.withLock { $0.closeSessionCallCount += 1 }
+        }
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var closeSessionCallCount: Int {
+            get async { state.withLock { $0.closeSessionCallCount } }
+        }
     }
 
     private final class DuplicateFreshSessionTransport: RuntimeTransportProtocol, @unchecked Sendable {
@@ -483,6 +618,49 @@ struct RuntimeAgentExecutorTests {
         )
     }
 
+    private func makeACPProposalReviewContext(runID: UUID = UUID()) -> ExecutionContext {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+
+        try? FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let binding = ResolvedProviderBinding(
+            agentID: "proposal_reviewer_product_owner",
+            backendProfileID: "claude_product_high",
+            configuredProviderID: UUID(),
+            providerFamily: "claude_code",
+            providerIdentifier: "claude_code",
+            model: "opus",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "claude_agent_acp",
+            adapterFamily: "claude_agent_acp",
+            capabilityClass: .operatorGrade
+        )
+
+        return ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            stageLineageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Need feature flags instead of code deletion.",
+            providerBinding: binding
+        )
+    }
+
     private func initializeGitRepository(at root: URL) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -657,7 +835,7 @@ struct RuntimeAgentExecutorTests {
         let configuredProviderID = UUID()
         let binding = ResolvedProviderBinding(
             agentID: "proposal_reviewer_ui",
-            backendProfileID: "gemini_review_flash",
+            backendProfileID: "gemini_review_pro",
             configuredProviderID: configuredProviderID,
             providerFamily: "gemini",
             providerIdentifier: "gemini",
@@ -1207,6 +1385,40 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
+    @Test("Executor fail-closes ACP proposal review read-loop stalls before watchdog and emits durable failure evidence")
+    func gooseExecutorFailClosesACPProposalReviewReadLoopStall() async throws {
+        let originalSilence = RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds
+        let originalThreshold = RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold
+        let originalPoll = RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds
+        RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds = 0.05
+        RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold = 4
+        RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds = 10
+        defer {
+            RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds = originalSilence
+            RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold = originalThreshold
+            RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds = originalPoll
+        }
+
+        let transport = StalledACPReviewTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "proposal_reviewer_product_owner",
+            mode: "proposal_review.product_owner",
+            outputs: ["proposal_review_po"]
+        )
+        let task = makeTask(agent: agent.id, task: "review_proposal_as_product_owner")
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.canonicalOutcome == .failedBeforeOutput)
+        #expect(result.transportErrorKind == .unknown)
+        #expect(result.outputs["proposal_reviewer_product_owner_receipt.json"] != nil)
+        #expect(result.outputs["proposal_reviewer_product_owner_transcript.md"] != nil)
+    }
+
+    @MainActor
     @Test("Executor records lazy evidence hits when on-demand helper is invoked")
     func gooseExecutorRecordsLazyEvidenceHits() async throws {
         let transport = ObservableRuntimeTransport()
@@ -1668,5 +1880,82 @@ struct RuntimeAgentExecutorTests {
         #expect(!result.succeeded)
         #expect(result.errorMessage == "Provider session became unavailable during execution")
         #expect(result.errorMessage?.contains("Session not found") == false)
+    }
+
+    @MainActor
+    @Test("ACP proposal reviewer read-loop stall fails early with durable failure evidence")
+    func acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence() async throws {
+        let originalSilence = RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds
+        let originalPoll = RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds
+        RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds = 0.1
+        RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds = 20
+        defer {
+            RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds = originalSilence
+            RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds = originalPoll
+        }
+
+        let transport = ACPReadLoopStallTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_product_owner",
+            title: "Proposal Reviewer / Product Owner",
+            mode: "proposal_review.product_owner",
+            backendProfileID: "claude_product_high",
+            provider: "claude_code",
+            model: "opus",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: "product_owner",
+            prompt: "Review the proposal as a product owner.",
+            outputContract: "proposal_review_v1",
+            requiresHumanApproval: false,
+            inputs: ["idea_brief", "proposal_current"],
+            outputs: ["proposal_review_po"],
+            worktreeWriteEnabled: false,
+            sessionReuseScope: .same_invocation_owner,
+            sessionFamilyID: nil,
+            runtimeProfileID: "claude_agent_acp"
+        )
+        let task = makeTask(agent: agent.id, task: "review_proposal_as_product_owner")
+        let context = makeACPProposalReviewContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.outputs["proposal_reviewer_product_owner_receipt.json"] != nil)
+        #expect(result.outputs["proposal_reviewer_product_owner_transcript.md"] != nil)
+        #expect(result.canonicalOutcome == AgentCanonicalOutcome.failedBeforeOutput)
+        #expect(result.transportErrorKind == .unknown)
+    }
+
+    @MainActor
+    @Test("Executor settles watchdog timeouts through durable failure path without automatic retry")
+    func executorSettlesWatchdogTimeoutWithoutAutomaticRetry() async throws {
+        let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 0.05
+        defer {
+            RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+        }
+
+        let transport = WatchdogTimeoutTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let result = try await executor.execute(
+            task: makeTask(),
+            agent: makeAgent(),
+            context: makeContext()
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.canonicalOutcome == .timedOutBeforeOutput)
+        #expect(result.transportErrorKind == .timeout)
+        #expect(result.outputs["test_agent_receipt.json"] != nil)
+        #expect(result.outputs["test_agent_transcript.md"] != nil)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await transport.createSessionCallCount == 1)
+        #expect(await transport.closeSessionCallCount == 1)
     }
 }

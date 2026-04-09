@@ -238,6 +238,142 @@ struct RecoveryCoordinatorTests {
         #expect(retryAttempts.count == 1)
         #expect(retryAttempts.first?.supersedesAgentExecutionID == failedAgent.id)
     }
+
+    @Test("Interrupted transition prefers resume action over invalid retry stage")
+    func interruptedTransitionPrefersResumeAction() throws {
+        let context = try makeRecoveryContext()
+        let idea = Idea(title: "Interrupted Idea", body: "Body", status: .active)
+        context.insert(idea)
+
+        let run = makeRun(status: .blocked)
+        run.idea = idea
+        idea.runs.append(run)
+        context.insert(run)
+
+        let completedStage = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        completedStage.run = run
+        run.stageExecutions.append(completedStage)
+        context.insert(completedStage)
+
+        let continuationStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .ready,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        continuationStage.run = run
+        run.stageExecutions.append(continuationStage)
+        context.insert(continuationStage)
+
+        let staleBlockedStage = StageExecution(
+            stageID: "state_10_implementation_refined",
+            label: "Implementation refined",
+            startedAt: Date(timeIntervalSince1970: 150),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        staleBlockedStage.run = run
+        run.stageExecutions.append(staleBlockedStage)
+        context.insert(staleBlockedStage)
+
+        let staleSnapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(),
+            runID: run.id,
+            recommendedAction: RecoveryActionDetail(
+                action: .retryFailedStage,
+                stageID: "state_10_implementation_refined",
+                agentID: nil,
+                explanation: "Stale retry-stage snapshot",
+                staysInSameRun: true,
+                reusesSiblingOutputs: false,
+                reExecutesWholeStage: true
+            ),
+            availableActions: [],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        staleBlockedStage.recoverySnapshotJSON = try JSONEncoder().encode(staleSnapshot)
+
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 2,
+                lastCompletedStateID: "state_9_implementation_reviewed",
+                lastCompletedStageExecutionID: completedStage.id,
+                nextScheduledStateID: "state_7_implementation_started",
+                nextScheduledIteration: 2,
+                nextScheduledAttemptNumber: 1,
+                scheduledStageExecutionID: continuationStage.id,
+                settlementPhase: .transitionSettled,
+                updatedAt: Date()
+            )
+        )
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let actions = coordinator.availableActions(for: run)
+        let recoveryContext = coordinator.recoveryContext(for: run)
+
+        #expect(actions.first == .resumeInterrupted(stageID: "state_7_implementation_started"))
+        #expect(actions.contains(.resumeInterrupted(stageID: "state_7_implementation_started")))
+        #expect(!actions.contains(.retryStage(stageID: "state_7_implementation_started")))
+        #expect(recoveryContext.suggestedAction == .resumeInterrupted(stageID: "state_7_implementation_started"))
+        #expect(recoveryContext.reason.contains("state_7_implementation_started"))
+    }
+
+    @Test("Interrupted drift without cursor still prefers resume action")
+    func interruptedDriftWithoutCursorPrefersResumeAction() throws {
+        let context = try makeRecoveryContext()
+        let idea = Idea(title: "Interrupted Idea", body: "Body", status: .active)
+        context.insert(idea)
+
+        let run = makeRun(status: .blocked)
+        run.idea = idea
+        run.driftDetails = "Workflow source has changed (hash mismatch); Agent catalog source has changed (hash mismatch) Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
+        idea.runs.append(run)
+        context.insert(run)
+
+        let completedStage = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        completedStage.run = run
+        run.stageExecutions.append(completedStage)
+        context.insert(completedStage)
+
+        let continuationStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        continuationStage.run = run
+        run.stageExecutions.append(continuationStage)
+        context.insert(continuationStage)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let actions = coordinator.availableActions(for: run)
+        let recoveryContext = coordinator.recoveryContext(for: run)
+
+        #expect(actions.first == .resumeInterrupted(stageID: "state_7_implementation_started"))
+        #expect(actions.contains(.resumeInterrupted(stageID: "state_7_implementation_started")))
+        #expect(recoveryContext.suggestedAction == .resumeInterrupted(stageID: "state_7_implementation_started"))
+    }
 }
 
 private func makeRecoveryContext() throws -> ModelContext {

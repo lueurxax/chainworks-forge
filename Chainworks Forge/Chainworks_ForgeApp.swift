@@ -157,6 +157,9 @@ struct Chainworks_ForgeApp: App {
             schema: schema,
             isStoredInMemoryOnly: environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" || isUIAutomationHost
         )
+        PersistentStoreRepair.repairDefaultStoreIfNeeded(
+            isStoredInMemoryOnly: modelConfiguration.isStoredInMemoryOnly
+        )
 
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])

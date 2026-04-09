@@ -10,6 +10,7 @@ struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
     var defaultModel: String?
     var capabilities: ProviderCapabilities
     var adapterVersion: String
+    var isEnabled: Bool
 
     init(
         id: UUID = UUID(),
@@ -20,7 +21,8 @@ struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
         authMode: ProviderAuthMode,
         defaultModel: String? = nil,
         capabilities: ProviderCapabilities? = nil,
-        adapterVersion: String = "v1"
+        adapterVersion: String = "v1",
+        isEnabled: Bool = true
     ) {
         self.id = id
         self.family = family
@@ -31,6 +33,7 @@ struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
         self.defaultModel = defaultModel
         self.capabilities = capabilities ?? .default(for: family)
         self.adapterVersion = adapterVersion
+        self.isEnabled = isEnabled
     }
 }
 
@@ -43,6 +46,12 @@ enum ProviderDefaults {
             return "sonnet"
         case .gemini:
             return "gemini-2.5-pro"
+        case .codexACP:
+            return "gpt-5"
+        case .auggie:
+            return "auggie-default"
+        case .junie:
+            return "junie-default"
         }
     }
 
@@ -68,7 +77,7 @@ enum ProviderDefaults {
             if transport?.isGooseBacked == true, ["opus", "sonnet", "default"].contains(lower) {
                 return lower
             }
-        case .codex, .gemini:
+        case .codex, .gemini, .codexACP, .auggie, .junie:
             break
         }
 
@@ -94,6 +103,12 @@ enum ProviderDefaults {
             expectedPrefixes = ["claude", "anthropic", "sonnet", "opus", "default"]
         case .gemini:
             expectedPrefixes = ["gemini", "palm"]
+        case .codexACP:
+            expectedPrefixes = ["gpt", "codex", "o1", "o3", "o4"]
+        case .auggie:
+            expectedPrefixes = ["auggie"]
+        case .junie:
+            expectedPrefixes = ["junie"]
         }
 
         return expectedPrefixes.contains { lower.hasPrefix($0) }
@@ -104,6 +119,9 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
     case codex
     case claude
     case gemini
+    case codexACP
+    case auggie
+    case junie
 
     var runtimeProviderIdentifier: String {
         switch self {
@@ -113,16 +131,31 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
             return "claude_code"
         case .gemini:
             return "gemini"
+        case .codexACP:
+            return "codex_acp"
+        case .auggie:
+            return "auggie"
+        case .junie:
+            return "junie"
         }
     }
 
     var displayName: String {
-        rawValue.capitalized
+        switch self {
+        case .codexACP:
+            return "Codex ACP"
+        case .auggie:
+            return "Auggie"
+        case .junie:
+            return "Junie"
+        default:
+            return rawValue.capitalized
+        }
     }
 
     var gooseFirstPreferred: Bool {
         switch self {
-        case .codex, .claude:
+        case .codex, .claude, .codexACP, .auggie, .junie:
             return true
         case .gemini:
             return false
@@ -137,6 +170,12 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
             return .claude
         case "gemini":
             return .gemini
+        case "codex_acp", "codex-acp":
+            return .codexACP
+        case "auggie":
+            return .auggie
+        case "junie":
+            return .junie
         default:
             return nil
         }
@@ -230,6 +269,31 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
                 supportsFileEditing: false,
                 supportsSandboxHints: true
             )
+        case .codexACP, .auggie, .junie:
+            return ProviderCapabilities(
+                supportsStreaming: true,
+                supportsTools: true,
+                supportsStructuredOutput: false,
+                supportsEffortControl: false,
+                supportsSessionResume: family == .codexACP,
+                supportsFileEditing: true,
+                supportsSandboxHints: false
+            )
+        }
+    }
+
+    /// Check whether a RuntimeProfile.requires token is satisfied by this capability set.
+    func satisfies(_ token: String) -> Bool {
+        switch token {
+        case "streaming": return supportsStreaming
+        case "tools": return supportsTools
+        case "structured_output": return supportsStructuredOutput
+        case "effort_control": return supportsEffortControl
+        case "session_resume": return supportsSessionResume
+        case "file_editing": return supportsFileEditing
+        case "sandbox_hints": return supportsSandboxHints
+        case "permission_callbacks": return supportsTools  // permission callbacks are available wherever tools are
+        default: return false
         }
     }
 }

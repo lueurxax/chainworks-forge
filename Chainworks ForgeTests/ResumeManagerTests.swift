@@ -746,6 +746,60 @@ struct ResumeManagerTests {
         #expect(try context.fetch(FetchDescriptor<Run>()).contains(where: { $0.id == run.id }))
     }
 
+    @Test("Run repository cleanup does not remigrate attachment already preserved inside idea workspace")
+    func runRepositoryCleanupDoesNotRemigrateAlreadyPreservedAttachment() throws {
+        let repository = RunRepository(context: context)
+
+        let repoRoot = testRepositoryRootURL(file: #filePath)
+            .appendingPathComponent(".tmp-cleanup-tests", isDirectory: true)
+            .appendingPathComponent("IdeaRepo-\(UUID().uuidString)", isDirectory: true)
+        let preservedDirectory = repoRoot
+            .appendingPathComponent(".chainworks/idea-attachments", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: preservedDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let preservedAttachmentURL = preservedDirectory.appendingPathComponent("proposal_current.json")
+        try Data("{\"title\":\"Preserved\"}".utf8).write(to: preservedAttachmentURL)
+
+        let idea = Idea(
+            title: "Already preserved attachment",
+            body: "Should keep repo-owned attachment path untouched",
+            workspaceRootPath: repoRoot.path,
+            status: .active
+        )
+        idea.attachmentPath = preservedAttachmentURL.path
+        context.insert(idea)
+
+        let run = Run(
+            workflowID: "cleanup_test",
+            workflowTitle: "Cleanup Test",
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSourcePath: "test/workflow.yaml",
+            catalogSourcePath: "test/agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: repoRoot.path,
+            artifactRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("TerminalRunArtifacts-\(UUID().uuidString)", isDirectory: true).path,
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+        run.status = .cancelled
+        run.idea = idea
+        idea.runs.append(run)
+        context.insert(run)
+        try context.save()
+
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+
+        #expect(cleanupPlan.deletedRunCount == 1)
+        #expect(cleanupPlan.migratedAttachmentCount == 0)
+        #expect(cleanupPlan.protectedRunCount == 0)
+        #expect(idea.attachmentPath == preservedAttachmentURL.path)
+        #expect(FileManager.default.fileExists(atPath: preservedAttachmentURL.path))
+    }
+
     // MARK: - Side-Effect Detection
 
     @Test("Side-effect stage detected")
@@ -1259,8 +1313,8 @@ struct ResumeManagerTests {
         #expect(run.driftDetails?.contains("Execution stalled after the last session closed") == true)
     }
 
-    @Test("ExecutionService maintenance tick reconciles stalled run without query access")
-    func executionServiceMaintenanceTickReconcilesStalledRunWithoutQueryAccess() throws {
+    @Test("ExecutionService does not reconcile a completed stage boundary after session closed")
+    func executionServiceDoesNotReconcileCompletedStageBoundaryAfterSessionClosed() throws {
         let (run, plan, workspace) = try makeRunFromPlan()
         let catalog = try loadCanonicalCatalog()
         run.status = .running
@@ -1298,10 +1352,10 @@ struct ResumeManagerTests {
 
         service.runMaintenanceTick()
 
-        #expect(run.status == .blocked)
-        #expect(run.presentationStatus == .blocked)
-        #expect(stage.status == .blocked)
-        #expect(service.orchestrator(for: run.id) == nil)
+        #expect(run.status == .running)
+        #expect(run.presentationStatus == .running)
+        #expect(stage.status == .completed)
+        #expect(service.orchestrator(for: run.id) != nil)
     }
 
     @Test("ExecutionService reconciles stalled run even when agent rows remain running after session closed")
@@ -1365,6 +1419,87 @@ struct ResumeManagerTests {
         #expect(service.orchestrator(for: run.id) == nil)
     }
 
+    @Test("ExecutionService does not reconcile fan-out stage while another agent is still streaming after one session closed")
+    func executionServiceDoesNotReconcileFanoutStageWithConcurrentLiveAgentActivity() throws {
+        let (run, plan, workspace) = try makeRunFromPlan()
+        let catalog = try loadCanonicalCatalog()
+        run.status = .running
+
+        let stage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let closedAgent = AgentExecution(
+            agentID: "proposal_reviewer_architect",
+            agentTitle: "Proposal Reviewer / Architect",
+            taskName: "review_proposal_as_architect",
+            startedAt: Date().addingTimeInterval(-180),
+            status: .running,
+            provider: "codex",
+            effort: "high"
+        )
+        closedAgent.stageExecution = stage
+        stage.agentExecutions.append(closedAgent)
+        context.insert(closedAgent)
+
+        let activeAgent = AgentExecution(
+            agentID: "proposal_reviewer_product_owner",
+            agentTitle: "Proposal Reviewer / Product Owner",
+            taskName: "review_proposal_as_product_owner",
+            startedAt: Date().addingTimeInterval(-175),
+            status: .running,
+            provider: "claude_code",
+            effort: "high"
+        )
+        activeAgent.stageExecution = stage
+        stage.agentExecutions.append(activeAgent)
+        context.insert(activeAgent)
+        try context.save()
+
+        let service = ExecutionService(modelContext: context, executor: FailingExecutor(), catalog: catalog)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: FailingExecutor(),
+            modelContext: context,
+            catalog: catalog
+        )
+
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: "proposal_reviewer_architect",
+            event: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
+                detail: "Session closed"
+            )
+        )
+        orchestrator.injectTestingLiveExecutionEvent(
+            agentID: "proposal_reviewer_product_owner",
+            event: ExecutionEvent(
+                type: .textChunk,
+                timestamp: Date().addingTimeInterval(-10),
+                detail: "Still reviewing artifacts."
+            )
+        )
+        service.registerTestingOrchestrator(orchestrator)
+
+        service.runMaintenanceTick()
+
+        #expect(run.status == .running)
+        #expect(run.presentationStatus == .running)
+        #expect(stage.status == .running)
+        #expect(closedAgent.status == .running)
+        #expect(activeAgent.status == .running)
+        #expect(service.orchestrator(for: run.id) != nil)
+    }
+
     @Test("ExecutionService does not reconcile fresh post-session idle run")
     func executionServiceDoesNotReconcileFreshPostSessionIdleRun() {
         let run = Run(
@@ -1383,9 +1518,40 @@ struct ResumeManagerTests {
             run: run,
             hasPendingApproval: false,
             hasRunningAgents: false,
+            stalledStageStatus: nil,
             latestLiveEvent: ExecutionEvent(
                 type: .sessionClosed,
                 timestamp: Date().addingTimeInterval(-5),
+                detail: "Session closed"
+            ),
+            now: Date()
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService does not reconcile stalled run when the latest stage already completed")
+    func executionServiceDoesNotReconcileCompletedLatestStage() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            stalledStageStatus: .completed,
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
                 detail: "Session closed"
             ),
             now: Date()

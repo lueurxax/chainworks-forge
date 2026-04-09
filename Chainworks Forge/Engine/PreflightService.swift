@@ -169,6 +169,29 @@ struct PreflightService {
             }
         }
 
+        // Proposal 029: Validate RuntimeProfile.requires against ProviderCapabilities
+        if let plan, let loadedCatalog {
+            appendCapabilityChecks(
+                plan: plan,
+                catalog: loadedCatalog,
+                bindings: providerBindings,
+                checks: &checks,
+                warnings: &warnings,
+                blockingIssues: &blockingIssues
+            )
+        }
+
+        // Proposal 029: Validate adapter family registration (fail-closed)
+        for (agentID, binding) in providerBindings {
+            let family = binding.adapterFamily ?? "goose"
+            let knownFamilies: Set<String> = ["goose", "claude_agent_acp", "gemini_cli_acp", "codex_acp", "auggie_cli_acp", "junie_cli_acp"]
+            if !knownFamilies.contains(family) {
+                let msg = "Agent '\(agentID)' uses unregistered adapter family '\(family)'. Register the adapter before adding its runtime profile."
+                checks.append(PreflightCheck(category: "Runtime", title: "Adapter Registration", status: .fail, message: msg))
+                blockingIssues.append(msg)
+            }
+        }
+
         if let plan, let loadedCatalog {
             appendMCPChecks(
                 plan: plan,
@@ -579,6 +602,45 @@ struct PreflightService {
             ))
             if status == .fail {
                 blockingIssues.append(message)
+            }
+        }
+    }
+
+    // MARK: - Capability Enforcement (Proposal 029)
+
+    private func appendCapabilityChecks(
+        plan: RunPlan,
+        catalog: AgentCatalog,
+        bindings: [String: ResolvedProviderBinding],
+        checks: inout [PreflightCheck],
+        warnings: inout [String],
+        blockingIssues: inout [String]
+    ) {
+        let runtimeProfiles = catalog.runtimeProfiles ?? [:]
+        for (agentID, binding) in bindings {
+            guard let profileID = binding.runtimeProfileID,
+                  let profile = runtimeProfiles[profileID] else { continue }
+
+            let provider = providerRegistry.configuredProviders.first { $0.id == binding.configuredProviderID }
+            let capabilities = provider?.capabilities ?? ProviderCapabilities.default(for: provider?.family ?? .codex)
+
+            let unsatisfied = profile.requires.filter { !capabilities.satisfies($0) }
+            if unsatisfied.isEmpty {
+                checks.append(PreflightCheck(
+                    category: "Runtime",
+                    title: "Capability Check: \(agentID)",
+                    status: .pass,
+                    message: "Runtime profile '\(profileID)' requirements satisfied"
+                ))
+            } else {
+                let msg = "Agent '\(agentID)' runtime profile '\(profileID)' requires [\(unsatisfied.joined(separator: ", "))] but provider does not support them"
+                checks.append(PreflightCheck(
+                    category: "Runtime",
+                    title: "Capability Check: \(agentID)",
+                    status: .fail,
+                    message: msg
+                ))
+                blockingIssues.append(msg)
             }
         }
     }

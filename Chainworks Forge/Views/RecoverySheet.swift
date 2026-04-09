@@ -270,6 +270,11 @@ struct RecoverySheet: View {
                 try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
+            case .resumeInterrupted:
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
+                dismiss()
+
             case .resumeFromApprovalGate(let stageID):
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
                 dismiss()
@@ -372,6 +377,8 @@ struct RecoverySheet: View {
             return "Retries only the aggregate step '\(agentID)' in the same run. Reviewer outputs are reused."
         case .retryStage(let stageID):
             return "Re-executes the entire '\(stageID)' stage in the same run. All agents re-run."
+        case .resumeInterrupted(let stageID):
+            return "Continues the interrupted run from the prepared '\(stageID)' continuation point without rewriting stage lineage."
         case .resumeFromApprovalGate:
             return "Resumes from the approval gate in the same run. No re-execution."
         case .resetAgentSession(_, let agentID):
@@ -409,7 +416,7 @@ struct RecoverySheet: View {
 
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
-        case .resumeFromApprovalGate: return DesignTokens.Action.approve
+        case .resumeInterrupted, .resumeFromApprovalGate: return DesignTokens.Action.approve
         case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
         case .resetAgentSession: return DesignTokens.Status.error
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary

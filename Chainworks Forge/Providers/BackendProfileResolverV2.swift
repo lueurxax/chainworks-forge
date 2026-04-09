@@ -56,6 +56,10 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
             return "gemini_cli"
         case "codex_acp":
             return "codex"
+        case "auggie_cli_acp":
+            return "auggie"
+        case "junie_cli_acp":
+            return "junie"
         default:
             return nil
         }

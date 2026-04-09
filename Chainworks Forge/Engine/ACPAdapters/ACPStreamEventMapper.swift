@@ -110,29 +110,36 @@ enum ACPStreamEventMapper {
     /// - Parameters:
     ///   - method: The JSON-RPC method string.
     ///   - params: The JSON-RPC params dictionary (may be nil).
-    static func mapNotification(method: String, params: [String: Any]?) -> RuntimeStreamEvent? {
+    static func mapNotificationEvents(method: String, params: [String: Any]?) -> [RuntimeStreamEvent] {
         switch method {
         case "session/update":
-            guard let params else { return nil }
-            return mapSessionUpdate(params)
+            guard let params, let event = mapSessionUpdate(params) else { return [] }
+            return [event]
 
         case "session/request_permission":
-            // Permission callbacks are informational at the transport level.
-            // The transport layer handles grant/deny; the mapper surfaces
-            // this as a tool-call-started event so Forge live timeline can observe it.
             let toolName = extractPermissionToolName(from: params)
             let raw = serializeToJSON(params ?? [:]) ?? "{}"
-            return .toolCallStarted(toolName: "permission:\(toolName)", raw: raw)
+            // Forge auto-grants ACP permissions immediately inside the transport adapter,
+            // so the canonical live contract must show a full request/resolution lifecycle
+            // instead of a dangling "started" event that never finishes.
+            return [
+                .toolCallStarted(toolName: "permission:\(toolName)", raw: raw),
+                .toolCallFinished(toolName: "permission:\(toolName)", raw: raw)
+            ]
 
         case "session/error":
             let message = params?["message"] as? String
                 ?? params?["error"] as? String
                 ?? "Unknown ACP session error"
-            return .error(message: message)
+            return [.error(message: message)]
 
         default:
-            return nil
+            return []
         }
+    }
+
+    static func mapNotification(method: String, params: [String: Any]?) -> RuntimeStreamEvent? {
+        mapNotificationEvents(method: method, params: params).first
     }
 
     // MARK: - Result Mapping

@@ -116,7 +116,7 @@ final class RunReportBuilder {
 
     /// Determines if a report should be emitted based on current run state (§6.3).
     func shouldEmitReport(for run: Run) -> Bool {
-        switch run.status {
+        switch run.presentationStatus {
         case .completed, .failed, .cancelled, .blocked:
             return true
         default:
@@ -127,10 +127,11 @@ final class RunReportBuilder {
     // MARK: - Report Payload Construction (§6.4)
 
     func buildReportPayload(for run: Run, version: Int) -> RunReportPayload {
-        let historicalStages = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
+        let historicalStages = PersistedRunGraph.stageExecutions(for: run).sorted { $0.startedAt < $1.startedAt }
         let canonicalStages = canonicalStages(from: historicalStages)
         let allAgents = canonicalStages.flatMap { canonicalAgents(for: $0) }
-        let approvals = run.approvals.sorted { $0.requestedAt < $1.requestedAt }
+        let approvals = PersistedRunGraph.approvals(for: run).sorted { $0.requestedAt < $1.requestedAt }
+        let runStatus = run.presentationStatus
 
         // Stage timeline (canonical lineage only)
         let stageTimeline: [RunReportPayload.StageEntry] = canonicalStages.map { stage in
@@ -261,11 +262,14 @@ final class RunReportBuilder {
         let strategyRecommendationState = strategyRecommendationState(for: run)
         let strategyTelemetryComplete = hasCanonicalStrategyTelemetry(for: run)
 
+        // Proposal 032: Read durable transition cursor for report truth.
+        let cursor = run.transitionCursor
+
         return RunReportPayload(
             ideaTitle: run.idea?.title ?? "Unknown",
             workflowTitle: run.workflowTitle,
             runID: run.id,
-            runStatus: run.status.rawValue,
+            runStatus: runStatus.rawValue,
             version: version,
             startedAt: run.startedAt,
             completedAt: run.completedAt,
@@ -298,7 +302,11 @@ final class RunReportBuilder {
             recoveryActionsTaken: recoveryActionsTaken,
             failureEvidenceSummaries: failureEvidenceSummaries,
             proposalLoopSummary: proposalLoopSummary,
-            mcpTelemetry: kpiSummary?.mcpTelemetry
+            mcpTelemetry: kpiSummary?.mcpTelemetry,
+            transitionCursorLastCompletedStateID: cursor?.lastCompletedStateID,
+            transitionCursorNextScheduledStateID: cursor?.nextScheduledStateID,
+            transitionCursorSettlementPhase: cursor?.settlementPhase.rawValue,
+            transitionCursorNextStarted: cursor?.settlementPhase == .transitionStarted
         )
     }
 
@@ -453,11 +461,13 @@ final class RunReportBuilder {
         waitingApprovalStage: StageExecution?,
         snapshot: RecoveryActionSnapshot?
     ) -> String? {
-        if run.status == .waitingApproval, let gateStage = waitingApprovalStage {
+        let presentationStatus = run.presentationStatus
+
+        if presentationStatus == .waitingApproval, let gateStage = waitingApprovalStage {
             return "Resume from approval gate '\(gateStage.label)'"
         }
 
-        guard run.status == .failed || run.status == .blocked else { return nil }
+        guard presentationStatus == .failed || presentationStatus == .blocked else { return nil }
         guard let snapshot else {
             return "Clone run (frozen snapshot or current config)"
         }
@@ -683,7 +693,25 @@ final class RunReportBuilder {
             lines.append("")
         }
 
-        lines.append("## 12. Outcome")
+        // Proposal 032: Transition cursor truth
+        if payload.transitionCursorSettlementPhase != nil {
+            lines.append("## 12. Transition Cursor (Proposal 032)")
+            if let phase = payload.transitionCursorSettlementPhase {
+                lines.append("- Settlement phase: \(phase)")
+            }
+            if let last = payload.transitionCursorLastCompletedStateID {
+                lines.append("- Last completed state: \(last)")
+            }
+            if let next = payload.transitionCursorNextScheduledStateID {
+                lines.append("- Next scheduled state: \(next)")
+            }
+            if let started = payload.transitionCursorNextStarted {
+                lines.append("- Next-stage execution started: \(started ? "yes" : "no")")
+            }
+            lines.append("")
+        }
+
+        lines.append("## 13. Outcome")
         lines.append("- \(payload.runStatus)")
         lines.append("")
         return lines.joined(separator: "\n")
@@ -947,6 +975,12 @@ struct RunReportPayload: Codable, Sendable {
     // Proposal 022: Feedback fidelity / review carry-forward summary
     let proposalLoopSummary: ProposalLoopFeedbackSummary?
     let mcpTelemetry: SessionReuseKPIExporter.MCPTelemetrySummary?
+
+    // Proposal 032: Transition cursor truth for interrupted-transition reporting.
+    let transitionCursorLastCompletedStateID: String?
+    let transitionCursorNextScheduledStateID: String?
+    let transitionCursorSettlementPhase: String?
+    let transitionCursorNextStarted: Bool?
 
     struct FailureEvidenceSummary: Codable, Sendable {
         let stageID: String

@@ -479,7 +479,7 @@ struct RuntimeSessionBridgeTests {
             ideaBody: "Test idea",
             providerBinding: ResolvedProviderBinding(
                 agentID: "proposal_reviewer_ui",
-                backendProfileID: "gemini_review_flash",
+                backendProfileID: "gemini_review_pro",
                 configuredProviderID: UUID(),
                 providerFamily: "gemini",
                 providerIdentifier: "gemini-cli",
@@ -558,7 +558,7 @@ struct RuntimeSessionBridgeTests {
             ideaBody: "Test idea",
             providerBinding: ResolvedProviderBinding(
                 agentID: "proposal_reviewer_ui",
-                backendProfileID: "gemini_review_flash",
+                backendProfileID: "gemini_review_pro",
                 configuredProviderID: UUID(),
                 providerFamily: "gemini",
                 providerIdentifier: "gemini-cli",
@@ -1207,7 +1207,7 @@ struct RuntimeSessionBridgeTests {
             ideaBody: "Improve UX",
             providerBinding: ResolvedProviderBinding(
                 agentID: agent.id,
-                backendProfileID: "gemini_review_flash",
+                backendProfileID: "gemini_review_pro",
                 configuredProviderID: UUID(),
                 providerFamily: "gemini",
                 providerIdentifier: "gemini",

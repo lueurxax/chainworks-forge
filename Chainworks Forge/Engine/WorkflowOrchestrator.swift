@@ -144,6 +144,23 @@ final class WorkflowOrchestrator {
             currentStateID = resumeState
         }
 
+        // Proposal 032: Initialize durable transition cursor if absent.
+        // For resumed runs that already have a cursor, preserve it.
+        // For pre-P032 legacy runs being resumed with a heuristic continuation,
+        // seed the cursor from the resume state so we don't lose the computed
+        // continuation by overwriting with `.initial()`.
+        if run.transitionCursor == nil {
+            if let resumeState = stateID {
+                // Legacy run being resumed — seed cursor reflecting that the
+                // orchestrator is about to start executing `resumeState`.
+                run.persistTransitionCursor(TransitionCursor.seededForResume(
+                    nextScheduledStateID: resumeState
+                ))
+            } else {
+                run.persistTransitionCursor(.initial())
+            }
+        }
+
         reconcileLateMaterializedOutputsIfNeeded()
         loadPersistedArtifacts()
 
@@ -249,6 +266,17 @@ final class WorkflowOrchestrator {
             return
         }
 
+        // Proposal 032: Atomic settlement for approval-resume transition.
+        let completedStageExec = run.stageExecutions
+            .filter { $0.stageID == stageID && $0.status == .completed }
+            .sorted { $0.startedAt < $1.startedAt }
+            .last
+        settleTransition(
+            completedStateID: stageID,
+            completedStageExecutionID: completedStageExec?.id,
+            nextStateID: transition.to
+        )
+
         RuntimeDiagnostics.log("resumeAfterApproval transition stageID=\(stageID) to=\(transition.to)")
         currentStateID = transition.to
         await executeStateMachine()
@@ -270,6 +298,7 @@ final class WorkflowOrchestrator {
                 RuntimeDiagnostics.log("executeStateMachine reachedEnd stateID=\(state.id)")
                 run.status = .completed
                 run.completedAt = Date()
+                settleTerminal()
                 persistDeliveryReceiptIfNeeded(finalStateID: state.id)
                 persistFinalFeatureReportIfNeeded(finalStateID: state.id)
                 persistDeclarativeCoverageIfNeeded(finalStateID: state.id)
@@ -295,6 +324,7 @@ final class WorkflowOrchestrator {
                     RuntimeDiagnostics.log("executeStateMachine completedTerminalEndState stateID=\(state.id)")
                     run.status = .completed
                     run.completedAt = Date()
+                    settleTerminal(lastCompletedStateID: state.id, lastCompletedStageExec: run.stageExecutions.last { $0.stageID == state.id && $0.status == .completed })
                     persistDeliveryReceiptIfNeeded(finalStateID: state.id)
                     persistFinalFeatureReportIfNeeded(finalStateID: state.id)
                     persistDeclarativeCoverageIfNeeded(finalStateID: state.id)
@@ -327,6 +357,7 @@ final class WorkflowOrchestrator {
                     RuntimeDiagnostics.log("executeStateMachine deadEndComplete stateID=\(state.id)")
                     run.status = .completed
                     run.completedAt = Date()
+                    settleTerminal(lastCompletedStateID: state.id, lastCompletedStageExec: run.stageExecutions.last { $0.stageID == state.id && $0.status == .completed })
                     persistDeliveryReceiptIfNeeded(finalStateID: state.id)
                     isRunning = false
                     onComplete?(true)
@@ -335,12 +366,26 @@ final class WorkflowOrchestrator {
                 // Otherwise, stalled
                 RuntimeDiagnostics.log("executeStateMachine blockedNoTransition stateID=\(state.id) artifacts=\(producedArtifactNames.sorted())")
                 run.status = .blocked
+                settleTerminal()
                 isRunning = false
                 onComplete?(false)
                 return
             }
 
-            // Move to next state
+            // Proposal 032: Atomic transition settlement.
+            // Persist the completed state and scheduled next state in one save boundary
+            // before advancing the state machine. This ensures resume/recovery surfaces
+            // always see a durable continuation point even if the process exits now.
+            let completedStageExec = run.stageExecutions
+                .filter { $0.stageID == state.id && $0.status == .completed }
+                .sorted { $0.startedAt < $1.startedAt }
+                .last
+            settleTransition(
+                completedStateID: state.id,
+                completedStageExecutionID: completedStageExec?.id,
+                nextStateID: transition.to
+            )
+
             RuntimeDiagnostics.log("executeStateMachine transition from=\(state.id) to=\(transition.to)")
             currentStateID = transition.to
         }
@@ -363,6 +408,14 @@ final class WorkflowOrchestrator {
     /// Execute a single state: run block, then check approval.
     private func executeState(_ state: ExecutableState) async -> StateResult {
         RuntimeDiagnostics.log("executeState begin stateID=\(state.id)")
+
+        // Proposal 032: Mark the transition as started once agent work begins.
+        if let cursor = run.transitionCursor,
+           cursor.settlementPhase == .transitionSettled,
+           cursor.nextScheduledStateID == state.id {
+            run.persistTransitionCursor(cursor.markingTransitionStarted())
+        }
+
         let stageExec: StageExecution
         if let resumableStage = resumableStageExecution(for: state.id) {
             stageExec = resumableStage
@@ -2728,6 +2781,42 @@ final class WorkflowOrchestrator {
         return fields
     }
 
+    // MARK: - Proposal 032: Atomic Transition Settlement
+
+    /// Atomically settle a transition from a completed state to the next scheduled state.
+    /// Persists the cursor and saves the model context in one boundary, ensuring that
+    /// resume/recovery surfaces always see a durable continuation point.
+    private func settleTransition(
+        completedStateID: String,
+        completedStageExecutionID: UUID?,
+        nextStateID: String
+    ) {
+        let currentCursor = run.transitionCursor ?? .initial()
+        let iteration = currentIteration(for: nextStateID)
+        let newCursor = currentCursor.settlingTransition(
+            completedStateID: completedStateID,
+            completedStageExecutionID: completedStageExecutionID,
+            nextStateID: nextStateID,
+            nextIteration: iteration
+        )
+        run.persistTransitionCursor(newCursor)
+        try? modelContext.save()
+        RuntimeDiagnostics.log("settleTransition seq=\(newCursor.sequenceNumber) completed=\(completedStateID) next=\(nextStateID)")
+    }
+
+    /// Mark the cursor as terminal (completed, failed, blocked, or cancelled).
+    private func settleTerminal(
+        lastCompletedStateID: String? = nil,
+        lastCompletedStageExec: StageExecution? = nil
+    ) {
+        let currentCursor = run.transitionCursor ?? .initial()
+        let newCursor = currentCursor.markingTerminal(
+            lastCompletedStateID: lastCompletedStateID,
+            lastCompletedStageExecutionID: lastCompletedStageExec?.id
+        )
+        run.persistTransitionCursor(newCursor)
+    }
+
     // MARK: - Failure Handling
 
     private func handleFailure(state: ExecutableState) {
@@ -2738,6 +2827,7 @@ final class WorkflowOrchestrator {
         switch action {
         case "pause_and_require_human":
             run.status = .blocked
+            settleTerminal()
             persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
             isPaused = true
@@ -2745,11 +2835,13 @@ final class WorkflowOrchestrator {
         case "fail_run":
             run.status = .failed
             run.completedAt = Date()
+            settleTerminal()
             persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
             RuntimeDiagnostics.log("handleFailure failed stateID=\(state.id)")
         default:
             run.status = .blocked
+            settleTerminal()
             persistDeliveryReceiptIfNeeded(finalStateID: state.id)
             isRunning = false
             RuntimeDiagnostics.log("handleFailure blockedDefault stateID=\(state.id)")

@@ -253,7 +253,8 @@ struct RunRepository {
         }
 
         let runCleanupRoots = Dictionary(uniqueKeysWithValues: runs.map { run in
-            (run.id, Self.cleanupPaths(for: run))
+            let ownedRoots = Self.cleanupPaths(for: run).filter(Self.shouldRemoveOwnedPath)
+            return (run.id, ownedRoots)
         })
         let runByID = Dictionary(uniqueKeysWithValues: runs.map { ($0.id, $0) })
 

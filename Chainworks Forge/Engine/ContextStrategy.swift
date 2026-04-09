@@ -223,12 +223,19 @@ struct HandoffCompiler: Sendable {
             promotedArtifacts
                 .filter { allKeys.contains($0) }
         )
+        let semanticMandatoryKeys = semanticMandatoryArtifactKeys(
+            agent: agent,
+            task: task,
+            available: allKeys,
+            inputArtifacts: allArtifacts
+        )
 
         var mandatoryKeys = Set(resolvedArtifactNames(
             requested: policy?.mandatory ?? [],
             available: allKeys
         ))
         mandatoryKeys.formUnion(promotedKeys)
+        mandatoryKeys.formUnion(semanticMandatoryKeys)
         let summarizedKeys = Set(resolvedArtifactNames(
             requested: policy?.summarized ?? [],
             available: allKeys.subtracting(mandatoryKeys)
@@ -316,6 +323,62 @@ struct HandoffCompiler: Sendable {
         }
         let prefix = normalized.prefix(237)
         return "\(prefix)..."
+    }
+
+    private func semanticMandatoryArtifactKeys(
+        agent: ResolvedAgent,
+        task: AgentTask,
+        available: Set<String>,
+        inputArtifacts: [String: Data]
+    ) -> Set<String> {
+        let inlineLimitBytes = 64 * 1024
+
+        if agent.mode.hasPrefix("proposal_review.") {
+            let declaredInputs = Set((task.inputs ?? [])
+                .filter { $0 != "current_task_description" }
+                .filter { available.contains($0) })
+
+            // Proposal reviewers compare current proposal intent against review evidence.
+            // Their declared workflow inputs are core evidence, not opportunistic lazy context.
+            return inlineEligibleArtifacts(
+                declaredInputs,
+                inputArtifacts: inputArtifacts,
+                inlineLimitBytes: inlineLimitBytes
+            )
+        }
+
+        if agent.id == "lead_orchestrator", task.task == "aggregate_proposal_reviews" {
+            let declaredInputs = Set((task.inputs ?? [])
+                .filter { $0 != "current_task_description" }
+                .filter { available.contains($0) })
+
+            // Review aggregation is not useful if the orchestrator spends its turn lazily
+            // loading the core review corpus. Inline the declared review inputs so the
+            // orchestrator can immediately synthesize the required aggregate outputs.
+            return inlineEligibleArtifacts(
+                declaredInputs,
+                inputArtifacts: inputArtifacts,
+                inlineLimitBytes: inlineLimitBytes
+            )
+        }
+
+        return []
+    }
+
+    private func inlineEligibleArtifacts(
+        _ artifactNames: Set<String>,
+        inputArtifacts: [String: Data],
+        inlineLimitBytes: Int
+    ) -> Set<String> {
+        guard !artifactNames.isEmpty else {
+            return []
+        }
+        return Set(
+            artifactNames.filter { artifactName in
+                guard let data = inputArtifacts[artifactName] else { return false }
+                return data.count <= inlineLimitBytes
+            }
+        )
     }
 }
 

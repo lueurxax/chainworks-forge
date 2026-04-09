@@ -49,8 +49,8 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
     }
 
     /// Resolve the session bridge for a specific agent using the transport factory.
-    private func sessionBridge(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> RuntimeSessionBridge {
-        let transport = transportFactory.transport(for: agent, binding: binding)
+    private func sessionBridge(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> RuntimeSessionBridge {
+        let transport = try transportFactory.transport(for: agent, binding: binding)
         return RuntimeSessionBridge(transport: transport)
     }
 
@@ -61,7 +61,10 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     /// Maximum wall-clock time for a single agent execution attempt before the watchdog
     /// forcibly cancels it. Prevents runs from hanging for hours on stale sessions.
-    private static let executionTimeoutSeconds: TimeInterval = 1800 // 30 minutes
+    static var executionTimeoutSeconds: TimeInterval = 1800 // 30 minutes
+    static var acpProposalReviewStallSilenceSeconds: TimeInterval = 120
+    static var acpProposalReviewReadLoopThreshold = 4
+    static var acpProposalReviewStallPollIntervalMilliseconds: UInt64 = 5_000
 
     func execute(
         task: AgentTask,
@@ -70,7 +73,7 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
     ) async throws -> AgentResult {
         var lastResult: AgentResult?
         for attempt in 0...Self.maxTransportRetries {
-            let result = try await executeAttemptWithWatchdog(
+            let result = try await executeAttempt(
                 task: task,
                 agent: agent,
                 context: context,
@@ -89,51 +92,20 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         return lastResult!
     }
 
-    /// Wraps `executeAttempt` with a wall-clock timeout watchdog.
-    /// If the attempt exceeds `executionTimeoutSeconds`, it is cancelled and
-    /// returns a timeout failure instead of hanging indefinitely.
-    private func executeAttemptWithWatchdog(
-        task: AgentTask,
-        agent: ResolvedAgent,
-        context: ExecutionContext,
-        attemptIndex: Int
-    ) async throws -> AgentResult {
-        // Capture before task group so the nonisolated child task can read it safely.
-        let timeoutSeconds = Self.executionTimeoutSeconds
-        do {
-            return try await withThrowingTaskGroup(of: AgentResult.self) { group in
-                group.addTask {
-                    try await self.executeAttempt(task: task, agent: agent, context: context, attemptIndex: attemptIndex)
-                }
-                group.addTask {
-                    try await Task.sleep(for: .seconds(timeoutSeconds))
-                    throw ExecutionError.timeout(agentID: agent.id, seconds: Int(timeoutSeconds))
-                }
-
-                // Return whichever finishes first
-                let result = try await group.next()!
-                group.cancelAll()
-                return result
-            }
-        } catch is ExecutionError {
-            // Watchdog timeout triggered
-            return AgentResult.failure(
-                "Execution watchdog: agent '\(agent.id)' timed out after \(Int(timeoutSeconds))s (attempt \(attemptIndex))",
-                context: context,
-                override: override,
-                startedAt: Date()
-            )
-        }
-    }
-
     private func isRetryableError(_ result: AgentResult) -> Bool {
         guard let error = result.errorMessage else { return false }
+        if result.transportErrorKind == .timeout {
+            return false
+        }
+        if error.contains("ACP proposal review stalled in read loop") {
+            return false
+        }
+
         let isTransportError = error.contains("timed out") || error.contains("-1001") || error.contains("timeout")
             || error.contains("Session not found") || error.contains("session not found")
             || error.contains("session became unavailable")
         let isContractViolation = error.contains("Required outputs missing") || error.contains("output contract")
             || error.contains("not valid JSON") || error.contains("Missing required field")
-        let isWatchdogTimeout = error.contains("Execution watchdog")
 
         // When outputs are missing but the agent's text reveals a provider-side session, limit,
         // or crash error, the failure is recoverable with a fresh session — override the
@@ -154,7 +126,7 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
             return false
         }
 
-        return isTransportError || isWatchdogTimeout
+        return isTransportError
     }
 
     // MARK: - Execution Attempt Flow
@@ -193,8 +165,15 @@ let sessionID = sessionInfo.execution.sessionID
 ForgeLogger.session.info("[\(sessionID)] Stream Start. Agent: \(agent.id)")
 
 do {
-    streamResult = try await eventBridge.processStream(
+    let monitoredStream = monitoredEventStreamIfNeeded(
         sessionInfo.execution.eventStream,
+        sessionInfo: sessionInfo,
+        agent: agent
+    )
+    streamResult = try await processStreamWithSupervision(
+        monitoredStream,
+        agentID: agent.id,
+        sessionID: sessionID,
         onEvent: { [agentID] event in
             // Structured event logging for visibility into "long-running" sessions
             switch event.type {
@@ -214,19 +193,20 @@ do {
                 break
             }
             onEvent?(agentID, event)
-        }
+        },
+        eventBridge: eventBridge
     )
 } catch {
     ForgeLogger.session.error("[\(sessionID)] Stream Failed: \(error.localizedDescription)")
-    return await handleStreamFailure(
-        error: error,
-        sessionInfo: sessionInfo,
-        agent: agent,
+        return await handleStreamFailure(
+            error: error,
+            sessionInfo: sessionInfo,
+            agent: agent,
         context: context,
         expectedOutputs: expectedOutputs,
         startedAt: startedAt,
         eventBridge: eventBridge
-    )
+        )
 }
 
 let completedAt = Date()
@@ -260,6 +240,30 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
         return result
     }
 
+    private func processStreamWithSupervision(
+        _ stream: AsyncThrowingStream<RuntimeStreamEvent, Error>,
+        agentID: String,
+        sessionID: String,
+        onEvent: @Sendable @escaping (ExecutionEvent) -> Void,
+        eventBridge: ExecutionEventBridge
+    ) async throws -> ExecutionStreamResult {
+        let timeoutSeconds = Self.executionTimeoutSeconds
+        return try await withThrowingTaskGroup(of: ExecutionStreamResult.self) { group in
+            group.addTask {
+                try await eventBridge.processStream(stream, onEvent: onEvent)
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeoutSeconds))
+                ForgeLogger.session.error("[\(sessionID)] Stream Watchdog Timeout after \(Int(timeoutSeconds))s")
+                throw ExecutionError.timeout(agentID: agentID, seconds: Int(timeoutSeconds))
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
     // MARK: - Internal Steps
 
     private struct SessionResolutionInfo {
@@ -278,7 +282,7 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
         context: ExecutionContext
     ) async throws -> SessionResolutionInfo {
         // Proposal 026: Resolve per-agent transport via factory
-        let bridge = sessionBridge(for: agent, binding: context.providerBinding)
+        let bridge = try sessionBridge(for: agent, binding: context.providerBinding)
         let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
         let (workingDirectory, workspaceMode) = resolveWorkingDirectoryAndMode(agent: agent, context: context)
         let fingerprint = calculateFingerprint(agent: agent, context: context, systemPrompt: packet.systemPrompt, workingDirectory: workingDirectory, workspaceMode: workspaceMode)
@@ -531,6 +535,148 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
                 NSLocalizedDescriptionKey: "Provider session ID collision detected; refusing to attach session to the wrong lineage. \(lastCollisionDetails)"
             ]
         )
+    }
+
+    private func monitoredEventStreamIfNeeded(
+        _ stream: AsyncThrowingStream<RuntimeStreamEvent, Error>,
+        sessionInfo: SessionResolutionInfo,
+        agent: ResolvedAgent
+    ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+        guard shouldMonitorACPProposalReviewStall(sessionInfo: sessionInfo, agent: agent) else {
+            return stream
+        }
+
+        final class StallState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var lastProgressAt = Date()
+            private var readLoopStartCount = 0
+            private var finished = false
+
+            func recordProgress() {
+                lock.lock()
+                lastProgressAt = Date()
+                readLoopStartCount = 0
+                lock.unlock()
+            }
+
+            func recordReadLikeStart() {
+                lock.lock()
+                readLoopStartCount += 1
+                lock.unlock()
+            }
+
+            func markFinished() {
+                lock.lock()
+                finished = true
+                lock.unlock()
+            }
+
+            func snapshot() -> (lastProgressAt: Date, readLoopStartCount: Int, finished: Bool) {
+                lock.lock()
+                defer { lock.unlock() }
+                return (lastProgressAt, readLoopStartCount, finished)
+            }
+        }
+
+        let state = StallState()
+        state.recordProgress()
+
+        return AsyncThrowingStream { continuation in
+            let producer = Task {
+                do {
+                    for try await event in stream {
+                        switch event {
+                        case .textChunk(let text):
+                            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                state.recordProgress()
+                            }
+                        case .toolCallStarted(let toolName, _):
+                            if isACPReadLoopTool(toolName) {
+                                state.recordReadLikeStart()
+                            } else {
+                                state.recordProgress()
+                            }
+                        case .toolCallFinished(let toolName, _):
+                            if !isACPReadLoopTool(toolName) {
+                                state.recordProgress()
+                            }
+                        case .finalOutput, .finish, .sessionClosed:
+                            state.markFinished()
+                        default:
+                            break
+                        }
+
+                        continuation.yield(event)
+
+                        if case .sessionClosed = event {
+                            continuation.finish()
+                            return
+                        }
+                    }
+
+                    state.markFinished()
+                    continuation.finish()
+                } catch {
+                    state.markFinished()
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            let monitor = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(
+                        nanoseconds: Self.acpProposalReviewStallPollIntervalMilliseconds * 1_000_000
+                    )
+
+                    let snapshot = state.snapshot()
+                    if snapshot.finished {
+                        return
+                    }
+
+                    let stalledFor = Date().timeIntervalSince(snapshot.lastProgressAt)
+                    if snapshot.readLoopStartCount >= Self.acpProposalReviewReadLoopThreshold
+                        && stalledFor >= Self.acpProposalReviewStallSilenceSeconds {
+                        state.markFinished()
+                        producer.cancel()
+                        continuation.finish(throwing: ACPProposalReviewStallError(
+                            silenceSeconds: stalledFor,
+                            readLoopCount: snapshot.readLoopStartCount
+                        ))
+                        return
+                    }
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+                monitor.cancel()
+            }
+        }
+    }
+
+    private func shouldMonitorACPProposalReviewStall(
+        sessionInfo: SessionResolutionInfo,
+        agent: ResolvedAgent
+    ) -> Bool {
+        let runtimeNamespace = sessionInfo.execution.transport.mcpRuntimeNamespace?.lowercased()
+        let isACP = runtimeNamespace != nil && runtimeNamespace != "goose"
+        let reviewOutputs = Set([
+            "proposal_review_po",
+            "proposal_review_ux",
+            "proposal_review_ui",
+            "proposal_review_architect"
+        ])
+        let isProposalReview = agent.mode.hasPrefix("proposal_review.")
+            || agent.outputs.contains(where: { reviewOutputs.contains($0) })
+        return isACP && isProposalReview
+    }
+
+    private func isACPReadLoopTool(_ toolName: String) -> Bool {
+        let normalized = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "read"
+            || normalized == "read_file"
+            || normalized == "read_workspace"
+            || normalized == "permission:read"
     }
 
     private func handleStreamFailure(
@@ -1126,6 +1272,15 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
             return family.rawValue
         }
         return ProviderFamily.from(runtimeIdentifier: agent.provider)?.rawValue ?? agent.provider
+    }
+}
+
+private struct ACPProposalReviewStallError: LocalizedError {
+    let silenceSeconds: TimeInterval
+    let readLoopCount: Int
+
+    var errorDescription: String? {
+        "ACP proposal review stalled in read loop without progress after \(Int(silenceSeconds))s (\(readLoopCount) read callbacks)"
     }
 }
 

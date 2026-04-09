@@ -282,7 +282,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                                 )
                             }
 
-                            if let event = ACPStreamEventMapper.mapNotification(method: method, params: params) {
+                            for event in ACPStreamEventMapper.mapNotificationEvents(method: method, params: params) {
                                 continuation.yield(event)
                             }
                         }

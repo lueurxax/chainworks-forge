@@ -34,6 +34,12 @@ final class ResumeManager {
     /// Normalizes stale in-flight runs after a fresh app launch when auto-resume is disabled.
     /// Runs that still appear `.pending`, `.ready`, or `.running` cannot be truthful after a new
     /// process start, so they become recoverable `.blocked` runs that require explicit operator resume.
+    ///
+    /// Proposal 032: If the run has a durable transition cursor showing `transitionSettled`
+    /// (next state was scheduled but never started), the run is marked `.blocked` for operator
+    /// resume but the scheduled-but-not-started stage is preserved as `.ready` rather than
+    /// being rewritten to `.blocked`. This distinguishes "interrupted before work began"
+    /// from "interrupted mid-execution" and enables clean resume targeting.
     @discardableResult
     func normalizeInterruptedRunsForManualResume() throws -> Int {
         let interruptedRuns = try findInterruptedRuns()
@@ -46,7 +52,26 @@ final class ResumeManager {
             run.status = .blocked
             run.driftDetails = mergedInterruptionReason(existing: run.driftDetails)
 
+            // Proposal 032: Check cursor for scheduled-but-not-started continuation truth.
+            let cursor = run.transitionCursor
+            let scheduledNotStartedStageID: String?
+            if let cursor, cursor.settlementPhase == .transitionSettled {
+                scheduledNotStartedStageID = cursor.nextScheduledStateID
+            } else {
+                scheduledNotStartedStageID = nil
+            }
+
             for stageExecution in run.stageExecutions where [.pending, .ready, .running].contains(stageExecution.status) {
+                // Proposal 032 §5.3: If this stage was scheduled but never started,
+                // preserve it as .ready so resume can target it cleanly.
+                if let scheduledID = scheduledNotStartedStageID,
+                   stageExecution.stageID == scheduledID,
+                   stageExecution.status == .ready,
+                   !stageExecution.agentExecutions.contains(where: { !$0.artifacts.isEmpty }) {
+                    // Preserve as resumable — do not flatten to blocked.
+                    continue
+                }
+
                 stageExecution.status = .blocked
                 stageExecution.settlementKind = .blocked
                 stageExecution.settledAt = stageExecution.settledAt ?? now

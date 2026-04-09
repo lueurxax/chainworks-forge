@@ -3,6 +3,21 @@ import SwiftData
 
 @MainActor
 final class WorkflowMapProjectionService {
+    private struct PlanCacheKey: Hashable {
+        let runID: UUID
+        let workflowSnapshotHash: String
+        let catalogSnapshotHash: String
+        let planCompilerVersion: Int
+    }
+
+    private struct PlanCacheEntry {
+        let plan: RunPlan
+        let topology: WorkflowMapTopologyBuilder
+    }
+
+    private static var planCache: [PlanCacheKey: PlanCacheEntry] = [:]
+    private static var planCacheMissCount = 0
+
     private let modelContext: ModelContext
     private let executionService: ExecutionService
 
@@ -12,18 +27,19 @@ final class WorkflowMapProjectionService {
     }
 
     func projection(for run: Run) -> WorkflowMapProjection? {
-        let compiler = RunPlanCompiler(modelContext: modelContext)
-        guard let (plan, _) = try? compiler.rebuildPlanFromSnapshot(run: run) else {
+        guard let cachedPlan = cachedPlanEntry(for: run) else {
             return nil
         }
         let persistedStages = RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
         let persistedApprovals = PersistedRunGraph.approvals(for: run)
-
-        let topology = WorkflowMapTopologyBuilder(plan: plan)
+        let plan = cachedPlan.plan
+        let topology = cachedPlan.topology
         let orderedStateIDs = topology.orderedStateIDs()
         let liveTimeline = executionService.orchestrator(for: run.id)?.liveTimeline ?? []
         let persistedTimeline = buildPersistedTimeline(stages: persistedStages, approvals: persistedApprovals, plan: plan)
         let providerBindings = decodeProviderBindings(from: run.providerBindingSnapshotJSON)
+        let currentStageID = deriveCurrentStageID(for: run, from: persistedStages)
+        let runStatus = deriveRunStatus(for: run, persistedStages: persistedStages)
 
         let stages: [WorkflowMapStageProjection] = orderedStateIDs.enumerated().compactMap { index, stateID in
             guard let state = plan.states[stateID] else { return nil }
@@ -32,7 +48,7 @@ final class WorkflowMapProjectionService {
                 plan: plan,
                 topology: topology,
                 persistedStages: persistedStages,
-                currentStageID: run.currentStageID,
+                currentStageID: currentStageID,
                 stateID: stateID,
                 state: state,
                 order: index,
@@ -54,9 +70,9 @@ final class WorkflowMapProjectionService {
             runID: run.id,
             workflowID: plan.workflowID,
             workflowTitle: plan.workflowTitle,
-            runStatus: run.presentationStatus,
-            currentStageID: run.currentStageID,
-            currentStageLabel: run.currentStageID.flatMap { plan.states[$0]?.label },
+            runStatus: runStatus,
+            currentStageID: currentStageID,
+            currentStageLabel: currentStageID.flatMap { plan.states[$0]?.label },
             generatedAt: Date(),
             stageCount: stages.count,
             occurrenceCount: occurrences.count,
@@ -74,6 +90,99 @@ final class WorkflowMapProjectionService {
             persistedTimeline: persistedTimeline
         )
     }
+
+    private func cachedPlanEntry(for run: Run) -> PlanCacheEntry? {
+        let key = PlanCacheKey(
+            runID: run.id,
+            workflowSnapshotHash: run.workflowSnapshotHash,
+            catalogSnapshotHash: run.catalogSnapshotHash,
+            planCompilerVersion: run.planCompilerVersion
+        )
+
+        if let cached = Self.planCache[key] {
+            return cached
+        }
+
+        let compiler = RunPlanCompiler(modelContext: modelContext)
+        guard let (plan, _) = try? compiler.rebuildPlanFromSnapshot(run: run) else {
+            return nil
+        }
+
+        let entry = PlanCacheEntry(
+            plan: plan,
+            topology: WorkflowMapTopologyBuilder(plan: plan)
+        )
+        Self.planCache[key] = entry
+        Self.planCacheMissCount += 1
+        return entry
+    }
+
+    /// Proposal 032: Prefer the durable transition cursor for current-stage derivation.
+    /// Falls back to persisted stage row heuristics for pre-P032 runs.
+    private func deriveCurrentStageID(for run: Run, from persistedStages: [RunStageSnapshot]) -> String? {
+        if let cursor = run.transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled, .transitionStarted:
+                if let nextState = cursor.nextScheduledStateID {
+                    return nextState
+                }
+            case .terminal:
+                if let lastCompleted = cursor.lastCompletedStateID {
+                    return lastCompleted
+                }
+            case .awaitingFirstState:
+                break // Fall through to heuristic
+            }
+        }
+
+        let sorted = persistedStages.sorted { $0.startedAt < $1.startedAt }
+        return sorted.last(where: {
+            $0.status == .running
+                || $0.status == .waitingApproval
+                || $0.status == .blocked
+                || $0.status == .failed
+                || $0.status == .ready
+        })?.stageID
+            ?? sorted.last(where: { $0.status == .completed })?.stageID
+    }
+
+    private func deriveRunStatus(for run: Run, persistedStages: [RunStageSnapshot]) -> RunStatus {
+        if run.cancellationRequestedAt != nil && run.cancellationSettledAt == nil {
+            return .cancelling
+        }
+
+        if run.status == .pending || run.status == .ready || run.status == .running {
+            if let latestStage = persistedStages.sorted(by: { $0.startedAt < $1.startedAt }).last {
+                switch latestStage.status {
+                case .waitingApproval:
+                    return .waitingApproval
+                case .blocked:
+                    return .blocked
+                case .failed:
+                    return .failed
+                default:
+                    break
+                }
+            }
+        }
+
+        return run.status
+    }
+
+#if DEBUG
+    static func resetPlanCacheForTesting() {
+        planCache = [:]
+        planCacheMissCount = 0
+    }
+
+    static var planCacheMissCountForTesting: Int {
+        planCacheMissCount
+    }
+
+    static var cachedPlanCountForTesting: Int {
+        planCache.count
+    }
+#endif
 
     private func buildPersistedTimeline(
         stages: [RunStageSnapshot],

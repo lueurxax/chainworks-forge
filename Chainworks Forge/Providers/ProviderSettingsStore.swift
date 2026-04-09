@@ -146,8 +146,57 @@ final class ProviderSettingsStore {
                 endpoint: gooseBaseURL,
                 authMode: gooseBaseURL == nil || gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
                 defaultModel: "gemini-2.5-pro"
+            ),
+            ConfiguredProvider(
+                family: .codexACP,
+                displayName: "Codex ACP",
+                transport: .gooseServer,
+                authMode: .apiKey,
+                defaultModel: "gpt-5",
+                isEnabled: false
+            ),
+            ConfiguredProvider(
+                family: .auggie,
+                displayName: "Auggie CLI",
+                transport: .gooseServer,
+                authMode: .apiKey,
+                defaultModel: "auggie-default",
+                isEnabled: false
+            ),
+            ConfiguredProvider(
+                family: .junie,
+                displayName: "Junie CLI",
+                transport: .gooseServer,
+                authMode: .apiKey,
+                defaultModel: "junie-default",
+                isEnabled: false
             )
-        ] : []
+        ] : [
+            ConfiguredProvider(
+                family: .codexACP,
+                displayName: "Codex ACP",
+                transport: .gooseServer,
+                authMode: .apiKey,
+                defaultModel: "gpt-5",
+                isEnabled: false
+            ),
+            ConfiguredProvider(
+                family: .auggie,
+                displayName: "Auggie CLI",
+                transport: .gooseServer,
+                authMode: .apiKey,
+                defaultModel: "auggie-default",
+                isEnabled: false
+            ),
+            ConfiguredProvider(
+                family: .junie,
+                displayName: "Junie CLI",
+                transport: .gooseServer,
+                authMode: .apiKey,
+                defaultModel: "junie-default",
+                isEnabled: false
+            )
+        ]
 
         if let liveProvider = environment["CHAINWORKS_LIVE_PROVIDER"],
            let family = ProviderFamily.from(runtimeIdentifier: liveProvider) {

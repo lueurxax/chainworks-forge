@@ -6,6 +6,51 @@ import Foundation
 @MainActor
 @Suite("WorkflowMapProjection", .tags(.fast, .provider))
 struct WorkflowMapProjectionTests {
+    @Test("Projection reuses cached frozen plan for repeated requests on the same run")
+    mutating func projectionReusesCachedFrozenPlan() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        WorkflowMapProjectionService.resetPlanCacheForTesting()
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(descriptor).first)
+
+        let firstProjection = try #require(service.projection(for: run))
+        let secondProjection = try #require(service.projection(for: run))
+
+        #expect(firstProjection.workflowID == secondProjection.workflowID)
+        #expect(WorkflowMapProjectionService.planCacheMissCountForTesting == 1)
+        #expect(WorkflowMapProjectionService.cachedPlanCountForTesting == 1)
+    }
+
+    @Test("Projection loads persisted stage snapshots only once per request")
+    mutating func projectionLoadsStageSnapshotsOncePerRequest() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(descriptor).first)
+
+        RunStageSnapshotLoader.resetLoadInvocationCountForTesting()
+
+        _ = try #require(service.projection(for: run))
+
+        #expect(RunStageSnapshotLoader.loadInvocationCountForTesting == 1)
+    }
+
     @Test("Projection derives topology, handoffs, loops, and agent panels from frozen snapshot")
     mutating func projectionDerivesRuntimeMap() throws {
         let container = PreviewSupport.makeModelContainer(seed: { context in

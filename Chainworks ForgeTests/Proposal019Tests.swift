@@ -157,6 +157,132 @@ struct Proposal019Tests {
         #expect(handoff.promotedArtifacts == ["security_audit_raw"])
     }
 
+    @Test("Proposal reviewers receive declared review inputs as mandatory evidence instead of lazy refs")
+    func proposalReviewersPromoteDeclaredInputsOutOfLazyContext() throws {
+        let profile = try #require(StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"])
+        let compiler = HandoffCompiler()
+        let context = makeTestExecutionContext(
+            inputArtifacts: [
+                "idea_brief": Data("brief".utf8),
+                "proposal_current": Data(String(repeating: "proposal ", count: 300).utf8),
+                "proposal_feedback_coverage": Data("{\"coverage\":\"full\"}".utf8),
+                "reviewer_scope_plan": Data("{\"scope\":\"review\"}".utf8),
+                "score_lift_backlog": Data("{\"items\":[]}".utf8),
+                "security_audit_raw": Data("sensitive raw audit".utf8)
+            ]
+        )
+        let agent = makeTestAgent(
+            id: "proposal_reviewer_product_owner",
+            mode: "proposal_review.product_owner",
+            outputs: ["proposal_review_po"]
+        )
+        let task = makeTestTask(
+            agent: "proposal_reviewer_product_owner",
+            task: "review_proposal_as_product_owner",
+            inputs: [
+                "idea_brief",
+                "proposal_current",
+                "proposal_feedback_coverage",
+                "reviewer_scope_plan",
+                "score_lift_backlog"
+            ],
+            outputs: ["proposal_review_po"]
+        )
+
+        let handoff = compiler.compile(
+            profileID: "selective_compression_and_escalation",
+            profile: profile,
+            agent: agent,
+            task: task,
+            context: context
+        )
+
+        #expect(handoff.mandatoryArtifacts.keys.sorted() == [
+            "idea_brief",
+            "proposal_current",
+            "proposal_feedback_coverage",
+            "reviewer_scope_plan",
+            "score_lift_backlog"
+        ])
+        #expect(handoff.lazyArtifactRefs["idea_brief"] == nil)
+        #expect(handoff.lazyArtifactRefs["proposal_current"] == nil)
+        #expect(handoff.lazyArtifactRefs["proposal_feedback_coverage"] == nil)
+        #expect(handoff.lazyArtifactRefs["reviewer_scope_plan"] == nil)
+        #expect(handoff.lazyArtifactRefs["score_lift_backlog"] == nil)
+        #expect(handoff.lazyArtifactRefs["security_audit_raw"] != nil)
+    }
+
+    @Test("Lead orchestrator receives aggregate proposal review inputs as mandatory evidence instead of lazy refs")
+    func leadOrchestratorPromotesAggregateReviewInputsOutOfLazyContext() throws {
+        let profile = try #require(StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"])
+        let compiler = HandoffCompiler()
+        let context = makeTestExecutionContext(
+            inputArtifacts: [
+                "proposal_review_po": Data("{\"decision\":\"approve\"}".utf8),
+                "proposal_review_ux": Data("{\"decision\":\"approve\"}".utf8),
+                "proposal_review_ui": Data("{\"decision\":\"approve\"}".utf8),
+                "proposal_review_architect": Data("{\"decision\":\"approve\"}".utf8),
+                "proposal_current": Data(String(repeating: "proposal ", count: 400).utf8),
+                "security_audit_raw": Data("sensitive raw audit".utf8)
+            ]
+        )
+        let agent = makeTestAgent(
+            id: "lead_orchestrator",
+            mode: "orchestration",
+            outputs: [
+                "proposal_review_summary",
+                "review_corpus_bundle",
+                "score_lift_backlog",
+                "proposal_fact_digest",
+                "reviewer_scope_plan",
+                "orchestrator_summary",
+                "run_state"
+            ]
+        )
+        let task = makeTestTask(
+            agent: "lead_orchestrator",
+            task: "aggregate_proposal_reviews",
+            inputs: [
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect",
+                "proposal_current"
+            ],
+            outputs: [
+                "proposal_review_summary",
+                "review_corpus_bundle",
+                "score_lift_backlog",
+                "proposal_fact_digest",
+                "reviewer_scope_plan",
+                "orchestrator_summary",
+                "run_state"
+            ]
+        )
+
+        let handoff = compiler.compile(
+            profileID: "selective_compression_and_escalation",
+            profile: profile,
+            agent: agent,
+            task: task,
+            context: context
+        )
+
+        #expect(handoff.mandatoryArtifacts.keys.sorted() == [
+            "proposal_current",
+            "proposal_review_architect",
+            "proposal_review_po",
+            "proposal_review_ui",
+            "proposal_review_ux"
+        ])
+        #expect(handoff.lazyArtifactRefs["proposal_review_po"] == nil)
+        #expect(handoff.lazyArtifactRefs["proposal_review_ux"] == nil)
+        #expect(handoff.lazyArtifactRefs["proposal_review_ui"] == nil)
+        #expect(handoff.lazyArtifactRefs["proposal_review_architect"] == nil)
+        #expect(handoff.lazyArtifactRefs["proposal_current"] == nil)
+        #expect(handoff.lazyArtifactRefs["security_audit_raw"] != nil)
+    }
+
     @Test("Proposal-loop comparison tracks feedback carry-forward and rationale")
     func proposalLoopComparisonTracksFeedbackCarryForwardAndRationale() throws {
         let (_, context) = try makeTestModelContainer()

@@ -24,6 +24,15 @@ final class RecoveryCoordinator {
     func availableActions(for run: Run) -> [RecoveryAction] {
         guard isProposalLoopReadOnly(run) else { return [] }
 
+        if case .blocked = run.status,
+           let continuationStateID = interruptedContinuationStateID(for: run) {
+            return [
+                .resumeInterrupted(stageID: continuationStateID),
+                .cloneRunFrozenSnapshot,
+                .cloneRunCurrentConfig
+            ]
+        }
+
         if case .failed = run.status,
            let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run),
            let snapshotActions = recoveryActions(from: failedStage),
@@ -339,16 +348,27 @@ final class RecoveryCoordinator {
 
     /// Build a recovery context for the recovery sheet UI.
     /// Proposal 013: Now includes evidence summary and failure class information.
+    /// Proposal 032: Reads durable transition cursor first for resume targeting context.
     func recoveryContext(for run: Run) -> RecoveryContext {
         let reason: String
         let mostRecentStage: String
         let trustSummary: String
 
+        // Proposal 032 §6.4: Read the durable cursor first for recovery context.
+        let cursor = run.transitionCursor
+
         let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run)
         let evidencePacket = failedStage.flatMap { decodeEvidencePacket(from: $0) }
         let validationFailure = failedStage.flatMap { canonicalValidationFailure(for: $0, packet: evidencePacket) }
 
-        if let vf = validationFailure {
+        // Proposal 032: If cursor shows interrupted transition (settled but not started),
+        // surface that as the primary reason rather than generic "blocked" or failure evidence
+        // from a stage that never actually executed.
+        if let cursor, cursor.settlementPhase == .transitionSettled,
+           let lastCompleted = cursor.lastCompletedStateID,
+           let nextScheduled = cursor.nextScheduledStateID {
+            reason = "Interrupted after completing '\(lastCompleted)' — next state '\(nextScheduled)' was scheduled but never started"
+        } else if let vf = validationFailure {
             reason = "\(vf.failureClass.rawValue.replacingOccurrences(of: "_", with: " ").capitalized): \(vf.failureSummary)"
         } else if let packet = evidencePacket {
             reason = "\(packet.failureClass.rawValue.replacingOccurrences(of: "_", with: " ").capitalized): \(packet.failureSummary)"
@@ -369,12 +389,16 @@ final class RecoveryCoordinator {
 
         let actions = availableActions(for: run)
         let persistedSnapshot = failedStage.flatMap { canonicalRecoverySnapshot(for: $0) }
+        let interruptedContinuationAction = interruptedContinuationStateID(for: run)
+            .map { RecoveryAction.resumeInterrupted(stageID: $0) }
 
         // Proposal 013 UX-001: For contract mismatch, suggest operator inspection first
         // instead of blind retry. If a persisted recovery snapshot exists, it owns
         // the suggested action relation and must be read before recomputing locally.
         let suggestedAction: RecoveryAction?
-        if let snapshotAction = persistedSnapshot?.recommendedAction.flatMap(recoveryAction(from:)) {
+        if let interruptedContinuationAction {
+            suggestedAction = interruptedContinuationAction
+        } else if let snapshotAction = persistedSnapshot?.recommendedAction.flatMap(recoveryAction(from:)) {
             suggestedAction = snapshotAction
         } else if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
             // Operator-mediated: don't suggest retry first for contract mismatch
@@ -495,6 +519,45 @@ final class RecoveryCoordinator {
             .last
     }
 
+    private func interruptedContinuationStateID(for run: Run) -> String? {
+        guard run.status == .blocked else { return nil }
+        guard let continuationStateID = run.resumeContinuationStateID else { return nil }
+
+        let continuationStage = run.stageExecutions
+            .filter { $0.stageID == continuationStateID }
+            .sorted { $0.startedAt < $1.startedAt }
+            .last
+
+        let driftSuggestsManualResume = (run.driftDetails ?? "").localizedCaseInsensitiveContains("resume interrupted")
+            || (run.driftDetails ?? "").localizedCaseInsensitiveContains("interrupted by app restart")
+
+        if let cursor = run.transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled, .transitionStarted:
+                return continuationStateIDIfResumable(continuationStateID, stage: continuationStage)
+            case .awaitingFirstState, .terminal:
+                break
+            }
+        }
+
+        if driftSuggestsManualResume {
+            return continuationStateIDIfResumable(continuationStateID, stage: continuationStage)
+        }
+
+        return nil
+    }
+
+    private func continuationStateIDIfResumable(_ stateID: String, stage: StageExecution?) -> String? {
+        guard let stage else { return stateID }
+
+        switch stage.status {
+        case .pending, .ready, .running, .waitingApproval, .blocked, .failed:
+            return stateID
+        case .completed, .skipped:
+            return nil
+        }
+    }
+
     // MARK: - Proposal 013: Decode Helpers
 
     private func decodeValidationFailure(from agent: AgentExecution) -> ValidationFailureRecord? {
@@ -545,7 +608,7 @@ final class RecoveryCoordinator {
             case .retryAgent(_, let agentID), .retryAggregateStep(_, let agentID), .resetAgentSession(_, let agentID):
                 // Only keep agent-level actions if there's actually a failed execution for that agent
                 return stage.agentExecutions.contains { $0.agentID == agentID && $0.status == .failed }
-            case .retryStage, .resumeFromApprovalGate, .cloneRunFrozenSnapshot, .cloneRunCurrentConfig:
+            case .retryStage, .resumeInterrupted, .resumeFromApprovalGate, .cloneRunFrozenSnapshot, .cloneRunCurrentConfig:
                 return true
             }
         }
@@ -608,6 +671,7 @@ enum RecoveryAction: Identifiable, Equatable {
     case retryAgent(stageID: String, agentID: String)
     case retryAggregateStep(stageID: String, agentID: String)
     case retryStage(stageID: String)
+    case resumeInterrupted(stageID: String)
     case resumeFromApprovalGate(stageID: String)
     case resetAgentSession(stageID: String, agentID: String)
     case cloneRunFrozenSnapshot
@@ -618,6 +682,7 @@ enum RecoveryAction: Identifiable, Equatable {
         case .retryAgent(let stageID, let agentID): return "retryAgent_\(stageID)_\(agentID)"
         case .retryAggregateStep(let stageID, let agentID): return "retryAggregateStep_\(stageID)_\(agentID)"
         case .retryStage(let stageID): return "retryStage_\(stageID)"
+        case .resumeInterrupted(let stageID): return "resumeInterrupted_\(stageID)"
         case .resumeFromApprovalGate(let stageID): return "resumeGate_\(stageID)"
         case .resetAgentSession(let stageID, let agentID): return "resetSession_\(stageID)_\(agentID)"
         case .cloneRunFrozenSnapshot: return "cloneFrozen"
@@ -630,6 +695,7 @@ enum RecoveryAction: Identifiable, Equatable {
         case .retryAgent: return "Retry Agent"
         case .retryAggregateStep: return "Retry Aggregate Step"
         case .retryStage: return "Retry Stage"
+        case .resumeInterrupted: return "Resume Interrupted"
         case .resumeFromApprovalGate: return "Resume from Approval Gate"
         case .resetAgentSession: return "Reset Agent Session"
         case .cloneRunFrozenSnapshot: return "Clone Run (Frozen Snapshot)"
@@ -642,6 +708,7 @@ enum RecoveryAction: Identifiable, Equatable {
         case .retryAgent: return "arrow.clockwise"
         case .retryAggregateStep: return "arrow.counterclockwise"
         case .retryStage: return "arrow.counterclockwise"
+        case .resumeInterrupted: return "play.fill"
         case .resumeFromApprovalGate: return "play.fill"
         case .resetAgentSession: return "trash.circle"
         case .cloneRunFrozenSnapshot: return "doc.on.doc"

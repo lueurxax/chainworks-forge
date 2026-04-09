@@ -195,14 +195,35 @@ struct Proposal026Tests {
             Issue.record("Expected .textChunk with thinking prefix, got \(String(describing: thoughtChunk))")
         }
 
-        let errorEvent = ACPStreamEventMapper.mapNotification(
+        let permissionEvents = ACPStreamEventMapper.mapNotificationEvents(
+            method: "session/request_permission",
+            params: [
+                "tool": "read"
+            ]
+        )
+        #expect(permissionEvents.count == 2)
+        if permissionEvents.count == 2 {
+            if case .toolCallStarted(let toolName, _) = permissionEvents[0] {
+                #expect(toolName == "permission:read")
+            } else {
+                Issue.record("Expected permission start event, got \(String(describing: permissionEvents.first))")
+            }
+            if case .toolCallFinished(let toolName, _) = permissionEvents[1] {
+                #expect(toolName == "permission:read")
+            } else {
+                Issue.record("Expected permission finish event, got \(String(describing: permissionEvents.dropFirst().first))")
+            }
+        }
+
+        let errorEvents = ACPStreamEventMapper.mapNotificationEvents(
             method: "session/error",
             params: ["message": "Connection lost"]
         )
-        if case .error(let message) = errorEvent {
+        #expect(errorEvents.count == 1)
+        if case .error(let message) = errorEvents.first {
             #expect(message == "Connection lost")
         } else {
-            Issue.record("Expected .error, got \(String(describing: errorEvent))")
+            Issue.record("Expected .error, got \(String(describing: errorEvents.first))")
         }
     }
 

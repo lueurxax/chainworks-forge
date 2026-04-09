@@ -761,6 +761,11 @@ struct BlockedRunRecoveryView: View {
                 try executionService.resumeRun(run: run, compiler: compiler)
                 dismiss()
 
+            case .resumeInterrupted:
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                try executionService.resumeRun(run: run, compiler: compiler)
+                dismiss()
+
             case .resumeFromApprovalGate(let stageID):
                 _ = try coordinator.resumeFromApprovalGate(run: run, stageID: stageID)
                 dismiss()
@@ -864,7 +869,7 @@ struct BlockedRunRecoveryView: View {
 
     private func actionColor(_ action: RecoveryAction) -> Color {
         switch action {
-        case .resumeFromApprovalGate: return DesignTokens.Action.approve
+        case .resumeInterrupted, .resumeFromApprovalGate: return DesignTokens.Action.approve
         case .retryAgent, .retryAggregateStep, .retryStage: return DesignTokens.Action.caution
         case .resetAgentSession: return DesignTokens.Status.error
         case .cloneRunFrozenSnapshot: return DesignTokens.Action.primary
@@ -874,6 +879,8 @@ struct BlockedRunRecoveryView: View {
 
     private func actionDescription(_ action: RecoveryAction) -> String {
         switch action {
+        case .resumeInterrupted(let stageID):
+            return "Continue the interrupted run from the prepared continuation state \(stageID)."
         case .resumeFromApprovalGate(let stageID):
             return "Re-arm the approval gate at \(stageID) and continue execution."
         case .retryAggregateStep(let stageID, let agentID):

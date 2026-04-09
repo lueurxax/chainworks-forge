@@ -256,6 +256,7 @@ enum RuntimeTransportError: Error, LocalizedError {
     case sessionCreationFailed(reason: String)
     case streamingFailed(reason: String)
     case sessionCloseFailed(reason: String)
+    case unknownAdapterFamily(String)
 
     var errorDescription: String? {
         switch self {
@@ -269,6 +270,8 @@ enum RuntimeTransportError: Error, LocalizedError {
             return "Streaming failed: \(reason)"
         case .sessionCloseFailed(let reason):
             return "Session close failed: \(reason)"
+        case .unknownAdapterFamily(let family):
+            return "No registered transport adapter for runtime family '\(family)'. Register the adapter before adding its runtime profile to the catalog."
         }
     }
 }
@@ -278,14 +281,14 @@ enum RuntimeTransportError: Error, LocalizedError {
 /// Resolves the correct transport for each agent based on its runtime profile.
 /// Transports are cached by adapter family — max one instance per family per run.
 protocol RuntimeTransportFactory: Sendable {
-    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> any RuntimeTransportProtocol
+    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol
 }
 
 /// Trivial factory wrapping a single transport — backward compatibility for tests
 /// and runs where all agents share one transport.
 struct SingleTransportFactory: RuntimeTransportFactory {
     let transport: any RuntimeTransportProtocol
-    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) -> any RuntimeTransportProtocol {
+    func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol {
         transport
     }
 }
