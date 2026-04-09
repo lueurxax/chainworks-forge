@@ -474,12 +474,12 @@ ForgeLogger.session.info("[\(sessionID)] Stream Success. Duration: \(Int(complet
             )
         }
 
-        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
         return MCPPolicyResolver().resolve(
             agent: agent,
             catalog: catalog,
             providerBinding: context.providerBinding,
-            gooseRegistry: gooseRegistry,
+            runtimeRegistry: runtimeRegistry,
             runtimeNamespaceOverride: bridge.transport.mcpRuntimeNamespace
         )
     }

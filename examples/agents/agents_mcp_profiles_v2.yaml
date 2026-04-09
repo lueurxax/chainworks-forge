@@ -114,6 +114,7 @@ mcp_server_registry:
   developer:
     runtime_ids:
       goose: developer
+      codex: developer
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
@@ -121,6 +122,7 @@ mcp_server_registry:
   analyze:
     runtime_ids:
       goose: analyze
+      codex: analyze
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
@@ -135,6 +137,7 @@ mcp_server_registry:
   xcode:
     runtime_ids:
       goose: xcode
+      codex: xcode
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
@@ -142,6 +145,7 @@ mcp_server_registry:
   context7:
     runtime_ids:
       goose: context7
+      codex: context7
     session_scoped: true
     assignment_policy: explicit_opt_in
     risk_class: normal
@@ -581,6 +585,7 @@ backend_profiles:
     temperature: 0.12
     max_turns: 18
     structured_output: preferred
+    runtime_profile: codex_acp
   claude_product_high:
     provider: claude_code
     model: opus

@@ -67,7 +67,7 @@ struct StructuredOutputSchemaGate {
     ) -> Bool {
         if let runtimeProfile {
             switch runtimeProfile.adapterFamily {
-            case "claude_agent_acp", "gemini_cli_acp", "codex_acp":
+            case "claude_agent_acp", "gemini_cli_acp", "codex_acp", "auggie_cli_acp", "junie_cli_acp":
                 return true
             case "goose":
                 return providerSupportsStructuredOutput(provider: provider)

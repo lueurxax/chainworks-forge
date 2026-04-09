@@ -143,12 +143,12 @@ final class RuntimeSessionBridge: Sendable {
             )
         }
 
-        let gooseRegistry = try? extensionRegistryProvider.registrySnapshot()
+        let runtimeRegistry = try? extensionRegistryProvider.registrySnapshot()
         return MCPPolicyResolver().resolve(
             agent: agent,
             catalog: catalog,
             providerBinding: context.providerBinding,
-            gooseRegistry: gooseRegistry,
+            runtimeRegistry: runtimeRegistry,
             runtimeNamespaceOverride: transport.mcpRuntimeNamespace
         )
     }

@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-07 |
-| Status | Draft |
+| Status | Accepted (Implementation-aligned amendments on 2026-04-09) |
 | Author | Codex / Andrey Khasanov |
 | Depends on | [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/live-provider-execution-slice.md](../reference/live-provider-execution-slice.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [../reference/provider-platform.md](../reference/provider-platform.md) |
-| Scope | Expand the ACP runtime with three second-wave providers (Codex ACP, Auggie CLI ACP, Junie CLI ACP), including the required provider-platform expansion, fail-closed transport factory, MCP namespace migration, and capability enforcement ownership. |
-| Goal | Add three real ACP runtimes to the catalog while preserving Forge execution truth and closing the structural gaps identified in the R1 review. |
+| Scope | Expand the ACP runtime with three second-wave providers (Codex ACP, Auggie CLI ACP, Junie CLI ACP), preserve the already-landed catalog cutovers for Codex and Gemini review, and complete the remaining fail-closed transport, MCP registry, and capability-enforcement work without regressing current ACP routing. |
+| Goal | Keep the catalog and runtime aligned around real ACP-backed second-wave providers while preserving Forge execution truth and closing the remaining structural gaps identified in the R1 review. |
 
 ---
 
@@ -33,6 +33,8 @@ However, the R1 review of this proposal identified four structural problems that
 4. **New capability tokens have no enforcement consumer.** The proposal introduced `session_new`, `session_load`, `mcp_attach`, etc. but nothing in the codebase reads or enforces `requires` on `RuntimeProfile`.
 
 This revision addresses all four.
+
+Since the original draft, part of the rollout has already landed in the canonical catalog and validation path. This proposal now acts as the source of truth for those changes as well; implementation work that follows must preserve them rather than reverting to earlier pre-cutover assumptions.
 
 ---
 
@@ -60,6 +62,7 @@ This proposal includes:
 - **MCP registry migration**: promote `GooseExtensionRegistrySnapshot` / `GooseExtensionRegistryReader` to transport-neutral `RuntimeExtensionRegistry` with per-adapter install/readiness owners, and update `MCPPolicyResolver` to resolve against the registry for the binding's adapter family instead of hard-coding Goose
 - **Capability enforcement via existing `ProviderCapabilities`**: extend `ProviderCapabilities` (not a parallel authority) with runtime-profile-derived fields, and add preflight validation that checks adapter-declared capabilities against `RuntimeProfile.requires`
 - **Rollout gating**: per-adapter feature flag on `ConfiguredProvider.isEnabled` — single owner for enablement, no parallel enablement lanes
+- **Implementation-aligned catalog preservation**: keep the already-landed ACP routing and profile upgrades for `codex_writer_high`, `gemini_review_pro`, and second-wave orchestrator ACP profiles
 
 This proposal does **not** include:
 
@@ -67,6 +70,30 @@ This proposal does **not** include:
 - Hard runtime cutover
 - Asserting operator-grade classification for any second-wave provider
 - Cross-provider MCP parity claims
+
+### 3.1 Implementation-Aligned Amendments
+
+The following catalog/runtime decisions are already landed and are now normative. Future implementation under this proposal must preserve them unless a later proposal explicitly supersedes them:
+
+1. **`codex_writer_high` is ACP-bound.**
+   - `codex_writer_high` now resolves via `runtime_profile: codex_acp`.
+   - Do not revert this writer profile to the Goose-backed `.codex` transport path as part of second-wave implementation work.
+
+2. **Gemini proposal reviewers use `pro` on ACP.**
+   - `proposal_reviewer_ui` and `proposal_reviewer_ux` now bind to `gemini_review_pro`.
+   - Do not silently downgrade them back to a flash-tier review profile while finishing proposal 029 work.
+
+3. **Second-wave orchestrator ACP profiles request structured output.**
+   - `codex_orchestrator_acp`, `auggie_orchestrator_acp`, and `junie_orchestrator_acp` request `structured_output: preferred`.
+   - Gate/validation work must continue to treat this as valid ACP intent, not as a catalog error to “fix” by removing the request.
+
+4. **Catalog MCP runtime mappings for Codex are required, not optional scaffolding.**
+   - `developer`, `analyze`, `xcode`, and `context7` server mappings for the `codex` runtime namespace are part of the accepted rollout state.
+   - Second-wave implementation must not trim those mappings back out of `mcp_server_registry`.
+
+5. **Structured-output capability gating already recognizes second-wave ACP families.**
+   - `codex_acp`, `auggie_cli_acp`, and `junie_cli_acp` are already treated as structured-output-capable transports by preflight/schema validation.
+   - Future work must keep that alignment between catalog intent and gate behavior.
 
 ---
 
@@ -148,6 +175,8 @@ However, the registry layer beneath namespace resolution is still Goose-owned:
 - `resolveServer()` takes `gooseRegistry: GooseExtensionRegistrySnapshot?` (`MCPPolicyRuntime.swift:304`)
 - `GooseExtensionRegistryReader` is still the only `RuntimeExtensionRegistryProvider` conformer
 - Preflight loads the registry as "Goose Extension Registry" (`PreflightService.swift`)
+
+This gap remains real even after the 2026-04-09 catalog cutovers. In other words: second-wave ACP profiles and mappings are now accepted catalog truth, but the registry/provider side is still only partially generalized. Finishing proposal 029 means completing this registry migration, not undoing the catalog changes to match the older Goose-centric layer.
 
 This proposal needs to fix the registry layer, not the namespace layer.
 
@@ -292,7 +321,10 @@ backend_profiles:
    - Register `AuggieCLIACPTransport` and `JunieCLIACPTransport`
    - Run proof gates
 
-**Critical invariant**: Phase 1 ships the fail-closed factory **before** any profile scaffolding. No profile can exist in catalog data until its adapter is registered, because the factory will refuse to create the transport.
+**Implementation note (2026-04-09)**: profile scaffolding is no longer hypothetical. The canonical catalog already contains second-wave runtime profiles, Codex MCP namespace mappings, and the `codex_writer_high` ACP cutover. The operative invariant is now narrower and stricter:
+
+- no new adapter family may be added without fail-closed factory registration;
+- no existing ACP profile or mapping introduced by this rollout may be reverted back to Goose merely to accommodate unfinished structural work.
 
 ### 4.8 Disabled-Provider Rollout Semantics
 
@@ -331,6 +363,11 @@ backend_profiles:
 7. Run snapshots and execution reports preserve truth consistently across all provider families.
 8. Rollout enablement uses `ConfiguredProvider.isEnabled` as single owner: `preferredProvider(for:)` filters by `isEnabled`, preflight distinguishes "not enabled" from "capability mismatch", and preferred-provider repair respects disabled state. Second-wave families seed as disabled by default.
 9. A focused `proposal-029` gate in `test-gate.sh` passes on the canonical tree.
+10. The canonical catalog continues to preserve the current rollout decisions:
+    - `codex_writer_high` resolves through `codex_acp`
+    - Gemini proposal reviewers resolve through `gemini_review_pro`
+    - `codex`, `auggie`, and `junie` ACP orchestrator profiles keep `structured_output: preferred`
+    - `codex` MCP runtime mappings for `developer`, `analyze`, `xcode`, and `context7` remain present
 
 ---
 

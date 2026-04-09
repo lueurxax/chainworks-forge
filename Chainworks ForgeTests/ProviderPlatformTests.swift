@@ -1796,6 +1796,101 @@ struct ProviderPlatformTests {
         #expect(!report.blockingIssues.contains { $0.contains("Model GPT-5.4 is not available") })
     }
 
+    @Test("Preflight does not block codex ACP bindings on Goose provider health or missing codex MCP mappings")
+    mutating func preflightAllowsCodexACPBindingsWithoutGooseCredentialRequirement() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
+        let configuration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: configuration
+        ))
+        let codex = ConfiguredProvider(
+            family: .codex,
+            displayName: "Codex Goose",
+            transport: .gooseServer,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .apiKey,
+            defaultModel: "gpt-5-codex"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [codex],
+                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: codex.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.codex-acp-preflight"),
+            adapters: makeAdapters(gooseProbe: { _ in
+                .reachable(statusCode: 200)
+            })
+        ))
+        let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "tool_use",
+            backendProfileID: "codex_writer_high",
+            provider: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 18,
+            temperature: 0.12,
+            permissionProfile: "IMPLEMENT_WRITE",
+            mcpProfileID: "code_build_rich",
+            skillRef: "implementation_writer_core",
+            skillRole: nil,
+            prompt: "Implement the approved proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["implementation_summary"],
+            worktreeWriteEnabled: true,
+            runtimeProfileID: "codex_acp"
+        )
+
+        let plan = RunPlan(
+            workflowID: "codex_acp_preflight",
+            workflowTitle: "Codex ACP Preflight",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let report = await preflight.runReport(
+            workflowURL: URL(fileURLWithPath: configuration.workflowSourcePath),
+            catalogURL: URL(fileURLWithPath: configuration.agentCatalogSourcePath),
+            plan: plan
+        )
+
+        #expect(!report.blockingIssues.contains { $0.contains("runtime mapping for 'codex'") })
+        #expect(!report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("API key is missing") })
+        #expect(!report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("provider requires attention") })
+    }
+
     @Test("Sample run launcher creates frozen provider binding snapshot")
     mutating func sampleRunLauncherCreatesFrozenProviderBindingSnapshot() async throws {
         let tempDirectory = try makeTempDirectory()

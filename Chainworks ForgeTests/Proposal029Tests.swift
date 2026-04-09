@@ -167,4 +167,35 @@ struct Proposal029Tests {
         let resolved = registry.preferredProvider(for: .codexACP)
         #expect(resolved == nil)
     }
+
+    @Test("ProviderSettingsStore migrates empty persisted stores to seeded defaults")
+    func emptyPersistedStoreReseedsDefaults() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("p029-empty-store-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fileURL = tempDir.appendingPathComponent("settings.json")
+        try JSONEncoder().encode(ProviderSettings.empty).write(to: fileURL)
+
+        let store = ProviderSettingsStore(fileURL: fileURL)
+        let families = Set(store.settings.configuredProviders.map(\.family))
+
+        #expect(families.contains(.codex))
+        #expect(families.contains(.claude))
+        #expect(families.contains(.gemini))
+        #expect(!store.settings.configuredProviders.isEmpty)
+    }
+
+    @Test("Example catalog maps codex runtime namespace for rich MCP servers")
+    func exampleCatalogMapsCodexRuntimeNamespaceForRichMCPServers() throws {
+        let repoRoot = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true)
+        let catalogURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml")
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+
+        for serverID in ["developer", "analyze", "xcode", "context7"] {
+            let runtimeID = catalog.mcpServerRegistry[serverID]?.runtimeIDs["codex"]
+            #expect(runtimeID == serverID)
+        }
+    }
 }

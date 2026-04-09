@@ -192,7 +192,7 @@ struct MCPPolicyResolver: Sendable {
         agent: ResolvedAgent,
         catalog: AgentCatalog,
         providerBinding: ResolvedProviderBinding?,
-        gooseRegistry: RuntimeExtensionRegistrySnapshot?,
+        runtimeRegistry: RuntimeExtensionRegistrySnapshot?,
         runtimeNamespaceOverride: String? = nil
     ) -> MCPPolicyResolutionReport {
         let defaultProfile = catalog.mcpPolicy.defaultProfile
@@ -235,7 +235,7 @@ struct MCPPolicyResolver: Sendable {
             if runtimeNamespace == nil {
                 blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
             }
-            if runtimeNamespace == "goose", gooseRegistry == nil {
+            if runtimeNamespace == "goose", runtimeRegistry == nil {
                 blockingIssues.append("Goose extension registry is unavailable; cannot validate MCP profile '\(profileID)' for agent '\(agent.id)'.")
             }
         }
@@ -245,7 +245,7 @@ struct MCPPolicyResolver: Sendable {
                 serverID: serverID,
                 runtimeNamespace: runtimeNamespace,
                 registry: catalog.mcpServerRegistry,
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             ) {
             case .available(let runtimeID):
                 requiredRuntimeIDs.append(runtimeID)
@@ -266,7 +266,7 @@ struct MCPPolicyResolver: Sendable {
                 serverID: serverID,
                 runtimeNamespace: runtimeNamespace,
                 registry: catalog.mcpServerRegistry,
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             ) {
             case .available(let runtimeID):
                 optionalRuntimeIDs.append(runtimeID)
@@ -301,7 +301,7 @@ struct MCPPolicyResolver: Sendable {
         serverID: String,
         runtimeNamespace: String?,
         registry: [String: MCPServerRegistryEntry],
-        gooseRegistry: RuntimeExtensionRegistrySnapshot?
+        runtimeRegistry: RuntimeExtensionRegistrySnapshot?
     ) -> MCPServerResolution {
         guard let entry = registry[serverID] else {
             return .missing("MCP server '\(serverID)' is not declared in mcp_server_registry.")
@@ -313,10 +313,10 @@ struct MCPPolicyResolver: Sendable {
             return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
         }
         if runtimeNamespace == "goose" {
-            guard let gooseRegistry else {
+            guard let runtimeRegistry else {
                 return .missing("MCP server '\(serverID)' cannot be validated because Goose extension registry is unavailable.")
             }
-            guard gooseRegistry.configsByRuntimeID[runtimeID] != nil else {
+            guard runtimeRegistry.configsByRuntimeID[runtimeID] != nil else {
                 return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in Goose.")
             }
         }

@@ -95,10 +95,6 @@ enum ProviderAdapterSupport {
             issues.append("Goose server base URL is invalid")
         }
 
-        if !hasRequiredCredential(provider: provider, secretStore: secretStore) {
-            issues.append(credentialIssue(for: provider))
-        }
-
         if let baseURL {
             switch await gooseProbe(baseURL) {
             case .reachable(let statusCode):

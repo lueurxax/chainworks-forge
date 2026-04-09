@@ -674,7 +674,7 @@ struct PreflightService {
         warnings: inout [String],
         blockingIssues: inout [String]
     ) {
-        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
         let resolver = MCPPolicyResolver()
         let activeAgents = plan.agentBindings.values.sorted { $0.id < $1.id }
 
@@ -683,29 +683,29 @@ struct PreflightService {
                 agent: agent,
                 catalog: catalog,
                 providerBinding: bindings[agent.id],
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             )
             return !resolution.requestedExtensions.isEmpty
         }
 
         let registryStatus: PreflightCheckStatus
         let registryMessage: String
-        if let gooseRegistry {
+        if let runtimeRegistry {
             registryStatus = .pass
-            registryMessage = "Loaded Goose extension registry from \(gooseRegistry.configURL.path) (\(gooseRegistry.installedExtensionIDs.count) installed)"
+            registryMessage = "Loaded runtime extension registry from \(runtimeRegistry.configURL.path) (\(runtimeRegistry.installedExtensionIDs.count) installed)"
         } else if anyRequestedMCP {
             registryStatus = .fail
-            registryMessage = "Goose extension registry is unavailable, but one or more agents request MCP extensions."
+            registryMessage = "Runtime extension registry is unavailable, but one or more agents request MCP extensions."
             blockingIssues.append(registryMessage)
         } else {
             registryStatus = .warn
-            registryMessage = "Goose extension registry is unavailable; zero-MCP sessions remain valid."
+            registryMessage = "Runtime extension registry is unavailable; zero-MCP sessions remain valid."
             warnings.append(registryMessage)
         }
 
         checks.append(PreflightCheck(
             category: "MCP",
-            title: "Goose Extension Registry",
+            title: "Runtime Extension Registry",
             status: registryStatus,
             message: registryMessage
         ))
@@ -715,7 +715,7 @@ struct PreflightService {
                 agent: agent,
                 catalog: catalog,
                 providerBinding: bindings[agent.id],
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             )
             let summary = [
                 "profile=\(resolution.profileID)",

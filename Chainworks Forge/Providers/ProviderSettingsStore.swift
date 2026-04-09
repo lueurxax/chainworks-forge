@@ -18,7 +18,8 @@ final class ProviderSettingsStore {
         }
 
         if let loaded = try? Self.load(from: resolvedURL) {
-            self.settings = Self.sanitized(loaded)
+            let migrated = Self.migratedIfNeeded(loaded)
+            self.settings = Self.sanitized(migrated)
             if self.settings != loaded {
                 try? persist()
             }
@@ -57,7 +58,7 @@ final class ProviderSettingsStore {
         settings.configuredProviders.removeAll { $0.id == id }
         if settings.preferredProviderIDsByFamily[provider.family.rawValue] == id {
             settings.preferredProviderIDsByFamily[provider.family.rawValue] =
-                settings.configuredProviders.first(where: { $0.family == provider.family })?.id
+                settings.configuredProviders.first(where: { $0.family == provider.family && $0.isEnabled })?.id
         }
         try? persist()
     }
@@ -83,11 +84,19 @@ final class ProviderSettingsStore {
 
     private static func sanitized(_ settings: ProviderSettings) -> ProviderSettings {
         ProviderSettings(
-            configuredProviders: settings.configuredProviders.map(sanitized),
+            configuredProviders: settings.configuredProviders.map { sanitized($0) },
             preferredProviderIDsByFamily: settings.preferredProviderIDsByFamily,
             notificationOnProviderFailure: settings.notificationOnProviderFailure,
             runStartRequiresCleanPreflight: settings.runStartRequiresCleanPreflight
         )
+    }
+
+    private static func migratedIfNeeded(_ settings: ProviderSettings) -> ProviderSettings {
+        guard settings.configuredProviders.isEmpty,
+              settings.preferredProviderIDsByFamily.isEmpty else {
+            return settings
+        }
+        return seededDefault()
     }
 
     private static func sanitized(_ provider: ConfiguredProvider) -> ConfiguredProvider {
@@ -119,10 +128,9 @@ final class ProviderSettingsStore {
 
     private static func seededDefault() -> ProviderSettings {
         let environment = ProcessInfo.processInfo.environment
-        let seedsInMemory = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
         let fixtureEndpoint = environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == nil ? nil : "http://fixture.local"
         let gooseBaseURL = environment["CHAINWORKS_GOOSE_BASE_URL"] ?? fixtureEndpoint
-        var providers: [ConfiguredProvider] = seedsInMemory ? [
+        var providers: [ConfiguredProvider] = [
             ConfiguredProvider(
                 family: .codex,
                 displayName: "Codex Goose",
@@ -147,31 +155,6 @@ final class ProviderSettingsStore {
                 authMode: gooseBaseURL == nil || gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
                 defaultModel: "gemini-2.5-pro"
             ),
-            ConfiguredProvider(
-                family: .codexACP,
-                displayName: "Codex ACP",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "gpt-5",
-                isEnabled: false
-            ),
-            ConfiguredProvider(
-                family: .auggie,
-                displayName: "Auggie CLI",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "auggie-default",
-                isEnabled: false
-            ),
-            ConfiguredProvider(
-                family: .junie,
-                displayName: "Junie CLI",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "junie-default",
-                isEnabled: false
-            )
-        ] : [
             ConfiguredProvider(
                 family: .codexACP,
                 displayName: "Codex ACP",

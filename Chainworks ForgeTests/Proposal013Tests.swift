@@ -859,6 +859,54 @@ struct Proposal013Tests {
         #expect(result.isBlocking == false)
     }
 
+    @Test("StructuredOutputSchemaGate treats second-wave ACP transports as structured-output capable")
+    func structuredOutputGateSupportsSecondWaveACP() {
+        let catalog = makeTestCatalog(
+            withContracts: [:],
+            backendProfiles: [
+                "auggie_acp_profile": BackendProfile(
+                    provider: "auggie",
+                    model: "auggie-default",
+                    effort: "medium",
+                    temperature: 0,
+                    maxTurns: 8,
+                    structuredOutput: "preferred",
+                    runtimeProfile: "auggie_cli_acp"
+                ),
+                "junie_acp_profile": BackendProfile(
+                    provider: "junie",
+                    model: "junie-default",
+                    effort: "medium",
+                    temperature: 0,
+                    maxTurns: 8,
+                    structuredOutput: "preferred",
+                    runtimeProfile: "junie_cli_acp"
+                )
+            ],
+            runtimeProfiles: [
+                "auggie_cli_acp": RuntimeProfile(
+                    capabilityClass: .controlCapable,
+                    adapterFamily: "auggie_cli_acp",
+                    requires: ["streaming", "tools"],
+                    transportKind: "acp_stdio",
+                    mcpRealizationPath: "acp_native"
+                ),
+                "junie_cli_acp": RuntimeProfile(
+                    capabilityClass: .controlCapable,
+                    adapterFamily: "junie_cli_acp",
+                    requires: ["streaming", "tools"],
+                    transportKind: "acp_stdio",
+                    mcpRealizationPath: "acp_native"
+                )
+            ]
+        )
+
+        let results = StructuredOutputSchemaGate.validate(catalog: catalog)
+        #expect(results.count == 2)
+        #expect(results.allSatisfy { $0.transportSupportsStructured })
+        #expect(results.allSatisfy { !$0.isBlocking })
+    }
+
     // MARK: - Layer Q: Output Contract Declarative Bridge
 
     @Test("OutputContractDeclarativeBridge verifies V1-V2 binding parity")

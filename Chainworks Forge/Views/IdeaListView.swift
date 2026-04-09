@@ -2299,13 +2299,13 @@ struct WorkflowStartRunSheet: View {
         }
         let skillContentHashes = resolvedSkills.mapValues { $0.contentHash }
         let skillInjectedContentHashes = resolvedSkills.mapValues { $0.injectedContentHash }
-        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
         let resolvedMCPPolicies: [String: MCPPolicyResolutionReport] = adjustedPlan.agentBindings.reduce(into: [:]) { partialResult, entry in
             partialResult[entry.key] = MCPPolicyResolver().resolve(
                 agent: entry.value,
                 catalog: catalog,
                 providerBinding: providerBindings[entry.key],
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             )
         }
         let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
