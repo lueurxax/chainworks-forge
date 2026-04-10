@@ -35,7 +35,7 @@ private let dummyWorkflow = WorkflowDefinition(
 private let dummyCatalog = AgentCatalog(
     schemaVersion: 1,
     app: AppConfig(
-        name: "test", runtime: "goose", transport: "http",
+        name: "test", runtime: "claude_agent", transport: "http",
         description: "test", ideaInputMode: "text",
         singleActiveRunPerIdea: true, runResumePolicy: "automatic_on_launch",
         requiredProviders: []
@@ -105,7 +105,7 @@ private func makeCatalog(
     AgentCatalog(
         schemaVersion: 1,
         app: AppConfig(
-            name: "test", runtime: "goose", transport: "http",
+            name: "test", runtime: "claude_agent", transport: "http",
             description: "test", ideaInputMode: "text",
             singleActiveRunPerIdea: true, runResumePolicy: "automatic_on_launch",
             requiredProviders: []
@@ -859,7 +859,7 @@ struct YAMLParserTests {
         let url = repoRoot.appendingPathComponent("examples/agents/agents_mcp_profiles_v2.yaml")
         let catalog = try YAMLParser.loadAgentCatalog(from: url)
         #expect(catalog.mcpPolicy.defaultProfile == "none")
-        #expect(catalog.mcpServerRegistry["xcode"]?.runtimeIDs["goose"] == "xcode")
+        #expect(catalog.mcpServerRegistry["xcode"]?.runtimeIDs["claude_agent"] == "xcode")
         #expect(catalog.mcpProfiles["code_build_rich"] != nil)
         let codeWriter = try #require(catalog.agents.first(where: { $0.id == "code_writer" }))
         #expect(codeWriter.mcpProfile == "code_build_rich")

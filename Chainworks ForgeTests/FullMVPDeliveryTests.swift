@@ -134,7 +134,7 @@ struct FullMVPWorkflowTests {
             providerIdentifier: "claude_code",
             model: "sonnet",
             effort: "high",
-            transport: "goose_server",
+            transport: "acp_http",
             adapterVersion: "v1"
         )
 
@@ -880,7 +880,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureACPTransport(scenario: .fullMVPSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
@@ -1046,7 +1046,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureACPTransport(scenario: .fullMVPSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
@@ -1158,7 +1158,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPRefineThenSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureACPTransport(scenario: .fullMVPRefineThenSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,

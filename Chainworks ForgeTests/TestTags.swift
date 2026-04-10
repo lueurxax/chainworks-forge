@@ -11,7 +11,7 @@ extension Tag {
     /// Tests requiring external provider connectivity.
     @Tag static var integration: Self
 
-    /// Tests requiring a running Goose server.
+    /// Tests requiring a running runtime server.
     @Tag static var live: Self
 
     /// Provider-specific tests (Proposal 006 scope).

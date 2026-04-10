@@ -19,7 +19,7 @@ struct RuntimeSessionBridgeTests {
         var lastCreateRequest: RuntimeSessionRequest?
         private let runtimeNamespace: String?
 
-        init(runtimeNamespace: String? = "goose") {
+        init(runtimeNamespace: String? = "claude_agent") {
             self.runtimeNamespace = runtimeNamespace
         }
 
@@ -116,7 +116,7 @@ struct RuntimeSessionBridgeTests {
             schemaVersion: 1,
             app: AppConfig(
                 name: "Test",
-                runtime: "goose",
+                runtime: "claude_agent",
                 transport: "rest_sse",
                 description: "Test",
                 ideaInputMode: "text",
@@ -131,7 +131,6 @@ struct RuntimeSessionBridgeTests {
             mcpServerRegistry: [
                 "context7": MCPServerRegistryEntry(
                     runtimeIDs: [
-                        "goose": "context7",
                         "claude_agent": "context7"
                     ],
                     sessionScoped: true,
@@ -141,7 +140,6 @@ struct RuntimeSessionBridgeTests {
                 ),
                 "xcode": MCPServerRegistryEntry(
                     runtimeIDs: [
-                        "goose": "xcode",
                         "claude_agent": "xcode",
                         "gemini_cli": "xcode"
                     ],
@@ -266,7 +264,7 @@ struct RuntimeSessionBridgeTests {
     func sessionBridgeResolvesRequestedMCPExtensions() async throws {
         let transport = CapturingTransport()
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
-            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
             installedExtensionIDs: ["context7"],
             enabledExtensionIDs: ["context7"],
             configsByRuntimeID: [
@@ -349,7 +347,7 @@ struct RuntimeSessionBridgeTests {
     func sessionBridgeResolvesRequestedMCPExtensionsWithoutFrozenBinding() async throws {
         let transport = CapturingTransport()
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
-            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
             installedExtensionIDs: ["context7"],
             enabledExtensionIDs: ["context7"],
             configsByRuntimeID: [
@@ -422,7 +420,7 @@ struct RuntimeSessionBridgeTests {
     func sessionBridgeRealizesGeminiACPMCPServersFromLocalRegistry() async throws {
         let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
-            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
             installedExtensionIDs: ["xcode"],
             enabledExtensionIDs: ["xcode"],
             configsByRuntimeID: [
@@ -512,11 +510,169 @@ struct RuntimeSessionBridgeTests {
         ])
     }
 
+    @Test("Session bridge realizes Codex ACP platform MCP lanes from local registry")
+    func sessionBridgeRealizesCodexACPPlatformMCPLanesFromLocalRegistry() async throws {
+        let transport = CapturingTransport(runtimeNamespace: "codex")
+        let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
+            installedExtensionIDs: ["developer", "xcode"],
+            enabledExtensionIDs: ["developer", "xcode"],
+            configsByRuntimeID: [
+                "developer": RuntimeExtensionDefinition(
+                    enabled: true,
+                    type: "platform",
+                    name: "developer",
+                    description: "Write and edit files, and execute shell commands",
+                    displayName: "Developer",
+                    cmd: nil,
+                    args: nil,
+                    envs: nil,
+                    envKeys: nil,
+                    timeout: nil,
+                    bundled: true,
+                    availableTools: []
+                ),
+                "xcode": RuntimeExtensionDefinition(
+                    enabled: true,
+                    type: "stdio",
+                    name: "xcode",
+                    description: nil,
+                    displayName: nil,
+                    cmd: "xcrun",
+                    args: ["mcpbridge"],
+                    envs: [:],
+                    envKeys: nil,
+                    timeout: nil,
+                    bundled: nil,
+                    availableTools: nil
+                )
+            ]
+        ))
+        let bridge = RuntimeSessionBridge(
+            transport: transport,
+            extensionRegistryProvider: registryProvider
+        )
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            provider: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 24,
+            temperature: 0.0,
+            permissionProfile: "read_write",
+            mcpProfileID: "code_build_rich",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a code writer.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["approved_proposal"],
+            outputs: ["implementation_progress"],
+            worktreeWriteEnabled: true
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Test",
+                runtime: "acp",
+                transport: "acp_stdio",
+                description: "Test",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic",
+                requiredProviders: ["codex"]
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: nil, description: nil)],
+            mcpPolicy: .defaultDeny,
+            mcpServerRegistry: [
+                "developer": MCPServerRegistryEntry(
+                    runtimeIDs: ["codex": "developer"],
+                    sessionScoped: true,
+                    assignmentPolicy: "explicit_opt_in",
+                    riskClass: "normal",
+                    notes: nil
+                ),
+                "xcode": MCPServerRegistryEntry(
+                    runtimeIDs: ["codex": "xcode"],
+                    sessionScoped: true,
+                    assignmentPolicy: "explicit_opt_in",
+                    riskClass: "normal",
+                    notes: nil
+                )
+            ],
+            mcpProfiles: [
+                "code_build_rich": MCPProfile(
+                    requiredExtensions: ["xcode", "developer"],
+                    optionalExtensions: [],
+                    fallbackPolicy: "fail_if_required_missing"
+                )
+            ],
+            contracts: [:],
+            backendProfiles: [:],
+            permissionProfiles: [:],
+            agents: []
+        )
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_7_implementation_started",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Implement the approved proposal",
+            providerBinding: ResolvedProviderBinding(
+                agentID: "code_writer",
+                backendProfileID: "codex_builder_high",
+                configuredProviderID: UUID(),
+                providerFamily: "codex",
+                providerIdentifier: "codex",
+                model: "GPT-5.4",
+                effort: "high",
+                transport: "acp_stdio",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .controlCapable
+            ),
+            catalog: catalog
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: AgentTask(agent: "code_writer", task: "initial_implementation", inputs: ["approved_proposal"], outputs: ["implementation_progress"]),
+            context: context,
+            override: nil
+        )
+
+        #expect(transport.lastCreateRequest?.requestedExtensions == nil)
+        #expect(transport.lastCreateRequest?.mcpServers == [
+            RuntimeMCPServerDefinition(
+                name: "developer",
+                type: "platform"
+            ),
+            RuntimeMCPServerDefinition(
+                name: "xcode",
+                command: "xcrun",
+                args: ["mcpbridge"],
+                env: []
+            )
+        ])
+    }
+
     @Test("Session bridge blocks Gemini ACP session when required MCP server is unavailable locally")
     func sessionBridgeBlocksGeminiACPWhenRequiredMCPServerMissingLocally() async throws {
         let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
-            configURL: URL(fileURLWithPath: "/tmp/goose-config.yaml"),
+            configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
             installedExtensionIDs: [],
             enabledExtensionIDs: [],
             configsByRuntimeID: [:]

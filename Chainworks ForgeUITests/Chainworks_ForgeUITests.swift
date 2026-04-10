@@ -125,14 +125,14 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_WORKFLOW_SOURCE_PATH"] = workflowSourcePath
         app.launchEnvironment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"] = catalogSourcePath
         app.launchEnvironment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"] = uiTestExportDirectory().path
-        let gooseFixturePath = URL(fileURLWithPath: resolvedRepoRoot)
-            .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
+        let mcpFixturePath = URL(fileURLWithPath: resolvedRepoRoot)
+            .appendingPathComponent("examples/mcp/mcp-config-fixture.yaml")
             .path
-        if let inheritedGooseConfigPath = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_CONFIG_PATH"],
-           !inheritedGooseConfigPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            app.launchEnvironment["CHAINWORKS_GOOSE_CONFIG_PATH"] = inheritedGooseConfigPath
-        } else if FileManager.default.isReadableFile(atPath: gooseFixturePath) {
-            app.launchEnvironment["CHAINWORKS_GOOSE_CONFIG_PATH"] = gooseFixturePath
+        if let inheritedMCPConfigPath = ProcessInfo.processInfo.environment["CHAINWORKS_CODEX_CONFIG_PATH"],
+           !inheritedMCPConfigPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            app.launchEnvironment["CHAINWORKS_CODEX_CONFIG_PATH"] = inheritedMCPConfigPath
+        } else if FileManager.default.isReadableFile(atPath: mcpFixturePath) {
+            app.launchEnvironment["CHAINWORKS_CODEX_CONFIG_PATH"] = mcpFixturePath
         }
         if let directSurface {
             app.launchEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] = directSurface
@@ -966,31 +966,31 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "P006_Settings_Export")
     }
 
-    func testGooseAssistantSurface() throws {
+    func testRuntimeAssistantSurface() throws {
         let app = makeApp(
             initialTab: "Settings",
-            directSurface: "goose_assistant"
+            directSurface: "runtime_assistant"
         )
         launchClean(app)
 
-        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
-        let assistantTitle = app.staticTexts["goose-assistant-title"].firstMatch
+        let assistantRoot = anyElement(app, identifier: "runtime-connection-assistant-view")
+        let assistantTitle = app.staticTexts["runtime-assistant-title"].firstMatch
         XCTAssertTrue(
             assistantRoot.waitForExistence(timeout: 20)
             || assistantTitle.waitForExistence(timeout: 20),
-            "Goose connection assistant surface must render"
+            "Runtime connection assistant surface must render"
         )
 
-        let probeButton = app.buttons["goose-assistant-run-probe"].firstMatch
+        let probeButton = app.buttons["runtime-assistant-run-probe"].firstMatch
         XCTAssertTrue(probeButton.waitForExistence(timeout: 20), "Assistant must expose handshake probe action")
         probeButton.click()
 
-        let stateBadge = anyElement(app, identifier: "goose-assistant-state")
+        let stateBadge = anyElement(app, identifier: "runtime-assistant-state")
         XCTAssertTrue(stateBadge.waitForExistence(timeout: 20), "Assistant must expose journey state")
-        screenshot(app, name: "P010_Goose_Assistant")
+        screenshot(app, name: "P010_Runtime_Assistant")
     }
 
-    func testGooseAssistantOpensFromProviderSettings() throws {
+    func testRuntimeAssistantOpensFromProviderSettings() throws {
         let app = makeApp(
             initialTab: "Settings",
             directSurface: "provider_settings"
@@ -1001,15 +1001,15 @@ final class Chainworks_ForgeUITests: XCTestCase {
         XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "Provider settings direct surface must finish bootstrap")
 
         let openAssistant = app.buttons["provider-settings-open-assistant-codex"].firstMatch
-        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Provider settings must expose Goose assistant entry")
+        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Provider settings must expose runtime assistant entry")
         openAssistant.click()
 
-        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
-        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Settings must open the Goose assistant owner path")
-        XCTAssertTrue(app.buttons["goose-assistant-save-and-verify"].firstMatch.waitForExistence(timeout: 20))
+        let assistantRoot = anyElement(app, identifier: "runtime-connection-assistant-view")
+        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Settings must open the runtime assistant owner path")
+        XCTAssertTrue(app.buttons["runtime-assistant-save-and-verify"].firstMatch.waitForExistence(timeout: 20))
     }
 
-    func testGooseAssistantOpensFromFirstRunWizard() throws {
+    func testRuntimeAssistantOpensFromFirstRunWizard() throws {
         let app = makeApp(
             initialTab: "Settings",
             directSurface: "first_run_setup"
@@ -1020,15 +1020,15 @@ final class Chainworks_ForgeUITests: XCTestCase {
         XCTAssertTrue(wizardReady.waitForExistence(timeout: 20), "First Run Wizard direct surface must finish bootstrap")
 
         let openAssistant = app.buttons["first-run-open-assistant-codex"].firstMatch
-        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Wizard must expose Goose assistant entry")
+        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Wizard must expose runtime assistant entry")
         openAssistant.click()
 
-        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
-        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Wizard must hand off into the Goose assistant")
-        XCTAssertTrue(app.buttons["goose-assistant-return"].firstMatch.waitForExistence(timeout: 20))
+        let assistantRoot = anyElement(app, identifier: "runtime-connection-assistant-view")
+        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Wizard must hand off into the runtime assistant")
+        XCTAssertTrue(app.buttons["runtime-assistant-return"].firstMatch.waitForExistence(timeout: 20))
     }
 
-    func testGooseAssistantOpensFromPilotReadiness() throws {
+    func testRuntimeAssistantOpensFromPilotReadiness() throws {
         let app = makeApp(
             initialTab: "Pilot Readiness",
             directSurface: "pilot_readiness"
@@ -1039,11 +1039,11 @@ final class Chainworks_ForgeUITests: XCTestCase {
         XCTAssertTrue(surfaceReady.waitForExistence(timeout: 20), "Pilot readiness direct surface must finish bootstrap")
 
         let openAssistant = app.buttons["pilot-readiness-open-assistant-codex"].firstMatch
-        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Pilot readiness must expose Goose assistant handoff")
+        XCTAssertTrue(openAssistant.waitForExistence(timeout: 20), "Pilot readiness must expose runtime assistant handoff")
         openAssistant.click()
 
-        let assistantRoot = anyElement(app, identifier: "goose-connection-assistant-view")
-        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Pilot readiness must open the Goose assistant")
+        let assistantRoot = anyElement(app, identifier: "runtime-connection-assistant-view")
+        XCTAssertTrue(assistantRoot.waitForExistence(timeout: 20), "Pilot readiness must open the runtime assistant")
         XCTAssertTrue(anyElement(app, identifier: "provider-setup-evidence-panel").waitForExistence(timeout: 20))
     }
 

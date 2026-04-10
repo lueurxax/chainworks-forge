@@ -2,18 +2,7 @@ import Foundation
 import SwiftData
 import Observation
 
-// MARK: - GooseTransportAPI (Proposal 005, Section 5.5)
-
-/// Selects which transport protocol implementation to use for live execution.
-enum GooseTransportAPI: String, Codable, Sendable {
-    /// Original bespoke /api/sessions contract (never implemented server-side).
-    case bespoke
-    /// Real goosed /agent/start + /reply contract (Proposal 005).
-    case gooseServer = "goose_server"
-}
-
 enum LiveTransportMode: Sendable {
-    case network
     case fixtureProposalLoopSuccess
     case fixtureProposal022FeedbackCycle
     case fixtureProposal013AggregateFailure
@@ -21,13 +10,8 @@ enum LiveTransportMode: Sendable {
 }
 
 struct LiveRuntimeConfiguration: Sendable {
-    let baseURL: URL
-    let apiKey: String?
     let override: LiveExecutionOverride?
     let transportMode: LiveTransportMode
-    /// Proposal 005: which transport API to use for network mode.
-    /// Defaults to `.gooseServer` when `CHAINWORKS_GOOSE_BASE_URL` is set.
-    let transportAPI: GooseTransportAPI
 
     var summary: String {
         if let override {
@@ -37,23 +21,7 @@ struct LiveRuntimeConfiguration: Sendable {
     }
 
     var sourceDescription: String {
-        switch transportMode {
-        case .network:
-            switch transportAPI {
-            case .bespoke:
-                return "Goose backend (bespoke)"
-            case .gooseServer:
-                return "Goose server (goosed)"
-            }
-        case .fixtureProposalLoopSuccess:
-            return "Fixture backend"
-        case .fixtureProposal022FeedbackCycle:
-            return "Fixture backend"
-        case .fixtureProposal013AggregateFailure:
-            return "Fixture backend"
-        case .fixtureFullMVPSuccess:
-            return "Fixture backend"
-        }
+        "Fixture backend"
     }
 }
 
@@ -366,7 +334,7 @@ final class ExecutionService {
     /// **Phase 1** (synchronous): `beginSettlement()` — agents cancelled, preliminary log written,
     /// `presentationStatus` returns `.cancelling`.
     ///
-    /// **Session close** (async): Goose sessions are closed with per-session timeouts.
+    /// **Session close** (async): Runtime sessions are closed with per-session timeouts.
     /// Outcomes are recorded as observed truth, not optimistic placeholders.
     ///
     /// **Phase 2** (synchronous): `finalizeSettlement()` — settlement log updated with real outcomes,
@@ -405,7 +373,7 @@ final class ExecutionService {
         // Async session close — bounded per-session timeouts, outcomes recorded.
         let outcomes: [RunCancellationCoordinator.SessionCloseOutcome]
         if !sessionIDs.isEmpty {
-            outcomes = await RunCancellationCoordinator.closeGooseSessionsWithOutcomes(
+            outcomes = await RunCancellationCoordinator.closeRuntimeSessionsWithOutcomes(
                 sessionIDs: sessionIDs,
                 executor: executor
             )
@@ -799,15 +767,7 @@ final class ExecutionService {
         if forceUITestLiveRuntimeUnavailable {
             return .unavailable(
                 reason: "Live runtime is unavailable for this proof lane.",
-                recovery: "Connect a Goose backend or enable the fixture backend to unlock live workflows."
-            )
-        }
-
-        if let liveRuntimeConfiguration,
-           liveRuntimeConfiguration.transportMode != .network {
-            return .ready(
-                summary: liveRuntimeConfiguration.summary,
-                source: liveRuntimeConfiguration.sourceDescription
+                recovery: "Enable a runtime backend or the fixture backend to unlock live workflows."
             )
         }
 
@@ -820,7 +780,7 @@ final class ExecutionService {
 
         return .unavailable(
             reason: "Live runtime is unavailable",
-            recovery: "Connect a Goose backend or enable the fixture backend, then relaunch the app. Advanced setup: CHAINWORKS_GOOSE_BASE_URL or CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success."
+            recovery: "Enable a runtime backend or the fixture backend, then relaunch the app. Advanced setup: CHAINWORKS_FIXTURE_MODE=proposal_loop_success."
         )
     }
 
@@ -835,7 +795,7 @@ final class ExecutionService {
 
     private func requiresLiveRuntimeConfiguration(for plan: RunPlan) -> Bool {
         // Proposal 026: ACP-profiled runs launch their own subprocess —
-        // they do NOT require a Goose server to be configured.
+        // they do NOT require a legacy runtime server to be configured.
         if planHasACPRuntime(plan) { return false }
         return isLiveWorkflow(plan.workflowID) && liveRuntimeConfiguration == nil
     }
@@ -851,15 +811,15 @@ final class ExecutionService {
         }
 
         // Proposal 026: Per-agent transport via factory.
-        // Goose transport shared for all Goose agents; ACP transports cached per adapter family.
-        let gooseTransport: (any RuntimeTransportProtocol)?
+        // ACP transports are cached per adapter family. Fixture transport used for non-network modes.
+        let fixtureTransport: (any RuntimeTransportProtocol)?
         if let liveRuntimeConfiguration {
-            gooseTransport = resolveGooseTransport(liveRuntimeConfiguration)
+            fixtureTransport = resolveFixtureTransport(liveRuntimeConfiguration)
         } else {
-            gooseTransport = nil // ACP-only runs don't need Goose
+            fixtureTransport = nil
         }
 
-        let factory = DefaultRuntimeTransportFactory(gooseTransport: gooseTransport)
+        let factory = DefaultRuntimeTransportFactory(fixtureTransport: fixtureTransport)
         let sessionManager = AgentSessionManager(container: modelContext.container)
         return RuntimeAgentExecutor(
             transportFactory: factory,
@@ -868,19 +828,17 @@ final class ExecutionService {
         )
     }
 
-    /// Proposal 026: Resolve Goose-backed transport from live runtime configuration.
-    private func resolveGooseTransport(_ config: LiveRuntimeConfiguration) -> any RuntimeTransportProtocol {
+    /// Resolve fixture transport from live runtime configuration.
+    private func resolveFixtureTransport(_ config: LiveRuntimeConfiguration) -> any RuntimeTransportProtocol {
         switch config.transportMode {
-        case .network:
-            fatalError("Network-mode Goose transports have been removed. Use ACP runtime profiles or fixture modes instead.")
         case .fixtureProposalLoopSuccess:
-            return FixtureGooseTransport(scenario: .proposalLoopSuccess)
+            return FixtureACPTransport(scenario: .proposalLoopSuccess)
         case .fixtureProposal022FeedbackCycle:
-            return FixtureGooseTransport(scenario: .proposal022FeedbackCycle)
+            return FixtureACPTransport(scenario: .proposal022FeedbackCycle)
         case .fixtureProposal013AggregateFailure:
-            return FixtureGooseTransport(scenario: .proposal013AggregateFailure)
+            return FixtureACPTransport(scenario: .proposal013AggregateFailure)
         case .fixtureFullMVPSuccess:
-            return FixtureGooseTransport(scenario: .fullMVPSuccess)
+            return FixtureACPTransport(scenario: .fullMVPSuccess)
         }
     }
 
@@ -1093,23 +1051,23 @@ extension ExecutionService: ExecutionTerminationControlling {}
 
 /// Resolves the correct transport for each agent based on adapter family from its provider binding.
 /// Transports are cached by adapter family — max one instance per family per run.
-/// Goose transport is shared (created once). ACP transports are created on demand and cached.
+/// Fixture transport is shared (created once). ACP transports are created on demand and cached.
 final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked Sendable {
-    let gooseTransport: (any RuntimeTransportProtocol)?
+    let fixtureTransport: (any RuntimeTransportProtocol)?
     private let lock = NSLock()
     private var transportsByFamily: [String: any RuntimeTransportProtocol] = [:]
 
-    init(gooseTransport: (any RuntimeTransportProtocol)?) {
-        self.gooseTransport = gooseTransport
+    init(fixtureTransport: (any RuntimeTransportProtocol)?) {
+        self.fixtureTransport = fixtureTransport
     }
 
     func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol {
-        let family = binding?.adapterFamily ?? "goose"
-        guard family != "goose" && !family.isEmpty else {
-            guard let gooseTransport else {
-                throw RuntimeTransportError.sessionCreationFailed(reason: "Goose transport required but not configured. Agent '\(agent.id)' needs Goose but liveRuntimeConfiguration is absent.")
+        let family = binding?.adapterFamily ?? ""
+        guard !family.isEmpty else {
+            guard let fixtureTransport else {
+                throw RuntimeTransportError.sessionCreationFailed(reason: "Fixture transport required but not configured. Agent '\(agent.id)' has no adapter family and liveRuntimeConfiguration is absent.")
             }
-            return gooseTransport
+            return fixtureTransport
         }
 
         lock.lock()

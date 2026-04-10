@@ -48,19 +48,16 @@ struct MVPGoldenRunTests {
             )
         )
         #expect(run.providerBindingSnapshotJSON != nil)
-        let transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
+        let transport = FixtureACPTransport(scenario: .fullMVPSuccess)
         let executor = RuntimeAgentExecutor(transport: transport)
         let liveConfiguration = LiveRuntimeConfiguration(
-            baseURL: URL(string: "http://fixture.local")!,
-            apiKey: nil,
             override: LiveExecutionOverride(
                 enabled: true,
-                provider: "claude_code",
+                provider: "claude_acp",
                 model: "fixture-model",
                 effort: "high"
             ),
-            transportMode: .fixtureFullMVPSuccess,
-            transportAPI: .bespoke
+            transportMode: .fixtureFullMVPSuccess
         )
         let service = ExecutionService(
             modelContext: context,

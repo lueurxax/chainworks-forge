@@ -33,12 +33,6 @@ enum PreviewSupport {
                 workflowSourcePath: repoExampleURL("workflows/workflow.yaml").path,
                 agentCatalogSourcePath: repoExampleURL("agents/agents.yaml").path,
                 supportBundleExportPath: previewApplicationSupportURL("exports").path,
-                gooseServerHost: "127.0.0.1",
-                gooseServerPort: 51200,
-                gooseServerTLS: true,
-                gooseServerAutostart: true,
-                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
-                gooseServerSecretKey: "preview-secret",
                 activeConfigurationSource: .persistedSettings
             )
         )
@@ -97,11 +91,8 @@ enum PreviewSupport {
         liveConfigured: Bool = true
     ) -> ExecutionService {
         let runtimeConfiguration = liveConfigured ? LiveRuntimeConfiguration(
-            baseURL: URL(string: "https://127.0.0.1:51200")!,
-            apiKey: "preview-secret",
             override: nil,
-            transportMode: .network,
-            transportAPI: .gooseServer
+            transportMode: .fixtureProposalLoopSuccess
         ) : nil
 
         return ExecutionService(
@@ -124,7 +115,7 @@ enum PreviewSupport {
 
         let activeIdea = Idea(
             title: "Provider troubleshooting",
-            body: "Show why Codex and Claude fail in-app even when Goose is reachable.",
+            body: "Show why Codex and Claude fail in-app even when the runtime is reachable.",
             attachmentPath: previewDocumentsURL("specs/provider-troubleshooting.md").path,
             status: .active
         )

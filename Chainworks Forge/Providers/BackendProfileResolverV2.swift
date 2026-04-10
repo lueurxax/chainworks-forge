@@ -65,8 +65,8 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
         }
     }
 
-    var usesGooseExecutionPath: Bool {
-        effectiveRuntimeNamespace == "goose"
+    var usesLegacyExecutionPath: Bool {
+        effectiveRuntimeNamespace == nil
     }
 
     // MARK: - Proposal 011 (REQ-010): Cross-family coherence check
@@ -166,9 +166,9 @@ struct BackendProfileResolverV2 {
                 resolvedCapabilityClass = profile.capabilityClass
                 resolvedTransportKind = profile.transportKind
             } else {
-                // Default: legacy Goose runtime
+                // Default: legacy runtime (no explicit profile)
                 resolvedRuntimeProfileID = agent.runtimeProfileID
-                resolvedAdapterFamily = "goose"
+                resolvedAdapterFamily = "claude_agent_acp"
                 resolvedCapabilityClass = .legacyOperatorGrade
                 resolvedTransportKind = configuredProvider.transport.rawValue
             }

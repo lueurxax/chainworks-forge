@@ -92,7 +92,7 @@ struct RuntimeExtensionDefinition: Codable, Equatable, Sendable {
     }
 
     /// Initialise from a raw YAML dictionary (as returned by `Yams.load`).
-    /// Used by `GooseExtensionRegistryReader.snapshot()` to avoid
+    /// Used by extension registry reader `snapshot()` to avoid
     /// `Decodable` conformance actor-isolation issues in nonisolated contexts.
     nonisolated fileprivate init?(rawYAML dict: [String: Any]) {
         guard let name = dict["name"] as? String else { return nil }
@@ -118,47 +118,47 @@ struct RuntimeExtensionRegistrySnapshot: Equatable, Sendable {
     let configsByRuntimeID: [String: RuntimeExtensionDefinition]
 }
 
-struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
-    static let environmentConfigPathKey = "CHAINWORKS_GOOSE_CONFIG_PATH"
-    let configURL: URL
+private enum RuntimeExtensionRegistryConfigResolver {
+    nonisolated static func fixtureURLIfPresent() -> URL? {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let candidate = repoRoot.appendingPathComponent("examples/mcp/mcp-config-fixture.yaml")
+        return FileManager.default.isReadableFile(atPath: candidate.path) ? candidate : nil
+    }
 
-    nonisolated init(configURL: URL? = nil) {
-        if let configURL {
-            self.configURL = configURL
-            return
-        }
-
+    nonisolated static func defaultConfigURL(
+        primaryEnvironmentKey: String,
+        secondaryEnvironmentKey: String? = nil,
+        defaultPath: String
+    ) -> URL {
         let environment = ProcessInfo.processInfo.environment
         let isTestHost = environment["XCTestConfigurationFilePath"] != nil
         let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
-        if isTestHost || usesInMemoryStore {
-            // Nonisolated fixture URL resolution. Navigates 3 levels up from this
-            // source file to the repo root (Engine -> app target -> project -> repo).
-            let fixtureURL = URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
-            if FileManager.default.isReadableFile(atPath: fixtureURL.path) {
-                self.configURL = fixtureURL
-                return
-            }
+        if (isTestHost || usesInMemoryStore), let fixtureURL = fixtureURLIfPresent() {
+            return fixtureURL
         }
 
-        if let environmentPath = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_CONFIG_PATH"]?
+        if let explicitPath = environment[primaryEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !environmentPath.isEmpty {
-            self.configURL = URL(fileURLWithPath: environmentPath)
-            return
+           !explicitPath.isEmpty {
+            return URL(fileURLWithPath: explicitPath)
         }
 
-        self.configURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/goose/config.yaml")
+        if let secondaryEnvironmentKey,
+           let fallbackPath = environment[secondaryEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !fallbackPath.isEmpty {
+            return URL(fileURLWithPath: fallbackPath)
+        }
+
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(defaultPath)
     }
 
-    nonisolated func snapshot() throws -> RuntimeExtensionRegistrySnapshot {
+    nonisolated static func loadSnapshot(configURL: URL) throws -> RuntimeExtensionRegistrySnapshot {
         let contents = try String(contentsOf: configURL, encoding: .utf8)
-        // Use raw YAML load to avoid @MainActor-inferred Decodable conformance issues.
         let extensions: [String: RuntimeExtensionDefinition]
         if let root = try Yams.load(yaml: contents) as? [String: Any],
            let rawExtensions = root["extensions"] as? [String: Any] {
@@ -180,20 +180,14 @@ struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
             configsByRuntimeID: extensions
         )
     }
-
-    /// RuntimeExtensionRegistryProvider conformance.
-    nonisolated func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot {
-        try snapshot()
-    }
 }
 
 // MARK: - CodexExtensionRegistryReader (Proposal 029)
 
 /// Codex-specific RuntimeExtensionRegistryProvider conformer.
-/// Codex uses MCP natively, so it reads from the same Goose config format
-/// but applies Codex-specific extension ID mappings. This ensures the MCP
-/// policy resolver can validate extension availability against a Codex runtime
-/// rather than assuming a Goose-only world.
+/// Codex uses MCP natively, so it reads from a shared config format
+/// and applies Codex-specific extension ID mappings. This ensures the MCP
+/// policy resolver can validate extension availability against a Codex runtime.
 struct CodexExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
     static let environmentConfigPathKey = "CHAINWORKS_CODEX_CONFIG_PATH"
     let configURL: URL
@@ -204,58 +198,25 @@ struct CodexExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
             return
         }
 
-        let environment = ProcessInfo.processInfo.environment
-        let isTestHost = environment["XCTestConfigurationFilePath"] != nil
-        let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
-        if isTestHost || usesInMemoryStore {
-            // In test/in-memory mode, fall back to the same fixture as Goose
-            // since Codex uses the same config format.
-            let fixtureURL = URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
-            if FileManager.default.isReadableFile(atPath: fixtureURL.path) {
-                self.configURL = fixtureURL
-                return
-            }
-        }
-
-        if let environmentPath = ProcessInfo.processInfo.environment["CHAINWORKS_CODEX_CONFIG_PATH"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !environmentPath.isEmpty {
-            self.configURL = URL(fileURLWithPath: environmentPath)
+        let preferred = RuntimeExtensionRegistryConfigResolver.defaultConfigURL(
+            primaryEnvironmentKey: Self.environmentConfigPathKey,
+            defaultPath: ".config/mcp/config.yaml"
+        )
+        if FileManager.default.isReadableFile(atPath: preferred.path) {
+            self.configURL = preferred
             return
         }
 
-        // Default: Codex stores its config in the same location as Goose.
-        // When a dedicated Codex config path is added, update this default.
-        self.configURL = FileManager.default.homeDirectoryForCurrentUser
+        // ACP canonical path is ~/.config/mcp/config.yaml, but operator machines may
+        // still keep the shared runtime registry at the historical filesystem
+        // location while runtime execution is already ACP-only.
+        let legacySharedStore = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/goose/config.yaml")
+        self.configURL = legacySharedStore
     }
 
     nonisolated func snapshot() throws -> RuntimeExtensionRegistrySnapshot {
-        let contents = try String(contentsOf: configURL, encoding: .utf8)
-        let extensions: [String: RuntimeExtensionDefinition]
-        if let root = try Yams.load(yaml: contents) as? [String: Any],
-           let rawExtensions = root["extensions"] as? [String: Any] {
-            extensions = rawExtensions.compactMapValues { value -> RuntimeExtensionDefinition? in
-                guard let dict = value as? [String: Any] else { return nil }
-                return RuntimeExtensionDefinition(rawYAML: dict)
-            }
-        } else {
-            extensions = [:]
-        }
-        let installed = extensions.keys.sorted()
-        let enabled = extensions
-            .compactMap { key, value in value.enabled == true ? key : nil }
-            .sorted()
-        return RuntimeExtensionRegistrySnapshot(
-            configURL: configURL,
-            installedExtensionIDs: installed,
-            enabledExtensionIDs: enabled,
-            configsByRuntimeID: extensions
-        )
+        try RuntimeExtensionRegistryConfigResolver.loadSnapshot(configURL: configURL)
     }
 
     /// RuntimeExtensionRegistryProvider conformance.
@@ -312,8 +273,8 @@ struct MCPPolicyResolver: Sendable {
             if runtimeNamespace == nil {
                 blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
             }
-            if runtimeNamespace == "goose", runtimeRegistry == nil {
-                blockingIssues.append("Goose extension registry is unavailable; cannot validate MCP profile '\(profileID)' for agent '\(agent.id)'.")
+            if runtimeRegistry == nil {
+                blockingIssues.append("Runtime extension registry is unavailable; cannot validate MCP profile '\(profileID)' for agent '\(agent.id)'.")
             }
         }
 
@@ -389,12 +350,9 @@ struct MCPPolicyResolver: Sendable {
         guard let runtimeID = entry.runtimeIDs[runtimeNamespace], !runtimeID.isEmpty else {
             return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
         }
-        if runtimeNamespace == "goose" {
-            guard let runtimeRegistry else {
-                return .missing("MCP server '\(serverID)' cannot be validated because Goose extension registry is unavailable.")
-            }
+        if let runtimeRegistry {
             guard runtimeRegistry.configsByRuntimeID[runtimeID] != nil else {
-                return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in Goose.")
+                return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in the runtime registry.")
             }
         }
         return .available(runtimeID: runtimeID)

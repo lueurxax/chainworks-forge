@@ -37,7 +37,7 @@ struct ProviderSettingsView: View {
                     Text("Provider Settings")
                         .font(.title2.bold())
                         .accessibilityIdentifier("provider-settings-title")
-                    Text("Use Goose-backed setup first for Codex and Claude. Treat raw paths and storage as advanced configuration, not the primary setup journey.")
+                    Text("Use the runtime-backed setup first for Codex and Claude. Treat raw paths and storage as advanced configuration, not the primary setup journey.")
                         .font(DesignTokens.Typography.supporting)
                         .foregroundStyle(.secondary)
                     Button("Open First Run Wizard") {

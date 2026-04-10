@@ -1247,7 +1247,7 @@ struct ResumeManagerTests {
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
 
-        let idea = Idea(title: "Live Workflow", body: "Validate Goose-backed executor routing")
+        let idea = Idea(title: "Live Workflow", body: "Validate runtime-backed executor routing")
         context.insert(idea)
 
         let runID = UUID()
@@ -1277,16 +1277,13 @@ struct ResumeManagerTests {
             executor: SimulatedAgentExecutor(),
             catalog: catalog,
             liveRuntimeConfiguration: LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://localhost:9999")!,
-                apiKey: nil,
                 override: LiveExecutionOverride(
                     enabled: true,
-                    provider: "claude_code",
+                    provider: "claude_acp",
                     model: "default",
                     effort: "high"
                 ),
-                transportMode: .network,
-                transportAPI: .gooseServer
+                transportMode: .fixtureFullMVPSuccess
             )
         )
 
@@ -1754,8 +1751,8 @@ struct ResumeManagerTests {
         #expect(shouldReconcile == true)
     }
 
-    @Test("ExecutionService starts ACP-backed live workflow without Goose runtime config")
-    func executionServiceStartsACPBackedLiveWorkflowWithoutGooseRuntimeConfig() async throws {
+    @Test("ExecutionService starts ACP-backed live workflow without legacy runtime config")
+    func executionServiceStartsACPBackedLiveWorkflowWithoutLegacyRuntimeConfig() async throws {
         let workflow = try loadLiveWorkflow()
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)

@@ -221,14 +221,14 @@ struct UITestWorkflowMapSurface: View {
     }
 }
 
-struct UITestGooseAssistantSurface: View {
+struct UITestRuntimeAssistantSurface: View {
     var body: some View {
         ContentUnavailableView(
-            "Goose assistant removed",
+            "Runtime assistant removed",
             systemImage: "server.rack",
-            description: Text("The Goose assistant surface has been removed.")
+            description: Text("The runtime assistant surface has been removed.")
         )
-        .accessibilityIdentifier("ui-test-goose-assistant-surface")
+        .accessibilityIdentifier("ui-test-runtime-assistant-surface")
     }
 }
 
@@ -1119,7 +1119,6 @@ enum Proposal015ProofFixtureBuilder {
                     workflowSourcePath: workflowURL.path,
                     agentCatalogSourcePath: catalogURL.path,
                     supportBundleExportPath: rootURL.appendingPathComponent("exports", isDirectory: true).path,
-                    gooseServerAutostart: false,
                     activeConfigurationSource: .persistedSettings
                 )
             )

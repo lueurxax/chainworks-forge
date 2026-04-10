@@ -29,7 +29,7 @@ struct ContentView: View {
         case firstRunSetup = "first_run_setup"
         case ideaArchive = "idea_archive"
         case workflowMap = "workflow_map"
-        case gooseAssistant = "goose_assistant"
+        case runtimeAssistant = "runtime_assistant"
         case releaseGate = "release_gate"
         case deliveryPreflightReport = "delivery_preflight_report"
         case completedExportHub = "completed_export_hub"
@@ -181,8 +181,8 @@ struct ContentView: View {
             UITestIdeaArchiveSurface()
         case .workflowMap:
             UITestWorkflowMapSurface()
-        case .gooseAssistant:
-            UITestGooseAssistantSurface()
+        case .runtimeAssistant:
+            UITestRuntimeAssistantSurface()
         case .releaseGate:
             UITestReleaseGateSurface()
         case .deliveryPreflightReport:

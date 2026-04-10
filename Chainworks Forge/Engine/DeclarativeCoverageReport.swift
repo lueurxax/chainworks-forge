@@ -79,7 +79,7 @@ struct DeclarativeCoverageReport: Codable, Sendable {
                 surface: "agents.*.skill_ref / skill_role",
                 tier: .tier3LaterProposal,
                 status: .partial,
-                truth: "Parsed, validated, displayed, hashed into provenance; NOT injected into Goose prompts. Tracked for Proposal 015."
+                truth: "Parsed, validated, displayed, hashed into provenance; NOT injected into runtime prompts. Tracked for Proposal 015."
             ),
             CatalogCoverageEntry(
                 surface: "backend_profiles.*.effort",
@@ -91,13 +91,13 @@ struct DeclarativeCoverageReport: Codable, Sendable {
                 surface: "backend_profiles.*.max_turns / temperature",
                 tier: .tier3LaterProposal,
                 status: .partial,
-                truth: "Carried into ResolvedAgent and hashes but not enforced by live Goose transport."
+                truth: "Carried into ResolvedAgent and hashes but not enforced by live runtime transport."
             ),
             CatalogCoverageEntry(
                 surface: "permission_profiles.*",
                 tier: .tier3LaterProposal,
                 status: .partial,
-                truth: "Profile existence validated, profile ID sent to Goose, some profile names drive side-effect heuristics. Detailed allowlists not enforced."
+                truth: "Profile existence validated, profile ID sent to runtime, some profile names drive side-effect heuristics. Detailed allowlists not enforced."
             ),
             CatalogCoverageEntry(
                 surface: "agents.*.required_tools",

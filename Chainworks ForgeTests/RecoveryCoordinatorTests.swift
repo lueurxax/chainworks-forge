@@ -435,7 +435,7 @@ private func makeRecoveryCatalog() -> AgentCatalog {
         schemaVersion: 1,
         app: AppConfig(
             name: "test",
-            runtime: "goose",
+            runtime: "claude_agent",
             transport: "http",
             description: "test",
             ideaInputMode: "text",

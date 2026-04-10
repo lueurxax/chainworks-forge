@@ -25,7 +25,7 @@ enum TestModelContainerRetainer {
 /// Includes all Chainworks Forge model types.
 @MainActor
 func makeTestModelContext() throws -> ModelContext {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self,
@@ -41,7 +41,7 @@ func makeTestModelContext() throws -> ModelContext {
 /// Creates an in-memory ModelContainer + ModelContext pair suitable for XCTestCase setUp.
 @MainActor
 func makeTestModelContainer() throws -> (container: ModelContainer, context: ModelContext) {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self,
@@ -206,14 +206,14 @@ func makeTestRun(
 final class TestBundleMarker: NSObject {}
 
 @discardableResult
-private func installPortableGooseRegistryFixtureIfNeeded(file: StaticString = #filePath) -> String? {
+private func installPortableMCPRegistryFixtureIfNeeded(file: StaticString = #filePath) -> String? {
     let repoRoot = testRepositoryRootURL(file: file)
-    let fixturePath = repoRoot.appendingPathComponent("examples/goose/goose-config-fixture.yaml").path
+    let fixturePath = repoRoot.appendingPathComponent("examples/mcp/mcp-config-fixture.yaml").path
     guard FileManager.default.isReadableFile(atPath: fixturePath) else {
         return nil
     }
 
-    setenv(GooseExtensionRegistryReader.environmentConfigPathKey, fixturePath, 1)
+    setenv(CodexExtensionRegistryReader.environmentConfigPathKey, fixturePath, 1)
     return fixturePath
 }
 
@@ -274,7 +274,7 @@ private func materializePortableSkillBundles(
 
 @discardableResult
 func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let source = try String(contentsOf: sourceURL, encoding: .utf8)
     let localizedBundles = try materializePortableSkillBundles(nextTo: destinationURL)
     let rewritten = portableExternalSkillRewrites(
@@ -301,7 +301,7 @@ func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
 
 /// Loads the canonical agent catalog fixture from the test bundle.
 func loadTestCanonicalCatalog() throws -> AgentCatalog {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
     let url = FileManager.default.isReadableFile(atPath: repoURL.path)
         ? repoURL
@@ -326,7 +326,7 @@ func loadTestStewardConfig() throws -> StewardConfig {
 
 /// Loads the live proposal loop workflow fixture from the test bundle.
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
     let url = FileManager.default.isReadableFile(atPath: repoURL.path)
         ? repoURL
@@ -339,7 +339,7 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
 
 /// Loads the full MVP live workflow fixture from the test bundle.
 func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml")
     let url = FileManager.default.isReadableFile(atPath: repoURL.path)
         ? repoURL

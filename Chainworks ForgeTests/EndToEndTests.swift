@@ -297,7 +297,7 @@ struct EndToEndTests {
 
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace, plan: plan)
-        let transport = FixtureGooseTransport(
+        let transport = FixtureACPTransport(
             scenario: .proposalLoopSuccess
         )
         let executor = RuntimeAgentExecutor(transport: transport)

@@ -383,7 +383,7 @@ struct OrchestratorTests {
                 providerIdentifier: ProviderFamily.claudeACP.runtimeProviderIdentifier,
                 model: "sonnet",
                 effort: "high",
-                transport: "goose_server",
+                transport: "acp_http",
                 adapterVersion: "v1"
             )
         ])
@@ -1249,7 +1249,7 @@ struct OrchestratorTests {
             sessionID: "runtime-session-1",
             durationSeconds: 0.1,
             providerReceipt: ProviderExecutionReceipt(
-                providerFamily: "goose_openai",
+                providerFamily: "claude_acp",
                 configuredProviderID: nil,
                 model: "gpt-5.4",
                 effort: "high",

@@ -7,20 +7,20 @@ enum RuntimeCapabilityClass: String, Codable, Sendable {
     case lifecycleCapable = "lifecycle_capable"
     case controlCapable = "control_capable"
     case operatorGrade = "operator_grade"
-    /// Legacy Goose REST/SSE runtime, operator-grade equivalent.
+    /// Legacy REST/SSE runtime, operator-grade equivalent.
     case legacyOperatorGrade = "legacy_operator_grade"
 }
 
 /// Proposal 026: Declares a runtime transport adapter's identity and capabilities.
 struct RuntimeProfile: Codable, Sendable {
     let capabilityClass: RuntimeCapabilityClass
-    /// Adapter family identifier (e.g. "goose", "claude_agent_acp", "gemini_cli_acp").
+    /// Adapter family identifier (e.g. "claude_agent_acp", "gemini_cli_acp", "codex_acp").
     let adapterFamily: String
     /// Required runtime capabilities (e.g. ["streaming", "tools", "permission_callbacks"]).
     let requires: [String]
-    /// Transport mechanism (e.g. "goose_server", "acp_stdio", "acp_http").
+    /// Transport mechanism (e.g. "acp_stdio", "acp_http").
     let transportKind: String
-    /// MCP realization strategy (e.g. "goose_extension", "acp_native", nil).
+    /// MCP realization strategy (e.g. "acp_native", nil).
     let mcpRealizationPath: String?
 
     enum CodingKeys: String, CodingKey {

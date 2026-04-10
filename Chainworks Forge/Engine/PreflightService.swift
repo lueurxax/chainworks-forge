@@ -204,8 +204,8 @@ struct PreflightService {
 
         // Proposal 029: Validate adapter family registration (fail-closed)
         for (agentID, binding) in providerBindings {
-            let family = binding.adapterFamily ?? "goose"
-            let knownFamilies: Set<String> = ["goose", "claude_agent_acp", "gemini_cli_acp", "codex_acp", "auggie_cli_acp", "junie_cli_acp"]
+            let family = binding.adapterFamily ?? "claude_agent_acp"
+            let knownFamilies: Set<String> = ["claude_agent_acp", "gemini_cli_acp", "codex_acp", "auggie_cli_acp", "junie_cli_acp"]
             if !knownFamilies.contains(family) {
                 let msg = "Agent '\(agentID)' uses unregistered adapter family '\(family)'. Register the adapter before adding its runtime profile."
                 checks.append(PreflightCheck(category: "Runtime", title: "Adapter Registration", status: .fail, message: msg))
@@ -643,7 +643,7 @@ struct PreflightService {
         warnings: inout [String],
         blockingIssues: inout [String]
     ) {
-        let runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
         let resolver = MCPPolicyResolver()
         let activeAgents = plan.agentBindings.values.sorted { $0.id < $1.id }
 

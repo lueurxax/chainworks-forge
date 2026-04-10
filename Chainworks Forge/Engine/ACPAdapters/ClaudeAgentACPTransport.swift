@@ -88,7 +88,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         if let model = request.model {
             sessionParams["model"] = Self.mapModelForACPCatalog(model)
         }
-        // Note: requestedExtensions from Forge are Goose extension IDs — not applicable for ACP.
+        // Note: requestedExtensions from Forge are legacy extension IDs — not applicable for ACP.
         // Claude Agent ACP handles MCP through its own config; client-provided MCP servers
         // can be passed via mcpServers array if needed in the future.
         // Map execution policy to ACP mode.
@@ -182,13 +182,13 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                     return
                 }
 
-                // Synthesize session lifecycle events (matches GooseServerTransport behavior)
+                // Synthesize session lifecycle events (matches RuntimeTransportProtocol pattern)
                 continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
                 do {
                     // ACP session/prompt expects prompt as an array of content items:
                     // [{"type": "text", "text": "..."}]
-                    // LOCKED-003: System prompt is embedded in the prompt content (same as GooseServerTransport).
+                    // LOCKED-003: System prompt is embedded in the prompt content (same as other transports).
                     self.lock.lock()
                     let systemPrompt = self.sessionSystemPrompts[sessionID]
                     self.lock.unlock()

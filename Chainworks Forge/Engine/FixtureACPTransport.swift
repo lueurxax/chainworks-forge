@@ -1,9 +1,9 @@
 import Foundation
 
-/// Deterministic Goose transport used for Proposal 004 integration/UI proof without a real backend.
-/// Proposal 005: conforms to `RuntimeTransportProtocol` directly (no longer subclasses `GooseTransport`).
+/// Deterministic ACP transport used for Proposal 004 integration/UI proof without a real backend.
+/// Proposal 005: conforms to `RuntimeTransportProtocol` directly.
 /// LOCKED-004: Fixture mode is not touched — fixture transport continues to work unchanged behind the protocol.
-final class FixtureGooseTransport: RuntimeTransportProtocol, @unchecked Sendable {
+final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     enum Scenario {
         case proposalLoopSuccess
         case proposal022FeedbackCycle
@@ -13,7 +13,7 @@ final class FixtureGooseTransport: RuntimeTransportProtocol, @unchecked Sendable
     }
 
     private let scenario: Scenario
-    private let stateQueue = DispatchQueue(label: "FixtureGooseTransport.state")
+    private let stateQueue = DispatchQueue(label: "FixtureACPTransport.state")
     private var sessionRequests: [String: RuntimeSessionRequest] = [:]
     private var taskInvocationCounts: [String: Int] = [:]
 
@@ -21,7 +21,7 @@ final class FixtureGooseTransport: RuntimeTransportProtocol, @unchecked Sendable
         self.scenario = scenario
     }
 
-    var mcpRuntimeNamespace: String? { "goose" }
+    var mcpRuntimeNamespace: String? { "claude_agent" }
 
     // MARK: - RuntimeTransportProtocol
 

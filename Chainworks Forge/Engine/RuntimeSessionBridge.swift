@@ -1,12 +1,12 @@
 import Foundation
 
-// MARK: - RuntimeSessionBridge (Proposal 026 — ACP-shaped session bridge, formerly GooseSessionBridge)
+// MARK: - RuntimeSessionBridge (Proposal 026 — ACP-shaped session bridge)
 
 /// Creates an isolated runtime session for a single AgentExecution.
 /// Binds workspace, prompt packet, and input artifacts into a structured execution request.
 ///
 /// Invariants:
-/// - Every live AgentExecution gets its own isolated Goose session (ARCH-027).
+/// - Every live AgentExecution gets its own isolated runtime session (ARCH-027).
 /// - No session reuse across agents or iterations.
 /// - No reliance on session memory; state is reconstructed from artifacts (ARCH-030).
 /// - Workspace is passed explicitly; no implicit cwd.
@@ -14,7 +14,7 @@ final class RuntimeSessionBridge: Sendable {
 
     // MARK: - Dependencies
 
-    /// Proposal 026: depends on `RuntimeTransportProtocol`, not concrete `GooseTransport`.
+    /// Proposal 026: depends on `RuntimeTransportProtocol`, not a concrete transport.
     let transport: any RuntimeTransportProtocol
     /// Proposal 026 Phase 2: MCP realization abstracted behind a protocol.
     private let extensionRegistryProvider: any RuntimeExtensionRegistryProvider
@@ -26,7 +26,7 @@ final class RuntimeSessionBridge: Sendable {
         extensionRegistryProvider: (any RuntimeExtensionRegistryProvider)? = nil
     ) {
         self.transport = transport
-        self.extensionRegistryProvider = extensionRegistryProvider ?? GooseExtensionRegistryReader()
+        self.extensionRegistryProvider = extensionRegistryProvider ?? CodexExtensionRegistryReader()
     }
 
     // MARK: - Session Lifecycle
@@ -63,9 +63,9 @@ final class RuntimeSessionBridge: Sendable {
             ? context.workspace.worktreeRoot!.path
             : readOnlyRoot
         let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
-        // Proposal 026: ACP runtimes handle MCP natively — Goose extension registry mismatches
-        // are not blocking for non-Goose transports.
-        let isACPRuntime = transport.mcpRuntimeNamespace != nil && transport.mcpRuntimeNamespace != "goose"
+        // Proposal 026: ACP runtimes handle MCP natively — extension registry mismatches
+        // are not blocking for ACP transports.
+        let isACPRuntime = transport.mcpRuntimeNamespace != nil
         if !mcpResolution.blockingIssues.isEmpty && !isACPRuntime {
             throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
         }
@@ -93,7 +93,7 @@ final class RuntimeSessionBridge: Sendable {
                 "iteration": String(context.iteration),
                 "attempt": String(context.attemptNumber)
             ],
-            // Proposal 026: ACP runtimes handle MCP natively — don't pass Goose extension IDs.
+            // Proposal 026: ACP runtimes handle MCP natively via mcpServers.
             requestedExtensions: isACPRuntime ? nil : mcpResolution.predictedEffectiveRuntimeExtensionIDs,
             mcpServers: acpMCPServers.isEmpty ? nil : acpMCPServers
         )
@@ -160,7 +160,7 @@ final class RuntimeSessionBridge: Sendable {
         report: MCPPolicyResolutionReport,
         transportNamespace: String?
     ) throws -> [RuntimeMCPServerDefinition] {
-        guard let transportNamespace, transportNamespace != "goose" else {
+        guard let transportNamespace else {
             return []
         }
         guard !(report.requiredRuntimeExtensionIDs + report.optionalRuntimeExtensionIDs).isEmpty else {
@@ -216,6 +216,18 @@ final class RuntimeSessionBridge: Sendable {
         }
 
         let normalizedType = definition.type?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "stdio"
+        if normalizedType == "platform" {
+            guard transportNamespace == "codex" else {
+                throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(
+                    "Required MCP server '\(runtimeID)' uses unsupported transport '\(normalizedType)' for runtime '\(transportNamespace)'."
+                )
+            }
+            return RuntimeMCPServerDefinition(
+                name: runtimeID,
+                type: "platform"
+            )
+        }
+
         guard normalizedType == "stdio" else {
             throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(
                 "Required MCP server '\(runtimeID)' uses unsupported transport '\(normalizedType)' for runtime '\(transportNamespace)'."
@@ -239,7 +251,7 @@ final class RuntimeSessionBridge: Sendable {
         )
     }
 
-    /// Submit a task prompt to an existing Goose session.
+    /// Submit a task prompt to an existing runtime session.
     func executeInExistingSession(
         sessionID: String,
         packet: ExecutionPacket
@@ -863,8 +875,8 @@ struct ExecutionPacket: Sendable {
 
 // MARK: - RuntimeSessionExecution
 
-/// Represents an in-flight execution within an isolated Goose session.
-/// Proposal 026: uses `RuntimeTransportProtocol` instead of concrete `GooseTransport`.
+/// Represents an in-flight execution within an isolated runtime session.
+/// Proposal 026: uses `RuntimeTransportProtocol` instead of a concrete transport.
 struct RuntimeSessionExecution: Sendable {
     let sessionID: String
     let actualEnabledExtensions: [String]?
@@ -889,7 +901,7 @@ struct RuntimeSessionExecution: Sendable {
                 let isCancelled = msg.contains("cancelled") || (error as? CancellationError) != nil
 
                 if !isAlreadyClosed && !isCancelled {
-                    ForgeLogger.bridge.error("Failed to cleanup Goose session \(sessionID): \(msg)")
+                    ForgeLogger.bridge.error("Failed to cleanup runtime session \(sessionID): \(msg)")
                 }
             }
         }
@@ -923,7 +935,7 @@ enum RuntimeSessionBridgeError: Error, LocalizedError {
         case .workspaceRootMissing:
             return "Workspace root is not set"
         case .sessionCreationFailed(let reason):
-            return "Goose session creation failed: \(reason)"
+            return "Runtime session creation failed: \(reason)"
         case .policyAcknowledgementMissing:
             return "Live execution blocked: backend did not acknowledge the required read-only execution policy"
         case .mcpPolicyResolutionFailed(let reason):

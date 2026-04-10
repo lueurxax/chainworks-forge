@@ -67,7 +67,7 @@ import SwiftData
 
     /// Proposal 026: Actual runtime profile used for this execution attempt.
     var runtimeProfileID: String?
-    /// Proposal 026: Actual adapter family (e.g. "goose", "claude_agent_acp", "gemini_cli_acp").
+    /// Proposal 026: Actual adapter family (e.g. "claude_agent_acp", "gemini_cli_acp", "codex_acp").
     var actualAdapterFamily: String?
     /// Proposal 026: Actual capability class of the runtime used.
     var actualCapabilityClass: String?

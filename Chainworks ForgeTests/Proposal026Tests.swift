@@ -284,12 +284,12 @@ struct Proposal026Tests {
         #expect(geminiProtocol.mcpRuntimeNamespace == "gemini_cli")
     }
 
-    // MARK: - Test 6: Goose default path when runtimeProfileID is nil
+    // MARK: - Test 6: Default path when runtimeProfileID is nil
 
-    @Test("Resolver defaults to goose adapter family when runtimeProfileID is nil")
-    func gooseDefaultPathWhenNoRuntimeProfile() throws {
+    @Test("Resolver defaults to claude_agent_acp adapter family when runtimeProfileID is nil")
+    func defaultPathWhenNoRuntimeProfile() throws {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("p026-goose-default-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("p026-default-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -312,7 +312,7 @@ struct Proposal026Tests {
         )
         let registry = ProviderRegistry(
             settingsStore: store,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.p026-goose-default", useInMemoryStore: true)
+            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.p026-default", useInMemoryStore: true)
         )
         let resolver = BackendProfileResolverV2(providerRegistry: registry)
 
@@ -336,8 +336,8 @@ struct Proposal026Tests {
         )
 
         let plan = RunPlan(
-            workflowID: "p026_goose_test",
-            workflowTitle: "P026 Goose Default",
+            workflowID: "p026_default_test",
+            workflowTitle: "P026 Default",
             states: [:],
             initialStateID: "state_1",
             agentBindings: [agent.id: agent],
@@ -358,7 +358,7 @@ struct Proposal026Tests {
         )
 
         let binding = try #require(bindings["legacy_agent"])
-        #expect(binding.adapterFamily == "goose")
+        #expect(binding.adapterFamily == "claude_agent_acp")
         #expect(binding.capabilityClass == .legacyOperatorGrade)
     }
 

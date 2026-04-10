@@ -6,12 +6,12 @@ import SwiftData
 @MainActor
 @Suite("Proposal 025", .serialized)
 struct Proposal025Tests {
-    @Test("Portable Goose registry fixture overrides unreadable inherited config path")
-    func portableGooseRegistryFixtureOverridesUnreadableInheritedPath() throws {
-        let envKey = GooseExtensionRegistryReader.environmentConfigPathKey
+    @Test("Portable MCP registry fixture overrides unreadable inherited config path")
+    func portableMCPRegistryFixtureOverridesUnreadableInheritedPath() throws {
+        let envKey = CodexExtensionRegistryReader.environmentConfigPathKey
         let original = ProcessInfo.processInfo.environment[envKey]
         let unreadablePath = FileManager.default.temporaryDirectory
-            .appendingPathComponent("missing-goose-\(UUID().uuidString).yaml", isDirectory: false)
+            .appendingPathComponent("missing-mcp-\(UUID().uuidString).yaml", isDirectory: false)
             .path
 
         setenv(envKey, unreadablePath, 1)
@@ -26,14 +26,14 @@ struct Proposal025Tests {
         _ = try makeTestModelContext()
 
         let resolved = ProcessInfo.processInfo.environment[envKey]
-        let expectedSuffix = "/examples/goose/goose-config-fixture.yaml"
+        let expectedSuffix = "/examples/mcp/mcp-config-fixture.yaml"
         #expect(resolved?.hasSuffix(expectedSuffix) == true)
         #expect(resolved != unreadablePath)
     }
 
-    @Test("Goose registry reader falls back to repo fixture on test hosts")
-    func gooseRegistryReaderFallsBackToRepoFixtureOnTestHosts() {
-        let envKey = GooseExtensionRegistryReader.environmentConfigPathKey
+    @Test("Codex registry reader falls back to repo fixture on test hosts")
+    func codexRegistryReaderFallsBackToRepoFixtureOnTestHosts() {
+        let envKey = CodexExtensionRegistryReader.environmentConfigPathKey
         let original = ProcessInfo.processInfo.environment[envKey]
         unsetenv(envKey)
         defer {
@@ -44,8 +44,8 @@ struct Proposal025Tests {
             }
         }
 
-        let reader = GooseExtensionRegistryReader()
-        #expect(reader.configURL.path.hasSuffix("/examples/goose/goose-config-fixture.yaml"))
+        let reader = CodexExtensionRegistryReader()
+        #expect(reader.configURL.path.hasSuffix("/examples/mcp/mcp-config-fixture.yaml"))
     }
 
     @Test("Simulated canonical contract outputs satisfy bundled workflow thresholds")
@@ -106,7 +106,7 @@ struct Proposal025Tests {
             "Chainworks Forge/Views/ReleaseGateView.swift",
             "Chainworks Forge/Views/IdeaListView.swift",
             "Chainworks ForgeTests/Chainworks_ForgeTests.swift",
-            "Chainworks ForgeTests/GooseSessionBridgeTests.swift"
+            "Chainworks ForgeTests/RuntimeSessionBridgeTests.swift"
         ]
 
         for relativePath in sensitiveFiles {
@@ -356,7 +356,7 @@ struct Proposal025Tests {
         let workspace = makeTestWorkspace()
         let run = makeTestRun(workspace: workspace, context: context)
         run.status = .blocked
-        run.driftDetails = "Goose extension registry is unavailable, but one or more agents request MCP extensions."
+        run.driftDetails = "Extension registry is unavailable, but one or more agents request MCP extensions."
 
         let summary = SessionReuseKPIExporter.exportKPIs(for: run.id, context: context)
         #expect(summary.mcpTelemetry.totalMCPPreflightBlockedRuns == 1)

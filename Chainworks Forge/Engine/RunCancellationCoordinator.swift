@@ -113,7 +113,7 @@ final class RunCancellationCoordinator {
     /// Complete the settlement contract by recording observed session-close outcomes
     /// and writing the terminal run state.
     ///
-    /// - Parameter sessionOutcomes: Actual per-session close results from `closeGooseSessionsWithOutcomes()`.
+    /// - Parameter sessionOutcomes: Actual per-session close results from `closeRuntimeSessionsWithOutcomes()`.
     func finalizeSettlement(sessionOutcomes: [SessionCloseOutcome]) {
         // Build outcome lookup: sessionID → succeeded.
         let outcomeLookup = Dictionary(
@@ -168,20 +168,20 @@ final class RunCancellationCoordinator {
         let succeeded: Bool
     }
 
-    /// Close Goose sessions and return per-session outcomes. Does NOT reference any SwiftData models.
+    /// Close runtime sessions and return per-session outcomes. Does NOT reference any SwiftData models.
     /// Each session close is bounded by `perSessionTimeout` to prevent cancellation UX from hanging.
-    nonisolated static func closeGooseSessionsWithOutcomes(
+    nonisolated static func closeRuntimeSessionsWithOutcomes(
         sessionIDs: [String],
         executor: AgentExecutor,
         perSessionTimeout: Duration = .seconds(10)
     ) async -> [SessionCloseOutcome] {
-        guard let gooseExecutor = executor as? RuntimeAgentExecutor else {
-            // No Goose executor — nothing to close (simulated executor).
+        guard let runtimeExecutor = executor as? RuntimeAgentExecutor else {
+            // No runtime executor — nothing to close (simulated executor).
             return []
         }
 
-        guard let transport = gooseExecutor.gooseTransportForCancellation else {
-            // No Goose transport — ACP-only run; sessions are subprocess-managed.
+        guard let transport = runtimeExecutor.runtimeTransportForCancellation else {
+            // No transport — ACP-only run; sessions are subprocess-managed.
             return sessionIDs.map { SessionCloseOutcome(sessionID: $0, attempted: false, succeeded: false) }
         }
         var outcomes: [SessionCloseOutcome] = []

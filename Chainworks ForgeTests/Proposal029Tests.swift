@@ -10,7 +10,7 @@ struct Proposal029Tests {
 
     @Test("Transport factory throws unknownAdapterFamily for unregistered family")
     func failClosedFactoryThrowsForUnknownFamily() throws {
-        let factory = DefaultRuntimeTransportFactory(gooseTransport: nil)
+        let factory = DefaultRuntimeTransportFactory(fixtureTransport: nil)
         let agent = ResolvedAgent(
             id: "test_agent",
             title: "Test Agent",
@@ -52,7 +52,7 @@ struct Proposal029Tests {
 
     @Test("Transport factory resolves registered ACP families without throwing")
     func factoryResolvesRegisteredFamilies() throws {
-        let factory = DefaultRuntimeTransportFactory(gooseTransport: nil)
+        let factory = DefaultRuntimeTransportFactory(fixtureTransport: nil)
         let agent = ResolvedAgent(
             id: "test_agent",
             title: "Test Agent",

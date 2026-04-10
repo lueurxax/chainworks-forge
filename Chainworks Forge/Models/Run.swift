@@ -390,7 +390,7 @@ struct FrozenBindingProvenance: Codable, Sendable {
     let configuredProviderDefaultModel: String?
     /// The explicit run-start override model (if any).
     let runOverrideModel: String?
-    /// The final resolved model actually sent to Goose.
+    /// The final resolved model actually sent to the runtime.
     let resolvedModel: String
     /// The final resolved provider family.
     let resolvedProviderFamily: String

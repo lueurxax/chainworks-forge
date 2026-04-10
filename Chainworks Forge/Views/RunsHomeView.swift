@@ -637,8 +637,8 @@ struct RuntimeProvenanceBadge: View {
     private var badgeLabel: String {
         switch trustLevel {
         case "fixture_verified": return "Fixture / verified"
-        case "server_unverified": return "Goose server / trust pending"
-        case "server_verified": return "Goose server / verified"
+        case "server_unverified": return "Runtime server / trust pending"
+        case "server_verified": return "Runtime server / verified"
         default: return "Unknown"
         }
     }

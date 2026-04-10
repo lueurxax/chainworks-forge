@@ -825,7 +825,7 @@ final class WorkflowOrchestrator {
         // Proposal 026 ARCH-001: Persist actual runtime settlement fields.
         let settlementBinding = providerBindingsByAgentID[agent.id]
         agentExec.runtimeProfileID = settlementBinding?.runtimeProfileID
-        agentExec.actualAdapterFamily = settlementBinding?.adapterFamily ?? "goose"
+        agentExec.actualAdapterFamily = settlementBinding?.adapterFamily ?? "claude_agent_acp"
         agentExec.actualCapabilityClass = settlementBinding?.capabilityClass?.rawValue ?? "legacy_operator_grade"
         agentExec.logSnippet = mergedLogSnippet(
             existing: agentExec.logSnippet,
@@ -1681,7 +1681,7 @@ final class WorkflowOrchestrator {
                 // Proposal 026 ARCH-001: Persist actual runtime settlement fields.
                 let settlementBinding = providerBindingsByAgentID[agent.id]
                 agentExec.runtimeProfileID = settlementBinding?.runtimeProfileID
-                agentExec.actualAdapterFamily = settlementBinding?.adapterFamily ?? "goose"
+                agentExec.actualAdapterFamily = settlementBinding?.adapterFamily ?? "claude_agent_acp"
                 agentExec.actualCapabilityClass = settlementBinding?.capabilityClass?.rawValue ?? "legacy_operator_grade"
 
                 applyExecutionTruth(from: result, to: agentExec)
@@ -2980,9 +2980,9 @@ final class WorkflowOrchestrator {
     // MARK: - Live Event Routing
 
     private func configureLiveEventBridge() {
-        guard let gooseExecutor = executor as? RuntimeAgentExecutor else { return }
+        guard let runtimeExecutor = executor as? RuntimeAgentExecutor else { return }
 
-        gooseExecutor.onExecutionEvent = { [weak self] agentID, event in
+        runtimeExecutor.onExecutionEvent = { [weak self] agentID, event in
             Task { @MainActor [weak self] in
                 self?.recordLiveExecutionEvent(agentID: agentID, event: event)
             }

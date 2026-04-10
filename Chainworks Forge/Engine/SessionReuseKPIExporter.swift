@@ -312,7 +312,7 @@ final class SessionReuseKPIExporter {
         let totalMCPPreflightBlockedRuns: Int = {
             guard let r = run, r.status == .blocked else { return 0 }
             let reason = (r.driftDetails ?? "").lowercased()
-            return (reason.contains("mcp") || reason.contains("goose extension registry") || reason.contains("session-scoped mcp")) ? 1 : 0
+            return (reason.contains("mcp") || reason.contains("extension registry") || reason.contains("session-scoped mcp")) ? 1 : 0
         }()
         let averageRequestedExtensionsPerExecution = mcpExecutions.isEmpty
             ? 0.0
@@ -435,7 +435,7 @@ final class SessionReuseKPIExporter {
         guard run.status == .blocked else { return 0 }
         let reason = (run.driftDetails ?? "").lowercased()
         if reason.contains("mcp")
-            || reason.contains("goose extension registry")
+            || reason.contains("extension registry")
             || reason.contains("session-scoped mcp")
             || reason.contains("unknown mcp profile") {
             return 1

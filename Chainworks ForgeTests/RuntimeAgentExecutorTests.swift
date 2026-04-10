@@ -210,7 +210,7 @@ struct RuntimeAgentExecutorTests {
                         continuation.yield(.sessionStarted(raw: #"{"session_id":"session-reused"}"#))
                         continuation.yield(.promptSubmitted(raw: #"{"session_id":"session-reused"}"#))
                         continuation.finish(throwing: NSError(
-                            domain: "GooseTest",
+                            domain: "RuntimeTest",
                             code: 404,
                             userInfo: [NSLocalizedDescriptionKey: "Failed to read session: Session not found"]
                         ))
@@ -518,7 +518,7 @@ struct RuntimeAgentExecutorTests {
                     continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
                     continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
                     continuation.finish(throwing: NSError(
-                        domain: "GooseTest",
+                        domain: "RuntimeTest",
                         code: 404,
                         userInfo: [NSLocalizedDescriptionKey: "Failed to read session: Session not found"]
                     ))
@@ -912,10 +912,10 @@ struct RuntimeAgentExecutorTests {
 
     // MARK: - Tests
 
-    /// testGooseExecutorCreatesSession — Section 12.1
+    /// testRuntimeExecutorCreatesSession — Section 12.1
     @MainActor
     @Test("Executor creates session with correct policy and produces receipt/transcript artifacts")
-    func gooseExecutorCreatesSession() async throws {
+    func runtimeExecutorCreatesSession() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: RuntimeSessionResponse(
@@ -960,10 +960,10 @@ struct RuntimeAgentExecutorTests {
                 "Result should contain transcript artifact")
     }
 
-    /// testGooseExecutorStreamsEvents — Section 12.1
+    /// testRuntimeExecutorStreamsEvents — Section 12.1
     @MainActor
     @Test("Executor streams events to event callback during execution")
-    func gooseExecutorStreamsEvents() async throws {
+    func runtimeExecutorStreamsEvents() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1003,10 +1003,10 @@ struct RuntimeAgentExecutorTests {
         #expect(eventTypes.contains(.finalOutput))
     }
 
-    /// testGooseExecutorPersistsReceiptArtifact — Section 12.1
+    /// testRuntimeExecutorPersistsReceiptArtifact — Section 12.1
     @MainActor
     @Test("Executor persists receipt artifact with correct agent ID and version")
-    func gooseExecutorPersistsReceiptArtifact() async throws {
+    func runtimeExecutorPersistsReceiptArtifact() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1041,7 +1041,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor runtime truth prefers frozen provider binding over live override")
-    func gooseExecutorPrefersFrozenProviderBindingForRuntimeTruth() async throws {
+    func runtimeExecutorPrefersFrozenProviderBindingForRuntimeTruth() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: RuntimeSessionResponse(
@@ -1141,10 +1141,10 @@ struct RuntimeAgentExecutorTests {
         #expect(receipt.effort == "medium")
     }
 
-    /// testGooseExecutorFailsWhenRequiredOutputsMissing — Section 12.1
+    /// testRuntimeExecutorFailsWhenRequiredOutputsMissing — Section 12.1
     @MainActor
     @Test("Executor fails when required outputs are missing from stream")
-    func gooseExecutorFailsWhenRequiredOutputsMissing() async throws {
+    func runtimeExecutorFailsWhenRequiredOutputsMissing() async throws {
         let transport = ObservableRuntimeTransport()
         // Stream completes but no files are written and no final output
         await transport.configure(
@@ -1171,7 +1171,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor materializes multiple required outputs from returned output blocks without disk writes")
-    func gooseExecutorMaterializesReturnedOutputBlocks() async throws {
+    func runtimeExecutorMaterializesReturnedOutputBlocks() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1212,7 +1212,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor merges required output blocks across final output and accumulated text")
-    func gooseExecutorMergesReturnedOutputBlocksAcrossSources() async throws {
+    func runtimeExecutorMergesReturnedOutputBlocksAcrossSources() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1260,7 +1260,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor tolerates degraded returned output end markers in accumulated text")
-    func gooseExecutorToleratesDegradedReturnedOutputEndMarkers() async throws {
+    func runtimeExecutorToleratesDegradedReturnedOutputEndMarkers() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1301,7 +1301,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor synthesizes partial implementation artifacts when code writer fails before writing them")
-    func gooseExecutorSynthesizesPartialImplementationArtifactsOnFailure() async throws {
+    func runtimeExecutorSynthesizesPartialImplementationArtifactsOnFailure() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1383,10 +1383,10 @@ struct RuntimeAgentExecutorTests {
         #expect(outputs["tests_result"] != nil)
     }
 
-    /// testGooseExecutorReturnsAgentResult — Section 12.1
+    /// testRuntimeExecutorReturnsAgentResult — Section 12.1
     @MainActor
     @Test("Executor returns agent result with log snippet and cost estimate")
-    func gooseExecutorReturnsAgentResult() async throws {
+    func runtimeExecutorReturnsAgentResult() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1528,10 +1528,10 @@ struct RuntimeAgentExecutorTests {
         #expect(receipt.errorMessage == nil)
     }
 
-    /// testGooseExecutorSessionCreationFailure
+    /// testRuntimeExecutorSessionCreationFailure
     @MainActor
     @Test("Executor handles session creation failure gracefully")
-    func gooseExecutorSessionCreationFailure() async throws {
+    func runtimeExecutorSessionCreationFailure() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -1646,7 +1646,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor fails without policy acknowledgement in session response")
-    func gooseExecutorFailsWithoutPolicyAcknowledgement() async throws {
+    func runtimeExecutorFailsWithoutPolicyAcknowledgement() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: RuntimeSessionResponse(
@@ -1671,7 +1671,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor does not retry contract or missing-output failures as transport errors")
-    func gooseExecutorDoesNotRetryContractFailures() async throws {
+    func runtimeExecutorDoesNotRetryContractFailures() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: RuntimeSessionResponse(
@@ -1706,7 +1706,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor fail-closes ACP proposal review read-loop stalls before watchdog and emits durable failure evidence")
-    func gooseExecutorFailClosesACPProposalReviewReadLoopStall() async throws {
+    func runtimeExecutorFailClosesACPProposalReviewReadLoopStall() async throws {
         let originalSilence = RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds
         let originalThreshold = RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold
         let originalPoll = RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds
@@ -1740,7 +1740,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor records lazy evidence hits when on-demand helper is invoked")
-    func gooseExecutorRecordsLazyEvidenceHits() async throws {
+    func runtimeExecutorRecordsLazyEvidenceHits() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: RuntimeSessionResponse(
@@ -1835,7 +1835,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor starts a fresh session after a prior successful generation settles")
-    func gooseExecutorFallsBackWhenReusedSessionDisappearsMidStream() async throws {
+    func runtimeExecutorFallsBackWhenReusedSessionDisappearsMidStream() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
         let config = ModelConfiguration("RuntimeAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
@@ -1901,7 +1901,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor rejects duplicate fresh provider session IDs when another lineage is still active")
-    func gooseExecutorRejectsDuplicateFreshProviderSessionIDsAcrossLineages() async throws {
+    func runtimeExecutorRejectsDuplicateFreshProviderSessionIDsAcrossLineages() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
         let config = ModelConfiguration("RuntimeAgentExecutorCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
@@ -1982,7 +1982,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor does not treat a completed generation as an active provider-session collision")
-    func gooseExecutorIgnoresCompletedGenerationDuringFreshCollisionCheck() async throws {
+    func runtimeExecutorIgnoresCompletedGenerationDuringFreshCollisionCheck() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
         let config = ModelConfiguration("RuntimeAgentExecutorCompletedCollisionTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
@@ -2071,7 +2071,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor starts a fresh session after prior generation settles even if transport used SSE errors before")
-    func gooseExecutorFallsBackWhenReusedSessionEndsWithSSEError() async throws {
+    func runtimeExecutorFallsBackWhenReusedSessionEndsWithSSEError() async throws {
         let schema = Schema([AgentSessionLineage.self, AgentSessionGeneration.self, AgentSessionEvent.self])
         let config = ModelConfiguration("RuntimeAgentExecutorTests-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
@@ -2137,7 +2137,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor maps quota stream errors to canonical limit exhaustion")
-    func gooseExecutorMapsQuotaErrorToLimitExhaustion() async throws {
+    func runtimeExecutorMapsQuotaErrorToLimitExhaustion() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -2159,7 +2159,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor falls back to fresh session when reused Codex session is no longer active")
-    func gooseExecutorFallsBackFromNoActiveCodexSession() async throws {
+    func runtimeExecutorFallsBackFromNoActiveCodexSession() async throws {
         let transport = StaleReuseNoActiveCodexSessionTransport()
         let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
 
@@ -2209,7 +2209,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor retries with a fresh session when a just-created ACP session is already inactive")
-    func gooseExecutorRecoversWhenFreshSessionImmediatelyDisappears() async throws {
+    func runtimeExecutorRecoversWhenFreshSessionImmediatelyDisappears() async throws {
         let transport = FreshSessionMissingTransport()
         let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
 
@@ -2252,8 +2252,95 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
+    @Test("Executor disables session reuse for codex ACP even when the owner key matches")
+    func executorDisablesSessionReuseForCodexACP() async throws {
+        let transport = StaleReuseTransport()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
+
+        let runID = UUID()
+        let baseContext = makeContext(runID: runID, iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "proposal_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+
+        let context1 = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+        let context2 = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: 2,
+            attemptNumber: 1,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_current"],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let task = AgentTask(
+            agent: "proposal_writer",
+            task: "draft_initial_proposal",
+            inputs: nil,
+            outputs: ["proposal_current"]
+        )
+
+        let firstResult = try await executor.execute(task: task, agent: agent, context: context1)
+        #expect(firstResult.succeeded)
+        #expect(firstResult.sessionReuseDisposition == .fresh)
+
+        let secondResult = try await executor.execute(task: task, agent: agent, context: context2)
+        #expect(secondResult.succeeded)
+        #expect(secondResult.sessionReuseDisposition == .fresh)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
+    }
+
+    @MainActor
     @Test("Executor maps Gemini capacity exhaustion to retryable limit failure after durable output")
-    func gooseExecutorMapsGeminiCapacityErrorAfterOutput() async throws {
+    func runtimeExecutorMapsGeminiCapacityErrorAfterOutput() async throws {
         let transport = ObservableRuntimeTransport()
         await transport.configure(
             sessionResult: nil,
@@ -2285,7 +2372,7 @@ struct RuntimeAgentExecutorTests {
 
     @MainActor
     @Test("Executor surfaces session loss as provider-session unavailable instead of raw not-found text")
-    func gooseExecutorSurfacesBoundedSessionUnavailableMessage() async throws {
+    func runtimeExecutorSurfacesBoundedSessionUnavailableMessage() async throws {
         let transport = PersistentSessionUnavailableTransport()
         let executor = RuntimeAgentExecutor(transport: transport)
 

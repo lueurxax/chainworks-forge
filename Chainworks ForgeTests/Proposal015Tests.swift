@@ -86,8 +86,8 @@ struct Proposal015Tests {
         #expect(auditPath.hasPrefix(tempDirectory.path))
     }
 
-    @Test("Goose session packet injects resolved skill content before agent prompt")
-    func gooseSessionPacketInjectsResolvedSkillContentBeforeAgentPrompt() throws {
+    @Test("Runtime session packet injects resolved skill content before agent prompt")
+    func runtimeSessionPacketInjectsResolvedSkillContentBeforeAgentPrompt() throws {
         let resolvedSkill = ResolvedSkill(
             id: "inline_writer",
             type: .inline,

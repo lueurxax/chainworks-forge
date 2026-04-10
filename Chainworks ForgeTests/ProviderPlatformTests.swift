@@ -83,7 +83,7 @@ struct ProviderPlatformTests {
     schema_version: 1
     app:
       name: Chainworks
-      runtime: goose
+      runtime: claude_agent
       transport: rest_sse
     agents:
       code_writer:
@@ -282,16 +282,13 @@ struct ProviderPlatformTests {
 
         let (_, context) = try makeTestModelContainer()
         let configuration = LiveRuntimeConfiguration(
-            baseURL: URL(string: "http://fixture.local")!,
-            apiKey: nil,
             override: LiveExecutionOverride(
                 enabled: true,
-                provider: "claude_code",
+                provider: "claude_acp",
                 model: "fixture-model",
                 effort: "high"
             ),
-            transportMode: .fixtureFullMVPSuccess,
-            transportAPI: .bespoke
+            transportMode: .fixtureFullMVPSuccess
         )
 
         let service = ExecutionService(
@@ -421,7 +418,7 @@ struct ProviderPlatformTests {
 
         let claude = ConfiguredProvider(
             family: .claudeACP,
-            displayName: "Claude Goose",
+            displayName: "Claude ACP",
             transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,
@@ -502,7 +499,7 @@ struct ProviderPlatformTests {
         )
         let provider = ConfiguredProvider(
             family: .claudeACP,
-            displayName: "Claude Goose",
+            displayName: "Claude ACP",
             transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .apiKey,
@@ -528,7 +525,7 @@ struct ProviderPlatformTests {
         await registry.refreshDiagnostics(appConfiguration: appConfiguration)
 
         let report = try #require(registry.troubleshootingReport(for: provider.id))
-        #expect(report.displayName == "Claude Goose")
+        #expect(report.displayName == "Claude ACP")
         #expect(registry.lastRefreshedAt != nil)
         #expect(report.evidence.contains { $0.label == "Configured transport" })
     }
@@ -957,8 +954,8 @@ struct ProviderPlatformTests {
         #expect(modelBlockingIssues.isEmpty, "GPT-5 should be case-insensitively matched to gpt-5. Blocking issues: \(report.blockingIssues)")
     }
 
-    @Test("Preflight does not block codex ACP bindings on Goose provider health or missing codex MCP mappings")
-    mutating func preflightAllowsCodexACPBindingsWithoutGooseCredentialRequirement() async throws {
+    @Test("Preflight does not block codex ACP bindings on legacy provider health or missing codex MCP mappings")
+    mutating func preflightAllowsCodexACPBindingsWithoutLegacyCredentialRequirement() async throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -978,7 +975,7 @@ struct ProviderPlatformTests {
         ))
         let codex = ConfiguredProvider(
             family: .codexACP,
-            displayName: "Codex Goose",
+            displayName: "Codex ACP",
             transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .apiKey,
@@ -1077,7 +1074,7 @@ struct ProviderPlatformTests {
                 configuredProviders: [
                     ConfiguredProvider(
                         family: .codexACP,
-                        displayName: "Codex Goose",
+                        displayName: "Codex ACP",
                         transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
@@ -1085,7 +1082,7 @@ struct ProviderPlatformTests {
                     ),
                     ConfiguredProvider(
                         family: .claudeACP,
-                        displayName: "Claude Goose",
+                        displayName: "Claude ACP",
                         transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
@@ -1093,7 +1090,7 @@ struct ProviderPlatformTests {
                     ),
                     ConfiguredProvider(
                         family: .geminiACP,
-                        displayName: "Gemini Goose",
+                        displayName: "Gemini ACP",
                         transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
@@ -1252,7 +1249,7 @@ struct ProviderPlatformTests {
     mutating func providerDraftNormalizesCrossFamilyModelBeforeSave() {
         var draft = ProviderDraft()
         draft.family = .claudeACP
-        draft.displayName = "Claude Goose"
+        draft.displayName = "Claude ACP"
         draft.transport = .cli
         draft.defaultModel = "gpt-5-codex"
 
@@ -1293,14 +1290,14 @@ struct ProviderPlatformTests {
         #expect(sanitized.displayName == "Claude ACP CLI")
     }
 
-    @Test("Provider settings store canonicalizes legacy Claude Goose model identifiers")
-    mutating func providerSettingsStoreCanonicalizesLegacyClaudeGooseModelIdentifiers() throws {
+    @Test("Provider settings store canonicalizes legacy Claude ACP model identifiers")
+    mutating func providerSettingsStoreCanonicalizesLegacyClaudeACPModelIdentifiers() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let legacyClaude = ConfiguredProvider(
             family: .claudeACP,
-            displayName: "Claude Goose",
+            displayName: "Claude ACP",
             transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,

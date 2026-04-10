@@ -3,8 +3,8 @@ import Foundation
 // MARK: - RuntimeTransportProtocol (Proposal 026 — ACP-shaped canonical runtime transport)
 
 /// Canonical runtime transport contract. ACP-shaped vocabulary for session lifecycle,
-/// prompt submission, and stream events. All runtime adapters (Goose, Claude Agent ACP,
-/// Gemini CLI ACP) implement this protocol.
+/// prompt submission, and stream events. All runtime adapters (Claude Agent ACP,
+/// Gemini CLI ACP, Codex ACP) implement this protocol.
 protocol RuntimeTransportProtocol: Sendable {
     /// Transport-owned runtime namespace used to resolve session-scoped MCP mappings.
     /// Keeps MCP policy independent from frozen provider bindings in fixture/proof flows.
@@ -243,7 +243,7 @@ enum RuntimeStreamEvent: Sendable {
 // MARK: - RuntimeExtensionRegistryProvider (Proposal 026 Phase 2)
 
 /// Abstracts MCP / extension registry access so core runtime code
-/// does not depend on the concrete Goose config reader.
+/// does not depend on a concrete config reader.
 protocol RuntimeExtensionRegistryProvider: Sendable {
     func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot
 }

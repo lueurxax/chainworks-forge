@@ -1,8 +1,8 @@
 import Foundation
 
-// MARK: - RuntimeAgentExecutor (concrete AgentExecutor via Goose — Section 8.1)
+// MARK: - RuntimeAgentExecutor (concrete AgentExecutor — Section 8.1)
 
-/// Concrete implementation of `AgentExecutor` using a Goose backend.
+/// Concrete implementation of `AgentExecutor` using runtime transports.
 /// Each execution creates an isolated session via `RuntimeSessionBridge` (ARCH-027).
 final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 
@@ -43,9 +43,9 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         )
     }
 
-    /// Transport used for cancellation/cleanup of Goose sessions.
-    var gooseTransportForCancellation: (any RuntimeTransportProtocol)? {
-        (transportFactory as? DefaultRuntimeTransportFactory)?.gooseTransport
+    /// Transport used for cancellation/cleanup of runtime sessions.
+    var runtimeTransportForCancellation: (any RuntimeTransportProtocol)? {
+        (transportFactory as? DefaultRuntimeTransportFactory)?.fixtureTransport
     }
 
     func prepareForAppTermination() {
@@ -146,14 +146,15 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         attemptIndex: Int
     ) async throws -> AgentResult {
         let startedAt = Date()
-        let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
+        let effectiveAgent = effectiveAgentForExecution(agent, context: context)
+        let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: effectiveAgent)
 
         try RuntimeSessionBridge.validateWorkspace(context.workspace)
 
         // 1. Resolve Session (Proposal 018)
         let sessionInfo: SessionResolutionInfo
         do {
-            sessionInfo = try await resolveSession(task: task, agent: agent, context: context)
+            sessionInfo = try await resolveSession(task: task, agent: effectiveAgent, context: context)
         } catch {
             return AgentResult.failure(
                 "Session creation failed (attempt \(attemptIndex)): \(error.localizedDescription)",
@@ -225,7 +226,7 @@ await sessionInfo.execution.closeSession()
         let checkpoint = await updateEconomicsAndCheckBudget(
             streamResult: streamResult,
             sessionInfo: sessionInfo,
-            agent: agent,
+            agent: effectiveAgent,
             context: context,
             startedAt: startedAt,
             completedAt: completedAt
@@ -236,7 +237,7 @@ await sessionInfo.execution.closeSession()
             streamResult: streamResult,
             sessionInfo: sessionInfo,
             checkpoint: checkpoint,
-            agent: agent,
+            agent: effectiveAgent,
             context: context,
             expectedOutputs: expectedOutputs,
             eventBridge: eventBridge,
@@ -250,6 +251,49 @@ await sessionInfo.execution.closeSession()
         }
         await settleCompletedGenerationIfNeeded(sessionInfo: sessionInfo, result: result)
         return result
+    }
+
+    private func effectiveAgentForExecution(
+        _ agent: ResolvedAgent,
+        context: ExecutionContext
+    ) -> ResolvedAgent {
+        guard shouldDisableSessionReuse(for: agent, context: context),
+              agent.sessionReuseScope != .none else {
+            return agent
+        }
+
+        return ResolvedAgent(
+            id: agent.id,
+            title: agent.title,
+            mode: agent.mode,
+            backendProfileID: agent.backendProfileID,
+            provider: agent.provider,
+            model: agent.model,
+            effort: agent.effort,
+            maxTurns: agent.maxTurns,
+            temperature: agent.temperature,
+            permissionProfile: agent.permissionProfile,
+            mcpProfileID: agent.mcpProfileID,
+            skillRef: agent.skillRef,
+            skillRole: agent.skillRole,
+            resolvedSkill: agent.resolvedSkill,
+            prompt: agent.prompt,
+            outputContract: agent.outputContract,
+            requiresHumanApproval: agent.requiresHumanApproval,
+            inputs: agent.inputs,
+            outputs: agent.outputs,
+            worktreeWriteEnabled: agent.worktreeWriteEnabled,
+            sessionReuseScope: .none,
+            sessionFamilyID: agent.sessionFamilyID,
+            runtimeProfileID: agent.runtimeProfileID
+        )
+    }
+
+    private func shouldDisableSessionReuse(
+        for agent: ResolvedAgent,
+        context: ExecutionContext
+    ) -> Bool {
+        context.providerBinding?.adapterFamily == "codex_acp"
     }
 
     private func processStreamWithSupervision(
@@ -487,9 +531,9 @@ await sessionInfo.execution.closeSession()
         }
 
         // Dispatch registry provider by adapter family (Proposal 029).
-        // - goose / nil: GooseExtensionRegistryReader (original path)
         // - codex_acp: CodexExtensionRegistryReader (Codex uses MCP natively)
         // - auggie_cli_acp, junie_cli_acp: nil (zero-MCP — no registry needed)
+        // - default: CodexExtensionRegistryReader (transport-neutral fallback)
         let runtimeRegistry: RuntimeExtensionRegistrySnapshot?
         switch context.providerBinding?.adapterFamily {
         case "codex_acp":
@@ -497,7 +541,7 @@ await sessionInfo.execution.closeSession()
         case "auggie_cli_acp", "junie_cli_acp":
             runtimeRegistry = nil
         default:
-            runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
+            runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
         }
         return MCPPolicyResolver().resolve(
             agent: agent,
@@ -696,7 +740,7 @@ await sessionInfo.execution.closeSession()
         agent: ResolvedAgent
     ) -> Bool {
         let runtimeNamespace = sessionInfo.execution.transport.mcpRuntimeNamespace?.lowercased()
-        let isACP = runtimeNamespace != nil && runtimeNamespace != "goose"
+        let isACP = runtimeNamespace != nil
         let reviewOutputs = Set([
             "proposal_review_po",
             "proposal_review_ux",
@@ -799,7 +843,7 @@ await sessionInfo.execution.closeSession()
             toolCalls: eventBridge.toolCalls,
             runtimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? sessionInfo.mcpResolution.predictedEffectiveRuntimeExtensionIDs
         )
-        let runtimeTransport = context.providerBinding?.transport ?? "goose"
+        let runtimeTransport = context.providerBinding?.transport ?? "unknown"
 
         return AgentResult(
             outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(failureMsg)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
@@ -990,7 +1034,7 @@ await sessionInfo.execution.closeSession()
         )
 
         let cost = estimateCost(streamResult: streamResult)
-        let runtimeTransport = context.providerBinding?.transport ?? "goose"
+        let runtimeTransport = context.providerBinding?.transport ?? "unknown"
         return AgentResult(
             outputs: outputs, logSnippet: buildLogSnippet(agent: agent, sessionID: sessionInfo.execution.sessionID, streamResult: streamResult, startedAt: startedAt, completedAt: completedAt),
             costCents: cost, succeeded: finalOutcome == .completed, errorMessage: finalOutcome == .completed ? nil : finalError, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),

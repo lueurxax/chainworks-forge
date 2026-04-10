@@ -157,7 +157,7 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
                     return
                 }
 
-                // Synthesize session lifecycle events (matches GooseServerTransport behavior)
+                // Synthesize session lifecycle events (matches RuntimeTransportProtocol pattern)
                 continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
                 do {

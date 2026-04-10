@@ -1420,16 +1420,13 @@ struct Proposal013Tests {
         )
 
         let liveConfig = LiveRuntimeConfiguration(
-            baseURL: URL(string: "http://fixture.local")!,
-            apiKey: nil,
             override: LiveExecutionOverride(
                 enabled: true,
-                provider: "claude_code",
+                provider: "claude_acp",
                 model: "fixture-model",
                 effort: "high"
             ),
-            transportMode: .fixtureProposal013AggregateFailure,
-            transportAPI: .bespoke
+            transportMode: .fixtureProposal013AggregateFailure
         )
         let service = ExecutionService(
             modelContext: context,
@@ -2135,7 +2132,7 @@ struct Proposal013Tests {
             effort: "extra high"
         )
         architect.completedAt = Date(timeIntervalSince1970: 110)
-        architect.logSnippet = "Session creation failed (attempt 0): Live execution blocked: MCP policy could not be honored. MCP server 'xcode' has no runtime mapping for 'goose'."
+        architect.logSnippet = "Session creation failed (attempt 0): Live execution blocked: MCP policy could not be honored. MCP server 'xcode' has no runtime mapping for 'claude_agent'."
         architect.stageExecution = currentReviewFailure
         context.insert(architect)
 
@@ -2143,8 +2140,8 @@ struct Proposal013Tests {
 
         #expect(payload.failureEvidenceSummaries.count == 1)
         #expect(payload.failureEvidenceSummaries.first?.stageID == "state_4_proposal_reviewed")
-        #expect(payload.failureEvidenceSummaries.first?.failureSummary.contains("no runtime mapping for 'goose'") == true)
-        #expect(payload.blockedReason?.contains("no runtime mapping for 'goose'") == true)
+        #expect(payload.failureEvidenceSummaries.first?.failureSummary.contains("no runtime mapping for 'claude_agent'") == true)
+        #expect(payload.blockedReason?.contains("no runtime mapping for 'claude_agent'") == true)
         #expect(payload.retryPath == "Retry agent 'proposal_reviewer_architect' in stage 'state_4_proposal_reviewed'")
         #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_2_proposal_drafted" })
         #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_5_proposal_refined" })
@@ -2272,7 +2269,7 @@ private func makeTestCatalog(
         schemaVersion: 1,
         app: AppConfig(
             name: "test",
-            runtime: "goose",
+            runtime: "claude_agent",
             transport: "http",
             description: "test",
             ideaInputMode: "text",

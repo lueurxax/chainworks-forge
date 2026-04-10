@@ -756,8 +756,8 @@ struct AppBootstrapView: View {
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
 
-                        case .gooseAssistant:
-                            UITestGooseAssistantSurface()
+                        case .runtimeAssistant:
+                            UITestRuntimeAssistantSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
@@ -849,7 +849,7 @@ struct AppBootstrapView: View {
     private func proposal015ProofRoot() -> some View {
         // Proposal 015's proof surface is fully fixture-backed and does not depend on
         // runtime/provider bootstrap. Keep this path minimal so approved-host UI proof
-        // does not fail behind unrelated Goose/provider initialization.
+        // does not fail behind unrelated provider initialization.
         withRequestedWindowSizeMarker {
             VStack(spacing: 0) {
                 Text("UI Test Surface: proposal015_proof")
@@ -972,72 +972,40 @@ struct AppBootstrapView: View {
 
     private static func loadLiveRuntimeConfiguration() -> LiveRuntimeConfiguration? {
         let environment = ProcessInfo.processInfo.environment
-        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal_loop_success" {
-            let override = LiveExecutionOverride(
-                enabled: true,
-                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
-                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
-                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
-            )
+        guard let fixtureMode = environment["CHAINWORKS_FIXTURE_MODE"],
+              !fixtureMode.isEmpty else { return nil }
 
+        let override = LiveExecutionOverride(
+            enabled: true,
+            provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
+            model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
+            effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
+        )
+
+        switch fixtureMode {
+        case "proposal_loop_success":
             return LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://fixture.local")!,
-                apiKey: nil,
                 override: override,
-                transportMode: .fixtureProposalLoopSuccess,
-                transportAPI: .bespoke
+                transportMode: .fixtureProposalLoopSuccess
             )
-        }
-        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal022_feedback_cycle" {
-            let override = LiveExecutionOverride(
-                enabled: true,
-                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
-                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
-                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
-            )
-
+        case "proposal022_feedback_cycle":
             return LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://fixture.local")!,
-                apiKey: nil,
                 override: override,
-                transportMode: .fixtureProposal022FeedbackCycle,
-                transportAPI: .bespoke
+                transportMode: .fixtureProposal022FeedbackCycle
             )
-        }
-        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal013_aggregate_failure" {
-            let override = LiveExecutionOverride(
-                enabled: true,
-                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
-                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
-                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
-            )
-
+        case "proposal013_aggregate_failure":
             return LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://fixture.local")!,
-                apiKey: nil,
                 override: override,
-                transportMode: .fixtureProposal013AggregateFailure,
-                transportAPI: .bespoke
+                transportMode: .fixtureProposal013AggregateFailure
             )
-        }
-        if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "full_mvp_success" {
-            let override = LiveExecutionOverride(
-                enabled: true,
-                provider: environment["CHAINWORKS_LIVE_PROVIDER"] ?? "claude_code",
-                model: environment["CHAINWORKS_LIVE_MODEL"] ?? "fixture-model",
-                effort: environment["CHAINWORKS_LIVE_EFFORT"] ?? "high"
-            )
-
+        case "full_mvp_success":
             return LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://fixture.local")!,
-                apiKey: nil,
                 override: override,
-                transportMode: .fixtureFullMVPSuccess,
-                transportAPI: .bespoke
+                transportMode: .fixtureFullMVPSuccess
             )
+        default:
+            return nil
         }
-
-        return nil
     }
 
     @MainActor

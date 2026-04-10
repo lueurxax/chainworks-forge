@@ -160,7 +160,7 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                     return
                 }
 
-                // Synthesize lifecycle events (matching GooseServerTransport pattern)
+                // Synthesize lifecycle events (matching RuntimeTransportProtocol pattern)
                 continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
                 do {

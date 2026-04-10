@@ -1,7 +1,7 @@
 schema_version: 1
 app:
   name: Chainworks
-  runtime: goose
+  runtime: claude_agent
   transport: rest_sse
   description: Multi-agent catalog for a single-engineer workflow constructor/executor.
   idea_input_mode: text_with_optional_file

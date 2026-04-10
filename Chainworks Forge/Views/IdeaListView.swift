@@ -1485,7 +1485,7 @@ struct WorkflowStartRunSheet: View {
                             Text(mode.title)
                                 .font(.subheadline.weight(.medium))
                                 .foregroundStyle(.primary)
-                            Text(mode == .live ? "Uses configured Goose-backed execution." : "Uses the canonical local executor.")
+                            Text(mode == .live ? "Uses configured live runtime execution." : "Uses the canonical local executor.")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -1649,7 +1649,7 @@ struct WorkflowStartRunSheet: View {
                             Label("Live runtime unavailable", systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption.weight(.semibold))
                                 .accessibilityIdentifier("live-runtime-unavailable-title")
-                            Text(liveRuntimeRecoveryCopy?.reason ?? "Live workflows require an available Goose runtime.")
+                            Text(liveRuntimeRecoveryCopy?.reason ?? "Live workflows require an available runtime transport.")
                                 .font(.caption2)
                                 .accessibilityIdentifier("live-runtime-unavailable-guidance")
                             if let recovery = liveRuntimeRecoveryCopy?.recovery, !recovery.isEmpty {
@@ -1700,7 +1700,7 @@ struct WorkflowStartRunSheet: View {
                     }
 
                     if selectedMode == .live && !liveModeConfigured {
-                        Text("Advanced setup: `CHAINWORKS_GOOSE_BASE_URL` or `CHAINWORKS_GOOSE_FIXTURE_MODE=proposal_loop_success`, then relaunch the app.")
+                        Text("Advanced setup: `CHAINWORKS_FIXTURE_MODE=proposal_loop_success`, then relaunch the app.")
                             .font(.caption)
                             .foregroundStyle(DesignTokens.Status.warning)
                             .accessibilityIdentifier("live-runtime-unavailable-advanced")
@@ -1923,7 +1923,7 @@ struct WorkflowStartRunSheet: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 if selectedMode == .live {
-                                    Text("Executor: Goose-backed live execution")
+                                    Text("Executor: Live runtime execution")
                                 } else {
                                     Text("Executor: Simulated")
                                 }
@@ -2299,7 +2299,7 @@ struct WorkflowStartRunSheet: View {
         }
         let skillContentHashes = resolvedSkills.mapValues { $0.contentHash }
         let skillInjectedContentHashes = resolvedSkills.mapValues { $0.injectedContentHash }
-        let runtimeRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
         let resolvedMCPPolicies: [String: MCPPolicyResolutionReport] = adjustedPlan.agentBindings.reduce(into: [:]) { partialResult, entry in
             partialResult[entry.key] = MCPPolicyResolver().resolve(
                 agent: entry.value,
@@ -2800,7 +2800,7 @@ struct WorkflowRunProgressView: View {
                 value: latestLiveSessionID ?? "No live session",
                 detail: latestLiveSessionID == nil
                     ? missingSessionDetail
-                    : "Most recent active Goose session",
+                    : "Most recent active runtime session",
                 symbol: "lanyardcard"
             )
         }
@@ -3454,7 +3454,7 @@ private extension String {
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
     let idea = Idea(
         title: "Investigate provider setup",
-        body: "Make Codex and Claude configuration legible and Goose-backed.",
+        body: "Make Codex and Claude configuration legible and runtime-backed.",
         attachmentPath: PreviewSupport.previewDocumentsURL("specs/provider-setup.md").path
     )
 
