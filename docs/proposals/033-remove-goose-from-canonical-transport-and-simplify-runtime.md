@@ -57,13 +57,14 @@ proposal-033|p033)
 
 **`Proposal033Tests` must prove**:
 
-1. `ProviderSettingsStore.migrateFromGooseEra()` correctly migrates persisted Goose-era JSON.
-2. `DefaultRuntimeTransportFactory` has no `gooseTransport` field and throws for `"goose"` family.
-3. `MCPPolicyResolver` has no `"goose"` namespace branches.
-4. `ResumeManager` blocks Goose-bound runs with explicit error.
-5. `FixtureACPTransport` produces valid execution proof (replaces `FixtureGooseTransport` scenarios).
-6. `effectiveRuntimeNamespace` has no `"goose"` case.
-7. Zero `"Goose"` in operator-facing preflight messages.
+1. `ProviderSettingsStore.migrateFromGooseEra()` correctly migrates persisted Goose-era local JSON (family, transport, endpoint, displayName, capabilities, adapterVersion, preferredProviderIDsByFamily keys).
+2. `SettingsTransferService` import path applies the same migration to imported Goose-era JSON before merging — cross-machine continuity preserved.
+3. `DefaultRuntimeTransportFactory` has no `gooseTransport` field and throws for `"goose"` family.
+4. `MCPPolicyResolver` has no `"goose"` namespace branches.
+5. `ResumeManager` blocks Goose-bound runs with explicit error.
+6. `FixtureACPTransport` produces valid execution proof (replaces `FixtureGooseTransport` scenarios).
+7. `effectiveRuntimeNamespace` has no `"goose"` case.
+8. Zero `"Goose"` in operator-facing preflight messages.
 
 ---
 
@@ -298,6 +299,10 @@ proposal-033|p033)
 | `reference/workflow-execution-engine.md` | Remove Goose transport assumptions; describe ACP-only executor |
 | `reference/per-agent-mcp-policy-and-runtime-validation.md` | Remove Goose extension registry references; ACP registries only |
 | `reference/test-suite-architecture.md` | Remove Goose fixture/test references; describe ACP fixture strategy |
+| `reference/provider-binding-truth.md` | Rewrite: remove Goose transport binding examples; ACP bindings only |
+| `reference/run-control.md` | Rewrite: remove Goose runtime control references; ACP session control only |
+| `reference/skill-resolution-and-runtime-integration.md` | Rewrite: remove Goose-era skill injection path references; skills are already transport-neutral but doc language may still reference Goose session |
+| `reference/agent-ui-test-execution.md` | Rewrite: remove Goose-backed UI test assumptions; ACP fixture strategy |
 | `.review-baselines/current-system-baseline.md` | Update baseline provider vocabulary to ACP-only |
 
 **Scope clarification**: "Zero Goose runtime references" means zero in Swift source, configuration files, environment variable names, and operator-facing UI strings. Brand/design assets (`chainworks_forge_design_kit_v1.md`) that use geese as visual metaphor are explicitly out of scope.
