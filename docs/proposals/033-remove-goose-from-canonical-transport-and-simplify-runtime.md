@@ -253,6 +253,14 @@ var runtimeSessionID: String?
 5. Persist migrated JSON.
 6. Write `"migration_version": 1` field to prevent re-running.
 
+**Credential / UUID migration**: Secrets are keyed by `"provider.\(UUID)"` in `KeychainSecretStore` (via `ProviderAdapterSupport.secretKey(for:)`). Migration semantics:
+
+- **Claude/Gemini rows (migrated)**: The `ConfiguredProvider` row is mutated in-place — `id` (UUID) is **preserved**. The Keychain secret remains valid because it's keyed by UUID, not family name. No re-auth needed.
+- **Codex rows (deleted)**: The row is removed. Its Keychain secret becomes orphaned — harmless, never accessed. The fresh seeded `.codexACP` entry gets a new UUID. Operator must configure credentials for the new entry. This is an explicit **re-auth requirement**, not a silent loss.
+- **SettingsTransferService**: Transfer placeholders are also keyed by UUID. Migrated Claude/Gemini UUIDs survive. Deleted Codex UUIDs are dropped from the transfer bundle.
+
+**Decision**: Preserve UUID for migrated rows (Claude/Gemini). Accept re-auth for deleted rows (Codex). No attempt to transfer secrets across UUID boundaries.
+
 **SettingsTransferService**: Import path runs the same migration on imported JSON before merging. Export path writes current (already-migrated) state — no special handling.
 
 **Canonical outcome for each Goose-era row**:
@@ -326,6 +334,9 @@ var runtimeSessionID: String?
 | `reference/run-control.md` | Rewrite: remove Goose runtime control references; ACP session control only |
 | `reference/skill-resolution-and-runtime-integration.md` | Rewrite: remove Goose-era skill injection path references; skills are already transport-neutral but doc language may still reference Goose session |
 | `reference/agent-ui-test-execution.md` | Rewrite: remove Goose-backed UI test assumptions; ACP fixture strategy |
+| `reference/runtime-contract.md` | Update `required now: codex, claude_code, gemini` → `codex_acp, claude_acp, gemini_acp, auggie, junie` |
+| `reference/mvp-sign-off.md` | Update provider list from `codex / claude_code / gemini` to ACP families |
+| `Support/MVPBoundaryPolicy.swift` | Update `canonicalMVPProviders` set and `providerDisplayNames` to ACP identifiers |
 | `.review-baselines/current-system-baseline.md` | Update baseline provider vocabulary to ACP-only |
 
 **Scope clarification**: "Zero Goose runtime references" means zero in Swift source, configuration files, environment variable names, and operator-facing UI strings. Brand/design assets (`chainworks_forge_design_kit_v1.md`) that use geese as visual metaphor are explicitly out of scope.
