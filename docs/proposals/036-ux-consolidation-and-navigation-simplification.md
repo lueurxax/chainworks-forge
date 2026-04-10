@@ -1,4 +1,4 @@
-# Proposal 033: UX Consolidation and Navigation Simplification
+# Proposal 036: UX Consolidation and Navigation Simplification
 
 | Field | Value |
 |---|---|
