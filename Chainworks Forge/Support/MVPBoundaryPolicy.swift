@@ -15,16 +15,20 @@ enum MVPBoundaryPolicy {
     /// The canonical MVP provider families. No MVP sign-off path may depend
     /// on a provider family beyond this set.
     static let canonicalProviderFamilies: Set<String> = [
-        "codex",
-        "claude_code",
-        "gemini",
+        "codex_acp",
+        "claude_acp",
+        "gemini_acp",
+        "auggie",
+        "junie",
     ]
 
     /// Human-readable labels for canonical providers (UI copy).
     static let providerLabels: [String: String] = [
-        "codex": "Codex",
-        "claude_code": "Claude Code",
-        "gemini": "Gemini",
+        "codex_acp": "Codex ACP",
+        "claude_acp": "Claude ACP",
+        "gemini_acp": "Gemini ACP",
+        "auggie": "Auggie",
+        "junie": "Junie",
     ]
 
     /// Check if a provider family is within MVP boundary.

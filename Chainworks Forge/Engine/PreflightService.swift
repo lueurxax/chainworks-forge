@@ -536,37 +536,6 @@ struct PreflightService {
         )).sorted().joined(separator: ", ")
 
         let snapshot = providerRegistry.healthSnapshot(for: provider.id)
-        if provider.transport == .gooseServer {
-            let title = "\(provider.displayName) Reachability"
-            if usesConfiguredTransport {
-                let reachabilityIssue = snapshot.flatMap { ProviderAdapterSupport.gooseServerReachabilityIssue(from: $0.blockingIssues) }
-                if let reachabilityIssue {
-                    checks.append(PreflightCheck(
-                        category: "Providers",
-                        title: title,
-                        status: .fail,
-                        message: reachabilityIssue
-                    ))
-                    blockingIssues.append(reachabilityIssue)
-                } else if let endpoint = provider.endpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !endpoint.isEmpty {
-                    checks.append(PreflightCheck(
-                        category: "Providers",
-                        title: title,
-                        status: snapshot == nil ? .warn : .pass,
-                        message: snapshot == nil
-                            ? "Reachability has not been checked yet"
-                            : "Goose server is reachable at \(ProviderAdapterSupport.gooseStatusURLString(for: endpoint))"
-                    ))
-                }
-            } else if !effectiveBindings.isEmpty {
-                checks.append(PreflightCheck(
-                    category: "Providers",
-                    title: title,
-                    status: .pass,
-                    message: "Effective bindings use runtime-managed transport (\(runtimeSummary)); configured Goose reachability is not on the execution path."
-                ))
-            }
-        }
         let healthStatus: PreflightCheckStatus
         let healthMessage: String
         if usesConfiguredTransport || effectiveBindings.isEmpty {
@@ -643,7 +612,7 @@ struct PreflightService {
                   let profile = runtimeProfiles[profileID] else { continue }
 
             let provider = providerRegistry.configuredProviders.first { $0.id == binding.configuredProviderID }
-            let capabilities = provider?.capabilities ?? ProviderCapabilities.default(for: provider?.family ?? .codex)
+            let capabilities = provider?.capabilities ?? ProviderCapabilities.default(for: provider?.family ?? .codexACP)
 
             let unsatisfied = profile.requires.filter { !capabilities.satisfies($0) }
             if unsatisfied.isEmpty {

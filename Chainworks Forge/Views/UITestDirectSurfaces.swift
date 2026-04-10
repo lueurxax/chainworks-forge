@@ -222,34 +222,12 @@ struct UITestWorkflowMapSurface: View {
 }
 
 struct UITestGooseAssistantSurface: View {
-    @Environment(ProviderSettingsStore.self) private var providerSettingsStore
-    @Environment(AppConfigurationStore.self) private var appConfigurationStore
-    @Environment(ProviderRegistry.self) private var providerRegistry
-    @Environment(GooseServerManager.self) private var gooseServerManager
-
-    private var targetProvider: ConfiguredProvider? {
-        providerSettingsStore.settings.configuredProviders.first(where: { $0.family.gooseFirstPreferred })
-    }
-
     var body: some View {
-        Group {
-            if let targetProvider {
-                GooseProviderConnectionAssistantView(
-                    providerID: targetProvider.id,
-                    origin: .providerSettings
-                )
-                    .environment(appConfigurationStore)
-                    .environment(providerSettingsStore)
-                    .environment(providerRegistry)
-                    .environment(gooseServerManager)
-            } else {
-                ContentUnavailableView(
-                    "Goose assistant unavailable",
-                    systemImage: "server.rack",
-                    description: Text("The UI test Goose assistant surface requires at least one Goose-first provider.")
-                )
-            }
-        }
+        ContentUnavailableView(
+            "Goose assistant removed",
+            systemImage: "server.rack",
+            description: Text("The Goose assistant surface has been removed.")
+        )
         .accessibilityIdentifier("ui-test-goose-assistant-surface")
     }
 }
@@ -1020,7 +998,6 @@ struct Proposal015ProofFixture {
     let appConfigurationStore: AppConfigurationStore
     let providerSettingsStore: ProviderSettingsStore
     let providerRegistry: ProviderRegistry
-    let gooseServerManager: GooseServerManager
     let proofRun: Run
     let comparisonRun: Run
     let primaryArtifact: Artifact
@@ -1154,16 +1131,11 @@ enum Proposal015ProofFixtureBuilder {
                 settingsStore: providerSettingsStore,
                 secretStore: KeychainSecretStore(useInMemoryStore: true)
             )
-            let gooseServerManager = GooseServerManager(
-                appConfigurationStore: appConfigurationStore,
-                probe: { _ in .unreachable(reason: "Proposal 015 proof fixture does not use a live Goose server.") }
-            )
             let executionService = ExecutionService(
                 modelContext: context,
                 executor: SimulatedAgentExecutor(catalog: catalog),
                 catalog: catalog,
                 liveRuntimeConfiguration: nil,
-                gooseServerManager: gooseServerManager,
                 notificationService: NotificationService()
             )
 
@@ -1178,7 +1150,6 @@ enum Proposal015ProofFixtureBuilder {
                     appConfigurationStore: appConfigurationStore,
                     providerSettingsStore: providerSettingsStore,
                     providerRegistry: providerRegistry,
-                    gooseServerManager: gooseServerManager,
                     proofRun: proofSeed.run,
                     comparisonRun: comparisonSeed.run,
                     primaryArtifact: proofSeed.primaryArtifact
@@ -1381,7 +1352,6 @@ struct UITestProposal015ProofSurface: View {
                                     .environment(fixture.appConfigurationStore)
                                     .environment(fixture.providerSettingsStore)
                                     .environment(fixture.providerRegistry)
-                                    .environment(fixture.gooseServerManager)
                                     .modelContainer(fixture.modelContainer)
                                     .frame(minHeight: 420)
                             }

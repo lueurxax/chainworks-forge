@@ -40,14 +40,12 @@ struct ConfiguredProvider: Identifiable, Codable, Equatable, Sendable {
 enum ProviderDefaults {
     static func defaultModel(for family: ProviderFamily) -> String {
         switch family {
-        case .codex:
-            return "gpt-5-codex"
-        case .claude:
-            return "sonnet"
-        case .gemini:
-            return "gemini-2.5-pro"
         case .codexACP:
             return "gpt-5"
+        case .claudeACP:
+            return "sonnet"
+        case .geminiACP:
+            return "gemini-2.5-pro"
         case .auggie:
             return "auggie-default"
         case .junie:
@@ -66,18 +64,14 @@ enum ProviderDefaults {
 
         let lower = trimmed.lowercased()
         switch family {
-        case .claude:
-            // Goose-backed claude-code currently responds reliably to short aliases only.
+        case .claudeACP:
             if lower.hasPrefix("claude-opus") || lower.hasPrefix("anthropic/claude-opus") || lower.hasPrefix("anthropic.claude-opus") {
                 return "opus"
             }
             if lower.hasPrefix("claude-sonnet") || lower.hasPrefix("anthropic/claude-sonnet") || lower.hasPrefix("anthropic.claude-sonnet") {
                 return "sonnet"
             }
-            if transport?.isGooseBacked == true, ["opus", "sonnet", "default"].contains(lower) {
-                return lower
-            }
-        case .codex, .gemini, .codexACP, .auggie, .junie:
+        case .codexACP, .geminiACP, .auggie, .junie:
             break
         }
 
@@ -85,10 +79,7 @@ enum ProviderDefaults {
     }
 
     static func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {
-        if family.gooseFirstPreferred && transport == .gooseServer {
-            return "\(family.displayName) Goose"
-        }
-        return "\(family.displayName) \(transport.displayName)"
+        "\(family.displayName) \(transport.displayName)"
     }
 
     static func model(_ model: String, isCompatibleWith family: ProviderFamily) -> Bool {
@@ -97,14 +88,12 @@ enum ProviderDefaults {
 
         let expectedPrefixes: [String]
         switch family {
-        case .codex:
-            expectedPrefixes = ["gpt", "o1", "o3", "chatgpt"]
-        case .claude:
-            expectedPrefixes = ["claude", "anthropic", "sonnet", "opus", "default"]
-        case .gemini:
-            expectedPrefixes = ["gemini", "palm"]
         case .codexACP:
             expectedPrefixes = ["gpt", "codex", "o1", "o3", "o4"]
+        case .claudeACP:
+            expectedPrefixes = ["claude", "anthropic", "sonnet", "opus", "default"]
+        case .geminiACP:
+            expectedPrefixes = ["gemini", "palm"]
         case .auggie:
             expectedPrefixes = ["auggie"]
         case .junie:
@@ -116,23 +105,20 @@ enum ProviderDefaults {
 }
 
 enum ProviderFamily: String, Codable, CaseIterable, Sendable {
-    case codex
-    case claude
-    case gemini
     case codexACP
+    case claudeACP
+    case geminiACP
     case auggie
     case junie
 
     var runtimeProviderIdentifier: String {
         switch self {
-        case .codex:
-            return "codex"
-        case .claude:
-            return "claude_code"
-        case .gemini:
-            return "gemini"
         case .codexACP:
             return "codex_acp"
+        case .claudeACP:
+            return "claude_acp"
+        case .geminiACP:
+            return "gemini_acp"
         case .auggie:
             return "auggie"
         case .junie:
@@ -144,34 +130,25 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
         switch self {
         case .codexACP:
             return "Codex ACP"
+        case .claudeACP:
+            return "Claude ACP"
+        case .geminiACP:
+            return "Gemini ACP"
         case .auggie:
             return "Auggie"
         case .junie:
             return "Junie"
-        default:
-            return rawValue.capitalized
-        }
-    }
-
-    var gooseFirstPreferred: Bool {
-        switch self {
-        case .codex, .claude, .codexACP, .auggie, .junie:
-            return true
-        case .gemini:
-            return false
         }
     }
 
     static func from(runtimeIdentifier: String) -> ProviderFamily? {
         switch runtimeIdentifier {
-        case "codex":
-            return .codex
-        case "claude", "claude_code", "claude-code":
-            return .claude
-        case "gemini":
-            return .gemini
-        case "codex_acp", "codex-acp":
+        case "codex_acp", "codex-acp", "codex":
             return .codexACP
+        case "claude_acp", "claude-acp", "claude", "claude_code", "claude-code":
+            return .claudeACP
+        case "gemini_acp", "gemini-acp", "gemini":
+            return .geminiACP
         case "auggie":
             return .auggie
         case "junie":
@@ -186,7 +163,6 @@ enum ProviderTransport: String, Codable, CaseIterable, Sendable {
     case cli
     case localBridge
     case httpAPI
-    case gooseServer = "goose_server"
 
     var displayName: String {
         switch self {
@@ -196,13 +172,7 @@ enum ProviderTransport: String, Codable, CaseIterable, Sendable {
             return "Local Bridge"
         case .httpAPI:
             return "HTTP API"
-        case .gooseServer:
-            return "Goose Server"
         }
-    }
-
-    var isGooseBacked: Bool {
-        self == .gooseServer
     }
 }
 
@@ -250,35 +220,46 @@ struct ProviderCapabilities: Codable, Equatable, Sendable {
 
     static func `default`(for family: ProviderFamily) -> ProviderCapabilities {
         switch family {
-        case .codex, .claude:
+        case .codexACP:
+            return ProviderCapabilities(
+                supportsStreaming: true,
+                supportsTools: true,
+                supportsStructuredOutput: false,
+                supportsEffortControl: false,
+                supportsSessionResume: true,
+                supportsFileEditing: true,
+                supportsSandboxHints: false,
+                supportsMCPReconciliation: false
+            )
+        case .claudeACP:
             return ProviderCapabilities(
                 supportsStreaming: true,
                 supportsTools: true,
                 supportsStructuredOutput: true,
                 supportsEffortControl: true,
                 supportsSessionResume: true,
-                supportsFileEditing: false,
+                supportsFileEditing: true,
                 supportsSandboxHints: true,
                 supportsMCPReconciliation: true
             )
-        case .gemini:
+        case .geminiACP:
             return ProviderCapabilities(
                 supportsStreaming: true,
                 supportsTools: true,
                 supportsStructuredOutput: true,
                 supportsEffortControl: true,
                 supportsSessionResume: false,
-                supportsFileEditing: false,
+                supportsFileEditing: true,
                 supportsSandboxHints: true,
                 supportsMCPReconciliation: true
             )
-        case .codexACP, .auggie, .junie:
+        case .auggie, .junie:
             return ProviderCapabilities(
                 supportsStreaming: true,
                 supportsTools: true,
                 supportsStructuredOutput: false,
                 supportsEffortControl: false,
-                supportsSessionResume: family == .codexACP,
+                supportsSessionResume: false,
                 supportsFileEditing: true,
                 supportsSandboxHints: false,
                 supportsMCPReconciliation: false

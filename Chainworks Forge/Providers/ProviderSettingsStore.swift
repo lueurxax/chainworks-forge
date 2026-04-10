@@ -128,45 +128,32 @@ final class ProviderSettingsStore {
 
     private static func seededDefault() -> ProviderSettings {
         let environment = ProcessInfo.processInfo.environment
-        let fixtureEndpoint = environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == nil ? nil : "http://fixture.local"
-        let gooseBaseURL = environment["CHAINWORKS_GOOSE_BASE_URL"] ?? fixtureEndpoint
         var providers: [ConfiguredProvider] = [
-            ConfiguredProvider(
-                family: .codex,
-                displayName: "Codex Goose",
-                transport: .gooseServer,
-                endpoint: gooseBaseURL,
-                authMode: gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
-                defaultModel: "gpt-5-codex"
-            ),
-            ConfiguredProvider(
-                family: .claude,
-                displayName: "Claude Goose",
-                transport: .gooseServer,
-                endpoint: gooseBaseURL,
-                authMode: gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
-                defaultModel: "sonnet"
-            ),
-            ConfiguredProvider(
-                family: .gemini,
-                displayName: gooseBaseURL == nil ? "Gemini CLI" : "Gemini Goose",
-                transport: gooseBaseURL == nil ? .cli : .gooseServer,
-                endpoint: gooseBaseURL,
-                authMode: gooseBaseURL == nil || gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
-                defaultModel: "gemini-2.5-pro"
-            ),
             ConfiguredProvider(
                 family: .codexACP,
                 displayName: "Codex ACP",
-                transport: .gooseServer,
+                transport: .cli,
                 authMode: .apiKey,
-                defaultModel: "gpt-5",
-                isEnabled: false
+                defaultModel: "gpt-5"
+            ),
+            ConfiguredProvider(
+                family: .claudeACP,
+                displayName: "Claude ACP",
+                transport: .cli,
+                authMode: .apiKey,
+                defaultModel: "sonnet"
+            ),
+            ConfiguredProvider(
+                family: .geminiACP,
+                displayName: "Gemini ACP",
+                transport: .cli,
+                authMode: .apiKey,
+                defaultModel: "gemini-2.5-pro"
             ),
             ConfiguredProvider(
                 family: .auggie,
                 displayName: "Auggie CLI",
-                transport: .gooseServer,
+                transport: .cli,
                 authMode: .apiKey,
                 defaultModel: "auggie-default",
                 isEnabled: false
@@ -174,7 +161,7 @@ final class ProviderSettingsStore {
             ConfiguredProvider(
                 family: .junie,
                 displayName: "Junie CLI",
-                transport: .gooseServer,
+                transport: .cli,
                 authMode: .apiKey,
                 defaultModel: "junie-default",
                 isEnabled: false
@@ -183,18 +170,12 @@ final class ProviderSettingsStore {
 
         if let liveProvider = environment["CHAINWORKS_LIVE_PROVIDER"],
            let family = ProviderFamily.from(runtimeIdentifier: liveProvider) {
-            let transport: ProviderTransport = gooseBaseURL == nil ? .cli : .gooseServer
-            let authMode: ProviderAuthMode = gooseBaseURL == nil || gooseBaseURL == fixtureEndpoint
-                ? .none
-                : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey)
-            let endpoint = gooseBaseURL
             providers.removeAll { $0.family == family }
             providers.append(ConfiguredProvider(
                 family: family,
-                displayName: transport == .gooseServer ? "\(family.displayName) Goose" : "\(family.displayName) Seeded",
-                transport: transport,
-                endpoint: endpoint,
-                authMode: authMode,
+                displayName: "\(family.displayName) Seeded",
+                transport: .cli,
+                authMode: .none,
                 defaultModel: environment["CHAINWORKS_LIVE_MODEL"],
                 capabilities: .default(for: family)
             ))

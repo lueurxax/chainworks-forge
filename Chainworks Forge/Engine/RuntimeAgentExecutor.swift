@@ -105,6 +105,9 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         if error.contains("ACP proposal review stalled in read loop") {
             return false
         }
+        if error.localizedCaseInsensitiveContains("stream ended before final result was received") {
+            return true
+        }
 
         let isTransportError = error.contains("timed out") || error.contains("-1001") || error.contains("timeout")
             || error.contains("Session not found") || error.contains("session not found")

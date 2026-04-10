@@ -3,13 +3,6 @@ import Foundation
 struct JunieProviderAdapter: ProviderAdapter {
     let family: ProviderFamily = .junie
     let adapterVersion = "junie-v1"
-    private let gooseProbe: @Sendable (URL) async -> GooseServerReachability
-
-    init(
-        gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = ProviderAdapterSupport.probeGooseServerStatus
-    ) {
-        self.gooseProbe = gooseProbe
-    }
 
     func verify(provider: ConfiguredProvider, secretStore: KeychainSecretStore) async -> ProviderHealthSnapshot {
         switch provider.transport {
@@ -25,13 +18,6 @@ struct JunieProviderAdapter: ProviderAdapter {
                 provider: provider,
                 summaryPrefix: "Junie",
                 secretStore: secretStore
-            )
-        case .gooseServer:
-            return await ProviderAdapterSupport.verifyGooseServerProvider(
-                provider: provider,
-                summaryPrefix: "Junie",
-                secretStore: secretStore,
-                gooseProbe: gooseProbe
             )
         }
     }

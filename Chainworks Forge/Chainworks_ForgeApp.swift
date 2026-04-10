@@ -481,7 +481,7 @@ struct AppBootstrapView: View {
     @State private var appConfigurationStore: AppConfigurationStore?
     @State private var providerSettingsStore: ProviderSettingsStore?
     @State private var providerRegistry: ProviderRegistry?
-    @State private var gooseServerManager: GooseServerManager?
+
     @State private var showFirstRunWizard = false
     @State private var dogfoodHarnessStarted = false
     @State private var proposal015AppProofStarted = false
@@ -495,14 +495,12 @@ struct AppBootstrapView: View {
         } else if let service = executionService,
            let appConfigurationStore,
            let providerSettingsStore,
-           let providerRegistry,
-           let gooseServerManager {
+           let providerRegistry {
             bootstrappedRoot(
                 service: service,
                 appConfigurationStore: appConfigurationStore,
                 providerSettingsStore: providerSettingsStore,
-                providerRegistry: providerRegistry,
-                gooseServerManager: gooseServerManager
+                providerRegistry: providerRegistry
             )
         } else {
             ProgressView("Starting engine...")
@@ -550,14 +548,9 @@ struct AppBootstrapView: View {
         )
         let providerSettingsStore = ProviderSettingsStore()
         let providerRegistry = ProviderRegistry(settingsStore: providerSettingsStore)
-        let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
         self.appConfigurationStore = appConfigurationStore
         self.providerSettingsStore = providerSettingsStore
         self.providerRegistry = providerRegistry
-        self.gooseServerManager = gooseServerManager
-        #if os(macOS)
-        (NSApp.delegate as? AppTerminationCoordinator)?.gooseServerManager = gooseServerManager
-        #endif
         UIAutomationDiagnostics.log(
             "bootstrapService.config directSurface=\(environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] ?? "nil") " +
             "inMemory=\(environment["CHAINWORKS_IN_MEMORY_STORE"] ?? "nil")"
@@ -565,17 +558,9 @@ struct AppBootstrapView: View {
 
         let catalog = Self.loadBundledCatalog(appConfiguration: resolvedConfiguration)
         let stewardConfig = Self.loadStewardConfig()
-        if !isUnitTestHost &&
-            !forceLiveRuntimeUnavailable &&
-            !disableEagerUITestBootstrap &&
-            !isProposal007DogfoodHarness &&
-            !isProposal015AppProofAutorun &&
-            !isProposal022AppProofAutorun {
-            await gooseServerManager.bootstrap()
-        }
         let liveRuntimeConfiguration = isUnitTestHost || forceLiveRuntimeUnavailable
             ? nil
-            : Self.loadLiveRuntimeConfiguration(gooseServerManager: gooseServerManager)
+            : Self.loadLiveRuntimeConfiguration()
         // The simulated executor remains the safe default, but Proposal 004 live runs
         // are resolved per-plan inside ExecutionService using `liveRuntimeConfiguration`.
         let executor = SimulatedAgentExecutor(simulatedDelay: 0.5, catalog: catalog)
@@ -584,8 +569,7 @@ struct AppBootstrapView: View {
             executor: executor,
             catalog: catalog,
             stewardConfig: stewardConfig,
-            liveRuntimeConfiguration: liveRuntimeConfiguration,
-            gooseServerManager: gooseServerManager
+            liveRuntimeConfiguration: liveRuntimeConfiguration
         )
         executionService = service
         #if os(macOS)
@@ -714,8 +698,7 @@ struct AppBootstrapView: View {
         service: ExecutionService,
         appConfigurationStore: AppConfigurationStore,
         providerSettingsStore: ProviderSettingsStore,
-        providerRegistry: ProviderRegistry,
-        gooseServerManager: GooseServerManager
+        providerRegistry: ProviderRegistry
     ) -> some View {
         if let forcedUISurface {
             withRequestedWindowSizeMarker {
@@ -744,98 +727,98 @@ struct AppBootstrapView: View {
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .pilotReadiness:
                             PilotReadinessView()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .firstRunSetup:
                             FirstRunSetupWizard(isPresented: .constant(true))
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .ideaArchive:
                             UITestIdeaArchiveSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .workflowMap:
                             UITestWorkflowMapSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .gooseAssistant:
                             UITestGooseAssistantSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .releaseGate:
                             UITestReleaseGateSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .deliveryPreflightReport:
                             UITestDeliveryPreflightReportSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .completedExportHub:
                             UITestCompletedExportHubSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .waitingApprovalRunProgress:
                             UITestWaitingApprovalRunProgressSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .accessibilityAudit:
                             UITestAccessibilityAuditSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .proposal015Proof:
                             UITestProposal015ProofSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .proposal013Proof:
                             UITestProposal013EvidenceSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         case .proposal022Proof:
                             UITestProposal022EvidenceSurface()
                                 .environment(service)
                                 .environment(appConfigurationStore)
                                 .environment(providerSettingsStore)
                                 .environment(providerRegistry)
-                                .environment(gooseServerManager)
+
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -851,14 +834,12 @@ struct AppBootstrapView: View {
                     .environment(appConfigurationStore)
                     .environment(providerSettingsStore)
                     .environment(providerRegistry)
-                    .environment(gooseServerManager)
                     .sheet(isPresented: $showFirstRunWizard) {
                         FirstRunSetupWizard(isPresented: $showFirstRunWizard)
                             .environment(service)
                             .environment(appConfigurationStore)
                             .environment(providerSettingsStore)
                             .environment(providerRegistry)
-                            .environment(gooseServerManager)
                     }
             }
         }
@@ -989,7 +970,7 @@ struct AppBootstrapView: View {
         return nil
     }
 
-    private static func loadLiveRuntimeConfiguration(gooseServerManager: GooseServerManager?) -> LiveRuntimeConfiguration? {
+    private static func loadLiveRuntimeConfiguration() -> LiveRuntimeConfiguration? {
         let environment = ProcessInfo.processInfo.environment
         if environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == "proposal_loop_success" {
             let override = LiveExecutionOverride(
@@ -1056,35 +1037,7 @@ struct AppBootstrapView: View {
             )
         }
 
-        guard let managed = gooseServerManager?.liveRuntimeConfiguration else {
-            return nil
-        }
-
-        let provider = environment["CHAINWORKS_LIVE_PROVIDER"]
-        let model = environment["CHAINWORKS_LIVE_MODEL"]
-        let effort = environment["CHAINWORKS_LIVE_EFFORT"]
-
-        let override: LiveExecutionOverride?
-        if let provider, !provider.isEmpty,
-           let model, !model.isEmpty,
-           let effort, !effort.isEmpty {
-            override = LiveExecutionOverride(
-                enabled: true,
-                provider: provider,
-                model: model,
-                effort: effort
-            )
-        } else {
-            override = nil
-        }
-
-        return LiveRuntimeConfiguration(
-            baseURL: managed.baseURL,
-            apiKey: managed.apiKey,
-            override: override,
-            transportMode: managed.transportMode,
-            transportAPI: managed.transportAPI
-        )
+        return nil
     }
 
     @MainActor

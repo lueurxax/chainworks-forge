@@ -1142,6 +1142,67 @@ struct RuntimeSessionBridgeTests {
         #expect(lastRequest?.executionPolicy?.workspaceMode == "read_write")
     }
 
+    @Test("Implementation-start orchestrator task includes explicit freeze-and-worktree guidance")
+    func implementationStartDirectiveIncludesExplicitFreezeAndWorktreeGuidance() {
+        let agent = ResolvedAgent(
+            id: "lead_orchestrator",
+            title: "Lead / Orchestrator",
+            mode: "orchestration",
+            provider: "claude_code",
+            model: "sonnet",
+            effort: "high",
+            maxTurns: 8,
+            temperature: 0.0,
+            permissionProfile: "ORCH",
+            skillRef: "orchestrator_core",
+            skillRole: nil,
+            prompt: "Lead workflow forward one safe state at a time.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["proposal_current", "proposal_review_summary", "run_state"],
+            outputs: ["approved_proposal", "implementation_plan", "implementation_backlog", "run_state"]
+        )
+        let task = AgentTask(
+            agent: "lead_orchestrator",
+            task: "freeze_proposal_and_provision_worktree",
+            inputs: ["proposal_current", "proposal_review_summary", "run_state"],
+            outputs: ["approved_proposal", "implementation_plan", "implementation_backlog", "run_state"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+        let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
+        try? FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+
+        let context = ExecutionContext(
+            workspace: RunWorkspace(
+                runID: workspace.runID,
+                workspaceRoot: workspace.workspaceRoot,
+                artifactRoot: workspace.artifactRoot,
+                worktreeRoot: worktreeRoot
+            ),
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_7_implementation_started",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [
+                "proposal_current": Data("proposal".utf8),
+                "proposal_review_summary": Data("{\"decision\":\"approve\"}".utf8),
+                "run_state": Data("{\"status\":\"completed\"}".utf8)
+            ],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("### Task-Specific Guidance"))
+        #expect(packet.taskDirective.contains("The dedicated worktree has already been provisioned by the engine"))
+        #expect(packet.taskDirective.contains("Freeze `proposal_current` into `approved_proposal`"))
+        #expect(packet.taskDirective.contains("Return `implementation_plan`, `implementation_backlog`, and `run_state`"))
+    }
+
     // MARK: - LiveExecutionOverride Tests
 
     @Test("Frozen provider binding wins over live override during session creation")

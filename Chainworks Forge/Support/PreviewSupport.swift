@@ -47,26 +47,23 @@ enum PreviewSupport {
     @MainActor
     static func makeProviderSettingsStore() -> ProviderSettingsStore {
         let claudeProvider = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
+            family: .claudeACP,
+            displayName: "Claude ACP",
+            transport: .cli,
             authMode: .apiKey,
             defaultModel: "opus"
         )
         let codexProvider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex via Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
             authMode: .apiKey,
-            defaultModel: "gpt-5-codex"
+            defaultModel: "gpt-5"
         )
         let geminiProvider = ConfiguredProvider(
-            family: .gemini,
-            displayName: "Gemini HTTP",
-            transport: .httpAPI,
-            endpoint: "https://127.0.0.1:51200",
+            family: .geminiACP,
+            displayName: "Gemini ACP",
+            transport: .cli,
             authMode: .none,
             defaultModel: "gemini-2.5-pro"
         )

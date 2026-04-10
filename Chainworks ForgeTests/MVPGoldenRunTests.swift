@@ -8,7 +8,7 @@ import SwiftData
 struct MVPGoldenRunTests {
     private func encodeFixtureProviderBindings(for plan: RunPlan) throws -> Data {
         let bindings = Dictionary(uniqueKeysWithValues: plan.agentBindings.map { agentID, agent in
-            let family = ProviderFamily.from(runtimeIdentifier: agent.provider) ?? .claude
+            let family = ProviderFamily.from(runtimeIdentifier: agent.provider) ?? .claudeACP
             let binding = ResolvedProviderBinding(
                 agentID: agentID,
                 backendProfileID: agent.backendProfileID,
@@ -17,7 +17,7 @@ struct MVPGoldenRunTests {
                 providerIdentifier: family.runtimeProviderIdentifier,
                 model: agent.model,
                 effort: agent.effort,
-                transport: ProviderTransport.gooseServer.rawValue,
+                transport: ProviderTransport.cli.rawValue,
                 adapterVersion: "fixture-v1"
             )
             return (agentID, binding)

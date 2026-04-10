@@ -48,8 +48,8 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
 
     var effectiveRuntimeNamespace: String? {
         switch adapterFamily {
-        case nil, "", "goose":
-            return transport == ProviderTransport.gooseServer.rawValue ? "goose" : nil
+        case nil, "":
+            return nil
         case "claude_agent_acp":
             return "claude_agent"
         case "gemini_cli_acp":

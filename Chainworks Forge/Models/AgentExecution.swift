@@ -13,13 +13,7 @@ import SwiftData
     var effort: String
     var costCents: Int64?
     var logSnippet: String?
-    var gooseSessionID: String?
-
-    /// Canonical accessor (Proposal 026 — core code uses this name instead of gooseSessionID).
-    var runtimeSessionID: String? {
-        get { gooseSessionID }
-        set { gooseSessionID = newValue }
-    }
+    @Attribute(originalName: "gooseSessionID") var runtimeSessionID: String?
 
     // Proposal 004: Live provider fields (Section 11.1)
     var providerSessionID: String?

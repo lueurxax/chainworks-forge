@@ -21,9 +21,9 @@ struct Proposal026Tests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .claude,
+                        family: .claudeACP,
                         displayName: "Claude Test",
-                        transport: .gooseServer,
+                        transport: .cli,
                         authMode: .apiKey,
                         defaultModel: "sonnet"
                     )
@@ -242,6 +242,34 @@ struct Proposal026Tests {
 
     // MARK: - Test 5: ACP transports can be instantiated
 
+
+
+    @Test("ExecutionEventBridge reuses tool name for in-progress ACP updates by toolCallId")
+    func executionEventBridgeReusesToolNameForInProgressUpdate() async throws {
+        let bridge = ExecutionEventBridge()
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.toolCallStarted(
+                toolName: "search",
+                raw: #"{"toolCallId":"call_123","name":"search"}"#
+            ))
+            continuation.yield(.toolCallStarted(
+                toolName: "unknown",
+                raw: #"{"toolCallId":"call_123","content":"progress"}"#
+            ))
+            continuation.finish()
+        }
+
+        let collector = SharedEventCollector()
+        _ = try await bridge.processStream(stream) { event in
+            collector.append(event)
+        }
+
+        let toolEvents = collector.events.filter { $0.type == .toolCallStarted }
+        #expect(toolEvents.count == 2)
+        #expect(toolEvents.last?.toolName == "search")
+        #expect(toolEvents.last?.detail == "Tool: search")
+    }
+
     @Test("ClaudeAgentACPTransport and GeminiCLIACPTransport instantiate cleanly")
     func acpTransportInstantiation() {
         let claude = ClaudeAgentACPTransport(executablePath: "/usr/bin/false")
@@ -270,9 +298,9 @@ struct Proposal026Tests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .claude,
+                        family: .claudeACP,
                         displayName: "Claude Default",
-                        transport: .gooseServer,
+                        transport: .cli,
                         authMode: .apiKey,
                         defaultModel: "sonnet"
                     )
@@ -358,7 +386,7 @@ struct Proposal026Tests {
 
         agent.runtimeSessionID = "session-abc-123"
         #expect(agent.runtimeSessionID == "session-abc-123")
-        #expect(agent.gooseSessionID == "session-abc-123")
+        #expect(agent.runtimeSessionID == "session-abc-123")
     }
 
     // MARK: - Test 8: Executed canonical ACP proposal loop proof

@@ -587,6 +587,81 @@ struct RuntimeAgentExecutorTests {
         }
     }
 
+    private final class SilentEOFRetryTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+            let sessionID = callCount == 1 ? "session-eof-1" : "session-eof-2"
+            return RuntimeSessionResponse(
+                sessionId: sessionID,
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { state in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+            }
+
+            return AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if sessionID == "session-eof-1" {
+                        continuation.yield(.textChunk(text: "partial progress before EOF"))
+                        continuation.finish(throwing: RuntimeTransportError.streamingFailed(
+                            reason: "Codex ACP stream ended before final result was received"
+                        ))
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: """
+                    <<<CHAINWORKS_OUTPUT:proposal_current>>>
+                    # Recovered Proposal
+                    <<<END_CHAINWORKS_OUTPUT>>>
+                    """))
+                    continuation.yield(.finish(reason: "stop", totalTokens: 42, raw: #"{"type":"Finish","reason":"stop"}"#))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
     private final class DuplicateFreshSessionTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
             var createSessionCallCount = 0
@@ -2296,5 +2371,25 @@ struct RuntimeAgentExecutorTests {
         try await Task.sleep(for: .milliseconds(100))
         #expect(await transport.createSessionCallCount == 1)
         #expect(await transport.closeSessionCallCount == 1)
+    }
+
+    @MainActor
+    @Test("Executor retries silent Codex EOF before final result with a fresh session")
+    func executorRetriesSilentEOFBeforeFinalResult() async throws {
+        let transport = SilentEOFRetryTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "proposal_writer", task: "revise_proposal"),
+            agent: makeAgent(id: "proposal_writer", outputs: ["proposal_current"]),
+            context: makeContext()
+        )
+
+        #expect(result.succeeded)
+        #expect(result.outputs["proposal_current"] != nil)
+        #expect(result.sessionID == "session-eof-2")
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-eof-1", "session-eof-2"])
     }
 }

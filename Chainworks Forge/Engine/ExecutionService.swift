@@ -120,9 +120,6 @@ final class ExecutionService {
     /// keeping the live entrypoint visible for owner-path proofs.
     private let forceUITestLiveRuntimeUnavailable: Bool
 
-    /// Optional managed Goose server bridge.
-    let gooseServerManager: GooseServerManager?
-
     /// Steward config (loaded at app init, nil if not present).
     var stewardConfig: StewardConfig?
 
@@ -145,7 +142,6 @@ final class ExecutionService {
         catalog: AgentCatalog? = nil,
         stewardConfig: StewardConfig? = nil,
         liveRuntimeConfiguration: LiveRuntimeConfiguration? = nil,
-        gooseServerManager: GooseServerManager? = nil,
         notificationService: NotificationService? = nil
     ) {
         self.modelContext = modelContext
@@ -155,7 +151,6 @@ final class ExecutionService {
         self.fixedLiveRuntimeConfiguration = liveRuntimeConfiguration
         self.forceUITestLiveRuntimeUnavailable =
             ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] == "1"
-        self.gooseServerManager = gooseServerManager
         self.notificationService = notificationService ?? MainActor.assumeIsolated {
             NotificationService()
         }
@@ -164,7 +159,7 @@ final class ExecutionService {
     }
 
     var liveRuntimeConfiguration: LiveRuntimeConfiguration? {
-        fixedLiveRuntimeConfiguration ?? gooseServerManager?.liveRuntimeConfiguration
+        fixedLiveRuntimeConfiguration
     }
 
     func runMaintenanceTick(now: Date = Date()) {
@@ -816,31 +811,6 @@ final class ExecutionService {
             )
         }
 
-        if let gooseServerManager, let liveRuntimeConfiguration {
-            switch gooseServerManager.launchState {
-            case .running, .external:
-                return .ready(
-                    summary: liveRuntimeConfiguration.summary,
-                    source: liveRuntimeConfiguration.sourceDescription
-                )
-            case .starting:
-                return .unavailable(
-                    reason: "Managed Goose server is still starting",
-                    recovery: "Wait for the managed Goose server to finish booting, or refresh server status in Provider Settings."
-                )
-            case .failed(let reason):
-                return .unavailable(
-                    reason: "Managed Goose server is unavailable",
-                    recovery: reason
-                )
-            case .idle:
-                return .unavailable(
-                    reason: "Managed Goose server is not running",
-                    recovery: "Start the managed Goose server in Provider Settings or First Run Setup."
-                )
-            }
-        }
-
         if let liveRuntimeConfiguration {
             return .ready(
                 summary: liveRuntimeConfiguration.summary,
@@ -902,20 +872,7 @@ final class ExecutionService {
     private func resolveGooseTransport(_ config: LiveRuntimeConfiguration) -> any RuntimeTransportProtocol {
         switch config.transportMode {
         case .network:
-            switch config.transportAPI {
-            case .bespoke:
-                return GooseTransport(
-                    baseURL: config.baseURL,
-                    apiKey: config.apiKey
-                )
-            case .gooseServer:
-                return GooseServerTransport(
-                    baseURL: config.baseURL,
-                    secretKey: config.apiKey,
-                    provider: config.override?.provider,
-                    model: config.override?.model
-                )
-            }
+            fatalError("Network-mode Goose transports have been removed. Use ACP runtime profiles or fixture modes instead.")
         case .fixtureProposalLoopSuccess:
             return FixtureGooseTransport(scenario: .proposalLoopSuccess)
         case .fixtureProposal022FeedbackCycle:

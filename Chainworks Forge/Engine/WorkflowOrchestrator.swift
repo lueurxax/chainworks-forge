@@ -3484,17 +3484,17 @@ final class WorkflowOrchestrator {
             ?? ProviderFamily.from(runtimeIdentifier: agent.provider)
 
         switch (family, normalizedTier) {
-        case (.codex?, "fast"):
+        case (.codexACP?, "fast"):
             return "gpt-5.3-codex-spark"
-        case (.codex?, "frontier"):
+        case (.codexACP?, "frontier"):
             return "GPT-5.4"
-        case (.claude?, "fast"):
+        case (.claudeACP?, "fast"):
             return "sonnet"
-        case (.claude?, "frontier"):
+        case (.claudeACP?, "frontier"):
             return "opus"
-        case (.gemini?, "fast"):
+        case (.geminiACP?, "fast"):
             return "gemini-2.5-flash"
-        case (.gemini?, "frontier"):
+        case (.geminiACP?, "frontier"):
             return "gemini-2.5-pro"
         default:
             return baseBinding?.model ?? agent.model

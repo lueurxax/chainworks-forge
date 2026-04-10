@@ -2150,6 +2150,77 @@ struct Proposal013Tests {
         #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_5_proposal_refined" })
     }
 
+    @MainActor
+    @Test("RunReportBuilder suppresses stale nonterminal stage iterations and stale interrupted drift note after a later concrete failure")
+    func runReportSuppressesStaleRunningIterationAndInterruptedDriftNote() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        run.driftDetails = "Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
+        context.insert(run)
+
+        let reviewCompleted = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .completed,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        reviewCompleted.completedAt = Date(timeIntervalSince1970: 110)
+        reviewCompleted.run = run
+        context.insert(reviewCompleted)
+
+        let staleRunningRefine = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 120),
+            status: .running,
+            iteration: 6,
+            attemptNumber: 1
+        )
+        staleRunningRefine.run = run
+        context.insert(staleRunningRefine)
+
+        let currentFailedRefine = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 130),
+            status: .failed,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        currentFailedRefine.completedAt = Date(timeIntervalSince1970: 140)
+        currentFailedRefine.run = run
+        context.insert(currentFailedRefine)
+
+        let failedWriter = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "revise_proposal",
+            startedAt: Date(timeIntervalSince1970: 131),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedWriter.completedAt = Date(timeIntervalSince1970: 140)
+        failedWriter.logSnippet = "Stream processing failed: Streaming failed: Codex ACP stream ended before final result was received"
+        failedWriter.stageExecution = currentFailedRefine
+        context.insert(failedWriter)
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 13)
+
+        #expect(payload.stageTimeline.contains {
+            $0.label == "Proposal refined" && $0.iteration == 7 && $0.status == "failed"
+        })
+        #expect(!payload.stageTimeline.contains {
+            $0.label == "Proposal refined" && $0.iteration == 6 && $0.status == "running"
+        })
+        #expect(payload.failureEvidenceSummaries.count == 1)
+        #expect(payload.failureEvidenceSummaries.first?.stageID == "state_5_proposal_refined")
+        #expect(payload.blockedReason?.contains("Codex ACP stream ended before final result was received") == true)
+        #expect(payload.driftNote == nil)
+    }
+
     @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
     func proposal013AppProofCanonicalPassRule() {
         let packet = FailedStageEvidencePacket(

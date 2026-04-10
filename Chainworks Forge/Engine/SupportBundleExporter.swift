@@ -143,7 +143,7 @@ struct SupportBundleExporter {
                     "costCents": jsonValue(agent.costCents),
                     "configuredProviderID": jsonValue(agent.configuredProviderID?.uuidString),
                     "adapterVersion": agent.adapterVersion ?? "",
-                    "gooseSessionID": agent.gooseSessionID ?? "",
+                    "runtimeSessionID": agent.runtimeSessionID ?? "",
                     "providerSessionID": agent.providerSessionID ?? "",
                     "logSnippet": agent.logSnippet ?? ""
                 ]

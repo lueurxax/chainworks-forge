@@ -271,12 +271,15 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                         }
                     }
 
-                    // Stream ended without explicit finish
-                    continuation.finish()
+                    self.invalidateSession(sessionID: sessionID)
+                    continuation.finish(throwing: RuntimeTransportError.streamingFailed(
+                        reason: "Codex ACP stream ended before final result was received"
+                    ))
 
                 } catch is CancellationError {
                     continuation.finish()
                 } catch {
+                    self.invalidateSession(sessionID: sessionID)
                     continuation.finish(throwing: error)
                 }
             }
@@ -429,6 +432,19 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         let current = requestCounters[sessionID] ?? 0
         lock.unlock()
         return current
+    }
+
+    private func invalidateSession(sessionID: String) {
+        lock.lock()
+        let handle = activeSessions.removeValue(forKey: sessionID)
+        requestCounters.removeValue(forKey: sessionID)
+        sessionSystemPrompts.removeValue(forKey: sessionID)
+        sessionEnabledExtensions.removeValue(forKey: sessionID)
+        lock.unlock()
+
+        guard let handle else { return }
+        handle.subprocess.terminate()
+        Self.cleanupRuntimeHomeIfPresent(handle.runtimeHomeURL)
     }
 
     // MARK: - Private: Read Next JSON-RPC Result

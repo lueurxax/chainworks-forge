@@ -149,12 +149,13 @@ final class RunReportBuilder {
     func buildReportPayload(for run: Run, version: Int) -> RunReportPayload {
         let historicalStages = PersistedRunGraph.stageExecutions(for: run).sorted { $0.startedAt < $1.startedAt }
         let canonicalStages = canonicalStages(from: historicalStages)
+        let timelineStages = stageTimelineStages(from: canonicalStages)
         let allAgents = canonicalStages.flatMap { canonicalAgents(for: $0) }
         let approvals = PersistedRunGraph.approvals(for: run).sorted { $0.requestedAt < $1.requestedAt }
         let runStatus = run.presentationStatus
 
         // Stage timeline (canonical lineage only)
-        let stageTimeline: [RunReportPayload.StageEntry] = canonicalStages.map { stage in
+        let stageTimeline: [RunReportPayload.StageEntry] = timelineStages.map { stage in
             RunReportPayload.StageEntry(
                 label: stage.label,
                 status: stage.status.rawValue,
@@ -277,6 +278,11 @@ final class RunReportBuilder {
             ? currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
             : nil
         let blockedReason = currentRecoveryStage.flatMap { failureEvidencePacket(for: $0, run: run)?.failureSummary } ?? run.driftDetails
+        let driftNote = reportDriftNote(
+            run: run,
+            currentRecoveryStage: currentRecoveryStage,
+            interruptedContinuationStage: interruptedContinuationStage
+        )
         let retryPath = interruptedContinuationStage == nil ? retryPathDescription(from: currentRecoverySnapshot) : nil
         let resumePath = resumePathDescription(
             run: run,
@@ -305,7 +311,7 @@ final class RunReportBuilder {
             workflowSnapshotHash: run.workflowSnapshotHash,
             catalogSnapshotHash: run.catalogSnapshotHash,
             runtimeTrustLevel: run.runtimeTrustLevel ?? "unknown",
-            driftNote: run.driftDetails,
+            driftNote: driftNote,
             completedStages: completedStages,
             skippedStages: skippedStages,
             failedStages: failedStages,
@@ -399,6 +405,64 @@ final class RunReportBuilder {
             }
             return lhs.id.uuidString < rhs.id.uuidString
         }
+    }
+
+    private func stageTimelineStages(from canonicalStages: [StageExecution]) -> [StageExecution] {
+        let latestByStateID = Dictionary(grouping: canonicalStages, by: \.stageID)
+            .compactMapValues { stages in
+                stages.max { lhs, rhs in
+                    if lhs.startedAt != rhs.startedAt {
+                        return lhs.startedAt < rhs.startedAt
+                    }
+                    if lhs.iteration != rhs.iteration {
+                        return lhs.iteration < rhs.iteration
+                    }
+                    if lhs.attemptNumber != rhs.attemptNumber {
+                        return lhs.attemptNumber < rhs.attemptNumber
+                    }
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+            }
+
+        return canonicalStages.filter { stage in
+            guard let latest = latestByStateID[stage.stageID] else {
+                return true
+            }
+
+            switch stage.status {
+            case .pending, .ready, .running, .waitingApproval:
+                return latest.id == stage.id
+            case .completed, .skipped, .failed, .blocked:
+                return true
+            }
+        }
+    }
+
+    private func reportDriftNote(
+        run: Run,
+        currentRecoveryStage: StageExecution?,
+        interruptedContinuationStage: StageExecution?
+    ) -> String? {
+        let trimmed = run.driftDetails?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let driftNote = trimmed, !driftNote.isEmpty else {
+            return nil
+        }
+
+        if interruptedContinuationStage != nil {
+            return driftNote
+        }
+
+        guard currentRecoveryStage != nil else {
+            return driftNote
+        }
+
+        let lowered = driftNote.lowercased()
+        if lowered.contains("app restart")
+            || lowered.contains("resume interrupted")
+            || lowered.contains("interrupted") {
+            return nil
+        }
+        return driftNote
     }
 
     private func canonicalAgents(for stage: StageExecution) -> [AgentExecution] {

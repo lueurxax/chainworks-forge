@@ -17,12 +17,6 @@ struct ProviderTroubleshootingPanel: View {
                 statusPill
             }
 
-            if let guidance = report.gooseFirstGuidance {
-                Text(guidance)
-                    .font(.caption)
-                    .foregroundStyle(.blue)
-            }
-
             LabeledContent("Failure Layer", value: report.failureLayer.displayName)
                 .font(.caption)
 

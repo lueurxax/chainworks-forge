@@ -362,6 +362,21 @@ struct HandoffCompiler: Sendable {
             )
         }
 
+        if agent.id == "lead_orchestrator", task.task == "freeze_proposal_and_provision_worktree" {
+            let declaredInputs = Set((task.inputs ?? [])
+                .filter { $0 != "current_task_description" }
+                .filter { available.contains($0) })
+
+            // Implementation-start orchestration is fragile if proposal truth, review
+            // verdict, and persisted run state are all left behind lazy reads. Inline the
+            // declared planning inputs so the orchestrator can freeze and plan in one turn.
+            return inlineEligibleArtifacts(
+                declaredInputs,
+                inputArtifacts: inputArtifacts,
+                inlineLimitBytes: inlineLimitBytes
+            )
+        }
+
         return []
     }
 

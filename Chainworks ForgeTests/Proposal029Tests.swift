@@ -145,7 +145,7 @@ struct Proposal029Tests {
         let disabledProvider = ConfiguredProvider(
             family: .codexACP,
             displayName: "Codex ACP",
-            transport: .gooseServer,
+            transport: .cli,
             authMode: .apiKey,
             defaultModel: "gpt-5",
             isEnabled: false
@@ -181,9 +181,9 @@ struct Proposal029Tests {
         let store = ProviderSettingsStore(fileURL: fileURL)
         let families = Set(store.settings.configuredProviders.map(\.family))
 
-        #expect(families.contains(.codex))
-        #expect(families.contains(.claude))
-        #expect(families.contains(.gemini))
+        #expect(families.contains(.codexACP))
+        #expect(families.contains(.claudeACP))
+        #expect(families.contains(.geminiACP))
         #expect(!store.settings.configuredProviders.isEmpty)
     }
 
@@ -240,15 +240,71 @@ struct Proposal029Tests {
         #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("state_5.sqlite").path))
     }
 
+
+
+    @Test("CodexACPTransport surfaces silent EOF before prompt result as streaming failure")
+    func codexTransportTreatsSilentEOFAfterPromptAsError() async throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-eof-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let scriptURL = tempRoot.appendingPathComponent("fake-codex-acp.py")
+        let script = """
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    mid = req.get('method')
+    if mid == 'initialize':
+        print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'protocolVersion':1}}), flush=True)
+    elif mid == 'session/new':
+        print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'sessionId':'fake-session'}}), flush=True)
+    elif mid == 'session/prompt':
+        sys.exit(0)
+"""
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+        let transport = CodexACPTransport(executablePath: "/usr/bin/python3")
+        let session = try await transport.createSession(request: RuntimeSessionRequest(
+            systemPrompt: "test",
+            workingDirectory: tempRoot.path,
+            model: "gpt-5",
+            provider: nil,
+            executionPolicy: nil,
+            metadata: nil,
+            requestedExtensions: nil
+        ))
+
+        let stream = transport.submitPrompt(
+            sessionID: session.sessionId,
+            prompt: RuntimePromptRequest(content: "hello", context: nil)
+        )
+
+        do {
+            for try await _ in stream {}
+            Issue.record("Expected silent EOF to surface as a streaming failure")
+        } catch {
+            #expect(error.localizedDescription.contains("ended before final result"))
+        }
+    }
+
     @Test("ACPSubprocessManager sendJSON throws instead of crashing when runtime closes stdin")
     func acpSubprocessManagerHandlesClosedStdinGracefully() throws {
+        // Launch a process that closes stdin and exits immediately.
+        // Once the process exits, sendJSON must throw .notRunning or .brokenPipe.
         let manager = ACPSubprocessManager(
             executablePath: "/usr/bin/python3",
-            arguments: ["-c", "import os,time; os.close(0); time.sleep(1)"]
+            arguments: ["-c", "import os; os.close(0)"]
         )
         try manager.launch()
         defer { manager.terminate() }
-        Thread.sleep(forTimeInterval: 0.1)
+
+        // Wait for the process to actually exit (up to 2 seconds).
+        for _ in 0..<20 {
+            if !manager.isRunning { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
 
         do {
             try manager.sendJSON([
@@ -256,7 +312,7 @@ struct Proposal029Tests {
                 "id": 1,
                 "method": "ping"
             ])
-            Issue.record("Expected sendJSON to fail once runtime stdin is closed")
+            Issue.record("Expected sendJSON to fail once runtime has exited")
         } catch let error as ACPSubprocessError {
             switch error {
             case .brokenPipe, .notRunning:

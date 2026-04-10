@@ -570,6 +570,17 @@ final class RuntimeSessionBridge: Sendable {
             parts.append("Prefer clear English output unless the source artifact explicitly requires another language.")
         }
 
+        if task.task == "freeze_proposal_and_provision_worktree" {
+            parts.append("")
+            parts.append("### Task-Specific Guidance")
+            parts.append("The dedicated worktree has already been provisioned by the engine. Do not spend your turn re-provisioning or narrating setup steps.")
+            parts.append("Freeze `proposal_current` into `approved_proposal` and treat it as the frozen implementation source of truth.")
+            parts.append("Use `proposal_review_summary` as the implementation gate verdict and planning context.")
+            parts.append("Treat `run_state` as persisted workflow context, not unquestionable authority. If it contains stale stage identifiers or outdated next-step truth, correct it to match the current workflow before returning it.")
+            parts.append("Return `implementation_plan`, `implementation_backlog`, and `run_state` together with `approved_proposal` in the final response envelope.")
+            parts.append("Do not stop after read-only analysis. The task is incomplete until all required implementation-start outputs are present and non-empty.")
+        }
+
         if !structuredHints.isEmpty {
             parts.append("")
             parts.append("### Structured Output Requirements")

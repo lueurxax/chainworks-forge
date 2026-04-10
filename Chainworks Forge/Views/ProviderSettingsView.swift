@@ -7,16 +7,16 @@ struct ProviderSettingsView: View {
     @Environment(AppConfigurationStore.self) private var appConfigurationStore
     @Environment(ProviderSettingsStore.self) private var providerSettingsStore
     @Environment(ProviderRegistry.self) private var providerRegistry
-    @Environment(GooseServerManager.self) private var gooseServerManager
+
 
     @State private var draft = ProviderDraft()
     @State private var secret = ""
     @State private var importMessage: String?
     @State private var exportPath: String?
     @State private var showWizard = false
-    @State private var selectedAssistantProviderID: UUID?
+
     @State private var availableModelsByProviderID: [UUID: [String]] = [:]
-    @State private var gooseTroubleshootingByProviderID: [UUID: ProviderTroubleshootingReport] = [:]
+    @State private var troubleshootingByProviderID: [UUID: ProviderTroubleshootingReport] = [:]
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
 
     @State private var showAddProviderSheet = false
@@ -45,7 +45,6 @@ struct ProviderSettingsView: View {
                     }
                     .accessibilityIdentifier("provider-settings-open-wizard")
                 }
-                managedGooseServerSection
                 configuredProvidersSection
                 // Proposal 012 (H-01): Transfer moved inline as secondary section
                 transferSection
@@ -95,22 +94,6 @@ struct ProviderSettingsView: View {
                     .environment(appConfigurationStore)
                     .environment(providerSettingsStore)
                     .environment(providerRegistry)
-                    .environment(gooseServerManager)
-            }
-            .sheet(isPresented: Binding(
-                get: { selectedAssistantProviderID != nil },
-                set: { if !$0 { selectedAssistantProviderID = nil } }
-            )) {
-                if let selectedAssistantProviderID {
-                    GooseProviderConnectionAssistantView(
-                        providerID: selectedAssistantProviderID,
-                        origin: .providerSettings
-                    )
-                        .environment(appConfigurationStore)
-                        .environment(providerSettingsStore)
-                        .environment(providerRegistry)
-                        .environment(gooseServerManager)
-                }
             }
             // Proposal 012 (H-01): Add Provider sheet
             .sheet(isPresented: $showAddProviderSheet) {
@@ -143,9 +126,7 @@ struct ProviderSettingsView: View {
                         }
                     }
                     .accessibilityIdentifier("provider-settings-transport-picker")
-                    Text(draft.transport == .gooseServer
-                         ? "Goose Server uses the same runtime path as live runs."
-                         : "Choose the transport that matches how the provider is actually reached.")
+                    Text("Choose the transport that matches how the provider is actually reached.")
                         .font(DesignTokens.Typography.micro)
                         .foregroundStyle(.secondary)
 
@@ -162,7 +143,7 @@ struct ProviderSettingsView: View {
                         .accessibilityIdentifier("provider-settings-display-name")
                     TextField("Default Model", text: $draft.defaultModel)
                         .accessibilityIdentifier("provider-settings-default-model")
-                    TextField(draft.transport == .gooseServer ? "Goose Endpoint (required)" : "Endpoint (optional)", text: $draft.endpoint)
+                    TextField("Endpoint (optional)", text: $draft.endpoint)
                         .accessibilityIdentifier("provider-settings-endpoint")
                     if draft.authMode != .none {
                         SecureField("Secret", text: $secret)
@@ -316,12 +297,6 @@ struct ProviderSettingsView: View {
                             .font(DesignTokens.Typography.micro)
                             .foregroundStyle(.tertiary)
 
-                        if provider.family.gooseFirstPreferred && provider.transport != .gooseServer {
-                            Label("Goose-first setup is preferred for this family", systemImage: "info.circle")
-                                .font(DesignTokens.Typography.micro)
-                                .foregroundStyle(.blue)
-                        }
-
                         // Proposal 012 (L-12): Inline health with distinct states
                         if let snapshot = providerRegistry.healthSnapshot(for: provider.id) {
                             Divider()
@@ -344,20 +319,13 @@ struct ProviderSettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
 
-                        if let report = gooseTroubleshootingByProviderID[provider.id] {
+                        if let report = troubleshootingByProviderID[provider.id] {
                             ProviderTroubleshootingPanel(report: report)
                         }
 
                         Divider()
 
                         HStack(spacing: DesignTokens.Spacing.medium) {
-                            if provider.family.gooseFirstPreferred {
-                                Button("Open Goose Assistant") {
-                                    selectedAssistantProviderID = provider.id
-                                }
-                                .buttonStyle(.borderless)
-                                .accessibilityIdentifier("provider-settings-open-assistant-\(provider.family.rawValue)")
-                            }
                             Button("Prefer") {
                                 providerSettingsStore.setPreferredProvider(id: provider.id, for: provider.family)
                             }
@@ -375,32 +343,6 @@ struct ProviderSettingsView: View {
         }
         .onAppear {
             draft.applyFamilyDefaults(draft.family, configuration: appConfigurationStore.configuration)
-        }
-    }
-
-    private var managedGooseServerSection: some View {
-        Section("Managed Goose Server") {
-            LabeledContent("State", value: gooseServerManager.statusSummary)
-                .accessibilityIdentifier("provider-settings-goose-state")
-            if let baseURL = appConfigurationStore.configuration.gooseServerBaseURL {
-                LabeledContent("Base URL", value: baseURL.absoluteString)
-            }
-            LabeledContent("Autostart", value: appConfigurationStore.configuration.gooseServerAutostart ? "Enabled" : "Disabled")
-            if let binaryPath = appConfigurationStore.configuration.gooseServerBinaryPath {
-                LabeledContent("Binary", value: binaryPath)
-            }
-
-            HStack {
-                Button("Start Managed Server") {
-                    Task { await gooseServerManager.ensureRunning() }
-                }
-                .accessibilityIdentifier("provider-settings-start-goose")
-                Button("Refresh Server Status") {
-                    Task { await gooseServerManager.refreshStatus() }
-                }
-                .accessibilityIdentifier("provider-settings-refresh-goose")
-            }
-            .buttonStyle(.borderless)
         }
     }
 
@@ -489,7 +431,7 @@ struct ProviderSettingsView: View {
             models[provider.id] = await providerRegistry.availableModels(for: provider)
         }
         availableModelsByProviderID = models
-        gooseTroubleshootingByProviderID = Dictionary(
+        troubleshootingByProviderID = Dictionary(
             uniqueKeysWithValues: providerRegistry.configuredProviders.compactMap { provider in
                 providerRegistry.troubleshootingReport(for: provider.id).map { (provider.id, $0) }
             }
@@ -541,7 +483,6 @@ struct ProviderSettingsView: View {
     let providerSettingsStore = PreviewSupport.makeProviderSettingsStore()
     let providerRegistry = PreviewSupport.makeProviderRegistry(settingsStore: providerSettingsStore)
     let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
-    let gooseServerManager = GooseServerManager(appConfigurationStore: appConfigurationStore)
 
     return ProviderSettingsView()
         .modelContainer(container)
@@ -549,25 +490,19 @@ struct ProviderSettingsView: View {
         .environment(appConfigurationStore)
         .environment(providerSettingsStore)
         .environment(providerRegistry)
-        .environment(gooseServerManager)
         .frame(width: 1100, height: 820)
 }
 
 struct ProviderDraft {
-    var family: ProviderFamily = .codex
+    var family: ProviderFamily = .codexACP
     var displayName: String = ""
-    var transport: ProviderTransport = .gooseServer
+    var transport: ProviderTransport = .cli
     var endpoint: String = ""
     var authMode: ProviderAuthMode = .none
     var defaultModel: String = ""
 
     func makeProvider() -> ConfiguredProvider {
-        let fallbackName: String = {
-            if family.gooseFirstPreferred && transport == .gooseServer {
-                return "\(family.displayName) Goose"
-            }
-            return "\(family.displayName) \(transport.displayName)"
-        }()
+        let fallbackName = "\(family.displayName) \(transport.displayName)"
         let normalizedDefaultModel: String? = {
             guard let canonicalModel = ProviderDefaults.canonicalModel(
                 defaultModel,
@@ -602,10 +537,10 @@ struct ProviderDraft {
         ) ?? defaultModel
         let resolvedTransport: ProviderTransport
         switch family {
-        case .codex, .claude, .codexACP, .auggie, .junie:
-            resolvedTransport = .gooseServer
-        case .gemini:
-            resolvedTransport = .httpAPI
+        case .codexACP, .claudeACP, .auggie, .junie:
+            resolvedTransport = .cli
+        case .geminiACP:
+            resolvedTransport = .cli
         }
 
         self.family = family
@@ -623,14 +558,6 @@ struct ProviderDraft {
             defaultModel = ProviderDefaults.defaultModel(for: family)
         }
 
-        if transport == .gooseServer {
-            if endpoint.isEmpty {
-                endpoint = configuration.gooseServerBaseURL?.absoluteString ?? ""
-            }
-            if authMode == .none, let secret = configuration.gooseServerSecretKey, !secret.isEmpty {
-                authMode = .apiKey
-            }
-        }
     }
 
     private func generatedDisplayName(for family: ProviderFamily, transport: ProviderTransport) -> String {

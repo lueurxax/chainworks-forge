@@ -234,7 +234,13 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     private func resolveToolCallStartedName(toolName: String, raw: String) -> String {
         let metadata = parseToolPayloadMetadata(from: raw)
-        let resolved = preferredToolName(primary: toolName, fallback: metadata.toolName)
+        let fallbackFromCallID = metadata.callID.flatMap { callID in
+            withLock { _toolNamesByCallID[callID] }
+        }
+        let resolved = preferredToolName(
+            primary: toolName,
+            fallback: metadata.toolName ?? fallbackFromCallID
+        )
 
         if let callID = metadata.callID, isDisplayableToolName(resolved) {
             withLock {
