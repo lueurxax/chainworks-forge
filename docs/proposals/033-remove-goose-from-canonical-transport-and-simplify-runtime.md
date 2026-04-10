@@ -300,7 +300,10 @@ Both return migrated `Data` that `JSONDecoder` can then decode with the new enum
 6. Serialize back to `Data` and persist.
 7. Return migrated `Data` for `JSONDecoder` to decode with new enum cases.
 
-**Call sites**: Both `ProviderSettingsStore.init(fileURL:)` and `SettingsTransferService.importSettings(_:)` call `migrateRawJSONIfNeeded(_:)` on raw file/import data before passing to `JSONDecoder`. This ensures the migration runs before any typed deserialization.
+**Call sites** — each invokes its schema-specific migrator directly, no umbrella dispatcher:
+
+- `ProviderSettingsStore.init(fileURL:)` calls `migrateRawProviderSettings(_:)` on raw file data before `JSONDecoder.decode(ProviderSettings.self, ...)`.
+- `SettingsTransferService.importSettings(_:)` calls `migrateRawTransferPackage(_:)` on raw import data before `JSONDecoder.decode(ExportableSettingsPackage.self, ...)`.
 
 **Credential / UUID migration**: Secrets are keyed by `"provider.\(UUID)"` in `KeychainSecretStore` (via `ProviderAdapterSupport.secretKey(for:)`). Migration semantics:
 
