@@ -30,6 +30,8 @@ This proposal removes Goose completely and refactors each layer to be ACP-native
 
 Implementation cannot begin until the second-wave ACP proposal (P030) passes audit to `Implemented / Ready`.
 
+**Note on gate naming**: The second-wave ACP proposal file is `030-acp-second-wave-runtime-profiles-codex-auggie-junie.md`, but the canonical gate in `test-gate.sh` is registered as `proposal-029` with array `PROPOSAL_029_TESTS`. This is the historical gate name from before the proposal was renumbered. P033 uses `proposal-029` as the prerequisite gate name because that is what `test-gate.sh` actually implements. If the gate is renamed to `proposal-030` before P033 implementation, update the prerequisite accordingly.
+
 **Gate definition for `test-gate.sh`**:
 
 ```bash
@@ -58,7 +60,7 @@ proposal-033|p033)
 **`Proposal033Tests` must prove**:
 
 1. `ProviderSettingsStore.migrateFromGooseEra()` correctly migrates persisted Goose-era local JSON (family, transport, endpoint, displayName, capabilities, adapterVersion, preferredProviderIDsByFamily keys).
-2. `SettingsTransferService` import path applies the same migration to imported Goose-era JSON before merging — cross-machine continuity preserved.
+2. `SettingsTransferService` import path applies the same migration to imported Goose-era JSON before merging — Claude/Gemini rows preserve UUID and credentials, Codex rows are deleted (re-auth required on target machine).
 3. `DefaultRuntimeTransportFactory` has no `gooseTransport` field and throws for `"goose"` family.
 4. `MCPPolicyResolver` has no `"goose"` namespace branches.
 5. `ResumeManager` blocks Goose-bound runs with explicit error.

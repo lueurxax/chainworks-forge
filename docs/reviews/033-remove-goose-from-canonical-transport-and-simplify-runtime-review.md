@@ -20,25 +20,26 @@
   - targeted code refresh for provider UUID/secret storage coupling
   - targeted code refresh for frozen MVP provider boundary ownership
   - targeted doc refresh for runtime/sign-off boundary docs
+  - targeted proof-lane refresh for proposal numbering and gate ownership
 - Baseline freshness: `Partially refreshed`
 - External research used: `None`
 - Runtime evidence used: `None`
 - Current repo tensions found:
-  - the previous stale findings about missing docs coverage, missing `SettingsTransferService` proof, operator-facing Goose wording, and `gooseSessionID` ownership are now closed in the proposal text
-  - deleting old Codex rows still breaks credential continuity unless the proposal owns UUID/keychain remapping
-  - the provider-vocabulary migration still stops short of some canonical boundary owners (`runtime-contract`, `mvp-sign-off`, `MVPBoundaryPolicy`)
+  - the previous stale findings about missing docs coverage, missing `SettingsTransferService` proof, operator-facing Goose wording, `gooseSessionID` ownership, Codex UUID continuity, and provider-boundary fallout are now closed in the proposal text
+  - the proof lane still says transfer-path “cross-machine continuity preserved” even though `3.6a` now explicitly requires Codex re-auth and drops Codex placeholders
+  - the prerequisite gate still mixes `P030` dependency language with the historical `proposal-029` lane name without explaining whether that alias is intentional
   - `P030` remains red, so implementation is still operationally blocked behind the proposal's own prerequisite gate
 
 ## 1. Executive Summary
-- Overall readiness: `Red`
+- Overall readiness: `Amber`
 - Confidence: `High`
-- Proposal completeness signal: `Substantially improved, but still not implementation-safe`
+- Proposal completeness signal: `Substantially improved and close to handoff, but not yet internally consistent`
 - What improved:
-  1. The proposal now explicitly owns `SettingsTransferService` proof, neutral legacy operator wording, and persistent-model renaming for `runtimeSessionID`.
-  2. The earlier findings about docs-table gaps, proof-lane gaps, operator-string contradiction, and missing `gooseSessionID` ownership are now stale and should not be reused.
+  1. The proposal now explicitly owns `SettingsTransferService` proof, neutral legacy operator wording, persistent-model renaming for `runtimeSessionID`, Codex re-auth semantics, and the missing provider-boundary fallout (`runtime-contract`, `mvp-sign-off`, `MVPBoundaryPolicy.swift`).
+  2. The earlier findings about docs-table gaps, proof-lane gaps, operator-string contradiction, missing `gooseSessionID` ownership, missing Codex continuity semantics, and missing provider-boundary owners are now stale and should not be reused.
 - What still blocks `Green`:
-  1. Codex-row deletion still has no secret/keychain continuity contract even though current secrets are keyed by provider UUID.
-  2. The provider-vocabulary migration to `*_acp` still does not classify all canonical MVP boundary owners.
+  1. The proof lane still over-claims transfer continuity after the proposal switched Codex to explicit re-auth semantics.
+  2. The prerequisite gate contract still mixes `P030` and `proposal-029` naming without locking whether the alias is intentional.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
@@ -59,57 +60,57 @@
 |---|---|---|---|---:|---:|---:|---:|
 | UI | Green | High | Complete | 0 | 0 | 0 | 0 |
 | UX | Green | High | Complete | 0 | 0 | 0 | 0 |
-| iOS Architecture | Red | High | Complete | 1 | 1 | 0 | 0 |
+| iOS Architecture | Amber | High | Complete | 0 | 1 | 1 | 0 |
 
 ## 5. Findings by Discipline
 
 ### 5.1 iOS Architecture Findings
 - Finding ID: `ARCH-033-001`
-  Severity: `Critical`
-  Evidence IDs: `DOC-01`, `MAP-01`, `MAP-02`, `DATA-01`, `REAL-01`
-  Why it matters: The updated `3.6a` now deletes every old `.codex` provider row and replaces it with a fresh seeded `.codexACP` row. But current secret storage and settings-transfer placeholders are keyed by `provider.id`, not by provider family. [ProviderAdapter.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Providers/ProviderAdapter.swift#L231) derives the secret key as `provider.<uuid>`, and [SettingsTransferService.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Support/SettingsTransferService.swift#L46) exports/imports placeholder lists using that same key. If migration deletes the old Codex row and generates a new UUID for seeded `.codexACP`, the existing local secret and imported placeholder mapping no longer belong to the surviving row. The proposal currently says cross-machine continuity is preserved, but it does not define any secret remap or operator remediation for this UUID break.
-  Recommended fix: extend `3.6a` with an explicit Codex credential-continuity contract. Either:
-  1. migrate the old Codex row into `.codexACP` while preserving `id` specifically so the secret key remains valid, or
-  2. keep delete-and-reseed behavior, but explicitly state that Codex credentials are invalidated and the operator must re-enter them, with proof and UX copy updated accordingly.
+  Severity: `High`
+  Evidence IDs: `DOC-01`, `DATA-01`, `REAL-01`
+  Why it matters: The proposal now makes a clear decision in `3.6a`: Claude/Gemini preserve UUID and continuity, while Codex is deleted and requires explicit re-auth ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L256)). But the proof lane still says `SettingsTransferService` import proves “cross-machine continuity preserved” for the migration as a whole ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L61)). Those two statements no longer match: Codex continuity is intentionally not preserved. That leaves the gate ambiguous about what must be asserted and makes the current proof wording technically false if read literally.
+  Recommended fix: rewrite proof item `2` so it matches the new migration semantics. It should say continuity is preserved for in-place Claude/Gemini migrations, while deleted Codex rows require explicit re-auth and dropped placeholders. Acceptance/proof wording should validate both halves of that contract.
   Acceptance criteria:
-  - the proposal explicitly states what happens to the old Codex row UUID and its secret key
-  - `SettingsTransferService` placeholder continuity is either preserved or intentionally remediated
-  - Codex migration does not silently strand valid credentials behind an orphaned provider UUID
+  - proof wording no longer claims universal cross-machine continuity after Codex was moved to explicit re-auth
+  - `Proposal033Tests` explicitly proves Claude/Gemini continuity and Codex re-auth/remediation as separate outcomes
+  - transfer-path behavior and operator expectations use the same vocabulary as `3.6a`
   Confidence: `High`
 
 - Finding ID: `ARCH-033-002`
-  Severity: `High`
-  Evidence IDs: `DOC-01`, `DOC-02`, `DOC-03`, `MAP-03`, `REAL-02`
-  Why it matters: The provider-vocabulary migration is still under-owned across canonical boundary docs and policy code. `3.6a` now changes YAML/provider identifiers from `codex / claude_code / gemini` to `codex_acp / claude_acp / gemini_acp`, but current stable boundary owners still freeze the old set in [runtime-contract.md](/Users/user/Documents/Chainworks%20Forge/docs/reference/runtime-contract.md#L105), [mvp-sign-off.md](/Users/user/Documents/Chainworks%20Forge/docs/reference/mvp-sign-off.md#L49), and [MVPBoundaryPolicy.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Support/MVPBoundaryPolicy.swift#L9). The docs layer currently updates `current-system-baseline.md`, but not these boundary owners. That leaves MVP sign-off, runtime-boundary documentation, and policy code inconsistent with the proposal's new provider vocabulary.
-  Recommended fix: expand the docs/policy fallout to explicitly classify `runtime-contract.md`, `mvp-sign-off.md`, and `MVPBoundaryPolicy.swift` as part of the provider-vocabulary migration. If the proposal intentionally defers those owners, it must say so and narrow the vocabulary change instead of implying repo-wide canonical replacement.
+  Severity: `Medium`
+  Evidence IDs: `DOC-01`, `MAP-02`, `REAL-02`
+  Why it matters: The proposal now correctly depends on `P030`, but its proof-lane snippet still invokes `proposal-029-prereq` and `${PROPOSAL_029_TESTS[@]}` ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L50)). Current repo reality also still exposes only `proposal-029` in [scripts/test-gate.sh](/Users/user/Documents/Chainworks%20Forge/scripts/test-gate.sh#L1370), even though the proposal file and current implementation audits are all `030-*`. That leaves the prerequisite contract ambiguous: is `proposal-029` a historical alias for `P030`, or is the proposal pointing at the wrong gate name?
+  Recommended fix: make the gate naming explicit. Either:
+  1. keep the repo-owned gate alias as `proposal-029` and state that `P030` currently reuses that historical lane name, or
+  2. rename the lane and snippet to `proposal-030` / `PROPOSAL_030_TESTS` everywhere.
   Acceptance criteria:
-  - all canonical MVP provider-boundary owners are explicitly classified
-  - sign-off, runtime-contract, and policy-code provider sets cannot remain on `codex / claude_code / gemini` after `P033`
-  - the proposal is clear whether `claude_acp / gemini_acp` are the new canonical MVP provider identifiers or only an internal migration step
+  - the prerequisite gate uses one stable identifier across proposal text, repo script, and audit references
+  - rereviewers do not have to infer whether `proposal-029` is a historical alias for `P030`
+  - the proof lane can be executed unambiguously from the proposal alone
   Confidence: `High`
 
 ## 6. Cross-Discipline Conflicts and Decisions
-- Conflict: deleting `.codex` rows gives a cleaner break than preserving family identity, but current secrets and transfer placeholders are UUID-bound.
-  Tradeoff: delete-and-reseed simplifies family cleanup, but it silently breaks credential continuity unless the proposal owns remediation.
-  Decision: the proposal must explicitly choose between preserving the old UUID or requiring explicit Codex credential re-entry.
+- Conflict: the proposal now explicitly chooses Codex re-auth, but the proof lane still uses continuity language from the older migration model.
+  Tradeoff: retaining the old proof sentence makes the gate look simpler, but it no longer matches the actual migration semantics.
+  Decision: update the proof lane to assert two different outcomes: preserved continuity for migrated rows and explicit re-auth for deleted Codex rows.
   Owner: proposal author
 
-- Conflict: the proposal changes canonical provider identifiers, but some stable boundary docs and policy code still freeze the old set.
-  Tradeoff: limiting the fallout list keeps the proposal shorter, but it leaves canonical MVP boundary owners inconsistent.
-  Decision: expand the owned fallout or narrow the vocabulary change.
+- Conflict: the proposal depends on `P030`, but the repo-owned gate lane still carries the historical `proposal-029` name.
+  Tradeoff: keeping the old alias avoids a repo-wide gate rename, but it makes the proposal's prerequisite contract ambiguous unless that alias is spelled out.
+  Decision: either lock the alias explicitly or rename the lane end-to-end.
   Owner: proposal author
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P0 | Add explicit Codex UUID/secret continuity contract to `3.6a` | iOS Architecture | Proposal author | Before implementation | current keychain + transfer placeholder design | migration cannot silently orphan Codex credentials | `ARCH-033-001` |
-| P1 | Expand provider-vocabulary fallout to `runtime-contract.md`, `mvp-sign-off.md`, and `MVPBoundaryPolicy.swift` | iOS Architecture | Proposal author | Before implementation | current canonical MVP boundary owners | canonical provider boundary is consistent after `P033` | `ARCH-033-002` |
+| P0 | Align proof item `2` with the new Codex re-auth semantics in `3.6a` | iOS Architecture | Proposal author | Before implementation | updated migration contract | transfer proof matches the actual Codex/Claude/Gemini outcomes | `ARCH-033-001` |
+| P1 | Resolve `P030` vs `proposal-029` prerequisite-gate naming | iOS Architecture | Proposal author | Before implementation | current repo gate lane naming | prerequisite proof can be followed without alias guesswork | `ARCH-033-002` |
 
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Codex migration continuity | old Codex credentials remain usable or are explicitly remediated | explicit UUID/secret migration rule | no silent orphaned keychain secrets or placeholder drift | next rereview of `P033` | hold if Codex UUID/secret behavior remains implicit |
-| Provider boundary consistency | all canonical boundary owners converge on the same provider identifiers | fallout table includes docs + policy owners | no stale `codex / claude_code / gemini` boundary survives in canonical MVP surfaces | next rereview of `P033` | hold if provider-vocabulary ownership remains partial |
+| Transfer migration truth | proof lane matches the actual row-by-row migration semantics | separate assertions for migrated rows and deleted Codex rows | no generic “continuity preserved” claim survives when Codex requires re-auth | next rereview of `P033` | hold if proof wording still over-claims continuity |
+| Prerequisite gate clarity | proposal and repo use one stable name for the second-wave ACP prereq | gate snippet and repo script converge | no rereviewer has to infer whether `proposal-029` means `P030` | next rereview of `P033` | hold if gate naming remains mixed |
 | External dependency | `P030` readiness | `P030` audit turns green | `P033` implementation does not start early | next rereview of `P033` | hold if `P030` remains red |
 
 ## 9. Evidence Gaps and Open Questions
@@ -118,8 +119,8 @@
 - GAP-01: No blocking evidence gap remains. The remaining issues are proposal-text closure issues, not missing local evidence.
 
 ### Open Questions
-- QUESTION-01: should Codex migration preserve the old provider UUID specifically to preserve keychain continuity?
-- QUESTION-02: are `codex_acp / claude_acp / gemini_acp` intended to replace the canonical MVP provider boundary everywhere, including sign-off and policy code?
+- QUESTION-01: should the proof lane say “continuity preserved for migrated rows” instead of “cross-machine continuity preserved” to match the new Codex re-auth rule?
+- QUESTION-02: is `proposal-029` an intentional long-lived repo alias for `P030`, or should the gate be renamed in the same slice?
 
 ## 10. Evidence Gap Review Fallback
 
