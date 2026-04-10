@@ -240,19 +240,46 @@ var runtimeSessionID: String?
 
 **Implementation**: `ProviderSettingsStore` gains a **raw JSON pre-decode migration** that runs before `JSONDecoder` ever touches the payload. This is critical: once Goose-era enum cases (`.codex`, `.claude`, `.gemini`, `.gooseServer`) are deleted from Swift source, `JSONDecoder` will fail on any JSON containing those raw values. The migration must happen on raw `Data`/`[String: Any]`, not on typed models.
 
-**Migration seam** (runs in `ProviderSettingsStore.init` and `SettingsTransferService.importSettings`, before `JSONDecoder.decode`):
+**Two payload shapes require two schema-specific raw migrators:**
+
+1. **`provider-settings.json`** (local persistence) — top-level shape is `ProviderSettings`: `configuredProviders` array and `preferredProviderIDsByFamily` dict at root level.
+
+2. **`chainworks-settings.json`** (transfer/import) — top-level shape is `ExportableSettingsPackage`: `providerSettings` (nested `ProviderSettings`), `secretPlaceholders` array, and `appConfiguration` at root level.
+
+Each shape gets its own raw migrator:
 
 ```swift
-static func migrateRawJSONIfNeeded(_ data: Data) throws -> Data {
+// Shape 1: local ProviderSettings (used in ProviderSettingsStore.init)
+static func migrateRawProviderSettings(_ data: Data) throws -> Data {
     guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
     guard (json["migration_version"] as? Int ?? 0) < 1 else { return data }
-    // ... raw string rewrites on json["configuredProviders"] array ...
+    migrateProviderSettingsFields(&json)
     json["migration_version"] = 1
     return try JSONSerialization.data(withJSONObject: json)
 }
+
+// Shape 2: wrapped ExportableSettingsPackage (used in SettingsTransferService.importSettings)
+static func migrateRawTransferPackage(_ data: Data) throws -> Data {
+    guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+    guard var nested = json["providerSettings"] as? [String: Any] else { return data }
+    guard (nested["migration_version"] as? Int ?? 0) < 1 else { return data }
+    migrateProviderSettingsFields(&nested)
+    nested["migration_version"] = 1
+    json["providerSettings"] = nested
+    // Rewrite secretPlaceholders: drop entries keyed to deleted Codex UUIDs
+    if var placeholders = json["secretPlaceholders"] as? [String] {
+        let deletedUUIDs = findDeletedCodexUUIDs(nested)
+        placeholders.removeAll { key in deletedUUIDs.contains { key.contains($0) } }
+        json["secretPlaceholders"] = placeholders
+    }
+    return try JSONSerialization.data(withJSONObject: json)
+}
+
+// Shared: the actual field rewrites (family, transport, endpoint, etc.)
+private static func migrateProviderSettingsFields(_ json: inout [String: Any]) { ... }
 ```
 
-This returns migrated `Data` that `JSONDecoder` can then decode with the new enum cases.
+Both return migrated `Data` that `JSONDecoder` can then decode with the new enum cases.
 
 **Migration steps** (all on raw `[String: Any]`, never on typed models):
 
