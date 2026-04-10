@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // MARK: - ACPSubprocessManager (Proposal 026, Phase 3 — Step 3.4)
@@ -92,15 +93,24 @@ final class ACPSubprocessManager: @unchecked Sendable {
         self.stdinPipe = stdin
         self.stdoutPipe = stdout
         self.stderrPipe = stderr
+
+        // Avoid process-wide crashes on EPIPE when a runtime closes stdin before Forge sends
+        // a best-effort shutdown message.
+        let stdinFD = stdin.fileHandleForWriting.fileDescriptor
+        _ = fcntl(stdinFD, F_SETNOSIGPIPE, 1)
     }
 
     /// Send a JSON-RPC message (dictionary) to the subprocess stdin.
     /// Messages are newline-delimited (ndjson framing).
     func sendJSON(_ message: [String: Any]) throws {
         lock.lock()
+        let running = process?.isRunning ?? false
         let pipe = stdinPipe
         lock.unlock()
 
+        guard running else {
+            throw ACPSubprocessError.notRunning
+        }
         guard let pipe else {
             throw ACPSubprocessError.notRunning
         }
@@ -115,8 +125,37 @@ final class ACPSubprocessManager: @unchecked Sendable {
             throw ACPSubprocessError.serializationFailed
         }
 
-        let handle = pipe.fileHandleForWriting
-        handle.write(payloadData)
+        let fd = pipe.fileHandleForWriting.fileDescriptor
+        guard fd >= 0 else {
+            throw ACPSubprocessError.brokenPipe
+        }
+
+        try payloadData.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                throw ACPSubprocessError.serializationFailed
+            }
+
+            var written = 0
+            while written < payloadData.count {
+                let result = Darwin.write(fd, baseAddress.advanced(by: written), payloadData.count - written)
+                if result > 0 {
+                    written += result
+                    continue
+                }
+                if result == 0 {
+                    throw ACPSubprocessError.brokenPipe
+                }
+
+                switch errno {
+                case EINTR:
+                    continue
+                case EPIPE, EBADF:
+                    throw ACPSubprocessError.brokenPipe
+                default:
+                    throw ACPSubprocessError.writeFailed(errno: errno)
+                }
+            }
+        }
         ForgeLogger.acpSubprocess.debug("Sent \(payloadData.count) bytes to stdin: \(payload.prefix(200))")
     }
 
@@ -285,6 +324,8 @@ enum ACPSubprocessError: Error, LocalizedError {
     case alreadyRunning
     case notRunning
     case serializationFailed
+    case brokenPipe
+    case writeFailed(errno: Int32)
     case unexpectedExit(terminationStatus: Int32)
 
     var errorDescription: String? {
@@ -295,6 +336,10 @@ enum ACPSubprocessError: Error, LocalizedError {
             return "ACP subprocess is not running"
         case .serializationFailed:
             return "Failed to serialize JSON-RPC message"
+        case .brokenPipe:
+            return "ACP subprocess stdin is closed"
+        case .writeFailed(let errno):
+            return "Failed to write to ACP subprocess stdin (errno \(errno))"
         case .unexpectedExit(let status):
             return "ACP subprocess exited unexpectedly with status \(status)"
         }

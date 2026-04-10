@@ -7,6 +7,8 @@
   - `/Users/user/Documents/Chainworks Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md`
   - `/Users/user/Documents/Chainworks Forge/.review-baselines/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/current-system-baseline.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/reference/domain-model.md`
+  - `/Users/user/Documents/Chainworks Forge/docs/reference/execution-truth-and-recovery.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/provider-platform.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/provider-binding-truth.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/acp-runtime-transport.md`
@@ -21,29 +23,28 @@
   - `/Users/user/Documents/Chainworks Forge/.review-baselines/current-system-baseline.md`
   - `/Users/user/Documents/Chainworks Forge/docs/reference/current-system-baseline.md`
 - Baseline refreshed:
-  - targeted code refresh for durable provider settings and settings-transfer persistence
-  - targeted doc refresh for authoritative Goose-bearing runtime/provider/test references
+  - targeted code refresh for persistent session/model fields and support-bundle fallout
+  - targeted doc refresh for canonical subsystem docs that still encode Goose model/executor truth
   - targeted verification refresh for proposal-owned proof lane coverage
 - Baseline freshness: `Partially refreshed`
 - External research used: `None`
 - Runtime evidence used: `None`
 - Current repo tensions found:
-  - the previous stale findings about missing migration tables, docs table, and `proposal-033` gate are now closed in the proposal text
-  - the docs migration still omits some baseline-authoritative Goose-bearing refs outside the current table
-  - the proof lane still does not explicitly prove `chainworks-settings.json` / `SettingsTransferService` migration, even though `3.6a` owns that path
+  - the previous stale findings about missing migration tables, docs table, and `SettingsTransferService` proof are now closed in the proposal text
+  - the proposal now contains an internal contradiction between "zero Goose in operator-facing strings" and the historical legacy strings it still prescribes
+  - the model/persistence layer is still under-owned: `AgentExecution.gooseSessionID` and related support-bundle/domain-model fallout are not classified anywhere in the proposal
   - `P030` remains red, so implementation is still operationally blocked behind the proposal's own prerequisite gate
 
 ## 1. Executive Summary
-- Overall readiness: `Amber`
+- Overall readiness: `Red`
 - Confidence: `High`
-- Proposal completeness signal: `Strong, but not fully closed`
+- Proposal completeness signal: `Substantially improved, but internally inconsistent`
 - What improved:
-  1. The proposal now explicitly owns durable migration tables, field-level provider-row migration, docs migration, and a concrete `proposal-033` gate shape.
-  2. The goal wording is correctly narrowed to Goose runtime references, excluding brand/design metaphor.
-  3. The previous review's headline blockers about missing migration tables, missing docs table, and missing gate block are no longer valid on current `HEAD`.
+  1. The proposal now explicitly owns durable migration tables, `SettingsTransferService` proof, expanded docs migration, and a concrete `proposal-033` gate shape.
+  2. The earlier findings about missing docs/proof sections are now stale and should not be reused.
 - What still blocks `Green`:
-  1. The docs/reference migration still leaves some authoritative Goose-bearing runtime/provider/test docs unclassified.
-  2. The proof lane does not explicitly cover `SettingsTransferService` import migration for `chainworks-settings.json`, despite that path being in scope in `3.6a`.
+  1. The proposal cannot simultaneously require zero Goose operator strings and also prescribe Goose-labeled historical trust and blocked-run messages.
+  2. The proposal still does not own the persisted `gooseSessionID` model field or its doc/export fallout, despite claiming zero Goose runtime references in Swift source.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
@@ -62,57 +63,62 @@
 ## 4. Discipline Scorecard
 | Discipline | Readiness | Confidence | Evidence Completeness | Critical | High | Medium | Low |
 |---|---|---|---|---:|---:|---:|---:|
-| UI | Green | High | Complete | 0 | 0 | 0 | 0 |
-| UX | Green | High | Complete | 0 | 0 | 0 | 0 |
-| iOS Architecture | Amber | High | Complete | 0 | 1 | 1 | 0 |
+| UI | Red | High | Complete | 1 | 0 | 0 | 0 |
+| UX | Red | High | Complete | 1 | 0 | 0 | 0 |
+| iOS Architecture | Red | High | Complete | 1 | 1 | 0 | 0 |
 
 ## 5. Findings by Discipline
 
-### 5.1 iOS Architecture Findings
-- Finding ID: `ARCH-033-001`
-  Severity: `High`
-  Evidence IDs: `DOC-01`, `DOC-03`, `DOC-04`, `DOC-06`, `DOC-07`, `DOC-08`, `DOC-09`, `DOC-10`, `MAP-03`, `REAL-01`
-  Why it matters: The docs layer is materially better than in the previous pass, but the current table in `3.9` still stops short of the full baseline-authoritative Goose-bearing reference set. The stable baseline currently routes runtime/provider/test truth not only through the docs already listed in the proposal, but also through `provider-binding-truth.md`, `run-control.md`, `skill-resolution-and-runtime-integration.md`, and `agent-ui-test-execution.md`. Those docs still carry Goose-shaped language or links today. Without explicitly classifying them as `rewrite`, `delete`, or `transitively superseded`, implementation can finish with part of the canonical reference layer silently stale even after the main transport/provider docs are cleaned up.
-  Recommended fix: expand `3.9` from "large obvious docs" to "all baseline-authoritative Goose-bearing runtime/provider/test docs." At minimum, add explicit end states for `provider-binding-truth.md`, `run-control.md`, `skill-resolution-and-runtime-integration.md`, and `agent-ui-test-execution.md`.
+### 5.1 Cross-Discipline Findings
+- Finding ID: `CORE-033-001`
+  Severity: `Critical`
+  Evidence IDs: `DOC-01`, `REAL-01`
+  Why it matters: The proposal now contradicts itself on operator-facing wording. Section `3.9` defines `"Zero Goose runtime references"` as zero in operator-facing UI strings, and acceptance criterion `11` says UI surfaces have zero `"Goose"` in operator-facing strings. But section `4` still tells the operator `"This run used the Goose runtime which has been removed..."`, and section `6` still defines display labels `"Legacy (unverified) — historical Goose runs"` and `"Legacy (verified) — historical Goose runs"`. Implementation cannot satisfy both the scope/acceptance rule and the prescribed operator copy as written.
+  Recommended fix: choose one contract and lock it. Either:
+  1. strict zero-Goose operator wording, with historical surfaces rewritten to neutral legacy wording such as `Legacy runtime`, or
+  2. explicit carve-out for historical blocked-run/trust surfaces, with acceptance updated to exclude those legacy explanations from the zero-string rule.
   Acceptance criteria:
-  - every baseline-authoritative Goose-bearing runtime/provider/test doc is explicitly classified
-  - `docs/reference/current-system-baseline.md` and `docs/reference/README.md` cannot still route readers into stale Goose-era truth after `P033`
-  - transitive updates are named explicitly where the proposal does not rewrite a doc directly
+  - the goal, scope clarification, historical-run handling, trust model, and acceptance list all describe the same operator-facing wording policy
+  - there is no proposal-internal requirement to both remove and preserve Goose in user-visible copy
   Confidence: `High`
 
+### 5.2 iOS Architecture Findings
 - Finding ID: `ARCH-033-002`
-  Severity: `Medium`
-  Evidence IDs: `DOC-01`, `DOC-05`, `MAP-01`, `MAP-02`, `MAP-04`, `TEST-02`, `REAL-02`
-  Why it matters: `3.6a` now correctly owns both `provider-settings.json` and `chainworks-settings.json` migration semantics, including `SettingsTransferService` import behavior. But the proof lane in section `2` still only requires `Proposal033Tests` to prove `ProviderSettingsStore.migrateFromGooseEra()`. That leaves the cross-machine import path under-specified in the proposal's own verification contract. Current repo truth treats `chainworks-settings.json` as a durable operator surface, so proposal-owned proof should cover imported settings packages too, not only the local store file.
-  Recommended fix: extend the `Proposal033Tests` proof list or `proposal-033` acceptance gate so it explicitly proves `SettingsTransferService` import migration for a Goose-era `chainworks-settings.json` package, including deleted Codex Goose rows and migrated Claude/Gemini rows.
+  Severity: `High`
+  Evidence IDs: `DOC-02`, `DOC-03`, `MAP-01`, `MAP-02`, `REAL-02`
+  Why it matters: The proposal still does not own the persistent model/storage fallout for `AgentExecution.gooseSessionID`. Current code keeps `gooseSessionID` as the durable SwiftData field and exposes `runtimeSessionID` only as a compatibility accessor in [AgentExecution.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Models/AgentExecution.swift#L14). Support export still serializes the key as `gooseSessionID` in [SupportBundleExporter.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Engine/SupportBundleExporter.swift#L145), and the canonical model doc still documents it that way in [domain-model.md](/Users/user/Documents/Chainworks%20Forge/docs/reference/domain-model.md#L132). At the same time, the proposal goal claims zero Goose runtime references in Swift source. Without an explicit model-layer decision, implementers have to invent whether `gooseSessionID` is renamed with a real data migration, preserved as a grandfathered storage alias, or intentionally excluded from the zero-Goose rule.
+  Recommended fix: add a model/storage sub-section that fixes the fate of `AgentExecution.gooseSessionID` and its fallout. At minimum, specify:
+  1. whether the persisted field is renamed or retained as a compatibility column,
+  2. whether `SupportBundleExporter` keeps or rewrites the serialized key,
+  3. and that `domain-model.md` plus [execution-truth-and-recovery.md](/Users/user/Documents/Chainworks%20Forge/docs/reference/execution-truth-and-recovery.md#L1) are updated to match the chosen model/executor vocabulary.
   Acceptance criteria:
-  - the proof lane explicitly covers `SettingsTransferService` import migration, not only `ProviderSettingsStore`
-  - a Goose-era exported settings package can be imported without deserialization failure or stale Goose row leakage
-  - proof expectations match the migration scope already claimed in `3.6a`
+  - the proposal explicitly classifies `AgentExecution.gooseSessionID`
+  - the zero-Goose-in-Swift-source goal is reconciled with the persisted model strategy
+  - support-bundle and stable-doc fallout are named, not left to implementation guesswork
   Confidence: `High`
 
 ## 6. Cross-Discipline Conflicts and Decisions
-- Conflict: the proposal now owns a real docs table, but the current baseline-authoritative reference set is still wider than that table.
-  Tradeoff: keeping the docs matrix compact improves readability, but it weakens closure for a slice that explicitly rewrites the canonical runtime baseline.
-  Decision: expand the docs matrix to cover the full authoritative runtime/provider/test Goose-bearing set, or explicitly mark transitive supersession.
+- Conflict: the proposal wants zero Goose operator strings while also preserving explicit Goose wording for historical runs.
+  Tradeoff: explicit historical wording is clearer to operators, but it violates the proposal's own zero-Goose operator-string contract.
+  Decision: the proposal must pick one user-facing language policy and make scope + acceptance consistent with it.
   Owner: proposal author
 
-- Conflict: the migration contract now covers `SettingsTransferService`, but the proof lane still checks only local-store migration.
-  Tradeoff: keeping the proof list short simplifies the gate, but it leaves a durable operator path outside explicit proposal proof.
-  Decision: add one proof assertion for imported settings-package migration.
+- Conflict: the proposal aims for zero Goose runtime references in Swift source, but the persisted `AgentExecution` model still uses `gooseSessionID` as durable storage.
+  Tradeoff: keeping the field avoids a data migration, but it weakens the stated simplification goal unless explicitly grandfathered.
+  Decision: the proposal must either own a real model migration or explicitly grandfather the storage alias and narrow the goal.
   Owner: proposal author
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P1 | Expand `3.9` to classify all baseline-authoritative Goose-bearing runtime/provider/test docs | iOS Architecture | Proposal author | Before implementation | current baseline + reference index | no baseline doc remains silently stale after `P033` | `ARCH-033-001` |
-| P2 | Extend the proof lane to include `SettingsTransferService` import migration for `chainworks-settings.json` | iOS Architecture | Proposal author | Before implementation | current settings transfer contract | proof lane covers all migration surfaces claimed by `3.6a` | `ARCH-033-002` |
+| P0 | Reconcile the zero-Goose operator-string rule with historical blocked-run and trust copy | Cross-discipline | Proposal author | Before implementation | current sections `3.9`, `4`, `6`, `7` | no proposal-internal contradiction remains in operator-facing wording | `CORE-033-001` |
+| P1 | Add explicit model/storage contract for `AgentExecution.gooseSessionID` and related doc/export fallout | iOS Architecture | Proposal author | Before implementation | current persistent model + support bundle + stable docs | implementer does not have to invent schema compatibility behavior | `ARCH-033-002` |
 
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Reference migration | authoritative runtime/provider/test refs become self-consistent | expanded docs matrix with explicit classification | no stable reference layer silently points at Goose-owned truth | next rereview of `P033` | hold if baseline-authoritative Goose-bearing docs remain unowned |
-| Durable settings proof | both local and imported settings migration paths remain valid | proof lane includes store migration + transfer import migration | no Goose-era settings package breaks import or leaks stale provider rows | next rereview of `P033` | hold if `chainworks-settings.json` migration remains outside explicit proof |
+| Operator wording | goal/scope/acceptance and historical run messaging become internally consistent | one chosen legacy wording policy | no contradictory operator-copy requirements inside the proposal | next rereview of `P033` | hold if proposal still both bans and prescribes Goose-labeled UI strings |
+| Persistent model strategy | `gooseSessionID` fate becomes explicit across code/docs/export surfaces | model-layer subsection and proof expectations | no hidden schema decision left to implementation | next rereview of `P033` | hold if model/storage compatibility remains implicit |
 | External dependency | `P030` readiness | `P030` audit turns green | `P033` implementation does not start early | next rereview of `P033` | hold if `P030` remains red |
 
 ## 9. Evidence Gaps and Open Questions
@@ -121,8 +127,8 @@
 - GAP-01: No blocking evidence gap remains. The remaining issues are proposal-text closure issues, not missing local evidence.
 
 ### Open Questions
-- QUESTION-01: should the omitted baseline-authoritative docs be rewritten directly in `P033`, or explicitly marked as transitively superseded by a smaller owned doc set?
-- QUESTION-02: should the `SettingsTransferService` migration proof live inside `Proposal033Tests`, `ProviderPlatformTests`, or both?
+- QUESTION-01: should historical blocked-run/trust surfaces say `Goose` explicitly, or should they move to neutral `Legacy runtime` wording?
+- QUESTION-02: is `gooseSessionID` intended to remain as a grandfathered storage alias, or should `P033` own a real persisted-model migration?
 
 ## 10. Evidence Gap Review Fallback
 

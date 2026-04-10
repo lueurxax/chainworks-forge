@@ -138,6 +138,28 @@ proposal-033|p033)
 | Delete Goose-specific MCP dispatch in `resolveMCPPolicy` | Already dispatches by adapter family; remove `"goose"` path |
 | Update `resolveSession` to not pass `requestedExtensions` | ACP uses `mcpServers`, not Goose extension IDs |
 
+### 3.4a Persistent Model Migration (`AgentExecution.gooseSessionID`)
+
+**Current**: `AgentExecution` (SwiftData `@Model`) has a persisted stored property `gooseSessionID: String?` (line 16). A computed alias `runtimeSessionID` wraps it (lines 19-22). `SupportBundleExporter` exports the `gooseSessionID` key. `domain-model.md` documents it.
+
+**Decision**: **Rename the stored property** from `gooseSessionID` to `runtimeSessionID`, making the current alias the real property.
+
+**SwiftData migration**: SwiftData lightweight migration handles property renames when the old and new types match. Add `@Attribute(originalName: "gooseSessionID")` to preserve data from existing stores:
+
+```swift
+@Attribute(originalName: "gooseSessionID")
+var runtimeSessionID: String?
+```
+
+**Downstream changes**:
+
+| Owner | Change |
+|-------|--------|
+| `AgentExecution.swift` | Rename stored property, delete computed alias |
+| `SupportBundleExporter.swift` | Export as `"runtimeSessionID"` (or keep `"gooseSessionID"` as export-compat key with deprecation notice) |
+| `domain-model.md` | Update field name |
+| Any direct `gooseSessionID` references | Replace with `runtimeSessionID` |
+
 ### 3.5 Configuration Layer
 
 **Current**: `AppConfiguration` has six `gooseServer*` fields. `BootstrapConfigurationResolver` reads `CHAINWORKS_GOOSE_*` env vars.
@@ -314,11 +336,11 @@ proposal-033|p033)
 Runs with `adapterFamily == "goose"` or `transport == "goose_server"` in their frozen bindings:
 
 1. `ResumeManager.classifyRun()` checks frozen bindings.
-2. If any binding uses Goose → `.cannotResume(run, reason: "Goose runtime is no longer supported.")`.
+2. If any binding uses a removed adapter family → `.cannotResume(run, reason: "This run requires a runtime adapter that is no longer available. Archive it or create a new run.")`.
 3. Run status → `.blocked`, `driftDetails` → removal message.
-4. Operator sees: "This run used the Goose runtime which has been removed. Archive it or create a new run with an ACP provider."
+4. Operator sees: "This run requires a runtime adapter that is no longer available. Archive it or create a new run with a supported provider."
 
-No migration. No conversion. Old Goose runs are blocked forever.
+No migration. No conversion. Runs with removed adapter families are blocked forever. The operator-facing message does not name the removed runtime — it is transport-neutral.
 
 ---
 
@@ -333,8 +355,8 @@ No migration. No conversion. Old Goose runs are blocked forever.
 | Persisted Value | Display |
 |----------------|---------|
 | `fixture_verified` | "Fixture" |
-| `server_unverified` | "Legacy (unverified)" — historical Goose runs |
-| `server_verified` | "Legacy (verified)" — historical Goose runs |
+| `server_unverified` | "Legacy (unverified)" — pre-ACP runs |
+| `server_verified` | "Legacy (verified)" — pre-ACP runs |
 | `runtime_verified` | "Verified" |
 | `runtime_unverified` | "Unverified" |
 | `nil` | "Unknown" |

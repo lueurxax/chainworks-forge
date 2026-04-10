@@ -240,6 +240,35 @@ struct Proposal029Tests {
         #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("state_5.sqlite").path))
     }
 
+    @Test("ACPSubprocessManager sendJSON throws instead of crashing when runtime closes stdin")
+    func acpSubprocessManagerHandlesClosedStdinGracefully() throws {
+        let manager = ACPSubprocessManager(
+            executablePath: "/usr/bin/python3",
+            arguments: ["-c", "import os,time; os.close(0); time.sleep(1)"]
+        )
+        try manager.launch()
+        defer { manager.terminate() }
+        Thread.sleep(forTimeInterval: 0.1)
+
+        do {
+            try manager.sendJSON([
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "ping"
+            ])
+            Issue.record("Expected sendJSON to fail once runtime stdin is closed")
+        } catch let error as ACPSubprocessError {
+            switch error {
+            case .brokenPipe, .notRunning:
+                break
+            default:
+                Issue.record("Unexpected ACPSubprocessError: \(error.localizedDescription)")
+            }
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
     // MARK: - Test 10: AuggieCLIACPTransport session creation fails with subprocess error, not stub error
 
     @Test("AuggieCLIACPTransport session creation fails with subprocess error, not stub error")
