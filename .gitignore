@@ -21,3 +21,4 @@ DerivedDataCodex/
 
 # Local tool state
 .claude/
+traces/

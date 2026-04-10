@@ -199,6 +199,16 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     private func record(_ event: ExecutionEvent) {
         withLock {
+            if event.type == .textChunk,
+               let lastEvent = _eventLog.last,
+               lastEvent.type == .textChunk {
+                _eventLog[_eventLog.count - 1] = ExecutionEvent(
+                    type: .textChunk,
+                    timestamp: lastEvent.timestamp,
+                    detail: lastEvent.detail + event.detail
+                )
+                return
+            }
             _eventLog.append(event)
         }
     }

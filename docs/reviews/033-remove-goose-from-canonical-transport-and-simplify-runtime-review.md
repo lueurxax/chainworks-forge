@@ -20,26 +20,24 @@
   - targeted code refresh for provider UUID/secret storage coupling
   - targeted code refresh for frozen MVP provider boundary ownership
   - targeted doc refresh for runtime/sign-off boundary docs
-  - targeted proof-lane refresh for proposal numbering and gate ownership
+  - targeted persistence refresh for typed decode boundaries in provider settings import/load
 - Baseline freshness: `Partially refreshed`
 - External research used: `None`
 - Runtime evidence used: `None`
 - Current repo tensions found:
-  - the previous stale findings about missing docs coverage, missing `SettingsTransferService` proof, operator-facing Goose wording, `gooseSessionID` ownership, Codex UUID continuity, and provider-boundary fallout are now closed in the proposal text
-  - the proof lane still says transfer-path “cross-machine continuity preserved” even though `3.6a` now explicitly requires Codex re-auth and drops Codex placeholders
-  - the prerequisite gate still mixes `P030` dependency language with the historical `proposal-029` lane name without explaining whether that alias is intentional
+  - the previous stale findings about missing docs coverage, missing `SettingsTransferService` proof, operator-facing Goose wording, `gooseSessionID` ownership, Codex UUID continuity, provider-boundary fallout, transfer-proof wording, and gate alias ambiguity are now closed in the proposal text
+  - durable settings migration still needs an explicit pre-decode owner because current local and transfer paths decode typed enums before any migration hook can run
   - `P030` remains red, so implementation is still operationally blocked behind the proposal's own prerequisite gate
 
 ## 1. Executive Summary
 - Overall readiness: `Amber`
 - Confidence: `High`
-- Proposal completeness signal: `Substantially improved and close to handoff, but not yet internally consistent`
+- Proposal completeness signal: `Substantially improved and close to handoff, but one core persistence seam remains under-specified`
 - What improved:
-  1. The proposal now explicitly owns `SettingsTransferService` proof, neutral legacy operator wording, persistent-model renaming for `runtimeSessionID`, Codex re-auth semantics, and the missing provider-boundary fallout (`runtime-contract`, `mvp-sign-off`, `MVPBoundaryPolicy.swift`).
-  2. The earlier findings about docs-table gaps, proof-lane gaps, operator-string contradiction, missing `gooseSessionID` ownership, missing Codex continuity semantics, and missing provider-boundary owners are now stale and should not be reused.
+  1. The proposal now explicitly owns `SettingsTransferService` proof, neutral legacy operator wording, persistent-model renaming for `runtimeSessionID`, Codex re-auth semantics, the missing provider-boundary fallout (`runtime-contract`, `mvp-sign-off`, `MVPBoundaryPolicy.swift`), and the historical `proposal-029` gate alias.
+  2. The earlier findings about docs-table gaps, proof-lane gaps, operator-string contradiction, missing `gooseSessionID` ownership, missing Codex continuity semantics, missing provider-boundary owners, transfer-proof wording, and gate-name ambiguity are now stale and should not be reused.
 - What still blocks `Green`:
-  1. The proof lane still over-claims transfer continuity after the proposal switched Codex to explicit re-auth semantics.
-  2. The prerequisite gate contract still mixes `P030` and `proposal-029` naming without locking whether the alias is intentional.
+  1. The proposal still does not lock the raw pre-decode migration owner needed to make old Goose-era JSON readable after enum-case deletion.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
@@ -60,57 +58,39 @@
 |---|---|---|---|---:|---:|---:|---:|
 | UI | Green | High | Complete | 0 | 0 | 0 | 0 |
 | UX | Green | High | Complete | 0 | 0 | 0 | 0 |
-| iOS Architecture | Amber | High | Complete | 0 | 1 | 1 | 0 |
+| iOS Architecture | Amber | High | Complete | 0 | 1 | 0 | 0 |
 
 ## 5. Findings by Discipline
 
 ### 5.1 iOS Architecture Findings
 - Finding ID: `ARCH-033-001`
   Severity: `High`
-  Evidence IDs: `DOC-01`, `DATA-01`, `REAL-01`
-  Why it matters: The proposal now makes a clear decision in `3.6a`: Claude/Gemini preserve UUID and continuity, while Codex is deleted and requires explicit re-auth ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L256)). But the proof lane still says `SettingsTransferService` import proves “cross-machine continuity preserved” for the migration as a whole ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L61)). Those two statements no longer match: Codex continuity is intentionally not preserved. That leaves the gate ambiguous about what must be asserted and makes the current proof wording technically false if read literally.
-  Recommended fix: rewrite proof item `2` so it matches the new migration semantics. It should say continuity is preserved for in-place Claude/Gemini migrations, while deleted Codex rows require explicit re-auth and dropped placeholders. Acceptance/proof wording should validate both halves of that contract.
+  Evidence IDs: `DOC-01`, `MAP-01`, `MAP-02`, `DATA-01`, `REAL-01`
+  Why it matters: `3.6a` correctly recognizes that deleting enum cases breaks deserialization, and it says `ProviderSettingsStore.migrateFromGooseEra()` should run “once on load” while `SettingsTransferService` applies the same migration on imported JSON before merging ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L241)). But current repo owners still decode typed models first: [ProviderSettingsStore.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Providers/ProviderSettingsStore.swift#L81) decodes `ProviderSettings` directly, and [SettingsTransferService.swift](/Users/user/Documents/Chainworks%20Forge/Chainworks%20Forge/Support/SettingsTransferService.swift#L82) decodes `ExportableSettingsPackage` directly. Once `.codex`, `.claude`, `.gemini`, and `.gooseServer` cases are removed, old Goose-era JSON cannot reach a post-decode migration hook. The proposal still leaves the crucial pre-decode owner implicit.
+  Recommended fix: lock one explicit raw-data migration seam for both local and transfer paths. For example:
+  1. define a raw JSON migration helper or wire schema that rewrites old family/transport values before any `JSONDecoder().decode(...)` into `ProviderSettings` / `ExportableSettingsPackage`, and
+  2. explicitly state whether `migration_version` lives inside `ProviderSettings`, in a wrapper payload, or only in the raw migration layer, plus how `secretPlaceholders` are rewritten before placeholder validation.
   Acceptance criteria:
-  - proof wording no longer claims universal cross-machine continuity after Codex was moved to explicit re-auth
-  - `Proposal033Tests` explicitly proves Claude/Gemini continuity and Codex re-auth/remediation as separate outcomes
-  - transfer-path behavior and operator expectations use the same vocabulary as `3.6a`
-  Confidence: `High`
-
-- Finding ID: `ARCH-033-002`
-  Severity: `Medium`
-  Evidence IDs: `DOC-01`, `MAP-02`, `REAL-02`
-  Why it matters: The proposal now correctly depends on `P030`, but its proof-lane snippet still invokes `proposal-029-prereq` and `${PROPOSAL_029_TESTS[@]}` ([033-remove-goose-from-canonical-transport-and-simplify-runtime.md](/Users/user/Documents/Chainworks%20Forge/docs/proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md#L50)). Current repo reality also still exposes only `proposal-029` in [scripts/test-gate.sh](/Users/user/Documents/Chainworks%20Forge/scripts/test-gate.sh#L1370), even though the proposal file and current implementation audits are all `030-*`. That leaves the prerequisite contract ambiguous: is `proposal-029` a historical alias for `P030`, or is the proposal pointing at the wrong gate name?
-  Recommended fix: make the gate naming explicit. Either:
-  1. keep the repo-owned gate alias as `proposal-029` and state that `P030` currently reuses that historical lane name, or
-  2. rename the lane and snippet to `proposal-030` / `PROPOSAL_030_TESTS` everywhere.
-  Acceptance criteria:
-  - the prerequisite gate uses one stable identifier across proposal text, repo script, and audit references
-  - rereviewers do not have to infer whether `proposal-029` is a historical alias for `P030`
-  - the proof lane can be executed unambiguously from the proposal alone
+  - the proposal explicitly says migration happens on raw persisted/imported JSON before typed enum decoding
+  - the same owner or helper is named for both `provider-settings.json` and `chainworks-settings.json`
+  - `migration_version` and `secretPlaceholders` ownership are explicit enough that an implementer does not need to invent schema behavior
   Confidence: `High`
 
 ## 6. Cross-Discipline Conflicts and Decisions
-- Conflict: the proposal now explicitly chooses Codex re-auth, but the proof lane still uses continuity language from the older migration model.
-  Tradeoff: retaining the old proof sentence makes the gate look simpler, but it no longer matches the actual migration semantics.
-  Decision: update the proof lane to assert two different outcomes: preserved continuity for migrated rows and explicit re-auth for deleted Codex rows.
-  Owner: proposal author
-
-- Conflict: the proposal depends on `P030`, but the repo-owned gate lane still carries the historical `proposal-029` name.
-  Tradeoff: keeping the old alias avoids a repo-wide gate rename, but it makes the proposal's prerequisite contract ambiguous unless that alias is spelled out.
-  Decision: either lock the alias explicitly or rename the lane end-to-end.
+- Conflict: the proposal defines the row-by-row migration semantics, but current persistence owners decode typed enums before any migration point.
+  Tradeoff: keeping the proposal at the semantic level reads cleanly, but implementers can still choose a post-decode hook that can never see old Goose-era payloads once enum cases are removed.
+  Decision: the proposal must explicitly own a raw pre-decode migration seam.
   Owner: proposal author
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P0 | Align proof item `2` with the new Codex re-auth semantics in `3.6a` | iOS Architecture | Proposal author | Before implementation | updated migration contract | transfer proof matches the actual Codex/Claude/Gemini outcomes | `ARCH-033-001` |
-| P1 | Resolve `P030` vs `proposal-029` prerequisite-gate naming | iOS Architecture | Proposal author | Before implementation | current repo gate lane naming | prerequisite proof can be followed without alias guesswork | `ARCH-033-002` |
+| P0 | Add an explicit raw pre-decode migration owner for local and transfer settings payloads | iOS Architecture | Proposal author | Before implementation | current typed decode boundaries | old Goose-era JSON can still be migrated after enum-case removal without invented schema behavior | `ARCH-033-001` |
 
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Transfer migration truth | proof lane matches the actual row-by-row migration semantics | separate assertions for migrated rows and deleted Codex rows | no generic “continuity preserved” claim survives when Codex requires re-auth | next rereview of `P033` | hold if proof wording still over-claims continuity |
-| Prerequisite gate clarity | proposal and repo use one stable name for the second-wave ACP prereq | gate snippet and repo script converge | no rereviewer has to infer whether `proposal-029` means `P030` | next rereview of `P033` | hold if gate naming remains mixed |
+| Durable settings migration | old Goose-era local and transfer payloads remain readable after enum-case removal | raw migration owner is explicit for both load and import paths | no implementation is forced to invent a pre-decode seam | next rereview of `P033` | hold if migration can still be interpreted as post-decode only |
 | External dependency | `P030` readiness | `P030` audit turns green | `P033` implementation does not start early | next rereview of `P033` | hold if `P030` remains red |
 
 ## 9. Evidence Gaps and Open Questions
@@ -119,8 +99,8 @@
 - GAP-01: No blocking evidence gap remains. The remaining issues are proposal-text closure issues, not missing local evidence.
 
 ### Open Questions
-- QUESTION-01: should the proof lane say “continuity preserved for migrated rows” instead of “cross-machine continuity preserved” to match the new Codex re-auth rule?
-- QUESTION-02: is `proposal-029` an intentional long-lived repo alias for `P030`, or should the gate be renamed in the same slice?
+- QUESTION-01: should the proposal name a dedicated raw migration helper/wire payload, or is it enough to define the pre-decode seam abstractly?
+- QUESTION-02: where exactly should `migration_version` live so local settings and transfer packages share one durable migration contract?
 
 ## 10. Evidence Gap Review Fallback
 

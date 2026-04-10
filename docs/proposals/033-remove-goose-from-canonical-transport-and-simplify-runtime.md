@@ -238,10 +238,27 @@ var runtimeSessionID: String?
 | `"gemini"` | Rename key → `"geminiACP"` | `"geminiACP"` |
 | Other keys | Keep | Same |
 
-**Implementation**: `ProviderSettingsStore` gains a `migrateFromGooseEra()` method that runs once on load:
+**Implementation**: `ProviderSettingsStore` gains a **raw JSON pre-decode migration** that runs before `JSONDecoder` ever touches the payload. This is critical: once Goose-era enum cases (`.codex`, `.claude`, `.gemini`, `.gooseServer`) are deleted from Swift source, `JSONDecoder` will fail on any JSON containing those raw values. The migration must happen on raw `Data`/`[String: Any]`, not on typed models.
 
-1. Parse existing JSON.
-2. **Delete Goose-era Codex rows entirely**: Remove all providers where `family == "codex"` (regardless of transport). The Goose-era `.codex` family has no ACP continuation — `.codexACP` is a distinct family. The row (including its `displayName`, `endpoint`, `authMode`, `capabilities`, `adapterVersion`) is discarded. Operator gets a fresh seeded `.codexACP` entry instead.
+**Migration seam** (runs in `ProviderSettingsStore.init` and `SettingsTransferService.importSettings`, before `JSONDecoder.decode`):
+
+```swift
+static func migrateRawJSONIfNeeded(_ data: Data) throws -> Data {
+    guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+    guard (json["migration_version"] as? Int ?? 0) < 1 else { return data }
+    // ... raw string rewrites on json["configuredProviders"] array ...
+    json["migration_version"] = 1
+    return try JSONSerialization.data(withJSONObject: json)
+}
+```
+
+This returns migrated `Data` that `JSONDecoder` can then decode with the new enum cases.
+
+**Migration steps** (all on raw `[String: Any]`, never on typed models):
+
+1. Read raw JSON from disk as `[String: Any]`.
+2. Check `migration_version` — skip if already ≥ 1.
+3. **Delete Goose-era Codex rows entirely**: Remove all entries in `configuredProviders` array where `family == "codex"`. The Goose-era `.codex` family has no ACP continuation — `.codexACP` is a distinct family. The entry is discarded. Operator gets a fresh seeded `.codexACP` entry after decode.
 3. **Migrate surviving Claude/Gemini rows** with full field semantics:
    - `family: "claude"` → `"claudeACP"`, `family: "gemini"` → `"geminiACP"`
    - `transport: "goose_server"` → `"cli"` (ACP adapters are subprocess-based)
@@ -251,9 +268,12 @@ var runtimeSessionID: String?
    - `capabilities`: **replace with `ProviderCapabilities.default(for: .claudeACP)`** / `.geminiACP` — Goose-era capability flags may not match ACP reality
    - `adapterVersion`: rewrite `"v1"` → `"acp-v1"`
    - `isEnabled`: set to `true` (these were active Goose providers, keep them active as ACP)
-4. Rewrite `preferredProviderIDsByFamily` keys per migration table above.
-5. Persist migrated JSON.
-6. Write `"migration_version": 1` field to prevent re-running.
+4. Rewrite `preferredProviderIDsByFamily` keys per migration table above (raw string key rewrite).
+5. Set `migration_version: 1` in the raw JSON.
+6. Serialize back to `Data` and persist.
+7. Return migrated `Data` for `JSONDecoder` to decode with new enum cases.
+
+**Call sites**: Both `ProviderSettingsStore.init(fileURL:)` and `SettingsTransferService.importSettings(_:)` call `migrateRawJSONIfNeeded(_:)` on raw file/import data before passing to `JSONDecoder`. This ensures the migration runs before any typed deserialization.
 
 **Credential / UUID migration**: Secrets are keyed by `"provider.\(UUID)"` in `KeychainSecretStore` (via `ProviderAdapterSupport.secretKey(for:)`). Migration semantics:
 

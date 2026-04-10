@@ -310,6 +310,28 @@ struct LiveProposalWorkflowTests {
         #expect(transcriptText.contains(longChunk))
     }
 
+    @Test("Event bridge coalesces consecutive text chunks in event log while preserving accumulated text")
+    func eventBridgeCoalescesConsecutiveTextChunks() async throws {
+        let bridge = ExecutionEventBridge()
+
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.sessionStarted(raw: "{}"))
+            continuation.yield(.textChunk(text: "Hel"))
+            continuation.yield(.textChunk(text: "lo"))
+            continuation.yield(.textChunk(text: " "))
+            continuation.yield(.textChunk(text: "world"))
+            continuation.yield(.toolCallStarted(toolName: "read", raw: "{}"))
+            continuation.finish()
+        }
+
+        _ = try await bridge.processStream(stream) { _ in }
+
+        #expect(bridge.accumulatedText == "Hello world")
+        let textEvents = bridge.eventLog.filter { $0.type == .textChunk }
+        #expect(textEvents.count == 1)
+        #expect(textEvents.first?.detail == "Hello world")
+    }
+
     @Test("Event bridge resolves tool name from raw payload when start event name is unknown")
     func eventBridgeResolvesToolNameFromRawPayload() async throws {
         let bridge = ExecutionEventBridge()
