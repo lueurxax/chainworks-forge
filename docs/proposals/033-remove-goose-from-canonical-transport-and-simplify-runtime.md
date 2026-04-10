@@ -13,7 +13,7 @@
 
 ## 1. Context and Motivation
 
-Goose was the original runtime transport. The ACP migration (P026 → P030) introduced a parallel ACP seam that now covers five provider adapters. With P030 proven, Goose is dead weight:
+Goose was the original runtime transport. The ACP migration (P026 → P030) introduced a parallel ACP seam that now covers five provider adapters. With the second-wave ACP expansion (P030) proven, Goose is dead weight:
 
 - Transport layer carries dual paths (Goose REST/SSE + ACP JSON-RPC subprocess)
 - MCP resolution has Goose-specific registry, namespace, and validation logic
@@ -28,7 +28,7 @@ This proposal removes Goose completely and refactors each layer to be ACP-native
 
 ## 2. Hard Prerequisite Gate and Proof Lane
 
-Implementation cannot begin until P030 passes audit to `Implemented / Ready`.
+Implementation cannot begin until the second-wave ACP proposal (P030) passes audit to `Implemented / Ready`.
 
 **Gate definition for `test-gate.sh`**:
 
@@ -46,9 +46,9 @@ PROPOSAL_033_TESTS=(
 proposal-033|p033)
   check_idle_environment allow_app
   guard_direct_run_insertion
-  # Prerequisite: P030 must be green
-  log "Prerequisite: proposal-030 gate"
-  run_targeted_tests "proposal-030-prereq" "${PROPOSAL_030_TESTS[@]}"
+  # Prerequisite: second-wave ACP gate must be green
+  log "Prerequisite: proposal-029 gate (second-wave ACP)"
+  run_targeted_tests "proposal-029-prereq" "${PROPOSAL_029_TESTS[@]}"
   # P033-specific proof
   run_build "proposal-033"
   run_targeted_tests "proposal-033" "${PROPOSAL_033_TESTS[@]}"
@@ -83,6 +83,8 @@ proposal-033|p033)
 | Delete `GooseTransportAPI` enum | No `bespoke`/`goose_server` distinction needed |
 | Delete `resolveGooseTransport()` in ExecutionService | ACP transports are self-contained |
 | Delete `liveRuntimeConfiguration` Goose fields | Replace with `runtimeEndpointOverrides` if needed |
+| Delete `ExecutionService.gooseServerManager` field | ACP transports don't use a central server manager |
+| Delete `Chainworks_ForgeApp.swift` Goose bootstrap | Remove `gooseServerManager` creation, bootstrap, and passing to ExecutionService (~15 references) |
 | Delete `GooseServerTransport.swift` | — |
 | Delete `GooseServerManager.swift` | — |
 | Delete `GooseStreamEventMapper.swift` | — |
@@ -120,7 +122,6 @@ proposal-033|p033)
 |--------|--------|
 | Rename `GooseSessionBridge.swift` → `RuntimeSessionBridge.swift` | Already used the type name `RuntimeSessionBridge` internally |
 | Delete Goose extension reconciliation branches | ACP transports receive `mcpServers` directly, no Goose extension ID translation needed |
-| Delete `GooseSystemPromptStore` dependency | ACP transports embed system prompt in `session/new` or `session/prompt` directly |
 | Simplify `resolveMCPPolicy` | No Goose-specific blocking/warning conditions |
 
 **Result**: Session bridge is transport-neutral, delegates all transport-specific behavior to the `RuntimeTransportProtocol` implementation.
@@ -156,7 +157,7 @@ var runtimeSessionID: String?
 | Owner | Change |
 |-------|--------|
 | `AgentExecution.swift` | Rename stored property, delete computed alias |
-| `SupportBundleExporter.swift` | Export as `"runtimeSessionID"` (or keep `"gooseSessionID"` as export-compat key with deprecation notice) |
+| `SupportBundleExporter.swift` | Export as `"runtimeSessionID"` — no backward-compat key |
 | `domain-model.md` | Update field name |
 | Any direct `gooseSessionID` references | Replace with `runtimeSessionID` |
 
@@ -190,7 +191,7 @@ var runtimeSessionID: String?
 | Delete `.codex` (Goose-backed) → keep `.codexACP` | Codex ACP is the only Codex runtime |
 | Rename `.claude` → `.claudeACP` | Claude Agent ACP is the only Claude runtime |
 | Rename `.gemini` → `.geminiACP` | Gemini CLI ACP is the only Gemini runtime |
-| Delete `ProviderTransport.gooseServer` | Only `.cli` and `.httpAPI` remain (or collapse to just `.acpStdio`) |
+| Delete `ProviderTransport.gooseServer` | Remaining cases: `.cli`, `.httpAPI`, `.localBridge` |
 | Delete `GooseProviderConnectionAssistant.swift` | — |
 | Delete `GooseProviderConnectionAssistantView.swift` | — |
 | Delete `verifyGooseServerProvider()` in ProviderAdapterSupport | — |
@@ -238,7 +239,7 @@ var runtimeSessionID: String?
 **Implementation**: `ProviderSettingsStore` gains a `migrateFromGooseEra()` method that runs once on load:
 
 1. Parse existing JSON.
-2. **Delete Goose-only rows entirely**: Remove all providers where `family == "codex"` AND `transport == "goose_server"`. These were Goose-backed Codex — there is no ACP equivalent with the same identity. The row (including its `displayName`, `endpoint`, `authMode`, `capabilities`, `adapterVersion`) is discarded. Operator gets fresh seeded `.codexACP` entry instead.
+2. **Delete Goose-era Codex rows entirely**: Remove all providers where `family == "codex"` (regardless of transport). The Goose-era `.codex` family has no ACP continuation — `.codexACP` is a distinct family. The row (including its `displayName`, `endpoint`, `authMode`, `capabilities`, `adapterVersion`) is discarded. Operator gets a fresh seeded `.codexACP` entry instead.
 3. **Migrate surviving Claude/Gemini rows** with full field semantics:
    - `family: "claude"` → `"claudeACP"`, `family: "gemini"` → `"geminiACP"`
    - `transport: "goose_server"` → `"cli"` (ACP adapters are subprocess-based)
@@ -282,7 +283,7 @@ var runtimeSessionID: String?
 | Change | Detail |
 |--------|--------|
 | Delete `FixtureGooseTransport.swift` | Replace with `FixtureACPTransport` |
-| Create `FixtureACPTransport` | Same scenario enum, same deterministic behavior, `mcpRuntimeNamespace = "claude_agent"` (or parametric) |
+| Create `FixtureACPTransport` | Same scenario enum, same deterministic behavior, parametric `mcpRuntimeNamespace` defaulting to `"claude_agent"` |
 | Rename `GooseSessionBridgeTests.swift` → `RuntimeSessionBridgeTests.swift` | Remove Goose fixtures |
 | Rename `GooseAgentExecutorTests.swift` → `RuntimeAgentExecutorTests.swift` | Use ACP fixtures |
 | Delete `GooseServerTransportTests.swift` | — |
@@ -378,7 +379,9 @@ Reader normalizes legacy values on read. No data migration.
 9. `ResumeManager` blocks Goose-bound runs with explicit error.
 10. All tests compile and pass using `FixtureACPTransport`.
 11. UI surfaces have zero "Goose" in operator-facing strings.
-12. `proposal-033` gate passes with P030 prerequisite.
+12. Persisted `provider-settings.json` with Goose-era values loads correctly after `migrateFromGooseEra()`.
+13. `AgentExecution.runtimeSessionID` reads legacy `gooseSessionID` column via `@Attribute(originalName:)`.
+14. `proposal-033` gate passes with second-wave ACP prerequisite.
 
 ---
 
