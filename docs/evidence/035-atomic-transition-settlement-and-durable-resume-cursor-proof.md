@@ -9,14 +9,18 @@ Validate that resume/recovery uses cursor-continuation truth as the recovery aut
 - Existing full and proposal-level recovery verification lanes.
 
 ## What is considered proven
-1. `currentStageID`/current-stage derivation is cursor-first where cursor metadata exists.
-2. Interruption and resume paths derive continuation from cursor + immutable transition metadata, not from mixed snapshots alone.
-3. Map projection for UI-facing current stage follows durable cursor truth.
-4. Recovery reports and stage labels are aligned with cursor-authoritative continuation.
+1. Resume planning and transition settlement now persist cursor updates during interruption/retry boundaries.
+2. Interruption/recovery paths use transition metadata and cursor state together in planner and recovery reporting surfaces.
+3. Cursor-backed evidence is used for recovery reporting and audit traces in most slices.
+
+## Current implementation mismatch
+1. **Known gap:** `WorkflowMapProjectionService` can still derive UI-facing `currentStageID` from persisted workflow snapshots when cursor metadata is incomplete, so stale or mixed stage rows may override durable cursor truth.
+2. Until this gap is fixed, UI-facing current-stage truth is only partially cursor-driven.
 
 ## Current verification commands
 - `scripts/test-gate.sh proposal-033` (execution slice where cursor-driven behavior is covered)
 - `scripts/test-gate.sh proposal-030` and repository-level recovery/smoke gates as regression guards
 
 ## Residual risk
-- No unresolved critical risk in current code path; watch for regressions where writes to cursor and transition state become non-atomic in new transport/adapter additions.
+- Remaining risk is the cursor-vs-snapshot race in map projection described above, which can surface stale current-stage values for interrupted runs.
+- Additional risk remains if cursor and transition writes are not kept atomic in future transport/adapter additions.
