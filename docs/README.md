@@ -27,13 +27,12 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
 - [reference/skill-resolution-and-runtime-integration.md](reference/skill-resolution-and-runtime-integration.md) — Stable skill resolution, specialization, runtime injection, and frozen skill truth
 - [reference/per-agent-mcp-policy-and-runtime-validation.md](reference/per-agent-mcp-policy-and-runtime-validation.md) — Stable per-agent MCP intent, runtime validation, and persisted MCP truth
-- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — Stable ACP-shaped transport contract, adapter families, and Goose compatibility role
+- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — Stable ACP-only transport contract, adapter families, and persisted runtime truth
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Stable canonical outcome, recovery, and report/read-truth contract
 - [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Stable output-contract authority, failed-stage evidence, narrow recovery, and declarative contract enforcement
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Stable per-run session reuse, generation history, checkpoint refresh, and shell-owned reset contract
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Stable strategy-profile freezing, handoff compilation, lazy evidence, normalized telemetry, and shell-owned recommendation contract
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Stable proposal-loop review-corpus fidelity, backlog carry-forward, writer coverage, and targeted-rereview contract
-- [reference/goose-server-transport.md](reference/goose-server-transport.md) — GooseServerTransport, SSE mapping, session lifecycle, proven real connection
 - [reference/operator-experience.md](reference/operator-experience.md) — Stable operator shell baseline and contracts
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Stable segmented run-shell IA, pane routing, focused timeline, and shared artifact browsing contract
 - [reference/provider-platform.md](reference/provider-platform.md) — Stable multi-provider/settings/diagnostics baseline
@@ -44,7 +43,6 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/artifact-content-rendering.md](reference/artifact-content-rendering.md) — Stable unified read-only markdown/json artifact rendering contract
 - [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Stable provider/model truth and provenance contract
 - [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — Stable archive/restore lifecycle for ideas
-- [reference/goose-provider-remediation.md](reference/goose-provider-remediation.md) — Stable Goose-backed provider verification/remediation flow
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Stable workflow topology and agent-activity surface
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Stable repo-backed delivery slice: worktrees, implementation loop, manual release, evidence export
 - [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — Stable benchmark, recovery/export, and launch-gate sign-off contract
@@ -64,12 +62,9 @@ Active work that is not yet fully promoted into `reference/` lives under [`propo
 - [proposals/020-dynamic-cycle-addition.md](proposals/020-dynamic-cycle-addition.md)
 - [proposals/021-run-transition-notifications-and-attention-routing.md](proposals/021-run-transition-notifications-and-attention-routing.md)
 - [proposals/023-loop-improvement-analytics-and-iteration-progression.md](proposals/023-loop-improvement-analytics-and-iteration-progression.md)
-- [proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](proposals/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md)
 - [proposals/031-thin-ui-rewrite-over-projections-and-mcp.md](proposals/031-thin-ui-rewrite-over-projections-and-mcp.md)
 - [proposals/032-polish-stabilization-and-productization-backlog.md](proposals/032-polish-stabilization-and-productization-backlog.md)
-- [proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md](proposals/033-remove-goose-from-canonical-transport-and-simplify-runtime.md)
 - [proposals/034-clean-yaml-runtime-transport-normalization.md](proposals/034-clean-yaml-runtime-transport-normalization.md)
-- [proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md](proposals/035-atomic-transition-settlement-and-durable-resume-cursor.md)
 
 ## Examples
 
@@ -84,10 +79,12 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 
 ## Evidence And Proof
 
-- [evidence/goose-server-transport-verification.md](evidence/goose-server-transport-verification.md) -- Goose server transport verification record
 - [evidence/execution-truth-and-recovery-proof.md](evidence/execution-truth-and-recovery-proof.md) -- consolidated implementation/proof status for the execution-truth and recovery slice
 - [evidence/output-contracts-failure-evidence-and-recovery-proof.md](evidence/output-contracts-failure-evidence-and-recovery-proof.md) -- consolidated implementation/proof status for output contracts, failure evidence, and narrow recovery
 - [evidence/session-lineage-reuse-and-operator-reset-proof.md](evidence/session-lineage-reuse-and-operator-reset-proof.md) -- consolidated implementation/proof status for session-lineage reuse, checkpointing, and operator reset
+- [evidence/033-remove-goose-from-canonical-transport-and-simplify-runtime-proof.md](evidence/033-remove-goose-from-canonical-transport-and-simplify-runtime-proof.md) -- proof of canonical ACP transport simplification and legacy settings compatibility
+- [evidence/035-atomic-transition-settlement-and-durable-resume-cursor-proof.md](evidence/035-atomic-transition-settlement-and-durable-resume-cursor-proof.md) -- proof of cursor-authored transition settlement and deterministic resume
+- [evidence/030-acp-second-wave-runtime-profiles-proof.md](evidence/030-acp-second-wave-runtime-profiles-proof.md) -- proof of second-wave provider profile and adapter-aware runtime readiness behavior
 - [evidence/context-strategy-and-experiment-framework-proof.md](evidence/context-strategy-and-experiment-framework-proof.md) -- consolidated implementation/proof status for context strategies, lazy evidence, normalized telemetry, and strategy recommendation output
 - [evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md](evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md) -- consolidated implementation/proof status for proposal-loop review fidelity, score-lift backlog, writer coverage, and targeted rereview
 - [evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md) -- consolidated implementation/proof status for segmented run surfaces, focused timeline, and hierarchical artifact browsing
@@ -95,12 +92,15 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 - [evidence/design-system-and-brand-application-proof.md](evidence/design-system-and-brand-application-proof.md) -- consolidated implementation/proof status for the design-system and brand-application slice
 - [evidence/full-mvp-delivery-proof.md](evidence/full-mvp-delivery-proof.md) -- consolidated implementation/proof status for the repo-backed delivery slice
 - [evidence/mvp-sign-off-proof.md](evidence/mvp-sign-off-proof.md) -- consolidated implementation/proof status for MVP hardening and sign-off
-- [evidence/live_goose_connection_proof.json](evidence/live_goose_connection_proof.json) -- raw evidence JSON
 
 ## Research
 
 - [research/chainworks_core_idea.md](research/chainworks_core_idea.md)
 - [research/goose_swiftui_agent_architecture_research.md](research/goose_swiftui_agent_architecture_research.md)
+
+## Archive
+
+- [archive/README.md](archive/README.md) — historical material that is intentionally retained outside the canonical reference stack
 
 ## Product
 

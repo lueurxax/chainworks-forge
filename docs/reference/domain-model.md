@@ -83,7 +83,7 @@ These fields are `private(set)` and frozen at run creation. They record the exac
 
 #### Derived properties
 
-`currentStageID` is a **computed property**, not stored. It derives the current stage from the `stageExecutions` collection using priority ordering: `running` > `waitingApproval` > `blocked` > `ready` > last `completed`. This eliminates divergence risk across retries, skips, blocked states, and resume.
+`currentStageID` is now **cursor-first**. It is a computed property that first resolves continuation from durable transition cursor metadata (and only falls back to `stageExecutions` ordering when cursor metadata is absent). This preserves resume truth when mixed or stale stage rows exist and makes continuation deterministic across resume/restart paths.
 
 #### Relationships
 
@@ -132,11 +132,11 @@ Tracks a single agent's work within a stage.
 | `startedAt` | `Date` | When agent started |
 | `completedAt` | `Date?` | When agent finished |
 | `status` | `AgentStatus` | Current lifecycle state |
-| `provider` | `String` | `claude_code`, `codex`, or `gemini` |
+| `provider` | `String` | ACP-backed provider identifier such as `claude_acp`, `codex_acp`, or `gemini_acp` |
 | `effort` | `String` | `low` · `medium` · `high` · `critical` |
 | `costCents` | `Int64?` | Cost in minor units; `$0.73` = `73` |
 | `logSnippet` | `String?` | Last N lines of log for quick preview |
-| `gooseSessionID` | `String?` | Goose session tracking |
+| `runtimeSessionID` | `String?` | Runtime session tracking |
 
 #### Relationships
 
@@ -231,7 +231,7 @@ Metadata for a durable output produced by an agent. Content lives on disk; Swift
 |---|---|
 | `pending` | Not yet scheduled |
 | `ready` | Dependencies met, waiting for provider |
-| `running` | Actively executing via Goose |
+| `running` | Actively executing via the selected ACP runtime |
 | `completed` | Finished successfully |
 | `failed` | Finished with error |
 | `cancelled` | Stopped by user or orchestrator |

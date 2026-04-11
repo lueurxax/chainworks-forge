@@ -181,7 +181,6 @@ UI-quality proof gate for the implemented visual-polish and bounded accessibilit
 
 Scope:
 
-- runtime proof for `GooseProviderConnectionAssistantView`
 - runtime proof for `WorkflowMapView`
 - runtime proof for `ReleaseGateView`
 - explicit `1024×768` minimum-window proof
@@ -259,8 +258,8 @@ Context-strategy framework gate for strategy handoff, lazy evidence, telemetry, 
 Scope:
 
 - `Proposal019Tests`
-- `GooseSessionBridgeTests`
-- `GooseAgentExecutorTests`
+- `RuntimeSessionBridgeTests`
+- `RuntimeAgentExecutorTests`
 - `OrchestratorTests`
 
 Use when:
@@ -390,6 +389,41 @@ Important:
 
 - the stable documentation source of truth for this slice is now [artifact-content-rendering.md](../reference/artifact-content-rendering.md)
 
+### `proposal-033`
+
+ACP-only runtime architecture gate for the post-Goose canonical transport slice.
+
+Scope:
+
+- prerequisite `proposal-029` second-wave ACP runtime lane
+- `Proposal033Tests`
+- `RuntimeSessionBridgeTests`
+- `LiveACPConnectionProofTests`
+- `MVPGoldenRunTests`
+- `ProviderPlatformTests`
+
+Use when:
+
+- proving the ACP-only runtime architecture on the current head
+- validating provider-settings migration from Goose-era payloads
+- validating ACP-only MCP/session/executor behavior
+- verifying operator/runtime docs and gate ownership have caught up with the code
+
+Host policy:
+
+- local target only; this is a focused runtime/unit proof lane without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-033
+```
+
+Important:
+
+- this gate hard-depends on `proposal-029`
+- `proposal-033` is the repo-owned proof lane for [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](../reference/033-remove-goose-from-canonical-transport-and-simplify-runtime.md)
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
@@ -453,6 +487,12 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 ```bash
 ./scripts/test-gate.sh proposal-027
+```
+
+### ACP-only runtime proof
+
+```bash
+./scripts/test-gate.sh proposal-033
 ```
 
 ### Before sign-off

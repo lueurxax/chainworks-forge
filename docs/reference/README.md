@@ -4,6 +4,8 @@ Implementation-oriented reference docs for Chainworks Forge.
 
 If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md), then read the relevant subsystem documents below.
 
+Historical reference material that is no longer part of the canonical runtime architecture lives under [../archive/reference/README.md](../archive/reference/README.md).
+
 ## Foundation Layer
 
 - [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking
@@ -16,7 +18,10 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
-- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP-shaped transport contract, runtime selection, ACP adapters, and Goose compatibility role
+- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families, and persisted runtime truth
+- [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](030-acp-second-wave-runtime-profiles-codex-auggie-junie.md) — Second-wave ACP profile governance
+- [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](033-remove-goose-from-canonical-transport-and-simplify-runtime.md) — ACP canonical transport simplification and settings compatibility path
+- [035-atomic-transition-settlement-and-durable-resume-cursor.md](035-atomic-transition-settlement-and-durable-resume-cursor.md) — Atomic transition settlement and durable resume cursor
 - [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, stage-owned recovery evidence, approval restore, runtime binding truth, and report/recovery read precedence
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, aggregate summary hardening, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage within one run, immutable generation history, budget-driven compaction, checkpoint rehydration, and shell-owned per-agent reset
@@ -26,7 +31,6 @@ If you need a current-head orientation first, start with [current-system-baselin
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
-- [goose-server-transport.md](goose-server-transport.md) — GooseServerTransport adapter: goosed API contract, SSE event mapping, session lifecycle, executor pipeline, proven real Goose connection
 - [operator-experience.md](operator-experience.md) — Stable operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Stable unified rendering contract for read-only markdown and JSON artifacts
@@ -37,7 +41,6 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling
 - [idea-lifecycle.md](idea-lifecycle.md) — Active vs archived idea contract, archive/restore eligibility, cross-surface truth
-- [goose-provider-remediation.md](goose-provider-remediation.md) — Goose-first Codex/Claude remediation path, assistant, handshake probe, evidence panel
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
 - [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, evidence export
 - [mvp-sign-off.md](mvp-sign-off.md) — benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
