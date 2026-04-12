@@ -426,6 +426,7 @@ impl Orchestrator {
                     "Transition matched"
                 );
                 runs::update_current_state(&self.pool, run_id, &transition.to).await?;
+                db::repos::projections::rebuild_all_for_run(&self.pool, run_id).await?;
 
                 // Re-enter advance_run for the new state
                 self.work_queue
