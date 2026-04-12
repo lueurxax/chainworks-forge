@@ -14,6 +14,10 @@ pub struct RunPlan {
     pub initial_state: String,
     pub states: HashMap<String, CompiledState>,
     pub variables: HashMap<String, serde_json::Value>,
+    /// Artifact name → file path template from the agent catalog's `artifacts:` section.
+    /// Used by `exists('artifact_name')` transition conditions to check if an artifact
+    /// has been produced on the filesystem.
+    pub artifact_paths: HashMap<String, String>,
 }
 
 /// A single compiled state in the workflow state machine.

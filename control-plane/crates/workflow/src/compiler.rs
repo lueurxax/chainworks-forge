@@ -46,10 +46,18 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         states.insert(state_id.clone(), compiled);
     }
 
+    // Artifact name → path template from the catalog's `artifacts:` section.
+    let artifact_paths: HashMap<String, String> = cat
+        .artifacts
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
     Ok(RunPlan {
         initial_state: wf.initial_state,
         states,
         variables,
+        artifact_paths,
     })
 }
 

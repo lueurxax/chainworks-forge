@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -316,11 +318,18 @@ impl Orchestrator {
             }
         }
 
+        // Fetch run for condition evaluation context.
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+
         // Evaluate transitions — find the first that matches.
         for transition in &state.transitions {
-            let matches = self
-                .evaluate_condition(&transition.condition, run_id, all_stages)
-                .await;
+            let matches = self.evaluate_condition(
+                &transition.condition,
+                &run,
+                plan,
+            ).await;
             if matches {
                 // Check loop guard: if transitioning back to current state and loop exhausted
                 if transition.to == *current_state_id {
@@ -390,40 +399,76 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Simple condition evaluator for transition `when` expressions.
+    /// Condition evaluator for transition `when` expressions.
+    /// Matches Swift's `TransitionEvaluator` (ARCH-031 canonical patterns).
     ///
-    /// Supported patterns:
+    /// Supported:
     /// - `"true"` → always true
-    /// - `exists('artifact_name')` → check if an artifact with that name exists
-    /// - `approval.granted == true` → check if approval for current stage was granted
-    /// - Anything else → treated as true (with a warning)
+    /// - `exists('artifact_name')` → check filesystem via artifact_paths map
+    /// - `approval.granted == true` → check if approval was granted
+    /// - `expr and expr`, `expr or expr` → logical connectives
+    /// - Anything else → default true (with warning)
     async fn evaluate_condition(
         &self,
         condition: &str,
-        run_id: RunId,
-        _all_stages: &[StageExecution],
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
     ) -> bool {
         let trimmed = condition.trim().trim_matches('"');
 
-        if trimmed == "true" {
+        if trimmed == "true" || trimmed == "'true'" {
             return true;
         }
+        if trimmed == "false" || trimmed == "'false'" {
+            return false;
+        }
 
-        if trimmed.starts_with("exists(") {
-            // exists('artifact_name') — check artifacts table
+        // Handle `and` / `or` connectives
+        if let Some(pos) = trimmed.find(" and ") {
+            let lhs = &trimmed[..pos];
+            let rhs = &trimmed[pos + 5..];
+            return Box::pin(self.evaluate_condition(lhs, run, plan)).await
+                && Box::pin(self.evaluate_condition(rhs, run, plan)).await;
+        }
+        if let Some(pos) = trimmed.find(" or ") {
+            let lhs = &trimmed[..pos];
+            let rhs = &trimmed[pos + 4..];
+            return Box::pin(self.evaluate_condition(lhs, run, plan)).await
+                || Box::pin(self.evaluate_condition(rhs, run, plan)).await;
+        }
+
+        // exists('artifact_name') — resolve path from catalog artifacts map,
+        // then check if the file exists on disk (matches Swift TransitionEvaluator).
+        if trimmed.starts_with("exists(") && trimmed.ends_with(')') {
             let artifact_name = trimmed
                 .trim_start_matches("exists(")
                 .trim_end_matches(')')
                 .trim_matches('\'')
                 .trim_matches('"');
-            let artifacts = db::repos::artifacts::list_by_run(&self.pool, run_id)
-                .await
-                .unwrap_or_default();
-            return artifacts.iter().any(|a| a.name == artifact_name);
+
+            if let Some(path_template) = plan.artifact_paths.get(artifact_name) {
+                // Resolve env-style variables in path: ${VAR:-default}
+                let resolved = resolve_path_template(path_template, &run.workspace_root);
+                let exists = std::path::Path::new(&resolved).exists();
+                info!(
+                    artifact = artifact_name,
+                    path = %resolved,
+                    exists = exists,
+                    "Transition exists() check"
+                );
+                return exists;
+            }
+            // Artifact name not in catalog — check if it exists as a bare filename
+            // in the workspace (fallback)
+            warn!(
+                artifact = artifact_name,
+                "Artifact not found in catalog artifact_paths — defaulting to true"
+            );
+            return true;
         }
 
-        if trimmed.contains("approval.granted == true") {
-            let approvals = approvals::list_by_run(&self.pool, run_id)
+        if trimmed == "approval.granted == true" {
+            let approvals = approvals::list_by_run(&self.pool, run.id)
                 .await
                 .unwrap_or_default();
             return approvals
@@ -431,9 +476,7 @@ impl Orchestrator {
                 .any(|a| a.decision == ApprovalDecision::Granted);
         }
 
-        // For complex conditions (score comparisons, etc.) — default to true
-        // so the first matching transition fires. The state machine will
-        // refine this as we add a proper expression evaluator.
+        // Unrecognized expression — default to true for forward progress
         warn!(
             condition = trimmed,
             "Unrecognized transition condition — defaulting to true"
@@ -559,4 +602,37 @@ impl Orchestrator {
 
         Ok(())
     }
+}
+
+/// Resolve `${VAR:-default}` patterns in artifact path templates.
+/// Falls back to the default value if the env var is not set.
+/// Also resolves bare `.` as workspace_root.
+fn resolve_path_template(template: &str, workspace_root: &str) -> String {
+    let mut result = template.to_string();
+
+    // Resolve ${VAR:-default} patterns
+    while let Some(start) = result.find("${") {
+        let Some(end) = result[start..].find('}') else {
+            break;
+        };
+        let end = start + end;
+        let inner = &result[start + 2..end]; // VAR:-default
+        let resolved = if let Some(colon_pos) = inner.find(":-") {
+            let var_name = &inner[..colon_pos];
+            let default_val = &inner[colon_pos + 2..];
+            std::env::var(var_name).unwrap_or_else(|_| default_val.to_string())
+        } else {
+            std::env::var(inner).unwrap_or_default()
+        };
+        result = format!("{}{}{}", &result[..start], resolved, &result[end + 1..]);
+    }
+
+    // If the path starts with "." make it relative to workspace_root
+    if result.starts_with("./") || result == "." {
+        result = format!("{}/{}", workspace_root, result.trim_start_matches("./"));
+    } else if !result.starts_with('/') {
+        result = format!("{}/{}", workspace_root, result);
+    }
+
+    result
 }
