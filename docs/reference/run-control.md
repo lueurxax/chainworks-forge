@@ -50,7 +50,7 @@ Stopping an active idea means:
 
 - the active run stops advancing its state machine,
 - in-flight agent executions receive cooperative cancellation,
-- managed Goose sessions are closed where available,
+- active runtime sessions are closed where available,
 - the run remains visibly `cancelling` until settlement is confirmed,
 - only then does the run become terminal `cancelled`.
 
@@ -62,7 +62,7 @@ Cancellation is settled only when all of the following are true:
 
 1. the orchestrator has stopped advancing workflow state,
 2. every agent execution that was running at request time is now terminal,
-3. every open managed Goose session has a recorded close outcome,
+3. every open runtime session has a recorded close outcome,
 4. the run has both request and settlement timestamps plus structured settlement evidence.
 
 Persisted run-level fields:

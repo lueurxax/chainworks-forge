@@ -283,6 +283,8 @@ struct AgentCatalogView: View {
             switch error {
             case .fileNotFound(let path):
                 state = .fileNotFound(path)
+            case .fileReadFailed(let path, let inner):
+                state = .decodeError(path, inner)
             case .decodingFailed(let path, let inner):
                 state = .decodeError(path, inner)
             }

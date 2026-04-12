@@ -77,9 +77,9 @@ From `live_goose_connection_proof.json`:
 
 ## Files
 
-- **Test:** `Chainworks ForgeTests/LiveGooseConnectionProofTests.swift`
+- **Test:** `Chainworks ForgeTests/LiveACPConnectionProofTests.swift`
 - **Raw evidence:** [`docs/evidence/live_goose_connection_proof.json`](live_goose_connection_proof.json)
-- **Reference doc:** [`docs/reference/goose-server-transport.md`](../reference/goose-server-transport.md)
+- **Reference doc:** [`docs/archive/reference/goose-server-transport.md`](../archive/reference/goose-server-transport.md)
 - **Discovery file:** `/private/tmp/chainworks_goose_discovery.json` (runtime only)
 
 ## How to Reproduce
@@ -96,5 +96,5 @@ xcodebuild test \
   -project "Chainworks Forge.xcodeproj" \
   -scheme "Chainworks Forge" \
   -destination "platform=macOS" \
-  -only-testing:"Chainworks ForgeTests/LiveGooseConnectionProofTests"
+  -only-testing:"Chainworks ForgeTests/LiveACPConnectionProofTests"
 ```

@@ -49,9 +49,9 @@ The MVP sign-off layer is built around five rules:
 
 The implemented MVP provider set is:
 
-- `codex`
-- `claude_code`
-- `gemini`
+- `codex_acp`
+- `claude_acp`
+- `gemini_acp`
 
 Consequences:
 

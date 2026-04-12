@@ -54,7 +54,7 @@ Clone-with-current may recompile against current disk config, but that must crea
 
 `HandoffCompiler` owns context selection, summarization, promoted-artifact inclusion, and lazy references.
 
-`GooseSessionBridge` remains the only owner of the final provider-facing `ExecutionPacket`.
+`RuntimeSessionBridge` remains the only owner of the final provider-facing `ExecutionPacket`.
 
 `BindingFingerprintBuilder` continues to hash the effective execution surface that is actually sent to the provider, including strategy-owned handoff material once it has been embedded into the final packet.
 
@@ -165,8 +165,8 @@ No separate experiment dashboard is required for this slice to remain valid.
 The strongest current proof owners for this slice are:
 
 - `Proposal019Tests`
-- `GooseSessionBridgeTests`
-- `GooseAgentExecutorTests`
+- `RuntimeSessionBridgeTests`
+- `RuntimeAgentExecutorTests`
 - `OrchestratorTests`
 - `scripts/test-gate.sh proposal-019`
 

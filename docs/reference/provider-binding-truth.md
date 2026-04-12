@@ -70,7 +70,7 @@ Rules:
 
 Example of what must not happen:
 
-- showing `claude_code · gpt-5-codex` as if it were an ordinary expected binding without warning or provenance.
+- showing `claude_acp · gpt-5-codex` as if it were an ordinary expected binding without warning or provenance.
 
 ## Run-surface expectations
 
@@ -79,7 +79,7 @@ Run-centric surfaces should make these facts legible:
 - resolved provider family,
 - resolved model,
 - effort,
-- runtime profile / adapter family when they materially differ from Goose default execution,
+- runtime profile / adapter family when they materially differ from the catalog default execution lane,
 - provenance source,
 - mismatch warning state when applicable.
 
@@ -109,4 +109,4 @@ It also feeds:
 
 - [operator-experience.md](operator-experience.md) for reports and comparison,
 - [run-control.md](run-control.md) because cancelled/failed history must remain truthful,
-- [goose-provider-remediation.md](goose-provider-remediation.md) because remediation should improve provider truth rather than hide it.
+- [provider-platform.md](provider-platform.md) because remediation should improve provider truth rather than hide it.

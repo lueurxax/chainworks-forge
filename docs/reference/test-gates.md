@@ -363,7 +363,43 @@ Important:
 
 ### `proposal-027`
 
-Artifact content rendering gate for the unified read-only Markdown/JSON artifact presentation slice.
+Rust + SQLite local control-plane daemon gate. Runs the full `control-plane` Rust workspace test suite, covering:
+
+- SQLite repository layer (ideas, runs, stages, approvals, artifacts)
+- Projection rebuild and parity verification (`run_summaries`, `stage_summaries`, `approval_inbox`, `artifact_index`)
+- Domain engine transitions and command handler semantics (approve, reject, retry, cancel)
+- RecoveryService startup-repair for stuck-Running stages
+
+Scope:
+
+- `control-plane` Rust workspace (`cargo test --workspace`)
+
+Use when:
+
+- validating the daemon compiles and all integration tests pass on the current head
+- proving projection-layer parity after a run/stage mutation
+- confirming approval/retry command semantics match the app-owned baseline
+- reproving startup-repair recovery semantics
+
+Host policy:
+
+- local Rust toolchain required; no iOS/macOS simulator needed
+- executes in-process with SQLite in-memory databases; no daemon process required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-027
+```
+
+Important:
+
+- the artifact content rendering slice (formerly `proposal-027`) has been moved to `proposal-027r`
+- the stable documentation source of truth for the Rust control-plane is `docs/proposals/027-rust-sqlite-local-control-plane-extraction.md`
+
+### `proposal-027r`
+
+Artifact content rendering gate for the unified read-only Markdown/JSON artifact presentation slice (legacy `proposal-027` renderer gate, retained for reproducibility).
 
 Scope:
 
@@ -377,17 +413,17 @@ Use when:
 
 Host policy:
 
-- local target only; this gate currently executes unit tests without a UI target
+- local target only; this gate executes unit tests without a UI target
 
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-027
+./scripts/test-gate.sh proposal-027r
 ```
 
 Important:
 
-- the stable documentation source of truth for this slice is now [artifact-content-rendering.md](../reference/artifact-content-rendering.md)
+- the stable documentation source of truth for this slice is [artifact-content-rendering.md](../reference/artifact-content-rendering.md)
 
 ### `proposal-033`
 
@@ -423,6 +459,44 @@ Important:
 
 - this gate hard-depends on `proposal-029`
 - `proposal-033` is the repo-owned proof lane for [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](../reference/033-remove-goose-from-canonical-transport-and-simplify-runtime.md)
+
+### `proposal-037`
+
+ACP execution supervision and idle-watchdog gate.
+
+Scope:
+
+- focused `RuntimeAgentExecutorTests` watchdog and mutation-integrity cases
+- focused `OrchestratorTests` durable materialization and same-stage retry lineage cases
+- focused `ResumeManagerTests` stalled-boundary grace and reconcile cases
+- `RecoveryCoordinatorTests`
+- `Proposal013Tests`
+- `Proposal019Tests`
+- `LiveProposalWorkflowTests`
+- `WorkflowMapProjectionTests`
+- `RunTimelineInspectorViewTests`
+
+Use when:
+
+- changing ACP watchdog classification, retry ownership, or execution supervision truth
+- changing mutation-side-effect verification or Codex receipt telemetry
+- changing durable same-stage retry lineage for watchdog-driven retries
+
+Host policy:
+
+- local target only; this is a focused runtime/unit proof lane without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-037
+```
+
+Important:
+
+- this gate is the repo-owned proof lane for [037-acp-execution-supervision-and-idle-watchdog.md](../proposals/037-acp-execution-supervision-and-idle-watchdog.md)
+- it intentionally targets the explicit P037 proof cases instead of unrelated legacy retry/resume debt in broader suites
+- use it instead of ad hoc targeted test mixes when reproving watchdog behavior
 
 ### `full`
 

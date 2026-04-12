@@ -94,7 +94,7 @@ AgentCatalog
       -> SkillInjector
     -> ResolvedAgent
   -> RunStartSnapshot
-  -> GooseSessionBridge / runtime execution packet
+  -> RuntimeSessionBridge / runtime execution packet
   -> AgentExecution + reports + inspector
 ```
 

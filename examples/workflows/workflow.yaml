@@ -11,8 +11,8 @@ workflow:
     resume_policy: automatic_on_launch
     requires_project_access: true
   required_providers:
-    - codex
-    - claude_code
+    - codex_acp
+    - claude_acp
 variables:
   proposal_score_target: 8.5
   min_individual_proposal_score: 8

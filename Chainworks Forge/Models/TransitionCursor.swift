@@ -84,15 +84,20 @@ extension TransitionCursor {
     /// Seed a cursor for a pre-P032 legacy run being resumed from a heuristic continuation.
     /// Records the resume target as the next scheduled state so we don't lose the
     /// heuristic computation by writing `.initial()`.
-    static func seededForResume(nextScheduledStateID: String) -> TransitionCursor {
+    static func seededForResume(
+        nextScheduledStateID: String,
+        nextScheduledIteration: Int? = nil,
+        nextScheduledAttemptNumber: Int? = nil,
+        scheduledStageExecutionID: UUID? = nil
+    ) -> TransitionCursor {
         TransitionCursor(
             sequenceNumber: 0,
             lastCompletedStateID: nil,
             lastCompletedStageExecutionID: nil,
             nextScheduledStateID: nextScheduledStateID,
-            nextScheduledIteration: nil,
-            nextScheduledAttemptNumber: nil,
-            scheduledStageExecutionID: nil,
+            nextScheduledIteration: nextScheduledIteration,
+            nextScheduledAttemptNumber: nextScheduledAttemptNumber,
+            scheduledStageExecutionID: scheduledStageExecutionID,
             settlementPhase: .transitionSettled,
             updatedAt: Date()
         )

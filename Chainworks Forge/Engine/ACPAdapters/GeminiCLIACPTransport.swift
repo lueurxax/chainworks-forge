@@ -11,7 +11,9 @@ import Foundation
 /// - Protocol version: 1
 /// - ndjson over stdio
 /// - Supports: `initialize`, `session/new`, `session/load`, `session/prompt`,
-///   `session/set_mode`, `session/set_model`, `session/close`
+///   `session/set_mode`, `session/set_model`
+/// - `session/close` is not treated as a supported Gemini ACP request; Forge terminates
+///   the subprocess directly during shutdown
 /// - Real `session/update` streaming with `agent_message_chunk`, `agent_thought_chunk`,
 ///   `tool_call`, `tool_call_update`, `session/request_permission`
 /// - Real MCP server injection via `mcpServers` in `session/new`
@@ -40,6 +42,7 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     private var requestCounters: [String: Int] = [:]
     private var sessionSystemPrompts: [String: String] = [:]
     private var sessionEnabledExtensions: [String: [String]] = [:]
+    private var sessionDiagnostics: [String: [RuntimeProviderDiagnostic]] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -113,7 +116,9 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         if !request.systemPrompt.isEmpty {
             sessionSystemPrompts[sessionId] = request.systemPrompt
         }
+        sessionDiagnostics[sessionId] = []
         lock.unlock()
+        self.startStderrLogging(for: subprocess, prefix: "GeminiCLIACP", sessionID: sessionId)
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
 
@@ -220,7 +225,10 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                                 let finishEvent = ACPStreamEventMapper.mapPromptResult(result)
                                 continuation.yield(finishEvent)
                             } else if let error = json["error"] as? [String: Any] {
-                                let message = error["message"] as? String ?? "Unknown Gemini CLI ACP error"
+                                let message = ACPProtocolSupport.formatJSONRPCError(
+                                    error,
+                                    fallback: "Unknown Gemini CLI ACP error"
+                                )
                                 continuation.yield(.error(message: message))
                             }
                             continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
@@ -236,6 +244,7 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                             if method == "session/request_permission" {
                                 self.autoGrantPermission(
                                     subprocess: subprocess,
+                                    requestID: json["id"],
                                     params: params,
                                     sessionID: sessionID
                                 )
@@ -279,22 +288,13 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         requestCounters.removeValue(forKey: sessionID)
         sessionSystemPrompts.removeValue(forKey: sessionID)
         sessionEnabledExtensions.removeValue(forKey: sessionID)
+        sessionDiagnostics.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let subprocess else {
             throw RuntimeTransportError.sessionCloseFailed(reason: "No active Gemini CLI session for ID: \(sessionID)")
         }
 
-        // Send session/close request before terminating
-        let closeRequest = makeJSONRPCRequest(
-            method: "session/close",
-            params: ["sessionId": sessionID],
-            sessionID: nil
-        )
-        try? subprocess.sendJSON(closeRequest)
-
-        // Brief wait for clean shutdown, then terminate
-        try? await Task.sleep(for: .milliseconds(200))
         subprocess.terminate()
     }
 
@@ -302,12 +302,16 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         lock.lock()
         let subprocess = activeSessions[sessionID]
         let enabledExtensions = sessionEnabledExtensions[sessionID] ?? []
+        let diagnostics = sessionDiagnostics[sessionID] ?? []
         lock.unlock()
 
         guard subprocess != nil else {
             throw RuntimeTransportError.streamingFailed(reason: "No active Gemini CLI session for ID: \(sessionID)")
         }
-        return RuntimeSessionRuntimeState(enabledExtensions: enabledExtensions)
+        return RuntimeSessionRuntimeState(
+            enabledExtensions: enabledExtensions,
+            providerDiagnostics: diagnostics
+        )
     }
 
     // MARK: - Private: JSON-RPC Request Construction
@@ -363,7 +367,10 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                     return result
                 }
                 if let error = json["error"] as? [String: Any] {
-                    let message = error["message"] as? String ?? "Unknown Gemini CLI ACP error"
+                    let message = ACPProtocolSupport.formatJSONRPCError(
+                        error,
+                        fallback: "Unknown Gemini CLI ACP error"
+                    )
                     throw RuntimeTransportError.sessionCreationFailed(reason: message)
                 }
                 return nil
@@ -381,25 +388,64 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     /// with options `allow_always`, `allow_once`, `reject_once`.
     private func autoGrantPermission(
         subprocess: ACPSubprocessManager,
+        requestID: Any?,
         params: [String: Any]?,
         sessionID: String
     ) {
-        guard let params,
-              let requestId = params["id"] as? String ?? params["requestId"] as? String else {
+        guard let response = ACPProtocolSupport.permissionSelectionResponse(
+            requestID: requestID,
+            params: params
+        ) else {
+            ForgeLogger.execution.error("Failed to auto-grant permission for session \(sessionID)")
             return
         }
-
-        let response: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "session/permission_response",
-            "params": [
-                "sessionId": sessionID,
-                "requestId": requestId,
-                "response": "allow_once"
-            ] as [String: Any]
-        ]
-
         try? subprocess.sendJSON(response)
+    }
+
+    private func startStderrLogging(for subprocess: ACPSubprocessManager, prefix: String, sessionID: String) {
+        Task.detached {
+            do {
+                for try await line in subprocess.readStderrLines() {
+                    let sanitized = ACPProtocolSupport.stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !sanitized.isEmpty else { continue }
+                    if let diagnostic = ACPProtocolSupport.geminiProviderDiagnostic(fromStderrLine: sanitized) {
+                        if ACPProtocolSupport.shouldPersistProviderDiagnostic(diagnostic) {
+                            self.appendDiagnostic(diagnostic, to: sessionID)
+                        }
+                        switch diagnostic.normalizedReason {
+                        case "session_close_unsupported":
+                            ForgeLogger.execution.info("\(prefix) provider warning: session/close unsupported; skipping explicit close")
+                            continue
+                        case "model_capacity_exhausted":
+                            ForgeLogger.execution.error("\(prefix) provider error: model capacity exhausted")
+                            continue
+                        default:
+                            break
+                        }
+                    }
+                    if sanitized.localizedCaseInsensitiveContains("error")
+                        || sanitized.localizedCaseInsensitiveContains("failed")
+                        || sanitized.localizedCaseInsensitiveContains("panic") {
+                        ForgeLogger.execution.error("\(prefix) stderr: \(sanitized)")
+                    } else {
+                        ForgeLogger.execution.info("\(prefix) stderr: \(sanitized)")
+                    }
+                }
+            } catch {
+                ForgeLogger.execution.error("\(prefix) stderr reader failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func appendDiagnostic(_ diagnostic: RuntimeProviderDiagnostic, to sessionID: String) {
+        lock.lock()
+        var diagnostics = sessionDiagnostics[sessionID] ?? []
+        diagnostics.append(diagnostic)
+        if diagnostics.count > 32 {
+            diagnostics.removeFirst(diagnostics.count - 32)
+        }
+        sessionDiagnostics[sessionID] = diagnostics
+        lock.unlock()
     }
 
     // MARK: - Private: File-System Proxy
@@ -445,6 +491,7 @@ extension GeminiCLIACPTransport: RuntimeTransportTerminationControlling {
         requestCounters.removeAll()
         sessionSystemPrompts.removeAll()
         sessionEnabledExtensions.removeAll()
+        sessionDiagnostics.removeAll()
         lock.unlock()
 
         for subprocess in subprocesses {

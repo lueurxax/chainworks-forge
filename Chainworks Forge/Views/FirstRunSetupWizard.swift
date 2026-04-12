@@ -75,6 +75,15 @@ struct FirstRunSetupWizard: View {
                     }
                 }
 
+                if let diagnosticsMessage = appConfigurationStore.diagnosticsMessage {
+                    Section("Configuration Warning") {
+                        Label(diagnosticsMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("first-run-app-configuration-diagnostics")
+                    }
+                }
+
                 // Show sections based on current step (all visible but highlighted)
                 Section("Workspace & YAML") {
                     TextField("Run Storage Base Path", text: $runStorageBasePath)
@@ -95,7 +104,7 @@ struct FirstRunSetupWizard: View {
                             family: .codexACP,
                             displayName: "Codex ACP",
                             transport: .cli,
-                            authMode: .apiKey,
+                            authMode: .none,
                             defaultModel: "gpt-5"
                         ))
                     }
@@ -105,7 +114,7 @@ struct FirstRunSetupWizard: View {
                             family: .claudeACP,
                             displayName: "Claude ACP",
                             transport: .cli,
-                            authMode: .apiKey,
+                            authMode: .none,
                             defaultModel: "sonnet"
                         ))
                     }
@@ -115,7 +124,7 @@ struct FirstRunSetupWizard: View {
                             family: .geminiACP,
                             displayName: "Gemini ACP",
                             transport: .cli,
-                            authMode: .apiKey,
+                            authMode: .none,
                             defaultModel: "gemini-2.5-pro"
                         ))
                     }
@@ -403,13 +412,15 @@ struct FirstRunSetupWizard: View {
         }
 
         do {
-            _ = try transfer.importSettings(from: fileURL)
+            let warnings = try transfer.importSettings(from: fileURL)
             runStorageBasePath = appConfigurationStore.configuration.runStorageBasePath
             worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath ?? ""
             workflowSourcePath = appConfigurationStore.configuration.workflowSourcePath
             agentCatalogSourcePath = appConfigurationStore.configuration.agentCatalogSourcePath
             supportBundleExportPath = appConfigurationStore.configuration.supportBundleExportPath ?? ""
-            transferMessage = "Imported settings from \(fileURL.lastPathComponent)"
+            transferMessage = warnings.isEmpty
+                ? "Imported settings from \(fileURL.lastPathComponent)"
+                : "Imported settings from \(fileURL.lastPathComponent). " + warnings.joined(separator: " ")
             Task {
                 await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
                 await refreshPreflight()

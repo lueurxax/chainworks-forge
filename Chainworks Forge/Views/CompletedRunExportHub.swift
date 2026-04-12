@@ -20,6 +20,7 @@ struct CompletedRunExportHub: View {
     @State private var isExporting = false
     @State private var signOffSnapshot: MVPSignOffDecisionSnapshot?
     @State private var selectedArtifact: Artifact?
+    @State private var dataLoadWarning: String?
 
     private var stageSnapshots: [RunStageSnapshot] {
         RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
@@ -56,6 +57,13 @@ struct CompletedRunExportHub: View {
             VStack(alignment: .leading, spacing: 16) {
                 // TOP: Dominant summary block
                 resultSummarySection
+
+                if let dataLoadWarning {
+                    Label(dataLoadWarning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("completed-run-export-load-warning")
+                }
 
                 Divider()
 
@@ -692,6 +700,8 @@ struct CompletedRunExportHub: View {
     // MARK: - Data Loading
 
     private func loadRunData() {
+        dataLoadWarning = nil
+
         // Load all artifacts for this run
         let runID = run.id
         let descriptor = FetchDescriptor<Artifact>(
@@ -700,7 +710,14 @@ struct CompletedRunExportHub: View {
             },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
-        allArtifacts = (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            allArtifacts = try modelContext.fetch(descriptor)
+        } catch {
+            let message = "Failed to load run artifacts: \(error.localizedDescription)"
+            dataLoadWarning = message
+            ForgeLogger.ui.error("CompletedRunExportHub loadRunData failed for run \(run.id): \(error.localizedDescription)")
+            allArtifacts = []
+        }
 
         // Determine evidence pack status
         classifyEvidencePackStatus()
@@ -722,16 +739,22 @@ struct CompletedRunExportHub: View {
         // in sync with the evaluator's Gate 6 truth.
         if let cohortID = run.experimentCohortID {
             let pairDescriptor = FetchDescriptor<BenchmarkPair>()
-            if let allPairs = try? modelContext.fetch(pairDescriptor),
-               let pair = allPairs.first(where: { $0.appDrivenRecord?.linkedRunID == run.id && $0.cohort?.id == cohortID }) {
+            do {
+                let allPairs = try modelContext.fetch(pairDescriptor)
+                if let pair = allPairs.first(where: { $0.appDrivenRecord?.linkedRunID == run.id && $0.cohort?.id == cohortID }) {
                 // Run is linked to a benchmark pair — derive status from persisted export truth.
-                if let appRecord = pair.appDrivenRecord, appRecord.evidencePackExportedAt != nil {
-                    evidencePackStatus = .exported
-                    return
-                } else if pair.appDrivenRecord != nil {
-                    evidencePackStatus = .ready
-                    return
+                    if let appRecord = pair.appDrivenRecord, appRecord.evidencePackExportedAt != nil {
+                        evidencePackStatus = .exported
+                        return
+                    } else if pair.appDrivenRecord != nil {
+                        evidencePackStatus = .ready
+                        return
+                    }
                 }
+            } catch {
+                let message = "Failed to load benchmark export truth: \(error.localizedDescription)"
+                dataLoadWarning = dataLoadWarning ?? message
+                ForgeLogger.ui.error("CompletedRunExportHub classifyEvidencePackStatus failed for run \(run.id): \(error.localizedDescription)")
             }
         }
 
@@ -755,7 +778,14 @@ struct CompletedRunExportHub: View {
             },
             sortBy: [SortDescriptor(\.evaluatedAt, order: .reverse)]
         )
-        signOffSnapshot = try? modelContext.fetch(descriptor).first
+        do {
+            signOffSnapshot = try modelContext.fetch(descriptor).first
+        } catch {
+            let message = "Failed to load sign-off snapshot: \(error.localizedDescription)"
+            dataLoadWarning = dataLoadWarning ?? message
+            ForgeLogger.ui.error("CompletedRunExportHub loadSignOffSnapshot failed for run \(run.id): \(error.localizedDescription)")
+            signOffSnapshot = nil
+        }
     }
 
     private func preferredExportDirectory() -> URL {
@@ -798,7 +828,9 @@ struct CompletedRunExportHub: View {
             evidencePackStatus = .exported
             // Proposal 008 (REQ-020): Mark the linked benchmark record as exported
             // so the GO/HOLD gate can verify complete exported review packets.
-            markBenchmarkRecordExported()
+            if let warning = markBenchmarkRecordExported() {
+                exportMessage = "\(exportMessage ?? "Export completed.") Warning: \(warning)"
+            }
         } catch {
             exportMessage = "Export failed: \(error.localizedDescription)"
         }
@@ -808,16 +840,18 @@ struct CompletedRunExportHub: View {
 
     /// Proposal 008 (REQ-020): Stamp the benchmark execution record with the export timestamp
     /// so the evaluator's Gate 6 can verify complete exported review packets.
-    private func markBenchmarkRecordExported() {
-        guard let cohortID = run.experimentCohortID else { return }
-        let pairDescriptor = FetchDescriptor<BenchmarkPair>()
-        guard let allPairs = try? modelContext.fetch(pairDescriptor),
-              let pair = allPairs.first(where: {
-                  $0.appDrivenRecord?.linkedRunID == run.id && $0.cohort?.id == cohortID
-              }),
-              let appRecord = pair.appDrivenRecord else { return }
-        appRecord.evidencePackExportedAt = Date()
-        try? modelContext.save()
+    private func markBenchmarkRecordExported() -> String? {
+        do {
+            _ = try BenchmarkExportStamping.markRunEvidencePackExported(
+                runID: run.id,
+                cohortID: run.experimentCohortID,
+                context: modelContext
+            )
+            return nil
+        } catch {
+            ForgeLogger.ui.error("Evidence export stamp failed for run \(run.id): \(error.localizedDescription)")
+            return "Benchmark export stamp failed: \(error.localizedDescription)"
+        }
     }
 
     private func exportSignOffPacket() {

@@ -6,7 +6,7 @@ struct GeminiACPProviderAdapter: ProviderAdapter {
 
     func verify(provider: ConfiguredProvider, secretStore: KeychainSecretStore) async -> ProviderHealthSnapshot {
         await ProviderAdapterSupport.verifyCLIProvider(
-            executable: "gemini-cli-acp",
+            executable: "gemini",
             provider: provider,
             summaryPrefix: "Gemini ACP",
             secretStore: secretStore

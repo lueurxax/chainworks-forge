@@ -78,8 +78,10 @@ Operator surfaces must expose runtime trust instead of hiding it behind generic 
 The current trust states are:
 
 - `Fixture / verified baseline`
-- `Goose server / trust pending`
-- `Goose server / verified`
+- `Legacy / unverified`
+- `Legacy / verified`
+- `Runtime / unverified`
+- `Runtime / verified`
 
 That provenance appears in:
 

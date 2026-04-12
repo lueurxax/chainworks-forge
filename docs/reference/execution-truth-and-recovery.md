@@ -58,7 +58,7 @@ These values live in [`Chainworks Forge/Models/ExecutionTruth.swift`](<../../Cha
 Transport finish markers such as `stop` or `session_closed` describe how streaming ended.
 They do not by themselves prove successful completion.
 
-Current classification rules in `GooseAgentExecutor` therefore require more than a neutral finish marker:
+Current classification rules in `RuntimeAgentExecutor` therefore require more than a neutral finish marker:
 
 - durable output plus later transport failure becomes `completed_with_transport_error`,
 - timeout before output becomes `timed_out_before_output`,
@@ -71,6 +71,7 @@ Current classification rules in `GooseAgentExecutor` therefore require more than
 The primary persisted execution-truth columns on `AgentExecution` are:
 
 - `canonicalOutcome`
+- `supervisionClassification`
 - `transportErrorKind`
 - `providerStopReason`
 - `outputPresence`
@@ -88,6 +89,29 @@ Readers must use this precedence:
 3. coarse legacy fields like `AgentStatus` only when canonical columns are absent.
 
 Raw receipts or transcripts must never silently override canonical persisted outcome truth.
+
+### Watchdog-specific truth refines, but does not replace, canonical outcome
+
+`supervisionClassification` is the durable refinement field for watchdog-specific execution truth.
+
+The stable contract is:
+
+- `canonicalOutcome` remains the terminal execution state,
+- `supervisionClassification` carries watchdog-specific or integrity-specific refinement such as:
+  - `idleHangBeforeFirstProgress`
+  - `idleHangAfterProgress`
+  - `idleHangReadLoop`
+  - `idleHangAfterFirstEdit`
+  - `mutationSideEffectMissing`
+- `transportErrorKind` and `providerStopReason` remain orthogonal transport/provider evidence,
+- `outcomeEnvelopeJSON` and receipts explain the settled truth but do not redefine it.
+
+Readers must therefore interpret agent-level execution truth in this order:
+
+1. `canonicalOutcome` for terminal state,
+2. `supervisionClassification` for watchdog-specific refinement,
+3. `transportErrorKind` and `providerStopReason` for transport/provider context,
+4. evidence payloads only as supporting detail.
 
 ## Stage Truth and Recovery Evidence
 
@@ -110,6 +134,9 @@ The important contract is ownership, not file shape:
 - failed-stage evidence belongs to the stage record,
 - recovery recommendations belong to the stage record,
 - reports and recovery surfaces read the stage record first instead of inferring truth from loose artifact scans.
+
+`recoverySnapshotJSON` is stage-owned next-action truth, not agent-level execution truth.
+It may narrow the operator action after a watchdog failure or exhausted retry, but it must not override the settled `AgentExecution` truth described above.
 
 ### Recovery uses the narrowest valid next action
 
@@ -189,7 +216,7 @@ This slice is currently proved primarily through current-head non-UI test suites
 
 High-signal proof owners include:
 
-- `GooseAgentExecutorTests` for transport-outcome classification and limit exhaustion,
+- `RuntimeAgentExecutorTests` for transport-outcome classification and limit exhaustion,
 - `OrchestratorTests` for persistence of canonical outcome, provider/model truth, and validation-after-output settlement,
 - `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 - `RecoveryCoordinatorTests` for narrow recovery action ownership,

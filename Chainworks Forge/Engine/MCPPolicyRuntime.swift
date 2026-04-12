@@ -157,6 +157,28 @@ private enum RuntimeExtensionRegistryConfigResolver {
             .appendingPathComponent(defaultPath)
     }
 
+    nonisolated static func sharedLegacyConfigURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/goose/config.yaml")
+    }
+
+    nonisolated static func migrateLegacyRegistryIfNeeded(
+        canonicalURL: URL,
+        legacyURL: URL
+    ) throws {
+        let fileManager = FileManager.default
+        guard !fileManager.isReadableFile(atPath: canonicalURL.path),
+              fileManager.isReadableFile(atPath: legacyURL.path) else {
+            return
+        }
+
+        try fileManager.createDirectory(
+            at: canonicalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fileManager.copyItem(at: legacyURL, to: canonicalURL)
+    }
+
     nonisolated static func loadSnapshot(configURL: URL) throws -> RuntimeExtensionRegistrySnapshot {
         let contents = try String(contentsOf: configURL, encoding: .utf8)
         let extensions: [String: RuntimeExtensionDefinition]
@@ -182,37 +204,34 @@ private enum RuntimeExtensionRegistryConfigResolver {
     }
 }
 
-// MARK: - CodexExtensionRegistryReader (Proposal 029)
+// MARK: - RuntimeExtensionRegistryReader
 
-/// Codex-specific RuntimeExtensionRegistryProvider conformer.
-/// Codex uses MCP natively, so it reads from a shared config format
-/// and applies Codex-specific extension ID mappings. This ensures the MCP
-/// policy resolver can validate extension availability against a Codex runtime.
+/// Shared local MCP registry reader for ACP runtimes.
+/// Canonical ownership is `~/.config/mcp/config.yaml`.
+/// If an older shared registry exists only at `~/.config/goose/config.yaml`,
+/// it is migrated once into the canonical ACP path and then read from there.
 struct CodexExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
     static let environmentConfigPathKey = "CHAINWORKS_CODEX_CONFIG_PATH"
     let configURL: URL
 
-    nonisolated init(configURL: URL? = nil) {
-        if let configURL {
-            self.configURL = configURL
-            return
-        }
-
-        let preferred = RuntimeExtensionRegistryConfigResolver.defaultConfigURL(
-            primaryEnvironmentKey: Self.environmentConfigPathKey,
+    nonisolated init(configURL: URL? = nil, legacyConfigURL: URL? = nil) {
+        let envKey = "CHAINWORKS_CODEX_CONFIG_PATH"
+        let preferred = configURL ?? RuntimeExtensionRegistryConfigResolver.defaultConfigURL(
+            primaryEnvironmentKey: envKey,
             defaultPath: ".config/mcp/config.yaml"
         )
-        if FileManager.default.isReadableFile(atPath: preferred.path) {
-            self.configURL = preferred
-            return
+        let environment = ProcessInfo.processInfo.environment
+        let hasExplicitOverride = environment[envKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        if !hasExplicitOverride || configURL != nil {
+            let legacy = legacyConfigURL ?? RuntimeExtensionRegistryConfigResolver.sharedLegacyConfigURL()
+            try? RuntimeExtensionRegistryConfigResolver.migrateLegacyRegistryIfNeeded(
+                canonicalURL: preferred,
+                legacyURL: legacy
+            )
         }
-
-        // ACP canonical path is ~/.config/mcp/config.yaml, but operator machines may
-        // still keep the shared runtime registry at the historical filesystem
-        // location while runtime execution is already ACP-only.
-        let legacySharedStore = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/goose/config.yaml")
-        self.configURL = legacySharedStore
+        self.configURL = preferred
     }
 
     nonisolated func snapshot() throws -> RuntimeExtensionRegistrySnapshot {
@@ -233,56 +252,32 @@ struct MCPPolicyResolver: Sendable {
         runtimeRegistry: RuntimeExtensionRegistrySnapshot?,
         runtimeNamespaceOverride: String? = nil
     ) -> MCPPolicyResolutionReport {
-        let defaultProfile = catalog.mcpPolicy.defaultProfile
-        let profileID = (agent.mcpProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? agent.mcpProfileID!
-            : defaultProfile
+        let requestedServers = Array(Set(agent.requestedMCPServerIDs)).sorted()
+        let profileID = agent.backendProfileID ?? "none"
 
-        if profileID == "none" {
+        if requestedServers.isEmpty {
             return .none
         }
-
-        guard let profile = catalog.mcpProfiles[profileID] else {
-            return MCPPolicyResolutionReport(
-                profileID: profileID,
-                requiredExtensions: [],
-                optionalExtensions: [],
-                requestedExtensions: [],
-                requiredRuntimeExtensionIDs: [],
-                optionalRuntimeExtensionIDs: [],
-                predictedEffectiveExtensions: [],
-                predictedEffectiveRuntimeExtensionIDs: [],
-                deniedExtensions: [],
-                warnings: [],
-                blockingIssues: ["Agent '\(agent.id)' references unknown MCP profile '\(profileID)'."]
-            )
-        }
-
-        let fallback = MCPFallbackPolicy(rawValue: profile.fallbackPolicy) ?? .failIfRequiredMissing
         let runtimeNamespace = runtimeNamespaceOverride ?? runtimeNamespace(for: providerBinding)
 
         var requiredRuntimeIDs: [String] = []
-        var optionalRuntimeIDs: [String] = []
         var effectiveExtensions: [String] = []
         var effectiveRuntimeIDs: [String] = []
         var deniedExtensions: [String] = []
         var warnings: [String] = []
         var blockingIssues: [String] = []
 
-        if !profile.allRequestedExtensions.isEmpty {
-            if runtimeNamespace == nil {
-                blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
-            }
-            if runtimeRegistry == nil {
-                blockingIssues.append("Runtime extension registry is unavailable; cannot validate MCP profile '\(profileID)' for agent '\(agent.id)'.")
-            }
+        if runtimeNamespace == nil {
+            blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
+        }
+        if runtimeRegistry == nil {
+            blockingIssues.append("Runtime extension registry is unavailable; cannot validate backend MCP requirements for agent '\(agent.id)'.")
         }
 
-        for serverID in profile.requiredExtensions {
+        for serverID in requestedServers {
             switch resolveServer(
                 serverID: serverID,
                 runtimeNamespace: runtimeNamespace,
-                registry: catalog.mcpServerRegistry,
                 runtimeRegistry: runtimeRegistry
             ) {
             case .available(let runtimeID):
@@ -291,38 +286,17 @@ struct MCPPolicyResolver: Sendable {
                 effectiveRuntimeIDs.append(runtimeID)
             case .missing(let message):
                 deniedExtensions.append(serverID)
-                if fallback == .failIfRequiredMissing {
-                    blockingIssues.append(message)
-                } else {
-                    warnings.append(message)
-                }
-            }
-        }
-
-        for serverID in profile.optionalExtensions {
-            switch resolveServer(
-                serverID: serverID,
-                runtimeNamespace: runtimeNamespace,
-                registry: catalog.mcpServerRegistry,
-                runtimeRegistry: runtimeRegistry
-            ) {
-            case .available(let runtimeID):
-                optionalRuntimeIDs.append(runtimeID)
-                effectiveExtensions.append(serverID)
-                effectiveRuntimeIDs.append(runtimeID)
-            case .missing(let message):
-                deniedExtensions.append(serverID)
-                warnings.append(message)
+                blockingIssues.append(message)
             }
         }
 
         return MCPPolicyResolutionReport(
             profileID: profileID,
-            requiredExtensions: profile.requiredExtensions,
-            optionalExtensions: profile.optionalExtensions,
-            requestedExtensions: profile.allRequestedExtensions,
+            requiredExtensions: requestedServers,
+            optionalExtensions: [],
+            requestedExtensions: requestedServers,
             requiredRuntimeExtensionIDs: Array(Set(requiredRuntimeIDs)).sorted(),
-            optionalRuntimeExtensionIDs: Array(Set(optionalRuntimeIDs)).sorted(),
+            optionalRuntimeExtensionIDs: [],
             predictedEffectiveExtensions: Array(Set(effectiveExtensions)).sorted(),
             predictedEffectiveRuntimeExtensionIDs: Array(Set(effectiveRuntimeIDs)).sorted(),
             deniedExtensions: Array(Set(deniedExtensions)).sorted(),
@@ -338,24 +312,25 @@ struct MCPPolicyResolver: Sendable {
     private func resolveServer(
         serverID: String,
         runtimeNamespace: String?,
-        registry: [String: MCPServerRegistryEntry],
         runtimeRegistry: RuntimeExtensionRegistrySnapshot?
     ) -> MCPServerResolution {
-        guard let entry = registry[serverID] else {
-            return .missing("MCP server '\(serverID)' is not declared in mcp_server_registry.")
-        }
         guard let runtimeNamespace else {
             return .missing("MCP server '\(serverID)' requires a runtime with session-scoped MCP reconciliation support.")
         }
-        guard let runtimeID = entry.runtimeIDs[runtimeNamespace], !runtimeID.isEmpty else {
-            return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
-        }
         if let runtimeRegistry {
-            guard runtimeRegistry.configsByRuntimeID[runtimeID] != nil else {
-                return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in the runtime registry.")
+            guard let definition = runtimeRegistry.configsByRuntimeID[serverID] else {
+                return .missing("MCP server '\(serverID)' is not installed in the runtime registry.")
+            }
+            if definition.enabled == false {
+                return .missing("MCP server '\(serverID)' is installed in the runtime registry but disabled.")
+            }
+
+            let normalizedType = definition.type?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "stdio"
+            if normalizedType == "platform", runtimeNamespace != "codex" {
+                return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
             }
         }
-        return .available(runtimeID: runtimeID)
+        return .available(runtimeID: serverID)
     }
 }
 

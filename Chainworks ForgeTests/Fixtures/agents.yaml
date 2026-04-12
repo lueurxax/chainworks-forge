@@ -8,8 +8,8 @@ app:
   single_active_run_per_idea: true
   run_resume_policy: automatic_on_launch
   required_providers:
-  - codex
-  - claude_code
+  - codex_acp
+  - claude_acp
 paths:
   repo_root: ${CHAINWORKS_REPO_ROOT:-.}
   meta_root: ${CHAINWORKS_META_ROOT:-.chainworks}
@@ -385,77 +385,77 @@ contracts:
       - confidence
 backend_profiles:
   claude_orchestrator_high:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: high
     temperature: 0.1
     max_turns: 20
     structured_output: required
   claude_writer_high:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: high
     temperature: 0.2
     max_turns: 18
     structured_output: preferred
   claude_product_high:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: high
     temperature: 0.1
     max_turns: 14
     structured_output: required
   claude_design_medium:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: medium
     temperature: 0.2
     max_turns: 12
     structured_output: required
   codex_architect_high:
-    provider: codex
+    provider: codex_acp
     model: default
     effort: extra high
     temperature: 0.1
     max_turns: 16
     structured_output: required
   codex_builder_high:
-    provider: codex
+    provider: codex_acp
     model: default
     effort: high
     temperature: 0.1
     max_turns: 24
     structured_output: required
   codex_audit_high:
-    provider: codex
+    provider: codex_acp
     model: default
     effort: extra high
     temperature: 0.0
     max_turns: 18
     structured_output: required
   claude_security_high:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: high
     temperature: 0.0
     max_turns: 16
     structured_output: required
   claude_prepush_medium:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: medium
     temperature: 0.1
     max_turns: 12
     structured_output: required
   codex_ops_low:
-    provider: codex
+    provider: codex_acp
     model: default
     effort: low
     temperature: 0.0
     max_turns: 8
     structured_output: required
   claude_docs_medium:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: medium
     temperature: 0.2
@@ -463,21 +463,21 @@ backend_profiles:
     structured_output: required
   # Steward backend profiles (Proposal 003)
   claude_steward_high:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: high
     temperature: 0.1
     max_turns: 16
     structured_output: required
   claude_auditor_medium:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: medium
     temperature: 0.0
     max_turns: 14
     structured_output: required
   claude_retrospective_medium:
-    provider: claude_code
+    provider: claude_acp
     model: default
     effort: medium
     temperature: 0.1

@@ -282,6 +282,59 @@ struct Proposal027Tests {
         ])
     }
 
+    @Test("Workflow run artifact snapshot excludes immutable report history from summary surfaces")
+    func workflowRunArtifactSnapshotExcludesImmutableReportHistory() {
+        let now = Date()
+        let runID = UUID()
+
+        let immutableReport = Artifact(
+            name: "run_report_v12.md",
+            contractID: "run_report",
+            format: .markdown,
+            filePath: tempDirectory.appendingPathComponent("run_report_v12.md").path,
+            createdAt: now,
+            runID: runID,
+            stageID: "state_8_implementation_continued",
+            agentID: "system",
+            provider: "system"
+        )
+        immutableReport.reportKind = "immutable_history"
+        immutableReport.reportVersion = 12
+
+        let artifacts: [Artifact] = [
+            immutableReport,
+            Artifact(
+                name: "proposal_review_summary",
+                contractID: "proposal_review_summary",
+                format: .json,
+                filePath: tempDirectory.appendingPathComponent("proposal_review_summary.json").path,
+                createdAt: now.addingTimeInterval(-1),
+                runID: runID,
+                stageID: "state_4_proposal_reviewed",
+                agentID: "lead_orchestrator",
+                provider: "claude-code"
+            ),
+            Artifact(
+                name: "proposal_writer_receipt.json",
+                contractID: "proposal_writer_receipt",
+                format: .json,
+                filePath: tempDirectory.appendingPathComponent("proposal_writer_receipt.json").path,
+                createdAt: now.addingTimeInterval(-2),
+                runID: runID,
+                stageID: "state_5_proposal_refined",
+                agentID: "proposal_writer",
+                provider: "codex"
+            )
+        ]
+
+        let snapshot = WorkflowRunArtifactSnapshot(artifacts: artifacts)
+
+        #expect(snapshot.latestArtifacts.count == 2)
+        #expect(snapshot.latestArtifacts.contains(where: { $0.reportKind == "immutable_history" }) == false)
+        #expect(snapshot.approvalContextArtifacts.map(\.name) == ["proposal_review_summary"])
+        #expect(snapshot.latestDebugArtifacts.map(\.name) == ["proposal_writer_receipt.json"])
+    }
+
     @Test("Native markdown keeps markdown presentation intent when payload is not JSON")
     func nativeMarkdownKeepsMarkdownPresentationIntent() {
         let intent = ArtifactPresentationIntent.resolve(
@@ -561,5 +614,45 @@ struct Proposal027Tests {
         #expect(supersededNotice?.localizedCaseInsensitiveContains("superseded") == true)
         #expect(supersededNotice?.localizedCaseInsensitiveContains("continued") == true)
         #expect(latestNotice == nil)
+    }
+
+    @Test("Run report builder prunes immutable report history beyond retention window")
+    func runReportBuilderPrunesImmutableHistoryBeyondRetentionWindow() throws {
+        let workspace = makeTestWorkspace(tempDir: tempDirectory)
+        let run = try makeTestRun(workspace: workspace, context: context)
+        run.status = .blocked
+
+        let builder = RunReportBuilder(modelContext: context)
+        let retention = RunReportBuilder.immutableHistoryRetentionVersions
+        let totalVersions = retention + 3
+
+        for _ in 0..<totalVersions {
+            _ = try builder.emitReport(for: run)
+        }
+
+        let runID = run.id
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.runID == runID && artifact.reportKind == "immutable_history"
+            },
+            sortBy: [SortDescriptor(\.reportVersion, order: .forward)]
+        )
+        let persistedArtifacts = try context.fetch(descriptor)
+        let retainedVersions = Set(persistedArtifacts.compactMap(\.reportVersion))
+        let expectedVersions = Set((run.latestReportVersion - retention + 1)...run.latestReportVersion)
+
+        #expect(persistedArtifacts.count == retention * 2)
+        #expect(retainedVersions == expectedVersions)
+
+        let reportsDirectory = URL(fileURLWithPath: run.artifactRoot)
+            .appendingPathComponent("reports", isDirectory: true)
+        let reportFiles = try FileManager.default.contentsOfDirectory(atPath: reportsDirectory.path)
+            .filter { $0.hasPrefix("run_report_v") }
+
+        #expect(reportFiles.count == retention * 2)
+        #expect(reportFiles.contains("run_report_v1.md") == false)
+        #expect(reportFiles.contains("run_report_v1.json") == false)
+        #expect(reportFiles.contains("run_report_v\(run.latestReportVersion).md") == true)
+        #expect(reportFiles.contains("run_report_v\(run.latestReportVersion).json") == true)
     }
 }

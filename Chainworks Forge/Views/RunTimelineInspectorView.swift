@@ -1,53 +1,113 @@
 import SwiftUI
 
+struct FocusedTimelineSpineEntry: Identifiable, Sendable {
+    let id: String
+    let title: String
+    let detail: String
+    let timestamp: Date
+    let stageID: String
+    let surfaceLabel: String
+    let sessionID: String?
+    let liveEvent: ExecutionEvent?
+}
+
+func buildFocusedTimelineSpineEntries(
+    liveTimeline: [LiveExecutionTimelineEntry],
+    persistedTimeline: [WorkflowMapPersistedTimelineEntry]
+) -> [FocusedTimelineSpineEntry] {
+    let liveEntries = liveTimeline.map { entry in
+        FocusedTimelineSpineEntry(
+            id: entry.id.uuidString,
+            title: entry.agentTitle,
+            detail: entry.event.detail,
+            timestamp: entry.event.timestamp,
+            stageID: entry.stageID,
+            surfaceLabel: entry.event.type.rawValue,
+            sessionID: entry.event.sessionID,
+            liveEvent: entry.event
+        )
+    }
+
+        let persistedEntries = persistedTimeline.map { entry in
+            FocusedTimelineSpineEntry(
+                id: entry.id,
+                title: entry.title,
+                detail: entry.detail,
+                timestamp: entry.timestamp,
+                stageID: "persisted",
+                surfaceLabel: "persisted",
+                sessionID: entry.sessionID,
+                liveEvent: nil
+            )
+        }
+
+    return (liveEntries + persistedEntries).sorted { lhs, rhs in
+        if lhs.timestamp == rhs.timestamp {
+            return lhs.id > rhs.id
+        }
+        return lhs.timestamp > rhs.timestamp
+    }
+}
+
 struct RunTimelineInspectorView: View {
     let projection: WorkflowMapProjection
     var showsTitle: Bool = true
 
     var body: some View {
+        let timelineEntries = buildFocusedTimelineSpineEntries(
+            liveTimeline: projection.liveTimeline,
+            persistedTimeline: projection.persistedTimeline
+        )
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if showsTitle {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Live Timeline")
+                            Text("Timeline")
                                 .font(.title3.weight(.semibold))
-                            Text("Live stream of agent events during the current run.")
+                            Text("Focused run-detail timeline combining live execution and durable supervision history.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
 
-                    if projection.liveTimeline.isEmpty {
+                    if timelineEntries.isEmpty {
                         ContentUnavailableView(
                             "No Timeline Data",
                             systemImage: "waveform.path.ecg",
-                            description: Text("No live events yet.")
+                            description: Text("No live or persisted timeline events yet.")
                         )
                         .frame(maxWidth: .infinity)
                         .frame(maxHeight: .infinity)
                     } else {
-                        GroupBox("Live Stream") {
+                        GroupBox("Timeline") {
                             VStack(alignment: .leading, spacing: 10) {
-                                ForEach(projection.liveTimeline) { entry in
+                                ForEach(timelineEntries) { entry in
                                     VStack(alignment: .leading, spacing: 4) {
                                         HStack {
-                                            Text(entry.agentTitle)
+                                            Text(entry.title)
                                                 .font(.subheadline.weight(.semibold))
                                             Spacer()
-                                            Text(entry.event.type.rawValue)
+                                            Text(entry.surfaceLabel)
                                                 .font(.caption2)
                                                 .foregroundStyle(.secondary)
                                         }
 
-                                        TimelineEventDetailView(event: entry.event)
+                                        if let liveEvent = entry.liveEvent {
+                                            TimelineEventDetailView(event: liveEvent)
+                                        } else {
+                                            Text(entry.detail)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .textSelection(.enabled)
+                                        }
 
                                         HStack(spacing: 8) {
                                             Text(entry.stageID)
-                                            if let sessionID = entry.event.sessionID {
+                                            if let sessionID = entry.sessionID {
                                                 Text(sessionID)
                                             }
-                                            Text(entry.event.timestamp, format: .dateTime.hour().minute().second())
+                                            Text(entry.timestamp, format: .dateTime.hour().minute().second())
                                         }
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
@@ -62,7 +122,7 @@ struct RunTimelineInspectorView: View {
                                 }
                             }
                         }
-                        .animation(.spring(response: 0.45, dampingFraction: 0.82), value: projection.liveTimeline.map(\.id))
+                        .animation(.spring(response: 0.45, dampingFraction: 0.82), value: timelineEntries.map(\.id))
                     }
 
                     // Invisible anchor used to auto-scroll to the latest entry
@@ -73,7 +133,7 @@ struct RunTimelineInspectorView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
             }
-            .onChange(of: projection.liveTimeline.count) {
+            .onChange(of: timelineEntries.count) {
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                     proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
                 }

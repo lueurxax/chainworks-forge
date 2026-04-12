@@ -168,6 +168,31 @@ struct RuntimeSessionResponse: Codable, Sendable {
 
 struct RuntimeSessionRuntimeState: Codable, Sendable {
     let enabledExtensions: [String]
+    let runtimeHomePath: String?
+    let providerDiagnostics: [RuntimeProviderDiagnostic]
+
+    init(
+        enabledExtensions: [String],
+        runtimeHomePath: String? = nil,
+        providerDiagnostics: [RuntimeProviderDiagnostic] = []
+    ) {
+        self.enabledExtensions = enabledExtensions
+        self.runtimeHomePath = runtimeHomePath
+        self.providerDiagnostics = providerDiagnostics
+    }
+}
+
+enum RuntimeProviderDiagnosticSeverity: String, Codable, Sendable, Equatable {
+    case info
+    case warning
+    case error
+}
+
+struct RuntimeProviderDiagnostic: Codable, Sendable, Equatable {
+    let source: String
+    let severity: RuntimeProviderDiagnosticSeverity
+    let message: String
+    let normalizedReason: String?
 }
 
 // MARK: - RuntimeExecutionPolicy

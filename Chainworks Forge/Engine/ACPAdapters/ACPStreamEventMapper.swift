@@ -101,18 +101,27 @@ enum ACPStreamEventMapper {
         case "session/request_permission":
             let toolName = extractPermissionToolName(from: params)
             let raw = serializeToJSON(params ?? [:]) ?? "{}"
-            // Forge auto-grants ACP permissions immediately inside the transport adapter,
-            // so the canonical live contract must show a full request/resolution lifecycle
-            // instead of a dangling "started" event that never finishes.
-            return [
-                .toolCallStarted(toolName: "permission:\(toolName)", raw: raw),
-                .toolCallFinished(toolName: "permission:\(toolName)", raw: raw)
-            ]
+            // Permission requests are only started here. Completion must be inferred from
+            // subsequent provider progress, otherwise the UI falsely claims permission
+            // succeeded even when the provider rejected or failed to deserialize the response.
+            return [.toolCallStarted(toolName: "permission:\(toolName)", raw: raw)]
 
         case "session/error":
-            let message = params?["message"] as? String
-                ?? params?["error"] as? String
-                ?? "Unknown ACP session error"
+            let message: String
+            if let params,
+               let nestedError = params["error"] as? [String: Any] {
+                message = ACPProtocolSupport.formatJSONRPCError(
+                    nestedError,
+                    fallback: "Unknown ACP session error"
+                )
+            } else if let params {
+                message = ACPProtocolSupport.formatJSONRPCError(
+                    params,
+                    fallback: "Unknown ACP session error"
+                )
+            } else {
+                message = "Unknown ACP session error"
+            }
             return [.error(message: message)]
 
         default:
@@ -163,14 +172,14 @@ enum ACPStreamEventMapper {
         }
     }
 
-    /// Map a `tool_call_update` event. Observed statuses: `completed`, `in_progress`.
+    /// Map a `tool_call_update` event. Observed statuses: `completed`, `failed`, `in_progress`.
     private static func mapToolCallUpdate(_ json: [String: Any]) -> RuntimeStreamEvent {
         let toolName = extractToolName(from: json)
         let raw = serializeToJSON(json) ?? "{}"
 
         let status = json["status"] as? String ?? "in_progress"
         switch status {
-        case "completed":
+        case "completed", "failed":
             return .toolCallFinished(toolName: toolName, raw: raw)
         default:
             // in_progress updates — treat as refinements (started)

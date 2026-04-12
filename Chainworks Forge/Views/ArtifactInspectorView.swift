@@ -86,6 +86,7 @@ struct ArtifactInspectorView: View {
     @State private var content: String?
     @State private var isLoadingContent: Bool = false
     @State private var isPinned: Bool = false
+    @State private var actionMessage: String?
     @State private var isSkillTruthExpanded = false
     @State private var isResolvedSkillContentExpanded = false
 
@@ -116,6 +117,12 @@ struct ArtifactInspectorView: View {
                             .foregroundStyle(isPinned ? .orange : .secondary)
                     }
                     .help(isPinned ? "Unpin artifact" : "Pin artifact")
+                }
+
+                if let actionMessage {
+                    Text(actionMessage)
+                        .font(.caption)
+                        .foregroundStyle(DesignTokens.Status.error)
                 }
 
                 Divider()
@@ -229,7 +236,7 @@ struct ArtifactInspectorView: View {
                 provenanceChip("Effort", value: effort, icon: "gauge.medium")
             }
             provenanceChip("Attempt", value: "#\(artifact.attemptNumber)", icon: "arrow.clockwise")
-            provenanceChip("Trust", value: run.runtimeTrustLevel ?? "unknown", icon: "shield")
+            provenanceChip("Trust", value: run.runtimeTrustDisplayLabel, icon: "shield")
         }
     }
 
@@ -422,9 +429,19 @@ struct ArtifactInspectorView: View {
     // MARK: - Pin / Unpin (§9.4)
 
     private func togglePin() {
-        isPinned.toggle()
-        artifact.isPinned = isPinned
-        try? modelContext.save()
+        let previousPinned = isPinned
+        let updatedPinned = !isPinned
+        isPinned = updatedPinned
+        artifact.isPinned = updatedPinned
+        do {
+            try modelContext.save()
+            actionMessage = nil
+        } catch {
+            isPinned = previousPinned
+            artifact.isPinned = previousPinned
+            ForgeLogger.ui.error("Failed to update pin state for artifact \(artifact.id): \(error.localizedDescription)")
+            actionMessage = "Failed to update pin state: \(error.localizedDescription)"
+        }
     }
 
     private var formatColor: Color {

@@ -377,6 +377,23 @@ struct HandoffCompiler: Sendable {
             )
         }
 
+        if agent.id == "code_writer",
+           task.task == "initial_implementation" || task.task == "continue_implementation" {
+            let declaredInputs = Set((task.inputs ?? [])
+                .filter { $0 != "current_task_description" }
+                .filter { available.contains($0) })
+
+            // Codex implementation turns are expensive when proposal truth and the
+            // current plan/backlog are left behind lazy lookups. Inline the declared
+            // implementation inputs so the agent starts from concrete files instead of
+            // broad repo discovery.
+            return inlineEligibleArtifacts(
+                declaredInputs,
+                inputArtifacts: inputArtifacts,
+                inlineLimitBytes: inlineLimitBytes
+            )
+        }
+
         return []
     }
 

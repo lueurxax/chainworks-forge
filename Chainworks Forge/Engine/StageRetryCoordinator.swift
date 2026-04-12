@@ -27,7 +27,8 @@ final class StageRetryCoordinator {
     func retryFailedAgent(
         run: Run,
         stage: StageExecution,
-        failedAgent: AgentExecution
+        failedAgent: AgentExecution,
+        retryReason: String = "agent_retry_via_recovery"
     ) throws -> AgentExecution {
         guard failedAgent.status == .failed else {
             throw StageRetryError.agentNotFailed(failedAgent.agentID)
@@ -35,7 +36,7 @@ final class StageRetryCoordinator {
 
         // Compute next agent attempt number
         let existingAttempts = stage.agentExecutions
-            .filter { $0.agentID == failedAgent.agentID }
+            .filter { $0.agentID == failedAgent.agentID && $0.taskName == failedAgent.taskName }
             .count
         let nextAgentAttempt = existingAttempts + 1
 
@@ -48,7 +49,7 @@ final class StageRetryCoordinator {
             provider: failedAgent.provider,
             effort: failedAgent.effort
         )
-        retryExec.retryReason = "agent_retry_via_recovery"
+        retryExec.retryReason = retryReason
         retryExec.agentAttemptNumber = nextAgentAttempt
         retryExec.supersedesAgentExecutionID = failedAgent.id
         retryExec.resolvedBackendProfileID = failedAgent.resolvedBackendProfileID
@@ -146,9 +147,16 @@ final class StageRetryCoordinator {
             let retryActionType: RecoveryActionType = isAggregate
                 ? .retryFailedAggregateStep
                 : .retryFailedAgent
-            let retryActionDescription = isAggregate
-                ? "Retry only the failed aggregate step '\(failedAgent.agentTitle)' in the same run. Reviewer outputs are reused."
-                : "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused."
+            let retryActionDescription: String = {
+                if failedAgent.retryReason == "automatic_watchdog_retry",
+                   let supervision = failedAgent.supervisionClassification {
+                    return "Automatic watchdog retry already consumed after \(supervision.defaultSummary.lowercased()). Retry only the failed agent '\(failedAgent.agentTitle)' in the same run."
+                }
+                if isAggregate {
+                    return "Retry only the failed aggregate step '\(failedAgent.agentTitle)' in the same run. Reviewer outputs are reused."
+                }
+                return "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused."
+            }()
             let retryAgentAction = RecoveryActionDetail(
                 action: retryActionType,
                 stageID: failedStage.stageID,

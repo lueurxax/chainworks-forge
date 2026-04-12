@@ -6,33 +6,55 @@ struct IdeaListView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
     @Environment(\.uiTestAccessibilitySettings) private var uiTestAccessibilitySettings
-    @Query(sort: \Idea.createdAt, order: .reverse) private var ideas: [Idea]
+    @Query(sort: \Run.startedAt, order: .reverse) private var runs: [Run]
+    @Query(
+        filter: #Predicate<Idea> { idea in
+            idea.archivedAt == nil
+        },
+        sort: \Idea.createdAt,
+        order: .reverse
+    ) private var activeIdeas: [Idea]
+    @Query(
+        filter: #Predicate<Idea> { idea in
+            idea.archivedAt != nil
+        },
+        sort: \Idea.createdAt,
+        order: .reverse
+    ) private var archivedIdeas: [Idea]
     @State private var newIdeaDraft = NewIdeaDraft()
     @State private var showNewIdeaSheet = false
     @State private var showArchivedIdeas = false
     @State private var selectedIdeaID: UUID?
 
-    private var activeIdeas: [Idea] {
-        ideas.filter { !$0.isArchived }
-    }
-
-    private var sidebarIdeas: [Idea] {
-        activeIdeas.sorted(by: compareSidebarIdeas)
-    }
-
-    private var archivedIdeas: [Idea] {
-        ideas.filter(\.isArchived)
-    }
-
-    private var selectedIdea: Idea? {
-        guard let selectedIdeaID else { return nil }
-        return ideas.first(where: { $0.id == selectedIdeaID })
+    private var latestRunStatusByIdeaID: [UUID: RunStatus] {
+        var statuses: [UUID: RunStatus] = [:]
+        for run in runs {
+            guard let ideaID = run.idea?.id, statuses[ideaID] == nil else { continue }
+            statuses[ideaID] = run.listPresentationStatus
+        }
+        return statuses
     }
 
     var body: some View {
+        let activeIdeas = self.activeIdeas
+        let latestRunStatusByIdeaID = self.latestRunStatusByIdeaID
+        let sidebarIdeas = activeIdeas.sorted {
+            compareSidebarIdeas($0, $1, latestRunStatusByIdeaID: latestRunStatusByIdeaID)
+        }
+        let selectedIdea = selectedIdea(in: activeIdeas)
+        let summaryMetrics = IdeaSummaryMetrics(
+            activeIdeas: activeIdeas,
+            latestRunStatusByIdeaID: latestRunStatusByIdeaID
+        )
+        let summaryAccessibilityLabel = summaryStripAccessibilityLabel(metrics: summaryMetrics)
+        let activeIdeaIDs = activeIdeas.map(\.id)
+
         NavigationSplitView {
             VStack(spacing: 0) {
-                summaryStrip
+                summaryStrip(
+                    metrics: summaryMetrics,
+                    accessibilityLabel: summaryAccessibilityLabel
+                )
                 actionStrip
 
                 Group {
@@ -52,6 +74,7 @@ struct IdeaListView: View {
                                 NavigationLink(value: idea.id) {
                                     IdeaSidebarRow(
                                         idea: idea,
+                                        latestRunStatus: latestRunStatusByIdeaID[idea.id],
                                         isSelected: selectedIdeaID == idea.id
                                     )
                                 }
@@ -120,7 +143,7 @@ struct IdeaListView: View {
                 )
             }
         }
-        .onChange(of: activeIdeas.map(\.id)) { _, activeIDs in
+        .onChange(of: activeIdeaIDs) { _, activeIDs in
             if let selectedIdeaID, !activeIDs.contains(selectedIdeaID) {
                 self.selectedIdeaID = activeIDs.first
             } else if self.selectedIdeaID == nil {
@@ -136,24 +159,23 @@ struct IdeaListView: View {
 
     // MARK: - Summary Strip
 
-    private var summaryStrip: some View {
-        let draftCount = activeIdeas.filter { $0.status == .draft }.count
-        let activeCount = activeIdeas.filter { $0.status == .active }.count
-        let attentionCount = activeIdeas.filter(\.requiresAttention).count
-
-        return VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
+    private func summaryStrip(
+        metrics: IdeaSummaryMetrics,
+        accessibilityLabel: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Ideas")
                         .font(.title3.weight(.semibold))
-                    Text(attentionCount > 0 ? "\(attentionCount) need attention" : "Operator workspace")
+                    Text(metrics.attentionCount > 0 ? "\(metrics.attentionCount) need attention" : "Operator workspace")
                         .font(.caption)
-                        .foregroundStyle(attentionCount > 0 ? DesignTokens.Status.warning : .secondary)
+                        .foregroundStyle(metrics.attentionCount > 0 ? DesignTokens.Status.warning : .secondary)
                 }
                 Spacer()
-                if attentionCount > 0 {
+                if metrics.attentionCount > 0 {
                     StatusCapsule(
-                        text: "\(attentionCount) attention",
+                        text: "\(metrics.attentionCount) attention",
                         color: DesignTokens.Status.warning,
                         icon: "exclamationmark.circle.fill",
                         size: .small
@@ -163,37 +185,35 @@ struct IdeaListView: View {
 
             HStack(spacing: DesignTokens.Spacing.small) {
                 summaryChip(
-                    label: "\(activeIdeas.count) ideas",
+                    label: "\(metrics.totalCount) ideas",
                     icon: "lightbulb.fill",
                     color: .blue,
                     accessibilityIdentifier: "ideas-summary-chip-total"
                 )
                 summaryChip(
-                    label: "\(draftCount) drafts",
+                    label: "\(metrics.draftCount) drafts",
                     icon: "pencil",
                     color: .secondary,
                     accessibilityIdentifier: "ideas-summary-chip-drafts"
                 )
                 summaryChip(
-                    label: "\(activeCount) active",
+                    label: "\(metrics.activeCount) active",
                     icon: "bolt.fill",
                     color: DesignTokens.Status.success,
                     accessibilityIdentifier: "ideas-summary-chip-active"
                 )
-                if !archivedIdeas.isEmpty {
-                    Button {
-                        showArchivedIdeas = true
-                    } label: {
-                        summaryChip(
-                            label: "\(archivedIdeas.count) archived",
-                            icon: "archivebox",
-                            color: .secondary,
-                            accessibilityIdentifier: "ideas-summary-chip-archived"
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("ideas-summary-open-archive")
+                Button {
+                    showArchivedIdeas = true
+                } label: {
+                    summaryChip(
+                        label: "Archive",
+                        icon: "archivebox",
+                        color: .secondary,
+                        accessibilityIdentifier: "ideas-summary-chip-archived"
+                    )
                 }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("ideas-summary-open-archive")
             }
 
             HStack(spacing: 8) {
@@ -214,19 +234,21 @@ struct IdeaListView: View {
             }
             .font(.caption)
 
-            summaryChipAccessibilityProof(
-                totalLabel: "\(activeIdeas.count) ideas",
-                draftLabel: "\(draftCount) drafts",
-                activeLabel: "\(activeCount) active",
-                archivedLabel: archivedIdeas.isEmpty ? nil : "\(archivedIdeas.count) archived"
-            )
+            if uiTestAccessibilitySettings.hasOverrides {
+                summaryChipAccessibilityProof(
+                    totalLabel: "\(metrics.totalCount) ideas",
+                    draftLabel: "\(metrics.draftCount) drafts",
+                    activeLabel: "\(metrics.activeCount) active",
+                    archivedLabel: "Archive"
+                )
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 10)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Idea summary")
-        .accessibilityValue(summaryStripAccessibilityLabel)
+        .accessibilityValue(accessibilityLabel)
         .accessibilityIdentifier("ideas-summary-strip")
     }
 
@@ -317,18 +339,13 @@ struct IdeaListView: View {
         return activeModes.isEmpty ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
     }
 
-    private var summaryStripAccessibilityLabel: String {
-        let draftCount = activeIdeas.filter { $0.status == .draft }.count
-        let activeCount = activeIdeas.filter { $0.status == .active }.count
-        let archivedCount = archivedIdeas.count
+    private func summaryStripAccessibilityLabel(metrics: IdeaSummaryMetrics) -> String {
         var parts = [
-            "\(activeIdeas.count) ideas",
-            "\(draftCount) drafts",
-            "\(activeCount) active"
+            "\(metrics.totalCount) ideas",
+            "\(metrics.draftCount) drafts",
+            "\(metrics.activeCount) active",
+            "Archive"
         ]
-        if archivedCount > 0 {
-            parts.append("\(archivedCount) archived")
-        }
         parts.append(summaryChipAccessibilityModes)
         return parts.joined(separator: ", ")
     }
@@ -356,7 +373,12 @@ struct IdeaListView: View {
             attachmentPath: trimmedPath.isEmpty ? nil : trimmedPath
         )
         modelContext.insert(idea)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.ui.error("Failed to save new idea '\(idea.title)': \(error.localizedDescription)")
+            return
+        }
         selectedIdeaID = idea.id
         resetForm()
     }
@@ -383,10 +405,17 @@ struct IdeaListView: View {
     }
 
     private func deleteIdeas(offsets: IndexSet) {
+        let sidebarIdeas = activeIdeas.sorted {
+            compareSidebarIdeas($0, $1, latestRunStatusByIdeaID: latestRunStatusByIdeaID)
+        }
         for index in offsets {
             modelContext.delete(sidebarIdeas[index])
         }
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.ui.error("Failed to delete idea(s): \(error.localizedDescription)")
+        }
     }
 
     private func statusLabel(for idea: Idea) -> String {
@@ -425,9 +454,18 @@ struct IdeaListView: View {
         #endif
     }
 
-    private func compareSidebarIdeas(_ lhs: Idea, _ rhs: Idea) -> Bool {
-        let leftRank = ideaPriority(lhs)
-        let rightRank = ideaPriority(rhs)
+    private func selectedIdea(in activeIdeas: [Idea]) -> Idea? {
+        guard let selectedIdeaID else { return nil }
+        return activeIdeas.first(where: { $0.id == selectedIdeaID })
+    }
+
+    private func compareSidebarIdeas(
+        _ lhs: Idea,
+        _ rhs: Idea,
+        latestRunStatusByIdeaID: [UUID: RunStatus]
+    ) -> Bool {
+        let leftRank = ideaPriority(lhs, latestRunStatus: latestRunStatusByIdeaID[lhs.id])
+        let rightRank = ideaPriority(rhs, latestRunStatus: latestRunStatusByIdeaID[rhs.id])
         if leftRank != rightRank {
             return leftRank < rightRank
         }
@@ -437,9 +475,9 @@ struct IdeaListView: View {
         return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
     }
 
-    private func ideaPriority(_ idea: Idea) -> Int {
-        if let latestRun = idea.latestRun {
-            switch latestRun.listPresentationStatus {
+    private func ideaPriority(_ idea: Idea, latestRunStatus: RunStatus?) -> Int {
+        if let latestRunStatus {
+            switch latestRunStatus {
             case .waitingApproval:
                 return 0
             case .blocked:
@@ -470,6 +508,7 @@ struct IdeaListView: View {
 
 private struct IdeaSidebarRow: View {
     let idea: Idea
+    let latestRunStatus: RunStatus?
     let isSelected: Bool
 
     var body: some View {
@@ -489,7 +528,7 @@ private struct IdeaSidebarRow: View {
                 }
                 Spacer(minLength: 8)
                 StatusCapsule(
-                    text: idea.sidebarLifecycleStatusLabel,
+                    text: sidebarLifecycleStatusLabel,
                     color: primaryStatusColor,
                     icon: primaryStatusIcon,
                     size: .small
@@ -499,7 +538,7 @@ private struct IdeaSidebarRow: View {
             HStack(spacing: 6) {
                 if let attentionLabel {
                     sidebarMetaTag(attentionLabel, icon: attentionIcon, color: attentionColor)
-                } else if idea.hasActiveRun {
+                } else if hasActiveRun {
                     sidebarMetaTag("Run active", icon: "play.circle.fill", color: DesignTokens.Status.running)
                 }
 
@@ -532,9 +571,24 @@ private struct IdeaSidebarRow: View {
             .foregroundStyle(color)
     }
 
+    private var sidebarLifecycleStatusLabel: String {
+        guard let latestRunStatus else { return idea.status.rawValue.capitalized }
+        return latestRunStatus.rawValue.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private var hasActiveRun: Bool {
+        guard let latestRunStatus else { return false }
+        switch latestRunStatus {
+        case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
+            return true
+        case .completed, .failed, .cancelled:
+            return false
+        }
+    }
+
     private var primaryStatusColor: Color {
-        if let latestRun = idea.latestRun {
-            switch latestRun.listPresentationStatus {
+        if let latestRunStatus {
+            switch latestRunStatus {
             case .pending, .ready:
                 return DesignTokens.Status.neutral
             case .running:
@@ -563,10 +617,10 @@ private struct IdeaSidebarRow: View {
     }
 
     private var primaryStatusIcon: String? {
-        guard let latestRun = idea.latestRun else {
+        guard let latestRunStatus else {
             return idea.status == .draft ? "pencil" : "lightbulb.fill"
         }
-        switch latestRun.listPresentationStatus {
+        switch latestRunStatus {
         case .pending, .ready:
             return "clock"
         case .running:
@@ -587,8 +641,8 @@ private struct IdeaSidebarRow: View {
     }
 
     private var attentionLabel: String? {
-        guard let latestRun = idea.latestRun else { return nil }
-        switch latestRun.listPresentationStatus {
+        guard let latestRunStatus else { return nil }
+        switch latestRunStatus {
         case .waitingApproval:
             return "Needs approval"
         case .blocked:
@@ -601,8 +655,8 @@ private struct IdeaSidebarRow: View {
     }
 
     private var attentionIcon: String {
-        guard let latestRun = idea.latestRun else { return "exclamationmark.circle.fill" }
-        switch latestRun.listPresentationStatus {
+        guard let latestRunStatus else { return "exclamationmark.circle.fill" }
+        switch latestRunStatus {
         case .waitingApproval:
             return "checkmark.seal"
         case .blocked:
@@ -615,8 +669,8 @@ private struct IdeaSidebarRow: View {
     }
 
     private var attentionColor: Color {
-        guard let latestRun = idea.latestRun else { return DesignTokens.Status.warning }
-        switch latestRun.listPresentationStatus {
+        guard let latestRunStatus else { return DesignTokens.Status.warning }
+        switch latestRunStatus {
         case .failed:
             return DesignTokens.Status.error
         default:
@@ -628,7 +682,7 @@ private struct IdeaSidebarRow: View {
         if isSelected {
             return DesignTokens.Action.primary.opacity(0.14)
         }
-        if idea.requiresAttention {
+        if requiresAttention {
             return primaryStatusColor.opacity(0.08)
         }
         return Color.white.opacity(0.03)
@@ -638,18 +692,15 @@ private struct IdeaSidebarRow: View {
         if isSelected {
             return DesignTokens.Action.primary.opacity(0.55)
         }
-        if idea.requiresAttention {
+        if requiresAttention {
             return primaryStatusColor.opacity(0.24)
         }
         return Color.white.opacity(0.06)
     }
-}
 
-@MainActor
-private extension Idea {
-    var requiresAttention: Bool {
-        guard let latestRun else { return false }
-        switch latestRun.listPresentationStatus {
+    private var requiresAttention: Bool {
+        guard let latestRunStatus else { return false }
+        switch latestRunStatus {
         case .waitingApproval, .blocked, .failed:
             return true
         default:
@@ -669,6 +720,45 @@ struct NewIdeaDraft: Equatable {
 
     var canSave: Bool {
         !trimmedTitle.isEmpty
+    }
+}
+
+private struct IdeaSummaryMetrics {
+    let totalCount: Int
+    let draftCount: Int
+    let activeCount: Int
+    let attentionCount: Int
+
+    init(activeIdeas: [Idea], latestRunStatusByIdeaID: [UUID: RunStatus]) {
+        self.totalCount = activeIdeas.count
+
+        var draftCount = 0
+        var activeCount = 0
+        var attentionCount = 0
+
+        for idea in activeIdeas {
+            switch idea.status {
+            case .draft:
+                draftCount += 1
+            case .active:
+                activeCount += 1
+            case .completed, .failed:
+                break
+            }
+
+            if let latestRunStatus = latestRunStatusByIdeaID[idea.id] {
+                switch latestRunStatus {
+                case .waitingApproval, .blocked, .failed:
+                    attentionCount += 1
+                default:
+                    break
+                }
+            }
+        }
+
+        self.draftCount = draftCount
+        self.activeCount = activeCount
+        self.attentionCount = attentionCount
     }
 }
 
@@ -893,26 +983,11 @@ struct IdeaDetailView: View {
 
     /// Whether this idea has an active run (prevents starting another).
     private var hasActiveRun: Bool {
-        idea.runs.contains { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
+        idea.latestDetailRunCandidate?.canBeCancelledByOperator == true
     }
 
     private var displayedRun: Run? {
-        guard let activeRun else { return nil }
-        switch activeRun.presentationStatus {
-        case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
-            return activeRun
-        case .completed, .cancelled:
-            return nil
-        case .failed:
-            return activeRun
-        }
-    }
-
-    private var latestActiveRun: Run? {
-        idea.runs
-            .filter { [.pending, .ready, .running, .waitingApproval, .blocked].contains($0.status) }
-            .sorted { $0.startedAt > $1.startedAt }
-            .first
+        idea.preferredDetailRun(selectedRun: activeRun)
     }
 
     private var startRunActionTitle: String {
@@ -1079,7 +1154,7 @@ struct IdeaDetailView: View {
                     }
 
                     // Proposal 011 — REQ-001: Dedicated stop action for active runs
-                    if hasActiveRun, let runToStop = latestActiveRun {
+                    if hasActiveRun, let runToStop = idea.latestDetailRunCandidate {
                         Section("Run Control") {
                             Button(role: .destructive) {
                                 showStopConfirmation = true
@@ -1160,7 +1235,7 @@ struct IdeaDetailView: View {
             }
         }
         .task(id: idea.id) {
-            activeRun = latestActiveRun
+            activeRun = idea.latestDetailRunCandidate
             showStartRunSheet = false
             archiveMessage = nil
             showStopConfirmation = false
@@ -1176,7 +1251,13 @@ struct IdeaDetailView: View {
                     // Let the sheet dismiss and detail view render before mutating execution state.
                     await Task.yield()
                     idea.status = .active
-                    try? modelContext.save()
+                    do {
+                        try modelContext.save()
+                        archiveMessage = nil
+                    } catch {
+                        ForgeLogger.ui.error("Failed to persist idea status before starting run \(prepared.run.id): \(error.localizedDescription)")
+                        archiveMessage = "Run will start, but idea status could not be saved: \(error.localizedDescription)"
+                    }
                     executionService.startRun(
                         run: prepared.run,
                         plan: prepared.plan,
@@ -1224,9 +1305,17 @@ struct IdeaDetailView: View {
 
     private func saveWorkspaceRoot() {
         let trimmed = editingWorkspacePath.trimmingCharacters(in: .whitespaces)
-        SecurityScopedAccess.remember(path: trimmed.isEmpty ? nil : trimmed, kind: .workspaceRoot)
+        let bookmarkSaved = SecurityScopedAccess.remember(path: trimmed.isEmpty ? nil : trimmed, kind: .workspaceRoot)
         idea.workspaceRootPath = trimmed.isEmpty ? nil : trimmed
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+            archiveMessage = bookmarkSaved
+                ? "Saved project directory."
+                : "Saved project directory, but access could not be bookmarked for future launches."
+        } catch {
+            ForgeLogger.ui.error("Failed to save workspace root for idea \(idea.id): \(error.localizedDescription)")
+            archiveMessage = "Failed to save project directory: \(error.localizedDescription)"
+        }
     }
 
     private func isValidDirectory(_ path: String) -> Bool {
@@ -1293,7 +1382,7 @@ struct WorkflowStartRunSheet: View {
     @State private var workflowURLs: [WorkflowPreset: URL] = [:]
     @State private var catalogURL: URL?
     @State private var isStarting = false
-    @State private var selectedMode: ExecutionMode = .simulated
+    @State private var selectedMode: RunStartExecutionMode = .simulated
     @State private var selectedWorkflow: WorkflowPreset = .canonicalRelease
     @State private var startOptions: RunStartOptions = .empty
     @State private var selectedContextStrategyProfileID = "current_mixed_baseline"
@@ -1319,20 +1408,6 @@ struct WorkflowStartRunSheet: View {
         case error(String)
     }
 
-    private enum ExecutionMode: String, CaseIterable, Identifiable {
-        case simulated
-        case live
-
-        var id: String { rawValue }
-
-        var title: String {
-            switch self {
-            case .simulated: return "Simulated"
-            case .live: return "Live"
-            }
-        }
-    }
-
     private enum WorkflowPreset: String, CaseIterable, Identifiable {
         case canonicalRelease
         case proposalLoopLive
@@ -1340,7 +1415,7 @@ struct WorkflowStartRunSheet: View {
 
         var id: String { rawValue }
 
-        var mode: ExecutionMode {
+        var mode: RunStartExecutionMode {
             switch self {
             case .canonicalRelease: return .simulated
             case .proposalLoopLive: return .live
@@ -1453,10 +1528,6 @@ struct WorkflowStartRunSheet: View {
         )
     }
 
-    private var availableModes: [ExecutionMode] {
-        executionService.supportsLiveExecution ? ExecutionMode.allCases : [.simulated]
-    }
-
     private var liveRuntimeReady: Bool {
         if case .ready = executionService.liveRuntimeReadiness {
             return true
@@ -1477,15 +1548,30 @@ struct WorkflowStartRunSheet: View {
             Text("Execution Mode")
                 .font(.subheadline.weight(.medium))
             ForEach(availableModes) { mode in
+                let presentation = RunStartModePresentationPolicy.presentation(for: mode)
                 Button {
                     selectedMode = mode
                 } label: {
                     HStack(spacing: 10) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(mode.title)
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.primary)
-                            Text(mode == .live ? "Uses configured live runtime execution." : "Uses the canonical local executor.")
+                            HStack(spacing: 8) {
+                                Text(mode.title)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                if let badge = presentation.badge {
+                                    Text(badge)
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(mode == .live ? DesignTokens.Action.primary : .secondary)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(
+                                            Capsule(style: .continuous)
+                                                .fill(mode == .live ? DesignTokens.Action.primary.opacity(0.12) : DesignTokens.Status.neutral.opacity(0.10))
+                                        )
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(presentation.subtitle)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -1495,10 +1581,10 @@ struct WorkflowStartRunSheet: View {
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(selectedMode == mode ? DesignTokens.Action.primary.opacity(0.12) : DesignTokens.Status.neutral.opacity(0.08))
-                        )
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(selectedMode == mode ? DesignTokens.Action.primary.opacity(0.12) : DesignTokens.Status.neutral.opacity(0.08))
+                    )
                 }
                 .buttonStyle(.plain)
                 .accessibilityElement(children: .ignore)
@@ -1508,6 +1594,10 @@ struct WorkflowStartRunSheet: View {
             }
         }
         .accessibilityIdentifier("execution-mode-list")
+    }
+
+    private var availableModes: [RunStartExecutionMode] {
+        RunStartModePresentationPolicy.orderedModes(supportsLiveExecution: executionService.supportsLiveExecution)
     }
 
     private var liveModeConfigured: Bool {
@@ -1728,7 +1818,7 @@ struct WorkflowStartRunSheet: View {
                             .accessibilityIdentifier("live-runtime-config-block")
                         }
                     } else {
-                        Label("Simulated mode uses the canonical local executor.", systemImage: "checkmark.circle")
+                        Label("Simulated mode is a local diagnostic path and does not use live runtime execution.", systemImage: "checkmark.circle")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -2018,7 +2108,11 @@ struct WorkflowStartRunSheet: View {
         .frame(minWidth: 520, minHeight: 480)
         .task {
             resolveURLs()
-            selectedMode = shouldDefaultToDeliveryFlow ? .live : (availableModes.contains(selectedMode) ? selectedMode : .simulated)
+            selectedMode = RunStartModePresentationPolicy.defaultMode(
+                supportsLiveExecution: executionService.supportsLiveExecution,
+                shouldDefaultToDeliveryFlow: shouldDefaultToDeliveryFlow,
+                currentSelection: selectedMode
+            )
             if shouldDefaultToDeliveryFlow {
                 selectedWorkflow = .fullMVPLive
             } else {
@@ -2212,6 +2306,7 @@ struct WorkflowStartRunSheet: View {
             catalogURL: catalogURL,
             plan: compiledPlan,
             startOptions: startOptions,
+            requiresRuntimeMCPValidation: selectedMode == .live,
             idea: idea,
             effectiveProjectRootPath: effectiveProjectRoot
         )
@@ -2395,7 +2490,7 @@ struct WorkflowStartRunSheet: View {
 struct WorkflowRunProgressView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
-    @Query private var runArtifacts: [Artifact]
+    @Query private var summaryArtifacts: [Artifact]
 
     let run: Run
     private let forcedInitialPane: IdeaRunPane?
@@ -2411,9 +2506,10 @@ struct WorkflowRunProgressView: View {
         self.forcedInitialPane = initialPane
         _selectedPane = State(initialValue: initialPane ?? .summary)
         let runID = run.id
-        _runArtifacts = Query(
+        _summaryArtifacts = Query(
             filter: #Predicate<Artifact> { artifact in
                 artifact.runID == runID
+                    && (artifact.reportKind == nil || artifact.reportKind != "immutable_history")
             },
             sort: [SortDescriptor(\Artifact.createdAt, order: .reverse)]
         )
@@ -2436,7 +2532,7 @@ struct WorkflowRunProgressView: View {
     }
 
     private var orchestrator: WorkflowOrchestrator? {
-        executionService.orchestrator(for: run.id)
+        executionService.peekOrchestrator(for: run.id)
     }
 
     private var liveTimeline: [LiveExecutionTimelineEntry] {
@@ -2456,7 +2552,23 @@ struct WorkflowRunProgressView: View {
     }
 
     private var currentStageExecution: RunStageSnapshot? {
-        sortedStages.last
+        if let currentStageID = workflowMapProjection?.currentStageID,
+           let matchingStage = sortedStages.last(where: { $0.stageID == currentStageID }) {
+            return matchingStage
+        }
+        return sortedStages.last
+    }
+
+    private var effectiveRunStatus: RunStatus {
+        workflowMapProjection?.runStatus ?? run.presentationStatus
+    }
+
+    private var effectiveRunStatusLabel: String {
+        effectiveRunStatus.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+
+    private var effectiveCurrentStageLabel: String {
+        workflowMapProjection?.currentStageLabel ?? currentStageExecution?.label ?? run.cursorDerivedStageLabel
     }
 
     private var approvalContextArtifacts: [Artifact] {
@@ -2476,11 +2588,11 @@ struct WorkflowRunProgressView: View {
     }
 
     private var artifactSnapshot: WorkflowRunArtifactSnapshot {
-        WorkflowRunArtifactSnapshot(artifacts: runArtifacts)
+        WorkflowRunArtifactSnapshot(artifacts: summaryArtifacts)
     }
 
     private var preferredPane: IdeaRunPane {
-        defaultIdeaRunPane(for: run.presentationStatus)
+        defaultIdeaRunPane(for: effectiveRunStatus)
     }
 
     private var latestPersistedCheckpointText: String? {
@@ -2508,8 +2620,36 @@ struct WorkflowRunProgressView: View {
         return nil
     }
 
+    private var latestPersistedTimelineEntry: WorkflowMapPersistedTimelineEntry? {
+        workflowMapProjection?.persistedTimeline.first
+    }
+
+    private var latestPersistedSessionID: String? {
+        sortedStages
+            .flatMap(\.agentExecutions)
+            .sorted { lhs, rhs in
+                let leftTimestamp = lhs.completedAt ?? lhs.startedAt
+                let rightTimestamp = rhs.completedAt ?? rhs.startedAt
+                if leftTimestamp == rightTimestamp {
+                    return lhs.id.uuidString > rhs.id.uuidString
+                }
+                return leftTimestamp > rightTimestamp
+            }
+            .first { snapshot in
+                guard let sessionID = snapshot.runtimeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                    return false
+                }
+                return !sessionID.isEmpty
+            }?
+            .runtimeSessionID
+    }
+
+    private var effectiveLatestSessionID: String? {
+        latestLiveSessionID ?? latestPersistedSessionID
+    }
+
     private var nextActionText: String {
-        switch run.presentationStatus {
+        switch effectiveRunStatus {
         case .waitingApproval:
             return "Approve or reject the current proposal."
         case .blocked:
@@ -2600,7 +2740,7 @@ struct WorkflowRunProgressView: View {
         } message: {
             Text("This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history.")
         }
-        .task(id: run.presentationStatus.rawValue) {
+        .task(id: effectiveRunStatus.rawValue) {
             selectedPane = forcedInitialPane ?? preferredPane
         }
     }
@@ -2610,7 +2750,7 @@ struct WorkflowRunProgressView: View {
     }
 
     private var runStatusColor: Color {
-        switch run.presentationStatus {
+        switch effectiveRunStatus {
         case .pending, .ready:
             return DesignTokens.Status.neutral
         case .running:
@@ -2633,7 +2773,7 @@ struct WorkflowRunProgressView: View {
                         .font(.title2.bold())
                 HStack(spacing: 8) {
                     StatusCapsule(
-                        text: run.presentationStatusLabel,
+                        text: effectiveRunStatusLabel,
                         color: runStatusColor,
                         size: .regular
                     )
@@ -2642,7 +2782,7 @@ struct WorkflowRunProgressView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        Label(run.cursorDerivedStageLabel, systemImage: "square.stack.3d.up")
+                        Label(effectiveCurrentStageLabel, systemImage: "square.stack.3d.up")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -2652,7 +2792,7 @@ struct WorkflowRunProgressView: View {
             HStack(spacing: 10) {
                 Label("Elapsed \(elapsedText)", systemImage: "clock")
                 Label(run.totalCostCents.map { "\($0) cents" } ?? "Pending cost", systemImage: "dollarsign.circle")
-                if let sessionID = latestLiveSessionID {
+                if let sessionID = effectiveLatestSessionID {
                     Label(sessionID, systemImage: "lanyardcard")
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -2675,7 +2815,7 @@ struct WorkflowRunProgressView: View {
                     .accessibilityIdentifier("run-progress-stop-run-button")
                 }
 
-                if run.presentationStatus == .completed || run.presentationStatus == .blocked || run.presentationStatus == .failed || run.presentationStatus == .cancelled {
+                if effectiveRunStatus == .completed || effectiveRunStatus == .blocked || effectiveRunStatus == .failed || effectiveRunStatus == .cancelled {
                     Button("Open in Runs Home") {
                         NotificationCenter.default.post(
                             name: .chainworksOpenRunInRunsHome,
@@ -2742,7 +2882,7 @@ struct WorkflowRunProgressView: View {
                 VStack(alignment: .leading, spacing: ForgeSpacing.small) {
                     Text("Run Overview")
                         .font(ForgeTypography.sectionHeader)
-                    Text(currentStageExecution?.label ?? run.cursorDerivedStageLabel)
+                    Text(effectiveCurrentStageLabel)
                         .font(.title3.weight(.semibold))
                     Text(nextActionText)
                         .font(ForgeTypography.body)
@@ -2751,17 +2891,17 @@ struct WorkflowRunProgressView: View {
                 }
                 Spacer(minLength: ForgeSpacing.large)
                 StatusCapsule(
-                    text: run.presentationStatusLabel,
+                    text: effectiveRunStatusLabel,
                     color: runStatusColor,
                     size: .regular
                 )
-                .accessibilityIdentifier("run-status-\(run.presentationStatus.rawValue)")
+                .accessibilityIdentifier("run-status-\(effectiveRunStatus.rawValue)")
             }
 
             VStack(alignment: .leading, spacing: ForgeSpacing.small) {
                 summaryRow(label: "Workflow", value: run.workflowTitle)
-                summaryRow(label: "Current Stage", value: run.cursorDerivedStageLabel)
-                summaryRow(label: "Latest Phase", value: currentStageExecution?.label ?? run.cursorDerivedStageLabel)
+                summaryRow(label: "Current Stage", value: effectiveCurrentStageLabel)
+                summaryRow(label: "Latest Phase", value: effectiveCurrentStageLabel)
                 summaryRow(label: "Latest Event", value: latestMeaningfulEventText)
             }
         }
@@ -2797,10 +2937,12 @@ struct WorkflowRunProgressView: View {
             )
             summaryMetricCard(
                 title: "Session",
-                value: latestLiveSessionID ?? "No live session",
-                detail: latestLiveSessionID == nil
+                value: effectiveLatestSessionID ?? "No live session",
+                detail: effectiveLatestSessionID == nil
                     ? missingSessionDetail
-                    : "Most recent active runtime session",
+                    : latestLiveSessionID == nil
+                        ? "Most recent persisted runtime session"
+                        : "Most recent active runtime session",
                 symbol: "lanyardcard"
             )
         }
@@ -2858,7 +3000,7 @@ struct WorkflowRunProgressView: View {
         VStack(alignment: .leading, spacing: 14) {
             GroupBox("Progress") {
                 VStack(alignment: .leading, spacing: 8) {
-                    LabeledContent("Current Stage", value: currentStageExecution?.label ?? run.currentStageID ?? "Not started")
+                    LabeledContent("Current Stage", value: effectiveCurrentStageLabel)
                     LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
                     LabeledContent("Active Agents", value: "\(activeAgents.count)")
                     if activeAgents.isEmpty == false {
@@ -3068,7 +3210,10 @@ struct WorkflowRunProgressView: View {
     }
 
     private var latestMeaningfulEventText: String {
-        latestLiveEvent?.event.detail ?? latestPersistedCheckpointText ?? "Waiting for the next execution event"
+        latestLiveEvent?.event.detail
+            ?? latestPersistedTimelineEntry?.detail
+            ?? latestPersistedCheckpointText
+            ?? "Waiting for the next execution event"
     }
 
     private var latestLiveEvent: LiveExecutionTimelineEntry? {
@@ -3080,7 +3225,10 @@ struct WorkflowRunProgressView: View {
     }
 
     private var missingSessionDetail: String {
-        switch run.presentationStatus {
+        if latestPersistedSessionID != nil {
+            return "No in-memory live stream is attached. Showing the most recent persisted runtime session."
+        }
+        switch effectiveRunStatus {
         case .pending, .ready, .running:
             return "Waiting for the next session to start"
         case .waitingApproval:
@@ -3168,7 +3316,8 @@ struct WorkflowRunArtifactSnapshot {
     let latestDebugArtifacts: [Artifact]
 
     init(artifacts: [Artifact]) {
-        self.latestArtifacts = Self.sortLatestArtifacts(artifacts)
+        let compactArtifacts = artifacts.filter { $0.reportKind != "immutable_history" }
+        self.latestArtifacts = Self.sortLatestArtifacts(compactArtifacts)
         self.approvalContextArtifacts = Self.makeApprovalContextArtifacts(from: latestArtifacts)
         self.latestDebugArtifacts = Self.makeLatestDebugArtifacts(from: latestArtifacts)
     }

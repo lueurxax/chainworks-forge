@@ -441,7 +441,11 @@ enum PreviewSupport {
         context.insert(run)
 
         seedWorkflowMapStages(into: run)
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            ForgeLogger.app.error("Failed to persist preview workflow-map run seed: \(error.localizedDescription)")
+        }
     }
 
     @MainActor

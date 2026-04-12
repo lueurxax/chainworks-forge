@@ -213,7 +213,7 @@ Session history must never override execution truth, and reports must not infer 
 The strongest current proof owners for this slice are:
 
 - `AgentSessionTests`
-- `GooseAgentExecutorTests`
+- `RuntimeAgentExecutorTests`
 
 They cover the implemented claims around:
 

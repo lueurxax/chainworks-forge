@@ -44,6 +44,7 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
         )
 
         try subprocess.launch()
+        self.startStderrLogging(for: subprocess, prefix: "JunieCLIACP")
 
         // Step 1: Send `initialize` JSON-RPC request
         let initializeRequest = makeJSONRPCRequest(
@@ -235,7 +236,10 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
                                 let finishEvent = ACPStreamEventMapper.mapPromptResult(result)
                                 continuation.yield(finishEvent)
                             } else if let error = json["error"] as? [String: Any] {
-                                let message = error["message"] as? String ?? "Unknown Junie ACP error"
+                                let message = ACPProtocolSupport.formatJSONRPCError(
+                                    error,
+                                    fallback: "Unknown Junie ACP error"
+                                )
                                 continuation.yield(.error(message: message))
                             }
                             continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
@@ -257,6 +261,7 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
                             if method == "session/request_permission" {
                                 self.autoGrantPermission(
                                     subprocess: subprocess,
+                                    requestID: json["id"],
                                     params: params,
                                     sessionID: sessionID
                                 )
@@ -374,7 +379,10 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
                     return result
                 }
                 if let error = json["error"] as? [String: Any] {
-                    let message = error["message"] as? String ?? "Unknown Junie ACP error"
+                    let message = ACPProtocolSupport.formatJSONRPCError(
+                        error,
+                        fallback: "Unknown Junie ACP error"
+                    )
                     throw RuntimeTransportError.sessionCreationFailed(reason: message)
                 }
                 return nil
@@ -393,25 +401,36 @@ final class JunieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable 
     /// Forge auto-grants with `allow_once` based on the execution policy.
     private func autoGrantPermission(
         subprocess: ACPSubprocessManager,
+        requestID: Any?,
         params: [String: Any]?,
         sessionID: String
     ) {
-        guard let params,
-              let requestId = params["id"] as? String ?? params["requestId"] as? String else {
+        guard let response = ACPProtocolSupport.permissionSelectionResponse(
+            requestID: requestID,
+            params: params
+        ) else {
+            ForgeLogger.execution.error("Failed to auto-grant Junie permission for session \(sessionID)")
             return
         }
-
-        let response: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "session/permission_response",
-            "params": [
-                "sessionId": sessionID,
-                "requestId": requestId,
-                "response": "allow_once"
-            ] as [String: Any]
-        ]
-
         try? subprocess.sendJSON(response)
+    }
+
+    private func startStderrLogging(for subprocess: ACPSubprocessManager, prefix: String) {
+        Task.detached {
+            do {
+                for try await line in subprocess.readStderrLines() {
+                    if line.localizedCaseInsensitiveContains("error")
+                        || line.localizedCaseInsensitiveContains("failed")
+                        || line.localizedCaseInsensitiveContains("panic") {
+                        ForgeLogger.execution.error("\(prefix) stderr: \(line)")
+                    } else {
+                        ForgeLogger.execution.info("\(prefix) stderr: \(line)")
+                    }
+                }
+            } catch {
+                ForgeLogger.execution.error("\(prefix) stderr reader failed: \(error.localizedDescription)")
+            }
+        }
     }
 }
 

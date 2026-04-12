@@ -10,7 +10,7 @@ Current implementation and proof status for the output-contract, failure-evidenc
 | Source contract | [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) |
 | Current implementation status | Implemented |
 | Current readiness | Ready with Risks |
-| Primary proof owners | `Proposal013Tests`, `GooseSessionBridgeTests`, canonical `proposal-013` gate |
+| Primary proof owners | `Proposal013Tests`, `RuntimeSessionBridgeTests`, canonical `proposal-013` gate |
 | Last consolidated documentation refresh | `2026-03-31` |
 
 ## What is considered proven
@@ -32,7 +32,7 @@ The accepted proof story for this slice supports these claims:
 The strongest current-head proof owners are:
 
 - `Proposal013Tests`
-- `GooseSessionBridgeTests`
+- `RuntimeSessionBridgeTests`
 - `RecoveryCoordinatorTests`
 - `Chainworks_ForgeUITests.testProposal013AppProofSurface`
 - `scripts/test-gate.sh proposal-013`

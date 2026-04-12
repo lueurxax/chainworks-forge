@@ -2,6 +2,17 @@ import Foundation
 
 // MARK: - ClaudeAgentACPTransport (Proposal 026, Phase 3 — Step 3.6)
 
+enum ClaudeWorkspaceSettingsRepairReason: String, Sendable {
+    case emptyFile
+    case invalidJSON
+}
+
+struct ClaudeWorkspaceSettingsRepair: Sendable {
+    let settingsURL: URL
+    let backupURL: URL
+    let reason: ClaudeWorkspaceSettingsRepairReason
+}
+
 /// ACP transport adapter for Claude Agent (`claude-agent-acp` subprocess).
 /// Communicates via subprocess stdin/stdout using ACP JSON-RPC protocol over ndjson framing.
 ///
@@ -44,6 +55,11 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
         ForgeLogger.claudeACP.debug("createSession called, executablePath=\(executablePath), workingDir=\(request.workingDirectory ?? "nil")")
         let startTime = Date()
+        if let repair = try Self.sanitizeWorkspaceSettingsIfNeeded(workingDirectory: request.workingDirectory) {
+            ForgeLogger.claudeACP.info(
+                "Repaired malformed workspace Claude settings at \(repair.settingsURL.path) with backup \(repair.backupURL.lastPathComponent) [reason=\(repair.reason.rawValue)]"
+            )
+        }
         let subprocess = ACPSubprocessManager(
             executablePath: executablePath,
             arguments: [],
@@ -52,6 +68,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         )
 
         try subprocess.launch()
+        self.startStderrLogging(for: subprocess, prefix: "ClaudeAgentACP")
 
         // Step 1: Send `initialize` JSON-RPC request
         let initializeRequest = makeJSONRPCRequest(
@@ -260,7 +277,10 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                                 let finishEvent = ACPStreamEventMapper.mapPromptResult(result)
                                 continuation.yield(finishEvent)
                             } else if let error = json["error"] as? [String: Any] {
-                                let message = error["message"] as? String ?? "Unknown ACP error"
+                                let message = ACPProtocolSupport.formatJSONRPCError(
+                                    error,
+                                    fallback: "Unknown ACP error"
+                                )
                                 continuation.yield(.error(message: message))
                             }
                             continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
@@ -282,6 +302,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                             if method == "session/request_permission" {
                                 self.autoGrantPermission(
                                     subprocess: subprocess,
+                                    requestID: json["id"],
                                     params: params,
                                     sessionID: sessionID
                                 )
@@ -399,6 +420,45 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         return current
     }
 
+    static func sanitizeWorkspaceSettingsIfNeeded(
+        workingDirectory: String?,
+        fileManager: FileManager = .default
+    ) throws -> ClaudeWorkspaceSettingsRepair? {
+        guard let workingDirectory, !workingDirectory.isEmpty else { return nil }
+
+        let settingsURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent("settings.json", isDirectory: false)
+
+        guard fileManager.fileExists(atPath: settingsURL.path) else { return nil }
+
+        let data = try Data(contentsOf: settingsURL)
+        let reason: ClaudeWorkspaceSettingsRepairReason?
+        if data.isEmpty {
+            reason = .emptyFile
+        } else if !isValidClaudeWorkspaceSettingsJSON(data) {
+            reason = .invalidJSON
+        } else {
+            reason = nil
+        }
+
+        guard let reason else { return nil }
+
+        let backupURL = settingsURL.deletingLastPathComponent().appendingPathComponent(
+            "settings.json.invalid-\(Self.repairTimestampString()).bak",
+            isDirectory: false
+        )
+        try data.write(to: backupURL, options: .atomic)
+        let replacementData = Data("{}\n".utf8)
+        try replacementData.write(to: settingsURL, options: .atomic)
+
+        return ClaudeWorkspaceSettingsRepair(
+            settingsURL: settingsURL,
+            backupURL: backupURL,
+            reason: reason
+        )
+    }
+
     // MARK: - Private: Read Next JSON-RPC Result
 
     /// Read lines from the subprocess until a JSON-RPC response (with "result") is found.
@@ -435,25 +495,52 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     /// For now, Forge auto-grants with `allow_once` based on the execution policy.
     private func autoGrantPermission(
         subprocess: ACPSubprocessManager,
+        requestID: Any?,
         params: [String: Any]?,
         sessionID: String
     ) {
-        guard let params,
-              let requestId = params["id"] as? String ?? params["requestId"] as? String else {
+        guard let response = ACPProtocolSupport.permissionSelectionResponse(
+            requestID: requestID,
+            params: params
+        ) else {
+            ForgeLogger.claudeACP.error("Failed to auto-grant permission for session \(sessionID)")
             return
         }
-
-        let response: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "session/permission_response",
-            "params": [
-                "sessionId": sessionID,
-                "requestId": requestId,
-                "response": "allow_once"
-            ] as [String: Any]
-        ]
-
         try? subprocess.sendJSON(response)
+    }
+
+    private func startStderrLogging(for subprocess: ACPSubprocessManager, prefix: String) {
+        Task.detached {
+            do {
+                for try await line in subprocess.readStderrLines() {
+                    if line.localizedCaseInsensitiveContains("error")
+                        || line.localizedCaseInsensitiveContains("failed")
+                        || line.localizedCaseInsensitiveContains("panic") {
+                        ForgeLogger.claudeACP.error("\(prefix) stderr: \(line)")
+                    } else {
+                        ForgeLogger.claudeACP.info("\(prefix) stderr: \(line)")
+                    }
+                }
+            } catch {
+                ForgeLogger.claudeACP.error("\(prefix) stderr reader failed: \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
+private extension ClaudeAgentACPTransport {
+    static func isValidClaudeWorkspaceSettingsJSON(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            return false
+        }
+        return object is [String: Any]
+    }
+
+    static func repairTimestampString(now: Date = Date()) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: now)
+            .replacingOccurrences(of: ":", with: "-")
     }
 }
 

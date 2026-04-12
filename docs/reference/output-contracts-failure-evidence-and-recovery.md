@@ -43,7 +43,7 @@ It does not replace:
 
 - `WorkflowOrchestrator`,
 - `ArtifactManager`,
-- `GooseSessionBridge`,
+- `RuntimeSessionBridge`,
 - `RunReportBuilder`,
 - and recovery/report surfaces.
 

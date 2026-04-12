@@ -199,6 +199,132 @@ struct OrchestratorTests {
         }
     }
 
+    private actor BlockingSecondTaskBox {
+        private var hasStartedSecondTask = false
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func run(taskName: String) async -> AgentResult {
+            if taskName == "first_task" {
+                return AgentResult(
+                    outputs: [:],
+                    logSnippet: "first",
+                    costCents: nil,
+                    succeeded: true,
+                    errorMessage: nil,
+                    sessionID: nil,
+                    durationSeconds: 0,
+                    providerReceipt: nil,
+                    resolvedModel: nil,
+                    configuredProviderID: nil,
+                    adapterVersion: nil,
+                    canonicalOutcome: .completed,
+                    sessionReuseDisposition: .fresh
+                )
+            }
+
+            hasStartedSecondTask = true
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+
+            return AgentResult(
+                outputs: [:],
+                logSnippet: "second",
+                costCents: nil,
+                succeeded: true,
+                errorMessage: nil,
+                sessionID: nil,
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: nil,
+                configuredProviderID: nil,
+                adapterVersion: nil,
+                canonicalOutcome: .completed,
+                sessionReuseDisposition: .fresh
+            )
+        }
+
+        func waitUntilSecondTaskStarts() async {
+            while !hasStartedSecondTask {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        func releaseSecondTask() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
+    private struct BlockingSecondTaskExecutor: AgentExecutor {
+        let box: BlockingSecondTaskBox
+
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            await box.run(taskName: task.task)
+        }
+    }
+
+    private actor BlockingTaskStartBox {
+        private let expectedStartCount: Int
+        private var startedTaskNames: [String] = []
+        private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
+
+        init(expectedStartCount: Int) {
+            self.expectedStartCount = expectedStartCount
+        }
+
+        func run(taskName: String) async -> AgentResult {
+            startedTaskNames.append(taskName)
+            await withCheckedContinuation { continuation in
+                releaseContinuations.append(continuation)
+            }
+
+            return AgentResult(
+                outputs: [:],
+                logSnippet: "completed \(taskName)",
+                costCents: nil,
+                succeeded: true,
+                errorMessage: nil,
+                sessionID: nil,
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: nil,
+                configuredProviderID: nil,
+                adapterVersion: nil,
+                canonicalOutcome: .completed,
+                sessionReuseDisposition: .fresh
+            )
+        }
+
+        func waitUntilExpectedTasksStart() async {
+            while startedTaskNames.count < expectedStartCount {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        func releaseAll() {
+            let continuations = releaseContinuations
+            releaseContinuations.removeAll()
+            continuations.forEach { $0.resume() }
+        }
+    }
+
+    private struct BlockingTaskStartExecutor: AgentExecutor {
+        let box: BlockingTaskStartBox
+
+        func execute(
+            task: AgentTask,
+            agent: ResolvedAgent,
+            context: ExecutionContext
+        ) async throws -> AgentResult {
+            await box.run(taskName: task.task)
+        }
+    }
+
     private func runGit(_ arguments: [String], in directory: URL) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -501,6 +627,1206 @@ struct OrchestratorTests {
         #expect(signals.retryableEscalationCount == 1)
     }
 
+    @Test("Architect reviewer never resolves Codex fast tier to Spark")
+    func architectReviewerNeverResolvesCodexFastTierToSpark() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "proposal_reviewer_architect": ResolvedProviderBinding(
+                agentID: "proposal_reviewer_architect",
+                backendProfileID: "codex_architect_high",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.codexACP.rawValue,
+                providerIdentifier: ProviderFamily.codexACP.runtimeProviderIdentifier,
+                model: "GPT-5.4",
+                effort: "extra high",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Proposal Reviewer / Architect",
+            mode: "proposal_review.architect",
+            backendProfileID: "codex_architect_high",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            model: "GPT-5.4",
+            effort: "extra high",
+            maxTurns: 12,
+            temperature: 0.0,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: "architect",
+            prompt: "Review the proposal as an architect.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_architect"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "proposal_reviewer_architect",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "proposal_reviewer_architect", task: "review_architecture", inputs: nil, outputs: ["proposal_review_architect"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "proposal_reviewer_architect",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["proposal_reviewer_architect": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let success = AgentResult(
+            outputs: ["proposal_review_architect": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-architect",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "GPT-5.4"
+        )
+        let box = SequencedExecutionBox(results: [success])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(await box.models == ["GPT-5.4"])
+        #expect(run.status == .completed)
+
+        let agentExec = try #require(run.stageExecutions.first?.agentExecutions.first)
+        #expect(agentExec.modelTierUsed == "frontier")
+    }
+
+    @Test("Strategy escalation does not rerun apply-patch verification failures")
+    func strategyEscalationDoesNotRerunApplyPatchVerificationFailures() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "code_writer": ResolvedProviderBinding(
+                agentID: "code_writer",
+                backendProfileID: "codex_writer_high",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.codexACP.rawValue,
+                providerIdentifier: ProviderFamily.codexACP.runtimeProviderIdentifier,
+                model: "GPT-5.4",
+                effort: "high",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let agent = makeAgent(
+            id: "code_writer",
+            backendProfileID: "codex_writer_high",
+            outputs: ["implementation_progress"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "continue_implementation", inputs: nil, outputs: ["implementation_progress"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let failure = AgentResult(
+            outputs: [:],
+            logSnippet: "apply_patch verification failed",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "apply_patch verification failed: Failed to find expected lines in AddTransactionView.swift",
+            sessionID: "session-1",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completedWithTransportError,
+            sessionReuseDisposition: .fresh,
+            transportErrorKind: .provider,
+            providerStopReason: "apply_patch_verification_failed",
+            outputPresence: .none,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "GPT-5.4"
+        )
+        let unusedSuccess = AgentResult(
+            outputs: ["implementation_progress": Data("ok".utf8)],
+            logSnippet: "should not run",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-2",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.3-codex-spark",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "gpt-5.3-codex-spark"
+        )
+        let box = SequencedExecutionBox(results: [failure, unusedSuccess])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(await box.models == ["GPT-5.4"])
+        #expect(run.status == .failed)
+
+        let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let attempts = stage.agentExecutions.filter { $0.agentID == "code_writer" }
+        #expect(attempts.count == 1)
+        let agentExec = try #require(attempts.first)
+        #expect(agentExec.status == .failed)
+        #expect(agentExec.providerStopReason == "apply_patch_verification_failed")
+    }
+
+    @Test("Strategy escalation reruns Codex usage-limit failures with the frontier model")
+    func strategyEscalationRerunsCodexUsageLimitFailuresWithFrontierModel() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "code_writer": ResolvedProviderBinding(
+                agentID: "code_writer",
+                backendProfileID: "codex_writer_high",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.codexACP.rawValue,
+                providerIdentifier: ProviderFamily.codexACP.runtimeProviderIdentifier,
+                model: "GPT-5.4",
+                effort: "high",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            backendProfileID: "codex_writer_high",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "ORCH",
+            skillRef: "sk1",
+            skillRole: nil,
+            prompt: "implement",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["implementation_progress"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "continue_implementation", inputs: nil, outputs: ["implementation_progress"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let firstFailure = AgentResult(
+            outputs: [:],
+            logSnippet: "usage limit exhausted",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "Internal error (code -32603) {\"codex_error_info\":\"usage_limit_exceeded\"}",
+            sessionID: "session-1",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.3-codex-spark",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .limitExhaustedBeforeOutput,
+            sessionReuseDisposition: .fresh,
+            transportErrorKind: .provider,
+            providerStopReason: "usage_limit_exceeded",
+            outputPresence: .none,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "gpt-5.3-codex-spark"
+        )
+        let secondSuccess = AgentResult(
+            outputs: ["implementation_progress": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-2",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "GPT-5.4"
+        )
+        let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(await box.models == ["gpt-5.3-codex-spark", "GPT-5.4"])
+        #expect(run.status == .completed)
+    }
+
+    @Test("Gemini capacity exhaustion reruns sequential execution with a stable fallback model")
+    func geminiCapacityFallbackRerunsSequentialExecutionWithStableModel() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "proposal_reviewer_ui": ResolvedProviderBinding(
+                agentID: "proposal_reviewer_ui",
+                backendProfileID: "gemini_3_1_pro_preview_high",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.geminiACP.rawValue,
+                providerIdentifier: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+                model: "gemini-3.1-pro-preview",
+                effort: "medium",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "gemini_cli_acp",
+                adapterFamily: "gemini_cli_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ui",
+            title: "Proposal Reviewer / UI",
+            mode: "proposal_review.ui",
+            backendProfileID: "gemini_3_1_pro_preview_high",
+            provider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+            model: "gemini-3.1-pro-preview",
+            effort: "medium",
+            maxTurns: 12,
+            temperature: 0.2,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: nil,
+            prompt: "review proposal",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_ui"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "proposal_reviewer_ui",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "proposal_reviewer_ui", task: "review_ui", inputs: nil, outputs: ["proposal_review_ui"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "proposal_reviewer_ui",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["proposal_reviewer_ui": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let firstFailure = AgentResult(
+            outputs: [:],
+            logSnippet: "capacity exhausted",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "No capacity available for model gemini-3.1-pro-preview on the server",
+            sessionID: "session-1",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gemini-3.1-pro-preview",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .limitExhaustedBeforeOutput,
+            sessionReuseDisposition: .fresh,
+            transportErrorKind: .provider,
+            providerStopReason: "model_capacity_exhausted",
+            outputPresence: .none,
+            runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+            runtimeModel: "gemini-3.1-pro-preview"
+        )
+        let secondSuccess = AgentResult(
+            outputs: ["proposal_review_ui": Data("ok".utf8)],
+            logSnippet: "fallback success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-2",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gemini-2.5-pro",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+            runtimeModel: "gemini-2.5-pro"
+        )
+        let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+        #expect(await box.models == ["gemini-3.1-pro-preview", "gemini-2.5-pro"])
+
+        let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let attempts = stage.agentExecutions.filter { $0.agentID == "proposal_reviewer_ui" }
+        #expect(attempts.count == 1)
+        let agentExec = try #require(attempts.first)
+        #expect(agentExec.status == .completed)
+        #expect(agentExec.resolvedModel == "gemini-2.5-pro")
+    }
+
+    @Test("Gemini capacity exhaustion reruns parallel execution with a stable fallback model")
+    func geminiCapacityFallbackRerunsParallelExecutionWithStableModel() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "proposal_reviewer_ux": ResolvedProviderBinding(
+                agentID: "proposal_reviewer_ux",
+                backendProfileID: "gemini_3_1_pro_preview_high",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.geminiACP.rawValue,
+                providerIdentifier: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+                model: "gemini-3.1-pro-preview",
+                effort: "medium",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "gemini_cli_acp",
+                adapterFamily: "gemini_cli_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ux",
+            title: "Proposal Reviewer / UX",
+            mode: "proposal_review.ux",
+            backendProfileID: "gemini_3_1_pro_preview_high",
+            provider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+            model: "gemini-3.1-pro-preview",
+            effort: "medium",
+            maxTurns: 12,
+            temperature: 0.2,
+            permissionProfile: "RO_REVIEW",
+            skillRef: "proposal_review_triad",
+            skillRole: nil,
+            prompt: "review proposal",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_review_ux"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "proposal_reviewer_ux",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .parallel([AgentTask(agent: "proposal_reviewer_ux", task: "review_ux", inputs: nil, outputs: ["proposal_review_ux"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "proposal_reviewer_ux",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["proposal_reviewer_ux": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let firstFailure = AgentResult(
+            outputs: [:],
+            logSnippet: "capacity exhausted",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "No capacity available for model gemini-3.1-pro-preview on the server",
+            sessionID: "session-1",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gemini-3.1-pro-preview",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .limitExhaustedBeforeOutput,
+            sessionReuseDisposition: .fresh,
+            transportErrorKind: .provider,
+            providerStopReason: "model_capacity_exhausted",
+            outputPresence: .none,
+            runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+            runtimeModel: "gemini-3.1-pro-preview"
+        )
+        let secondSuccess = AgentResult(
+            outputs: ["proposal_review_ux": Data("ok".utf8)],
+            logSnippet: "fallback success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-2",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gemini-2.5-pro",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
+            runtimeModel: "gemini-2.5-pro"
+        )
+        let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+        #expect(await box.models == ["gemini-3.1-pro-preview", "gemini-2.5-pro"])
+
+        let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let attempts = stage.agentExecutions.filter { $0.agentID == "proposal_reviewer_ux" }
+        #expect(attempts.count == 1)
+        let agentExec = try #require(attempts.first)
+        #expect(agentExec.status == .completed)
+        #expect(agentExec.resolvedModel == "gemini-2.5-pro")
+    }
+
+    @Test("Sequential watchdog failures create durable same-stage retry lineage before succeeding")
+    func sequentialWatchdogFailureCreatesDurableRetryLineage() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        let agent = makeAgent(id: "agent_1", outputs: ["output_1"])
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "agent_1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "agent_1", task: "do_work", inputs: nil, outputs: ["output_1"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "agent_1",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["agent_1": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let firstFailure = AgentResult(
+            outputs: [:],
+            logSnippet: "stalled after first edit",
+            costCents: nil,
+            succeeded: false,
+            errorMessage: "Execution stalled after first edit without verified filesystem side effects",
+            sessionID: "session-1",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .failedBeforeOutput,
+            supervisionClassification: .idleHangAfterFirstEdit,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .none,
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+        let secondSuccess = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: "session-2",
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "gpt-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: "codex",
+            runtimeModel: "gpt-5.4"
+        )
+        let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(run.status == .completed)
+
+        let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
+        let attempts = stage.agentExecutions
+            .filter { $0.agentID == "agent_1" && $0.taskName == "do_work" }
+            .sorted { ($0.agentAttemptNumber ?? 1) < ($1.agentAttemptNumber ?? 1) }
+
+        #expect(attempts.count == 2)
+        let firstAttempt = try #require(attempts.first)
+        let retryAttempt = try #require(attempts.last)
+        #expect(firstAttempt.status == .failed)
+        #expect(firstAttempt.supervisionClassification == .idleHangAfterFirstEdit)
+        #expect(retryAttempt.status == .completed)
+        #expect(retryAttempt.retryReason == "automatic_watchdog_retry")
+        #expect(retryAttempt.agentAttemptNumber == 2)
+        #expect(retryAttempt.supersedesAgentExecutionID == firstAttempt.id)
+        #expect(retryAttempt.stageExecution?.id == stage.id)
+    }
+
+    @Test("Implementation loop does not downgrade Codex writer to fast tier after a no-progress attempt")
+    func implementationLoopDoesNotDowngradeCodexWriterAfterNoProgressAttempt() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "code_writer": ResolvedProviderBinding(
+                agentID: "code_writer",
+                backendProfileID: "bp",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.codexACP.rawValue,
+                providerIdentifier: ProviderFamily.codexACP.runtimeProviderIdentifier,
+                model: "GPT-5.4",
+                effort: "high",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let priorStage = StageExecution(
+            stageID: "start",
+            label: "Start",
+            startedAt: Date(timeIntervalSince1970: 1),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        priorStage.lineageID = "start"
+        priorStage.run = run
+        context.insert(priorStage)
+
+        let priorExecution = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "implement",
+            startedAt: Date(timeIntervalSince1970: 1),
+            status: .failed,
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            effort: "high"
+        )
+        priorExecution.completedAt = Date(timeIntervalSince1970: 2)
+        priorExecution.modelTierUsed = "fast"
+        priorExecution.canonicalOutcome = .timedOutBeforeOutput
+        priorExecution.transportErrorKind = .timeout
+        priorExecution.outputPresence = .none
+        priorExecution.stageExecution = priorStage
+        context.insert(priorExecution)
+
+        let previousArtifactRoot = workspace.artifactRoot
+            .appendingPathComponent("prior-no-progress", isDirectory: true)
+        try FileManager.default.createDirectory(at: previousArtifactRoot, withIntermediateDirectories: true)
+
+        let changedFilesURL = previousArtifactRoot.appendingPathComponent("changed_files_manifest")
+        try """
+        {
+          "files" : [],
+          "summary" : "Execution stopped before producing a changed-files report."
+        }
+        """.write(to: changedFilesURL, atomically: true, encoding: .utf8)
+
+        let progressURL = previousArtifactRoot.appendingPathComponent("implementation_progress")
+        try """
+        {
+          "completed_items" : [],
+          "current_phase" : "implementation",
+          "deferred_items" : ["changed_files_manifest", "tests_result"],
+          "status" : "blocked"
+        }
+        """.write(to: progressURL, atomically: true, encoding: .utf8)
+
+        let changedFilesArtifact = Artifact(
+            name: "changed_files_manifest",
+            contractID: "changed_files_manifest",
+            format: .json,
+            filePath: changedFilesURL.path,
+            runID: run.id,
+            stageID: "start",
+            agentID: "code_writer",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            attemptNumber: 1
+        )
+        changedFilesArtifact.agentExecution = priorExecution
+        context.insert(changedFilesArtifact)
+
+        let progressArtifact = Artifact(
+            name: "implementation_progress",
+            contractID: "implementation_progress",
+            format: .json,
+            filePath: progressURL.path,
+            runID: run.id,
+            stageID: "start",
+            agentID: "code_writer",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            attemptNumber: 1
+        )
+        progressArtifact.agentExecution = priorExecution
+        context.insert(progressArtifact)
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            backendProfileID: "bp",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "CODE_WRITE",
+            skillRef: "sk1",
+            skillRole: nil,
+            prompt: "implement",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["output_1"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "implement", inputs: nil, outputs: ["output_1"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let success = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "GPT-5.4"
+        )
+        let box = SequencedExecutionBox(results: [success])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let models = await box.models
+        #expect(models == ["GPT-5.4"])
+
+        let latestExecution = try #require(
+            run.stageExecutions
+                .flatMap(\.agentExecutions)
+                .filter { $0.agentID == "code_writer" && $0.startedAt > priorExecution.startedAt }
+                .sorted { $0.startedAt < $1.startedAt }
+                .last
+        )
+        #expect(latestExecution.modelTierUsed == "frontier")
+    }
+
+    @Test("Implementation loop does not downgrade Codex writer to fast tier after a usage-limit attempt")
+    func implementationLoopDoesNotDowngradeCodexWriterAfterUsageLimitAttempt() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "code_writer": ResolvedProviderBinding(
+                agentID: "code_writer",
+                backendProfileID: "bp",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.codexACP.rawValue,
+                providerIdentifier: ProviderFamily.codexACP.runtimeProviderIdentifier,
+                model: "GPT-5.4",
+                effort: "high",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let priorStage = StageExecution(
+            stageID: "start",
+            label: "Start",
+            startedAt: Date(timeIntervalSince1970: 1),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        priorStage.lineageID = "start"
+        priorStage.run = run
+        context.insert(priorStage)
+
+        let priorExecution = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "implement",
+            startedAt: Date(timeIntervalSince1970: 1),
+            status: .failed,
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            effort: "high"
+        )
+        priorExecution.completedAt = Date(timeIntervalSince1970: 2)
+        priorExecution.modelTierUsed = "fast"
+        priorExecution.providerStopReason = "usage_limit_exceeded"
+        priorExecution.canonicalOutcome = .limitExhaustedBeforeOutput
+        priorExecution.transportErrorKind = .provider
+        priorExecution.outputPresence = .none
+        priorExecution.stageExecution = priorStage
+        context.insert(priorExecution)
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            backendProfileID: "bp",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "CODE_WRITE",
+            skillRef: "sk1",
+            skillRole: nil,
+            prompt: "implement",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["output_1"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "implement", inputs: nil, outputs: ["output_1"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let success = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "GPT-5.4"
+        )
+        let box = SequencedExecutionBox(results: [success])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        let models = await box.models
+        #expect(models == ["GPT-5.4"])
+
+        let latestExecution = try #require(
+            run.stageExecutions
+                .flatMap(\.agentExecutions)
+                .filter { $0.agentID == "code_writer" && $0.startedAt > priorExecution.startedAt }
+                .sorted { $0.startedAt < $1.startedAt }
+                .last
+        )
+        #expect(latestExecution.modelTierUsed == "frontier")
+    }
+
     // MARK: - Multi-State Workflow
 
     @Test("Multi-state workflow executes agents in order")
@@ -561,6 +1887,205 @@ struct OrchestratorTests {
         #expect(executor.executedTasks.count == 2)
         #expect(executor.executedTasks[0].agentID == "a1")
         #expect(executor.executedTasks[1].agentID == "a2")
+    }
+
+    @Test("Downstream stage materialization is durably visible before first agent result")
+    func downstreamStageMaterializationIsDurableBeforeAgentWork() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        try context.save()
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "s1": ExecutableState(
+                    id: "s1", label: "Stage 1", type: .start,
+                    ownerAgentID: "a1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a1", task: "first_task", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "s2", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "s2": ExecutableState(
+                    id: "s2", label: "Stage 2", type: nil,
+                    ownerAgentID: "a2",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a2", task: "second_task", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a2", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "s1",
+            agentBindings: [
+                "a1": makeAgent(id: "a1"),
+                "a2": makeAgent(id: "a2")
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let box = BlockingSecondTaskBox()
+        let orchestrator = WorkflowOrchestrator(
+            run: run, plan: plan, workspace: workspace,
+            executor: BlockingSecondTaskExecutor(box: box), modelContext: context
+        )
+
+        let runTask = Task { @MainActor in
+            await orchestrator.start()
+        }
+
+        await box.waitUntilSecondTaskStarts()
+
+        let freshContext = ModelContext(container)
+        let freshRuns = try freshContext.fetch(FetchDescriptor<Run>())
+        let persistedRun = try #require(freshRuns.first(where: { $0.id == run.id }))
+        #expect(persistedRun.transitionCursor?.settlementPhase == .transitionStarted)
+        #expect(
+            persistedRun.stageExecutions.contains(where: {
+                $0.stageID == "s2" && $0.status == .running
+            })
+        )
+
+        await box.releaseSecondTask()
+        await runTask.value
+    }
+
+    @Test("Sequential agent execution is durably visible before first agent result")
+    func sequentialAgentExecutionIsDurableBeforeFirstResult() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        try context.save()
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "a1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "a1", task: "blocking_task", inputs: nil, outputs: nil)])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["a1": makeAgent(id: "a1")],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let box = BlockingTaskStartBox(expectedStartCount: 1)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: BlockingTaskStartExecutor(box: box),
+            modelContext: context
+        )
+
+        let runTask = Task { @MainActor in
+            await orchestrator.start()
+        }
+
+        await box.waitUntilExpectedTasksStart()
+
+        let freshContext = ModelContext(container)
+        let persistedRun = try #require(try freshContext.fetch(FetchDescriptor<Run>()).first(where: { $0.id == run.id }))
+        let persistedStage = try #require(persistedRun.stageExecutions.first(where: { $0.stageID == "start" }))
+        #expect(persistedStage.status == .running)
+        #expect(persistedStage.agentExecutions.count == 1)
+        #expect(persistedStage.agentExecutions.first?.status == .running)
+
+        await box.releaseAll()
+        await runTask.value
+    }
+
+    @Test("Parallel agent executions are durably visible before first agent result")
+    func parallelAgentExecutionsAreDurablyVisibleBeforeFirstResult() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        try context.save()
+
+        let plan = RunPlan(
+            workflowID: "wf", workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start", label: "Start", type: .start,
+                    ownerAgentID: "a1",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .parallel([
+                            AgentTask(agent: "a1", task: "parallel_one", inputs: nil, outputs: nil),
+                            AgentTask(agent: "a2", task: "parallel_two", inputs: nil, outputs: nil)
+                        ])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false, approvalPolicy: nil, loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end", label: "End", type: .end,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "a1": makeAgent(id: "a1"),
+                "a2": makeAgent(id: "a2")
+            ],
+            variables: [:],
+            scoring: nil, failurePolicy: nil,
+            workflowSnapshotHash: "h1", catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(), catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let box = BlockingTaskStartBox(expectedStartCount: 2)
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: BlockingTaskStartExecutor(box: box),
+            modelContext: context
+        )
+
+        let runTask = Task { @MainActor in
+            await orchestrator.start()
+        }
+
+        await box.waitUntilExpectedTasksStart()
+
+        let freshContext = ModelContext(container)
+        let persistedRun = try #require(try freshContext.fetch(FetchDescriptor<Run>()).first(where: { $0.id == run.id }))
+        let persistedStage = try #require(persistedRun.stageExecutions.first(where: { $0.stageID == "start" }))
+        #expect(persistedStage.status == .running)
+        #expect(persistedStage.agentExecutions.count == 2)
+        #expect(persistedStage.agentExecutions.allSatisfy { $0.status == .running })
+
+        await box.releaseAll()
+        await runTask.value
     }
 
     // MARK: - Parallel Execution
@@ -993,7 +2518,8 @@ struct OrchestratorTests {
         #expect(run.status == .completed)
         #expect(stage.status == .completed)
         #expect(agentExecution.status == .completed)
-        #expect(agentExecution.canonicalOutcome == .timedOutAfterOutput)
+        #expect(agentExecution.canonicalOutcome == .completedWithTransportError)
+        #expect(agentExecution.transportErrorKind == .timeout)
         #expect(agentExecution.artifacts.contains(where: { $0.name == "proposal_review_architect" }))
     }
 
@@ -2592,6 +4118,7 @@ struct OrchestratorTests {
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .failedBeforeOutput,
+            supervisionClassification: .mutationSideEffectMissing,
             sessionReuseDisposition: .fresh,
             outputPresence: .durableOutput
         )
@@ -2674,6 +4201,8 @@ struct OrchestratorTests {
         let stageExec = try #require(stageExecutionsByID["start"])
         let agentExec = try #require(stageExec.agentExecutions.first)
         #expect(agentExec.status == .completed)
+        #expect(agentExec.canonicalOutcome == .completedWithTransportError)
+        #expect(agentExec.supervisionClassification == .mutationSideEffectMissing)
         let artifactNames = Set(agentExec.artifacts.map(\.name))
         #expect(artifactNames.contains("implementation_progress"))
         #expect(artifactNames.contains("implementation_self_assessment"))

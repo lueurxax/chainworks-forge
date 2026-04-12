@@ -53,8 +53,8 @@ struct RunComparisonService {
         let driftB = runB.driftDetails
 
         // Runtime trust level
-        let trustA = runA.runtimeTrustLevel ?? "unknown"
-        let trustB = runB.runtimeTrustLevel ?? "unknown"
+        let trustA = runA.normalizedRuntimeTrustLevel ?? "unknown"
+        let trustB = runB.normalizedRuntimeTrustLevel ?? "unknown"
 
         // Provider / model / effort bindings
         let bindingsA = extractBindings(from: runA)

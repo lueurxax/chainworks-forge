@@ -310,10 +310,16 @@ struct RecoverySheet: View {
                     break
                 }
                 // Load workflow from source path
-                guard let workflow = try? YAMLParser.loadWorkflow(
-                    from: URL(fileURLWithPath: run.workflowSourcePath)
-                ) else {
-                    errorMessage = "Cannot load workflow from \(run.workflowSourcePath)"
+                let workflow: WorkflowDefinition
+                do {
+                    workflow = try YAMLParser.loadWorkflow(
+                        from: URL(fileURLWithPath: run.workflowSourcePath)
+                    )
+                } catch {
+                    ForgeLogger.ui.error(
+                        "RecoverySheet failed to load workflow for run \(run.id) from \(run.workflowSourcePath): \(error.localizedDescription)"
+                    )
+                    errorMessage = "Cannot load workflow from \(run.workflowSourcePath): \(error.localizedDescription)"
                     break
                 }
                 let compiler = RunPlanCompiler(modelContext: modelContext)

@@ -140,20 +140,19 @@ Deterministic mock. Generates structurally valid outputs via
 `OutputContractTemplates`. Supports injectable failures (`failingAgentIDs`) and
 configurable delay. Thread-safe task tracking for test assertions.
 
-#### GooseAgentExecutor (`GooseAgentExecutor.swift`)
+#### RuntimeAgentExecutor (`RuntimeAgentExecutor.swift`)
 
-Live executor using a Goose backend. Accepts `any GooseTransportProtocol` (bespoke
-or `GooseServerTransport`). Per-execution flow:
+Live executor using the selected ACP runtime transport. Per-execution flow:
 
 1. Validate workspace boundaries.
-2. Create an isolated session via `GooseSessionBridge`.
+2. Create an isolated session via `RuntimeSessionBridge`.
 3. Stream execution events through `ExecutionEventBridge`.
 4. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
 5. Read declared output files from the workspace artifact directory.
 6. Validate required outputs -- missing outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
-before the SSE connection dropped.
+before the transport closed.
 
 ### Artifact Manager (`ArtifactManager.swift`)
 
@@ -223,9 +222,8 @@ Responsibilities:
 - **Approval resolution** -- routes approval decisions to the correct orchestrator.
 - **Cancellation** -- cancels the orchestrator and cleans up state.
 - **Executor selection** -- for live workflows (`proposal_loop_live`), selects a
-  `GooseAgentExecutor` backed by the selected `RuntimeTransportProtocol`
-  implementation (Goose compatibility or ACP-native adapter) and optional
-  provider/model override.
+  `RuntimeAgentExecutor` backed by the selected `RuntimeTransportProtocol`
+  implementation and optional provider/model override.
 - **Post-run hooks** -- triggers Steward analysis and emits run reports on completion.
 
 ---
@@ -276,7 +274,7 @@ Responsibilities:
       │        │                                 │
       │        v                                 │
       │  ┌─────────────┐                         │
-      │  │AgentExecutor│  (Simulated or Goose)   │
+      │  │AgentExecutor│  (Simulated or ACP)     │
       │  └─────┬───────┘                         │
       │        │ AgentResult ([String: Data])     │
       │        v                                 │
@@ -301,7 +299,7 @@ Responsibilities:
 | `Engine/WorkflowOrchestrator.swift` | Per-run state machine driver |
 | `Engine/AgentExecutor.swift` | Executor protocol, ExecutionContext, AgentResult |
 | `Engine/SimulatedAgentExecutor.swift` | Deterministic mock executor |
-| `Engine/GooseAgentExecutor.swift` | Live executor via Goose backend |
+| `Engine/RuntimeAgentExecutor.swift` | Live executor via ACP runtime transport |
 | `Engine/ArtifactManager.swift` | SwiftData metadata bridge for artifacts |
 | `Engine/ArtifactStorage.swift` | Nonisolated disk I/O with path guards |
 | `Engine/TransitionEvaluator.swift` | Stateless transition condition evaluator |

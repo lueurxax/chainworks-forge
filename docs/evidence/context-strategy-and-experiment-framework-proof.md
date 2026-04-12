@@ -10,7 +10,7 @@ Current implementation and proof status for the context-strategy, experiment, la
 | Source contract | [../reference/context-strategy-and-experiment-framework.md](../reference/context-strategy-and-experiment-framework.md) |
 | Current implementation status | Implemented |
 | Current readiness | Ready |
-| Primary proof owners | `Proposal019Tests`, `GooseSessionBridgeTests`, `GooseAgentExecutorTests`, `OrchestratorTests`, canonical `proposal-019` gate |
+| Primary proof owners | `Proposal019Tests`, `RuntimeSessionBridgeTests`, `RuntimeAgentExecutorTests`, `OrchestratorTests`, canonical `proposal-019` gate |
 | Last consolidated documentation refresh | `2026-04-01` |
 
 ## What is considered proven
@@ -31,8 +31,8 @@ The accepted proof story for this slice supports these claims:
 The strongest current-head proof owners are:
 
 - `Proposal019Tests`
-- `GooseSessionBridgeTests`
-- `GooseAgentExecutorTests`
+- `RuntimeSessionBridgeTests`
+- `RuntimeAgentExecutorTests`
 - `OrchestratorTests`
 - `scripts/test-gate.sh proposal-019`
 

@@ -693,6 +693,7 @@ struct BlockedRunRecoveryView: View {
     }
 
     private func togglePromotedArtifact(named artifactName: String) {
+        let previousPromotedArtifacts = promotedArtifacts
         var names = promotedArtifacts
         if let index = names.firstIndex(of: artifactName) {
             names.remove(at: index)
@@ -700,9 +701,17 @@ struct BlockedRunRecoveryView: View {
             names.append(artifactName)
         }
         names.sort()
-        promotedArtifacts = names
-        run.promotedHandoffArtifactsJSON = try? JSONEncoder().encode(names)
-        try? modelContext.save()
+        do {
+            let encodedNames = try JSONEncoder().encode(names)
+            promotedArtifacts = names
+            run.promotedHandoffArtifactsJSON = encodedNames
+            try modelContext.save()
+            errorMessage = nil
+        } catch {
+            promotedArtifacts = previousPromotedArtifacts
+            ForgeLogger.recovery.error("Failed to update promoted artifacts for run \(run.id): \(error.localizedDescription)")
+            errorMessage = "Failed to update promoted artifacts: \(error.localizedDescription)"
+        }
     }
 
     private func nonEmpty(_ value: String) -> String? {

@@ -8,11 +8,54 @@ import SwiftData
 /// Latest summary artifacts exist separately from immutable history.
 @MainActor
 final class RunReportBuilder {
+    static let immutableHistoryRetentionVersions = 10
 
     private let modelContext: ModelContext
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
+    }
+
+    enum SummarySnapshotMode {
+        case checkpoint
+        case live(status: RunStatus)
+
+        var effectiveStatus: RunStatus? {
+            switch self {
+            case .checkpoint:
+                return nil
+            case .live(let status):
+                return status
+            }
+        }
+
+        var suppressRecoveryNarrative: Bool {
+            switch self {
+            case .checkpoint:
+                return false
+            case .live(let status):
+                switch status {
+                case .pending, .ready, .running:
+                    return true
+                case .waitingApproval, .blocked, .completed, .failed, .cancelled, .cancelling:
+                    return false
+                }
+            }
+        }
+
+        var completedAtOverride: Date?? {
+            switch self {
+            case .checkpoint:
+                return nil
+            case .live(let status):
+                switch status {
+                case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
+                    return .some(nil)
+                case .completed, .failed, .cancelled:
+                    return nil
+                }
+            }
+        }
     }
 
     // MARK: - Report Generation (§6.3)
@@ -70,6 +113,7 @@ final class RunReportBuilder {
 
         // Emit latest summary
         try emitLatestSummary(for: run, basedOn: report)
+        try pruneImmutableHistory(for: run, keepingLatestVersions: Self.immutableHistoryRetentionVersions)
 
         try modelContext.save()
 
@@ -112,6 +156,23 @@ final class RunReportBuilder {
         }
     }
 
+    func emitLatestSummarySnapshot(for run: Run) throws {
+        let version = max(run.latestReportVersion, 1)
+        let mode = SummarySnapshotMode.live(status: run.status)
+        let report = buildReportPayload(for: run, version: version, summarySnapshotMode: mode)
+        try emitLatestSummary(for: run, basedOn: report)
+        try modelContext.save()
+    }
+
+    func pruneImmutableHistoryForAllRuns() throws {
+        let descriptor = FetchDescriptor<Run>()
+        let runs = try modelContext.fetch(descriptor)
+        for run in runs where run.latestReportVersion > Self.immutableHistoryRetentionVersions {
+            try pruneImmutableHistory(for: run, keepingLatestVersions: Self.immutableHistoryRetentionVersions)
+        }
+        try modelContext.save()
+    }
+
     // MARK: - Proposal 032: Cursor-Derived Report Stage ID
 
     /// Derive the stageID for report artifact metadata from the durable cursor.
@@ -137,7 +198,7 @@ final class RunReportBuilder {
     /// Determines if a report should be emitted based on current run state (§6.3).
     func shouldEmitReport(for run: Run) -> Bool {
         switch run.presentationStatus {
-        case .completed, .failed, .cancelled, .blocked:
+        case .completed, .failed, .cancelled, .blocked, .waitingApproval:
             return true
         default:
             return false
@@ -146,13 +207,17 @@ final class RunReportBuilder {
 
     // MARK: - Report Payload Construction (§6.4)
 
-    func buildReportPayload(for run: Run, version: Int) -> RunReportPayload {
+    func buildReportPayload(
+        for run: Run,
+        version: Int,
+        summarySnapshotMode: SummarySnapshotMode = .checkpoint
+    ) -> RunReportPayload {
         let historicalStages = PersistedRunGraph.stageExecutions(for: run).sorted { $0.startedAt < $1.startedAt }
         let canonicalStages = canonicalStages(from: historicalStages)
         let timelineStages = stageTimelineStages(from: canonicalStages)
         let allAgents = canonicalStages.flatMap { canonicalAgents(for: $0) }
         let approvals = PersistedRunGraph.approvals(for: run).sorted { $0.requestedAt < $1.requestedAt }
-        let runStatus = run.presentationStatus
+        let runStatus = summarySnapshotMode.effectiveStatus ?? run.presentationStatus
 
         // Stage timeline (canonical lineage only)
         let stageTimeline: [RunReportPayload.StageEntry] = timelineStages.map { stage in
@@ -245,12 +310,18 @@ final class RunReportBuilder {
         let proposalLoopSummary = ProposalLoopFeedbackParser.parseSummary(from: allArtifacts)
 
         // §6.5: Retry/recovery narrative
-        let retriesPerformed = historicalStages.reduce(0) { $0 + max(0, $1.attemptNumber - 1) }
+        let stageRetriesPerformed = historicalStages.reduce(0) { $0 + max(0, $1.attemptNumber - 1) }
+        let agentRetriesPerformed = historicalStages
+            .flatMap(\.agentExecutions)
+            .filter { $0.retryReason != nil }
+            .count
+        let retriesPerformed = stageRetriesPerformed + agentRetriesPerformed
         let recoveryActionsTaken: [String] = historicalStages
             .flatMap(\.agentExecutions)
             .compactMap { $0.retryReason }
 
         let interruptedContinuationStage = interruptedContinuationStage(for: run, historicalStages: historicalStages)
+        let exhaustedWatchdogStage = exhaustedAutomaticWatchdogFailureStage(from: historicalStages)
 
         let unresolvedFailureStages = unresolvedFailureStages(
             from: canonicalStages,
@@ -264,7 +335,7 @@ final class RunReportBuilder {
             return RunReportPayload.FailureEvidenceSummary(
                 stageID: packet.stageID,
                 stageLabel: packet.stageLabel,
-                failureClass: packet.failureClass.rawValue,
+                failureClass: packet.supervisionClassification?.rawValue ?? packet.failureClass.rawValue,
                 failureSummary: packet.failureSummary,
                 rawOutputsExist: packet.rawOutputsExist,
                 receiptExists: packet.receiptExists,
@@ -272,23 +343,28 @@ final class RunReportBuilder {
             )
         }
 
-        let currentRecoveryStage = interruptedContinuationStage
+        let currentRecoveryStage = exhaustedWatchdogStage
+            ?? interruptedContinuationStage
             ?? unresolvedFailureStages.last
-        let currentRecoverySnapshot = interruptedContinuationStage == nil
-            ? currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
-            : nil
-        let blockedReason = currentRecoveryStage.flatMap { failureEvidencePacket(for: $0, run: run)?.failureSummary } ?? run.driftDetails
-        let driftNote = reportDriftNote(
+        let currentRecoverySnapshot = currentRecoveryStage.flatMap { recoverySnapshot(for: run, stage: $0) }
+        let usesInterruptedContinuationTruth = exhaustedWatchdogStage == nil
+            && interruptedContinuationStage?.id == currentRecoveryStage?.id
+        let blockedReason = summarySnapshotMode.suppressRecoveryNarrative
+            ? nil
+            : currentRecoveryStage.flatMap { failureEvidencePacket(for: $0, run: run)?.failureSummary } ?? run.driftDetails
+        let driftNote = summarySnapshotMode.suppressRecoveryNarrative ? nil : reportDriftNote(
             run: run,
             currentRecoveryStage: currentRecoveryStage,
-            interruptedContinuationStage: interruptedContinuationStage
+            interruptedContinuationStage: usesInterruptedContinuationTruth ? interruptedContinuationStage : nil
         )
-        let retryPath = interruptedContinuationStage == nil ? retryPathDescription(from: currentRecoverySnapshot) : nil
-        let resumePath = resumePathDescription(
+        let retryPath = summarySnapshotMode.suppressRecoveryNarrative
+            ? nil
+            : (usesInterruptedContinuationTruth ? nil : retryPathDescription(from: currentRecoverySnapshot))
+        let resumePath = summarySnapshotMode.suppressRecoveryNarrative ? nil : resumePathDescription(
             run: run,
             waitingApprovalStage: historicalStages.last(where: { $0.status == .waitingApproval }),
             snapshot: currentRecoverySnapshot,
-            interruptedContinuationStage: interruptedContinuationStage
+            interruptedContinuationStage: usesInterruptedContinuationTruth ? interruptedContinuationStage : nil
         )
         let contextStrategyProfileID = strategyProfileID(for: run)
         let strategyAssignmentMode = strategyAssignmentMode(for: run)
@@ -305,12 +381,12 @@ final class RunReportBuilder {
             runStatus: runStatus.rawValue,
             version: version,
             startedAt: run.startedAt,
-            completedAt: run.completedAt,
+            completedAt: summarySnapshotMode.completedAtOverride ?? run.completedAt,
             elapsedSeconds: elapsedTime(for: run),
             totalCostCents: run.totalCostCents,
             workflowSnapshotHash: run.workflowSnapshotHash,
             catalogSnapshotHash: run.catalogSnapshotHash,
-            runtimeTrustLevel: run.runtimeTrustLevel ?? "unknown",
+            runtimeTrustLevel: run.normalizedRuntimeTrustLevel ?? "unknown",
             driftNote: driftNote,
             completedStages: completedStages,
             skippedStages: skippedStages,
@@ -405,6 +481,30 @@ final class RunReportBuilder {
             }
             return lhs.id.uuidString < rhs.id.uuidString
         }
+    }
+
+    private func exhaustedAutomaticWatchdogFailureStage(from stages: [StageExecution]) -> StageExecution? {
+        stages
+            .filter { $0.status == .failed || $0.status == .blocked }
+            .sorted { lhs, rhs in
+                if lhs.startedAt != rhs.startedAt {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                if lhs.iteration != rhs.iteration {
+                    return lhs.iteration < rhs.iteration
+                }
+                if lhs.attemptNumber != rhs.attemptNumber {
+                    return lhs.attemptNumber < rhs.attemptNumber
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            .last { stage in
+                stage.agentExecutions.contains { agent in
+                    agent.status == .failed
+                        && agent.supervisionClassification != nil
+                        && agent.retryReason == "automatic_watchdog_retry"
+                }
+            }
     }
 
     private func stageTimelineStages(from canonicalStages: [StageExecution]) -> [StageExecution] {
@@ -694,7 +794,7 @@ final class RunReportBuilder {
         lines.append("")
         if let mcpTelemetry = payload.mcpTelemetry {
             lines.append("## 5A. MCP Telemetry")
-            lines.append("- Executions with MCP profile: \(mcpTelemetry.totalExecutionsWithMCPProfile)")
+            lines.append("- Executions with backend MCP requirements: \(mcpTelemetry.totalExecutionsWithMCPProfile)")
             lines.append("- Zero-MCP executions: \(mcpTelemetry.totalZeroMCPExecutions)")
             lines.append("- Requested runtime extensions: \(mcpTelemetry.totalRequestedExtensionCount)")
             lines.append("- Predicted runtime extensions: \(mcpTelemetry.totalPredictedExtensionCount)")
@@ -753,7 +853,7 @@ final class RunReportBuilder {
                 || !agent.predictedMCPExtensions.isEmpty
                 || !agent.actualMCPExtensions.isEmpty
                 || !agent.deniedMCPExtensions.isEmpty {
-                lines.append("  - MCP profile: \(agent.mcpProfileID ?? "none")")
+                lines.append("  - Backend MCP owner: \(agent.mcpProfileID ?? "none")")
                 lines.append("  - MCP requested: \(joinedList(agent.requestedMCPExtensions))")
                 lines.append("  - MCP predicted: \(joinedList(agent.predictedMCPExtensions))")
                 lines.append("  - MCP actual: \(joinedList(agent.actualMCPExtensions))")
@@ -896,6 +996,9 @@ final class RunReportBuilder {
         lines.append("Elapsed: \(formattedDuration(payload.elapsedSeconds))")
         if let cost = payload.totalCostCents { lines.append("Cost: \(cost) cents") }
         if let drift = payload.driftNote { lines.append("Drift: \(drift)") }
+        if let blockedReason = payload.blockedReason { lines.append("Blocked reason: \(blockedReason)") }
+        if let retryPath = payload.retryPath { lines.append("Retry path: \(retryPath)") }
+        if let resumePath = payload.resumePath { lines.append("Resume path: \(resumePath)") }
         if let profile = payload.contextStrategyProfileID { lines.append("Strategy: \(profile)") }
         if let mode = payload.strategyAssignmentMode { lines.append("Strategy mode: \(mode)") }
         if let state = payload.strategyRecommendationState { lines.append("Strategy recommendation state: \(state)") }
@@ -927,6 +1030,13 @@ final class RunReportBuilder {
             }
         }
         lines.append("")
+        if !payload.failureEvidenceSummaries.isEmpty {
+            lines.append("Failure evidence summaries:")
+            for evidence in payload.failureEvidenceSummaries {
+                lines.append("- \(evidence.stageLabel): \(evidence.failureClass) — \(evidence.failureSummary)")
+            }
+            lines.append("")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -940,6 +1050,20 @@ final class RunReportBuilder {
             "completedStages": payload.completedStages,
             "failedStages": payload.failedStages,
             "elapsedSeconds": payload.elapsedSeconds,
+            "blockedReason": payload.blockedReason as Any,
+            "retryPath": payload.retryPath as Any,
+            "resumePath": payload.resumePath as Any,
+            "failureEvidenceSummaries": payload.failureEvidenceSummaries.map {
+                [
+                    "stageID": $0.stageID,
+                    "stageLabel": $0.stageLabel,
+                    "failureClass": $0.failureClass,
+                    "failureSummary": $0.failureSummary,
+                    "rawOutputsExist": $0.rawOutputsExist,
+                    "receiptExists": $0.receiptExists,
+                    "transcriptExists": $0.transcriptExists
+                ]
+            },
             "proposalLoopSummary": payload.proposalLoopSummary.map { $0.backlogItemCount > -1 ? [
                 "reviewCorpusBundlePresent": $0.reviewCorpusBundlePresent,
                 "reviewCorpusRawArtifactCount": $0.reviewCorpusRawArtifactCount as Any,
@@ -1071,6 +1195,31 @@ final class RunReportBuilder {
             withIntermediateDirectories: true
         )
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func pruneImmutableHistory(for run: Run, keepingLatestVersions retentionLimit: Int) throws {
+        guard retentionLimit > 0 else { return }
+
+        let minimumRetainedVersion = max(1, run.latestReportVersion - retentionLimit + 1)
+        let runID = run.id
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { artifact in
+                artifact.runID == runID && artifact.reportKind == "immutable_history"
+            }
+        )
+
+        let staleArtifacts = try modelContext.fetch(descriptor).filter { artifact in
+            guard let version = artifact.reportVersion else { return false }
+            return version < minimumRetainedVersion
+        }
+
+        for artifact in staleArtifacts {
+            let fileURL = URL(fileURLWithPath: artifact.filePath)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+            modelContext.delete(artifact)
+        }
     }
 }
 

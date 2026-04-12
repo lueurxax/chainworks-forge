@@ -127,40 +127,6 @@ struct RuntimeSessionBridgeTests {
             paths: [:],
             artifacts: [:],
             skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: nil, description: nil)],
-            mcpPolicy: .defaultDeny,
-            mcpServerRegistry: [
-                "context7": MCPServerRegistryEntry(
-                    runtimeIDs: [
-                        "claude_agent": "context7"
-                    ],
-                    sessionScoped: true,
-                    assignmentPolicy: "explicit_opt_in",
-                    riskClass: "normal",
-                    notes: nil
-                ),
-                "xcode": MCPServerRegistryEntry(
-                    runtimeIDs: [
-                        "claude_agent": "xcode",
-                        "gemini_cli": "xcode"
-                    ],
-                    sessionScoped: true,
-                    assignmentPolicy: "explicit_opt_in",
-                    riskClass: "normal",
-                    notes: nil
-                )
-            ],
-            mcpProfiles: [
-                "docs_reference": MCPProfile(
-                    requiredExtensions: ["context7"],
-                    optionalExtensions: [],
-                    fallbackPolicy: "fail_if_required_missing"
-                ),
-                "review_visual": MCPProfile(
-                    requiredExtensions: ["xcode"],
-                    optionalExtensions: [],
-                    fallbackPolicy: "fail_if_required_missing"
-                )
-            ],
             contracts: [:],
             backendProfiles: [:],
             permissionProfiles: [:],
@@ -260,8 +226,8 @@ struct RuntimeSessionBridgeTests {
         #expect(packet.systemPrompt.contains("Do not rely on implicit working directory"))
     }
 
-    @Test("Session bridge resolves requested MCP extensions from per-agent profile")
-    func sessionBridgeResolvesRequestedMCPExtensions() async throws {
+    @Test("Session bridge realizes Claude ACP MCP servers from backend-owned MCP set")
+    func sessionBridgeRealizesClaudeACPMCPServersFromBackendOwnedMCPSet() async throws {
         let transport = CapturingTransport()
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
@@ -298,7 +264,7 @@ struct RuntimeSessionBridgeTests {
             maxTurns: 10,
             temperature: 0.0,
             permissionProfile: "read_only",
-            mcpProfileID: "docs_reference",
+            requestedMCPServerIDs: ["context7"],
             skillRef: "test_skill",
             skillRole: nil,
             prompt: "You are a test agent.",
@@ -340,11 +306,19 @@ struct RuntimeSessionBridgeTests {
             override: nil
         )
 
-        #expect(transport.lastCreateRequest?.requestedExtensions == ["context7"])
+        #expect(transport.lastCreateRequest?.requestedExtensions == nil)
+        #expect(transport.lastCreateRequest?.mcpServers == [
+            RuntimeMCPServerDefinition(
+                name: "context7",
+                command: "context7",
+                args: [],
+                env: []
+            )
+        ])
     }
 
-    @Test("Session bridge resolves requested MCP extensions from transport runtime when frozen binding is absent")
-    func sessionBridgeResolvesRequestedMCPExtensionsWithoutFrozenBinding() async throws {
+    @Test("Session bridge realizes MCP servers from transport runtime when frozen binding is absent")
+    func sessionBridgeRealizesMCPServersWithoutFrozenBinding() async throws {
         let transport = CapturingTransport()
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
@@ -381,7 +355,7 @@ struct RuntimeSessionBridgeTests {
             maxTurns: 10,
             temperature: 0.0,
             permissionProfile: "read_only",
-            mcpProfileID: "docs_reference",
+            requestedMCPServerIDs: ["context7"],
             skillRef: "test_skill",
             skillRole: nil,
             prompt: "You are a test agent.",
@@ -413,7 +387,15 @@ struct RuntimeSessionBridgeTests {
             override: nil
         )
 
-        #expect(transport.lastCreateRequest?.requestedExtensions == ["context7"])
+        #expect(transport.lastCreateRequest?.requestedExtensions == nil)
+        #expect(transport.lastCreateRequest?.mcpServers == [
+            RuntimeMCPServerDefinition(
+                name: "context7",
+                command: "context7",
+                args: [],
+                env: []
+            )
+        ])
     }
 
     @Test("Session bridge realizes Gemini ACP MCP servers from local registry")
@@ -454,7 +436,7 @@ struct RuntimeSessionBridgeTests {
             maxTurns: 10,
             temperature: 0.0,
             permissionProfile: "read_only",
-            mcpProfileID: "review_visual",
+            requestedMCPServerIDs: ["xcode"],
             skillRef: "test_skill",
             skillRole: nil,
             prompt: "You are a UI reviewer.",
@@ -510,8 +492,8 @@ struct RuntimeSessionBridgeTests {
         ])
     }
 
-    @Test("Session bridge realizes Codex ACP platform MCP lanes from local registry")
-    func sessionBridgeRealizesCodexACPPlatformMCPLanesFromLocalRegistry() async throws {
+    @Test("Session bridge validates Codex ACP platform MCP lanes without injecting them into session/new")
+    func sessionBridgeValidatesCodexACPPlatformMCPLanesWithoutInjectingThem() async throws {
         let transport = CapturingTransport(runtimeNamespace: "codex")
         let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
             configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
@@ -562,7 +544,7 @@ struct RuntimeSessionBridgeTests {
             maxTurns: 24,
             temperature: 0.0,
             permissionProfile: "read_write",
-            mcpProfileID: "code_build_rich",
+            requestedMCPServerIDs: ["developer", "xcode"],
             skillRef: "test_skill",
             skillRole: nil,
             prompt: "You are a code writer.",
@@ -590,30 +572,6 @@ struct RuntimeSessionBridgeTests {
             paths: [:],
             artifacts: [:],
             skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: nil, description: nil)],
-            mcpPolicy: .defaultDeny,
-            mcpServerRegistry: [
-                "developer": MCPServerRegistryEntry(
-                    runtimeIDs: ["codex": "developer"],
-                    sessionScoped: true,
-                    assignmentPolicy: "explicit_opt_in",
-                    riskClass: "normal",
-                    notes: nil
-                ),
-                "xcode": MCPServerRegistryEntry(
-                    runtimeIDs: ["codex": "xcode"],
-                    sessionScoped: true,
-                    assignmentPolicy: "explicit_opt_in",
-                    riskClass: "normal",
-                    notes: nil
-                )
-            ],
-            mcpProfiles: [
-                "code_build_rich": MCPProfile(
-                    requiredExtensions: ["xcode", "developer"],
-                    optionalExtensions: [],
-                    fallbackPolicy: "fail_if_required_missing"
-                )
-            ],
             contracts: [:],
             backendProfiles: [:],
             permissionProfiles: [:],
@@ -656,10 +614,6 @@ struct RuntimeSessionBridgeTests {
         #expect(transport.lastCreateRequest?.requestedExtensions == nil)
         #expect(transport.lastCreateRequest?.mcpServers == [
             RuntimeMCPServerDefinition(
-                name: "developer",
-                type: "platform"
-            ),
-            RuntimeMCPServerDefinition(
                 name: "xcode",
                 command: "xcrun",
                 args: ["mcpbridge"],
@@ -691,7 +645,93 @@ struct RuntimeSessionBridgeTests {
             maxTurns: 10,
             temperature: 0.0,
             permissionProfile: "read_only",
-            mcpProfileID: "review_visual",
+            requestedMCPServerIDs: ["xcode"],
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "You are a UI reviewer.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_ui"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            stageID: "state_4_proposal_reviewed",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: ResolvedProviderBinding(
+                agentID: "proposal_reviewer_ui",
+                backendProfileID: "gemini_review_pro",
+                configuredProviderID: UUID(),
+                providerFamily: "gemini",
+                providerIdentifier: "gemini-cli",
+                model: "gemini-2.5-flash",
+                effort: "medium",
+                transport: "acp_stdio",
+                adapterVersion: "v1",
+                runtimeProfileID: "gemini_cli_acp",
+                adapterFamily: "gemini_cli_acp",
+                capabilityClass: .controlCapable
+            ),
+            catalog: makeCatalog()
+        )
+
+        await #expect(throws: RuntimeSessionBridgeError.self) {
+            _ = try await bridge.executeInIsolatedSession(
+                agent: agent,
+                task: AgentTask(agent: "proposal_reviewer_ui", task: "review_ui", inputs: ["proposal_current"], outputs: ["proposal_review_ui"]),
+                context: context,
+                override: nil
+            )
+        }
+    }
+
+    @Test("Session bridge blocks Gemini ACP session when required MCP server is installed but disabled locally")
+    func sessionBridgeBlocksGeminiACPWhenRequiredMCPServerDisabledLocally() async throws {
+        let transport = CapturingTransport(runtimeNamespace: "gemini_cli")
+        let registryProvider = StubExtensionRegistryProvider(snapshot: RuntimeExtensionRegistrySnapshot(
+            configURL: URL(fileURLWithPath: "/tmp/mcp-config.yaml"),
+            installedExtensionIDs: ["xcode"],
+            enabledExtensionIDs: [],
+            configsByRuntimeID: [
+                "xcode": RuntimeExtensionDefinition(
+                    enabled: false,
+                    type: "stdio",
+                    name: "xcode",
+                    description: nil,
+                    displayName: nil,
+                    cmd: "xcrun",
+                    args: ["mcpbridge"],
+                    envs: [:],
+                    envKeys: nil,
+                    timeout: nil,
+                    bundled: nil,
+                    availableTools: nil
+                )
+            ]
+        ))
+        let bridge = RuntimeSessionBridge(
+            transport: transport,
+            extensionRegistryProvider: registryProvider
+        )
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_ui",
+            title: "Proposal Reviewer / UI",
+            mode: "autonomous",
+            provider: "gemini-cli",
+            model: "gemini-2.5-flash",
+            effort: "medium",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "read_only",
+            requestedMCPServerIDs: ["xcode"],
             skillRef: "test_skill",
             skillRole: nil,
             prompt: "You are a UI reviewer.",
@@ -1357,6 +1397,159 @@ struct RuntimeSessionBridgeTests {
         #expect(packet.taskDirective.contains("The dedicated worktree has already been provisioned by the engine"))
         #expect(packet.taskDirective.contains("Freeze `proposal_current` into `approved_proposal`"))
         #expect(packet.taskDirective.contains("Return `implementation_plan`, `implementation_backlog`, and `run_state`"))
+    }
+
+    @Test("Code writer implementation directive prefers canonical inputs over repo rediscovery")
+    func codeWriterImplementationDirectivePrefersCanonicalInputsOverRediscovery() {
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 24,
+            temperature: 0.0,
+            permissionProfile: "read_write",
+            requestedMCPServerIDs: [],
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Implement the approved proposal.",
+            outputContract: "test_contract",
+            requiresHumanApproval: false,
+            inputs: ["approved_proposal", "implementation_plan", "implementation_backlog", "run_state"],
+            outputs: ["implementation_progress"],
+            worktreeWriteEnabled: true
+        )
+        let task = AgentTask(
+            agent: "code_writer",
+            task: "continue_implementation",
+            inputs: ["approved_proposal", "implementation_plan", "implementation_backlog", "run_state"],
+            outputs: ["implementation_progress"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+        let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
+        try? FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        let approvedPath = workspace.artifactRoot.appendingPathComponent("approved_proposal.md").path
+        let backlogPath = workspace.artifactRoot.appendingPathComponent("implementation_backlog.json").path
+
+        let context = ExecutionContext(
+            workspace: RunWorkspace(
+                runID: workspace.runID,
+                workspaceRoot: workspace.workspaceRoot,
+                artifactRoot: workspace.artifactRoot,
+                worktreeRoot: worktreeRoot
+            ),
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 2,
+            attemptNumber: 1,
+            inputArtifacts: [
+                "approved_proposal": Data("proposal".utf8),
+                "implementation_plan": Data("plan".utf8),
+                "implementation_backlog": Data("backlog".utf8),
+                "run_state": Data("{\"stage\":\"state_8_implementation_continued\"}".utf8)
+            ],
+            inputArtifactPaths: [
+                "approved_proposal": approvedPath,
+                "implementation_backlog": backlogPath
+            ],
+            variables: [:],
+            ideaBody: "Implement the approved proposal",
+            providerBinding: nil
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+
+        #expect(packet.taskDirective.contains("Canonical input artifact paths:"))
+        #expect(packet.taskDirective.contains(approvedPath))
+        #expect(packet.taskDirective.contains(backlogPath))
+        #expect(packet.taskDirective.contains("Do not re-discover repository structure unless a referenced path is missing or clearly stale."))
+        #expect(packet.taskDirective.contains("If a referenced path has drifted, do one brief remap and continue."))
+    }
+
+    @Test("Code writer packet remaps legacy project-root paths inside text artifacts to worktree root")
+    func codeWriterPacketRemapsLegacyProjectRootPathsToWorktreeRoot() {
+        let agent = makeWriteAgent(id: "code_writer")
+        let task = AgentTask(
+            agent: "code_writer",
+            task: "continue_implementation",
+            inputs: ["implementation_plan"],
+            outputs: ["implementation_progress"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+        let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
+        try? FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        let legacyProjectRoot = "/Users/user/Documents/CryptoSavingsTracker"
+        let implementationPlan = """
+        | Project Root | \(legacyProjectRoot) |
+        - Inspect \(legacyProjectRoot)/ios/CryptoSavingsTracker/Utilities/OnboardingManager.swift
+        """
+
+        let context = ExecutionContext(
+            workspace: RunWorkspace(
+                runID: workspace.runID,
+                workspaceRoot: workspace.workspaceRoot,
+                artifactRoot: workspace.artifactRoot,
+                worktreeRoot: worktreeRoot
+            ),
+            projectRoot: URL(fileURLWithPath: legacyProjectRoot, isDirectory: true),
+            stageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 2,
+            attemptNumber: 1,
+            inputArtifacts: [
+                "implementation_plan": Data(implementationPlan.utf8)
+            ],
+            variables: [:],
+            ideaBody: "Implement the approved proposal",
+            providerBinding: nil
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let attachment = packet.contextAttachments.first { $0.name == "implementation_plan" }
+        #expect(attachment?.content?.contains(legacyProjectRoot) == false)
+        #expect(attachment?.content?.contains(worktreeRoot.path) == true)
+    }
+
+    @Test("Code writer directive forbids direct artifact writes through shell commands")
+    func codeWriterDirectiveForbidsDirectArtifactWritesThroughShellCommands() {
+        let agent = makeWriteAgent(id: "code_writer")
+        let task = AgentTask(
+            agent: "code_writer",
+            task: "continue_implementation",
+            inputs: ["implementation_plan"],
+            outputs: ["implementation_progress", "implementation_self_assessment", "changed_files_manifest", "tests_result"]
+        )
+        let workspace = makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.workspaceRoot) }
+        let worktreeRoot = workspace.workspaceRoot.appendingPathComponent("worktree", isDirectory: true)
+        try? FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+
+        let context = ExecutionContext(
+            workspace: RunWorkspace(
+                runID: workspace.runID,
+                workspaceRoot: workspace.workspaceRoot,
+                artifactRoot: workspace.artifactRoot,
+                worktreeRoot: worktreeRoot
+            ),
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 2,
+            attemptNumber: 1,
+            inputArtifacts: ["implementation_plan": Data("plan".utf8)],
+            variables: [:],
+            ideaBody: "Implement the approved proposal",
+            providerBinding: nil
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        #expect(packet.taskDirective.contains("Never use shell redirection, heredocs, `cat >`, or direct writes into the artifact root"))
+        #expect(packet.taskDirective.contains("Only return required outputs via the final CHAINWORKS_OUTPUT envelope"))
     }
 
     // MARK: - LiveExecutionOverride Tests

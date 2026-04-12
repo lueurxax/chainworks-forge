@@ -39,8 +39,15 @@ final class RuntimeSessionBridge: Sendable {
         context: ExecutionContext,
         override: LiveExecutionOverride?
     ) async throws -> RuntimeSessionExecution {
+        let pathAliases = Self.pathAliases(for: context)
+
         // Step 1: Build the structured execution packet
-        let packet = Self.buildExecutionPacket(agent: agent, task: task, context: context)
+        let packet = Self.buildExecutionPacket(
+            agent: agent,
+            task: task,
+            context: context,
+            pathAliases: pathAliases
+        )
 
         // Step 2: Resolve provider/model.
         // Frozen per-agent provider bindings are the canonical runtime authority for live runs.
@@ -60,13 +67,11 @@ final class RuntimeSessionBridge: Sendable {
         let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
         let readOnlyRoot = context.projectRoot?.path ?? context.workspace.workspaceRoot.path
         let workingDirectory = useWorktree
-            ? context.workspace.worktreeRoot!.path
+            ? (pathAliases.worktreeRootAlias?.path ?? context.workspace.worktreeRoot!.path)
             : readOnlyRoot
         let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
-        // Proposal 026: ACP runtimes handle MCP natively — extension registry mismatches
-        // are not blocking for ACP transports.
         let isACPRuntime = transport.mcpRuntimeNamespace != nil
-        if !mcpResolution.blockingIssues.isEmpty && !isACPRuntime {
+        if !mcpResolution.blockingIssues.isEmpty {
             throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(mcpResolution.blockingIssues.joined(separator: "; "))
         }
         let acpMCPServers = try resolveACPMCPServers(
@@ -121,6 +126,7 @@ final class RuntimeSessionBridge: Sendable {
             sessionID: sessionResponse.sessionId,
             actualEnabledExtensions: actualEnabledExtensions,
             startupLatencyMilliseconds: sessionResponse.startupLatencyMilliseconds,
+            runtimeHomePath: runtimeState?.runtimeHomePath,
             eventStream: eventStream,
             transport: transport
         )
@@ -131,8 +137,8 @@ final class RuntimeSessionBridge: Sendable {
         context: ExecutionContext
     ) -> MCPPolicyResolutionReport {
         guard let catalog = context.catalog else {
-            return agent.mcpProfileID == nil ? .none : MCPPolicyResolutionReport(
-                profileID: agent.mcpProfileID ?? "none",
+            return agent.requestedMCPServerIDs.isEmpty ? .none : MCPPolicyResolutionReport(
+                profileID: agent.backendProfileID ?? "none",
                 requiredExtensions: [],
                 optionalExtensions: [],
                 requestedExtensions: [],
@@ -142,7 +148,7 @@ final class RuntimeSessionBridge: Sendable {
                 predictedEffectiveRuntimeExtensionIDs: [],
                 deniedExtensions: [],
                 warnings: [],
-                blockingIssues: ["Catalog is unavailable; cannot resolve MCP profile for agent '\(agent.id)'."]
+                blockingIssues: ["Catalog is unavailable; cannot resolve backend MCP requirements for agent '\(agent.id)'."]
             )
         }
 
@@ -214,6 +220,11 @@ final class RuntimeSessionBridge: Sendable {
                 "Required MCP server '\(runtimeID)' is not installed in the local extension registry for runtime '\(transportNamespace)'."
             )
         }
+        if definition.enabled == false {
+            throw RuntimeSessionBridgeError.mcpPolicyResolutionFailed(
+                "Required MCP server '\(runtimeID)' is installed in the local extension registry for runtime '\(transportNamespace)' but disabled."
+            )
+        }
 
         let normalizedType = definition.type?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "stdio"
         if normalizedType == "platform" {
@@ -222,10 +233,11 @@ final class RuntimeSessionBridge: Sendable {
                     "Required MCP server '\(runtimeID)' uses unsupported transport '\(normalizedType)' for runtime '\(transportNamespace)'."
                 )
             }
-            return RuntimeMCPServerDefinition(
-                name: runtimeID,
-                type: "platform"
-            )
+            // Codex exposes bundled platform lanes natively; they are validated against the
+            // local runtime registry, but they are not injected via `mcpServers` in
+            // `session/new`. Sending them as MCP server definitions causes Codex ACP to
+            // reject the request with `Invalid params`.
+            return nil
         }
 
         guard normalizedType == "stdio" else {
@@ -271,6 +283,7 @@ final class RuntimeSessionBridge: Sendable {
             sessionID: sessionID,
             actualEnabledExtensions: runtimeState?.enabledExtensions,
             startupLatencyMilliseconds: nil,
+            runtimeHomePath: runtimeState?.runtimeHomePath,
             eventStream: eventStream,
             transport: transport
         )
@@ -283,7 +296,8 @@ final class RuntimeSessionBridge: Sendable {
     static func buildExecutionPacket(
         agent: ResolvedAgent,
         task: AgentTask,
-        context: ExecutionContext
+        context: ExecutionContext,
+        pathAliases: ExecutionPathAliases? = nil
     ) -> ExecutionPacket {
         // Proposal 013: V2 resolver — catalog-driven contract resolution
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
@@ -295,6 +309,17 @@ final class RuntimeSessionBridge: Sendable {
                 artifactRoot: context.workspace.artifactRoot
             )
         }
+        let projectRootPath = context.projectRoot?.standardizedFileURL.path
+        let workspaceRootPath = context.workspace.workspaceRoot.standardizedFileURL.path
+        let artifactRootPath = context.workspace.artifactRoot.standardizedFileURL.path
+        let worktreeRootPath = context.workspace.worktreeRoot?.standardizedFileURL.path
+        let workspaceRootDisplayPath = pathAliases?.workspaceRootAlias?.path ?? workspaceRootPath
+        let artifactRootDisplayPath = pathAliases?.artifactRootAlias?.path ?? artifactRootPath
+        let worktreeRootDisplayPath = pathAliases?.worktreeRootAlias?.path ?? worktreeRootPath
+        let normalizeToWorktree = agent.worktreeWriteEnabled &&
+            worktreeRootDisplayPath != nil &&
+            projectRootPath != nil &&
+            worktreeRootDisplayPath != projectRootPath
 
         // 1. System prompt
         let systemPrompt = buildSystemPrompt(
@@ -308,6 +333,9 @@ final class RuntimeSessionBridge: Sendable {
             agent: agent,
             task: task,
             context: context,
+            workspaceRootDisplayPath: workspaceRootDisplayPath,
+            artifactRootDisplayPath: artifactRootDisplayPath,
+            worktreeRootDisplayPath: worktreeRootDisplayPath,
             expectedOutputs: expectedOutputs,
             catalog: context.catalog,
             lazyEvidenceToolAssets: lazyEvidenceToolAssets
@@ -317,8 +345,10 @@ final class RuntimeSessionBridge: Sendable {
         var attachments: [RuntimeContextAttachment] = []
 
         // Workspace context attachment
-        let projectRootDescription = context.projectRoot?.path ?? "not provided"
-        let worktreeRootDescription = context.workspace.worktreeRoot?.path ?? "not provisioned"
+        let projectRootDescription = projectRootPath ?? "not provided"
+        let workspaceRootDescription = workspaceRootDisplayPath
+        let artifactRootDescription = artifactRootDisplayPath
+        let worktreeRootDescription = worktreeRootDisplayPath ?? "not provisioned"
         let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
         let boundaryNote = useWorktree
             ? "IMPORTANT: This agent has write access to the worktree root. All file operations must use explicit absolute paths within the worktree root."
@@ -333,9 +363,9 @@ final class RuntimeSessionBridge: Sendable {
             Stage ID: \(context.stageID)
             Iteration: \(context.iteration)
             Attempt: \(context.attemptNumber)
-            Workspace Root: \(context.workspace.workspaceRoot.path)
+            Workspace Root: \(workspaceRootDescription)
             Project Root: \(projectRootDescription)
-            Artifact Root: \(context.workspace.artifactRoot.path)
+            Artifact Root: \(artifactRootDescription)
             Worktree Root: \(worktreeRootDescription)
             \(boundaryNote)
             """,
@@ -345,7 +375,17 @@ final class RuntimeSessionBridge: Sendable {
         // Input artifact attachments (strategy-aware handoff)
         if let handoff = handoffPacket {
             for (name, data) in handoff.mandatoryArtifacts.sorted(by: { $0.key < $1.key }) {
-                let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
+                let content = normalizedAttachmentContent(
+                    data: data,
+                    normalizeToWorktree: normalizeToWorktree,
+                    projectRootPath: projectRootPath,
+                    workspaceRootPath: workspaceRootPath,
+                    artifactRootPath: artifactRootPath,
+                    worktreeRootPath: worktreeRootPath,
+                    workspaceRootDisplayPath: workspaceRootDisplayPath,
+                    artifactRootDisplayPath: artifactRootDisplayPath,
+                    worktreeRootDisplayPath: worktreeRootDisplayPath
+                ) ?? "<binary data, \(data.count) bytes>"
                 attachments.append(RuntimeContextAttachment(
                     type: "artifact",
                     name: name,
@@ -358,7 +398,17 @@ final class RuntimeSessionBridge: Sendable {
                 attachments.append(RuntimeContextAttachment(
                     type: "text",
                     name: "summary_\(name)",
-                    content: summary,
+                    content: normalizedAttachmentContent(
+                        summary,
+                        normalizeToWorktree: normalizeToWorktree,
+                        projectRootPath: projectRootPath,
+                        workspaceRootPath: workspaceRootPath,
+                        artifactRootPath: artifactRootPath,
+                        worktreeRootPath: worktreeRootPath,
+                        workspaceRootDisplayPath: workspaceRootDisplayPath,
+                        artifactRootDisplayPath: artifactRootDisplayPath,
+                        worktreeRootDisplayPath: worktreeRootDisplayPath
+                    ),
                     path: nil
                 ))
             }
@@ -404,7 +454,17 @@ final class RuntimeSessionBridge: Sendable {
             ))
         } else {
             for (name, data) in context.inputArtifacts {
-                let content = String(data: data, encoding: .utf8) ?? "<binary data, \(data.count) bytes>"
+                let content = normalizedAttachmentContent(
+                    data: data,
+                    normalizeToWorktree: normalizeToWorktree,
+                    projectRootPath: projectRootPath,
+                    workspaceRootPath: workspaceRootPath,
+                    artifactRootPath: artifactRootPath,
+                    worktreeRootPath: worktreeRootPath,
+                    workspaceRootDisplayPath: workspaceRootDisplayPath,
+                    artifactRootDisplayPath: artifactRootDisplayPath,
+                    worktreeRootDisplayPath: worktreeRootDisplayPath
+                ) ?? "<binary data, \(data.count) bytes>"
                 attachments.append(RuntimeContextAttachment(
                     type: "artifact",
                     name: name,
@@ -495,6 +555,7 @@ final class RuntimeSessionBridge: Sendable {
         parts.append("")
         parts.append("## Boundaries")
         parts.append("- You must return required outputs in the final response using the Chainworks output envelope. The app persists artifacts; do not rely on direct writes to the run artifact directory.")
+        parts.append("- Never use shell redirection, heredocs, `cat >`, or direct writes into the artifact root. Only return required outputs via the final CHAINWORKS_OUTPUT envelope.")
         parts.append("- Do not perform any git operations.")
         parts.append("- Do not rely on implicit working directory — use explicit absolute paths from the workspace context.")
         parts.append("- For read-only repo-backed stages, read source only from the Project Root provided in workspace_context.")
@@ -509,6 +570,9 @@ final class RuntimeSessionBridge: Sendable {
         agent: ResolvedAgent,
         task: AgentTask,
         context: ExecutionContext,
+        workspaceRootDisplayPath: String,
+        artifactRootDisplayPath: String,
+        worktreeRootDisplayPath: String?,
         expectedOutputs: [String],
         catalog: AgentCatalog?,
         lazyEvidenceToolAssets: LazyEvidenceToolAssets?
@@ -593,6 +657,26 @@ final class RuntimeSessionBridge: Sendable {
             parts.append("Do not stop after read-only analysis. The task is incomplete until all required implementation-start outputs are present and non-empty.")
         }
 
+        if agent.id == "code_writer",
+           task.task == "initial_implementation" || task.task == "continue_implementation" {
+            parts.append("")
+            parts.append("### Task-Specific Guidance")
+            parts.append("Treat the provided worktree/project roots and canonical input artifact paths as the authoritative starting point for implementation.")
+            let canonicalPaths = context.inputArtifactPaths
+                .filter { !($0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+                .sorted { $0.key < $1.key }
+            if !canonicalPaths.isEmpty {
+                parts.append("Canonical input artifact paths:")
+                for (name, path) in canonicalPaths {
+                    parts.append("- \(name): \(normalizeAbsolutePathForExecution(path, workspaceRootDisplayPath: workspaceRootDisplayPath, artifactRootDisplayPath: artifactRootDisplayPath, worktreeRootDisplayPath: worktreeRootDisplayPath, context: context))")
+                }
+            }
+            parts.append("Do not re-discover repository structure unless a referenced path is missing or clearly stale.")
+            parts.append("If a referenced path has drifted, do one brief remap and continue. Do not spend the turn on broad search churn.")
+            parts.append("Prefer moving directly from the approved plan/backlog into concrete edits and tests instead of repeated search/read passes.")
+            parts.append("Never emit shell commands that write required outputs into the run artifact directory. Required outputs must be returned only through the final CHAINWORKS_OUTPUT envelope.")
+        }
+
         if !structuredHints.isEmpty {
             parts.append("")
             parts.append("### Structured Output Requirements")
@@ -641,6 +725,134 @@ final class RuntimeSessionBridge: Sendable {
         parts.append("Complete the task and produce all required output files. Do not continue beyond the task scope.")
 
         return parts.joined(separator: "\n")
+    }
+
+    private static func normalizedAttachmentContent(
+        _ content: String,
+        normalizeToWorktree: Bool,
+        projectRootPath: String?,
+        workspaceRootPath: String,
+        artifactRootPath: String,
+        worktreeRootPath: String?,
+        workspaceRootDisplayPath: String,
+        artifactRootDisplayPath: String,
+        worktreeRootDisplayPath: String?
+    ) -> String {
+        var normalized = content
+        if workspaceRootDisplayPath != workspaceRootPath {
+            normalized = normalized.replacingOccurrences(of: workspaceRootPath, with: workspaceRootDisplayPath)
+        }
+        if artifactRootDisplayPath != artifactRootPath {
+            normalized = normalized.replacingOccurrences(of: artifactRootPath, with: artifactRootDisplayPath)
+        }
+        if let worktreeRootPath,
+           let worktreeRootDisplayPath,
+           worktreeRootDisplayPath != worktreeRootPath {
+            normalized = normalized.replacingOccurrences(of: worktreeRootPath, with: worktreeRootDisplayPath)
+        }
+        guard normalizeToWorktree,
+              let projectRootPath,
+              let worktreeRootDisplayPath,
+              !projectRootPath.isEmpty,
+              !worktreeRootDisplayPath.isEmpty,
+              normalized.contains(projectRootPath) else {
+            return normalized
+        }
+        return normalized.replacingOccurrences(of: projectRootPath, with: worktreeRootDisplayPath)
+    }
+
+    private static func normalizedAttachmentContent(
+        data: Data,
+        normalizeToWorktree: Bool,
+        projectRootPath: String?,
+        workspaceRootPath: String,
+        artifactRootPath: String,
+        worktreeRootPath: String?,
+        workspaceRootDisplayPath: String,
+        artifactRootDisplayPath: String,
+        worktreeRootDisplayPath: String?
+    ) -> String? {
+        guard let content = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return normalizedAttachmentContent(
+            content,
+            normalizeToWorktree: normalizeToWorktree,
+            projectRootPath: projectRootPath,
+            workspaceRootPath: workspaceRootPath,
+            artifactRootPath: artifactRootPath,
+            worktreeRootPath: worktreeRootPath,
+            workspaceRootDisplayPath: workspaceRootDisplayPath,
+            artifactRootDisplayPath: artifactRootDisplayPath,
+            worktreeRootDisplayPath: worktreeRootDisplayPath
+        )
+    }
+
+    private static func normalizeAbsolutePathForExecution(
+        _ path: String,
+        workspaceRootDisplayPath: String,
+        artifactRootDisplayPath: String,
+        worktreeRootDisplayPath: String?,
+        context: ExecutionContext
+    ) -> String {
+        var normalized = path
+        let workspaceRootPath = context.workspace.workspaceRoot.standardizedFileURL.path
+        let artifactRootPath = context.workspace.artifactRoot.standardizedFileURL.path
+        let worktreeRootPath = context.workspace.worktreeRoot?.standardizedFileURL.path
+        if workspaceRootDisplayPath != workspaceRootPath {
+            normalized = normalized.replacingOccurrences(of: workspaceRootPath, with: workspaceRootDisplayPath)
+        }
+        if artifactRootDisplayPath != artifactRootPath {
+            normalized = normalized.replacingOccurrences(of: artifactRootPath, with: artifactRootDisplayPath)
+        }
+        if let worktreeRootPath,
+           let worktreeRootDisplayPath,
+           worktreeRootDisplayPath != worktreeRootPath {
+            normalized = normalized.replacingOccurrences(of: worktreeRootPath, with: worktreeRootDisplayPath)
+        }
+        return normalized
+    }
+
+    private static func pathAliases(for context: ExecutionContext) -> ExecutionPathAliases {
+        let workspaceRootAlias = aliasURLIfNeeded(
+            for: context.workspace.workspaceRoot,
+            stableLabel: "workspace-\(context.workspace.runID.uuidString)"
+        )
+        let artifactRootAlias = aliasURLIfNeeded(
+            for: context.workspace.artifactRoot,
+            stableLabel: "artifacts-\(context.workspace.runID.uuidString)"
+        )
+        let worktreeRootAlias = context.workspace.worktreeRoot.flatMap {
+            aliasURLIfNeeded(for: $0, stableLabel: "worktree-\(context.workspace.runID.uuidString)")
+        }
+        return ExecutionPathAliases(
+            workspaceRootAlias: workspaceRootAlias,
+            artifactRootAlias: artifactRootAlias,
+            worktreeRootAlias: worktreeRootAlias
+        )
+    }
+
+    private static func aliasURLIfNeeded(for url: URL, stableLabel: String) -> URL? {
+        let standardized = url.standardizedFileURL
+        guard standardized.path.contains(" ") else { return nil }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chainworks-exec-aliases", isDirectory: true)
+        let aliasURL = root.appendingPathComponent(stableLabel, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: aliasURL.path) {
+                let destination = try FileManager.default.destinationOfSymbolicLink(atPath: aliasURL.path)
+                if destination == standardized.path {
+                    return aliasURL
+                }
+                try FileManager.default.removeItem(at: aliasURL)
+            }
+            try FileManager.default.createSymbolicLink(atPath: aliasURL.path, withDestinationPath: standardized.path)
+            return aliasURL
+        } catch {
+            ForgeLogger.bridge.info("Failed to prepare execution path alias for \(standardized.path): \(error.localizedDescription)")
+            return nil
+        }
     }
 
     private static func buildLazyArtifactAttachmentContent(pointer: ArtifactPointer) -> String {
@@ -873,6 +1085,12 @@ struct ExecutionPacket: Sendable {
     let contextAttachments: [RuntimeContextAttachment]
 }
 
+struct ExecutionPathAliases: Sendable {
+    let workspaceRootAlias: URL?
+    let artifactRootAlias: URL?
+    let worktreeRootAlias: URL?
+}
+
 // MARK: - RuntimeSessionExecution
 
 /// Represents an in-flight execution within an isolated runtime session.
@@ -881,6 +1099,7 @@ struct RuntimeSessionExecution: Sendable {
     let sessionID: String
     let actualEnabledExtensions: [String]?
     let startupLatencyMilliseconds: Int?
+    let runtimeHomePath: String?
     let eventStream: AsyncThrowingStream<RuntimeStreamEvent, Error>
     let transport: any RuntimeTransportProtocol
 
@@ -897,11 +1116,14 @@ struct RuntimeSessionExecution: Sendable {
                 let msg = error.localizedDescription
                 // 404 means the session was already closed by the backend (idle timeout or concurrent cleanup).
                 // 'cancelled' is redundant here as we are already cleaning up.
-                let isAlreadyClosed = msg.contains("404") || msg.contains("not found")
+                let lowered = msg.lowercased()
+                let isAlreadyClosed = lowered.contains("404")
+                    || lowered.contains("not found")
+                    || (lowered.contains("no active ") && lowered.contains(" session"))
                 let isCancelled = msg.contains("cancelled") || (error as? CancellationError) != nil
 
                 if !isAlreadyClosed && !isCancelled {
-                    ForgeLogger.bridge.error("Failed to cleanup runtime session \(sessionID): \(msg)")
+                    await ForgeLogger.bridge.error("Failed to cleanup runtime session \(sessionID): \(msg)")
                 }
             }
         }

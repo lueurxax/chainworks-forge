@@ -17,9 +17,8 @@ The app must be able to:
 
 This document records that implemented baseline as a reference contract.
 
-Related stable doc:
+Related stable docs:
 
-- [goose-provider-remediation.md](goose-provider-remediation.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
 - [project-workspace-contract.md](project-workspace-contract.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
@@ -29,15 +28,17 @@ Related stable doc:
 
 The current MVP provider set is:
 
-1. `codex`
-2. `claude_code`
-3. `gemini`
+1. `codex_acp`
+2. `claude_acp`
+3. `gemini_acp`
+4. `auggie`
+5. `junie`
 
 The operator should reason about provider family, configured installation/account, model, effort, capabilities, and current health without needing to care about transport internals.
 
 Runtime transport selection and per-agent MCP policy are adjacent contracts, but they are not owned here:
 
-- transport-family and ACP/Goose adapter truth live in [acp-runtime-transport.md](acp-runtime-transport.md),
+- transport-family and ACP adapter truth live in [acp-runtime-transport.md](acp-runtime-transport.md),
 - per-agent MCP policy and requested/predicted/actual runtime truth live in [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md).
 
 ## Core components
@@ -205,7 +206,7 @@ Run-start gate semantics:
 
 Preflight reads from persisted configuration stores, not ad hoc path state.
 
-For Goose-backed providers, preflight also consumes the remediation/verification truth described in [goose-provider-remediation.md](goose-provider-remediation.md).
+Preflight consumes ACP-era adapter health, persisted provider configuration, and runtime compatibility truth directly from the provider platform and runtime layers.
 
 ## Usage receipts
 
@@ -251,7 +252,6 @@ The provider-platform baseline includes:
 - `ProviderSettingsView`
 - `PreflightReportView`
 - `PilotReadinessView`
-- `GooseProviderConnectionAssistant`
 - `ProviderSetupEvidencePanel`
 
 Those surfaces cover:
@@ -259,7 +259,7 @@ Those surfaces cover:
 - workspace/YAML selection,
 - provider configuration,
 - provider verification,
-- Goose-backed remediation for `codex` and `claude_code`,
+- ACP runtime readiness and provider diagnostics,
 - sample-run bootstrap,
 - current provider/YAML/workspace health,
 - configuration source,
@@ -268,20 +268,6 @@ Those surfaces cover:
 - pending approvals.
 
 The goal is to make the system operable on a fresh machine, not just understandable to someone already living in the codebase.
-
-## Goose-backed remediation
-
-For `codex` and `claude_code`, the primary operator path is Goose-backed.
-
-That remediation slice is stable and implemented:
-
-- unhealthy provider rows and first-run setup can hand off into `GooseProviderConnectionAssistant`,
-- verification follows a stepwise Goose handshake rather than a generic "try again" loop,
-- `ProviderSetupEvidencePanel` exposes endpoint/provider/model/probe facts,
-- `PilotReadinessView` and run-start preflight consume the same derived truth.
-
-This avoids a split reality where runtime depends on Goose but operator setup validates something else.
-
 ## Boundaries
 
 This reference intentionally stops at provider/platform readiness.

@@ -9,6 +9,10 @@ import SwiftData
 /// to produce structured report entries for inclusion in run reports, receipts,
 /// and operator export surfaces.
 final class SessionLineageReportBridge {
+    struct ReportEnvelope: Codable, Sendable {
+        let reports: [AgentSessionReport]
+        let errorMessage: String?
+    }
 
     /// Report entry for a single agent's session lineage within a run.
     struct AgentSessionReport: Codable, Sendable {
@@ -29,13 +33,37 @@ final class SessionLineageReportBridge {
         let compactionCount: Int
     }
 
+    static func generateEnvelope(
+        for runID: UUID,
+        fetchLineages: () throws -> [AgentSessionLineage]
+    ) -> ReportEnvelope {
+        do {
+            let lineages = try fetchLineages()
+            return ReportEnvelope(
+                reports: buildReports(from: lineages),
+                errorMessage: nil
+            )
+        } catch {
+            let message = "Failed to fetch session lineage reports for run \(runID): \(error.localizedDescription)"
+            ForgeLogger.recovery.error(message)
+            return ReportEnvelope(reports: [], errorMessage: message)
+        }
+    }
+
     /// Generate session lineage reports for all agents in a run.
     static func generateReports(for runID: UUID, context: ModelContext) -> [AgentSessionReport] {
-        let predicate = #Predicate<AgentSessionLineage> { $0.runID == runID }
-        let descriptor = FetchDescriptor<AgentSessionLineage>(predicate: predicate)
-        guard let lineages = try? context.fetch(descriptor) else { return [] }
+        generateEnvelope(
+            for: runID,
+            fetchLineages: {
+                let predicate = #Predicate<AgentSessionLineage> { $0.runID == runID }
+                let descriptor = FetchDescriptor<AgentSessionLineage>(predicate: predicate)
+                return try context.fetch(descriptor)
+            }
+        ).reports
+    }
 
-        return lineages.map { lineage in
+    private static func buildReports(from lineages: [AgentSessionLineage]) -> [AgentSessionReport] {
+        lineages.map { lineage in
             let sortedGenerations = lineage.generations.sorted(by: { $0.generation < $1.generation })
             let activeGen = lineage.activeGenerationID.flatMap { activeID in
                 lineage.generations.first(where: { $0.id == activeID })
@@ -75,8 +103,20 @@ final class SessionLineageReportBridge {
 
     /// Generate a JSON-serializable summary for inclusion in run reports.
     static func generateReportJSON(for runID: UUID, context: ModelContext) -> Data? {
-        let reports = generateReports(for: runID, context: context)
-        guard !reports.isEmpty else { return nil }
-        return try? JSONEncoder().encode(reports)
+        let envelope = generateEnvelope(
+            for: runID,
+            fetchLineages: {
+                let predicate = #Predicate<AgentSessionLineage> { $0.runID == runID }
+                let descriptor = FetchDescriptor<AgentSessionLineage>(predicate: predicate)
+                return try context.fetch(descriptor)
+            }
+        )
+        guard !envelope.reports.isEmpty || envelope.errorMessage != nil else { return nil }
+        do {
+            return try JSONEncoder().encode(envelope)
+        } catch {
+            ForgeLogger.recovery.error("Failed to encode session lineage report envelope for run \(runID): \(error.localizedDescription)")
+            return nil
+        }
     }
 }

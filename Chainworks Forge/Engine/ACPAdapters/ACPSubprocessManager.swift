@@ -32,6 +32,8 @@ final class ACPSubprocessManager: @unchecked Sendable {
     /// Prevents multiple tasks from racing on the same stdout FileHandle.
     private var sharedLineStream: AsyncThrowingStream<String, Error>?
     private var sharedStreamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+    private var sharedStderrLineStream: AsyncThrowingStream<String, Error>?
+    private var sharedStderrStreamContinuation: AsyncThrowingStream<String, Error>.Continuation?
 
     // MARK: - Init
 
@@ -225,6 +227,61 @@ final class ACPSubprocessManager: @unchecked Sendable {
         return stream
     }
 
+    /// Returns a shared stderr line stream for runtime diagnostics.
+    /// Transports can drain this to surface provider-side errors that do not appear on stdout.
+    func readStderrLines() -> AsyncThrowingStream<String, Error> {
+        lock.lock()
+        if let existing = sharedStderrLineStream {
+            lock.unlock()
+            return existing
+        }
+        let pipe = stderrPipe
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            self.sharedStderrStreamContinuation = continuation
+
+            guard let pipe else {
+                continuation.finish(throwing: ACPSubprocessError.notRunning)
+                return
+            }
+
+            let readerTask = Task.detached {
+                let handle = pipe.fileHandleForReading
+                var buffer = Data()
+
+                while !Task.isCancelled {
+                    let chunk = handle.availableData
+
+                    guard !chunk.isEmpty else {
+                        if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
+                            continuation.yield(line)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    buffer.append(chunk)
+
+                    while let newlineRange = buffer.range(of: Data([0x0A])) {
+                        let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+                        buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+                        if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                            continuation.yield(line)
+                        }
+                    }
+                }
+                continuation.finish()
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                readerTask.cancel()
+            }
+        }
+        sharedStderrLineStream = stream
+        lock.unlock()
+        return stream
+    }
+
     /// Terminate the subprocess gracefully (SIGTERM), then forcefully (SIGKILL) if needed.
     func terminate() {
         lock.lock()
@@ -260,6 +317,10 @@ final class ACPSubprocessManager: @unchecked Sendable {
         stdinPipe = nil
         stdoutPipe = nil
         stderrPipe = nil
+        sharedLineStream = nil
+        sharedStreamContinuation = nil
+        sharedStderrLineStream = nil
+        sharedStderrStreamContinuation = nil
         lock.unlock()
     }
 

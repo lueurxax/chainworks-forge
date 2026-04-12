@@ -47,7 +47,7 @@ struct RunPlanCompilerTests {
         // Verify a sample agent's backend is resolved
         let leadOrch = plan.agentBindings["lead_orchestrator"]
         #expect(leadOrch != nil)
-        #expect(leadOrch?.provider == "claude_code")
+        #expect(ProviderFamily.from(runtimeIdentifier: leadOrch?.provider ?? "") == .claudeACP)
         #expect(leadOrch?.effort == "high")
     }
 
@@ -338,12 +338,12 @@ struct RunPlanCompilerTests {
 
         // Verify lead_orchestrator binding details
         let leadOrch = plan.agentBindings["lead_orchestrator"]
-        #expect(leadOrch?.provider == "claude_code")
+        #expect(ProviderFamily.from(runtimeIdentifier: leadOrch?.provider ?? "") == .claudeACP)
         #expect(leadOrch?.effort == "high")
 
         // Verify code_writer binding details
         let codeWriter = plan.agentBindings["code_writer"]
-        #expect(codeWriter?.provider == "codex")
+        #expect(ProviderFamily.from(runtimeIdentifier: codeWriter?.provider ?? "") == .codexACP)
         #expect(codeWriter?.effort == "high")
     }
 }

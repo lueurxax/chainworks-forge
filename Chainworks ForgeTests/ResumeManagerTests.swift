@@ -486,6 +486,74 @@ struct ResumeManagerTests {
         }
     }
 
+    @Test("Classify run surfaces unreadable source drift diagnostics")
+    func classifyRunWithUnreadableSourcesSurfacesDiagnostics() async throws {
+        let sourceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeUnreadable-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let workflowURL = sourceRoot.appendingPathComponent("workflow.yaml")
+        let catalogURL = sourceRoot.appendingPathComponent("agents.yaml")
+        let workflowFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
+        let catalogFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
+        try FileManager.default.copyItem(at: workflowFixtureURL, to: workflowURL)
+        _ = try writePortableCatalogCopy(from: catalogFixtureURL, to: catalogURL)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
+
+        let idea = Idea(title: "Unreadable Drift", body: "Unreadable source should be visible")
+        context.insert(idea)
+
+        let runID = UUID()
+        let workspaceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeUnreadableWorkspace-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: workspaceRoot,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: workflowURL.path,
+            catalogSourcePath: catalogURL.path
+        )
+        idea.workspaceRootPath = sourceRoot.path
+        run.frozenWorkspaceRootPath = sourceRoot.path
+        run.status = .running
+        try context.save()
+
+        try FileManager.default.removeItem(at: workflowURL)
+        try FileManager.default.createDirectory(at: workflowURL, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(actions.count == 1)
+        if case .resume(let resumedRun, _, _) = actions[0] {
+            let driftDetails = try #require(resumedRun.driftDetails)
+            #expect(driftDetails.contains("Workflow source could not be read during drift detection"))
+            #expect(driftDetails.contains("Agent catalog source could not be read during drift detection"))
+        } else {
+            Issue.record("Expected .resume with drift diagnostics, got \(actions[0])")
+        }
+    }
+
     @Test("Run creation persists frozen workflow and catalog snapshot artifacts")
     func runCreationPersistsFrozenSnapshotArtifacts() throws {
         let sourceRoot = FileManager.default.temporaryDirectory
@@ -1029,6 +1097,53 @@ struct ResumeManagerTests {
         await cancelAndAwaitSettled(service, runID: run.id)
     }
 
+    @Test("ExecutionService resume immediately persists running status and refreshes latest summary")
+    func executionServiceResumeImmediatelyPersistsRunningStatusAndSummary() async throws {
+        let (run, plan, workspace) = try makeRunFromPlan()
+        run.status = .blocked
+        run.completedAt = Date(timeIntervalSince1970: 400)
+        run.driftDetails = "Execution stalled after the last session closed before the workflow could transition."
+
+        let blockedStage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: plan.initialStateID)
+
+        let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
+        let service = ExecutionService(modelContext: context, executor: executor)
+
+        try service.resumeRun(run: run, compiler: compiler)
+
+        #expect(run.status == .running)
+        #expect(run.completedAt == nil)
+
+        let latestSummaryURL = workspace.artifactRoot
+            .appendingPathComponent("reports", isDirectory: true)
+            .appendingPathComponent("run_summary_latest.json")
+
+        await awaitCondition("Latest summary should be refreshed to running", timeout: 3.0) {
+            guard FileManager.default.fileExists(atPath: latestSummaryURL.path),
+                  let data = try? Data(contentsOf: latestSummaryURL),
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+
+            return payload["status"] as? String == RunStatus.running.rawValue
+                && payload["blockedReason"] as? String == nil
+        }
+
+        await cancelAndAwaitSettled(service, runID: run.id)
+    }
+
     @Test("ExecutionService resumes agent retry without creating a new stage iteration")
     func executionServiceResumeRunAfterAgentRetryReusesExistingStageExecution() async throws {
         let (run, plan, _, catalog) = try makeRetryableRunFromPlan()
@@ -1128,11 +1243,18 @@ struct ResumeManagerTests {
         )
         failedAgent.stageExecution = stage
         failedAgent.logSnippet = "Required outputs missing: output_1"
+        failedAgent.supervisionClassification = .idleHangAfterFirstEdit
+        failedAgent.transportErrorKind = .stream
         context.insert(failedAgent)
         try context.save()
 
-        let coordinator = RecoveryCoordinator(modelContext: context)
-        _ = try coordinator.retryAgent(run: run, stageID: plan.initialStateID, agentID: "test_agent")
+        let retryCoordinator = StageRetryCoordinator(modelContext: context)
+        _ = try retryCoordinator.retryFailedAgent(
+            run: run,
+            stage: stage,
+            failedAgent: failedAgent,
+            retryReason: "automatic_watchdog_retry"
+        )
 
         let retryExec = try #require(
             stage.agentExecutions
@@ -1172,6 +1294,10 @@ struct ResumeManagerTests {
         #expect(stage.agentExecutions.count == 2)
         #expect(failedAgent.status == .completed)
         #expect(retryExec.status == .completed)
+        #expect(failedAgent.supervisionClassification == .idleHangAfterFirstEdit)
+        #expect(failedAgent.canonicalOutcome == .completedWithTransportError)
+        #expect(retryExec.retryReason == "automatic_watchdog_retry")
+        #expect(retryExec.transportErrorKind == .stream)
         #expect(
             failedAgent.artifacts.contains { $0.name == "output_1" }
         )
@@ -1650,6 +1776,102 @@ struct ResumeManagerTests {
                 detail: "Session closed"
             ),
             now: Date()
+        )
+
+        #expect(shouldReconcile == true)
+    }
+
+    @Test("ExecutionService does not reconcile freshly started downstream stage before first agent work")
+    func executionServiceDoesNotReconcileFreshStartedDownstreamStageBeforeFirstAgentWork() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 2,
+                lastCompletedStateID: "state_5_proposal_refined",
+                lastCompletedStageExecutionID: UUID(),
+                nextScheduledStateID: "state_4_proposal_reviewed",
+                nextScheduledIteration: 9,
+                nextScheduledAttemptNumber: 1,
+                scheduledStageExecutionID: nil,
+                settlementPhase: .transitionStarted,
+                updatedAt: now.addingTimeInterval(-31)
+            )
+        )
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: false,
+            hasStartedStageWithoutAgentWork: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-31),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-31),
+                detail: "Upstream writer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService reconciles truly stale started downstream stage after extended grace")
+    func executionServiceReconcilesTrulyStaleStartedDownstreamStageAfterExtendedGrace() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 2,
+                lastCompletedStateID: "state_5_proposal_refined",
+                lastCompletedStageExecutionID: UUID(),
+                nextScheduledStateID: "state_4_proposal_reviewed",
+                nextScheduledIteration: 9,
+                nextScheduledAttemptNumber: 1,
+                scheduledStageExecutionID: nil,
+                settlementPhase: .transitionStarted,
+                updatedAt: now.addingTimeInterval(-301)
+            )
+        )
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: false,
+            hasStartedStageWithoutAgentWork: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-301),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-301),
+                detail: "Upstream writer session closed"
+            ),
+            now: now
         )
 
         #expect(shouldReconcile == true)

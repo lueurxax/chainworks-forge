@@ -91,6 +91,7 @@ struct WorkflowMapPersistedTimelineEntry: Identifiable, Sendable {
     let title: String
     let detail: String
     let timestamp: Date
+    let sessionID: String?
 }
 
 struct WorkflowMapStageProjection: Identifiable, Sendable {

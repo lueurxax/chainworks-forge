@@ -20,6 +20,29 @@ enum TransportErrorKind: String, Codable, Sendable, Equatable {
     case unknown = "unknown"
 }
 
+enum SupervisionClassification: String, Codable, Sendable, Equatable {
+    case idleHangBeforeFirstProgress = "idle_hang_before_first_progress"
+    case idleHangAfterProgress = "idle_hang_after_progress"
+    case idleHangReadLoop = "idle_hang_read_loop"
+    case idleHangAfterFirstEdit = "idle_hang_after_first_edit"
+    case mutationSideEffectMissing = "mutation_side_effect_missing"
+
+    var defaultSummary: String {
+        switch self {
+        case .idleHangBeforeFirstProgress:
+            return "Execution stalled before first meaningful progress after prompt submission"
+        case .idleHangAfterProgress:
+            return "Execution stalled after meaningful progress stopped"
+        case .idleHangReadLoop:
+            return "Execution stalled in a weak read loop without strong progress"
+        case .idleHangAfterFirstEdit:
+            return "Execution stalled after the first edit boundary"
+        case .mutationSideEffectMissing:
+            return "Mutating tool reported success, but no filesystem side effect was observed"
+        }
+    }
+}
+
 enum OutputPresence: String, Codable, Sendable, Equatable {
     case none = "none"
     case durableOutput = "durable_output"

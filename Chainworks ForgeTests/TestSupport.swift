@@ -287,6 +287,13 @@ func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throw
     return destinationURL
 }
 
+@discardableResult
+func writePortableWorkflowCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    try source.write(to: destinationURL, atomically: true, encoding: .utf8)
+    return destinationURL
+}
+
 /// Loads the canonical workflow fixture from the test bundle.
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
@@ -334,7 +341,10 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
             Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
             "proposal-loop-live.yaml fixture must be bundled with tests"
         )
-    return try YAMLParser.loadWorkflow(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("chainworks-test-proposal-loop-live-\(UUID().uuidString).yaml")
+    try writePortableWorkflowCopy(from: url, to: portableURL)
+    return try YAMLParser.loadWorkflow(from: portableURL)
 }
 
 /// Loads the full MVP live workflow fixture from the test bundle.
@@ -347,7 +357,10 @@ func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
             Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
             "full-mvp-live.yaml fixture must be bundled with tests"
         )
-    return try YAMLParser.loadWorkflow(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("chainworks-test-full-mvp-live-\(UUID().uuidString).yaml")
+    try writePortableWorkflowCopy(from: url, to: portableURL)
+    return try YAMLParser.loadWorkflow(from: portableURL)
 }
 
 /// Loads the compact workflow fixture from the test bundle.

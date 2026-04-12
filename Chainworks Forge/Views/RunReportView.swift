@@ -422,7 +422,14 @@ struct RunReportView: View {
             },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
-        reportArtifacts = (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            reportArtifacts = try modelContext.fetch(descriptor)
+        } catch {
+            let message = "Failed to load immutable reports: \(error.localizedDescription)"
+            ForgeLogger.ui.error("RunReportView failed to fetch immutable reports for run \(run.id): \(error.localizedDescription)")
+            reportArtifacts = []
+            loadError = message
+        }
         if autoSelectLatestImmutableReport,
            selectedReportContent == nil,
            let latestReport = reportArtifacts.first {
@@ -436,18 +443,25 @@ struct RunReportView: View {
                     artifact.id == summaryID
                 }
             )
-            if let summaryArtifact = try? modelContext.fetch(summaryDescriptor).first {
-                self.summaryArtifact = summaryArtifact
-                do {
-                    summaryContent = try sloProbe.measure(
-                        artifactName: summaryArtifact.name,
-                        runID: run.id
-                    ) {
-                        try SecurityScopedAccess.loadString(from: URL(fileURLWithPath: summaryArtifact.filePath))
+            do {
+                if let summaryArtifact = try modelContext.fetch(summaryDescriptor).first {
+                    self.summaryArtifact = summaryArtifact
+                    do {
+                        summaryContent = try sloProbe.measure(
+                            artifactName: summaryArtifact.name,
+                            runID: run.id
+                        ) {
+                            try SecurityScopedAccess.loadString(from: URL(fileURLWithPath: summaryArtifact.filePath))
+                        }
+                    } catch {
+                        loadError = "Failed to load summary: \(error.localizedDescription)"
                     }
-                } catch {
-                    loadError = "Failed to load summary: \(error.localizedDescription)"
+                } else {
+                    loadError = loadError ?? "Failed to load summary: summary artifact was not found."
                 }
+            } catch {
+                ForgeLogger.ui.error("RunReportView failed to fetch summary artifact for run \(run.id): \(error.localizedDescription)")
+                loadError = "Failed to load summary artifact: \(error.localizedDescription)"
             }
         }
 
@@ -510,11 +524,17 @@ struct RunReportView: View {
     private func loadReportContent(_ artifact: Artifact) {
         selectedReportArtifact = artifact
         // Proposal 008 (PERF-080): Measure report retrieval latency.
-        selectedReportContent = try? sloProbe.measure(
-            artifactName: artifact.name,
-            runID: run.id
-        ) {
-            try SecurityScopedAccess.loadString(from: URL(fileURLWithPath: artifact.filePath))
+        do {
+            selectedReportContent = try sloProbe.measure(
+                artifactName: artifact.name,
+                runID: run.id
+            ) {
+                try SecurityScopedAccess.loadString(from: URL(fileURLWithPath: artifact.filePath))
+            }
+        } catch {
+            ForgeLogger.ui.error("RunReportView failed to load report artifact \(artifact.id) for run \(run.id): \(error.localizedDescription)")
+            loadError = "Failed to load report \(artifact.name): \(error.localizedDescription)"
+            selectedReportContent = nil
         }
     }
 

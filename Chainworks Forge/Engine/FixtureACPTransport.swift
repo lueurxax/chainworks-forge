@@ -38,7 +38,7 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                 capabilityToken: "fixture-read-only",
                 backendPolicyVersion: "fixture-v1"
             ),
-            actualEnabledExtensions: request.requestedExtensions,
+            actualEnabledExtensions: request.requestedExtensions ?? request.mcpServers?.map(\.name),
             startupLatencyMilliseconds: 0
         )
     }

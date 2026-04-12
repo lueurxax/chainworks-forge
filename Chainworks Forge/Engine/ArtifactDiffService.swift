@@ -8,8 +8,25 @@ struct ArtifactDiffService {
 
     /// Compare two artifact contents and produce a line-level diff.
     static func diff(artifactA: Artifact, artifactB: Artifact) -> ArtifactDiff? {
-        guard let contentA = try? String(contentsOfFile: artifactA.filePath, encoding: .utf8),
-              let contentB = try? String(contentsOfFile: artifactB.filePath, encoding: .utf8) else {
+        let contentA: String
+        do {
+            contentA = try String(contentsOfFile: artifactA.filePath, encoding: .utf8)
+        } catch {
+            let message = "Artifact diff failed to read '\(artifactA.name)' at \(artifactA.filePath): \(error.localizedDescription)"
+            Task { @MainActor in
+                ForgeLogger.ui.error(message)
+            }
+            return nil
+        }
+
+        let contentB: String
+        do {
+            contentB = try String(contentsOfFile: artifactB.filePath, encoding: .utf8)
+        } catch {
+            let message = "Artifact diff failed to read '\(artifactB.name)' at \(artifactB.filePath): \(error.localizedDescription)"
+            Task { @MainActor in
+                ForgeLogger.ui.error(message)
+            }
             return nil
         }
 

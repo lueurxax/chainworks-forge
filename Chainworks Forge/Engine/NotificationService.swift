@@ -120,6 +120,7 @@ final class NotificationService {
 
     func updatePreferences(_ newPreferences: NotificationPreferences) {
         preferences = newPreferences
+        _ = newPreferences.save()
     }
 
     // MARK: - Helpers

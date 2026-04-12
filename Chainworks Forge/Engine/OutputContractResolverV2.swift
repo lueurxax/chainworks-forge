@@ -195,7 +195,7 @@ enum OutputContractResolverV2 {
         }
 
         // JSON validation: parse and check required fields
-        if let jsonObject = try? JSONSerialization.jsonObject(with: data),
+        if let jsonObject = parsedJSONObject(from: data),
            let dict = jsonObject as? [String: Any] {
             // Valid JSON — check required fields
             let missingFields = schema.requiredFields.filter { dict[$0] == nil }
@@ -251,6 +251,97 @@ enum OutputContractResolverV2 {
             validationError: "Output is not valid JSON or not a JSON object",
             rawPayloadSize: data.count
         )
+    }
+
+    private static func parsedJSONObject(from data: Data) -> Any? {
+        if let jsonObject = try? JSONSerialization.jsonObject(with: data) {
+            return jsonObject
+        }
+
+        guard let repairedData = repairedJSONDataIfLikelyQuotedStringIssue(data) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: repairedData)
+    }
+
+    private static func repairedJSONDataIfLikelyQuotedStringIssue(_ data: Data) -> Data? {
+        guard let raw = String(data: data, encoding: .utf8), raw.contains("\"") else {
+            return nil
+        }
+
+        var repaired = ""
+        repaired.reserveCapacity(raw.utf8.count + 16)
+
+        let scalars = Array(raw.unicodeScalars)
+        var index = 0
+        var inString = false
+        var escaped = false
+
+        while index < scalars.count {
+            let scalar = scalars[index]
+
+            if !inString {
+                repaired.unicodeScalars.append(scalar)
+                if scalar == "\"" {
+                    inString = true
+                }
+                index += 1
+                continue
+            }
+
+            if escaped {
+                repaired.unicodeScalars.append(scalar)
+                escaped = false
+                index += 1
+                continue
+            }
+
+            if scalar == "\\" {
+                repaired.unicodeScalars.append(scalar)
+                escaped = true
+                index += 1
+                continue
+            }
+
+            if scalar == "\"" {
+                let nextSignificant = nextNonWhitespaceScalar(in: scalars, after: index)
+                let isClosingQuote = nextSignificant == nil
+                    || nextSignificant == ","
+                    || nextSignificant == "}"
+                    || nextSignificant == "]"
+                    || nextSignificant == ":"
+
+                if isClosingQuote {
+                    repaired.unicodeScalars.append(scalar)
+                    inString = false
+                } else {
+                    repaired.append("\\\"")
+                }
+                index += 1
+                continue
+            }
+
+            repaired.unicodeScalars.append(scalar)
+            index += 1
+        }
+
+        guard repaired != raw else { return nil }
+        return repaired.data(using: .utf8)
+    }
+
+    private static func nextNonWhitespaceScalar(
+        in scalars: [UnicodeScalar],
+        after index: Int
+    ) -> UnicodeScalar? {
+        var cursor = index + 1
+        while cursor < scalars.count {
+            let scalar = scalars[cursor]
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                return scalar
+            }
+            cursor += 1
+        }
+        return nil
     }
 
     // MARK: - Stem Matching

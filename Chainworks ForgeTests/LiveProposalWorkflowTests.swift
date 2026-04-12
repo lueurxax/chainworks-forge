@@ -390,4 +390,105 @@ struct LiveProposalWorkflowTests {
         #expect(events[1].toolName == "inspect_repo_context")
         #expect(events[1].detail == "Tool completed: inspect_repo_context")
     }
+
+    @Test("Event bridge captures Codex usage telemetry from usage_update events")
+    func eventBridgeCapturesCodexUsageTelemetry() async throws {
+        let bridge = ExecutionEventBridge()
+        let usageRaw = """
+        {
+          "sessionUpdate": "usage_update",
+          "usage": {
+            "input_tokens": 808763,
+            "cached_input_tokens": 729088,
+            "output_tokens": 2142,
+            "model_context_window": 258400
+          }
+        }
+        """
+
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.promptSubmitted(raw: #"{"session_id":"session-telemetry"}"#))
+            continuation.yield(.toolCallStarted(toolName: "search", raw: "{}"))
+            continuation.yield(.unknown(type: "usage_update", data: usageRaw))
+            continuation.yield(.toolCallStarted(toolName: "write", raw: "{}"))
+            continuation.finish()
+        }
+
+        _ = try await bridge.processStream(stream) { _ in }
+        let telemetry = try #require(bridge.codexTelemetry(runtimeHomeBytes: 4096))
+
+        #expect(telemetry.inputTokens == 808763)
+        #expect(telemetry.cachedInputTokens == 729088)
+        #expect(telemetry.outputTokens == 2142)
+        #expect(telemetry.modelContextWindow == 258400)
+        #expect(telemetry.usageUpdateCount == 1)
+        #expect(telemetry.discoveryToolCallCount == 1)
+        #expect(telemetry.toolCallCount == 2)
+        #expect(telemetry.promptSubmittedAt != nil)
+        #expect(telemetry.firstEditAt != nil)
+        #expect(telemetry.lastMutatingToolName == "write")
+        #expect(telemetry.runtimeHomeBytes == 4096)
+    }
+
+    @Test("Receipt builder includes Codex telemetry block")
+    func receiptBuilderIncludesCodexTelemetryBlock() throws {
+        let startedAt = Date()
+        let completedAt = startedAt.addingTimeInterval(5)
+        let receipt = ExecutionReceiptBuilder.buildReceipt(
+            agentID: "code_writer",
+            sessionID: "session-telemetry",
+            stageID: "state_8_implementation_continued",
+            iteration: 1,
+            attemptNumber: 1,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            events: [],
+            toolCalls: [],
+            finalContent: "done",
+            succeeded: true,
+            errorMessage: nil,
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            codexTelemetry: CodexReceiptTelemetry(
+                inputTokens: 808763,
+                cachedInputTokens: 729088,
+                outputTokens: 2142,
+                modelContextWindow: 258400,
+                usageUpdateCount: 4,
+                toolCallCount: 11,
+                discoveryToolCallCount: 8,
+                promptSubmittedAt: startedAt,
+                firstEditAt: startedAt.addingTimeInterval(3),
+                lastMeaningfulProgressAt: completedAt,
+                lastToolName: "edit",
+                lastMutatingToolName: "edit",
+                accumulatedTextBytes: 8192,
+                rawToolPayloadBytes: 16384,
+                runtimeHomeBytes: 65536,
+                runawayReason: nil,
+                supervisionClassification: .idleHangAfterFirstEdit,
+                silenceDurationSeconds: 120,
+                automaticRetryConsumed: true,
+                mutationVerificationAttempted: true,
+                mutationSideEffectObserved: false,
+                firstVerifiedMutatedPath: nil
+            )
+        )
+
+        let data = try #require(receipt["code_writer_receipt.json"])
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(ExecutionReceipt.self, from: data)
+
+        #expect(decoded.codexTelemetry?.inputTokens == 808763)
+        #expect(decoded.codexTelemetry?.cachedInputTokens == 729088)
+        #expect(decoded.codexTelemetry?.discoveryToolCallCount == 8)
+        #expect(decoded.codexTelemetry?.lastToolName == "edit")
+        #expect(decoded.codexTelemetry?.supervisionClassification == .idleHangAfterFirstEdit)
+        #expect(decoded.codexTelemetry?.automaticRetryConsumed == true)
+        #expect(decoded.codexTelemetry?.mutationVerificationAttempted == true)
+        #expect(decoded.codexTelemetry?.mutationSideEffectObserved == false)
+        #expect(decoded.codexTelemetry?.runtimeHomeBytes == 65536)
+    }
 }

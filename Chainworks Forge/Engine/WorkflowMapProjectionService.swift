@@ -26,6 +26,16 @@ final class WorkflowMapProjectionService {
         self.executionService = executionService
     }
 
+    func runStatus(for run: Run) -> RunStatus {
+        let latestPersistedStage = RunLatestStageStatusLoader.load(for: run, modelContext: modelContext)
+        let liveTimeline = executionService.peekOrchestrator(for: run.id)?.liveTimeline ?? []
+        return deriveRunStatus(
+            for: run,
+            latestPersistedStage: latestPersistedStage,
+            liveTimeline: liveTimeline
+        )
+    }
+
     func projection(for run: Run) -> WorkflowMapProjection? {
         guard let cachedPlan = cachedPlanEntry(for: run) else {
             return nil
@@ -35,16 +45,16 @@ final class WorkflowMapProjectionService {
         let plan = cachedPlan.plan
         let topology = cachedPlan.topology
         let orderedStateIDs = topology.orderedStateIDs()
-        let liveTimeline = executionService.orchestrator(for: run.id)?.liveTimeline ?? []
+        let liveTimeline = executionService.peekOrchestrator(for: run.id)?.liveTimeline ?? []
         let persistedTimeline = buildPersistedTimeline(stages: persistedStages, approvals: persistedApprovals, plan: plan)
         let providerBindings = decodeProviderBindings(from: run.providerBindingSnapshotJSON)
-        let currentStageID = deriveCurrentStageID(for: run, from: persistedStages)
+        let currentStageID = deriveCurrentStageID(for: run, from: persistedStages, liveTimeline: liveTimeline)
         let projectionStages = suppressStaleFutureStageExecutions(
             in: persistedStages,
             currentStageID: currentStageID,
             orderedStateIDs: orderedStateIDs
         )
-        let runStatus = deriveRunStatus(for: run, persistedStages: persistedStages)
+        let runStatus = deriveRunStatus(for: run, persistedStages: persistedStages, liveTimeline: liveTimeline)
 
         let stages: [WorkflowMapStageProjection] = orderedStateIDs.enumerated().compactMap { index, stateID in
             guard let state = plan.states[stateID] else { return nil }
@@ -124,7 +134,19 @@ final class WorkflowMapProjectionService {
 
     /// Proposal 032: Prefer the durable transition cursor for current-stage derivation.
     /// Falls back to persisted stage row heuristics for pre-P032 runs.
-    private func deriveCurrentStageID(for run: Run, from persistedStages: [RunStageSnapshot]) -> String? {
+    private func deriveCurrentStageID(
+        for run: Run,
+        from persistedStages: [RunStageSnapshot],
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> String? {
+        if let liveRetryStageID = latestLiveRetryStageIDIfNewerThanPersistedTerminalState(
+            run: run,
+            persistedStages: persistedStages,
+            liveTimeline: liveTimeline
+        ) {
+            return liveRetryStageID
+        }
+
         if let cursor = run.transitionCursor {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
@@ -151,27 +173,178 @@ final class WorkflowMapProjectionService {
             ?? sorted.last(where: { $0.status == .completed })?.stageID
     }
 
-    private func deriveRunStatus(for run: Run, persistedStages: [RunStageSnapshot]) -> RunStatus {
+    private func deriveRunStatus(
+        for run: Run,
+        persistedStages: [RunStageSnapshot],
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> RunStatus {
         if run.cancellationRequestedAt != nil && run.cancellationSettledAt == nil {
             return .cancelling
         }
 
-        if run.status == .pending || run.status == .ready || run.status == .running {
-            if let latestStage = persistedStages.sorted(by: { $0.startedAt < $1.startedAt }).last {
-                switch latestStage.status {
-                case .waitingApproval:
-                    return .waitingApproval
-                case .blocked:
-                    return .blocked
-                case .failed:
-                    return .failed
-                default:
-                    break
-                }
+        if hasLiveRetryActivityNewerThanPersistedTerminalState(
+            persistedStageStartedAt: persistedStages
+                .sorted(by: compareStageSnapshots)
+                .last(where: { $0.status == .blocked || $0.status == .failed })
+                .map { $0.completedAt ?? $0.startedAt },
+            liveTimeline: liveTimeline
+        ) {
+            return .running
+        }
+
+        if latestLiveRetryStageIDIfNewerThanPersistedTerminalState(
+            run: run,
+            persistedStages: persistedStages,
+            liveTimeline: liveTimeline
+        ) != nil {
+            return .running
+        }
+
+        switch run.status {
+        case .waitingApproval, .blocked, .completed, .failed, .cancelled, .cancelling:
+            return run.status
+        case .pending, .ready, .running:
+            break
+        }
+
+        if let latestStage = persistedStages.sorted(by: { $0.startedAt < $1.startedAt }).last {
+            switch latestStage.status {
+            case .pending:
+                return .pending
+            case .ready:
+                return run.status == .pending ? .pending : .ready
+            case .running:
+                return .running
+            case .waitingApproval:
+                return .waitingApproval
+            case .blocked:
+                return .blocked
+            case .failed:
+                return .failed
+            case .completed, .skipped:
+                break
             }
         }
 
         return run.status
+    }
+
+    private func deriveRunStatus(
+        for run: Run,
+        latestPersistedStage: RunLatestStageStatusSnapshot?,
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> RunStatus {
+        if run.cancellationRequestedAt != nil && run.cancellationSettledAt == nil {
+            return .cancelling
+        }
+
+        if hasLiveRetryActivityNewerThanPersistedTerminalState(
+            persistedStageStartedAt: latestPersistedStage.map(\.startedAt),
+            liveTimeline: liveTimeline
+        ) {
+            return .running
+        }
+
+        if latestLiveRetryStageIDIfNewerThanPersistedTerminalState(
+            run: run,
+            latestPersistedStage: latestPersistedStage,
+            liveTimeline: liveTimeline
+        ) != nil {
+            return .running
+        }
+
+        switch run.status {
+        case .waitingApproval, .blocked, .completed, .failed, .cancelled, .cancelling:
+            return run.status
+        case .pending, .ready, .running:
+            break
+        }
+
+        if let latestStage = latestPersistedStage {
+            switch latestStage.status {
+            case .pending:
+                return .pending
+            case .ready:
+                return run.status == .pending ? .pending : .ready
+            case .running:
+                return .running
+            case .waitingApproval:
+                return .waitingApproval
+            case .blocked:
+                return .blocked
+            case .failed:
+                return .failed
+            case .completed, .skipped:
+                break
+            }
+        }
+
+        return run.status
+    }
+
+    private func hasLiveRetryActivityNewerThanPersistedTerminalState(
+        persistedStageStartedAt: Date?,
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> Bool {
+        guard
+            let persistedStageStartedAt,
+            let latestLiveEntry = liveTimeline.max(by: { lhs, rhs in
+                if lhs.event.timestamp == rhs.event.timestamp {
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                return lhs.event.timestamp < rhs.event.timestamp
+            })
+        else {
+            return false
+        }
+
+        return latestLiveEntry.event.timestamp > persistedStageStartedAt
+    }
+
+    private func latestLiveRetryStageIDIfNewerThanPersistedTerminalState(
+        run: Run,
+        persistedStages: [RunStageSnapshot],
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> String? {
+        guard !liveTimeline.isEmpty else { return nil }
+        guard
+            let latestPersistedStage = persistedStages.sorted(by: compareStageSnapshots).last,
+            latestPersistedStage.status == .blocked || latestPersistedStage.status == .failed,
+            let latestLiveEntry = liveTimeline.max(by: { lhs, rhs in
+                if lhs.event.timestamp == rhs.event.timestamp {
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                return lhs.event.timestamp < rhs.event.timestamp
+            }),
+            latestLiveEntry.event.timestamp > (latestPersistedStage.completedAt ?? latestPersistedStage.startedAt)
+        else {
+            return nil
+        }
+
+        return latestLiveEntry.stageID
+    }
+
+    private func latestLiveRetryStageIDIfNewerThanPersistedTerminalState(
+        run: Run,
+        latestPersistedStage: RunLatestStageStatusSnapshot?,
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> String? {
+        guard !liveTimeline.isEmpty else { return nil }
+        guard
+            let latestPersistedStage,
+            latestPersistedStage.status == .blocked || latestPersistedStage.status == .failed,
+            let latestLiveEntry = liveTimeline.max(by: { lhs, rhs in
+                if lhs.event.timestamp == rhs.event.timestamp {
+                    return lhs.stageID < rhs.stageID
+                }
+                return lhs.event.timestamp < rhs.event.timestamp
+            }),
+            latestLiveEntry.event.timestamp > latestPersistedStage.startedAt
+        else {
+            return nil
+        }
+
+        return latestLiveEntry.stageID
     }
 
     private func suppressStaleFutureStageExecutions(
@@ -249,9 +422,76 @@ final class WorkflowMapProjectionService {
                     id: "stage::\(stage.id.uuidString)",
                     title: stageLabel,
                     detail: "Persisted stage status: \(stage.status.rawValue.replacingOccurrences(of: "_", with: " "))",
-                    timestamp: timestamp
+                    timestamp: timestamp,
+                    sessionID: nil
                 )
             )
+
+            for agent in stage.agentExecutions {
+                let agentTimestamp = agent.completedAt ?? agent.startedAt
+                if let sessionID = agent.runtimeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !sessionID.isEmpty {
+                    let statusLabel = agent.status.rawValue.replacingOccurrences(of: "_", with: " ")
+                    entries.append(
+                        WorkflowMapPersistedTimelineEntry(
+                            id: "agent-session::\(agent.id.uuidString)",
+                            title: agent.agentTitle,
+                            detail: "Persisted agent \(statusLabel) in session \(sessionID)",
+                            timestamp: agentTimestamp,
+                            sessionID: sessionID
+                        )
+                    )
+                }
+
+                if let supervision = agent.supervisionClassification {
+                    entries.append(
+                        WorkflowMapPersistedTimelineEntry(
+                            id: "agent-supervision::\(agent.id.uuidString)",
+                            title: agent.agentTitle,
+                            detail: "Persisted supervision: \(supervision.defaultSummary)",
+                            timestamp: agentTimestamp,
+                            sessionID: agent.runtimeSessionID
+                        )
+                    )
+                }
+
+                if agent.retryReason == "automatic_watchdog_retry" {
+                    let attemptLabel = agent.agentAttemptNumber.map { "attempt \($0)" } ?? "retry"
+                    let retryDetail: String = {
+                        switch agent.status {
+                        case .completed:
+                            return "Persisted automatic watchdog retry succeeded (\(attemptLabel)) for \(agent.taskName)"
+                        case .failed:
+                            return "Persisted automatic watchdog retry exhausted (\(attemptLabel)) for \(agent.taskName)"
+                        default:
+                            return "Persisted automatic watchdog retry (\(attemptLabel)) for \(agent.taskName)"
+                        }
+                    }()
+                    entries.append(
+                        WorkflowMapPersistedTimelineEntry(
+                            id: "agent-retry::\(agent.id.uuidString)",
+                            title: agent.agentTitle,
+                            detail: retryDetail,
+                            timestamp: agent.startedAt,
+                            sessionID: agent.runtimeSessionID
+                        )
+                    )
+                }
+            }
+
+            if let snapshot = decodeRecoverySnapshot(from: stage),
+               let recommended = snapshot.recommendedAction,
+               stage.agentExecutions.contains(where: { $0.retryReason == "automatic_watchdog_retry" }) {
+                entries.append(
+                    WorkflowMapPersistedTimelineEntry(
+                        id: "stage-recovery::\(stage.id.uuidString)",
+                        title: stageLabel,
+                        detail: recommended.explanation,
+                        timestamp: snapshot.timestamp,
+                        sessionID: nil
+                    )
+                )
+            }
         }
 
         for approval in approvals {
@@ -262,7 +502,8 @@ final class WorkflowMapProjectionService {
                     id: "approval::\(approval.id.uuidString)",
                     title: stageLabel,
                     detail: "Persisted approval \(approval.decision.rawValue.replacingOccurrences(of: "_", with: " "))",
-                    timestamp: timestamp
+                    timestamp: timestamp,
+                    sessionID: nil
                 )
             )
         }
@@ -330,6 +571,11 @@ final class WorkflowMapProjectionService {
             transitions: transitions,
             loopTelemetry: loopTelemetry
         )
+    }
+
+    private func decodeRecoverySnapshot(from stage: RunStageSnapshot) -> RecoveryActionSnapshot? {
+        guard let data = stage.recoverySnapshotJSON else { return nil }
+        return try? JSONDecoder().decode(RecoveryActionSnapshot.self, from: data)
     }
 
     private func buildOccurrences(

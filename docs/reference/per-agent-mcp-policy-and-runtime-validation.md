@@ -87,7 +87,7 @@ AgentCatalog
   -> YAML validation
   -> RunPlanCompiler / ResolvedAgent
   -> MCPPolicyResolver
-  -> GooseSessionBridge or ACP-native runtime path
+  -> RuntimeSessionBridge
   -> AgentExecution settlement
   -> RunReportBuilder / RunComparisonService / operator shell
 ```
@@ -106,8 +106,7 @@ Before execution, the catalog validator checks:
 
 Runtime realization depends on adapter family:
 
-- Goose-backed runtimes reconcile against Goose extension IDs,
-- ACP-native runtimes keep Forge truth but realize MCP through ACP-native semantics,
+- ACP runtimes keep Forge truth but realize MCP through ACP-native semantics,
 - portability-sensitive paths must not hardcode workstation-specific absolute paths.
 
 The runtime layer may vary, but the persisted Forge truth model remains the same.
@@ -180,8 +179,7 @@ That means MCP policy is not a background adapter detail. It is part of the prod
 - `Chainworks Forge/DSL/AgentCatalog.swift`
 - `Chainworks Forge/DSL/YAMLValidator.swift`
 - `Chainworks Forge/Engine/MCPPolicyRuntime.swift`
-- `Chainworks Forge/Engine/GooseSessionBridge.swift`
-- `Chainworks Forge/Engine/GooseAdapter/GooseServerTransport.swift`
+- `Chainworks Forge/Engine/RuntimeSessionBridge.swift`
 - `Chainworks Forge/Engine/RunReportBuilder.swift`
 - `Chainworks Forge/Engine/RunComparisonService.swift`
 - `Chainworks Forge/Models/AgentExecution.swift`

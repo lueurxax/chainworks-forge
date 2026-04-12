@@ -40,12 +40,24 @@ enum PreflightStatus: String, Codable, Equatable, Sendable {
 struct PreflightService {
     let appConfigurationStore: AppConfigurationStore
     let providerRegistry: ProviderRegistry
+    let extensionRegistryProvider: any RuntimeExtensionRegistryProvider
+
+    init(
+        appConfigurationStore: AppConfigurationStore,
+        providerRegistry: ProviderRegistry,
+        extensionRegistryProvider: any RuntimeExtensionRegistryProvider = CodexExtensionRegistryReader()
+    ) {
+        self.appConfigurationStore = appConfigurationStore
+        self.providerRegistry = providerRegistry
+        self.extensionRegistryProvider = extensionRegistryProvider
+    }
 
     func runReport(
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
         startOptions: RunStartOptions,
+        requiresRuntimeMCPValidation: Bool = true,
         idea: Idea? = nil,
         effectiveProjectRootPath: String? = nil
     ) async -> PreflightReport {
@@ -218,6 +230,7 @@ struct PreflightService {
                 plan: plan,
                 catalog: loadedCatalog,
                 bindings: providerBindings,
+                requiresRuntimeMCPValidation: requiresRuntimeMCPValidation,
                 checks: &checks,
                 warnings: &warnings,
                 blockingIssues: &blockingIssues
@@ -349,6 +362,7 @@ struct PreflightService {
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
+        requiresRuntimeMCPValidation: Bool = true,
         idea: Idea? = nil,
         effectiveProjectRootPath: String? = nil
     ) async -> PreflightReport {
@@ -357,6 +371,7 @@ struct PreflightService {
             catalogURL: catalogURL,
             plan: plan,
             startOptions: RunStartOptions(),
+            requiresRuntimeMCPValidation: requiresRuntimeMCPValidation,
             idea: idea,
             effectiveProjectRootPath: effectiveProjectRootPath
         )
@@ -606,7 +621,7 @@ struct PreflightService {
         warnings: inout [String],
         blockingIssues: inout [String]
     ) {
-        let runtimeProfiles = catalog.runtimeProfiles ?? [:]
+        let runtimeProfiles = catalog.runtimeProfiles
         for (agentID, binding) in bindings {
             guard let profileID = binding.runtimeProfileID,
                   let profile = runtimeProfiles[profileID] else { continue }
@@ -639,11 +654,12 @@ struct PreflightService {
         plan: RunPlan,
         catalog: AgentCatalog,
         bindings: [String: ResolvedProviderBinding],
+        requiresRuntimeMCPValidation: Bool,
         checks: inout [PreflightCheck],
         warnings: inout [String],
         blockingIssues: inout [String]
     ) {
-        let runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? extensionRegistryProvider.registrySnapshot()
         let resolver = MCPPolicyResolver()
         let activeAgents = plan.agentBindings.values.sorted { $0.id < $1.id }
 
@@ -659,7 +675,15 @@ struct PreflightService {
 
         let registryStatus: PreflightCheckStatus
         let registryMessage: String
-        if let runtimeRegistry {
+        if !requiresRuntimeMCPValidation {
+            registryStatus = anyRequestedMCP ? .warn : .pass
+            registryMessage = anyRequestedMCP
+                ? "Runtime MCP validation skipped for simulated execution mode."
+                : "Simulated execution mode selected; no runtime MCP validation required."
+            if anyRequestedMCP {
+                warnings.append(registryMessage)
+            }
+        } else if let runtimeRegistry {
             registryStatus = .pass
             registryMessage = "Loaded runtime extension registry from \(runtimeRegistry.configURL.path) (\(runtimeRegistry.installedExtensionIDs.count) installed)"
         } else if anyRequestedMCP {
@@ -680,6 +704,16 @@ struct PreflightService {
         ))
 
         for agent in activeAgents {
+            if !requiresRuntimeMCPValidation, !agent.requestedMCPServerIDs.isEmpty {
+                let requested = agent.requestedMCPServerIDs.sorted().joined(separator: ",")
+                checks.append(PreflightCheck(
+                    category: "MCP",
+                    title: "Backend MCP — \(agent.id)",
+                    status: .warn,
+                    message: "Simulated execution mode skips runtime MCP validation; backend '\(agent.backendProfileID ?? "none")' requests [\(requested)]."
+                ))
+                continue
+            }
             let resolution = resolver.resolve(
                 agent: agent,
                 catalog: catalog,
@@ -687,7 +721,7 @@ struct PreflightService {
                 runtimeRegistry: runtimeRegistry
             )
             let summary = [
-                "profile=\(resolution.profileID)",
+                "backend=\(resolution.profileID)",
                 "requested=\(resolution.requestedExtensions.joined(separator: ","))",
                 "effective=\(resolution.predictedEffectiveExtensions.joined(separator: ","))",
                 "denied=\(resolution.deniedExtensions.joined(separator: ","))"
@@ -710,7 +744,7 @@ struct PreflightService {
 
             checks.append(PreflightCheck(
                 category: "MCP",
-                title: "MCP Profile — \(agent.id)",
+                title: "Backend MCP — \(agent.id)",
                 status: status,
                 message: message
             ))

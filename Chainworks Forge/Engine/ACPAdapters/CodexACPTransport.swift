@@ -28,6 +28,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     private var requestCounters: [String: Int] = [:]
     private var sessionSystemPrompts: [String: String] = [:]
     private var sessionEnabledExtensions: [String: [String]] = [:]
+    private var sessionDiagnostics: [String: [RuntimeProviderDiagnostic]] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -55,7 +56,6 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
             Self.cleanupRuntimeHomeIfPresent(runtimeHomeURL)
             throw error
         }
-
         // Step 1: Send `initialize` JSON-RPC request
         let initializeRequest = makeJSONRPCRequest(
             method: "initialize",
@@ -120,10 +120,12 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         activeSessions[sessionId] = SessionHandle(subprocess: subprocess, runtimeHomeURL: runtimeHomeURL)
         requestCounters[sessionId] = 2 // initialize=1, session/new=2
         sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
+        sessionDiagnostics[sessionId] = []
         if !request.systemPrompt.isEmpty {
             sessionSystemPrompts[sessionId] = request.systemPrompt
         }
         lock.unlock()
+        self.startStderrLogging(for: subprocess, prefix: "CodexACP", sessionID: sessionId)
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
 
@@ -238,7 +240,10 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                                 let finishEvent = ACPStreamEventMapper.mapPromptResult(result)
                                 continuation.yield(finishEvent)
                             } else if let error = json["error"] as? [String: Any] {
-                                let message = error["message"] as? String ?? "Unknown Codex ACP error"
+                                let message = ACPProtocolSupport.formatJSONRPCError(
+                                    error,
+                                    fallback: "Unknown Codex ACP error"
+                                )
                                 continuation.yield(.error(message: message))
                             }
                             continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
@@ -260,6 +265,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                             if method == "session/request_permission" {
                                 self.autoGrantPermission(
                                     subprocess: subprocess,
+                                    requestID: json["id"],
                                     params: params,
                                     sessionID: sessionID
                                 )
@@ -296,6 +302,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         requestCounters.removeValue(forKey: sessionID)
         sessionSystemPrompts.removeValue(forKey: sessionID)
         sessionEnabledExtensions.removeValue(forKey: sessionID)
+        sessionDiagnostics.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let handle else {
@@ -326,7 +333,11 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         guard handle != nil else {
             throw RuntimeTransportError.streamingFailed(reason: "No active Codex session for ID: \(sessionID)")
         }
-        return RuntimeSessionRuntimeState(enabledExtensions: enabledExtensions)
+        return RuntimeSessionRuntimeState(
+            enabledExtensions: enabledExtensions,
+            runtimeHomePath: handle?.runtimeHomeURL?.path,
+            providerDiagnostics: currentDiagnostics(for: sessionID)
+        )
     }
 
     // MARK: - Private: Model Mapping
@@ -374,11 +385,19 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         let sourceHomeURL = sourceCodexHomeURL(environment: environment)
         let sourceAuthURL = sourceHomeURL.appendingPathComponent("auth.json", isDirectory: false)
         let runtimeAuthURL = runtimeHomeURL.appendingPathComponent("auth.json", isDirectory: false)
+        let sourceConfigURL = sourceHomeURL.appendingPathComponent("config.toml", isDirectory: false)
+        let runtimeConfigURL = runtimeHomeURL.appendingPathComponent("config.toml", isDirectory: false)
 
         if fileManager.fileExists(atPath: sourceAuthURL.path) {
             try fileManager.copyItem(at: sourceAuthURL, to: runtimeAuthURL)
         } else {
             ForgeLogger.execution.info("CodexACPTransport: auth.json not found at \(sourceAuthURL.path); starting isolated runtime home without copied auth")
+        }
+
+        if fileManager.fileExists(atPath: sourceConfigURL.path) {
+            try fileManager.copyItem(at: sourceConfigURL, to: runtimeConfigURL)
+        } else {
+            ForgeLogger.execution.info("CodexACPTransport: config.toml not found at \(sourceConfigURL.path); starting isolated runtime home without copied runtime config")
         }
 
         ForgeLogger.execution.debug("CodexACPTransport: prepared isolated CODEX_HOME at \(runtimeHomeURL.path) for workingDir=\(workingDirectory ?? "nil")")
@@ -440,6 +459,7 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         requestCounters.removeValue(forKey: sessionID)
         sessionSystemPrompts.removeValue(forKey: sessionID)
         sessionEnabledExtensions.removeValue(forKey: sessionID)
+        sessionDiagnostics.removeValue(forKey: sessionID)
         lock.unlock()
 
         guard let handle else { return }
@@ -464,7 +484,10 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                     return result
                 }
                 if let error = json["error"] as? [String: Any] {
-                    let message = error["message"] as? String ?? "Unknown Codex ACP error"
+                    let message = ACPProtocolSupport.formatJSONRPCError(
+                        error,
+                        fallback: "Unknown Codex ACP error"
+                    )
                     throw RuntimeTransportError.sessionCreationFailed(reason: message)
                 }
                 return nil
@@ -483,25 +506,58 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     /// Forge auto-grants with `allow_once` based on the execution policy.
     private func autoGrantPermission(
         subprocess: ACPSubprocessManager,
+        requestID: Any?,
         params: [String: Any]?,
         sessionID: String
     ) {
-        guard let params,
-              let requestId = params["id"] as? String ?? params["requestId"] as? String else {
+        guard let response = ACPProtocolSupport.permissionSelectionResponse(
+            requestID: requestID,
+            params: params
+        ) else {
+            ForgeLogger.execution.error("CodexACP permission auto-grant failed: could not build response for session \(sessionID)")
             return
         }
-
-        let response: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "session/permission_response",
-            "params": [
-                "sessionId": sessionID,
-                "requestId": requestId,
-                "response": "allow_once"
-            ] as [String: Any]
-        ]
-
         try? subprocess.sendJSON(response)
+    }
+
+    private func startStderrLogging(for subprocess: ACPSubprocessManager, prefix: String, sessionID: String) {
+        Task.detached {
+            do {
+                for try await line in subprocess.readStderrLines() {
+                    let sanitized = ACPProtocolSupport.stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !sanitized.isEmpty else { continue }
+                    if let diagnostic = ACPProtocolSupport.codexProviderDiagnostic(fromStderrLine: sanitized) {
+                        self.appendDiagnostic(diagnostic, to: sessionID)
+                    }
+                    if sanitized.localizedCaseInsensitiveContains("error")
+                        || sanitized.localizedCaseInsensitiveContains("failed")
+                        || sanitized.localizedCaseInsensitiveContains("panic") {
+                        ForgeLogger.execution.error("\(prefix) stderr: \(sanitized)")
+                    } else {
+                        ForgeLogger.execution.info("\(prefix) stderr: \(sanitized)")
+                    }
+                }
+            } catch {
+                ForgeLogger.execution.error("\(prefix) stderr reader failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func currentDiagnostics(for sessionID: String) -> [RuntimeProviderDiagnostic] {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionDiagnostics[sessionID] ?? []
+    }
+
+    private func appendDiagnostic(_ diagnostic: RuntimeProviderDiagnostic, to sessionID: String) {
+        lock.lock()
+        var diagnostics = sessionDiagnostics[sessionID] ?? []
+        diagnostics.append(diagnostic)
+        if diagnostics.count > 32 {
+            diagnostics.removeFirst(diagnostics.count - 32)
+        }
+        sessionDiagnostics[sessionID] = diagnostics
+        lock.unlock()
     }
 }
 
@@ -513,6 +569,7 @@ extension CodexACPTransport: RuntimeTransportTerminationControlling {
         requestCounters.removeAll()
         sessionSystemPrompts.removeAll()
         sessionEnabledExtensions.removeAll()
+        sessionDiagnostics.removeAll()
         lock.unlock()
 
         for handle in handles {

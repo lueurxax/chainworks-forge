@@ -31,12 +31,12 @@ The accepted proof story for this slice supports these claims:
 The strongest current-head proof owners are:
 
 - `AgentSessionTests`
-- `GooseAgentExecutorTests`
+- `RuntimeAgentExecutorTests`
 
 The focused accepted proof lane on the current tree is:
 
 - direct macOS `xcodebuild build`
-- focused `xcodebuild test` slice for `AgentSessionTests` and `GooseAgentExecutorTests`
+- focused `xcodebuild test` slice for `AgentSessionTests` and `RuntimeAgentExecutorTests`
 
 Fresh same-head proof recorded in the final implementation audit:
 

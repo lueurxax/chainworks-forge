@@ -368,7 +368,7 @@ struct RunComparisonView: View {
             || !binding.actualMCPExtensions.isEmpty
             || !binding.deniedMCPExtensions.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
-                Text("MCP profile: \(binding.mcpProfileID ?? "none")")
+                Text("Backend MCP owner: \(binding.mcpProfileID ?? "none")")
                     .font(.caption2.monospaced())
                     .foregroundStyle(tint)
                 Text("Requested: \(joinedList(binding.requestedMCPExtensions))")

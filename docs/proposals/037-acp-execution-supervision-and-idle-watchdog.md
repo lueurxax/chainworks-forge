@@ -47,7 +47,9 @@ After implementation, the system must be able to answer:
 4. Can operator surfaces explain the difference between:
    - no progress after prompt submission,
    - progress followed by silence,
-   - and read-loop churn without advancement?
+   - read-loop churn without advancement,
+   - silence immediately after the first mutating tool boundary (`edit`, `apply_patch`, equivalent),
+   - and mutating-tool success that never materializes into a real filesystem change?
 5. Can all ACP families use the same supervision model and the same retry policy?
 
 ---
@@ -59,6 +61,7 @@ This proposal includes:
 - one ACP-wide supervision contract based on `RuntimeStreamEvent`,
 - explicit definitions of `meaningful progress`,
 - watchdog deadlines for first progress, idle-after-progress, and weak read-loop progress,
+- fail-closed verification for mutating-tool side effects,
 - one automatic fresh retry for watchdog-triggered hangs,
 - deterministic failure truth and reporting after retry exhaustion,
 - operator-facing timeline/report/receipt semantics for watchdog intervention,
@@ -153,7 +156,27 @@ Not all meaningful progress is equally strong.
 
 Weak progress may delay failure briefly, but must not keep an execution alive indefinitely.
 
-### 5.3 Explicit non-goals
+### 5.3 First mutating tool boundary
+
+The supervision contract must explicitly track the first mutating tool boundary.
+
+Examples:
+
+- `edit`
+- `apply_patch`
+- `write`
+- `permission:edit`
+- future equivalent file-mutating ACP tool calls
+
+This proposal treats the first mutating tool boundary as a special execution milestone because the observed Codex failure pattern is:
+
+1. long discovery churn (`search`, `read`, `execute`),
+2. first mutating tool call,
+3. silence with no further meaningful progress.
+
+That pattern must not be collapsed into generic `idle_hang_after_progress` if the telemetry can prove it occurred after the first mutating tool boundary.
+
+### 5.4 Explicit non-goals
 
 The supervision contract must not attempt to infer "the model is still thinking" from:
 
@@ -163,6 +186,24 @@ The supervision contract must not attempt to infer "the model is still thinking"
 - or external network sockets.
 
 If the runtime does not emit meaningful progress, the execution is not healthy enough to remain indefinitely in `running`.
+
+### 5.5 Mutating tool success is not self-proving
+
+For file-mutating tool boundaries, provider-side success is not sufficient proof that the side effect actually happened.
+
+Observed failure mode:
+
+1. the runtime emits a mutating tool success (`edit`, `apply_patch`, equivalent),
+2. the session continues reasoning as if the patch landed,
+3. the real worktree remains unchanged,
+4. token usage continues to grow,
+5. and the execution later dies as an apparent idle hang or runaway session.
+
+This proposal therefore requires a second integrity rule:
+
+> mutating tool success counts as durable progress only if the expected filesystem side effect is observable in the worktree.
+
+If no side effect is observable, the execution must fail closed as a mutation-integrity error rather than continue accruing tokens on a false state.
 
 ---
 
@@ -208,6 +249,39 @@ The existing broad execution timeout remains as a last-resort outer guard:
 
 But once Proposal 037 is implemented, ordinary ACP hangs should almost always fail earlier via the supervision contract rather than via generic `Execution timed out`.
 
+### 6.5 First-edit silence deadline
+
+If execution has crossed the first mutating tool boundary and then emits no further meaningful progress within:
+
+- `first-edit silence deadline = 120s`
+
+the execution is classified as:
+
+- `idle_hang_after_first_edit`
+
+This classification is more specific than `idle_hang_after_progress` and is intended to catch the observed coding-session stall pattern where the runtime survives discovery, survives the first write authorization, and then goes silent before continuing productive work.
+
+### 6.6 Mutating-side-effect verification
+
+After the first mutating tool boundary, the engine must verify that a real filesystem mutation occurred within a short integrity window.
+
+Initial rule:
+
+- `mutating side-effect verification window = 30s`
+
+Expected signals may include:
+
+- a newly created file exists,
+- a previously existing file has changed mtime and content,
+- a patch/edit target now contains the expected textual delta,
+- or another durable worktree-side mutation artifact exists.
+
+If the provider reports mutating-tool success but no such side effect becomes observable within the window, the execution is classified as:
+
+- `mutation_side_effect_missing`
+
+This classification is not an idle-hang subtype. It is an execution-integrity failure.
+
 ---
 
 ## 7. Automatic Recovery Policy
@@ -219,6 +293,8 @@ For all three watchdog classifications:
 - `idle_hang_before_first_progress`
 - `idle_hang_after_progress`
 - `idle_hang_read_loop`
+- `idle_hang_after_first_edit`
+- `mutation_side_effect_missing`
 
 the default recovery policy is:
 
@@ -236,7 +312,33 @@ Required behavior:
 4. resubmit the same execution packet,
 5. record that the watchdog consumed the one automatic retry.
 
-### 7.3 Retry exhaustion
+### 7.3 Durable retry-lineage owner
+
+This proposal does not allow watchdog retry to remain executor-local.
+
+The durable owner model is:
+
+- `RuntimeAgentExecutor` may detect the watchdog fire and emit the retry request,
+- `StageRetryCoordinator` owns creation of the durable retry lineage,
+- `StageExecution` remains the owner of stage-level retry/recovery truth,
+- `ResumeManager` and transition/cursor logic must treat an in-flight watchdog retry as normal same-stage work, not as interruption truth.
+
+The first automatic watchdog retry must therefore be represented as:
+
+- a new `AgentExecution`,
+- inside the same `StageExecution`,
+- with the same `StageExecution.attemptNumber`,
+- with incremented `AgentExecution.agentAttemptNumber`,
+- with `supersedesAgentExecutionID` pointing at the watchdog-failed attempt,
+- and with `retryReason` set to a watchdog-specific value such as `automatic_watchdog_retry`.
+
+This proposal explicitly rejects:
+
+- hidden executor-local retries with no persisted lineage,
+- automatic creation of a new `StageExecution` for the first watchdog retry,
+- or any retry path that makes reports/recovery infer retry history from transport logs alone.
+
+### 7.4 Retry exhaustion
 
 If the fresh retry is also terminated by the same supervision contract, the execution settles as a normal recoverable failure.
 
@@ -252,7 +354,56 @@ The resulting run/stage state should follow the standard failure/recovery path.
 
 ## 8. Truth and Persistence Contract
 
-### 8.1 Attempt-level truth
+### 8.1 Persisted supervision-classification design
+
+Proposal 037 does **not** extend `AgentCanonicalOutcome` with new `idle_hang_*` enum cases.
+
+The stable canonical terminal-outcome contract in
+[../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md)
+remains intact.
+
+Instead, watchdog-specific truth must be persisted in a new dedicated field on `AgentExecution`:
+
+- `supervisionClassification`
+
+Expected values:
+
+- `idle_hang_before_first_progress`
+- `idle_hang_after_progress`
+- `idle_hang_read_loop`
+- `idle_hang_after_first_edit`
+- `mutation_side_effect_missing`
+
+This field is nullable and backward-compatible:
+
+- old rows leave it unset,
+- non-watchdog executions leave it unset,
+- watchdog-driven executions must set it durably before settlement completes.
+
+### 8.2 Canonical outcome pairing
+
+`supervisionClassification` refines, but does not replace, the stable canonical outcome.
+
+For watchdog-triggered failures:
+
+- attempts with no durable output settle with existing canonical failure truth such as `failed_before_output`,
+- attempts with durable output already present settle with the existing after-output failure path already used by the repo,
+- `providerStopReason` may preserve supporting provider detail,
+- but watchdog-specific operator/report wording must come from `supervisionClassification` when it exists.
+
+### 8.3 Reader precedence
+
+Readers must use this precedence order:
+
+1. `AgentExecution.canonicalOutcome`
+2. `AgentExecution.supervisionClassification` when canonical outcome is a failure-compatible terminal state
+3. `transportErrorKind`
+4. `providerStopReason`
+5. supporting envelopes / receipts / transcripts
+
+This keeps the stable execution-truth model compatible while making watchdog classifications durable and operator-visible.
+
+### 8.4 Attempt-level truth
 
 The first watchdog fire is attempt-level truth, not immediately run-level blocked truth.
 
@@ -262,13 +413,21 @@ That means:
 - a new fresh retry attempt is created automatically,
 - the run remains live while that retry is in progress.
 
-### 8.2 Final execution truth after retry exhaustion
+### 8.5 Final execution truth after retry exhaustion
 
-Once the automatic retry is exhausted, the canonical failure reason must remain the supervision reason:
+Once the automatic retry is exhausted, the durable watchdog-specific truth must remain on
+`AgentExecution.supervisionClassification`.
+
+The stable terminal-outcome field remains `canonicalOutcome`; it continues to carry the repo's
+existing failure-compatible terminal state.
+
+The watchdog-specific refinement that must survive retry exhaustion is:
 
 - `idle_hang_before_first_progress`
 - `idle_hang_after_progress`
 - `idle_hang_read_loop`
+- `idle_hang_after_first_edit`
+- `mutation_side_effect_missing`
 
 The engine must not down-convert this into:
 
@@ -277,13 +436,37 @@ The engine must not down-convert this into:
 - session-closed transition stall,
 - or plain missing outputs without supervision context.
 
-### 8.3 Receipt fields
+### 8.6 Stage-owned recovery truth
+
+When retry exhaustion occurs, the stage-level durable owner remains `StageExecution`.
+
+Required durable effects:
+
+- the failed retry attempt persists its `supervisionClassification`,
+- the containing `StageExecution` persists the recovery recommendation in `recoverySnapshotJSON`,
+- `RunReportBuilder` and recovery surfaces read stage-owned `recoverySnapshotJSON` only after agent-level execution truth,
+- `ResumeManager` must not reinterpret exhausted watchdog retry as app-restart interruption unless separate interruption evidence exists.
+
+`recoverySnapshotJSON` is therefore secondary truth for next-action guidance.
+It does not replace or outrank:
+
+- `canonicalOutcome`
+- `supervisionClassification`
+- `transportErrorKind`
+- `providerStopReason`
+
+### 8.7 Receipt fields
 
 Receipts and execution records must preserve at least:
 
 - watchdog classification,
 - first prompt timestamp,
 - last meaningful progress timestamp,
+- first mutating tool timestamp, when present,
+- last mutating tool name, when present,
+- whether a post-mutation filesystem verification was attempted,
+- whether a durable side effect was observed,
+- the first verified mutated path or mutation target, when present,
 - silence duration at watchdog fire,
 - whether automatic retry was consumed,
 - whether the final outcome came from the original attempt or the retry.
@@ -296,6 +479,11 @@ Receipts and execution records must preserve at least:
 
 The live timeline must make automatic supervision visible.
 
+This proposal does not create a new top-level watchdog-history surface.
+Timeline visibility must extend the current run-detail / workflow-map / focused-timeline owner path
+described by the stable run-surface references. Watchdog history is subordinate to that existing
+shell spine, not a parallel diagnostics lane.
+
 Operator-facing timeline/history should show:
 
 - execution started,
@@ -304,6 +492,12 @@ Operator-facing timeline/history should show:
 - and whether the retry succeeded or also failed.
 
 The engine must not make the retry appear as a mysterious second session with no explanation.
+
+The durable data path for this history is:
+
+- failed original `AgentExecution` with `supervisionClassification`,
+- replacement `AgentExecution` with incremented `agentAttemptNumber` and watchdog-specific `retryReason`,
+- optional stage-level `recoverySnapshotJSON` once retry exhaustion occurs.
 
 ### 9.2 Run reports
 
@@ -314,8 +508,24 @@ Expected operator-facing language:
 - "No meaningful progress was observed within 120s after prompt submission."
 - "Execution stopped making progress for 300s after earlier progress."
 - "Execution remained in a read loop for 120s without advancing."
+- "Execution stopped making progress for 120s after the first mutating tool boundary."
+- "The runtime reported a mutating tool success, but no corresponding filesystem change was observed."
 
 Reports must not collapse these into generic `Execution timed out` when a watchdog classification exists.
+
+`RunReportBuilder` must therefore read:
+
+1. `canonicalOutcome`
+2. `supervisionClassification`
+3. stage-owned `recoverySnapshotJSON`
+
+before consulting looser transport or interruption narrative.
+
+In that order:
+
+- `canonicalOutcome` answers the stable terminal-state question,
+- `supervisionClassification` answers the watchdog-specific "what kind of hang was this?" question,
+- `recoverySnapshotJSON` answers the stage-owned "what should the operator do next?" question.
 
 ### 9.3 Recovery surfaces
 
@@ -354,55 +564,137 @@ Acceptance must require proof for all of the following:
    - no strong progress
    - watchdog fires at `120s`
 
-4. **Successful auto-retry recovery**
+4. **First-edit silence**
+   - discovery churn occurs
+   - first mutating tool boundary is observed
+   - no later meaningful progress for `120s`
+   - watchdog fires as `idle_hang_after_first_edit`
+
+5. **Successful auto-retry recovery**
    - first attempt watchdog-fails
    - fresh retry succeeds
    - run remains live and continues
 
-5. **Retry exhaustion**
+6. **Retry exhaustion**
    - first attempt watchdog-fails
    - retry watchdog-fails again
    - execution settles as recoverable failure with explicit supervision reason
 
-### 10.2 Proposal gate sketch
+### 10.2 ACP-wide taxonomy owner
 
-The implementation gate for this proposal should require targeted tests that prove:
+The shared owner for weak/strong/mutating progress taxonomy is the transport-neutral event-normalization layer currently centered on `ExecutionEventBridge`.
 
-- event classification,
-- timestamp tracking,
-- watchdog firing at the documented thresholds,
-- fresh retry invalidating old session state,
-- receipts/reporting using supervision truth,
-- and no infinite `running` after ACP silence.
+Required contract:
 
-The exact gate name and test target list may be finalized during implementation planning.
+- adapters normalize raw provider events into generic tool names,
+- the shared classifier maps those names into progress classes before watchdog logic runs,
+- watchdog logic consumes progress classes, not provider-specific tool strings.
+
+Initial canonical mapping:
+
+- weak read:
+  - `read`
+  - `permission:read`
+- weak discovery:
+  - `search`
+  - `execute`
+  - `permission:execute`
+- strong non-mutating:
+  - `text_chunk`
+  - non-discovery `tool_call_started`
+  - non-discovery `tool_call_finished`
+- mutating:
+  - `edit`
+  - `apply_patch`
+  - `write`
+  - `permission:edit`
+
+This mapping is intentionally aligned with the current shared classifier in `ExecutionEventBridge` and the watchdog consumers in `RuntimeAgentExecutor`:
+
+- `search`, `execute`, and `permission:execute` remain weak/discovery progress,
+- only text output and non-discovery tool activity count as strong progress,
+- mutating tools remain their own class because they trigger both `idle_hang_after_first_edit` and side-effect verification.
+
+Future ACP families may add raw names only by extending this shared classifier; they must not introduce family-specific watchdog policy.
+
+### 10.3 Repo-owned proof lane
+
+This proposal chooses one explicit proof lane:
+
+- `proposal-037`
+
+It must be added to both:
+
+- [../reference/test-gates.md](../reference/test-gates.md)
+- [../../scripts/test-gate.sh](../../scripts/test-gate.sh)
+
+Initial target coverage for the lane:
+
+- focused `RuntimeAgentExecutorTests` cases for watchdog classification, mutation-side-effect verification, Codex session-history budgets, and fresh-session retry after watchdog trip
+- focused `OrchestratorTests` cases for durable stage/agent materialization and same-stage watchdog retry lineage
+- focused `ResumeManagerTests` cases for extended-grace reconcile behavior at post-session and post-fanout boundaries
+- `RecoveryCoordinatorTests`
+- `Proposal013Tests`
+- `Proposal019Tests`
+- `LiveProposalWorkflowTests`
+- `WorkflowMapProjectionTests`
+- `RunTimelineInspectorViewTests`
+
+Required coverage owned by `proposal-037`:
+
+- event classification and timestamp tracking
+- watchdog firing at `120s / 300s / 120s / 120s`
+- fail-closed mutation verification after mutating-tool success with no real worktree delta
+- automatic retry creating durable same-stage `AgentExecution` lineage
+- retry exhaustion persisting `supervisionClassification` and stage recovery truth
+- report/recovery readers preferring supervision truth over generic timeout/interruption wording
+- no infinite `running` after ACP silence
 
 ---
 
-## 11. Implementation Slices
+## 11. Implementation Status and Remaining Slices
 
-The implementation should likely proceed in four slices:
+Proposal 037 is no longer greenfield. Parts of the substrate already exist in the repository and must be treated as landed baseline, not future intent.
 
-1. **Event supervision core**
-   - define event classes
+### 11.1 Already-landed substrate
+
+The following pieces are already present and proposal readers must treat them as baseline:
+
+- `AgentExecution.supervisionClassification` exists and is the durable agent-level refinement field,
+- the `proposal-037` test gate already exists in:
+  - [../reference/test-gates.md](../reference/test-gates.md)
+  - [../../scripts/test-gate.sh](../../scripts/test-gate.sh)
+- shared weak/strong/mutating taxonomy is already enforced by the normalization layer centered on `ExecutionEventBridge`,
+- watchdog-specific proof cases already live in the targeted suites named in §10.3.
+
+### 11.2 Remaining implementation slices
+
+Remaining work should proceed in four slices:
+
+1. **Event supervision hardening**
+   - keep the shared progress classifier aligned across `ExecutionEventBridge`, `RuntimeAgentExecutor`, and proof fixtures
    - track meaningful progress timestamps
-   - implement two-phase watchdog
+   - finish the two-phase watchdog and first-edit silence watchdog
+   - keep post-mutation filesystem verification fail-closed
 
 2. **Retry machinery**
    - invalidate stale session generation
    - force fresh retry
+   - persist watchdog retry through stage-owned `AgentExecution` lineage
    - persist retry-consumed truth
 
 3. **Truth and surfaces**
-   - receipts
-   - reports
-   - recovery UI
-   - live timeline markers
+   - finish receipts, reports, recovery UI, and live timeline markers on top of the already-landed `supervisionClassification` substrate
+   - raise the stable watchdog-specific truth contract into:
+     - [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md)
 
 4. **Proof and hardening**
+   - keep `proposal-037` gate aligned with the real proof lane
    - targeted tests
    - fixture transport scenarios
    - long-run verification
+   - first-edit stall fixtures for coding agents
+   - mutation-success-without-filesystem-delta fixtures
 
 ---
 
@@ -414,12 +706,14 @@ This proposal is complete only when all of the following are true:
 2. ACP execution with no first progress fails at `120s`, not only at `1800s`.
 3. ACP execution with early progress then silence fails at `300s`, not only at `1800s`.
 4. ACP read-loop churn fails at `120s` under the weak-progress policy.
-5. The first watchdog failure triggers exactly one automatic fresh retry.
-6. The retry invalidates old session state and creates a new session.
-7. Retry exhaustion produces explicit supervision failure truth, not generic timeout.
-8. Reports and recovery surfaces show supervision-specific reasons.
-9. Successful auto-retry keeps the run alive and does not leave false blocked truth behind.
-10. No ACP execution can remain indefinitely in `running` after meaningful progress has stopped.
+5. ACP execution that goes silent for `120s` after the first mutating tool boundary fails as `idle_hang_after_first_edit`.
+6. ACP execution that reports mutating-tool success without a real filesystem delta fails as `mutation_side_effect_missing`.
+7. The first watchdog or mutation-integrity failure triggers exactly one automatic fresh retry.
+8. The retry invalidates old session state and creates a new session.
+9. Retry exhaustion produces explicit supervision failure truth, not generic timeout.
+10. Reports and recovery surfaces show supervision-specific reasons.
+11. Successful auto-retry keeps the run alive and does not leave false blocked truth behind.
+12. No ACP execution can remain indefinitely in `running` after meaningful progress has stopped or after a false mutating-tool success with no durable side effect.
 
 ---
 
@@ -429,6 +723,8 @@ Proposal 037 chooses one deterministic supervision model:
 
 - ACP execution liveness is defined by meaningful stream progress,
 - fixed deadlines are `120s / 300s / 120s`,
+- an additional `120s` deadline applies after the first mutating tool boundary,
+- mutating-tool success must be verified against real filesystem side effects within `30s`,
 - every ACP family is treated the same,
 - one automatic fresh retry is allowed,
 - and supervision truth must remain explicit all the way through receipts, reports, and operator recovery.

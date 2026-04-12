@@ -7,7 +7,6 @@ SCHEME_NAME="Chainworks Forge"
 DESTINATION="platform=macOS"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 TEST_PLANS_DIR="$ROOT_DIR/TestPlans"
-PORTABLE_GOOSE_CONFIG_PATH="$ROOT_DIR/examples/goose/goose-config-fixture.yaml"
 UNSIGNED_BUILD_ARGS=(
   CODE_SIGNING_ALLOWED=NO
   CODE_SIGNING_REQUIRED=NO
@@ -40,7 +39,7 @@ PROPOSAL_006_TESTS=(
 )
 
 PROPOSAL_012_TESTS=(
-  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testGooseAssistantSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRuntimeAssistantSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testWorkflowMapSurfaceShowsAfterRunStart"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testReleaseGateSurfaceShowsDecisionContextActions"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
@@ -49,7 +48,7 @@ PROPOSAL_012_TESTS=(
 
 PROPOSAL_013_TESTS=(
   "Chainworks ForgeTests/Proposal013Tests"
-  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal013AppProofSurface"
 )
 
@@ -62,7 +61,7 @@ PROPOSAL_014_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsWizardFlowSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsExportSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testPilotReadinessRefreshSurface"
-  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testGooseAssistantSurface"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRuntimeAssistantSurface"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testWorkflowMapSurfaceShowsAfterRunStart"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testReleaseGateSurfaceShowsDecisionContextActions"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal012AppendixAMinWindowOwnersAt1024x768"
@@ -71,24 +70,24 @@ PROPOSAL_014_TESTS=(
 
 PROPOSAL_015_TESTS=(
   "Chainworks ForgeTests/Proposal015Tests"
-  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal015SkillVisibilityProofSurface"
 )
 
 PROPOSAL_015_NON_UI_TESTS=(
   "Chainworks ForgeTests/Proposal015Tests"
-  "Chainworks ForgeTests/GooseSessionBridgeTests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
 )
 
 PROPOSAL_018_TESTS=(
   "Chainworks ForgeTests/AgentSessionTests"
-  "Chainworks ForgeTests/GooseAgentExecutorTests"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests"
 )
 
 PROPOSAL_019_TESTS=(
   "Chainworks ForgeTests/Proposal019Tests"
-  "Chainworks ForgeTests/GooseSessionBridgeTests"
-  "Chainworks ForgeTests/GooseAgentExecutorTests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests"
   "Chainworks ForgeTests/OrchestratorTests"
 )
 
@@ -108,16 +107,14 @@ PROPOSAL_024_TESTS=(
 
 PROPOSAL_025_TESTS=(
   "Chainworks ForgeTests/Proposal025Tests"
-  "Chainworks ForgeTests/GooseSessionBridgeTests"
-  "Chainworks ForgeTests/GooseServerTransportTests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
   "Chainworks ForgeTests/Chainworks_ForgeTests"
 )
 
 PROPOSAL_026_TESTS=(
   "Chainworks ForgeTests/Proposal026Tests"
-  "Chainworks ForgeTests/GooseSessionBridgeTests"
-  "Chainworks ForgeTests/GooseServerTransportTests"
-  "Chainworks ForgeTests/GooseAgentExecutorTests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests"
   "Chainworks ForgeTests/ProviderPlatformTests"
 )
 
@@ -136,6 +133,46 @@ PROPOSAL_032_TESTS=(
   "Chainworks ForgeTests/ResumeManagerTests"
   "Chainworks ForgeTests/RecoveryCoordinatorTests"
   "Chainworks ForgeTests/WorkflowMapProjectionTests"
+)
+
+PROPOSAL_033_TESTS=(
+  "Chainworks ForgeTests/Proposal033Tests"
+  "Chainworks ForgeTests/RuntimeSessionBridgeTests"
+  "Chainworks ForgeTests/LiveACPConnectionProofTests"
+  "Chainworks ForgeTests/MVPGoldenRunTests"
+  "Chainworks ForgeTests/ProviderPlatformTests"
+)
+
+PROPOSAL_037_TESTS=(
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorFailClosesACPProposalReviewReadLoopStallsBeforeWatchdogAndEmitsDurableFailureEvidence()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorSurfacesWatchdogFirstProgressHangsWithoutPerformingRetryLineageItself()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorFailsClosedWhenMutatingToolSuccessProducesNoFilesystemSideEffect()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorRetriesCodexACPAfterRunawayGuardrailTrips()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorRetriesCodexACPAfterOversizedRawToolPayloadGuardrailTrips()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorRetriesCodexACPAfterRuntimeHomeGrowthGuardrailTrips()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorRetriesCodexACPAfterSessionHistoryTokenBudgetTrips()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorPreservesCodexACPSessionReuseScopeInsteadOfForcingNone()"
+  "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorRetriesSilentCodexEOFBeforeFinalResultWithAFreshSession()"
+  "Chainworks ForgeTests/OrchestratorTests/sequentialWatchdogFailuresCreateDurableSameStageRetryLineageBeforeSucceeding()"
+  "Chainworks ForgeTests/OrchestratorTests/downstreamStageMaterializationIsDurablyVisibleBeforeFirstAgentResult()"
+  "Chainworks ForgeTests/OrchestratorTests/sequentialAgentExecutionIsDurablyVisibleBeforeFirstAgentResult()"
+  "Chainworks ForgeTests/OrchestratorTests/parallelAgentExecutionsAreDurablyVisibleBeforeFirstAgentResult()"
+  "Chainworks ForgeTests/OrchestratorTests/orchestratorCreatesTheCursorScheduledStageIterationInsteadOfReusingAStaleRunningStage()"
+  "Chainworks ForgeTests/OrchestratorTests/implementationPartialArtifactSetRecoversFailedCodeWriterIntoContinuePath()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceDoesNotReconcileImmediatelyAfterAllFanoutReviewersSettle()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceReconcilesExpiredPostFanoutSettlement()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceDoesNotReconcileFreshStartedDownstreamStageBeforeFirstAgentWork()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceReconcilesTrulyStaleStartedDownstreamStageAfterExtendedGrace()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceDoesNotReconcileNewlyStartedStageFromPreviousSessionClose()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceDoesNotReconcileWhileParallelStageAgentsAreStillRunning()"
+  "Chainworks ForgeTests/ResumeManagerTests/executionServiceReconcilesTrulyStaleRunningAgentStageAfterExtendedGrace()"
+  "Chainworks ForgeTests/RecoveryCoordinatorTests"
+  "Chainworks ForgeTests/Proposal013Tests"
+  "Chainworks ForgeTests/Proposal019Tests"
+  "Chainworks ForgeTests/LiveProposalWorkflowTests"
+  "Chainworks ForgeTests/WorkflowMapProjectionTests"
+  "Chainworks ForgeTests/RunTimelineInspectorViewTests"
 )
 
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
@@ -172,12 +209,6 @@ append_xcodebuild_signing_args() {
   fi
 
   printf '%s\0' "${UNSIGNED_BUILD_ARGS[@]}"
-}
-
-export_portable_goose_registry() {
-  if [[ -f "$PORTABLE_GOOSE_CONFIG_PATH" ]]; then
-    export CHAINWORKS_GOOSE_CONFIG_PATH="$PORTABLE_GOOSE_CONFIG_PATH"
-  fi
 }
 
 die() {
@@ -435,8 +466,6 @@ check_idle_environment() {
   fi
 }
 
-export_portable_goose_registry
-
 guard_direct_run_insertion() {
   log "Guard: no direct Run construction outside RunRepository"
   python3 - "$ROOT_DIR/Chainworks Forge" <<'PY'
@@ -496,7 +525,7 @@ sensitive_files = [
     app_root / "Views/ReleaseGateView.swift",
     app_root / "Views/IdeaListView.swift",
     test_root / "Chainworks_ForgeTests.swift",
-    test_root / "GooseSessionBridgeTests.swift",
+    test_root / "RuntimeSessionBridgeTests.swift",
 ]
 
 for f in sensitive_files:
@@ -667,7 +696,7 @@ run_proposal022_app_proof() {
 
   env \
     CHAINWORKS_IN_MEMORY_STORE=1 \
-    CHAINWORKS_GOOSE_FIXTURE_MODE=proposal022_feedback_cycle \
+    CHAINWORKS_FIXTURE_MODE=proposal022_feedback_cycle \
     CHAINWORKS_P022_APP_PROOF_AUTORUN=1 \
     CHAINWORKS_P022_APP_PROOF_RESULT_PATH="$result_path" \
     "$app_binary" >"$log_path" 2>&1 &
@@ -877,6 +906,8 @@ run_targeted_tests() {
     -project "$PROJECT_PATH"
     -scheme "$SCHEME_NAME"
     -destination "$DESTINATION"
+    -parallel-testing-enabled NO
+    -maximum-parallel-testing-workers 1
     -derivedDataPath "$derived_data"
   )
 
@@ -903,8 +934,6 @@ run_targeted_tests() {
     previous_automation_log_path="${CHAINWORKS_UI_AUTOMATION_LOG_PATH:-}"
     export CHAINWORKS_UI_AUTOMATION_LOG_PATH="$automation_log_path"
     cmd+=(${signing_args[@]+"${signing_args[@]}"})
-    cmd+=("-parallel-testing-enabled" "NO")
-    cmd+=("-maximum-parallel-testing-workers" "1")
     if [[ "$gate_name" != "proposal-013-ui" ]]; then
       cmd+=("-resultBundlePath" "$result_bundle")
     fi
@@ -1146,9 +1175,12 @@ Available gates:
   proposal-024    Proposal 024 run-surface information architecture gate
   proposal-025    Proposal 025 per-agent MCP policy and runtime validation gate
   proposal-026    Proposal 026 ACP-first runtime transport and Goose decoupling gate
-  proposal-027    Proposal 027 unified read-only JSON and markdown rendering gate
+  proposal-027    Proposal 027 Rust+SQLite local control-plane extraction gate
+  proposal-027r   Proposal 027 unified read-only JSON/markdown rendering gate (legacy renderer)
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
+  proposal-033    Proposal 033 ACP-only runtime architecture gate
+  proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1357,6 +1389,14 @@ case "$GATE" in
     run_targeted_tests "proposal-026" "${PROPOSAL_026_TESTS[@]}"
     ;;
   proposal-027|p027)
+    log "Proposal 027 control-plane gate: Rust+SQLite daemon test suite"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --workspace 2>&1
+    )
+    log "Proposal 027 control-plane gate passed"
+    ;;
+  proposal-027r|p027r)
     check_idle_environment allow_app
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
       log "Latest crash log before run: $BEFORE_CRASH_LOG"
@@ -1364,8 +1404,8 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     guard_direct_run_insertion
-    run_build "proposal-027"
-    run_targeted_tests "proposal-027" "${PROPOSAL_027_TESTS[@]}"
+    run_build "proposal-027r"
+    run_targeted_tests "proposal-027r" "${PROPOSAL_027_TESTS[@]}"
     ;;
   proposal-029|p029)
     check_idle_environment allow_app
@@ -1388,6 +1428,30 @@ case "$GATE" in
     guard_direct_run_insertion
     run_build "proposal-032"
     run_targeted_tests "proposal-032" "${PROPOSAL_032_TESTS[@]}"
+    ;;
+  proposal-033|p033)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    log "Prerequisite: proposal-029 gate (second-wave ACP)"
+    run_targeted_tests "proposal-029-prereq" "${PROPOSAL_029_TESTS[@]}"
+    run_build "proposal-033"
+    run_targeted_tests "proposal-033" "${PROPOSAL_033_TESTS[@]}"
+    ;;
+  proposal-037|p037)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-037"
+    run_split_targeted_gate "proposal-037" "${PROPOSAL_037_TESTS[@]}"
     ;;
   full)
     check_idle_environment strict

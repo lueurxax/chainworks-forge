@@ -28,7 +28,7 @@ The accepted proof story for this slice supports these claims:
 
 The strongest current-head proof owners are:
 
-- `GooseAgentExecutorTests`
+- `RuntimeAgentExecutorTests`
 - `OrchestratorTests`
 - `ResumeManagerTests`
 - `RecoveryCoordinatorTests`

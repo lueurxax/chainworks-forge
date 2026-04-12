@@ -108,7 +108,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_ALLOW_ENV_OVERRIDE"] = "1"
         app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
         app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
-        app.launchEnvironment["CHAINWORKS_GOOSE_FIXTURE_MODE"] = ""
+        app.launchEnvironment["CHAINWORKS_FIXTURE_MODE"] = ""
         app.launchEnvironment["CHAINWORKS_LIVE_PROVIDER"] = ""
         app.launchEnvironment["CHAINWORKS_LIVE_MODEL"] = ""
         app.launchEnvironment["CHAINWORKS_LIVE_EFFORT"] = ""
@@ -171,7 +171,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
         }
         let resolvedFixtureMode = liveFixtureMode ?? (liveFixture ? "proposal_loop_success" : nil)
         if let resolvedFixtureMode {
-            app.launchEnvironment["CHAINWORKS_GOOSE_FIXTURE_MODE"] = resolvedFixtureMode
+            app.launchEnvironment["CHAINWORKS_FIXTURE_MODE"] = resolvedFixtureMode
             app.launchEnvironment["CHAINWORKS_LIVE_PROVIDER"] = "claude_code"
             app.launchEnvironment["CHAINWORKS_LIVE_MODEL"] = "fixture-model"
             app.launchEnvironment["CHAINWORKS_LIVE_EFFORT"] = "high"

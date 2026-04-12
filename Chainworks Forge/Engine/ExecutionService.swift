@@ -83,6 +83,7 @@ final class ExecutionService {
 
     /// Optional fixture or externally injected live runtime configuration.
     private let fixedLiveRuntimeConfiguration: LiveRuntimeConfiguration?
+    private let providerRegistry: ProviderRegistry?
 
     /// UI-test-only override used to force the unavailable recovery lane while
     /// keeping the live entrypoint visible for owner-path proofs.
@@ -99,10 +100,12 @@ final class ExecutionService {
 
     /// Counter for post-run hook trigger.
     private var completedRunsSinceLastAnalysis: Int = 0
+    private(set) var reconcileInvocationCountForTesting: Int = 0
 
     /// REQ-008: Flag set when a config change is detected and analysis should run after next completed run.
     private var configChangeAnalysisScheduled: Bool = false
     private var maintenanceTask: Task<Void, Never>?
+    private var reportHistoryCompactionTask: Task<Void, Never>?
 
     init(
         modelContext: ModelContext,
@@ -110,20 +113,24 @@ final class ExecutionService {
         catalog: AgentCatalog? = nil,
         stewardConfig: StewardConfig? = nil,
         liveRuntimeConfiguration: LiveRuntimeConfiguration? = nil,
-        notificationService: NotificationService? = nil
+        notificationService: NotificationService? = nil,
+        providerRegistry: ProviderRegistry? = nil
     ) {
         self.modelContext = modelContext
         self.executor = executor
         self.catalog = catalog
         self.stewardConfig = stewardConfig
         self.fixedLiveRuntimeConfiguration = liveRuntimeConfiguration
+        self.providerRegistry = providerRegistry
         self.forceUITestLiveRuntimeUnavailable =
             ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_FORCE_LIVE_RUNTIME_UNAVAILABLE"] == "1"
         self.notificationService = notificationService ?? MainActor.assumeIsolated {
             NotificationService()
         }
+        RuntimeHelperProcessJanitor.live.sweepStaleHelpers()
         rebuildPersistedPendingApprovals()
         startMaintenanceLoop()
+        scheduleReportHistoryCompaction()
     }
 
     var liveRuntimeConfiguration: LiveRuntimeConfiguration? {
@@ -137,10 +144,29 @@ final class ExecutionService {
     func prepareForTermination() {
         maintenanceTask?.cancel()
         maintenanceTask = nil
+        reportHistoryCompactionTask?.cancel()
+        reportHistoryCompactionTask = nil
 
         for orchestrator in activeOrchestrators.values {
             guard let runtimeExecutor = orchestrator.executor as? RuntimeAgentExecutor else { continue }
             runtimeExecutor.prepareForAppTermination()
+        }
+    }
+
+    private func scheduleReportHistoryCompaction() {
+        reportHistoryCompactionTask?.cancel()
+        reportHistoryCompactionTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+
+            let builder = reportBuilder ?? RunReportBuilder(modelContext: modelContext)
+            reportBuilder = builder
+
+            do {
+                try builder.pruneImmutableHistoryForAllRuns()
+            } catch {
+                ForgeLogger.execution.error("Run report history compaction failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -153,6 +179,7 @@ final class ExecutionService {
         workspace: RunWorkspace
     ) {
         guard let orchestrator = prepareOrchestrator(run: run, plan: plan, workspace: workspace) else { return }
+        prepareRunForLiveAttachment(run)
         synchronizeIdeaStatus(for: run)
 
         Task { @MainActor in
@@ -177,6 +204,7 @@ final class ExecutionService {
 
         let resumeStateID = run.resumeContinuationStateID
         ForgeLogger.execution.info("Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id)")
+        prepareRunForLiveAttachment(run)
         synchronizeIdeaStatus(for: run)
 
         Task { @MainActor in
@@ -201,6 +229,7 @@ final class ExecutionService {
                     }
 
                     let resumeStateID = run.resumeContinuationStateID
+                    prepareRunForLiveAttachment(run)
                     Task { @MainActor in
                         await orchestrator.start(from: resumeStateID)
                     }
@@ -275,8 +304,7 @@ final class ExecutionService {
                 approvalBefore: beforeDiagnostic.approvalBefore,
                 approvalAfter: updatedApproval.map(Self.makeApprovalSnapshot)
             )
-            try? persistApprovalResolutionDiagnostic(diagnostic, for: run)
-            try? modelContext.save()
+            persistApprovalResolution(diagnostic, for: run, approvalID: approvalID)
             refreshDockBadge()
             return
         }
@@ -317,8 +345,7 @@ final class ExecutionService {
                     approvalBefore: beforeDiagnostic.approvalBefore,
                     approvalAfter: updatedApproval.map(Self.makeApprovalSnapshot)
                 )
-                try? persistApprovalResolutionDiagnostic(diagnostic, for: run)
-                try? modelContext.save()
+                persistApprovalResolution(diagnostic, for: run, approvalID: approvalID)
             } catch {
                 pendingApprovals[approvalID] = request
                 ForgeLogger.execution.error("Failed to resolve persisted approval \(approvalID): \(error.localizedDescription)")
@@ -390,7 +417,6 @@ final class ExecutionService {
 
     /// Whether any runs are active.
     var hasActiveRuns: Bool {
-        reconcileStalledOrchestratorsIfNeeded()
         return !activeOrchestrators.isEmpty
     }
 
@@ -401,13 +427,11 @@ final class ExecutionService {
 
     /// P005-OPS §10: Number of blocked runs requiring attention.
     var blockedRunCount: Int {
-        reconcileStalledOrchestratorsIfNeeded()
         return activeOrchestrators.values.filter { $0.run.status == .blocked }.count
     }
 
     /// P005-OPS §10: Number of failed runs requiring attention.
     var failedRunCount: Int {
-        reconcileStalledOrchestratorsIfNeeded()
         return activeOrchestrators.values.filter { $0.run.status == .failed }.count
     }
 
@@ -415,6 +439,12 @@ final class ExecutionService {
     func orchestrator(for runID: UUID) -> WorkflowOrchestrator? {
         reconcileStalledOrchestratorsIfNeeded()
         return activeOrchestrators[runID]
+    }
+
+    /// Read-only lookup used by UI/projection paths that must not trigger
+    /// reconcile side effects on the main thread.
+    func peekOrchestrator(for runID: UUID) -> WorkflowOrchestrator? {
+        activeOrchestrators[runID]
     }
 
     func registerTestingOrchestrator(_ orchestrator: WorkflowOrchestrator) {
@@ -454,6 +484,7 @@ final class ExecutionService {
             self?.pendingApprovals[request.id] = request
             let stageLabel = run.stageExecutions.first(where: { $0.stageID == request.stageID })?.label ?? request.stageID
             self?.notificationService.notifyApprovalRequired(run: run, stageLabel: stageLabel)
+            self?.emitReportIfNeeded(for: run)
             self?.refreshDockBadge()
         }
 
@@ -494,14 +525,35 @@ final class ExecutionService {
         return try? JSONDecoder().decode(AgentCatalog.self, from: plan.catalogSnapshotJSON)
     }
 
+    private var hasACPBackedRuntimeConfiguration: Bool {
+        guard let catalog else { return false }
+        let hasRuntimeProfiles = !catalog.runtimeProfiles.isEmpty
+        let hasACPBackends = catalog.backendProfiles.values.contains { profile in
+            guard let runtimeProfileID = profile.runtimeProfile,
+                  let runtimeProfile = catalog.runtimeProfiles[runtimeProfileID] else {
+                return false
+            }
+            return runtimeProfile.transportKind == "acp_stdio"
+        }
+        let hasConfiguredProviders = !(providerRegistry?.configuredProviders.isEmpty ?? true)
+        return hasRuntimeProfiles && hasACPBackends && hasConfiguredProviders
+    }
+
     var supportsLiveExecution: Bool {
-        forceUITestLiveRuntimeUnavailable || liveRuntimeConfiguration != nil
+        if forceUITestLiveRuntimeUnavailable { return true }
+        return liveRuntimeConfiguration != nil || hasACPBackedRuntimeConfiguration
     }
 
     private func synchronizeIdeaStatus(for run: Run) {
         guard let idea = run.idea else { return }
         idea.synchronizePersistedStatusFromRuns()
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.execution.error(
+                "Failed to persist synchronized idea status for run \(run.id): \(error.localizedDescription)"
+            )
+        }
     }
 
     private func startMaintenanceLoop() {
@@ -514,6 +566,38 @@ final class ExecutionService {
                 self.runMaintenanceTick()
             }
         }
+    }
+
+    private func prepareRunForLiveAttachment(_ run: Run) {
+        guard run.status != .waitingApproval else {
+            do {
+                try modelContext.save()
+            } catch {
+                ForgeLogger.execution.error(
+                    "Failed to persist waiting-approval live attachment for run \(run.id): \(error.localizedDescription)"
+                )
+            }
+            emitLatestSummarySnapshot(for: run)
+            return
+        }
+
+        run.status = .running
+        run.completedAt = nil
+
+        if let details = run.driftDetails,
+           details.localizedCaseInsensitiveContains("execution stalled after") {
+            run.driftDetails = nil
+        }
+
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.execution.error(
+                "Failed to persist active run status for run \(run.id): \(error.localizedDescription)"
+            )
+        }
+
+        emitLatestSummarySnapshot(for: run)
     }
 
     func rebuildPersistedPendingApprovals() {
@@ -561,14 +645,17 @@ final class ExecutionService {
     }
 
     private func reconcileStalledOrchestratorsIfNeeded(now: Date = Date()) {
+        reconcileInvocationCountForTesting += 1
         let stalledRunIDs = activeOrchestrators.compactMap { runID, orchestrator -> UUID? in
             let hasPendingApproval = pendingApprovals.values.contains { $0.runID == runID }
             let latestEventEntry = Self.latestMeaningfulTimelineEntry(in: orchestrator.liveTimeline)
             let stalledStage = stalledStage(for: orchestrator.run)
-            let hasRunningAgents = orchestrator.run.stageExecutions
-                .flatMap(\.agentExecutions)
-                .contains { $0.status == .running }
+            let hasRunningAgents = Self.hasLiveRunningAgents(in: orchestrator.liveTimeline)
             let hasSettledParallelFanout = Self.hasSettledParallelFanout(stage: stalledStage)
+            let hasStartedStageWithoutAgentWork = Self.hasStartedStageWithoutAgentWork(
+                run: orchestrator.run,
+                stage: stalledStage
+            )
             let hasLaterLiveActivity = latestEventEntry.map {
                 Self.hasLaterLiveActivity(in: orchestrator.liveTimeline, after: $0)
             } ?? false
@@ -578,6 +665,7 @@ final class ExecutionService {
                 hasPendingApproval: hasPendingApproval,
                 hasRunningAgents: hasRunningAgents,
                 hasSettledParallelFanout: hasSettledParallelFanout,
+                hasStartedStageWithoutAgentWork: hasStartedStageWithoutAgentWork,
                 stalledStageStatus: stalledStage?.status,
                 stalledStageStartedAt: stalledStage?.startedAt,
                 latestLiveEvent: latestEventEntry?.event,
@@ -626,7 +714,13 @@ final class ExecutionService {
         orchestrator.updateSessionAuditTrailOnCompletion()
         emitReportIfNeeded(for: run)
         fireCompletionNotification(for: run)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.execution.error(
+                "Failed to persist stalled-run reconciliation for run \(runID): \(error.localizedDescription)"
+            )
+        }
     }
 
     private func stalledStage(for run: Run) -> StageExecution? {
@@ -657,6 +751,7 @@ final class ExecutionService {
         hasPendingApproval: Bool,
         hasRunningAgents: Bool,
         hasSettledParallelFanout: Bool = false,
+        hasStartedStageWithoutAgentWork: Bool = false,
         stalledStageStatus: StageStatus?,
         stalledStageStartedAt: Date?,
         latestLiveEvent: ExecutionEvent?,
@@ -684,7 +779,8 @@ final class ExecutionService {
             return false
         }
 
-        let extendedTransitionGraceRequired = hasRunningAgents || hasSettledParallelFanout
+        let extendedTransitionGraceRequired =
+            hasRunningAgents || hasSettledParallelFanout || hasStartedStageWithoutAgentWork
         let effectiveGraceInterval = extendedTransitionGraceRequired
             ? max(graceInterval, runningAgentsGraceInterval)
             : graceInterval
@@ -718,6 +814,7 @@ final class ExecutionService {
             hasPendingApproval: hasPendingApproval,
             hasRunningAgents: hasRunningAgents,
             hasSettledParallelFanout: false,
+            hasStartedStageWithoutAgentWork: false,
             stalledStageStatus: stalledStageStatus,
             stalledStageStartedAt: nil,
             latestLiveEvent: latestLiveEvent,
@@ -741,6 +838,23 @@ final class ExecutionService {
         }
     }
 
+    private static func hasStartedStageWithoutAgentWork(run: Run, stage: StageExecution?) -> Bool {
+        guard
+            let stage,
+            let cursor = run.transitionCursor,
+            cursor.settlementPhase == .transitionStarted,
+            cursor.nextScheduledStateID == stage.stageID
+        else {
+            return false
+        }
+
+        guard stage.status == .running || stage.status == .ready else {
+            return false
+        }
+
+        return stage.agentExecutions.isEmpty
+    }
+
     private static func latestMeaningfulTimelineEntry(in timeline: [LiveExecutionTimelineEntry]) -> LiveExecutionTimelineEntry? {
         timeline.reversed().first(where: { $0.event.type != .textChunk }) ?? timeline.last
     }
@@ -751,6 +865,24 @@ final class ExecutionService {
     ) -> Bool {
         timeline.contains { entry in
             entry.event.timestamp > latestEntry.event.timestamp
+        }
+    }
+
+    private static func hasLiveRunningAgents(in timeline: [LiveExecutionTimelineEntry]) -> Bool {
+        let latestEventByAgentID = Dictionary(
+            grouping: timeline,
+            by: \.agentID
+        ).compactMapValues { entries in
+            entries.max(by: { lhs, rhs in
+                if lhs.event.timestamp != rhs.event.timestamp {
+                    return lhs.event.timestamp < rhs.event.timestamp
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            })
+        }
+
+        return latestEventByAgentID.values.contains { entry in
+            entry.event.type != .sessionClosed
         }
     }
 
@@ -778,9 +910,16 @@ final class ExecutionService {
             )
         }
 
+        if hasACPBackedRuntimeConfiguration {
+            return .ready(
+                summary: "ACP-backed agent-defined runtime",
+                source: "Agent catalog"
+            )
+        }
+
         return .unavailable(
             reason: "Live runtime is unavailable",
-            recovery: "Enable a runtime backend or the fixture backend, then relaunch the app. Advanced setup: CHAINWORKS_FIXTURE_MODE=proposal_loop_success."
+            recovery: "Configure at least one ACP provider in Settings or enable the fixture backend, then relaunch the app. Advanced setup: CHAINWORKS_FIXTURE_MODE=proposal_loop_success."
         )
     }
 
@@ -937,6 +1076,21 @@ final class ExecutionService {
         }
     }
 
+    private func emitLatestSummarySnapshot(for run: Run) {
+        if reportBuilder == nil {
+            reportBuilder = RunReportBuilder(modelContext: modelContext)
+        }
+        guard let builder = reportBuilder else { return }
+
+        do {
+            try builder.emitLatestSummarySnapshot(for: run)
+        } catch {
+            ForgeLogger.execution.error(
+                "Failed to emit latest run summary snapshot for run \(run.id): \(error.localizedDescription)"
+            )
+        }
+    }
+
     // MARK: - Proposal 008 (REQ-006): Benchmark Run Recording
 
     /// If the completed run is linked to a benchmark cohort, record its execution
@@ -1043,6 +1197,28 @@ final class ExecutionService {
             attemptNumber: latestStage?.attemptNumber ?? 1
         )
     }
+
+    private func persistApprovalResolution(
+        _ diagnostic: ApprovalResolutionDiagnostic,
+        for run: Run,
+        approvalID: UUID
+    ) {
+        do {
+            try persistApprovalResolutionDiagnostic(diagnostic, for: run)
+        } catch {
+            ForgeLogger.execution.error(
+                "Failed to persist approval resolution diagnostic for approval \(approvalID): \(error.localizedDescription)"
+            )
+        }
+
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.execution.error(
+                "Failed to persist approval resolution state for approval \(approvalID): \(error.localizedDescription)"
+            )
+        }
+    }
 }
 
 extension ExecutionService: ExecutionTerminationControlling {}
@@ -1054,11 +1230,16 @@ extension ExecutionService: ExecutionTerminationControlling {}
 /// Fixture transport is shared (created once). ACP transports are created on demand and cached.
 final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked Sendable {
     let fixtureTransport: (any RuntimeTransportProtocol)?
+    private let helperProcessJanitor: any RuntimeHelperProcessJanitorProtocol
     private let lock = NSLock()
     private var transportsByFamily: [String: any RuntimeTransportProtocol] = [:]
 
-    init(fixtureTransport: (any RuntimeTransportProtocol)?) {
+    init(
+        fixtureTransport: (any RuntimeTransportProtocol)?,
+        helperProcessJanitor: any RuntimeHelperProcessJanitorProtocol = RuntimeHelperProcessJanitor.live
+    ) {
         self.fixtureTransport = fixtureTransport
+        self.helperProcessJanitor = helperProcessJanitor
     }
 
     func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol {
@@ -1073,6 +1254,8 @@ final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked 
         lock.lock()
         defer { lock.unlock() }
         if let existing = transportsByFamily[family] { return existing }
+
+        helperProcessJanitor.sweepStaleHelpers()
 
         let created: any RuntimeTransportProtocol
         switch family {

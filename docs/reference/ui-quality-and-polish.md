@@ -63,7 +63,7 @@ Implemented hierarchy/state work includes:
 - structured provider settings rather than one undifferentiated settings wall,
 - pilot readiness summary treatment,
 - step-oriented first-run setup presentation,
-- visible journey/probing feedback in Goose remediation,
+- visible journey/probing feedback in provider diagnostics and setup,
 - surface-local loading, success, and retry copy for bounded async actions.
 
 ### Shared status semantics
@@ -133,7 +133,6 @@ These surfaces now define the stable proof-owning UI quality baseline:
 | `FirstRunSetupWizard` | Preview + interaction/runtime proof | steps, validation, launch feedback |
 | `ArchivedIdeasView` | Preview | empty-state/readability consistency |
 | `DeliveryPreflightReportView` | Preview + adopter-slice accessibility proof | positive and negative status rendering |
-| `GooseProviderConnectionAssistantView` | Preview + runtime proof | guided remediation journey and probing feedback |
 | `ApprovalGateView` | Interaction/runtime proof | keyboard-only confirm/dismiss ownership |
 | `ReleaseGateView` | Preview + runtime proof | artifact semantics and decision affordances |
 | `RecoverySheet` | Interaction/runtime proof | recovery action discoverability and dismissal |

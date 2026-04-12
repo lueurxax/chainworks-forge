@@ -23,17 +23,27 @@ struct NotificationPreferences: Codable, Sendable {
 
     private static let storageKey = "chainworks_notification_preferences"
 
-    func save() {
-        if let data = try? JSONEncoder().encode(self) {
+    @discardableResult
+    func save() -> Bool {
+        do {
+            let data = try JSONEncoder().encode(self)
             UserDefaults.standard.set(data, forKey: Self.storageKey)
+            return true
+        } catch {
+            ForgeLogger.notification.error("Failed to save notification preferences: \(error.localizedDescription)")
+            return false
         }
     }
 
     static func load() -> NotificationPreferences {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let prefs = try? JSONDecoder().decode(NotificationPreferences.self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
             return .defaultPreferences
         }
-        return prefs
+        do {
+            return try JSONDecoder().decode(NotificationPreferences.self, from: data)
+        } catch {
+            ForgeLogger.notification.error("Failed to decode notification preferences: \(error.localizedDescription)")
+            return .defaultPreferences
+        }
     }
 }

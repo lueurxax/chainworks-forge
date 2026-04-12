@@ -5,12 +5,12 @@
 | Date | 2026-04-01 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposal 027 (Go + Temporal control-plane extraction) |
-| Goal | Add an MCP server on top of the Go/Temporal control plane so any compatible agent or client can operate the system through a stable, high-level command surface. |
+| Depends on | Proposal 027 (server-side parity replica); Proposal 043 is the complementary read-path contract, not a blocker for northbound command work |
+| Goal | Add an MCP server on top of the Rust + SQLite control plane so compatible agents and clients can operate the system through a stable, high-level command surface. |
 
 ## 1. Why this proposal exists
 
-Once orchestration lives in the Go service, the next step is to make that control plane accessible to external agents and tools without binding the system to one specific UI.
+Once the server-side control plane exists, the next step is to make that control plane accessible to external agents and tools without binding the system to one specific UI.
 
 MCP is the right northbound interface for this because it allows:
 - tools,
@@ -26,9 +26,12 @@ MCP is the **public control facade** over the orchestrator.
 After Proposal 029:
 
 - the system can be controlled by any MCP-compatible client,
-- core orchestration remains in Go/Temporal,
+- core orchestration remains in the Rust + SQLite control plane,
 - the UI is no longer the only way to drive runs,
-- the MCP surface becomes the canonical mutation interface for operators and agent-clients.
+- the MCP surface becomes the canonical mutation interface for operators, automation clients, and agent-clients.
+
+Proposal 029 is intentionally allowed to land early.
+It does not need to wait for thin-client cutover, because command/control can stabilize before the UI read path moves.
 
 ## 3. Architectural decision
 
@@ -38,6 +41,8 @@ It should expose domain actions, not internal implementation primitives.
 
 ### 3.2 Domain-first MCP surface
 Tools should look like:
+- `ideas.create`
+- `ideas.list`
 - `runs.start`
 - `runs.list`
 - `runs.get`
@@ -48,11 +53,13 @@ Tools should look like:
 - `sessions.reset_agent`
 - `artifacts.get`
 - `reports.compare`
+- `automations.list`
+- `automations.run`
 - `experiments.start`
 
 Not like:
 - `set_stage_status`
-- `mutate_temporal_history`
+- `mutate_control_plane_state`
 - `attach_random_runtime_extension`
 
 ## 4. Scope
@@ -67,6 +74,11 @@ First-wave MCP tools:
 - `runs.cancel`
 - `runs.clone_from_snapshot`
 
+#### Ideas
+- `ideas.create`
+- `ideas.list`
+- `ideas.get`
+
 #### Approvals
 - `approvals.list`
 - `approvals.resolve`
@@ -80,6 +92,11 @@ First-wave MCP tools:
 - `artifacts.get`
 - `reports.get`
 - `reports.compare`
+
+#### Automation / operations
+- `automations.list`
+- `automations.run`
+- `runtime.health`
 
 #### Experiments (optional first slice)
 - `experiments.list`
@@ -119,6 +136,9 @@ The system may keep a non-MCP read/query API for:
 - local read optimization.
 
 MCP remains the command/control surface.
+
+The target-state read plane is GraphQL-first.
+Proposal 029 should therefore stay command-oriented and avoid becoming a second read-model protocol for the UI.
 
 ## 6. Security and authorization
 
@@ -161,6 +181,9 @@ These are different layers and must remain separate.
 
 ### Phase 3
 - treat MCP as the canonical mutation/control surface
+
+The read path may still remain outside MCP during these phases.
+That separation is intentional and should later be formalized by Proposal 043.
 
 ## 9. Non-goals
 
@@ -205,7 +228,7 @@ Proposal 029 is complete when:
 3. retry/reset commands exist over MCP,
 4. artifact/report retrieval works over MCP resources or tools,
 5. the MCP server enforces caller-specific tool exposure,
-6. control flows operate through MCP without moving orchestration logic out of the Go service.
+6. control flows operate through MCP without moving orchestration logic out of the Rust control plane.
 
 ## 12. Final recommendation
 

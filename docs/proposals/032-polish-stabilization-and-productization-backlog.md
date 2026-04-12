@@ -5,8 +5,8 @@
 | Date | 2026-04-01 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposals 027, 028, and 030 |
-| Goal | Collect and organize all remaining polish, stabilization, productization, and follow-on improvements after control-plane extraction, MCP exposure, and UI thinning land. |
+| Depends on | Proposals 027, 029, 031, 041, 042, and 043 |
+| Goal | Collect and organize all remaining polish, stabilization, productization, and follow-on improvements after parity extraction, MCP exposure, query contracts, daemon lifecycle, and thin-client cutover land. |
 
 ## 1. Why this proposal exists
 
@@ -102,4 +102,4 @@ Proposal 032 is useful when:
 
 Keep Proposal 032 intentionally light now.
 
-It should serve as the living place for all remaining “this still needs care” work after the control-plane extraction, MCP server, and UI rewrite land.
+It should serve as the living place for all remaining “this still needs care” work after the parity replica, MCP server, daemon lifecycle, query/read contract, and thin-client cutover land.

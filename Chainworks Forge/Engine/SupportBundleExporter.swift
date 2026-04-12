@@ -106,7 +106,7 @@ struct SupportBundleExporter {
                 "startedAt": ISO8601DateFormatter().string(from: run.startedAt),
                 "completedAt": jsonValue(run.completedAt.map { ISO8601DateFormatter().string(from: $0) }),
                 "totalCostCents": jsonValue(run.totalCostCents),
-                "runtimeTrustLevel": run.runtimeTrustLevel ?? ""
+                "runtimeTrustLevel": run.normalizedRuntimeTrustLevel ?? ""
             ]
         } else {
             latestRunSummary = [:]

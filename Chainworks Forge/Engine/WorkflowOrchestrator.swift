@@ -53,6 +53,8 @@ struct LiveExecutionTimelineEntry: Identifiable, Sendable {
 @MainActor
 @Observable
 final class WorkflowOrchestrator {
+    private static let automaticWatchdogRetryReason = "automatic_watchdog_retry"
+
     // MARK: - Configuration
 
     let run: Run
@@ -151,10 +153,14 @@ final class WorkflowOrchestrator {
         // continuation by overwriting with `.initial()`.
         if run.transitionCursor == nil {
             if let resumeState = stateID {
+                let seededStage = resumableStageExecution(for: resumeState)
                 // Legacy run being resumed — seed cursor reflecting that the
                 // orchestrator is about to start executing `resumeState`.
                 run.persistTransitionCursor(TransitionCursor.seededForResume(
-                    nextScheduledStateID: resumeState
+                    nextScheduledStateID: resumeState,
+                    nextScheduledIteration: seededStage?.iteration,
+                    nextScheduledAttemptNumber: seededStage?.attemptNumber,
+                    scheduledStageExecutionID: seededStage?.id
                 ))
             } else {
                 run.persistTransitionCursor(.initial())
@@ -170,6 +176,13 @@ final class WorkflowOrchestrator {
 
         isRunning = true
         run.status = .running
+        run.completedAt = nil
+        healPrematureBlockedStateIfNeeded()
+        do {
+            try modelContext.save()
+        } catch {
+            RuntimeDiagnostics.log("start durableRunStatusSaveFailed runID=\(run.id) error=\(error.localizedDescription)")
+        }
 
         // Main state machine loop
         await executeStateMachine()
@@ -428,20 +441,15 @@ final class WorkflowOrchestrator {
     private func executeState(_ state: ExecutableState) async -> StateResult {
         RuntimeDiagnostics.log("executeState begin stateID=\(state.id)")
 
-        // Proposal 032: Mark the transition as started once agent work begins.
-        if let cursor = run.transitionCursor,
-           cursor.settlementPhase == .transitionSettled,
-           cursor.nextScheduledStateID == state.id {
-            run.persistTransitionCursor(cursor.markingTransitionStarted())
-        }
-
         let stageExec: StageExecution
+        var requiresDurableStageStartSave = false
         if let scheduledSelection = scheduledStageSelection(for: state.id) {
             if let scheduledStage = scheduledSelection.execution,
                scheduledStage.status == .running || scheduledStage.status == .ready {
                 stageExec = scheduledStage
                 stageExec.status = .running
                 stageExec.completedAt = nil
+                requiresDurableStageStartSave = true
             } else {
                 let freshStage = StageExecution(
                     stageID: state.id,
@@ -453,11 +461,13 @@ final class WorkflowOrchestrator {
                 freshStage.run = run
                 modelContext.insert(freshStage)
                 stageExec = freshStage
+                requiresDurableStageStartSave = true
             }
         } else if let resumableStage = resumableStageExecution(for: state.id) {
             stageExec = resumableStage
             stageExec.status = .running
             stageExec.completedAt = nil
+            requiresDurableStageStartSave = true
         } else {
             // Create StageExecution lazily (ARCH-027)
             let iteration = currentIteration(for: state.id)
@@ -471,6 +481,26 @@ final class WorkflowOrchestrator {
             freshStage.run = run
             modelContext.insert(freshStage)
             stageExec = freshStage
+            requiresDurableStageStartSave = true
+        }
+
+        // Proposal 032: Mark the transition as started once the downstream stage
+        // is materialized, not earlier at state entry.
+        if let cursor = run.transitionCursor,
+           cursor.settlementPhase == .transitionSettled,
+           cursor.nextScheduledStateID == state.id {
+            run.persistTransitionCursor(cursor.markingTransitionStarted())
+            requiresDurableStageStartSave = true
+        }
+
+        if requiresDurableStageStartSave {
+            do {
+                try modelContext.save()
+            } catch {
+                RuntimeDiagnostics.log("executeState durableStageStartSaveFailed stateID=\(state.id) error=\(error.localizedDescription)")
+                run.driftDetails = "Failed to durably persist stage start for '\(state.id)': \(error.localizedDescription)"
+                return .failed
+            }
         }
 
         // Proposal 007: Provision worktree before executing implementation states
@@ -634,6 +664,28 @@ final class WorkflowOrchestrator {
         Self.applySkillMetadata(to: agentExec, from: agent)
         registerLiveExecution(agentExec, for: agent.id)
 
+        do {
+            try modelContext.save()
+        } catch {
+            RuntimeDiagnostics.log("executeAgentTask durableAgentStartSaveFailed agentID=\(agent.id) stateID=\(state.id) error=\(error.localizedDescription)")
+            agentExec.status = .failed
+            agentExec.completedAt = Date()
+            agentExec.logSnippet = "Failed to durably persist agent start: \(error.localizedDescription)"
+            applyTerminalExecutionTruth(
+                to: agentExec,
+                canonicalOutcome: .failedBeforeOutput,
+                transportErrorKind: .unknown,
+                providerStopReason: nil,
+                outputPresence: .none,
+                runtimeProvider: nil,
+                runtimeModel: nil,
+                rawErrorMessage: error.localizedDescription,
+                rawFinishEvent: nil
+            )
+            unregisterLiveExecution(agentExec, for: agent.id)
+            return false
+        }
+
         // Gather input artifacts
         let inputData: [String: Data]
         do {
@@ -680,10 +732,16 @@ final class WorkflowOrchestrator {
             inputArtifacts: inputData,
             inputArtifactPaths: inputArtifactPaths
         )
+        let primaryModelTier = preferredPrimaryModelTier(
+            for: agent,
+            task: task,
+            stageExecution: stageExec,
+            profile: contextStrategyProfile
+        )
         let primaryExecutionBinding = strategyAdjustedBinding(
             for: agent,
             baseBinding: providerBindingsByAgentID[agent.id],
-            modelTier: contextStrategyProfile?.defaultModelTier
+            modelTier: primaryModelTier
         )
         let primaryExecutionAgent = strategyAdjustedAgent(
             from: agent,
@@ -695,7 +753,7 @@ final class WorkflowOrchestrator {
             inputArtifacts: inputData,
             profile: contextStrategyProfile,
             modelTierUsed: resolvedModelTierUsed(
-                requestedTier: contextStrategyProfile?.defaultModelTier,
+                requestedTier: primaryModelTier,
                 effectiveAgent: primaryExecutionAgent
             )
         )
@@ -717,7 +775,10 @@ final class WorkflowOrchestrator {
             contextStrategyProfileID: contextStrategyProfileID,
             strategyAssignmentMode: strategyAssignmentMode,
             contextStrategyProfile: contextStrategyProfile,
-            handoffPacket: handoffPacket
+            handoffPacket: handoffPacket,
+            agentAttemptNumber: agentExec.agentAttemptNumber,
+            retryReason: agentExec.retryReason,
+            supersedesAgentExecutionID: agentExec.supersedesAgentExecutionID
         )
 
         // Proposal 007 REQ-008 / REQ-011: Route release agents through ReleaseOpsCoordinator
@@ -737,15 +798,73 @@ final class WorkflowOrchestrator {
         // Execute off-MainActor, marshal results back
         var result: AgentResult
         var finalModelTierUsed = resolvedModelTierUsed(
-            requestedTier: contextStrategyProfile?.defaultModelTier,
+            requestedTier: primaryModelTier,
             effectiveAgent: primaryExecutionAgent
         )
         var escalationCount = 0
         var retryableEscalationCount = 0
         do {
             result = try await executor.execute(task: task, agent: primaryExecutionAgent, context: execContext)
+            var attemptedCapacityFallbackModels = Set([primaryExecutionAgent.model.lowercased()])
+            var currentFallbackBinding = primaryExecutionBinding
+
+            while let fallbackBinding = capacityFallbackBinding(
+                for: agent,
+                attemptedBinding: currentFallbackBinding,
+                result: result
+            ) {
+                let normalizedFallbackModel = fallbackBinding.model.lowercased()
+                guard attemptedCapacityFallbackModels.insert(normalizedFallbackModel).inserted else {
+                    break
+                }
+
+                let fallbackAgent = strategyAdjustedAgent(
+                    from: agent,
+                    binding: fallbackBinding
+                )
+                ForgeLogger.execution.info(
+                    "Capacity fallback for agent '\(agent.id)': \(currentFallbackBinding?.model ?? primaryExecutionAgent.model) -> \(fallbackBinding.model)"
+                )
+                let fallbackContext = ExecutionContext(
+                    workspace: currentWorkspace,
+                    projectRoot: preferredProjectRoot,
+                    stageID: state.id,
+                    stageLineageID: stageExec.lineageID,
+                    ownerExecutionLineageID: agentExec.id,
+                    iteration: stageExec.iteration,
+                    attemptNumber: stageExec.attemptNumber,
+                    inputArtifacts: inputData,
+                    inputArtifactPaths: inputArtifactPaths,
+                    variables: runtimeVariables,
+                    ideaBody: run.idea?.body ?? "",
+                    ideaAttachmentPath: run.idea?.attachmentPath,
+                    providerBinding: fallbackBinding,
+                    catalog: catalog,
+                    contextStrategyProfileID: contextStrategyProfileID,
+                    strategyAssignmentMode: strategyAssignmentMode,
+                    contextStrategyProfile: contextStrategyProfile,
+                    handoffPacket: handoffPacket,
+                    agentAttemptNumber: agentExec.agentAttemptNumber,
+                    retryReason: agentExec.retryReason,
+                    supersedesAgentExecutionID: agentExec.supersedesAgentExecutionID
+                )
+                result = try await executor.execute(
+                    task: task,
+                    agent: fallbackAgent,
+                    context: fallbackContext
+                )
+                currentFallbackBinding = fallbackBinding
+                finalModelTierUsed = resolvedModelTierUsed(
+                    requestedTier: nil,
+                    effectiveAgent: fallbackAgent
+                )
+            }
+
             if shouldEscalateStrategyExecution(
                 result: result,
+                profile: contextStrategyProfile
+            ) && shouldAttemptEscalatedExecution(
+                primaryModelTier: primaryModelTier,
                 profile: contextStrategyProfile
             ) {
                 let escalatedBinding = strategyAdjustedBinding(
@@ -775,7 +894,10 @@ final class WorkflowOrchestrator {
                     contextStrategyProfileID: contextStrategyProfileID,
                     strategyAssignmentMode: strategyAssignmentMode,
                     contextStrategyProfile: contextStrategyProfile,
-                    handoffPacket: handoffPacket
+                    handoffPacket: handoffPacket,
+                    agentAttemptNumber: agentExec.agentAttemptNumber,
+                    retryReason: agentExec.retryReason,
+                    supersedesAgentExecutionID: agentExec.supersedesAgentExecutionID
                 )
                 result = try await executor.execute(
                     task: task,
@@ -812,6 +934,16 @@ final class WorkflowOrchestrator {
             )
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
+        }
+
+        let automaticWatchdogRetryConsumed = hasConsumedAutomaticWatchdogRetry(
+            for: task,
+            agent: agent,
+            currentExecution: agentExec,
+            in: stageExec
+        )
+        if automaticWatchdogRetryConsumed, result.supervisionClassification != nil {
+            result = result.markedAutomaticRetryConsumed()
         }
 
         // Marshal results back to MainActor
@@ -1023,6 +1155,7 @@ final class WorkflowOrchestrator {
             unregisterLiveExecution(agentExec, for: agent.id)
             return true
         } else {
+            let shouldScheduleAutomaticRetry = result.supervisionClassification != nil && !automaticWatchdogRetryConsumed
             if !result.outputs.isEmpty {
                 do {
                     let (artifacts, envelopes) = try ArtifactPersistenceOrderingPolicy.persistRawOutputs(
@@ -1092,10 +1225,21 @@ final class WorkflowOrchestrator {
                             }
 
                             agentExec.status = .completed
-                            agentExec.retryReason = nil
                             agentExec.logSnippet = mergedLogSnippet(
                                 existing: agentExec.logSnippet,
                                 result: "Recovered after transport failure because durable outputs validated"
+                            )
+                            applyTerminalExecutionTruth(
+                                to: agentExec,
+                                canonicalOutcome: .completedWithTransportError,
+                                supervisionClassification: agentExec.supervisionClassification ?? result.supervisionClassification,
+                                transportErrorKind: agentExec.transportErrorKind ?? result.transportErrorKind,
+                                providerStopReason: agentExec.providerStopReason ?? result.providerStopReason,
+                                outputPresence: .durableOutput,
+                                runtimeProvider: agentExec.runtimeProvider,
+                                runtimeModel: agentExec.runtimeModel,
+                                rawErrorMessage: agentExec.logSnippet,
+                                rawFinishEvent: result.outcomeEnvelope?.rawFinishEvent
                             )
                             updateCompactionOutcome(agentExec: agentExec, succeeded: true)
                             unregisterLiveExecution(agentExec, for: agent.id)
@@ -1103,19 +1247,21 @@ final class WorkflowOrchestrator {
                         }
                     }
 
-                    persistStageFailureEvidence(
-                        stageExec: stageExec,
-                        failedAgentExec: agentExec,
-                        validationFailure: nil,
-                        additionalEnvelopes: envelopes
-                    )
+                    if !shouldScheduleAutomaticRetry {
+                        persistStageFailureEvidence(
+                            stageExec: stageExec,
+                            failedAgentExec: agentExec,
+                            validationFailure: nil,
+                            additionalEnvelopes: envelopes
+                        )
+                    }
                 } catch {
                     agentExec.logSnippet = mergedLogSnippet(
                         existing: agentExec.logSnippet,
                         result: "Raw failure outputs could not be persisted: \(error.localizedDescription)"
                     )
                 }
-            } else {
+            } else if !shouldScheduleAutomaticRetry {
                 persistStageFailureEvidence(
                     stageExec: stageExec,
                     failedAgentExec: agentExec,
@@ -1128,6 +1274,27 @@ final class WorkflowOrchestrator {
             // Proposal 013 §8.2: Record compaction outcome truth
             updateCompactionOutcome(agentExec: agentExec, succeeded: false)
             unregisterLiveExecution(agentExec, for: agent.id)
+            if shouldScheduleAutomaticRetry {
+                do {
+                    _ = try scheduleAutomaticWatchdogRetry(
+                        run: run,
+                        stageExec: stageExec,
+                        failedAgentExec: agentExec
+                    )
+                    return await executeAgentTask(task, state: state, stageExec: stageExec)
+                } catch {
+                    agentExec.logSnippet = mergedLogSnippet(
+                        existing: agentExec.logSnippet,
+                        result: "Automatic watchdog retry scheduling failed: \(error.localizedDescription)"
+                    )
+                    persistStageFailureEvidence(
+                        stageExec: stageExec,
+                        failedAgentExec: agentExec,
+                        validationFailure: nil,
+                        additionalEnvelopes: []
+                    )
+                }
+            }
             return false
         }
     }
@@ -1541,6 +1708,31 @@ final class WorkflowOrchestrator {
             taskAgentPairs.append((task, agent, agentExec))
         }
 
+        do {
+            try modelContext.save()
+        } catch {
+            RuntimeDiagnostics.log("executeParallelTasks durableAgentStartSaveFailed stateID=\(state.id) error=\(error.localizedDescription)")
+            let now = Date()
+            for pair in taskAgentPairs {
+                pair.agentExec.status = .failed
+                pair.agentExec.completedAt = pair.agentExec.completedAt ?? now
+                pair.agentExec.logSnippet = "Failed to durably persist agent start: \(error.localizedDescription)"
+                applyTerminalExecutionTruth(
+                    to: pair.agentExec,
+                    canonicalOutcome: .failedBeforeOutput,
+                    transportErrorKind: .unknown,
+                    providerStopReason: nil,
+                    outputPresence: .none,
+                    runtimeProvider: nil,
+                    runtimeModel: nil,
+                    rawErrorMessage: error.localizedDescription,
+                    rawFinishEvent: nil
+                )
+                unregisterLiveExecution(pair.agentExec, for: pair.agent.id)
+            }
+            return false
+        }
+
         // Execute all in parallel
         let results = await withTaskGroup(of: (Int, AgentResult?).self) { group in
             for (index, pair) in taskAgentPairs.enumerated() {
@@ -1550,22 +1742,23 @@ final class WorkflowOrchestrator {
                 } catch {
                     pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList([])
                     pair.agentExec.inputBindingsJSON = buildInputBindings(for: pair.task)
+                    let preparationFailure = AgentResult(
+                        outputs: [:],
+                        logSnippet: nil,
+                        costCents: nil,
+                        succeeded: false,
+                        errorMessage: "Source context preparation failed: \(error.localizedDescription)",
+                        sessionID: nil,
+                        durationSeconds: 0,
+                        providerReceipt: nil,
+                        resolvedModel: nil,
+                        configuredProviderID: nil,
+                        adapterVersion: nil
+                    )
                     group.addTask {
                         (
                             index,
-                            AgentResult(
-                                outputs: [:],
-                                logSnippet: nil,
-                                costCents: nil,
-                                succeeded: false,
-                                errorMessage: "Source context preparation failed: \(error.localizedDescription)",
-                                sessionID: nil,
-                                durationSeconds: 0,
-                                providerReceipt: nil,
-                                resolvedModel: nil,
-                                configuredProviderID: nil,
-                                adapterVersion: nil
-                            )
+                            preparationFailure
                         )
                     }
                     continue
@@ -1593,10 +1786,16 @@ final class WorkflowOrchestrator {
                     inputArtifacts: gatheredInputs,
                     inputArtifactPaths: inputArtifactPaths
                 )
+                let primaryModelTier = self.preferredPrimaryModelTier(
+                    for: agent,
+                    task: task,
+                    stageExecution: stageExec,
+                    profile: contextStrategyProfile
+                )
                 let primaryExecutionBinding = strategyAdjustedBinding(
                     for: agent,
                     baseBinding: providerBindingsByAgentID[agent.id],
-                    modelTier: contextStrategyProfile?.defaultModelTier
+                    modelTier: primaryModelTier
                 )
                 let primaryExecutionAgent = strategyAdjustedAgent(
                     from: agent,
@@ -1608,7 +1807,7 @@ final class WorkflowOrchestrator {
                     inputArtifacts: gatheredInputs,
                     profile: self.contextStrategyProfile,
                     modelTierUsed: resolvedModelTierUsed(
-                        requestedTier: contextStrategyProfile?.defaultModelTier,
+                        requestedTier: primaryModelTier,
                         effectiveAgent: primaryExecutionAgent
                     )
                 )
@@ -1630,7 +1829,10 @@ final class WorkflowOrchestrator {
                     contextStrategyProfileID: contextStrategyProfileID,
                     strategyAssignmentMode: strategyAssignmentMode,
                     contextStrategyProfile: contextStrategyProfile,
-                    handoffPacket: handoffPacket
+                    handoffPacket: handoffPacket,
+                    agentAttemptNumber: pair.agentExec.agentAttemptNumber,
+                    retryReason: pair.agentExec.retryReason,
+                    supersedesAgentExecutionID: pair.agentExec.supersedesAgentExecutionID
                 )
                 let executor = self.executor
                 pair.agentExec.consumedInputArtifactNamesJSON = encodeArtifactNameList(Array(gatheredInputs.keys).sorted())
@@ -1659,16 +1861,143 @@ final class WorkflowOrchestrator {
 
         // Marshal all results back on MainActor
         var allSucceeded = true
+        var scheduledAutomaticRetry = false
 
         for (index, optResult) in results {
             let pair = taskAgentPairs[index]
             let agentExec = pair.agentExec
             let agent = pair.agent
+            var normalizedResult = optResult
             agentExec.resolvedBackendProfileID = agent.backendProfileID
+            let automaticWatchdogRetryConsumed = hasConsumedAutomaticWatchdogRetry(
+                for: pair.task,
+                agent: agent,
+                currentExecution: agentExec,
+                in: stageExec
+            )
 
             agentExec.completedAt = Date()
 
-            if let result = optResult {
+            if var result = optResult {
+                let primaryModelTier = preferredPrimaryModelTier(
+                    for: agent,
+                    task: pair.task,
+                    stageExecution: stageExec,
+                    profile: contextStrategyProfile
+                )
+                var currentFallbackBinding = strategyAdjustedBinding(
+                    for: agent,
+                    baseBinding: providerBindingsByAgentID[agent.id],
+                    modelTier: primaryModelTier
+                )
+                var attemptedCapacityFallbackModels = Set([
+                    (currentFallbackBinding?.model ?? agent.model).lowercased()
+                ])
+
+                while let fallbackBinding = capacityFallbackBinding(
+                    for: agent,
+                    attemptedBinding: currentFallbackBinding,
+                    result: result
+                ) {
+                    let normalizedFallbackModel = fallbackBinding.model.lowercased()
+                    guard attemptedCapacityFallbackModels.insert(normalizedFallbackModel).inserted else {
+                        break
+                    }
+
+                    let gatheredInputs: [String: Data]
+                    do {
+                        gatheredInputs = try await gatherExecutionInputs(for: pair.task, agent: agent)
+                    } catch {
+                        result = AgentResult(
+                            outputs: [:],
+                            logSnippet: nil,
+                            costCents: nil,
+                            succeeded: false,
+                            errorMessage: "Source context preparation failed: \(error.localizedDescription)",
+                            sessionID: nil,
+                            durationSeconds: 0,
+                            providerReceipt: nil,
+                            resolvedModel: nil,
+                            configuredProviderID: nil,
+                            adapterVersion: nil
+                        )
+                        break
+                    }
+
+                    let inputArtifactPaths = gatherInputArtifactPaths(for: pair.task)
+                    let handoffPacket = buildHandoffPacket(
+                        profileID: contextStrategyProfileID,
+                        profile: contextStrategyProfile,
+                        agent: agent,
+                        task: pair.task,
+                        inputArtifacts: gatheredInputs,
+                        inputArtifactPaths: inputArtifactPaths
+                    )
+                    let fallbackAgent = strategyAdjustedAgent(
+                        from: agent,
+                        binding: fallbackBinding
+                    )
+                    ForgeLogger.execution.info(
+                        "Capacity fallback for agent '\(agent.id)': \(currentFallbackBinding?.model ?? agent.model) -> \(fallbackBinding.model)"
+                    )
+                    let fallbackContext = ExecutionContext(
+                        workspace: currentWorkspace,
+                        projectRoot: preferredProjectRoot,
+                        stageID: state.id,
+                        stageLineageID: stageExec.lineageID,
+                        ownerExecutionLineageID: agentExec.id,
+                        iteration: stageExec.iteration,
+                        attemptNumber: stageExec.attemptNumber,
+                        inputArtifacts: gatheredInputs,
+                        inputArtifactPaths: inputArtifactPaths,
+                        variables: runtimeVariables,
+                        ideaBody: run.idea?.body ?? "",
+                        ideaAttachmentPath: run.idea?.attachmentPath,
+                        providerBinding: fallbackBinding,
+                        catalog: catalog,
+                        contextStrategyProfileID: contextStrategyProfileID,
+                        strategyAssignmentMode: strategyAssignmentMode,
+                        contextStrategyProfile: contextStrategyProfile,
+                        handoffPacket: handoffPacket,
+                        agentAttemptNumber: agentExec.agentAttemptNumber,
+                        retryReason: agentExec.retryReason,
+                        supersedesAgentExecutionID: agentExec.supersedesAgentExecutionID
+                    )
+                    do {
+                        result = try await executor.execute(
+                            task: pair.task,
+                            agent: fallbackAgent,
+                            context: fallbackContext
+                        )
+                    } catch {
+                        result = AgentResult(
+                            outputs: [:],
+                            logSnippet: nil,
+                            costCents: nil,
+                            succeeded: false,
+                            errorMessage: error.localizedDescription,
+                            sessionID: nil,
+                            durationSeconds: 0,
+                            providerReceipt: nil,
+                            resolvedModel: fallbackAgent.model,
+                            configuredProviderID: fallbackBinding.configuredProviderID,
+                            adapterVersion: fallbackBinding.adapterVersion,
+                            canonicalOutcome: .failedBeforeOutput,
+                            sessionReuseDisposition: .fresh,
+                            transportErrorKind: .unknown,
+                            providerStopReason: nil,
+                            outputPresence: .none,
+                            runtimeProvider: fallbackBinding.providerIdentifier,
+                            runtimeModel: fallbackAgent.model
+                        )
+                    }
+                    currentFallbackBinding = fallbackBinding
+                }
+
+                if automaticWatchdogRetryConsumed, result.supervisionClassification != nil {
+                    result = result.markedAutomaticRetryConsumed()
+                }
+                normalizedResult = result
                 agentExec.costCents = result.costCents
                 agentExec.resolvedModel = result.resolvedModel
                 agentExec.configuredProviderID = result.configuredProviderID
@@ -1702,7 +2031,7 @@ final class WorkflowOrchestrator {
                 )
             }
 
-            guard let result = optResult else {
+            guard let result = normalizedResult else {
                 agentExec.status = .failed
                 agentExec.logSnippet = "Execution failed"
                 applyTerminalExecutionTruth(
@@ -1729,6 +2058,7 @@ final class WorkflowOrchestrator {
             }
 
             guard result.succeeded else {
+                let shouldScheduleAutomaticRetry = result.supervisionClassification != nil && !automaticWatchdogRetryConsumed
                 if !result.outputs.isEmpty {
                     do {
                         let (artifacts, envelopes) = try ArtifactPersistenceOrderingPolicy.persistRawOutputs(
@@ -1801,10 +2131,21 @@ final class WorkflowOrchestrator {
                                 }
 
                                 agentExec.status = .completed
-                                agentExec.retryReason = nil
                                 agentExec.logSnippet = mergedLogSnippet(
                                     existing: agentExec.logSnippet,
                                     result: "Recovered after transport failure because durable outputs validated"
+                                )
+                                applyTerminalExecutionTruth(
+                                    to: agentExec,
+                                    canonicalOutcome: .completedWithTransportError,
+                                    supervisionClassification: agentExec.supervisionClassification ?? result.supervisionClassification,
+                                    transportErrorKind: agentExec.transportErrorKind ?? result.transportErrorKind,
+                                    providerStopReason: agentExec.providerStopReason ?? result.providerStopReason,
+                                    outputPresence: .durableOutput,
+                                    runtimeProvider: agentExec.runtimeProvider,
+                                    runtimeModel: agentExec.runtimeModel,
+                                    rawErrorMessage: agentExec.logSnippet,
+                                    rawFinishEvent: result.outcomeEnvelope?.rawFinishEvent
                                 )
                                 updateCompactionOutcome(agentExec: agentExec, succeeded: true)
                                 unregisterLiveExecution(agentExec, for: agent.id)
@@ -1812,19 +2153,21 @@ final class WorkflowOrchestrator {
                             }
                         }
 
-                        persistStageFailureEvidence(
-                            stageExec: stageExec,
-                            failedAgentExec: agentExec,
-                            validationFailure: nil,
-                            additionalEnvelopes: envelopes
-                        )
+                        if !shouldScheduleAutomaticRetry {
+                            persistStageFailureEvidence(
+                                stageExec: stageExec,
+                                failedAgentExec: agentExec,
+                                validationFailure: nil,
+                                additionalEnvelopes: envelopes
+                            )
+                        }
                     } catch {
                         agentExec.logSnippet = mergedLogSnippet(
                             existing: agentExec.logSnippet,
                             result: "Raw failure outputs could not be persisted: \(error.localizedDescription)"
                         )
                     }
-                } else {
+                } else if !shouldScheduleAutomaticRetry {
                     persistStageFailureEvidence(
                         stageExec: stageExec,
                         failedAgentExec: agentExec,
@@ -1837,6 +2180,28 @@ final class WorkflowOrchestrator {
                 agentExec.logSnippet = result.errorMessage
                 updateCompactionOutcome(agentExec: agentExec, succeeded: false)
                 unregisterLiveExecution(agentExec, for: agent.id)
+                if shouldScheduleAutomaticRetry {
+                    do {
+                        _ = try scheduleAutomaticWatchdogRetry(
+                            run: run,
+                            stageExec: stageExec,
+                            failedAgentExec: agentExec
+                        )
+                        scheduledAutomaticRetry = true
+                        continue
+                    } catch {
+                        agentExec.logSnippet = mergedLogSnippet(
+                            existing: agentExec.logSnippet,
+                            result: "Automatic watchdog retry scheduling failed: \(error.localizedDescription)"
+                        )
+                        persistStageFailureEvidence(
+                            stageExec: stageExec,
+                            failedAgentExec: agentExec,
+                            validationFailure: nil,
+                            additionalEnvelopes: []
+                        )
+                    }
+                }
                 allSucceeded = false
                 continue
             }
@@ -1990,7 +2355,46 @@ final class WorkflowOrchestrator {
             unregisterLiveExecution(agentExec, for: agent.id)
         }
 
+        if scheduledAutomaticRetry {
+            return await executeParallelTasks(tasks, state: state, stageExec: stageExec)
+        }
+
         return allSucceeded
+    }
+
+    private func hasConsumedAutomaticWatchdogRetry(
+        for task: AgentTask,
+        agent: ResolvedAgent,
+        currentExecution: AgentExecution,
+        in stageExec: StageExecution
+    ) -> Bool {
+        if currentExecution.retryReason == Self.automaticWatchdogRetryReason {
+            return true
+        }
+
+        return stageExec.agentExecutions.contains {
+            $0.id != currentExecution.id &&
+            $0.agentID == agent.id &&
+            $0.taskName == task.task &&
+            $0.retryReason == Self.automaticWatchdogRetryReason
+        }
+    }
+
+    @discardableResult
+    private func scheduleAutomaticWatchdogRetry(
+        run: Run,
+        stageExec: StageExecution,
+        failedAgentExec: AgentExecution
+    ) throws -> AgentExecution {
+        let retryCoordinator = StageRetryCoordinator(modelContext: modelContext)
+        let retryExec = try retryCoordinator.retryFailedAgent(
+            run: run,
+            stage: stageExec,
+            failedAgent: failedAgentExec,
+            retryReason: Self.automaticWatchdogRetryReason
+        )
+        try modelContext.save()
+        return retryExec
     }
 
     // MARK: - Delivery Worktree Provisioning (Proposal 007 — ARCH-067)
@@ -2379,7 +2783,6 @@ final class WorkflowOrchestrator {
         candidateExec.validationFailureJSON = nil
         candidateExec.status = .completed
         candidateExec.completedAt = candidateExec.completedAt ?? Date()
-        candidateExec.retryReason = nil
         candidateExec.logSnippet = mergedLogSnippet(
             existing: candidateExec.logSnippet,
             result: "Recovered from late materialized contract outputs on disk"
@@ -2387,6 +2790,7 @@ final class WorkflowOrchestrator {
         applyTerminalExecutionTruth(
             to: candidateExec,
             canonicalOutcome: .completedWithTransportError,
+            supervisionClassification: candidateExec.supervisionClassification,
             transportErrorKind: candidateExec.transportErrorKind,
             providerStopReason: candidateExec.providerStopReason,
             outputPresence: .durableOutput,
@@ -2401,7 +2805,6 @@ final class WorkflowOrchestrator {
             latestExecution.status = .completed
             latestExecution.completedAt = latestExecution.completedAt ?? Date()
             latestExecution.validationFailureJSON = nil
-            latestExecution.retryReason = nil
             latestExecution.logSnippet = mergedLogSnippet(
                 existing: latestExecution.logSnippet,
                 result: "Skipped because a prior attempt recovered valid contract outputs"
@@ -2409,7 +2812,8 @@ final class WorkflowOrchestrator {
             applyTerminalExecutionTruth(
                 to: latestExecution,
                 canonicalOutcome: .completedWithTransportError,
-                transportErrorKind: latestExecution.transportErrorKind,
+                supervisionClassification: latestExecution.supervisionClassification,
+                transportErrorKind: latestExecution.transportErrorKind ?? candidateExec.transportErrorKind,
                 providerStopReason: latestExecution.providerStopReason,
                 outputPresence: .durableOutput,
                 runtimeProvider: latestExecution.runtimeProvider,
@@ -3302,6 +3706,7 @@ final class WorkflowOrchestrator {
         applyTerminalExecutionTruth(
             to: agentExec,
             canonicalOutcome: canonicalOutcome,
+            supervisionClassification: result.supervisionClassification,
             transportErrorKind: result.transportErrorKind,
             providerStopReason: result.providerStopReason,
             outputPresence: result.outputPresence,
@@ -3315,12 +3720,15 @@ final class WorkflowOrchestrator {
         agentExec.deniedMCPExtensionsJSON = encodeStringArray(result.deniedMCPExtensions)
         agentExec.mcpSessionStartupLatencyMilliseconds = result.mcpSessionStartupLatencyMilliseconds
         agentExec.mcpServerTelemetryJSON = encodeMCPServerMetrics(result.mcpServerMetrics)
-        agentExec.retryReason = suggestedRetryReason(from: result)
+        if let retryReason = suggestedRetryReason(from: result) {
+            agentExec.retryReason = retryReason
+        }
     }
 
     private func applyTerminalExecutionTruth(
         to agentExec: AgentExecution,
         canonicalOutcome: AgentCanonicalOutcome,
+        supervisionClassification: SupervisionClassification? = nil,
         transportErrorKind: TransportErrorKind?,
         providerStopReason: String?,
         outputPresence: OutputPresence,
@@ -3331,6 +3739,7 @@ final class WorkflowOrchestrator {
         envelope: OutcomeEnvelope? = nil
     ) {
         agentExec.canonicalOutcome = canonicalOutcome
+        agentExec.supervisionClassification = supervisionClassification
         agentExec.transportErrorKind = transportErrorKind
         agentExec.providerStopReason = providerStopReason
         agentExec.outputPresence = outputPresence
@@ -3436,21 +3845,172 @@ final class WorkflowOrchestrator {
         )
     }
 
+    private func preferredPrimaryModelTier(
+        for agent: ResolvedAgent,
+        task: AgentTask,
+        stageExecution: StageExecution,
+        profile: ContextStrategyProfile?
+    ) -> String? {
+        let requestedTier = profile?.defaultModelTier
+        guard shouldHoldBackFastTierForNoProgress(
+            requestedTier: requestedTier,
+            agent: agent,
+            task: task,
+            stageExecution: stageExecution
+        ) else {
+            return requestedTier
+        }
+
+        let escalationTier = profile?.escalationModelTier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let escalationTier, !escalationTier.isEmpty {
+            return escalationTier
+        }
+        return nil
+    }
+
+    private func shouldHoldBackFastTierForNoProgress(
+        requestedTier: String?,
+        agent: ResolvedAgent,
+        task: AgentTask,
+        stageExecution: StageExecution
+    ) -> Bool {
+        let normalizedTier = requestedTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalizedTier == "fast" else { return false }
+        guard agent.id == "code_writer" else { return false }
+        guard agent.mode == "implementation" || agent.worktreeWriteEnabled else { return false }
+        guard task.task == "implement" || task.task == "continue_implementation" || task.task == "initial_implementation" else {
+            return false
+        }
+        guard let priorExecution = latestComparableExecution(for: agent, stageExecution: stageExecution) else {
+            return false
+        }
+
+        return executionShowsNoMeaningfulImplementationProgress(priorExecution)
+            || executionExhaustedFastTierLimits(priorExecution)
+    }
+
+    private func latestComparableExecution(
+        for agent: ResolvedAgent,
+        stageExecution: StageExecution
+    ) -> AgentExecution? {
+        let comparableExecutions = run.stageExecutions
+            .filter { candidate in
+                candidate.id != stageExecution.id
+                    && candidate.stageID == stageExecution.stageID
+            }
+            .flatMap(\.agentExecutions)
+            .filter { candidate in
+                candidate.agentID == agent.id
+                    && candidate.startedAt <= stageExecution.startedAt
+            }
+            .sorted { lhs, rhs in
+                let lhsCompleted = lhs.completedAt ?? lhs.startedAt
+                let rhsCompleted = rhs.completedAt ?? rhs.startedAt
+                if lhsCompleted == rhsCompleted {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                return lhsCompleted < rhsCompleted
+            }
+
+        return comparableExecutions.last
+    }
+
+    private func executionShowsNoMeaningfulImplementationProgress(_ execution: AgentExecution) -> Bool {
+        if let changedFilesArtifact = artifact(
+            named: ImplementationFailureArtifactSynthesizer.changedFilesArtifactName,
+            for: execution
+        ) {
+            let changedFiles = changedFilesList(from: changedFilesArtifact)
+            if let changedFiles, !changedFiles.isEmpty {
+                return false
+            }
+            if changedFiles != nil {
+                return true
+            }
+        }
+
+        if let progressArtifact = artifact(
+            named: ImplementationFailureArtifactSynthesizer.progressArtifactName,
+            for: execution
+        ) {
+            let completedItems = completedImplementationItems(from: progressArtifact)
+            if let completedItems, !completedItems.isEmpty {
+                return false
+            }
+            if completedItems != nil {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func executionExhaustedFastTierLimits(_ execution: AgentExecution) -> Bool {
+        if let providerStopReason = execution.providerStopReason?.lowercased(),
+           isUsageLimitStopReason(providerStopReason) {
+            return true
+        }
+
+        switch execution.canonicalOutcome {
+        case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput:
+            return true
+        default:
+            break
+        }
+
+        if let snippet = execution.logSnippet?.lowercased(),
+           isUsageLimitStopReason(snippet) {
+            return true
+        }
+
+        return false
+    }
+
+    private func artifact(named name: String, for execution: AgentExecution) -> Artifact? {
+        execution.artifacts.first { artifact in
+            artifact.name == name || artifact.contractID == name
+        }
+    }
+
+    private func changedFilesList(from artifact: Artifact) -> [String]? {
+        guard let object = artifactJSONObject(for: artifact) else { return nil }
+        return object["files"] as? [String]
+    }
+
+    private func completedImplementationItems(from artifact: Artifact) -> [String]? {
+        guard let object = artifactJSONObject(for: artifact) else { return nil }
+        return object["completed_items"] as? [String]
+    }
+
+    private func artifactJSONObject(for artifact: Artifact) -> [String: Any]? {
+        guard FileManager.default.fileExists(atPath: artifact.filePath) else { return nil }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: artifact.filePath)) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
     private func strategyAdjustedAgent(
         from agent: ResolvedAgent,
         binding: ResolvedProviderBinding?
     ) -> ResolvedAgent {
+        let resolvedProvider = binding?.providerIdentifier ?? agent.provider
         let resolvedModel = binding?.model ?? agent.model
-        guard resolvedModel != agent.model else { return agent }
+        let resolvedEffort = binding?.effort ?? agent.effort
+        let resolvedRuntimeProfileID = binding?.runtimeProfileID ?? agent.runtimeProfileID
+        guard resolvedProvider != agent.provider
+            || resolvedModel != agent.model
+            || resolvedEffort != agent.effort
+            || resolvedRuntimeProfileID != agent.runtimeProfileID else {
+            return agent
+        }
 
         return ResolvedAgent(
             id: agent.id,
             title: agent.title,
             mode: agent.mode,
             backendProfileID: agent.backendProfileID,
-            provider: agent.provider,
+            provider: resolvedProvider,
             model: resolvedModel,
-            effort: agent.effort,
+            effort: resolvedEffort,
             maxTurns: agent.maxTurns,
             temperature: agent.temperature,
             permissionProfile: agent.permissionProfile,
@@ -3466,8 +4026,78 @@ final class WorkflowOrchestrator {
             worktreeWriteEnabled: agent.worktreeWriteEnabled,
             sessionReuseScope: agent.sessionReuseScope,
             sessionFamilyID: agent.sessionFamilyID,
-            runtimeProfileID: agent.runtimeProfileID
+            runtimeProfileID: resolvedRuntimeProfileID
         )
+    }
+
+    private func capacityFallbackBinding(
+        for agent: ResolvedAgent,
+        attemptedBinding: ResolvedProviderBinding?,
+        result: AgentResult
+    ) -> ResolvedProviderBinding? {
+        guard shouldAttemptCapacityFallback(for: result) else { return nil }
+        guard let attemptedBinding else { return nil }
+
+        let family = ProviderFamily(rawValue: attemptedBinding.providerFamily)
+            ?? ProviderFamily.from(runtimeIdentifier: agent.provider)
+        guard let fallbackModel = fallbackModelForCapacityExhaustion(
+            family: family,
+            currentModel: attemptedBinding.model
+        ) else {
+            return nil
+        }
+        guard fallbackModel.caseInsensitiveCompare(attemptedBinding.model) != .orderedSame else {
+            return nil
+        }
+
+        return ResolvedProviderBinding(
+            agentID: attemptedBinding.agentID,
+            backendProfileID: attemptedBinding.backendProfileID,
+            configuredProviderID: attemptedBinding.configuredProviderID,
+            providerFamily: attemptedBinding.providerFamily,
+            providerIdentifier: attemptedBinding.providerIdentifier,
+            model: fallbackModel,
+            effort: attemptedBinding.effort,
+            transport: attemptedBinding.transport,
+            adapterVersion: attemptedBinding.adapterVersion,
+            runtimeProfileID: attemptedBinding.runtimeProfileID,
+            adapterFamily: attemptedBinding.adapterFamily,
+            capabilityClass: attemptedBinding.capabilityClass
+        )
+    }
+
+    private func shouldAttemptCapacityFallback(for result: AgentResult) -> Bool {
+        if result.providerStopReason == "model_capacity_exhausted" {
+            return true
+        }
+
+        let lowercasedError = result.errorMessage?.lowercased() ?? ""
+        return lowercasedError.contains("model_capacity_exhausted")
+            || lowercasedError.contains("capacity exhausted")
+            || lowercasedError.contains("no capacity available for model")
+    }
+
+    private func fallbackModelForCapacityExhaustion(
+        family: ProviderFamily?,
+        currentModel: String
+    ) -> String? {
+        let lowercasedModel = currentModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        switch family {
+        case .geminiACP?:
+            if lowercasedModel == "gemini-2.5-flash" {
+                return nil
+            }
+            if lowercasedModel == "gemini-2.5-pro" {
+                return "gemini-2.5-flash"
+            }
+            if lowercasedModel.contains("preview") || lowercasedModel.hasPrefix("gemini-3") {
+                return "gemini-2.5-pro"
+            }
+            return "gemini-2.5-pro"
+        default:
+            return nil
+        }
     }
 
     private func resolveStrategyModel(
@@ -3482,6 +4112,10 @@ final class WorkflowOrchestrator {
 
         let family = baseBinding.flatMap { ProviderFamily(rawValue: $0.providerFamily) }
             ?? ProviderFamily.from(runtimeIdentifier: agent.provider)
+
+        if shouldForceFrontierCodexTier(for: agent, family: family), normalizedTier == "fast" {
+            return "GPT-5.4"
+        }
 
         switch (family, normalizedTier) {
         case (.codexACP?, "fast"):
@@ -3505,11 +4139,35 @@ final class WorkflowOrchestrator {
         requestedTier: String?,
         effectiveAgent: ResolvedAgent
     ) -> String {
-        let normalizedTier = requestedTier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedTier = requestedTier?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let family = ProviderFamily.from(runtimeIdentifier: effectiveAgent.provider)
+        if normalizedTier == "fast",
+           shouldForceFrontierCodexTier(for: effectiveAgent, family: family) {
+            return "frontier"
+        }
         if let normalizedTier, !normalizedTier.isEmpty {
             return normalizedTier
         }
         return effectiveAgent.model.isEmpty ? "bound_runtime" : "bound_runtime"
+    }
+
+    private func shouldForceFrontierCodexTier(
+        for agent: ResolvedAgent,
+        family: ProviderFamily?
+    ) -> Bool {
+        guard family == .codexACP else { return false }
+
+        let skillRole = agent.skillRole?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let backendProfileID = agent.backendProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let agentID = agent.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let mode = agent.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        return skillRole == "architect"
+            || backendProfileID == "codex_architect_high"
+            || agentID == "proposal_reviewer_architect"
+            || mode == "proposal_review.architect"
     }
 
     private func shouldEscalateStrategyExecution(
@@ -3524,6 +4182,12 @@ final class WorkflowOrchestrator {
         guard let escalationTier, !escalationTier.isEmpty, escalationTier != defaultTier else {
             return false
         }
+        if result.providerStopReason == "apply_patch_verification_failed" {
+            return false
+        }
+        if isUsageLimitResult(result) {
+            return true
+        }
 
         if result.canonicalOutcome == .failedAfterOutputValidation {
             return false
@@ -3533,6 +4197,9 @@ final class WorkflowOrchestrator {
                 || error.contains("output contract")
                 || error.contains("not valid json")
                 || error.contains("missing required field") {
+                return false
+            }
+            if error.contains("apply_patch verification failed") {
                 return false
             }
             if error.contains("timed out")
@@ -3551,11 +4218,48 @@ final class WorkflowOrchestrator {
         }
 
         switch result.canonicalOutcome {
-        case .timedOutBeforeOutput, .timedOutAfterOutput, .completedWithTransportError:
+        case .timedOutBeforeOutput, .timedOutAfterOutput, .completedWithTransportError,
+                .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput:
             return true
         default:
             return false
         }
+    }
+
+    private func isUsageLimitResult(_ result: AgentResult) -> Bool {
+        if let providerStopReason = result.providerStopReason?.lowercased(),
+           isUsageLimitStopReason(providerStopReason) {
+            return true
+        }
+        if let error = result.errorMessage?.lowercased(),
+           isUsageLimitStopReason(error) {
+            return true
+        }
+        switch result.canonicalOutcome {
+        case .limitExhaustedBeforeOutput, .limitExhaustedAfterOutput:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func isUsageLimitStopReason(_ value: String) -> Bool {
+        value.contains("usage_limit_exceeded")
+            || value.contains("usage limit")
+            || value.contains("rate limit")
+            || value.contains("quota")
+            || value.contains("limit exceeded")
+            || value.contains("budget exhausted")
+    }
+
+    private func shouldAttemptEscalatedExecution(
+        primaryModelTier: String?,
+        profile: ContextStrategyProfile?
+    ) -> Bool {
+        let primaryTier = primaryModelTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let escalationTier = profile?.escalationModelTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let escalationTier, !escalationTier.isEmpty else { return false }
+        return primaryTier != escalationTier
     }
 
     private func mergedLogSnippet(existing: String?, result: String?) -> String? {
@@ -3938,6 +4642,7 @@ final class WorkflowOrchestrator {
         guard run.status == .blocked, !isCancelled, !isPaused else { return }
 
         run.status = .running
+        run.completedAt = nil
 
         if let details = run.driftDetails,
            details.localizedCaseInsensitiveContains("execution stalled after") {

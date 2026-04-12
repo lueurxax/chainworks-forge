@@ -1,8 +1,8 @@
-# Workspace Isolation Risk (Goose Backend)
+# Workspace Isolation Risk (Runtime Backend)
 
 ## Context
 
-Chainworks uses Goose as an execution substrate for multi-agent workflows.
+Chainworks uses runtime subprocess adapters as the execution substrate for multi-agent workflows.
 Each Run operates on a project workspace with multiple agents performing read/write and side-effect operations.
 
 During testing, a critical issue was observed:
@@ -27,7 +27,7 @@ This is a runtime/session isolation problem.
 
 ## Root Cause (Hypothesis)
 
-Based on Goose behavior and known issues:
+Based on historical runtime behavior and known issues:
 
 1. Working directory is not strictly bound to session context
 2. Some tools/extensions rely on process-level `cwd`

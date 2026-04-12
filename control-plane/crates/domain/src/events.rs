@@ -1,0 +1,36 @@
+use serde::{Deserialize, Serialize};
+
+use crate::approval::ApprovalDecision;
+use crate::ids::{ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use crate::run::RunStatus;
+use crate::stage::StageStatus;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DomainEvent {
+    RunStarted {
+        run_id: RunId,
+        idea_id: IdeaId,
+    },
+    RunStatusChanged {
+        run_id: RunId,
+        status: RunStatus,
+    },
+    StageStatusChanged {
+        run_id: RunId,
+        stage_execution_id: StageExecutionId,
+        status: StageStatus,
+    },
+    ApprovalRequested {
+        run_id: RunId,
+        approval_id: ApprovalId,
+        stage_id: String,
+    },
+    ApprovalResolved {
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    },
+    ArtifactCreated {
+        run_id: RunId,
+        artifact_id: ArtifactId,
+    },
+}

@@ -128,22 +128,47 @@ enum ProviderAdapterSupport {
 
 enum ProcessSupport {
     nonisolated static func which(_ executable: String) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = [executable]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
+        resolveExecutable(executable)
+    }
+
+    nonisolated static func resolveExecutable(
+        _ executable: String,
+        basePath: String? = ProcessInfo.processInfo.environment["PATH"],
+        additionalSearchDirectories: [String] = []
+    ) -> String? {
+        if executable.hasPrefix("/") {
+            return FileManager.default.isExecutableFile(atPath: executable) ? executable : nil
         }
 
-        guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return output?.isEmpty == false ? output : nil
+        let pathDirectories = (basePath ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        let preferredDirectories = [
+            "\(NSHomeDirectory())/.local/bin",
+            "\(NSHomeDirectory())/.npm-global/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+
+        var searchDirectories: [String] = []
+        for directory in additionalSearchDirectories + preferredDirectories + pathDirectories
+        where !directory.isEmpty && !searchDirectories.contains(directory) {
+            searchDirectories.append(directory)
+        }
+
+        for directory in searchDirectories {
+            let candidate = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent(executable)
+                .path
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+
+        return nil
     }
 }

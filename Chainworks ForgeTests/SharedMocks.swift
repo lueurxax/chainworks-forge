@@ -60,6 +60,7 @@ final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sen
         var createSessionResult: RuntimeSessionResponse?
         var createSessionError: Error?
         var streamEvents: [RuntimeStreamEvent] = []
+        var runtimeState: RuntimeSessionRuntimeState?
         var closeSessionCalled = false
         var lastSessionID: String?
         var lastSessionRequest: RuntimeSessionRequest?
@@ -73,12 +74,14 @@ final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sen
     func configure(
         sessionResult: RuntimeSessionResponse? = nil,
         sessionError: Error? = nil,
-        events: [RuntimeStreamEvent] = []
+        events: [RuntimeStreamEvent] = [],
+        runtimeState: RuntimeSessionRuntimeState? = nil
     ) async {
         state.withLock { state in
             state.createSessionResult = sessionResult
             state.createSessionError = sessionError
             state.streamEvents = events
+            state.runtimeState = runtimeState
         }
     }
 
@@ -114,6 +117,10 @@ final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sen
 
     func closeSession(sessionID: String) async throws {
         state.withLock { $0.closeSessionCalled = true }
+    }
+
+    func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+        state.withLock { $0.runtimeState }
     }
 
     func reset() async {

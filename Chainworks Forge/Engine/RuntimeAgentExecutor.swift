@@ -67,9 +67,41 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
     /// Maximum wall-clock time for a single agent execution attempt before the watchdog
     /// forcibly cancels it. Prevents runs from hanging for hours on stale sessions.
     static var executionTimeoutSeconds: TimeInterval = 1800 // 30 minutes
-    static var acpProposalReviewStallSilenceSeconds: TimeInterval = 120
-    static var acpProposalReviewReadLoopThreshold = 4
-    static var acpProposalReviewStallPollIntervalMilliseconds: UInt64 = 5_000
+    static var acpFirstProgressDeadlineSeconds: TimeInterval = 120
+    static var acpIdleAfterProgressDeadlineSeconds: TimeInterval = 300
+    static var acpWeakReadLoopSilenceSeconds: TimeInterval = 120
+    static var acpFirstEditSilenceDeadlineSeconds: TimeInterval = 120
+    static var acpMutationSideEffectDeadlineSeconds: TimeInterval = 30
+    static var acpWeakReadLoopThreshold = 2
+    static var acpWatchdogPollIntervalMilliseconds: UInt64 = 5_000
+    static var acpProposalReviewStallSilenceSeconds: TimeInterval {
+        get { acpWeakReadLoopSilenceSeconds }
+        set { acpWeakReadLoopSilenceSeconds = newValue }
+    }
+    static var acpProposalReviewReadLoopThreshold: Int {
+        get { acpWeakReadLoopThreshold }
+        set { acpWeakReadLoopThreshold = newValue }
+    }
+    static var acpProposalReviewStallPollIntervalMilliseconds: UInt64 {
+        get { acpWatchdogPollIntervalMilliseconds }
+        set { acpWatchdogPollIntervalMilliseconds = newValue }
+    }
+    static var codexACPMaxExecutionSeconds: TimeInterval = 600
+    static var codexACPMaxProposalExecutionSeconds: TimeInterval = 900
+    static var codexACPMaxToolCallCount = 250
+    static var codexACPMaxAccumulatedTextBytes = 8_000_000
+    static var codexACPMaxRawToolPayloadBytes = 4_000_000
+    static var codexACPMaxRuntimeHomeBytes = 64_000_000
+    static var codexACPMaxInputTokens = 500_000
+    static var codexACPMaxCachedInputTokens = 400_000
+    static var codexACPGuardrailPollIntervalMilliseconds: UInt64 = 5_000
+
+    static func codexACPExecutionAgeLimitSeconds(for agent: ResolvedAgent) -> TimeInterval {
+        if agent.mode.hasPrefix("proposal_") {
+            return codexACPMaxProposalExecutionSeconds
+        }
+        return codexACPMaxExecutionSeconds
+    }
 
     func execute(
         task: AgentTask,
@@ -85,6 +117,10 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
                 attemptIndex: attempt
             )
 
+            if result.supervisionClassification != nil {
+                return result
+            }
+
             if result.succeeded || !isRetryableError(result) {
                 return result
             }
@@ -99,11 +135,30 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
 
     private func isRetryableError(_ result: AgentResult) -> Bool {
         guard let error = result.errorMessage else { return false }
+        if let providerStopReason = result.providerStopReason?.lowercased() {
+            switch providerStopReason {
+            case "apply_patch_verification_failed",
+                 "exec_command_create_process_failed",
+                 "exec_command_failed":
+                return false
+            default:
+                break
+            }
+        }
         if result.transportErrorKind == .timeout {
             return false
         }
-        if error.contains("ACP proposal review stalled in read loop") {
+        if result.supervisionClassification != nil {
+            return true
+        }
+        let loweredError = error.lowercased()
+        if loweredError.contains("apply_patch verification failed")
+            || loweredError.contains("exec_command failed for")
+            || loweredError.contains("failed to create unified exec process") {
             return false
+        }
+        if error.localizedCaseInsensitiveContains("codex acp session exceeded runaway guardrail") {
+            return true
         }
         if error.localizedCaseInsensitiveContains("stream ended before final result was received") {
             return true
@@ -167,17 +222,19 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         // 2. Execute & Process Stream
         let eventBridge = ExecutionEventBridge()
         let agentID = agent.id
-        let onEvent = onExecutionEvent
+    let onEvent = onExecutionEvent
 // 2. Stream & Process
 let streamResult: ExecutionStreamResult
 let sessionID = sessionInfo.execution.sessionID
 ForgeLogger.session.info("[\(sessionID)] Stream Start. Agent: \(agent.id)")
+var settledRuntimeState: RuntimeSessionRuntimeState?
 
 do {
     let monitoredStream = monitoredEventStreamIfNeeded(
         sessionInfo.execution.eventStream,
         sessionInfo: sessionInfo,
-        agent: agent
+        agent: agent,
+        context: context
     )
     streamResult = try await processStreamWithSupervision(
         monitoredStream,
@@ -219,6 +276,7 @@ do {
 }
 
 let completedAt = Date()
+settledRuntimeState = try? await sessionInfo.execution.transport.readSessionRuntimeState(sessionID: sessionID)
 await sessionInfo.execution.closeSession()
 
 
@@ -240,6 +298,7 @@ await sessionInfo.execution.closeSession()
             agent: effectiveAgent,
             context: context,
             expectedOutputs: expectedOutputs,
+            runtimeState: settledRuntimeState,
             eventBridge: eventBridge,
             startedAt: startedAt,
             completedAt: completedAt
@@ -253,47 +312,17 @@ await sessionInfo.execution.closeSession()
         return result
     }
 
-    private func effectiveAgentForExecution(
+    func effectiveAgentForExecution(
         _ agent: ResolvedAgent,
         context: ExecutionContext
     ) -> ResolvedAgent {
-        guard shouldDisableSessionReuse(for: agent, context: context),
-              agent.sessionReuseScope != .none else {
-            return agent
-        }
-
-        return ResolvedAgent(
-            id: agent.id,
-            title: agent.title,
-            mode: agent.mode,
-            backendProfileID: agent.backendProfileID,
-            provider: agent.provider,
-            model: agent.model,
-            effort: agent.effort,
-            maxTurns: agent.maxTurns,
-            temperature: agent.temperature,
-            permissionProfile: agent.permissionProfile,
-            mcpProfileID: agent.mcpProfileID,
-            skillRef: agent.skillRef,
-            skillRole: agent.skillRole,
-            resolvedSkill: agent.resolvedSkill,
-            prompt: agent.prompt,
-            outputContract: agent.outputContract,
-            requiresHumanApproval: agent.requiresHumanApproval,
-            inputs: agent.inputs,
-            outputs: agent.outputs,
-            worktreeWriteEnabled: agent.worktreeWriteEnabled,
-            sessionReuseScope: .none,
-            sessionFamilyID: agent.sessionFamilyID,
-            runtimeProfileID: agent.runtimeProfileID
-        )
-    }
-
-    private func shouldDisableSessionReuse(
-        for agent: ResolvedAgent,
-        context: ExecutionContext
-    ) -> Bool {
-        context.providerBinding?.adapterFamily == "codex_acp"
+        // Session reuse quarantine for codex_acp has been lifted.
+        // RuntimeSessionExecution still closes the provider session after each settled execute,
+        // so normal successful turns do not keep a long-lived reusable backend session alive.
+        // Any future codex-specific guardrails should be enforced at session supervision
+        // or budget checkpoints rather than by rewriting the agent's reuse scope here.
+        let _ = context
+        return agent
     }
 
     private func processStreamWithSupervision(
@@ -310,7 +339,7 @@ await sessionInfo.execution.closeSession()
             }
             group.addTask {
                 try await Task.sleep(for: .seconds(timeoutSeconds))
-                ForgeLogger.session.error("[\(sessionID)] Stream Watchdog Timeout after \(Int(timeoutSeconds))s")
+                await ForgeLogger.session.error("[\(sessionID)] Stream Watchdog Timeout after \(Int(timeoutSeconds))s")
                 throw ExecutionError.timeout(agentID: agentID, seconds: Int(timeoutSeconds))
             }
 
@@ -330,6 +359,15 @@ await sessionInfo.execution.closeSession()
         let ownerKey: String
         let fingerprint: String
         let mcpResolution: MCPPolicyResolutionReport
+    }
+
+    private struct SupervisionOutcome {
+        let classification: SupervisionClassification
+        let surfacedSummary: String
+        let silenceSeconds: Double?
+        let mutationVerificationAttempted: Bool
+        let mutationSideEffectObserved: Bool?
+        let firstVerifiedMutatedPath: String?
     }
 
     private func resolveSession(
@@ -515,8 +553,8 @@ await sessionInfo.execution.closeSession()
 
     private func resolveMCPPolicy(agent: ResolvedAgent, context: ExecutionContext, bridge: RuntimeSessionBridge) -> MCPPolicyResolutionReport {
         guard let catalog = context.catalog else {
-            return agent.mcpProfileID == nil ? .none : MCPPolicyResolutionReport(
-                profileID: agent.mcpProfileID ?? "none",
+            return agent.requestedMCPServerIDs.isEmpty ? .none : MCPPolicyResolutionReport(
+                profileID: agent.backendProfileID ?? "none",
                 requiredExtensions: [],
                 optionalExtensions: [],
                 requestedExtensions: [],
@@ -526,7 +564,7 @@ await sessionInfo.execution.closeSession()
                 predictedEffectiveRuntimeExtensionIDs: [],
                 deniedExtensions: [],
                 warnings: [],
-                blockingIssues: ["Catalog is unavailable; cannot resolve MCP profile for agent '\(agent.id)'."]
+                blockingIssues: ["Catalog is unavailable; cannot resolve backend MCP requirements for agent '\(agent.id)'."]
             )
         }
 
@@ -621,28 +659,127 @@ await sessionInfo.execution.closeSession()
     private func monitoredEventStreamIfNeeded(
         _ stream: AsyncThrowingStream<RuntimeStreamEvent, Error>,
         sessionInfo: SessionResolutionInfo,
-        agent: ResolvedAgent
+        agent: ResolvedAgent,
+        context: ExecutionContext
     ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
-        guard shouldMonitorACPProposalReviewStall(sessionInfo: sessionInfo, agent: agent) else {
+        let monitorACPWatchdog = shouldMonitorACPSupervision(sessionInfo: sessionInfo)
+        let monitorCodexRunaway = shouldMonitorCodexACPGuardrails(sessionInfo: sessionInfo)
+        let mutationObserver = MutationSideEffectObserver(workingDirectory: resolveWorkingDirectoryAndMode(agent: agent, context: context).0)
+        guard monitorACPWatchdog || monitorCodexRunaway else {
             return stream
         }
 
         final class StallState: @unchecked Sendable {
             private let lock = NSLock()
-            private var lastProgressAt = Date()
+            private let startedAt = Date()
+            private var lastProgressAt: Date
+            private var promptSubmittedAt: Date?
+            private var firstProgressAt: Date?
             private var readLoopStartCount = 0
+            private var totalToolStartCount = 0
+            private var firstMutatingToolAt: Date?
+            private var firstCompletedMutatingToolAt: Date?
+            private var lastMutatingToolName: String?
+            private var lastMutationBoundaryAt: Date?
+            private var accumulatedTextBytes = 0
+            private var rawToolPayloadBytes = 0
+            private var latestInputTokens: Int?
+            private var latestCachedInputTokens: Int?
+            private var latestOutputTokens: Int?
+            private var latestModelContextWindow: Int?
+            private var mutationVerificationAttempted = false
+            private var mutationSideEffectObserved: Bool?
+            private var firstVerifiedMutatedPath: String?
             private var finished = false
+
+            init() {
+                lastProgressAt = startedAt
+            }
+
+            func recordPromptSubmitted() {
+                lock.lock()
+                promptSubmittedAt = promptSubmittedAt ?? Date()
+                lock.unlock()
+            }
 
             func recordProgress() {
                 lock.lock()
                 lastProgressAt = Date()
+                firstProgressAt = firstProgressAt ?? lastProgressAt
                 readLoopStartCount = 0
                 lock.unlock()
             }
 
             func recordReadLikeStart() {
                 lock.lock()
+                totalToolStartCount += 1
                 readLoopStartCount += 1
+                lock.unlock()
+            }
+
+            func recordToolStartAsProgress() {
+                lock.lock()
+                totalToolStartCount += 1
+                lastProgressAt = Date()
+                firstProgressAt = firstProgressAt ?? lastProgressAt
+                readLoopStartCount = 0
+                lock.unlock()
+            }
+
+            func recordMutatingToolStarted(toolName: String) {
+                lock.lock()
+                let now = Date()
+                firstMutatingToolAt = firstMutatingToolAt ?? now
+                lastMutatingToolName = toolName
+                lastMutationBoundaryAt = now
+                lock.unlock()
+            }
+
+            func recordMutatingToolCompleted(toolName: String) {
+                lock.lock()
+                let now = Date()
+                firstCompletedMutatingToolAt = firstCompletedMutatingToolAt ?? now
+                lastMutatingToolName = toolName
+                lastMutationBoundaryAt = now
+                lock.unlock()
+            }
+
+            func recordText(_ text: String) {
+                lock.lock()
+                accumulatedTextBytes += text.lengthOfBytes(using: .utf8)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    lastProgressAt = Date()
+                    readLoopStartCount = 0
+                }
+                lock.unlock()
+            }
+
+            func recordToolPayload(_ raw: String) {
+                lock.lock()
+                rawToolPayloadBytes += raw.lengthOfBytes(using: .utf8)
+                lock.unlock()
+            }
+
+            func recordUsageUpdate(_ snapshot: CodexUsageSnapshot) {
+                lock.lock()
+                latestInputTokens = snapshot.inputTokens ?? latestInputTokens
+                latestCachedInputTokens = snapshot.cachedInputTokens ?? latestCachedInputTokens
+                latestOutputTokens = snapshot.outputTokens ?? latestOutputTokens
+                latestModelContextWindow = snapshot.modelContextWindow ?? latestModelContextWindow
+                lock.unlock()
+            }
+
+            func recordMutationVerification(observed: Bool, firstVerifiedPath: String?) {
+                lock.lock()
+                mutationVerificationAttempted = true
+                mutationSideEffectObserved = observed
+                if firstVerifiedMutatedPath == nil {
+                    firstVerifiedMutatedPath = firstVerifiedPath
+                }
+                if observed {
+                    lastProgressAt = Date()
+                    firstProgressAt = firstProgressAt ?? lastProgressAt
+                }
                 lock.unlock()
             }
 
@@ -652,37 +789,92 @@ await sessionInfo.execution.closeSession()
                 lock.unlock()
             }
 
-            func snapshot() -> (lastProgressAt: Date, readLoopStartCount: Int, finished: Bool) {
+            func snapshot() -> (
+                startedAt: Date,
+                promptSubmittedAt: Date?,
+                firstProgressAt: Date?,
+                lastProgressAt: Date,
+                readLoopStartCount: Int,
+                totalToolStartCount: Int,
+                firstMutatingToolAt: Date?,
+                firstCompletedMutatingToolAt: Date?,
+                lastMutatingToolName: String?,
+                lastMutationBoundaryAt: Date?,
+                accumulatedTextBytes: Int,
+                rawToolPayloadBytes: Int,
+                latestInputTokens: Int?,
+                latestCachedInputTokens: Int?,
+                latestOutputTokens: Int?,
+                latestModelContextWindow: Int?,
+                mutationVerificationAttempted: Bool,
+                mutationSideEffectObserved: Bool?,
+                firstVerifiedMutatedPath: String?,
+                finished: Bool
+            ) {
                 lock.lock()
                 defer { lock.unlock() }
-                return (lastProgressAt, readLoopStartCount, finished)
+                return (
+                    startedAt,
+                    promptSubmittedAt,
+                    firstProgressAt,
+                    lastProgressAt,
+                    readLoopStartCount,
+                    totalToolStartCount,
+                    firstMutatingToolAt,
+                    firstCompletedMutatingToolAt,
+                    lastMutatingToolName,
+                    lastMutationBoundaryAt,
+                    accumulatedTextBytes,
+                    rawToolPayloadBytes,
+                    latestInputTokens,
+                    latestCachedInputTokens,
+                    latestOutputTokens,
+                    latestModelContextWindow,
+                    mutationVerificationAttempted,
+                    mutationSideEffectObserved,
+                    firstVerifiedMutatedPath,
+                    finished
+                )
             }
         }
 
         let state = StallState()
-        state.recordProgress()
 
         return AsyncThrowingStream { continuation in
             let producer = Task {
                 do {
                     for try await event in stream {
                         switch event {
+                        case .promptSubmitted:
+                            state.recordPromptSubmitted()
                         case .textChunk(let text):
-                            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                state.recordProgress()
-                            }
-                        case .toolCallStarted(let toolName, _):
-                            if isACPReadLoopTool(toolName) {
+                            state.recordText(text)
+                        case .toolCallStarted(let toolName, let raw):
+                            state.recordToolPayload(raw)
+                            switch acpProgressClass(for: toolName) {
+                            case .weak:
                                 state.recordReadLikeStart()
-                            } else {
+                            case .strong:
+                                state.recordToolStartAsProgress()
+                            case .mutating:
+                                state.recordToolStartAsProgress()
+                                state.recordMutatingToolStarted(toolName: toolName)
+                            }
+                        case .toolCallFinished(let toolName, let raw):
+                            state.recordToolPayload(raw)
+                            if acpProgressClass(for: toolName) != .weak {
                                 state.recordProgress()
                             }
-                        case .toolCallFinished(let toolName, _):
-                            if !isACPReadLoopTool(toolName) {
-                                state.recordProgress()
+                            if acpProgressClass(for: toolName) == .mutating {
+                                state.recordMutatingToolCompleted(toolName: toolName)
                             }
                         case .finalOutput, .finish, .sessionClosed:
                             state.markFinished()
+                        case .unknown(let type, let raw):
+                            if type == "usage_update",
+                               let snapshot = CodexUsageSnapshot.parse(raw: raw) {
+                                state.recordUsageUpdate(snapshot)
+                            }
                         default:
                             break
                         }
@@ -704,26 +896,179 @@ await sessionInfo.execution.closeSession()
             }
 
             let monitor = Task {
+                let pollIntervalMilliseconds: UInt64 = {
+                    switch (monitorACPWatchdog, monitorCodexRunaway) {
+                    case (true, true):
+                        return min(
+                            Self.acpWatchdogPollIntervalMilliseconds,
+                            Self.codexACPGuardrailPollIntervalMilliseconds
+                        )
+                    case (true, false):
+                        return Self.acpWatchdogPollIntervalMilliseconds
+                    case (false, true):
+                        return Self.codexACPGuardrailPollIntervalMilliseconds
+                    case (false, false):
+                        return Self.acpWatchdogPollIntervalMilliseconds
+                    }
+                }()
                 while !Task.isCancelled {
-                    try? await Task.sleep(
-                        nanoseconds: Self.acpProposalReviewStallPollIntervalMilliseconds * 1_000_000
-                    )
+                    try? await Task.sleep(nanoseconds: pollIntervalMilliseconds * 1_000_000)
 
                     let snapshot = state.snapshot()
                     if snapshot.finished {
                         return
                     }
 
-                    let stalledFor = Date().timeIntervalSince(snapshot.lastProgressAt)
-                    if snapshot.readLoopStartCount >= Self.acpProposalReviewReadLoopThreshold
-                        && stalledFor >= Self.acpProposalReviewStallSilenceSeconds {
+                    let runtimeState = try? await sessionInfo.execution.transport.readSessionRuntimeState(
+                        sessionID: sessionInfo.execution.sessionID
+                    )
+                    if let providerDiagnostic = fatalProviderDiagnosticForSupervision(from: runtimeState) {
                         state.markFinished()
                         producer.cancel()
-                        continuation.finish(throwing: ACPProposalReviewStallError(
-                            silenceSeconds: stalledFor,
-                            readLoopCount: snapshot.readLoopStartCount
+                        continuation.finish(throwing: RuntimeProviderDiagnosticFailure(diagnostic: providerDiagnostic))
+                        return
+                    }
+
+                    let now = Date()
+                    let stalledFor = now.timeIntervalSince(snapshot.lastProgressAt)
+
+                    if monitorACPWatchdog,
+                       let promptSubmittedAt = snapshot.promptSubmittedAt,
+                       snapshot.firstProgressAt == nil,
+                       now.timeIntervalSince(promptSubmittedAt) >= Self.acpFirstProgressDeadlineSeconds,
+                       stalledFor >= Self.acpFirstProgressDeadlineSeconds {
+                        state.markFinished()
+                        producer.cancel()
+                        continuation.finish(throwing: ACPWatchdogClassificationError(
+                            classification: .idleHangBeforeFirstProgress,
+                            silenceSeconds: now.timeIntervalSince(promptSubmittedAt),
+                            lastMutatingToolName: nil
                         ))
                         return
+                    }
+
+                    if monitorACPWatchdog,
+                       snapshot.readLoopStartCount >= Self.acpWeakReadLoopThreshold,
+                       snapshot.firstMutatingToolAt == nil,
+                       stalledFor >= Self.acpWeakReadLoopSilenceSeconds {
+                        state.markFinished()
+                        producer.cancel()
+                        continuation.finish(throwing: ACPWatchdogClassificationError(
+                            classification: .idleHangReadLoop,
+                            silenceSeconds: stalledFor,
+                            lastMutatingToolName: nil
+                        ))
+                        return
+                    }
+
+                    if monitorACPWatchdog,
+                       let firstCompletedMutatingToolAt = snapshot.firstCompletedMutatingToolAt,
+                       snapshot.mutationVerificationAttempted == false,
+                       now.timeIntervalSince(firstCompletedMutatingToolAt) >= Self.acpMutationSideEffectDeadlineSeconds {
+                        let verification = mutationObserver.observeDelta()
+                        state.recordMutationVerification(
+                            observed: verification.changed,
+                            firstVerifiedPath: verification.firstChangedPath
+                        )
+                        if verification.changed == false {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: MutationSideEffectMissingError(
+                                firstVerifiedMutatedPath: verification.firstChangedPath
+                            ))
+                            return
+                        }
+                    }
+
+                    if monitorACPWatchdog,
+                       snapshot.firstMutatingToolAt != nil,
+                       stalledFor >= Self.acpFirstEditSilenceDeadlineSeconds {
+                        state.markFinished()
+                        producer.cancel()
+                        continuation.finish(throwing: ACPWatchdogClassificationError(
+                            classification: .idleHangAfterFirstEdit,
+                            silenceSeconds: stalledFor,
+                            lastMutatingToolName: snapshot.lastMutatingToolName
+                        ))
+                        return
+                    }
+
+                    if monitorACPWatchdog,
+                       snapshot.firstProgressAt != nil,
+                       snapshot.firstMutatingToolAt == nil,
+                       stalledFor >= Self.acpIdleAfterProgressDeadlineSeconds {
+                        state.markFinished()
+                        producer.cancel()
+                        continuation.finish(throwing: ACPWatchdogClassificationError(
+                            classification: .idleHangAfterProgress,
+                            silenceSeconds: stalledFor,
+                            lastMutatingToolName: snapshot.lastMutatingToolName
+                        ))
+                        return
+                    }
+
+                    if monitorCodexRunaway {
+                        let elapsed = now.timeIntervalSince(snapshot.startedAt)
+                        if snapshot.totalToolStartCount >= Self.codexACPMaxToolCallCount {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "tool call count \(snapshot.totalToolStartCount) exceeded \(Self.codexACPMaxToolCallCount)"
+                            ))
+                            return
+                        }
+                        if snapshot.accumulatedTextBytes >= Self.codexACPMaxAccumulatedTextBytes {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "streamed text bytes \(snapshot.accumulatedTextBytes) exceeded \(Self.codexACPMaxAccumulatedTextBytes)"
+                            ))
+                            return
+                        }
+                        if snapshot.rawToolPayloadBytes >= Self.codexACPMaxRawToolPayloadBytes {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "raw tool payload bytes \(snapshot.rawToolPayloadBytes) exceeded \(Self.codexACPMaxRawToolPayloadBytes)"
+                            ))
+                            return
+                        }
+                        if let runtimeHomePath = sessionInfo.execution.runtimeHomePath,
+                           runtimeHomeDirectorySize(atPath: runtimeHomePath) >= Self.codexACPMaxRuntimeHomeBytes {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "runtime home bytes \(runtimeHomeDirectorySize(atPath: runtimeHomePath)) exceeded \(Self.codexACPMaxRuntimeHomeBytes)"
+                            ))
+                            return
+                        }
+                        if let latestInputTokens = snapshot.latestInputTokens,
+                           latestInputTokens >= Self.codexACPMaxInputTokens {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "session history input tokens \(latestInputTokens) exceeded \(Self.codexACPMaxInputTokens)"
+                            ))
+                            return
+                        }
+                        if let latestCachedInputTokens = snapshot.latestCachedInputTokens,
+                           latestCachedInputTokens >= Self.codexACPMaxCachedInputTokens {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "session history cached input tokens \(latestCachedInputTokens) exceeded \(Self.codexACPMaxCachedInputTokens)"
+                            ))
+                            return
+                        }
+                        let executionAgeLimitSeconds = Self.codexACPExecutionAgeLimitSeconds(for: agent)
+                        if elapsed >= executionAgeLimitSeconds {
+                            state.markFinished()
+                            producer.cancel()
+                            continuation.finish(throwing: CodexACPRunawayGuardrailError(
+                                reason: "execution age \(Int(elapsed))s exceeded \(Int(executionAgeLimitSeconds))s"
+                            ))
+                            return
+                        }
                     }
                 }
             }
@@ -735,29 +1080,79 @@ await sessionInfo.execution.closeSession()
         }
     }
 
-    private func shouldMonitorACPProposalReviewStall(
-        sessionInfo: SessionResolutionInfo,
-        agent: ResolvedAgent
+    private func shouldMonitorACPSupervision(
+        sessionInfo: SessionResolutionInfo
     ) -> Bool {
-        let runtimeNamespace = sessionInfo.execution.transport.mcpRuntimeNamespace?.lowercased()
-        let isACP = runtimeNamespace != nil
-        let reviewOutputs = Set([
-            "proposal_review_po",
-            "proposal_review_ux",
-            "proposal_review_ui",
-            "proposal_review_architect"
-        ])
-        let isProposalReview = agent.mode.hasPrefix("proposal_review.")
-            || agent.outputs.contains(where: { reviewOutputs.contains($0) })
-        return isACP && isProposalReview
+        sessionInfo.execution.transport.mcpRuntimeNamespace?.isEmpty == false
     }
 
-    private func isACPReadLoopTool(_ toolName: String) -> Bool {
+    private func shouldMonitorCodexACPGuardrails(
+        sessionInfo: SessionResolutionInfo
+    ) -> Bool {
+        sessionInfo.execution.transport.mcpRuntimeNamespace?.lowercased() == "codex"
+    }
+
+    private func acpProgressClass(for toolName: String) -> ACPProgressClass {
         let normalized = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalized == "read"
+        if normalized == "edit" || normalized == "apply_patch" || normalized == "write" {
+            return .mutating
+        }
+        if normalized == "search"
+            || normalized == "read"
             || normalized == "read_file"
             || normalized == "read_workspace"
+            || normalized == "execute"
             || normalized == "permission:read"
+            || normalized == "permission:execute" {
+            return .weak
+        }
+        return .strong
+    }
+
+    private func runtimeHomeDirectorySize(atPath path: String) -> Int {
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .fileSizeKey]
+        guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: Array(keys)) else {
+            return 0
+        }
+
+        var total = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: keys),
+                  values.isRegularFile == true else {
+                continue
+            }
+            total += values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? values.fileSize ?? 0
+        }
+        return total
+    }
+
+    private func codexTelemetry(
+        eventBridge: ExecutionEventBridge,
+        sessionInfo: SessionResolutionInfo,
+        rawErrorMessage: String? = nil,
+        supervisionOutcome: SupervisionOutcome? = nil,
+        automaticRetryConsumed: Bool = false
+    ) -> CodexReceiptTelemetry? {
+        guard sessionInfo.execution.transport.mcpRuntimeNamespace?.lowercased() == "codex" else {
+            return nil
+        }
+        let runtimeHomeBytes = sessionInfo.execution.runtimeHomePath.map(runtimeHomeDirectorySize(atPath:))
+        var telemetry = eventBridge.codexTelemetry(
+            runtimeHomeBytes: runtimeHomeBytes,
+            runawayReason: rawErrorMessage?.localizedCaseInsensitiveContains("codex acp session exceeded runaway guardrail") == true
+                ? rawErrorMessage
+                : nil
+        )
+        if let supervisionOutcome {
+            telemetry?.supervisionClassification = supervisionOutcome.classification
+            telemetry?.silenceDurationSeconds = supervisionOutcome.silenceSeconds
+            telemetry?.mutationVerificationAttempted = supervisionOutcome.mutationVerificationAttempted
+            telemetry?.mutationSideEffectObserved = supervisionOutcome.mutationSideEffectObserved
+            telemetry?.firstVerifiedMutatedPath = supervisionOutcome.firstVerifiedMutatedPath
+        }
+        telemetry?.automaticRetryConsumed = automaticRetryConsumed
+        return telemetry
     }
 
     private func handleStreamFailure(
@@ -769,6 +1164,9 @@ await sessionInfo.execution.closeSession()
         startedAt: Date,
         eventBridge: ExecutionEventBridge
     ) async -> AgentResult {
+        let runtimeState = try? await sessionInfo.execution.transport.readSessionRuntimeState(
+            sessionID: sessionInfo.execution.sessionID
+        )
         await sessionInfo.execution.closeSession()
         let completedAt = Date()
 
@@ -783,13 +1181,26 @@ await sessionInfo.execution.closeSession()
         }
         let outputPresence: OutputPresence = salvaged.isEmpty ? .none : .durableOutput
         let rawErrorMessage = error.localizedDescription
+        let supervisionOutcome = supervisionOutcome(from: error)
+        let providerDiagnostic = providerDiagnostic(from: error) ?? preferredProviderDiagnostic(from: runtimeState)
         let surfacedErrorMessage = surfacedStreamFailureMessage(
             rawErrorMessage: rawErrorMessage,
-            reuseDisposition: sessionInfo.reuseDisposition
+            reuseDisposition: sessionInfo.reuseDisposition,
+            supervisionOutcome: supervisionOutcome,
+            providerDiagnostic: providerDiagnostic
         )
-        let transportKind = classifyTransportErrorKind(rawErrorMessage)
-        let canonicalOutcome = classifyStreamFailureOutcome(errorMessage: rawErrorMessage, outputPresence: outputPresence)
+        let codexTelemetry = codexTelemetry(
+            eventBridge: eventBridge,
+            sessionInfo: sessionInfo,
+            rawErrorMessage: rawErrorMessage,
+            supervisionOutcome: supervisionOutcome
+        )
+        let transportKind = providerDiagnostic != nil ? .provider : classifyTransportErrorKind(rawErrorMessage)
+        let canonicalOutcome = supervisionOutcome != nil
+            ? .failedBeforeOutput
+            : classifyStreamFailureOutcome(errorMessage: rawErrorMessage, outputPresence: outputPresence)
         let sessionBecameUnavailableMidStream = isSessionMissingError(rawErrorMessage)
+            || isSilentEOFBeforeFinalResultError(rawErrorMessage)
 
         var checkpoint: AgentSessionCheckpoint?
         if let gid = sessionInfo.generationID, let sessionManager = sessionManager {
@@ -797,6 +1208,17 @@ await sessionInfo.execution.closeSession()
                 try? await sessionManager.invalidateGeneration(
                     generationID: gid,
                     reason: "transport stream failure: \(rawErrorMessage)"
+                )
+                try? await sessionManager.recordEvent(
+                    lineageID: sessionInfo.lineageID!,
+                    generationID: gid,
+                    type: .invalidated
+                )
+            } else if let supervisionOutcome {
+                let reason = "Supervision failure: \(supervisionOutcome.classification.rawValue)"
+                try? await sessionManager.invalidateGeneration(
+                    generationID: gid,
+                    reason: reason
                 )
                 try? await sessionManager.recordEvent(
                     lineageID: sessionInfo.lineageID!,
@@ -819,7 +1241,7 @@ await sessionInfo.execution.closeSession()
             }
         }
 
-        let failureMsg = failureMessage(for: canonicalOutcome, fallback: surfacedErrorMessage)
+        let failureMsg = providerDiagnostic?.message ?? failureMessage(for: canonicalOutcome, fallback: surfacedErrorMessage)
         salvaged = await ImplementationFailureArtifactSynthesizer.supplementMissingOutputs(
             existingOutputs: salvaged,
             expectedOutputs: expectedOutputs,
@@ -832,7 +1254,14 @@ await sessionInfo.execution.closeSession()
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: nil,
             succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, provider: resolvedRuntimeProvider(agent: agent, context: context), model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context),
-            sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue, sessionReuseScope: agent.sessionReuseScope.rawValue, sessionFamilyID: agent.sessionFamilyID
+            supervision: buildSupervisionReceipt(eventBridge: eventBridge, outcome: supervisionOutcome),
+            codexTelemetry: codexTelemetry,
+            sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue,
+            sessionReuseScope: agent.sessionReuseScope.rawValue,
+            sessionFamilyID: agent.sessionFamilyID,
+            agentAttemptNumber: context.agentAttemptNumber,
+            retryReason: context.retryReason,
+            supersedesAgentExecutionID: context.supersedesAgentExecutionID,
         )
         for (name, data) in receiptArtifacts { salvaged[name] = data }
         let lazyEvidenceArtifactHits = detectLazyEvidenceArtifactHits(
@@ -849,14 +1278,15 @@ await sessionInfo.execution.closeSession()
             outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(failureMsg)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
             providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: runtimeTransport, costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
             resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: canonicalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, outputPresence: finalOutputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            canonicalOutcome: canonicalOutcome, supervisionClassification: supervisionOutcome?.classification, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, providerStopReason: providerDiagnostic?.normalizedReason, outputPresence: finalOutputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
             mcpProfileID: sessionInfo.mcpResolution.profileID,
             requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
             effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
             deniedMCPExtensions: sessionInfo.mcpResolution.deniedExtensions,
             mcpSessionStartupLatencyMilliseconds: sessionInfo.execution.startupLatencyMilliseconds,
             mcpServerMetrics: mcpServerMetrics,
-            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: nil, outputPresence: finalOutputPresence, rawErrorMessage: rawErrorMessage, rawFinishEvent: nil),
+            codexTelemetry: codexTelemetry,
+            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: canonicalOutcome, transportErrorKind: transportKind, providerStopReason: providerDiagnostic?.normalizedReason, outputPresence: finalOutputPresence, rawErrorMessage: providerDiagnostic?.message ?? rawErrorMessage, rawFinishEvent: nil),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
     }
@@ -964,6 +1394,7 @@ await sessionInfo.execution.closeSession()
         agent: ResolvedAgent,
         context: ExecutionContext,
         expectedOutputs: [String],
+        runtimeState: RuntimeSessionRuntimeState?,
         eventBridge: ExecutionEventBridge,
         startedAt: Date,
         completedAt: Date
@@ -982,6 +1413,11 @@ await sessionInfo.execution.closeSession()
         }
 
         let initialOutputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
+        let providerDiagnostic = preferredProviderDiagnostic(from: runtimeState)
+        let lazyArtifactFailure = surfacedLazyArtifactFailure(
+            toolCalls: eventBridge.toolCalls,
+            handoffPacket: context.handoffPacket
+        )
         let canonicalOutcome = classifyCompletedStreamOutcome(
             outputPresence: initialOutputPresence,
             finishReason: streamResult.finishReason,
@@ -991,9 +1427,13 @@ await sessionInfo.execution.closeSession()
 
         let initialMissingOutputs = expectedOutputs.filter { outputs[$0] == nil }
         let initialError: String? = if !initialMissingOutputs.isEmpty {
-            "Required outputs missing: \(initialMissingOutputs.joined(separator: ", "))"
+            providerDiagnostic?.message
+                ?? lazyArtifactFailure
+                ?? "Required outputs missing: \(initialMissingOutputs.joined(separator: ", "))"
         } else if canonicalOutcome != .completed {
-            failureMessage(for: canonicalOutcome, fallback: "Execution did not produce final output")
+            providerDiagnostic?.message
+                ?? lazyArtifactFailure
+                ?? failureMessage(for: canonicalOutcome, fallback: "Execution did not produce final output")
         } else {
             nil
         }
@@ -1010,9 +1450,13 @@ await sessionInfo.execution.closeSession()
         let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
         let finalOutcome: AgentCanonicalOutcome = !missingOutputs.isEmpty ? (canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome) : canonicalOutcome
         let finalError: String? = if !missingOutputs.isEmpty {
-            "Required outputs missing: \(missingOutputs.joined(separator: ", "))"
+            providerDiagnostic?.message
+                ?? lazyArtifactFailure
+                ?? "Required outputs missing: \(missingOutputs.joined(separator: ", "))"
         } else if finalOutcome != .completed {
-            failureMessage(for: finalOutcome, fallback: "Execution did not produce final output")
+            providerDiagnostic?.message
+                ?? lazyArtifactFailure
+                ?? failureMessage(for: finalOutcome, fallback: "Execution did not produce final output")
         } else {
             nil
         }
@@ -1021,7 +1465,13 @@ await sessionInfo.execution.closeSession()
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: streamResult.finalContent,
             succeeded: finalOutcome == .completed, errorMessage: finalError, provider: resolvedRuntimeProvider(agent: agent, context: context), model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context),
-            sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue, sessionReuseScope: agent.sessionReuseScope.rawValue, sessionFamilyID: agent.sessionFamilyID
+            codexTelemetry: codexTelemetry(eventBridge: eventBridge, sessionInfo: sessionInfo),
+            sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue,
+            sessionReuseScope: agent.sessionReuseScope.rawValue,
+            sessionFamilyID: agent.sessionFamilyID,
+            agentAttemptNumber: context.agentAttemptNumber,
+            retryReason: context.retryReason,
+            supersedesAgentExecutionID: context.supersedesAgentExecutionID,
         )
         for (name, data) in receiptArtifacts { outputs[name] = data }
         let lazyEvidenceArtifactHits = detectLazyEvidenceArtifactHits(
@@ -1035,12 +1485,14 @@ await sessionInfo.execution.closeSession()
 
         let cost = estimateCost(streamResult: streamResult)
         let runtimeTransport = context.providerBinding?.transport ?? "unknown"
+        let resolvedTransportErrorKind: TransportErrorKind? = providerDiagnostic != nil && finalOutcome != .completed ? .provider : nil
+        let resolvedProviderStopReason = providerDiagnostic?.normalizedReason ?? streamResult.finishReason
         return AgentResult(
             outputs: outputs, logSnippet: buildLogSnippet(agent: agent, sessionID: sessionInfo.execution.sessionID, streamResult: streamResult, startedAt: startedAt, completedAt: completedAt),
             costCents: cost, succeeded: finalOutcome == .completed, errorMessage: finalOutcome == .completed ? nil : finalError, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
             providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: runtimeTransport, costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
             resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: resolvedTransportErrorKind, providerStopReason: resolvedProviderStopReason, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
             mcpProfileID: sessionInfo.mcpResolution.profileID,
             requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
             effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
@@ -1048,7 +1500,8 @@ await sessionInfo.execution.closeSession()
             mcpSessionStartupLatencyMilliseconds: sessionInfo.execution.startupLatencyMilliseconds,
             mcpServerMetrics: mcpServerMetrics,
             accumulatedText: streamResult.accumulatedText,
-            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: finalOutcome, transportErrorKind: nil, providerStopReason: streamResult.finishReason, outputPresence: outputPresence, rawErrorMessage: finalError, rawFinishEvent: streamResult.finishRaw),
+            codexTelemetry: codexTelemetry(eventBridge: eventBridge, sessionInfo: sessionInfo),
+            outcomeEnvelope: OutcomeEnvelope(canonicalOutcome: finalOutcome, transportErrorKind: resolvedTransportErrorKind, providerStopReason: resolvedProviderStopReason, outputPresence: outputPresence, rawErrorMessage: providerDiagnostic?.message ?? finalError, rawFinishEvent: streamResult.finishRaw),
             lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
         )
     }
@@ -1114,26 +1567,59 @@ await sessionInfo.execution.closeSession()
         from content: String,
         expectedOutputs: [String]
     ) -> [String: Data] {
-        let pattern = #"<<<CHAINWORKS_OUTPUT:([A-Za-z0-9._-]+)>>>\s*([\s\S]*?)\s*<<<END_CHAINWORKS_OUTPUT\s*>{2,3}"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        let startPattern = #"<<<CHAINWORKS_OUTPUT:([A-Za-z0-9._-]+)>>>"#
+        let endPattern = #"<<<END_CHAINWORKS_OUTPUT\s*>{2,3}"#
+        guard let startRegex = try? NSRegularExpression(pattern: startPattern),
+              let endRegex = try? NSRegularExpression(pattern: endPattern) else {
             return [:]
         }
 
         let expectedNames = Set(expectedOutputs)
-        let nsRange = NSRange(content.startIndex..<content.endIndex, in: content)
         var outputs: [String: Data] = [:]
+        var searchStart = content.startIndex
 
-        for match in regex.matches(in: content, range: nsRange) {
-            guard match.numberOfRanges == 3,
-                  let nameRange = Range(match.range(at: 1), in: content),
-                  let bodyRange = Range(match.range(at: 2), in: content) else {
-                continue
+        while searchStart < content.endIndex {
+            let searchRange = NSRange(searchStart..<content.endIndex, in: content)
+            guard let startMatch = startRegex.firstMatch(in: content, range: searchRange),
+                  startMatch.numberOfRanges == 2,
+                  let nameRange = Range(startMatch.range(at: 1), in: content),
+                  let fullStartRange = Range(startMatch.range(at: 0), in: content) else {
+                break
             }
 
             let outputName = String(content[nameRange])
-            guard expectedNames.contains(outputName) else { continue }
+            let bodyStart = fullStartRange.upperBound
 
-            let body = String(content[bodyRange]).trimmingCharacters(in: .newlines)
+            let trailingRange = NSRange(bodyStart..<content.endIndex, in: content)
+            let endMatch = endRegex.firstMatch(in: content, range: trailingRange)
+            let nextStartMatch = startRegex.firstMatch(in: content, range: trailingRange)
+
+            let bodyEnd: String.Index
+            if let endMatch,
+               let endRange = Range(endMatch.range(at: 0), in: content),
+               let nextStartMatch,
+               let nextStartRange = Range(nextStartMatch.range(at: 0), in: content),
+               nextStartRange.lowerBound < endRange.lowerBound {
+                bodyEnd = nextStartRange.lowerBound
+                searchStart = nextStartRange.lowerBound
+            } else if let endMatch,
+                      let endRange = Range(endMatch.range(at: 0), in: content) {
+                bodyEnd = endRange.lowerBound
+                searchStart = endRange.upperBound
+            } else if let nextStartMatch,
+                      let nextStartRange = Range(nextStartMatch.range(at: 0), in: content) {
+                bodyEnd = nextStartRange.lowerBound
+                searchStart = nextStartRange.lowerBound
+            } else {
+                bodyEnd = content.endIndex
+                searchStart = content.endIndex
+            }
+
+            guard expectedNames.contains(outputName) else {
+                continue
+            }
+
+            let body = String(content[bodyStart..<bodyEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !body.isEmpty else { continue }
             outputs[outputName] = Data(body.utf8)
         }
@@ -1213,6 +1699,33 @@ await sessionInfo.execution.closeSession()
         return hits.sorted()
     }
 
+    private func surfacedLazyArtifactFailure(
+        toolCalls: [ToolCallRecord],
+        handoffPacket: HandoffPacket?
+    ) -> String? {
+        guard let handoffPacket, !handoffPacket.lazyArtifactRefs.isEmpty else { return nil }
+        for call in toolCalls where call.succeeded == false {
+            let haystack = "\(call.rawPayload)\n\(call.responseRawPayload ?? "")"
+            guard haystack.localizedCaseInsensitiveContains("get_lazy_artifact"),
+                  haystack.localizedCaseInsensitiveContains("lazy artifact not found") else {
+                continue
+            }
+            if let match = haystack.range(
+                of: #"lazy artifact not found:\s*([A-Za-z0-9_\-\.]+)"#,
+                options: .regularExpression
+            ) {
+                let fragment = String(haystack[match])
+                if let artifact = fragment.split(separator: ":").last?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !artifact.isEmpty {
+                    return "Lazy artifact request failed: \(artifact)"
+                }
+            }
+            return "Lazy artifact request failed: requested artifact is not available in the handoff packet"
+        }
+        return nil
+    }
+
     private func classifyTransportErrorKind(_ errorMessage: String) -> TransportErrorKind {
         let lowercased = errorMessage.lowercased()
         if lowercased.contains("timed out") || lowercased.contains("timeout") || lowercased.contains("-1001") { return .timeout }
@@ -1236,8 +1749,16 @@ await sessionInfo.execution.closeSession()
 
     private func surfacedStreamFailureMessage(
         rawErrorMessage: String,
-        reuseDisposition: SessionReuseDisposition
+        reuseDisposition: SessionReuseDisposition,
+        supervisionOutcome: SupervisionOutcome?,
+        providerDiagnostic: RuntimeProviderDiagnostic?
     ) -> String {
+        if let providerDiagnostic {
+            return providerDiagnostic.message
+        }
+        if let supervisionOutcome {
+            return supervisionOutcome.surfacedSummary
+        }
         if isCapacityExhaustionError(rawErrorMessage) {
             return "Provider capacity exhausted; retry the agent"
         }
@@ -1251,6 +1772,41 @@ await sessionInfo.execution.closeSession()
             return "Provider session became unavailable during execution"
         }
         return "Stream processing failed: \(rawErrorMessage)"
+    }
+
+    private func preferredProviderDiagnostic(
+        from runtimeState: RuntimeSessionRuntimeState?
+    ) -> RuntimeProviderDiagnostic? {
+        guard let diagnostics = runtimeState?.providerDiagnostics, !diagnostics.isEmpty else {
+            return nil
+        }
+        return diagnostics.last(where: { $0.severity == .error }) ?? diagnostics.last
+    }
+
+    private func providerDiagnostic(from error: Error) -> RuntimeProviderDiagnostic? {
+        (error as? RuntimeProviderDiagnosticFailure)?.diagnostic
+    }
+
+    private func fatalProviderDiagnosticForSupervision(
+        from runtimeState: RuntimeSessionRuntimeState?
+    ) -> RuntimeProviderDiagnostic? {
+        guard let diagnostic = preferredProviderDiagnostic(from: runtimeState),
+              diagnostic.severity == .error else {
+            return nil
+        }
+
+        let fatalReasons: Set<String> = [
+            "apply_patch_verification_failed",
+            "stdin_closed_for_session",
+            "write_stdin_failed",
+            "exec_command_create_process_failed",
+            "exec_command_failed"
+        ]
+        guard let normalizedReason = diagnostic.normalizedReason,
+              fatalReasons.contains(normalizedReason) else {
+            return nil
+        }
+        return diagnostic
     }
 
     private static func describeProviderSessionConflicts(_ conflicts: [ProviderSessionConflict]) -> String {
@@ -1276,6 +1832,10 @@ await sessionInfo.execution.closeSession()
             || lowercased.contains("failed to read session")
             || lowercased.contains("404")
             || (lowercased.contains("no active ") && lowercased.contains(" session"))
+    }
+
+    private func isSilentEOFBeforeFinalResultError(_ errorMessage: String) -> Bool {
+        errorMessage.localizedCaseInsensitiveContains("stream ended before final result was received")
     }
 
     private func isLimitExhaustionReason(_ reason: String) -> Bool {
@@ -1315,6 +1875,55 @@ await sessionInfo.execution.closeSession()
         case .cancelledBeforeOutput, .cancelledAfterOutput: return "Execution was cancelled"
         case .completed, .failedBeforeOutput: return fallback
         }
+    }
+
+    private func supervisionOutcome(from error: Error) -> SupervisionOutcome? {
+        if let watchdog = error as? ACPWatchdogClassificationError {
+            return SupervisionOutcome(
+                classification: watchdog.classification,
+                surfacedSummary: watchdog.errorDescription ?? watchdog.classification.defaultSummary,
+                silenceSeconds: watchdog.silenceSeconds,
+                mutationVerificationAttempted: false,
+                mutationSideEffectObserved: nil,
+                firstVerifiedMutatedPath: nil
+            )
+        }
+        if let mutation = error as? MutationSideEffectMissingError {
+            return SupervisionOutcome(
+                classification: .mutationSideEffectMissing,
+                surfacedSummary: mutation.errorDescription ?? SupervisionClassification.mutationSideEffectMissing.defaultSummary,
+                silenceSeconds: nil,
+                mutationVerificationAttempted: true,
+                mutationSideEffectObserved: false,
+                firstVerifiedMutatedPath: mutation.firstVerifiedMutatedPath
+            )
+        }
+        return nil
+    }
+
+    private func buildSupervisionReceipt(
+        eventBridge: ExecutionEventBridge,
+        outcome: SupervisionOutcome?,
+        automaticRetryConsumed: Bool = false
+    ) -> ExecutionSupervisionReceipt? {
+        guard eventBridge.promptSubmittedAt != nil
+            || eventBridge.lastMeaningfulProgressAt != nil
+            || eventBridge.firstMutatingToolAt != nil
+            || outcome != nil else {
+            return nil
+        }
+        return ExecutionSupervisionReceipt(
+            classification: outcome?.classification,
+            promptSubmittedAt: eventBridge.promptSubmittedAt,
+            lastMeaningfulProgressAt: eventBridge.lastMeaningfulProgressAt,
+            firstMutatingToolAt: eventBridge.firstMutatingToolAt,
+            lastMutatingToolName: eventBridge.lastMutatingToolName,
+            silenceDurationSeconds: outcome?.silenceSeconds,
+            automaticRetryConsumed: automaticRetryConsumed,
+            mutationVerificationAttempted: outcome?.mutationVerificationAttempted ?? false,
+            mutationSideEffectObserved: outcome?.mutationSideEffectObserved,
+            firstVerifiedMutatedPath: outcome?.firstVerifiedMutatedPath
+        )
     }
 
     private func resolveWorkingDirectoryAndMode(agent: ResolvedAgent, context: ExecutionContext) -> (String, String) {
@@ -1359,12 +1968,113 @@ await sessionInfo.execution.closeSession()
     }
 }
 
-private struct ACPProposalReviewStallError: LocalizedError {
+private struct ACPWatchdogClassificationError: LocalizedError {
+    let classification: SupervisionClassification
     let silenceSeconds: TimeInterval
-    let readLoopCount: Int
+    let lastMutatingToolName: String?
 
     var errorDescription: String? {
-        "ACP proposal review stalled in read loop without progress after \(Int(silenceSeconds))s (\(readLoopCount) read callbacks)"
+        switch classification {
+        case .idleHangBeforeFirstProgress:
+            return "ACP execution stalled before first meaningful progress after \(Int(silenceSeconds))s"
+        case .idleHangAfterProgress:
+            return "ACP execution stalled after meaningful progress stopped for \(Int(silenceSeconds))s"
+        case .idleHangReadLoop:
+            return "ACP execution stalled in weak read loop after \(Int(silenceSeconds))s"
+        case .idleHangAfterFirstEdit:
+            if let lastMutatingToolName {
+                return "ACP execution stalled after first mutating tool '\(lastMutatingToolName)' for \(Int(silenceSeconds))s"
+            }
+            return "ACP execution stalled after first edit boundary for \(Int(silenceSeconds))s"
+        case .mutationSideEffectMissing:
+            return SupervisionClassification.mutationSideEffectMissing.defaultSummary
+        }
+    }
+}
+
+private struct MutationSideEffectMissingError: LocalizedError {
+    let firstVerifiedMutatedPath: String?
+
+    var errorDescription: String? {
+        SupervisionClassification.mutationSideEffectMissing.defaultSummary
+    }
+}
+
+private struct CodexACPRunawayGuardrailError: LocalizedError {
+    let reason: String
+
+    var errorDescription: String? {
+        "Codex ACP session exceeded runaway guardrail: \(reason)"
+    }
+}
+
+private struct RuntimeProviderDiagnosticFailure: LocalizedError {
+    let diagnostic: RuntimeProviderDiagnostic
+
+    var errorDescription: String? {
+        diagnostic.message
+    }
+}
+
+private struct MutationDeltaObservation {
+    let changed: Bool
+    let firstChangedPath: String?
+}
+
+private struct MutationSideEffectObserver {
+    let workingDirectory: String
+    private let baselineEntries: Set<String>
+
+    init(workingDirectory: String) {
+        self.workingDirectory = workingDirectory
+        self.baselineEntries = Self.collectEntries(at: workingDirectory)
+    }
+
+    func observeDelta() -> MutationDeltaObservation {
+        let currentEntries = Self.collectEntries(at: workingDirectory)
+        let delta = currentEntries.subtracting(baselineEntries)
+        return MutationDeltaObservation(changed: !delta.isEmpty, firstChangedPath: delta.sorted().first)
+    }
+
+    private static func collectEntries(at workingDirectory: String) -> Set<String> {
+        guard !workingDirectory.isEmpty else { return [] }
+        let cwdURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        let gitDir = cwdURL.appendingPathComponent(".git")
+        if FileManager.default.fileExists(atPath: gitDir.path) {
+            if let output = try? execGitStatus(in: workingDirectory) {
+                return Set(output.split(separator: "\n").map(String.init))
+            }
+        }
+
+        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
+        guard let enumerator = FileManager.default.enumerator(at: cwdURL, includingPropertiesForKeys: keys) else {
+            return []
+        }
+        var entries: Set<String> = []
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true else {
+                continue
+            }
+            let relative = fileURL.path.replacingOccurrences(of: cwdURL.path + "/", with: "")
+            let stamp = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let size = values.fileSize ?? 0
+            entries.insert("\(relative)|\(Int(stamp))|\(size)")
+        }
+        return entries
+    }
+
+    private static func execGitStatus(in workingDirectory: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git", "-C", workingDirectory, "status", "--porcelain"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(decoding: data, as: UTF8.self)
     }
 }
 
@@ -1375,5 +2085,98 @@ extension AgentResult {
 
     static func minimal(_ outcome: AgentCanonicalOutcome, sessionID: String, duration: Double) -> AgentResult {
         AgentResult(outputs: [:], logSnippet: nil, costCents: nil, succeeded: outcome == .completed, errorMessage: nil, sessionID: sessionID, durationSeconds: duration, providerReceipt: nil, resolvedModel: nil, configuredProviderID: nil, adapterVersion: nil, canonicalOutcome: outcome)
+    }
+
+    func markedAutomaticRetryConsumed() -> AgentResult {
+        var updatedOutputs = outputs
+        if let receiptData = outputs.first(where: { $0.key.hasSuffix("_receipt.json") })?.value {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if var receipt = try? decoder.decode(ExecutionReceipt.self, from: receiptData) {
+                let updatedSupervision = ExecutionSupervisionReceipt(
+                    classification: receipt.supervision?.classification ?? supervisionClassification,
+                    promptSubmittedAt: receipt.supervision?.promptSubmittedAt ?? codexTelemetry?.promptSubmittedAt,
+                    lastMeaningfulProgressAt: receipt.supervision?.lastMeaningfulProgressAt ?? codexTelemetry?.lastMeaningfulProgressAt,
+                    firstMutatingToolAt: receipt.supervision?.firstMutatingToolAt ?? codexTelemetry?.firstEditAt,
+                    lastMutatingToolName: receipt.supervision?.lastMutatingToolName ?? codexTelemetry?.lastMutatingToolName,
+                    silenceDurationSeconds: receipt.supervision?.silenceDurationSeconds ?? codexTelemetry?.silenceDurationSeconds,
+                    automaticRetryConsumed: true,
+                    mutationVerificationAttempted: receipt.supervision?.mutationVerificationAttempted ?? codexTelemetry?.mutationVerificationAttempted ?? false,
+                    mutationSideEffectObserved: receipt.supervision?.mutationSideEffectObserved ?? codexTelemetry?.mutationSideEffectObserved,
+                    firstVerifiedMutatedPath: receipt.supervision?.firstVerifiedMutatedPath ?? codexTelemetry?.firstVerifiedMutatedPath
+                )
+                receipt = ExecutionReceipt(
+                    receiptVersion: receipt.receiptVersion,
+                    agentID: receipt.agentID,
+                    sessionID: receipt.sessionID,
+                    stageID: receipt.stageID,
+                    iteration: receipt.iteration,
+                    attemptNumber: receipt.attemptNumber,
+                    startedAt: receipt.startedAt,
+                    completedAt: receipt.completedAt,
+                    durationSeconds: receipt.durationSeconds,
+                    succeeded: receipt.succeeded,
+                    errorMessage: receipt.errorMessage,
+                    provider: receipt.provider,
+                    model: receipt.model,
+                    effort: receipt.effort,
+                    toolCallCount: receipt.toolCallCount,
+                    toolCalls: receipt.toolCalls,
+                    eventCount: receipt.eventCount,
+                    supervision: updatedSupervision,
+                    codexTelemetry: {
+                        var telemetry = receipt.codexTelemetry
+                        telemetry?.automaticRetryConsumed = true
+                        return telemetry
+                    }(),
+                    agentAttemptNumber: receipt.agentAttemptNumber,
+                    retryReason: receipt.retryReason,
+                    supersedesAgentExecutionID: receipt.supersedesAgentExecutionID,
+                    sessionReuseDisposition: receipt.sessionReuseDisposition,
+                    sessionReuseScope: receipt.sessionReuseScope,
+                    sessionFamilyID: receipt.sessionFamilyID
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                if let updatedData = try? encoder.encode(receipt),
+                   let key = outputs.keys.first(where: { $0.hasSuffix("_receipt.json") }) {
+                    updatedOutputs[key] = updatedData
+                }
+            }
+        }
+        return AgentResult(
+            outputs: updatedOutputs,
+            logSnippet: logSnippet,
+            costCents: costCents,
+            succeeded: succeeded,
+            errorMessage: errorMessage,
+            sessionID: sessionID,
+            durationSeconds: durationSeconds,
+            providerReceipt: providerReceipt,
+            resolvedModel: resolvedModel,
+            configuredProviderID: configuredProviderID,
+            adapterVersion: adapterVersion,
+            canonicalOutcome: canonicalOutcome,
+            supervisionClassification: supervisionClassification,
+            sessionLineageID: sessionLineageID,
+            sessionGenerationID: sessionGenerationID,
+            sessionReuseDisposition: sessionReuseDisposition,
+            sessionCheckpoint: sessionCheckpoint,
+            transportErrorKind: transportErrorKind,
+            providerStopReason: providerStopReason,
+            outputPresence: outputPresence,
+            runtimeProvider: runtimeProvider,
+            runtimeModel: runtimeModel,
+            mcpProfileID: mcpProfileID,
+            requestedMCPExtensions: requestedMCPExtensions,
+            effectiveMCPRuntimeExtensionIDs: effectiveMCPRuntimeExtensionIDs,
+            deniedMCPExtensions: deniedMCPExtensions,
+            mcpSessionStartupLatencyMilliseconds: mcpSessionStartupLatencyMilliseconds,
+            mcpServerMetrics: mcpServerMetrics,
+            accumulatedText: accumulatedText,
+            outcomeEnvelope: outcomeEnvelope,
+            lazyEvidenceArtifactHits: lazyEvidenceArtifactHits
+        )
     }
 }

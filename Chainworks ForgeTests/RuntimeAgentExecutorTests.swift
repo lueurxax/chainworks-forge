@@ -241,6 +241,340 @@ struct RuntimeAgentExecutorTests {
         }
     }
 
+    private final class CodexRunawayGuardrailTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            return RuntimeSessionResponse(
+                sessionId: "codex-guard-\(callCount)",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { state in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+            }
+
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if sessionID == "codex-guard-1" {
+                        continuation.yield(.toolCallStarted(toolName: "search", raw: "{}"))
+                        continuation.yield(.toolCallFinished(toolName: "search", raw: "{}"))
+                        continuation.yield(.toolCallStarted(toolName: "search", raw: "{}"))
+                        continuation.yield(.toolCallFinished(toolName: "search", raw: "{}"))
+                        continuation.yield(.toolCallStarted(toolName: "search", raw: "{}"))
+
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(60))
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: "guardrail-recovered"))
+                    continuation.yield(.finish(reason: "end_turn", totalTokens: 42, raw: "{}"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
+    private final class CodexOversizedPayloadTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            return RuntimeSessionResponse(
+                sessionId: "codex-payload-\(callCount)",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { state in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+            }
+
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if sessionID == "codex-payload-1" {
+                        let hugePayload = String(repeating: "x", count: 512)
+                        continuation.yield(.toolCallStarted(toolName: "build_sim", raw: "{}"))
+                        continuation.yield(.toolCallFinished(toolName: "build_sim", raw: hugePayload))
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(60))
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: "payload-guardrail-recovered"))
+                    continuation.yield(.finish(reason: "end_turn", totalTokens: 21, raw: "{}"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+            RuntimeSessionRuntimeState(enabledExtensions: [])
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
+    private final class CodexRuntimeHomeGuardrailTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+        private let runtimeHomeURL: URL
+
+        init(runtimeHomeURL: URL) {
+            self.runtimeHomeURL = runtimeHomeURL
+        }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            return RuntimeSessionResponse(
+                sessionId: "codex-home-\(callCount)",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { state in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+            }
+
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if sessionID == "codex-home-1" {
+                        let oversized = runtimeHomeURL.appendingPathComponent("oversized.bin")
+                        let data = Data(repeating: 0x41, count: 512)
+                        try? data.write(to: oversized)
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(60))
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: "runtime-home-guardrail-recovered"))
+                    continuation.yield(.finish(reason: "end_turn", totalTokens: 21, raw: "{}"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+            RuntimeSessionRuntimeState(
+                enabledExtensions: [],
+                runtimeHomePath: runtimeHomeURL.path
+            )
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+    }
+
+    private final class CodexSessionHistoryGuardrailTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+            var submittedSessionIDs: [String] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            return RuntimeSessionResponse(
+                sessionId: "codex-history-\(callCount)",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { state in
+                state.submitPromptCallCount += 1
+                state.submittedSessionIDs.append(sessionID)
+            }
+
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if sessionID == "codex-history-1" {
+                        continuation.yield(.toolCallStarted(toolName: "search", raw: "{}"))
+                        continuation.yield(.unknown(type: "usage_update", data: #"{"usage":{"input_tokens":600000,"cached_input_tokens":500000,"output_tokens":2048,"model_context_window":258400}}"#))
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(60))
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: "session-history-guardrail-recovered"))
+                    continuation.yield(.finish(reason: "end_turn", totalTokens: 21, raw: "{}"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+
+        var submittedSessionIDs: [String] {
+            get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
     private final class StaleReuseSSEErrorTransport: RuntimeTransportProtocol, @unchecked Sendable {
         private struct State {
             var createSessionCallCount = 0
@@ -458,7 +792,133 @@ struct RuntimeAgentExecutorTests {
         }
     }
 
+    private final class ProviderDiagnosticStreamFailureTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "provider-diagnostic-stream-failure",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish(throwing: RuntimeTransportError.streamingFailed(
+                        reason: "Codex ACP stream ended before final result was received"
+                    ))
+                }
+            }
+        }
+
+        func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+            RuntimeSessionRuntimeState(
+                enabledExtensions: [],
+                providerDiagnostics: [
+                    RuntimeProviderDiagnostic(
+                        source: "codex_stderr",
+                        severity: .error,
+                        message: "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open",
+                        normalizedReason: "stdin_closed_for_session"
+                    )
+                ]
+            )
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
+
+    private final class FatalProviderDiagnosticDuringStreamTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        private struct State {
+            var runtimeStateReadCount = 0
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            state.withLock { $0.createSessionCallCount += 1 }
+            return RuntimeSessionResponse(
+                sessionId: "fatal-provider-diagnostic-session",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            state.withLock { $0.submitPromptCallCount += 1 }
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+            let count = state.withLock { state -> Int in
+                state.runtimeStateReadCount += 1
+                return state.runtimeStateReadCount
+            }
+            if count < 2 {
+                return RuntimeSessionRuntimeState(enabledExtensions: [])
+            }
+            return RuntimeSessionRuntimeState(
+                enabledExtensions: [],
+                providerDiagnostics: [
+                    RuntimeProviderDiagnostic(
+                        source: "codex_stderr",
+                        severity: .error,
+                        message: "apply_patch verification failed: Failed to find expected lines in AddTransactionView.swift",
+                        normalizedReason: "apply_patch_verification_failed"
+                    )
+                ]
+            )
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
+        }
+    }
+
     private final class ACPReadLoopStallTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "claude_agent" }
+
         func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
             RuntimeSessionResponse(
                 sessionId: "acp-stall-session",
@@ -530,6 +990,8 @@ struct RuntimeAgentExecutorTests {
     }
 
     private final class WatchdogTimeoutTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "claude_agent" }
+
         private struct State {
             var createSessionCallCount = 0
             var closeSessionCallCount = 0
@@ -561,7 +1023,6 @@ struct RuntimeAgentExecutorTests {
                 let task = Task {
                     continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
                     continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
-                    continuation.yield(.textChunk(text: "Starting a long-running non-ACP execution."))
                     while !Task.isCancelled {
                         try? await Task.sleep(for: .seconds(60))
                     }
@@ -585,6 +1046,143 @@ struct RuntimeAgentExecutorTests {
         var closeSessionCallCount: Int {
             get async { state.withLock { $0.closeSessionCallCount } }
         }
+    }
+
+    private final class StreamingThinkingBeforeOutputTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "claude_agent" }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "streaming-thinking-before-output",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    for chunk in [
+                        "[thinking] analyzing reviews",
+                        "[thinking] aggregating scores",
+                        "[thinking] drafting output envelope"
+                    ] {
+                        try? await Task.sleep(for: .milliseconds(30))
+                        continuation.yield(.textChunk(text: chunk))
+                    }
+                    try? await Task.sleep(for: .milliseconds(20))
+                    continuation.yield(.finalOutput(content: """
+                    <<<CHAINWORKS_OUTPUT:proposal_review_summary>>>
+                    {"pass":false,"average_score":7.75,"aggregate_score":7.75,"min_individual_score":4,"blocker_count":3,"summary":"revise","required_changes":["a"],"recurring_themes":["b"],"decision":"revise"}
+                    <<<END_CHAINWORKS_OUTPUT>>>
+                    """))
+                    continuation.yield(.finish(reason: "end_turn", totalTokens: 42, raw: #"{"stopReason":"end_turn"}"#))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
+
+    private final class CompletedMutationWithoutSideEffectTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "mutation-without-side-effect",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"mutation-without-side-effect"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"mutation-without-side-effect"}"#))
+                    continuation.yield(.textChunk(text: "Applying an edit now."))
+                    continuation.yield(.toolCallStarted(toolName: "edit", raw: #"{"tool_name":"edit","tool_call_id":"call-edit-1"}"#))
+                    continuation.yield(.toolCallStarted(toolName: "permission:edit", raw: #"{"tool_name":"permission:edit","tool_call_id":"call-perm-edit-1"}"#))
+                    continuation.yield(.toolCallFinished(toolName: "permission:edit", raw: #"{"tool_name":"permission:edit","tool_call_id":"call-perm-edit-1"}"#))
+                    continuation.yield(.toolCallFinished(toolName: "edit", raw: #"{"tool_name":"edit","tool_call_id":"call-edit-1"}"#))
+                    continuation.yield(.textChunk(text: "Edit reported success."))
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
+
+    private final class StartedEditWithoutCompletionTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "started-edit-without-completion",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                let task = Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"started-edit-without-completion"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"started-edit-without-completion"}"#))
+                    continuation.yield(.textChunk(text: "Applying an edit now."))
+                    continuation.yield(.toolCallStarted(toolName: "edit", raw: #"{"tool_name":"edit","tool_call_id":"call-edit-1"}"#))
+                    continuation.yield(.toolCallStarted(toolName: "permission:edit", raw: #"{"tool_name":"permission:edit","tool_call_id":"call-perm-edit-1"}"#))
+                    continuation.yield(.toolCallFinished(toolName: "permission:edit", raw: #"{"tool_name":"permission:edit","tool_call_id":"call-perm-edit-1"}"#))
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    task.cancel()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
     }
 
     private final class SilentEOFRetryTransport: RuntimeTransportProtocol, @unchecked Sendable {
@@ -792,7 +1390,13 @@ struct RuntimeAgentExecutorTests {
         return AgentSessionManager(container: container)
     }
 
-    private func makeContext(runID: UUID = UUID(), iteration: Int = 1) -> ExecutionContext {
+    private func makeContext(
+        runID: UUID = UUID(),
+        iteration: Int = 1,
+        agentAttemptNumber: Int? = nil,
+        retryReason: String? = nil,
+        supersedesAgentExecutionID: UUID? = nil
+    ) -> ExecutionContext {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("test-\(runID.uuidString)", isDirectory: true)
         let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
@@ -817,11 +1421,21 @@ struct RuntimeAgentExecutorTests {
             inputArtifacts: [:],
             variables: [:],
             ideaBody: "Test idea body",
-            providerBinding: nil
+            providerBinding: nil,
+            agentAttemptNumber: agentAttemptNumber,
+            retryReason: retryReason,
+            supersedesAgentExecutionID: supersedesAgentExecutionID
         )
     }
 
-    private func makeContext(runID: UUID = UUID(), iteration: Int = 1, worktreeRoot: URL?) -> ExecutionContext {
+    private func makeContext(
+        runID: UUID = UUID(),
+        iteration: Int = 1,
+        worktreeRoot: URL?,
+        agentAttemptNumber: Int? = nil,
+        retryReason: String? = nil,
+        supersedesAgentExecutionID: UUID? = nil
+    ) -> ExecutionContext {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("test-\(runID.uuidString)", isDirectory: true)
         let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
@@ -845,7 +1459,10 @@ struct RuntimeAgentExecutorTests {
             inputArtifacts: [:],
             variables: [:],
             ideaBody: "Test idea body",
-            providerBinding: nil
+            providerBinding: nil,
+            agentAttemptNumber: agentAttemptNumber,
+            retryReason: retryReason,
+            supersedesAgentExecutionID: supersedesAgentExecutionID
         )
     }
 
@@ -1035,8 +1652,44 @@ struct RuntimeAgentExecutorTests {
             let receipt = try decoder.decode(ExecutionReceipt.self, from: data)
             #expect(receipt.agentID == "proposal_writer")
             #expect(receipt.succeeded)
-            #expect(receipt.receiptVersion == "1.1")
+            #expect(receipt.receiptVersion == "1.2")
         }
+    }
+
+    @MainActor
+    @Test("Executor receipt preserves retry lineage metadata from execution context")
+    func runtimeExecutorReceiptPreservesRetryLineageMetadata() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .finalOutput(content: "Test output"),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(id: "code_writer", outputs: ["changed_files_manifest"])
+        let task = makeTask(agent: "code_writer", task: "continue_implementation")
+        let superseded = UUID()
+        let context = makeContext(
+            agentAttemptNumber: 2,
+            retryReason: "automatic_watchdog_retry",
+            supersedesAgentExecutionID: superseded
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+        let receiptKey = try #require(result.outputs.keys.first { $0.contains("_receipt.json") })
+        let data = try #require(result.outputs[receiptKey])
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(ExecutionReceipt.self, from: data)
+        #expect(receipt.agentAttemptNumber == 2)
+        #expect(receipt.retryReason == "automatic_watchdog_retry")
+        #expect(receipt.supersedesAgentExecutionID == superseded)
     }
 
     @MainActor
@@ -1300,6 +1953,47 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
+    @Test("Executor materializes trailing returned output block when final end marker is missing")
+    func runtimeExecutorMaterializesTrailingOutputBlockWithoutEndMarker() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            sessionResult: nil,
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .finalOutput(content: """
+                <<<CHAINWORKS_OUTPUT:proposal_current>>>
+                {"title":"Proposal"}
+                <<<END_CHAINWORKS_OUTPUT>>>
+
+                <<<CHAINWORKS_OUTPUT:proposal_revision_summary>>>
+                {"summary":"ok"}
+                <<<END_CHAINWORKS_OUTPUT>>>
+
+                <<<CHAINWORKS_OUTPUT:proposal_feedback_coverage>>>
+                {"coverage":"full"}
+                """),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "proposal_writer",
+            outputs: ["proposal_current", "proposal_revision_summary", "proposal_feedback_coverage"]
+        )
+        let task = makeTask(agent: "proposal_writer", task: "refine_proposal")
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(String(decoding: try #require(result.outputs["proposal_current"]), as: UTF8.self).contains("\"title\":\"Proposal\""))
+        #expect(String(decoding: try #require(result.outputs["proposal_revision_summary"]), as: UTF8.self).contains("\"summary\":\"ok\""))
+        #expect(String(decoding: try #require(result.outputs["proposal_feedback_coverage"]), as: UTF8.self).contains("\"coverage\":\"full\""))
+    }
+
+    @MainActor
     @Test("Executor synthesizes partial implementation artifacts when code writer fails before writing them")
     func runtimeExecutorSynthesizesPartialImplementationArtifactsOnFailure() async throws {
         let transport = ObservableRuntimeTransport()
@@ -1551,6 +2245,317 @@ struct RuntimeAgentExecutorTests {
 
         #expect(!result.succeeded)
         #expect(result.errorMessage?.contains("Session creation failed") == true)
+    }
+
+    @MainActor
+    @Test("Executor surfaces provider stderr verification failure instead of generic missing-final-output")
+    func runtimeExecutorSurfacesProviderVerificationFailureOnSettledStream() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .toolCallStarted(toolName: "edit", raw: "{}"),
+                .toolCallFinished(toolName: "permission:edit", raw: "{}"),
+                .sessionClosed(raw: "{}")
+            ],
+            runtimeState: RuntimeSessionRuntimeState(
+                enabledExtensions: [],
+                providerDiagnostics: [
+                    RuntimeProviderDiagnostic(
+                        source: "codex_stderr",
+                        severity: .error,
+                        message: "apply_patch verification failed: Failed to find expected lines in OnboardingFlowView.swift",
+                        normalizedReason: "apply_patch_verification_failed"
+                    )
+                ]
+            )
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+        let agent = makeAgent(id: "code_writer", outputs: [])
+        let task = makeTask(agent: "code_writer", task: "continue_implementation")
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.transportErrorKind == .provider)
+        #expect(result.providerStopReason == "apply_patch_verification_failed")
+        #expect(result.errorMessage == "apply_patch verification failed: Failed to find expected lines in OnboardingFlowView.swift")
+        #expect(result.outcomeEnvelope?.providerStopReason == "apply_patch_verification_failed")
+        #expect(result.outcomeEnvelope?.rawErrorMessage == "apply_patch verification failed: Failed to find expected lines in OnboardingFlowView.swift")
+    }
+
+    @MainActor
+    @Test("Executor fails fast when live Codex provider diagnostics report fatal patch-context failure")
+    func runtimeExecutorFailsFastOnLiveCodexProviderDiagnostic() async throws {
+        let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
+        let originalPoll = RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 1
+        RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = 10
+        defer {
+            RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+            RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = originalPoll
+        }
+
+        let transport = FatalProviderDiagnosticDuringStreamTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "code_writer", task: "continue_implementation"),
+            agent: makeAgent(id: "code_writer", outputs: []),
+            context: context
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.transportErrorKind == .provider)
+        #expect(result.providerStopReason == "apply_patch_verification_failed")
+        #expect(result.errorMessage == "apply_patch verification failed: Failed to find expected lines in AddTransactionView.swift")
+        #expect(result.supervisionClassification == nil)
+        #expect(result.outcomeEnvelope?.providerStopReason == "apply_patch_verification_failed")
+        #expect(await transport.createSessionCallCount == 1)
+        #expect(await transport.submitPromptCallCount == 1)
+    }
+
+    @MainActor
+    @Test("Executor surfaces lazy artifact lookup failure instead of generic missing-final-output")
+    func runtimeExecutorSurfacesLazyArtifactLookupFailureOnSettledStream() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .toolCallStarted(
+                    toolName: "get_lazy_artifact",
+                    raw: #"{"toolCallId":"call_lazy_1","name":"get_lazy_artifact"}"#
+                ),
+                .toolCallFinished(
+                    toolName: "get_lazy_artifact",
+                    raw: #"{"toolCallId":"call_lazy_1","name":"get_lazy_artifact","status":"failed","rawOutput":{"stdout":"lazy artifact not found: proposal_review_architect_json\n"}}"#
+                ),
+                .sessionClosed(raw: "{}")
+            ],
+            runtimeState: RuntimeSessionRuntimeState(
+                enabledExtensions: [],
+                providerDiagnostics: []
+            )
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let baseContext = makeContext(iteration: 1)
+        let handoffPacket = HandoffPacket(
+            profileID: "current_mixed_baseline",
+            mode: .selective,
+            task: "refine_proposal",
+            mandatoryArtifacts: [:],
+            summaries: [:],
+            lazyArtifactRefs: [
+                "proposal_review_architect": ArtifactPointer(
+                    artifactName: "proposal_review_architect",
+                    absolutePath: "/tmp/proposal_review_architect",
+                    byteCount: 10
+                )
+            ],
+            checkpoint: nil,
+            summaryMetrics: HandoffSummaryMetrics(
+                mandatoryArtifactCount: 0,
+                summarizedArtifactCount: 0,
+                lazyArtifactCount: 1,
+                compactionCount: 0,
+                payloadBytesBeforeStrategy: 100,
+                payloadBytesAfterStrategy: 20
+            ),
+            promotedArtifacts: []
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: nil,
+            handoffPacket: handoffPacket
+        )
+        let agent = makeAgent(id: "proposal_writer", outputs: [])
+        let task = makeTask(agent: "proposal_writer", task: "refine_proposal")
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.errorMessage == "Lazy artifact request failed: proposal_review_architect_json")
+    }
+
+    @MainActor
+    @Test("Executor surfaces provider stderr on stream failure instead of generic transport text")
+    func runtimeExecutorSurfacesProviderDiagnosticOnStreamFailure() async throws {
+        let executor = RuntimeAgentExecutor(transport: ProviderDiagnosticStreamFailureTransport())
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+        let result = try await executor.execute(
+            task: makeTask(agent: "code_writer", task: "continue_implementation"),
+            agent: makeAgent(id: "code_writer", outputs: []),
+            context: context
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.transportErrorKind == .provider)
+        #expect(result.providerStopReason == "stdin_closed_for_session")
+        #expect(result.errorMessage == "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open")
+        #expect(result.outcomeEnvelope?.providerStopReason == "stdin_closed_for_session")
+        #expect(result.outcomeEnvelope?.rawErrorMessage == "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open")
+    }
+
+    @MainActor
+    @Test("Executor surfaces Gemini capacity exhaustion instead of generic missing outputs")
+    func runtimeExecutorSurfacesGeminiCapacityExhaustionOnSettledStream() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .sessionClosed(raw: "{}")
+            ],
+            runtimeState: RuntimeSessionRuntimeState(
+                enabledExtensions: [],
+                providerDiagnostics: [
+                    RuntimeProviderDiagnostic(
+                        source: "gemini_stderr",
+                        severity: .error,
+                        message: "Attempt 1 failed with status 429. No capacity available for model gemini-3.1-pro-preview on the server. MODEL_CAPACITY_EXHAUSTED",
+                        normalizedReason: "model_capacity_exhausted"
+                    )
+                ]
+            )
+        )
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let baseContext = makeContext(iteration: 1)
+        let geminiBinding = ResolvedProviderBinding(
+            agentID: "proposal_reviewer_ui",
+            backendProfileID: "gemini_review_pro",
+            configuredProviderID: UUID(),
+            providerFamily: "gemini",
+            providerIdentifier: "gemini",
+            model: "gemini-3.1-pro-preview",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "gemini_cli_acp",
+            adapterFamily: "gemini_cli_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: geminiBinding
+        )
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "proposal_reviewer_ui", task: "review_proposal_ui"),
+            agent: makeAgent(id: "proposal_reviewer_ui", outputs: ["proposal_review_ui"]),
+            context: context
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.transportErrorKind == .provider)
+        #expect(result.providerStopReason == "model_capacity_exhausted")
+        #expect(result.errorMessage == "Attempt 1 failed with status 429. No capacity available for model gemini-3.1-pro-preview on the server. MODEL_CAPACITY_EXHAUSTED")
+        #expect(result.outcomeEnvelope?.providerStopReason == "model_capacity_exhausted")
+        #expect(result.outcomeEnvelope?.rawErrorMessage == "Attempt 1 failed with status 429. No capacity available for model gemini-3.1-pro-preview on the server. MODEL_CAPACITY_EXHAUSTED")
     }
 
     @MainActor
@@ -2244,7 +3249,7 @@ struct RuntimeAgentExecutorTests {
         let result = try await executor.execute(task: task, agent: agent, context: context1)
 
         #expect(result.succeeded)
-        #expect(result.sessionReuseDisposition == SessionReuseDisposition.fresh_after_transport_error)
+        #expect(result.sessionReuseDisposition == SessionReuseDisposition.fresh)
         #expect(result.errorMessage == nil)
         #expect(await transport.createSessionCallCount == 2)
         #expect(await transport.submitPromptCallCount == 1)
@@ -2252,13 +3257,11 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
-    @Test("Executor disables session reuse for codex ACP even when the owner key matches")
-    func executorDisablesSessionReuseForCodexACP() async throws {
-        let transport = StaleReuseTransport()
-        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
+    @Test("Executor preserves codex ACP session reuse scope instead of forcing none")
+    func executorPreservesCodexACPReuseScope() async throws {
+        let executor = RuntimeAgentExecutor(transport: PromptCaptureTransport())
 
-        let runID = UUID()
-        let baseContext = makeContext(runID: runID, iteration: 1)
+        let baseContext = makeContext(iteration: 1)
         let codexBinding = ResolvedProviderBinding(
             agentID: "proposal_writer",
             backendProfileID: "codex_writer_high",
@@ -2274,26 +3277,13 @@ struct RuntimeAgentExecutorTests {
             capabilityClass: .operatorGrade
         )
 
-        let context1 = ExecutionContext(
+        let context = ExecutionContext(
             workspace: baseContext.workspace,
             stageID: baseContext.stageID,
             stageLineageID: baseContext.stageLineageID,
             ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
-            iteration: 1,
-            attemptNumber: 1,
-            inputArtifacts: baseContext.inputArtifacts,
-            inputArtifactPaths: baseContext.inputArtifactPaths,
-            variables: baseContext.variables,
-            ideaBody: baseContext.ideaBody,
-            providerBinding: codexBinding
-        )
-        let context2 = ExecutionContext(
-            workspace: baseContext.workspace,
-            stageID: baseContext.stageID,
-            stageLineageID: baseContext.stageLineageID,
-            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
-            iteration: 2,
-            attemptNumber: 1,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
             inputArtifacts: baseContext.inputArtifacts,
             inputArtifactPaths: baseContext.inputArtifactPaths,
             variables: baseContext.variables,
@@ -2319,23 +3309,355 @@ struct RuntimeAgentExecutorTests {
             outputs: ["proposal_current"],
             sessionReuseScope: .same_invocation_owner
         )
+
+        let effectiveAgent = executor.effectiveAgentForExecution(agent, context: context)
+        #expect(effectiveAgent.sessionReuseScope == .same_invocation_owner)
+        #expect(effectiveAgent.runtimeProfileID == agent.runtimeProfileID)
+    }
+
+    @MainActor
+    @Test("Executor retries codex ACP after runaway guardrail trips")
+    func executorRetriesCodexAfterRunawayGuardrail() async throws {
+        let originalMaxToolCalls = RuntimeAgentExecutor.codexACPMaxToolCallCount
+        let originalPollInterval = RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds
+        RuntimeAgentExecutor.codexACPMaxToolCallCount = 3
+        RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = 10
+        defer {
+            RuntimeAgentExecutor.codexACPMaxToolCallCount = originalMaxToolCalls
+            RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = originalPollInterval
+        }
+
+        let transport = CodexRunawayGuardrailTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "proposal_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: [],
+            sessionReuseScope: .same_invocation_owner
+        )
         let task = AgentTask(
             agent: "proposal_writer",
             task: "draft_initial_proposal",
             inputs: nil,
-            outputs: ["proposal_current"]
+            outputs: []
         )
 
-        let firstResult = try await executor.execute(task: task, agent: agent, context: context1)
-        #expect(firstResult.succeeded)
-        #expect(firstResult.sessionReuseDisposition == .fresh)
+        let result = try await executor.execute(task: task, agent: agent, context: context)
 
-        let secondResult = try await executor.execute(task: task, agent: agent, context: context2)
-        #expect(secondResult.succeeded)
-        #expect(secondResult.sessionReuseDisposition == .fresh)
+        #expect(result.succeeded)
+        #expect(result.errorMessage == nil)
         #expect(await transport.createSessionCallCount == 2)
         #expect(await transport.submitPromptCallCount == 2)
-        #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
+        #expect(await transport.submittedSessionIDs == ["codex-guard-1", "codex-guard-2"])
+    }
+
+    @Test("Codex ACP proposal authoring gets a longer execution-age guardrail than implementation")
+    func codexExecutionAgeGuardrailIsLongerForProposalAuthoring() {
+        let proposalAuthoringAgent = makeAgent(id: "proposal_writer", mode: "proposal_authoring")
+        let implementationAgent = makeAgent(
+            id: "code_writer",
+            mode: "implementation",
+            outputs: ["changed_files_manifest"],
+            worktreeWriteEnabled: true
+        )
+
+        #expect(
+            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalAuthoringAgent)
+            > RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: implementationAgent)
+        )
+        #expect(
+            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalAuthoringAgent) == 900
+        )
+        #expect(
+            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: implementationAgent)
+            == RuntimeAgentExecutor.codexACPMaxExecutionSeconds
+        )
+    }
+
+    @MainActor
+    @Test("Executor retries codex ACP after oversized raw tool payload guardrail trips")
+    func executorRetriesCodexAfterOversizedRawToolPayloadGuardrail() async throws {
+        let originalMaxRawPayloadBytes = RuntimeAgentExecutor.codexACPMaxRawToolPayloadBytes
+        let originalPollInterval = RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds
+        RuntimeAgentExecutor.codexACPMaxRawToolPayloadBytes = 256
+        RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = 10
+        defer {
+            RuntimeAgentExecutor.codexACPMaxRawToolPayloadBytes = originalMaxRawPayloadBytes
+            RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = originalPollInterval
+        }
+
+        let transport = CodexOversizedPayloadTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "proposal_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: [],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let task = AgentTask(
+            agent: "proposal_writer",
+            task: "draft_initial_proposal",
+            inputs: nil,
+            outputs: []
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(result.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["codex-payload-1", "codex-payload-2"])
+    }
+
+    @MainActor
+    @Test("Executor retries codex ACP after runtime home growth guardrail trips")
+    func executorRetriesCodexAfterRuntimeHomeGuardrail() async throws {
+        let originalMaxRuntimeHomeBytes = RuntimeAgentExecutor.codexACPMaxRuntimeHomeBytes
+        let originalPollInterval = RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds
+        RuntimeAgentExecutor.codexACPMaxRuntimeHomeBytes = 256
+        RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = 10
+
+        let runtimeHomeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("runtime-home-guardrail-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: runtimeHomeURL, withIntermediateDirectories: true)
+
+        defer {
+            RuntimeAgentExecutor.codexACPMaxRuntimeHomeBytes = originalMaxRuntimeHomeBytes
+            RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = originalPollInterval
+            try? FileManager.default.removeItem(at: runtimeHomeURL)
+        }
+
+        let transport = CodexRuntimeHomeGuardrailTransport(runtimeHomeURL: runtimeHomeURL)
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "proposal_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: [],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let task = AgentTask(
+            agent: "proposal_writer",
+            task: "draft_initial_proposal",
+            inputs: nil,
+            outputs: []
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(result.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+    }
+
+    @MainActor
+    @Test("Executor retries codex ACP after session history token budget trips")
+    func executorRetriesCodexAfterSessionHistoryTokenBudgetTrips() async throws {
+        let originalMaxInputTokens = RuntimeAgentExecutor.codexACPMaxInputTokens
+        let originalMaxCachedInputTokens = RuntimeAgentExecutor.codexACPMaxCachedInputTokens
+        let originalPollInterval = RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds
+        RuntimeAgentExecutor.codexACPMaxInputTokens = 500_000
+        RuntimeAgentExecutor.codexACPMaxCachedInputTokens = 400_000
+        RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = 10
+        defer {
+            RuntimeAgentExecutor.codexACPMaxInputTokens = originalMaxInputTokens
+            RuntimeAgentExecutor.codexACPMaxCachedInputTokens = originalMaxCachedInputTokens
+            RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = originalPollInterval
+        }
+
+        let transport = CodexSessionHistoryGuardrailTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let baseContext = makeContext(iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "proposal_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: [],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let task = AgentTask(agent: "proposal_writer", task: "draft_initial_proposal", inputs: nil, outputs: [])
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(result.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["codex-history-1", "codex-history-2"])
     }
 
     @MainActor
@@ -2387,11 +3709,14 @@ struct RuntimeAgentExecutorTests {
     @Test("ACP proposal reviewer read-loop stall fails early with durable failure evidence")
     func acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence() async throws {
         let originalSilence = RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds
+        let originalThreshold = RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold
         let originalPoll = RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds
         RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds = 0.1
+        RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold = 2
         RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds = 20
         defer {
             RuntimeAgentExecutor.acpProposalReviewStallSilenceSeconds = originalSilence
+            RuntimeAgentExecutor.acpProposalReviewReadLoopThreshold = originalThreshold
             RuntimeAgentExecutor.acpProposalReviewStallPollIntervalMilliseconds = originalPoll
         }
 
@@ -2433,31 +3758,325 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
-    @Test("Executor settles watchdog timeouts through durable failure path without automatic retry")
-    func executorSettlesWatchdogTimeoutWithoutAutomaticRetry() async throws {
+    @Test("Executor surfaces watchdog first-progress hangs without performing retry lineage itself")
+    func executorSurfacesWatchdogFirstProgressHang() async throws {
         let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
-        RuntimeAgentExecutor.executionTimeoutSeconds = 0.05
+        let originalFirstProgress = RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds
+        let originalPoll = RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 1
+        RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds = 0.05
+        RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = 20
         defer {
             RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+            RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds = originalFirstProgress
+            RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = originalPoll
         }
 
         let transport = WatchdogTimeoutTransport()
         let executor = RuntimeAgentExecutor(transport: transport)
+        let baseContext = makeContext()
+        let binding = ResolvedProviderBinding(
+            agentID: "test_agent",
+            backendProfileID: "claude_orchestrator_high",
+            configuredProviderID: UUID(),
+            providerFamily: "claude_code",
+            providerIdentifier: "claude_code",
+            model: "opus",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "claude_agent_acp",
+            adapterFamily: "claude_agent_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            projectRoot: baseContext.projectRoot,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            ideaAttachmentPath: baseContext.ideaAttachmentPath,
+            providerBinding: binding
+        )
 
         let result = try await executor.execute(
             task: makeTask(),
             agent: makeAgent(),
-            context: makeContext()
+            context: context
         )
 
         #expect(!result.succeeded)
-        #expect(result.canonicalOutcome == .timedOutBeforeOutput)
-        #expect(result.transportErrorKind == .timeout)
+        #expect(result.supervisionClassification == .idleHangBeforeFirstProgress)
         #expect(result.outputs["test_agent_receipt.json"] != nil)
         #expect(result.outputs["test_agent_transcript.md"] != nil)
         try await Task.sleep(for: .milliseconds(100))
         #expect(await transport.createSessionCallCount == 1)
-        #expect(await transport.closeSessionCallCount == 1)
+    }
+
+    @MainActor
+    @Test("Executor does not classify streaming thinking activity as before-first-progress hang")
+    func executorDoesNotKillStreamingThinkingBeforeOutput() async throws {
+        let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
+        let originalFirstProgress = RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds
+        let originalPoll = RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 1
+        RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds = 0.05
+        RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = 20
+        defer {
+            RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+            RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds = originalFirstProgress
+            RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = originalPoll
+        }
+
+        let transport = StreamingThinkingBeforeOutputTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let baseContext = makeContext()
+        let binding = ResolvedProviderBinding(
+            agentID: "lead_orchestrator",
+            backendProfileID: "claude_orchestrator_high",
+            configuredProviderID: UUID(),
+            providerFamily: "claude_code",
+            providerIdentifier: "claude_code",
+            model: "opus",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "claude_agent_acp",
+            adapterFamily: "claude_agent_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            projectRoot: baseContext.projectRoot,
+            stageID: "state_4_proposal_reviewed",
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            ideaAttachmentPath: baseContext.ideaAttachmentPath,
+            providerBinding: binding
+        )
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "lead_orchestrator", task: "aggregate_proposal_reviews"),
+            agent: makeAgent(id: "lead_orchestrator", outputs: ["proposal_review_summary"]),
+            context: context
+        )
+
+        #expect(result.succeeded)
+        #expect(result.supervisionClassification == nil)
+        #expect(result.errorMessage == nil)
+    }
+
+    @MainActor
+    @Test("Executor invalidates the active session generation before returning watchdog failure truth")
+    func executorInvalidatesGenerationBeforeReturningWatchdogFailure() async throws {
+        let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
+        let originalFirstProgress = RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds
+        let originalPoll = RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 1
+        RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds = 0.05
+        RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = 20
+        defer {
+            RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+            RuntimeAgentExecutor.acpFirstProgressDeadlineSeconds = originalFirstProgress
+            RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = originalPoll
+        }
+
+        let sessionManager = try makeSessionManager()
+        let transport = WatchdogTimeoutTransport()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let runID = UUID()
+        let baseContext = makeContext(runID: runID)
+        let binding = ResolvedProviderBinding(
+            agentID: "test_agent",
+            backendProfileID: "claude_orchestrator_high",
+            configuredProviderID: UUID(),
+            providerFamily: "claude_code",
+            providerIdentifier: "claude_code",
+            model: "opus",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "claude_agent_acp",
+            adapterFamily: "claude_agent_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: binding
+        )
+        let agent = makeAgent()
+
+        let result = try await executor.execute(
+            task: makeTask(),
+            agent: agent,
+            context: context
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.supervisionClassification == .idleHangBeforeFirstProgress)
+
+        let lineageID = try await sessionManager.getOrCreateLineage(
+            runID: runID,
+            agentID: agent.id,
+            scope: agent.sessionReuseScope,
+            familyID: agent.sessionFamilyID
+        )
+        let lineage = try #require(try await sessionManager.getLineage(id: lineageID))
+        #expect(lineage.activeGenerationID == nil)
+        let generation = try #require(lineage.generations.first)
+        #expect(generation.id == result.sessionGenerationID)
+        #expect(generation.status == .invalidated)
+        #expect(generation.endReason?.contains("idle_hang_before_first_progress") == true)
+        #expect(lineage.events.contains { $0.generationID == generation.id && $0.eventType == .invalidated })
+    }
+
+    @MainActor
+    @Test("Executor fails closed when mutating tool success produces no filesystem side effect")
+    func executorFailsClosedOnMutationSideEffectMissing() async throws {
+        let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
+        let originalMutationDeadline = RuntimeAgentExecutor.acpMutationSideEffectDeadlineSeconds
+        let originalPoll = RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 1
+        RuntimeAgentExecutor.acpMutationSideEffectDeadlineSeconds = 0.05
+        RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = 20
+        defer {
+            RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+            RuntimeAgentExecutor.acpMutationSideEffectDeadlineSeconds = originalMutationDeadline
+            RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = originalPoll
+        }
+
+        let transport = CompletedMutationWithoutSideEffectTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let worktreeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mutation-missing-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+
+        let binding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_builder_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = makeContext(worktreeRoot: worktreeRoot)
+        let writeContext = ExecutionContext(
+            workspace: context.workspace,
+            projectRoot: context.projectRoot,
+            stageID: "state_8_implementation_continued",
+            stageLineageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            inputArtifactPaths: [:],
+            variables: [:],
+            ideaBody: "Test idea body",
+            providerBinding: binding
+        )
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "code_writer", task: "continue_implementation"),
+            agent: makeAgent(id: "code_writer", outputs: ["changed_files_manifest"], worktreeWriteEnabled: true),
+            context: writeContext
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.supervisionClassification == .mutationSideEffectMissing)
+    }
+
+    @MainActor
+    @Test("Executor treats started-but-unfinished edit as post-edit hang, not missing side effect")
+    func executorTreatsStartedButUnfinishedEditAsHang() async throws {
+        let originalTimeout = RuntimeAgentExecutor.executionTimeoutSeconds
+        let originalMutationDeadline = RuntimeAgentExecutor.acpMutationSideEffectDeadlineSeconds
+        let originalFirstEditDeadline = RuntimeAgentExecutor.acpFirstEditSilenceDeadlineSeconds
+        let originalPoll = RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds
+        RuntimeAgentExecutor.executionTimeoutSeconds = 1
+        RuntimeAgentExecutor.acpMutationSideEffectDeadlineSeconds = 1
+        RuntimeAgentExecutor.acpFirstEditSilenceDeadlineSeconds = 0.05
+        RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = 20
+        defer {
+            RuntimeAgentExecutor.executionTimeoutSeconds = originalTimeout
+            RuntimeAgentExecutor.acpMutationSideEffectDeadlineSeconds = originalMutationDeadline
+            RuntimeAgentExecutor.acpFirstEditSilenceDeadlineSeconds = originalFirstEditDeadline
+            RuntimeAgentExecutor.acpWatchdogPollIntervalMilliseconds = originalPoll
+        }
+
+        let transport = StartedEditWithoutCompletionTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+
+        let worktreeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("started-edit-hang-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+
+        let binding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_builder_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let context = makeContext(worktreeRoot: worktreeRoot)
+        let writeContext = ExecutionContext(
+            workspace: context.workspace,
+            projectRoot: context.projectRoot,
+            stageID: "state_8_implementation_continued",
+            stageLineageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            inputArtifactPaths: [:],
+            variables: [:],
+            ideaBody: "Test idea body",
+            providerBinding: binding
+        )
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "code_writer", task: "continue_implementation"),
+            agent: makeAgent(id: "code_writer", outputs: ["changed_files_manifest"], worktreeWriteEnabled: true),
+            context: writeContext
+        )
+
+        #expect(!result.succeeded)
+        #expect(result.supervisionClassification == .idleHangAfterFirstEdit)
+        #expect(result.errorMessage?.contains("'edit'") == true)
     }
 
     @MainActor
@@ -2475,6 +4094,50 @@ struct RuntimeAgentExecutorTests {
         #expect(result.succeeded)
         #expect(result.outputs["proposal_current"] != nil)
         #expect(result.sessionID == "session-eof-2")
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-eof-1", "session-eof-2"])
+    }
+
+    @MainActor
+    @Test("Executor invalidates silent Codex EOF generations before retrying with session reuse enabled")
+    func executorInvalidatesSilentEOFGenerationBeforeRetry() async throws {
+        let transport = SilentEOFRetryTransport()
+        let sessionManager = try makeSessionManager()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let runID = UUID()
+
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "drafting",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "read_only",
+            skillRef: "test_skill",
+            skillRole: nil,
+            prompt: "Refine the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["proposal_current"],
+            sessionReuseScope: .same_agent_family_within_run,
+            sessionFamilyID: "proposal_loop"
+        )
+
+        let result = try await executor.execute(
+            task: makeTask(agent: "proposal_writer", task: "revise_proposal"),
+            agent: agent,
+            context: makeContext(runID: runID)
+        )
+
+        #expect(result.succeeded)
+        #expect(result.outputs["proposal_current"] != nil)
+        #expect(result.sessionID == "session-eof-2")
+        #expect(result.sessionReuseDisposition == .fresh_after_transport_error)
         #expect(await transport.createSessionCallCount == 2)
         #expect(await transport.submitPromptCallCount == 2)
         #expect(await transport.submittedSessionIDs == ["session-eof-1", "session-eof-2"])

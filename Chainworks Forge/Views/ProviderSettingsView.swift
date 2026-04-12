@@ -44,6 +44,18 @@ struct ProviderSettingsView: View {
                         showWizard = true
                     }
                     .accessibilityIdentifier("provider-settings-open-wizard")
+                    if let diagnosticsMessage = appConfigurationStore.diagnosticsMessage {
+                        Label(diagnosticsMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("app-configuration-diagnostics-message")
+                    }
+                    if let diagnosticsMessage = providerSettingsStore.diagnosticsMessage {
+                        Label(diagnosticsMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("provider-settings-diagnostics-message")
+                    }
                 }
                 configuredProvidersSection
                 // Proposal 012 (H-01): Transfer moved inline as secondary section
@@ -254,6 +266,21 @@ struct ProviderSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let diagnosticsMessage = providerSettingsStore.diagnosticsMessage {
+                HStack(alignment: .top, spacing: DesignTokens.Spacing.small) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(DesignTokens.Status.warning)
+                    VStack(alignment: .leading, spacing: DesignTokens.Spacing.compact) {
+                        Text("Provider settings need attention")
+                            .font(DesignTokens.Typography.cardTitle)
+                        Text(diagnosticsMessage)
+                            .font(DesignTokens.Typography.supporting)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityIdentifier("provider-settings-diagnostics-message")
+            }
+
             // Proposal 012 (L-12): Inline refresh error
             if let refreshError {
                 HStack {
@@ -377,8 +404,18 @@ struct ProviderSettingsView: View {
         draft.normalizeForSave()
         let provider = draft.makeProvider()
         providerSettingsStore.upsert(provider: provider)
+        refreshError = nil
         if draft.authMode != .none, !secret.isEmpty {
-            try? providerRegistry.secretStore.setSecret(secret, for: ProviderAdapterSupport.secretKey(for: provider))
+            do {
+                try providerRegistry.secretStore.setSecret(
+                    secret,
+                    for: ProviderAdapterSupport.secretKey(for: provider)
+                )
+            } catch {
+                let message = "Failed to save provider secret for \(provider.displayName): \(error.localizedDescription)"
+                refreshError = message
+                ForgeLogger.app.error(message)
+            }
         }
         draft = ProviderDraft()
         draft.applyFamilyDefaults(draft.family, configuration: appConfigurationStore.configuration)
@@ -414,8 +451,10 @@ struct ProviderSettingsView: View {
                 secretStore: providerRegistry.secretStore
             )
             do {
-                _ = try transfer.importSettings(from: url)
-                importMessage = "Imported settings from \(url.lastPathComponent)"
+                let warnings = try transfer.importSettings(from: url)
+                importMessage = warnings.isEmpty
+                    ? "Imported settings from \(url.lastPathComponent)"
+                    : "Imported settings from \(url.lastPathComponent). " + warnings.joined(separator: " ")
                 Task { await refreshDiagnostics() }
             } catch {
                 importMessage = error.localizedDescription

@@ -111,7 +111,8 @@ The same system is carried into:
 - `ProviderSettingsView`
 - `PilotReadinessView`
 - `FirstRunSetupWizard`
-- `GooseProviderConnectionAssistantView`
+- `ProviderSetupEvidencePanel`
+- `ProviderTroubleshootingPanel`
 
 ### Recovery and supporting surfaces
 

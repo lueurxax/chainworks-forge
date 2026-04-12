@@ -24,11 +24,18 @@ struct MVPSignOffSummaryView: View {
     @State private var pairs: [BenchmarkPair] = []
     @State private var exportMessage: String?
     @State private var isExporting = false
+    @State private var dataLoadWarning: String?
 
     var body: some View {
         ScrollView {
             if let snapshot {
                 VStack(alignment: .leading, spacing: 16) {
+                    if let dataLoadWarning {
+                        Label(dataLoadWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+
                     // 1. Decision header -- GO/HOLD dominant
                     decisionHeader
 
@@ -70,11 +77,18 @@ struct MVPSignOffSummaryView: View {
                 }
                 .padding()
             } else {
-                ContentUnavailableView(
-                    "No Sign-Off Evaluation",
-                    systemImage: "checkmark.seal",
-                    description: Text("No MVP sign-off evaluation has been computed for this run's benchmark cohort yet.")
-                )
+                VStack(spacing: 12) {
+                    if let dataLoadWarning {
+                        Label(dataLoadWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    ContentUnavailableView(
+                        "No Sign-Off Evaluation",
+                        systemImage: "checkmark.seal",
+                        description: Text("No MVP sign-off evaluation has been computed for this run's benchmark cohort yet.")
+                    )
+                }
             }
         }
         .navigationTitle("MVP Sign-Off")
@@ -612,9 +626,18 @@ struct MVPSignOffSummaryView: View {
 
     /// Look up the sign-off snapshot from the run's linked benchmark pair/cohort.
     private func loadSignOffData() {
+        dataLoadWarning = nil
         // Find a benchmark pair that links to this run
         let allPairsDescriptor = FetchDescriptor<BenchmarkPair>()
-        guard let allPairs = try? modelContext.fetch(allPairsDescriptor) else { return }
+        let allPairs: [BenchmarkPair]
+        do {
+            allPairs = try modelContext.fetch(allPairsDescriptor)
+        } catch {
+            let message = "Failed to load benchmark pairs: \(error.localizedDescription)"
+            dataLoadWarning = message
+            ForgeLogger.ui.error("MVPSignOffSummaryView failed to fetch benchmark pairs for run \(run.id): \(error.localizedDescription)")
+            return
+        }
         guard let pair = allPairs.first(where: { $0.appDrivenRecord?.linkedRunID == run.id }) else { return }
         guard let cohortID = pair.cohort?.id else { return }
 
@@ -622,7 +645,15 @@ struct MVPSignOffSummaryView: View {
         let snapshotDescriptor = FetchDescriptor<MVPSignOffDecisionSnapshot>(
             sortBy: [SortDescriptor(\.evaluatedAt, order: .reverse)]
         )
-        guard let allSnapshots = try? modelContext.fetch(snapshotDescriptor) else { return }
+        let allSnapshots: [MVPSignOffDecisionSnapshot]
+        do {
+            allSnapshots = try modelContext.fetch(snapshotDescriptor)
+        } catch {
+            let message = "Failed to load sign-off snapshots: \(error.localizedDescription)"
+            dataLoadWarning = message
+            ForgeLogger.ui.error("MVPSignOffSummaryView failed to fetch sign-off snapshots for run \(run.id): \(error.localizedDescription)")
+            return
+        }
         snapshot = allSnapshots.first(where: { $0.cohortID == cohortID })
     }
 
@@ -635,7 +666,14 @@ struct MVPSignOffSummaryView: View {
                 cohort.id == cohortID
             }
         )
-        cohort = try? modelContext.fetch(cohortDescriptor).first
+        do {
+            cohort = try modelContext.fetch(cohortDescriptor).first
+        } catch {
+            let message = "Failed to load benchmark cohort: \(error.localizedDescription)"
+            dataLoadWarning = dataLoadWarning ?? message
+            ForgeLogger.ui.error("MVPSignOffSummaryView failed to fetch benchmark cohort for run \(run.id): \(error.localizedDescription)")
+            cohort = nil
+        }
 
         // Load pairs
         if let cohort {

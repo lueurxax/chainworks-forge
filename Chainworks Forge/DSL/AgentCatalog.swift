@@ -213,6 +213,8 @@ struct BackendProfile: Codable, Sendable {
     let temperature: Double
     let maxTurns: Int
     let structuredOutput: String
+    /// Canonical runtime-owned MCP requirement set (P033).
+    let mcp: [String]
     /// Proposal 026: References a key in AgentCatalog.runtimeProfiles.
     let runtimeProfile: String?
 
@@ -220,6 +222,7 @@ struct BackendProfile: Codable, Sendable {
         case provider, model, effort, temperature
         case maxTurns = "max_turns"
         case structuredOutput = "structured_output"
+        case mcp
         case runtimeProfile = "runtime_profile"
     }
 
@@ -230,6 +233,7 @@ struct BackendProfile: Codable, Sendable {
         temperature: Double,
         maxTurns: Int,
         structuredOutput: String,
+        mcp: [String] = [],
         runtimeProfile: String? = nil
     ) {
         self.provider = provider
@@ -238,6 +242,7 @@ struct BackendProfile: Codable, Sendable {
         self.temperature = temperature
         self.maxTurns = maxTurns
         self.structuredOutput = structuredOutput
+        self.mcp = Array(Set(mcp)).sorted()
         self.runtimeProfile = runtimeProfile
     }
 
@@ -249,6 +254,7 @@ struct BackendProfile: Codable, Sendable {
         temperature = try container.decode(Double.self, forKey: .temperature)
         maxTurns = try container.decode(Int.self, forKey: .maxTurns)
         structuredOutput = try container.decode(String.self, forKey: .structuredOutput)
+        mcp = Array(Set(try container.decodeIfPresent([String].self, forKey: .mcp) ?? [])).sorted()
         runtimeProfile = try container.decodeIfPresent(String.self, forKey: .runtimeProfile)
     }
 }

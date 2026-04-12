@@ -45,6 +45,12 @@ struct PilotReadinessView: View {
                         if let worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath {
                             LabeledContent("Worktree Base", value: worktreeBasePath)
                         }
+                        if let diagnosticsMessage = appConfigurationStore.diagnosticsMessage {
+                            Label(diagnosticsMessage, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .accessibilityIdentifier("pilot-readiness-app-configuration-diagnostics")
+                        }
                     }
                 }
 

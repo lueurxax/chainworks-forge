@@ -36,11 +36,11 @@ import SwiftData
     var stack: String?
     var experimentCohortID: UUID?
 
-    // P005-OPS §6.5: Report and runtime trust additions
+    // P005-OPS §6.5 / Proposal 033 §6: runtime trust additions
     var latestSummaryArtifactID: UUID?
     var latestImmutableReportArtifactID: UUID?
     var latestReportVersion: Int = 0
-    var runtimeTrustLevel: String?    // "fixture_verified" | "server_unverified" | "server_verified"
+    var runtimeTrustLevel: String?    // "fixture_verified" | legacy "server_*" | ACP-era "runtime_*"
     var providerBindingSnapshotJSON: Data?
     var startOptionsJSON: Data?
 
@@ -193,6 +193,81 @@ import SwiftData
     }
 }
 
+struct RuntimeTrustPresentation: Equatable, Sendable {
+    let rawValue: String?
+    let semanticValue: String?
+
+    init(trustLevel: String?) {
+        self.rawValue = trustLevel
+        switch trustLevel {
+        case "fixture_verified":
+            self.semanticValue = "fixture_verified"
+        case "runtime_verified", "server_verified":
+            self.semanticValue = "runtime_verified"
+        case "runtime_unverified", "server_unverified":
+            self.semanticValue = "runtime_unverified"
+        default:
+            self.semanticValue = nil
+        }
+    }
+
+    var badgeLabel: String {
+        switch rawValue {
+        case "fixture_verified": return "Fixture / verified"
+        case "server_unverified": return "Legacy (unverified)"
+        case "server_verified": return "Legacy (verified)"
+        case "runtime_verified": return "Verified"
+        case "runtime_unverified": return "Unverified"
+        default: return "Unknown"
+        }
+    }
+
+    var badgeIcon: String {
+        switch semanticValue {
+        case "fixture_verified", "runtime_verified":
+            return "checkmark.shield.fill"
+        case "runtime_unverified":
+            return "shield.lefthalf.filled"
+        default:
+            return "questionmark.circle"
+        }
+    }
+
+    var badgeColorName: String {
+        switch semanticValue {
+        case "fixture_verified", "runtime_verified":
+            return "success"
+        case "runtime_unverified":
+            return "warning"
+        default:
+            return "neutral"
+        }
+    }
+}
+
+extension Run {
+    private var persistedOperatorStatusDominatesTransientStageTruth: Bool {
+        switch status {
+        case .waitingApproval, .blocked, .completed, .failed, .cancelled, .cancelling:
+            return true
+        case .pending, .ready, .running:
+            return false
+        }
+    }
+
+    @MainActor var runtimeTrustPresentation: RuntimeTrustPresentation {
+        RuntimeTrustPresentation(trustLevel: runtimeTrustLevel)
+    }
+
+    @MainActor var normalizedRuntimeTrustLevel: String? {
+        runtimeTrustPresentation.semanticValue
+    }
+
+    @MainActor var runtimeTrustDisplayLabel: String {
+        runtimeTrustPresentation.badgeLabel
+    }
+}
+
 enum RunStatus: String, Codable {
     case pending
     case ready
@@ -234,19 +309,33 @@ extension Run {
         if cancellationRequestedAt != nil && cancellationSettledAt == nil {
             return .cancelling
         }
-        if status == .pending || status == .ready || status == .running {
-            let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
-            if let latestStage = sorted.last {
+        let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
+        if let latestStage = sorted.last {
+            if persistedOperatorStatusDominatesTransientStageTruth {
                 switch latestStage.status {
-                case .waitingApproval:
-                    return .waitingApproval
-                case .blocked:
-                    return .blocked
-                case .failed:
-                    return .failed
-                default:
+                case .pending, .ready, .running:
+                    return status
+                case .waitingApproval, .blocked, .failed:
                     break
+                case .completed, .skipped:
+                    return status
                 }
+            }
+            switch latestStage.status {
+            case .pending:
+                return .pending
+            case .ready:
+                return status == .pending ? .pending : .ready
+            case .running:
+                return .running
+            case .waitingApproval:
+                return .waitingApproval
+            case .blocked:
+                return .blocked
+            case .failed:
+                return .failed
+            case .completed, .skipped:
+                break
             }
         }
         return status

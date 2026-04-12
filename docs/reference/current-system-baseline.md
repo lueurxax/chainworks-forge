@@ -24,8 +24,8 @@ At the current baseline, the product includes:
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
-- live Goose-backed execution for real provider sessions,
-- ACP-shaped runtime transport with ACP-native adapters and Goose compatibility transport,
+- live ACP-backed execution for real provider sessions,
+- ACP-only runtime transport with adapter-specific subprocess execution,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
@@ -52,11 +52,10 @@ Use these reference docs as the current source of truth:
 | Frozen runtime and resume truth | [runtime-contract.md](runtime-contract.md) |
 | Skill resolution and runtime injection | [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) |
 | Per-agent MCP policy and runtime validation | [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) |
-| ACP runtime transport and Goose compatibility | [acp-runtime-transport.md](acp-runtime-transport.md) |
+| ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
-| Goose server transport | [goose-server-transport.md](goose-server-transport.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
 | Run surface IA and artifact hierarchy | [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) |
 | Provider/settings platform | [provider-platform.md](provider-platform.md) |
@@ -64,7 +63,6 @@ Use these reference docs as the current source of truth:
 | Stop/cancel truth | [run-control.md](run-control.md) |
 | Idea-owned workspace root | [project-workspace-contract.md](project-workspace-contract.md) |
 | Idea archive/restore | [idea-lifecycle.md](idea-lifecycle.md) |
-| Goose remediation journey | [goose-provider-remediation.md](goose-provider-remediation.md) |
 | Workflow map | [live-workflow-map.md](live-workflow-map.md) |
 | Repo-backed full delivery | [full-mvp-delivery.md](full-mvp-delivery.md) |
 | MVP sign-off | [mvp-sign-off.md](mvp-sign-off.md) |
@@ -92,9 +90,11 @@ That boundary is owned by [operator-experience.md](operator-experience.md).
 
 The current MVP provider families are:
 
-1. `codex`
-2. `claude_code`
-3. `gemini`
+1. `codex_acp`
+2. `claude_acp`
+3. `gemini_acp`
+4. `auggie`
+5. `junie`
 
 That provider set is baseline truth across settings, run start, binding freeze, diagnostics, and sign-off.
 

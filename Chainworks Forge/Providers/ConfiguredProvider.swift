@@ -143,11 +143,11 @@ enum ProviderFamily: String, Codable, CaseIterable, Sendable {
 
     static func from(runtimeIdentifier: String) -> ProviderFamily? {
         switch runtimeIdentifier {
-        case "codex_acp", "codex-acp", "codex":
+        case "codexACP", "codex_acp", "codex-acp", "codex":
             return .codexACP
-        case "claude_acp", "claude-acp", "claude", "claude_code", "claude-code":
+        case "claudeACP", "claude_acp", "claude-acp", "claude", "claude_code", "claude-code":
             return .claudeACP
-        case "gemini_acp", "gemini-acp", "gemini":
+        case "geminiACP", "gemini_acp", "gemini-acp", "gemini":
             return .geminiACP
         case "auggie":
             return .auggie

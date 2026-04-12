@@ -7,7 +7,7 @@ agent:
 
   backend:
     runtime: claude_agent
-    provider: claude_code
+    provider: claude_acp
     model: opus
     effort: high
 

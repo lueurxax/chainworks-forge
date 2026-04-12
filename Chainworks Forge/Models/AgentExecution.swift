@@ -51,6 +51,7 @@ import SwiftData
     var outputEnvelopesJSON: Data?            // Serialized [StructuredOutputEnvelope]
     var compactionMetadataJSON: Data?         // Serialized CompactionMetadata (if output was compacted)
     var canonicalOutcome: AgentCanonicalOutcome?
+    var supervisionClassification: SupervisionClassification?
     var transportErrorKind: TransportErrorKind?
     var providerStopReason: String?
     var outputPresence: OutputPresence?

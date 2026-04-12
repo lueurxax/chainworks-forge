@@ -48,7 +48,8 @@ struct ContentView: View {
             .flatMap(UISurface.init(rawValue:))
         forcedInitialTab = initialTab
         // P005-OPS §5: RunsHomeView is the primary operator landing surface
-        _selectedTab = State(initialValue: initialTab ?? .runsHome)
+        let landingTab = initialTab ?? .runsHome
+        _selectedTab = State(initialValue: landingTab)
     }
 
     private func exampleFileURL(
@@ -82,17 +83,23 @@ struct ContentView: View {
         VStack(spacing: 0) {
             TabView(selection: $selectedTab) {
                 // P005-OPS §5: Primary operator landing surface
-                RunsHomeView()
+                deferredTab(.runsHome) {
+                    RunsHomeView()
+                }
                     .tabItem { Label("Runs Home", systemImage: "house") }
                     .tag(Tab.runsHome)
                     .accessibilityIdentifier("tab-runs-home")
 
-                IdeaListView()
+                deferredTab(.ideas) {
+                    IdeaListView()
+                }
                     .tabItem { Label("Ideas", systemImage: "lightbulb") }
                     .tag(Tab.ideas)
                     .accessibilityIdentifier("tab-ideas")
 
-                ApprovalInboxView()
+                deferredTab(.approvals) {
+                    ApprovalInboxView()
+                }
                     .tabItem {
                         Label("Approvals", systemImage: "checkmark.seal")
                     }
@@ -100,40 +107,48 @@ struct ContentView: View {
                     .badge(executionService.pendingApprovalCount)
                     .accessibilityIdentifier("tab-approvals")
 
-                AgentCatalogView(
-                    catalogURL: exampleFileURL(
-                        configuredPath: appConfigurationStore.configuration.agentCatalogSourcePath,
-                        bundleName: "agents",
-                        repoRelativePath: "examples/agents/agents.yaml"
+                deferredTab(.agentCatalog) {
+                    AgentCatalogView(
+                        catalogURL: exampleFileURL(
+                            configuredPath: appConfigurationStore.configuration.agentCatalogSourcePath,
+                            bundleName: "agents",
+                            repoRelativePath: "examples/agents/agents.yaml"
+                        )
                     )
-                )
+                }
                 .tabItem { Label("Agent Catalog", systemImage: "person.3") }
                 .tag(Tab.agentCatalog)
                 .accessibilityIdentifier("tab-agent-catalog")
 
-                WorkflowInspectorView(
-                    workflowURL: exampleFileURL(
-                        configuredPath: appConfigurationStore.configuration.workflowSourcePath,
-                        bundleName: "workflow",
-                        repoRelativePath: "examples/workflows/workflow.yaml"
-                    ),
-                    compactWorkflowURL: exampleFileURL(bundleName: "proposal-to-release", repoRelativePath: "examples/workflows/proposal-to-release.yaml"),
-                    catalogURL: exampleFileURL(
-                        configuredPath: appConfigurationStore.configuration.agentCatalogSourcePath,
-                        bundleName: "agents",
-                        repoRelativePath: "examples/agents/agents.yaml"
+                deferredTab(.workflowInspector) {
+                    WorkflowInspectorView(
+                        workflowURL: exampleFileURL(
+                            configuredPath: appConfigurationStore.configuration.workflowSourcePath,
+                            bundleName: "workflow",
+                            repoRelativePath: "examples/workflows/workflow.yaml"
+                        ),
+                        compactWorkflowURL: exampleFileURL(bundleName: "proposal-to-release", repoRelativePath: "examples/workflows/proposal-to-release.yaml"),
+                        catalogURL: exampleFileURL(
+                            configuredPath: appConfigurationStore.configuration.agentCatalogSourcePath,
+                            bundleName: "agents",
+                            repoRelativePath: "examples/agents/agents.yaml"
+                        )
                     )
-                )
+                }
                 .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
                 .tag(Tab.workflowInspector)
                 .accessibilityIdentifier("tab-workflow-inspector")
 
-                PilotReadinessView()
+                deferredTab(.pilotReadiness) {
+                    PilotReadinessView()
+                }
                     .tabItem { Label("Pilot Readiness", systemImage: "checkmark.shield") }
                     .tag(Tab.pilotReadiness)
                     .accessibilityIdentifier("tab-pilot-readiness")
 
-                ProviderSettingsView()
+                deferredTab(.providerSettings) {
+                    ProviderSettingsView()
+                }
                     .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
                     .tag(Tab.providerSettings)
                     .accessibilityIdentifier("tab-provider-settings")
@@ -165,6 +180,19 @@ struct ContentView: View {
             }
             // Approval badge on Ideas tab when approvals are pending
             .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
+        }
+    }
+
+    @ViewBuilder
+    private func deferredTab<Content: View>(
+        _ tab: Tab,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        if selectedTab == tab {
+            content()
+        } else {
+            Color.clear
+                .accessibilityHidden(true)
         }
     }
 

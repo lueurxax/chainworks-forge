@@ -5,7 +5,6 @@ import Foundation
 @MainActor
 @Suite("Proposal029", .serialized)
 struct Proposal029Tests {
-
     // MARK: - Test 1: Fail-closed factory throws for unknown adapter family
 
     @Test("Transport factory throws unknownAdapterFamily for unregistered family")
@@ -210,7 +209,7 @@ struct Proposal029Tests {
         }
     }
 
-    @Test("CodexACPTransport prepares isolated CODEX_HOME with auth only")
+    @Test("CodexACPTransport prepares isolated CODEX_HOME with auth and runtime config only")
     func codexTransportPreparesIsolatedRuntimeHome() throws {
         let fileManager = FileManager.default
         let tempRoot = fileManager.temporaryDirectory
@@ -236,7 +235,7 @@ struct Proposal029Tests {
         defer { CodexACPTransport.cleanupRuntimeHomeIfPresent(runtimeHome, fileManager: fileManager) }
 
         #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("auth.json").path))
-        #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("config.toml").path))
+        #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("config.toml").path))
         #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("state_5.sqlite").path))
     }
 
@@ -252,6 +251,7 @@ struct Proposal029Tests {
 
         let scriptURL = tempRoot.appendingPathComponent("fake-codex-acp.py")
         let script = """
+#!/usr/bin/env python3
 import json, sys
 for line in sys.stdin:
     req = json.loads(line)
@@ -264,8 +264,9 @@ for line in sys.stdin:
         sys.exit(0)
 """
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
-        let transport = CodexACPTransport(executablePath: "/usr/bin/python3")
+        let transport = CodexACPTransport(executablePath: scriptURL.path)
         let session = try await transport.createSession(request: RuntimeSessionRequest(
             systemPrompt: "test",
             workingDirectory: tempRoot.path,
@@ -371,15 +372,13 @@ for line in sys.stdin:
         }
     }
 
-    @Test("Example catalog maps codex runtime namespace for rich MCP servers")
-    func exampleCatalogMapsCodexRuntimeNamespaceForRichMCPServers() throws {
+    @Test("Example catalog keeps only realizable Codex MCP requirements inline on backend profiles")
+    func exampleCatalogKeepsOnlyRealizableCodexMCPRequirementsInline() throws {
         let repoRoot = URL(fileURLWithPath: "/Users/user/Documents/Chainworks Forge", isDirectory: true)
         let catalogURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml")
         let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
 
-        for serverID in ["developer", "analyze", "xcode", "context7"] {
-            let runtimeID = catalog.mcpServerRegistry[serverID]?.runtimeIDs["codex"]
-            #expect(runtimeID == serverID)
-        }
+        #expect(catalog.backendProfiles["codex_builder_high"]?.mcp == ["context7", "xcode"])
+        #expect(catalog.backendProfiles["codex_audit_high"]?.mcp == ["xcode"])
     }
 }

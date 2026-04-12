@@ -5,9 +5,9 @@
 | Date | 2026-04-01 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Supersedes | Previous draft: `027-go-temporal-control-plane-extraction.md` |
-| Depends on | Current product semantics already established in the client: execution truth, contract truth, session lineage, proposal-loop fidelity, MCP policy, ACP direction |
-| Goal | Move orchestration and domain logic out of the client into a local Rust control-plane daemon backed by SQLite, while preserving current product semantics and keeping the client functional during the transition. |
+| Supersedes | Previous draft: `050-go-temporal-control-plane-extraction.md` |
+| Depends on | Current product semantics already established in the client: execution truth, contract truth, session lineage, proposal-loop fidelity, MCP policy; P033 ACP-only runtime architecture (implemented) |
+| Goal | Implement a server-side Rust + SQLite control-plane replica of the current client-owned logic, without changing the client yet, so behavior can be validated before cutover. |
 
 ## 1. Why this proposal exists
 
@@ -42,7 +42,10 @@ Instead of introducing a full external workflow platform, this proposal assumes:
 That makes **Rust + SQLite** a better fit than **Go + Temporal** for the current stage of the product.
 
 This proposal does **not** redesign product semantics.
-It moves existing semantics into a smaller, local-first control-plane architecture.
+It builds a smaller, local-first control-plane architecture that reproduces current client behavior first.
+
+Until the thin-client cutover lands, the client remains the owner of user-visible behavior.
+Proposal 027 is therefore a parity replica, not the first ownership transfer.
 
 ---
 
@@ -50,11 +53,11 @@ It moves existing semantics into a smaller, local-first control-plane architectu
 
 After Proposal 027:
 
-- the client is no longer the owner of orchestration logic,
-- a local Rust daemon becomes the owner of workflow truth,
+- a local Rust daemon exists as a server-side parity replica of the current client logic,
 - SQLite becomes the durable local source of truth for runs, stages, approvals, artifacts, and read models,
 - background orchestration is driven by an application-owned workflow engine rather than a third-party workflow platform,
-- the client becomes a thin consumer of projections and commands,
+- the client remains functional and continues to own user-visible behavior during validation,
+- the daemon is ready for parity checking, shadow execution, and later cutover,
 - no existing run/report/recovery semantics should regress.
 
 This proposal intentionally chooses a simpler topology over stronger distributed guarantees.
@@ -124,49 +127,62 @@ This is a conscious trade:
 - more direct control over semantics,
 - easier local deployment.
 
-### 3.4 The client stops owning logic
+### 3.4 The client and daemon have different roles during parity
 
-The client should stop deciding:
+During Proposal 027:
 
-- what stage comes next,
-- how retries work,
-- how approvals mutate state,
-- how session resets are applied,
-- what recovery paths are legal.
+- the daemon must reproduce workflow behavior, persistence semantics, and command handling,
+- the client still remains the user-facing owner until the thin-client cutover,
+- parity can therefore be validated without making the product depend on the daemon yet.
 
-The client should eventually become:
+The client should only stop owning orchestration logic in the later thin-client cutover proposal, after parity proof is green.
 
-- query renderer,
-- artifact viewer,
-- approval/retry/reset command initiator.
+### 3.5 Proposal 027 is the first step, not the cutover
+
+Proposal 027 should be read together with the follow-on work:
+
+- Proposal 041: parity harness, golden runs, and behavioral diff
+- Proposal 042: daemon lifecycle, supervision, packaging, and health
+- Proposal 043: query projections and client consumption contract
+- Proposal 029: northbound MCP command plane
+- Proposal 031: first user-visible cutover to a thin client
+
+This proposal is complete only when the server-side replica exists and is ready to be validated against the current client.
 
 ---
 
 ## 4. Proposed system shape
 
 ```text
-Client UI
-  -> query/read API
-  -> command API
-
-Local Rust Control Plane Daemon
-  -> orchestration engine
-  -> background executor
-  -> projections/read models
-  -> artifact metadata layer
-  -> runtime adapter layer
-  -> command journal / recovery layer
-
-SQLite
-  -> source of truth
-  -> projections
-  -> recovery state
-  -> job scheduling state
-
-Southbound runtimes
-  -> Goose legacy adapter
-  -> future ACP adapters
-  -> provider-specific adapter layer
+SwiftUI Client                    External clients
+[thin; GraphQL-only]              [automation, agents, CLI, ops]
+        │                                  │
+        │ GraphQL                          │ MCP
+        │ (queries, subscriptions,         │ (domain actions,
+        │  mutations)                      │  resources)
+        │                                  │
+        ▼                                  ▼
+┌───────────────────────────────────────────────────┐
+│               Local Rust Control Plane            │
+│                                                   │
+│  domain engine  (workflow brain / decision maker) │
+│  orchestration layer / state machine              │
+│  ACP runtime manager                              │
+│  projection engine                                │
+│  artifact metadata layer                          │
+│  command journal / repair layer                   │
+│  GraphQL server          MCP server               │
+└──────────────────┬──────────────────┬─────────────┘
+                   │                  │
+         SQLite / local FS       ACP adapters
+                   │                  │
+        - source of truth        Claude Agent ACP
+        - projections            Gemini CLI ACP
+        - recovery state         Auggie ACP
+        - job queue              Junie ACP
+        - artifact paths + FS    ...
+          (contents, reports,
+           transcripts, receipts)
 ```
 
 This is intentionally a **small local system**:
@@ -186,16 +202,54 @@ The Rust daemon should run as a local control-plane process.
 
 Recommended characteristics:
 
-- single binary
-- local IPC or localhost API
+- single binary, single-process singleton — no zoo of services
+- local daemon process
+- GraphQL server for the thin SwiftUI client (queries, subscriptions, mutations)
+- MCP server for external clients (automation, agents, CLI)
 - owns background loops
-- owns SQLite connection pool
+- owns SQLite connection pool and local artifact file store
 - can be started by the desktop client or launched independently
 - restart-safe through persisted state in SQLite
 
 ### 5.2 Main subsystems
 
 The daemon should contain at least:
+
+#### Domain engine (the workflow brain)
+The primary decision-maker. Responsible for:
+- run lifecycle
+- stage transitions
+- approval semantics
+- retry legality
+- recovery rules
+- report semantics
+- session lineage policy
+- proposal-loop fidelity
+- MCP policy evaluation
+- runtime binding freeze
+
+Only the domain engine makes product-level decisions.
+ACP runtimes, MCP clients, and GraphQL mutations execute under its authority.
+
+#### Orchestration layer
+Responsible for:
+- evaluating current run state
+- deciding legal next actions
+- enqueuing background work
+- waiting on approval resolution
+- progressing stage lifecycles
+- policy enforcement
+
+#### ACP runtime manager
+Responsible for:
+- selecting the runtime profile for a run
+- creating ACP sessions with correct `cwd` / workspace / MCP set
+- tracking requested → effective runtime truth
+- saving runtime receipts and execution events
+- returning structured execution truth to the domain engine
+
+The ACP runtime manager executes the domain engine's decisions.
+It does not make product-level choices.
 
 #### Command handlers
 Responsible for:
@@ -206,24 +260,16 @@ Responsible for:
 - cancel run
 - clone from snapshot
 
-#### Orchestration engine
-Responsible for:
-- evaluating current run state
-- deciding legal next actions
-- enqueuing background work
-- waiting on approvals
-- progressing stage lifecycles
-
 #### Background executor
 Responsible for:
 - polling runnable work
-- invoking runtime adapters
+- invoking ACP runtime adapters
 - persisting receipts and outcomes
 - updating stage and run settlement state
 
-#### Projection updater
+#### Projection engine
 Responsible for:
-- materializing UI-friendly read models
+- materializing UI-friendly read models (ideas, runs, stages, approvals, artifacts, reports, runtime health, proposal-loop metrics)
 - keeping summary tables fresh
 - supporting reports and recovery views
 
@@ -262,7 +308,27 @@ SQLite should store both:
 
 The system does **not** need a separate event store or separate workflow platform state store in this proposal.
 
-### 6.2 Suggested table groups
+### 6.2 Local file artifact store
+
+Artifact contents are stored on disk, not in SQLite.
+
+The local file store holds:
+- proposal artifacts
+- review artifacts
+- reports
+- transcripts
+- runtime receipts
+- evidence bundles
+- visual artifacts
+
+SQLite stores only the metadata layer on top:
+- file paths and checksums
+- provenance and ownership
+- linkage to runs, stages, and agents
+
+This split keeps SQLite manageable and artifact retrieval direct.
+
+### 6.3 Suggested table groups
 
 #### Canonical execution tables
 - `runs`
@@ -288,7 +354,7 @@ The system does **not** need a separate event store or separate workflow platfor
 - `proposal_loop_metrics`
 - `recovery_recommendations`
 
-### 6.3 Command journal
+### 6.4 Command journal
 
 The daemon should record incoming mutating commands in a durable command journal:
 
@@ -304,7 +370,7 @@ The daemon should record incoming mutating commands in a durable command journal
 This is not full event-sourcing.
 It is a practical audit and repair layer.
 
-### 6.4 Work queue
+### 6.5 Work queue
 
 The daemon should maintain a SQLite-backed `work_items` table for runnable internal jobs, for example:
 
@@ -366,24 +432,37 @@ The goal is **predictable local recovery**.
 
 ---
 
-## 8. API boundary
+## 8. Boundary shape
 
-### 8.1 Client-service boundary
+### 8.1 Northbound boundary shape
 
-The Rust daemon should expose a local command/query interface.
+The Rust daemon exposes two distinct northbound surfaces to different consumers:
 
-The exact transport may be:
+**GraphQL — the only interface for the SwiftUI client**
+- queries and subscriptions for reads and live state
+- mutations as a command façade for operator actions
+- the SwiftUI client never talks to MCP directly
 
-- localhost HTTP
-- Unix domain socket
-- named pipe
-- embedded RPC
+Minimum live subscriptions required for thin-client UX:
+- active run updates
+- active stage updates
+- approval inbox updates
+- runtime / session status updates
 
-Proposal 027 does not force the final choice, but it does require a clean boundary.
+**MCP — the external control plane for non-UI consumers**
+- external agents, automation clients, CLI, ops flows
+- canonical tool surface for creating ideas, starting runs, approvals, retries, resets, comparisons
+- resources: `idea://{id}`, `run://{id}`, `artifact://{id}`, `report://{id}`
+
+MCP publishes domain actions, not internal low-level mutations.
+
+Proposal 027 does not need to finalize every transport detail, but it must preserve this boundary shape.
 
 ### 8.2 Ownership rules
 
-The service owns:
+**During P027 (parity phase):**
+
+The daemon validates that it is capable of owning:
 - workflow truth
 - retries
 - approvals
@@ -392,7 +471,14 @@ The service owns:
 - runtime adapter choice
 - recovery legality
 
-The client owns:
+The client remains the canonical product owner of all of the above until P031.
+`ExecutionService`, `RecoveryCoordinator`, `RunReportBuilder`, and `WorkflowMapProjectionService` stay app-owned throughout P027.
+Daemon projections are verifiable shadow truth, not the live client path.
+
+**After cutover (P031):**
+
+The service becomes the canonical owner.
+The client is reduced to:
 - rendering
 - local view state
 - user interaction
@@ -415,20 +501,17 @@ The client owns:
 - orchestration engine
 - projections
 - startup repair
-- bridge to existing runtime adapters
+- bridge to ACP runtime adapters
 
-### Phase 3 — route one bounded slice through the daemon
+### Phase 3 — validate one bounded slice through the daemon
 - proposal loop or another narrow live slice
 - client remains functional
 - validate parity on real runs
 
-### Phase 4 — move remaining orchestration ownership out of client
-- all execution commands route through daemon
-- client becomes projection/command consumer
-
-### Phase 5 — remove obsolete client-owned orchestration code
-- delete duplicated orchestration logic
-- keep only UI-local state and presentation helpers
+### Phase 4 — prepare northbound and thin-client contracts
+- MCP command plane lands early
+- GraphQL read/query plane stabilizes
+- client remains the active owner until cutover proof is green
 
 ---
 
@@ -454,10 +537,9 @@ The design choice here is:
 
 Proposal 027 does **not**:
 
-- add MCP northbound server support,
-- rewrite the UI,
-- force ACP migration,
-- remove Goose,
+- perform the user-visible thin-client cutover,
+- finalize the GraphQL client contract,
+- finalize MCP command exposure,
 - solve runtime-provider comparison,
 - optimize for multi-node scale,
 - implement strong distributed guarantees,
@@ -496,7 +578,8 @@ Risk:
 - client and daemon both think they own run truth.
 
 Mitigation:
-- authority transfer plan,
+- parity validation confirms the daemon holds the same truth as the live app-owned path before any cutover,
+- authority transfer is explicitly deferred to P031; no shared ownership window exists in P027,
 - feature-flagged slices,
 - no new business logic added to the client.
 
@@ -515,14 +598,14 @@ Mitigation:
 
 Proposal 027 is complete when:
 
-1. orchestration logic is executable in the Rust daemon,
+1. orchestration logic is executable in the Rust daemon end-to-end,
 2. SQLite is the durable local source of truth for at least one real workflow slice,
-3. the client can render run/stage/approval/artifact state entirely from service projections,
-4. approval and retry flows work via service commands,
+3. daemon projections correctly replicate run/stage/approval/artifact state and are verifiable through a parity comparison tool; client-side migration to service projections is owned by P031 and P043,
+4. approval and retry commands are processed correctly through the daemon service layer under parity validation; client command routing to the daemon is owned by P029 and P031,
 5. current product semantics do not regress,
 6. the system can survive process restart with predictable local repair,
-7. the client is no longer the owner of workflow decisions,
-8. the full local topology remains “daemon + SQLite” without requiring a separate workflow platform.
+7. the daemon can own workflow decisions end-to-end in a validated parity context; the client authority transfer is deferred to P031,
+8. the full local topology remains “daemon + SQLite + local file store” without requiring a separate workflow platform.
 
 ---
 
@@ -531,7 +614,7 @@ Proposal 027 is complete when:
 Proposal 027 should be treated as a local-first control-plane extraction, not as a platform migration.
 
 The goal is not to chase infrastructure sophistication.
-The goal is to move workflow truth out of the client and into a small, explicit, maintainable local system.
+The goal is to build and validate a daemon that is capable of holding workflow truth — so that P031 can make the authority transfer safely.
 
 Rust + SQLite is the right choice here if the priorities are:
 

@@ -271,9 +271,10 @@ final class SessionReuseKPIExporter {
             }
             return artifacts.count
         }()
-        let mcpExecutions = allExecutions.filter {
-            guard let profileID = $0.mcpProfileID?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
-            return !profileID.isEmpty && profileID != "none"
+        let mcpExecutions = allExecutions.filter { execution in
+            !decodeStringArray(execution.requestedMCPExtensionsJSON).isEmpty
+                || !decodeStringArray(execution.effectiveMCPRuntimeExtensionIDsJSON).isEmpty
+                || !decodeStringArray(execution.deniedMCPExtensionsJSON).isEmpty
         }
         let totalRequestedExtensionCount = mcpExecutions.reduce(0) { partial, execution in
             partial + decodeStringArray(execution.requestedMCPExtensionsJSON).count

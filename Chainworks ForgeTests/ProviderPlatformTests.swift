@@ -9,6 +9,20 @@ import AppKit
 @MainActor
 @Suite("ProviderPlatform", .tags(.fast, .provider))
 struct ProviderPlatformTests {
+    private struct RawBookmarkRecord: Codable {
+        let path: String
+        let kind: SecurityScopedBookmarkKind
+        let bookmarkData: Data
+    }
+
+    private struct ThrowingExtensionRegistryProvider: RuntimeExtensionRegistryProvider {
+        let error: Error
+
+        func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot {
+            throw error
+        }
+    }
+
     private static var retainedObjects: [AnyObject] = []
     private static var retainedRegistries: [ProviderRegistry] = []
 
@@ -69,7 +83,7 @@ struct ProviderPlatformTests {
       execution:
         single_active_run_per_idea: true
       required_providers:
-        - codex
+        - codexACP
     variables: {}
     states:
       state_1_write:
@@ -89,7 +103,7 @@ struct ProviderPlatformTests {
       code_writer:
         title: Code Writer
         mode: tool_use
-        provider: codex
+        provider: codexACP
         model: codex
         effort: high
         max_turns: 5
@@ -275,6 +289,25 @@ struct ProviderPlatformTests {
         #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
     }
 
+    @Test("Workflow YAML remains readable through security-scoped access")
+    mutating func workflowYAMLRemainsReadableThroughSecurityScopedAccess() throws {
+        clearSecurityScopedBookmarks()
+
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            clearSecurityScopedBookmarks()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let (workflowURL, _) = try makeCanonicalYAMLCopies(in: tempDirectory)
+        SecurityScopedAccess.remember(url: workflowURL, kind: .workflowSource)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+
+        #expect(workflow.workflow.id.isEmpty == false)
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().contains(workflowURL.standardizedFileURL.path))
+    }
+
     @Test("Fixture live runtime is ready")
     mutating func fixtureLiveRuntimeIsReady() throws {
         let tempDirectory = try makeTempDirectory()
@@ -306,6 +339,50 @@ struct ProviderPlatformTests {
             #expect(source == "Fixture backend")
         case .unavailable(let reason, let recovery):
             Issue.record("Fixture runtime should be ready, got unavailable: \(reason) / \(recovery)")
+        }
+    }
+
+    @Test("ACP-backed live runtime is ready when providers are configured")
+    mutating func acpBackedLiveRuntimeIsReadyWhenProvidersAreConfigured() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let (_, context) = try makeTestModelContainer()
+        let provider = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gpt-5.4"
+        )
+        let settingsStore = ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [provider],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: provider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        )
+        let registry = retain(ProviderRegistry(settingsStore: settingsStore))
+        let catalog = try YAMLParser.loadAgentCatalog(from: testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml"))
+
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(simulatedDelay: 0),
+            catalog: catalog,
+            stewardConfig: nil,
+            liveRuntimeConfiguration: nil,
+            providerRegistry: registry
+        )
+
+        #expect(service.supportsLiveExecution)
+        switch service.liveRuntimeReadiness {
+        case .ready(let summary, let source):
+            #expect(summary.contains("ACP"))
+            #expect(source == "Agent catalog")
+        case .unavailable(let reason, let recovery):
+            Issue.record("ACP runtime should be ready, got unavailable: \(reason) / \(recovery)")
         }
     }
 
@@ -661,6 +738,127 @@ struct ProviderPlatformTests {
         }
         #expect(appStore.configuration == initialConfiguration)
         #expect(providerStore.settings.configuredProviders.map(\.displayName) == ["Initial Codex"])
+    }
+
+    @Test("Settings import surfaces bookmark persistence warnings")
+    mutating func settingsImportSurfacesBookmarkPersistenceWarnings() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            SecurityScopedAccess.resetForTesting()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: AppConfiguration.seededDefault()
+        ))
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: .empty
+        ))
+
+        let importedProvider = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Imported Codex",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gpt-5"
+        )
+        let package = ExportableSettingsPackage(
+            transferSchemaVersion: SettingsTransferService.currentSchemaVersion,
+            appConfiguration: AppConfiguration(
+                runStorageBasePath: "/imported/runs",
+                worktreeBasePath: nil,
+                workflowSourcePath: "/imported/workflow.yaml",
+                agentCatalogSourcePath: "/imported/agents.yaml",
+                supportBundleExportPath: nil,
+                activeConfigurationSource: .persistedSettings
+            ),
+            providerSettings: ProviderSettings(
+                configuredProviders: [importedProvider],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: importedProvider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            ),
+            exportedAt: Date(),
+            appVersion: "dev",
+            secretPlaceholders: []
+        )
+
+        let packageURL = tempDirectory.appendingPathComponent("chainworks-settings.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(package).write(to: packageURL, options: .atomic)
+
+        SecurityScopedAccess.installBookmarkDataProviderForTesting { _ in
+            struct BookmarkFailure: LocalizedError {
+                var errorDescription: String? { "bookmark fixture failed" }
+            }
+            throw BookmarkFailure()
+        }
+
+        let service = SettingsTransferService(
+            appConfigurationStore: appStore,
+            providerSettingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.import-warning")
+        )
+
+        let warnings = try service.importSettings(from: packageURL)
+
+        #expect(warnings.count == 1)
+        #expect(warnings[0].contains("could not be bookmarked"))
+        #expect(appStore.configuration.runStorageBasePath == "/imported/runs")
+        #expect(providerStore.settings.configuredProviders.map(\.displayName) == ["Imported Codex"])
+    }
+
+    @Test("Security-scoped access reports bookmark creation failure")
+    mutating func securityScopedAccessReportsBookmarkCreationFailure() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            SecurityScopedAccess.resetForTesting()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let targetURL = tempDirectory.appendingPathComponent("workflow.yaml")
+        try "schema_version: 1\n".write(to: targetURL, atomically: true, encoding: .utf8)
+
+        SecurityScopedAccess.installBookmarkDataProviderForTesting { _ in
+            struct BookmarkFailure: LocalizedError {
+                var errorDescription: String? { "bookmark fixture failed" }
+            }
+            throw BookmarkFailure()
+        }
+
+        let saved = SecurityScopedAccess.remember(url: targetURL, kind: .workflowSource)
+
+        #expect(saved == false)
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
+    }
+
+    @Test("Security-scoped access prunes stale temporary bookmarks without resolving them")
+    mutating func securityScopedAccessPrunesStaleTemporaryBookmarks() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            SecurityScopedAccess.resetForTesting()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let targetURL = tempDirectory
+            .appendingPathComponent("examples/workflows", isDirectory: true)
+            .appendingPathComponent("proposal-to-release.yaml")
+        let encoded = try JSONEncoder().encode([
+            RawBookmarkRecord(
+                path: targetURL.standardizedFileURL.path,
+                kind: .workflowSource,
+                bookmarkData: Data("stale".utf8)
+            )
+        ])
+        SecurityScopedAccess.setRawBookmarkStoreDataForTesting(encoded)
+
+        let exists = SecurityScopedAccess.fileExists(at: targetURL)
+
+        #expect(exists == false)
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
     }
 
     @Test("Preflight fails when required provider family is missing")
@@ -1047,6 +1245,106 @@ struct ProviderPlatformTests {
         #expect(!report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("provider requires attention") })
     }
 
+    @Test("Simulated preflight skips runtime MCP validation when registry is unavailable")
+    mutating func simulatedPreflightSkipsRuntimeMCPValidationWhenRegistryUnavailable() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
+        let configuration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: configuration
+        ))
+        let codex = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .none,
+            defaultModel: "gpt-5"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [codex],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: codex.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.simulated-mcp-skip"),
+            adapters: makeAdapters()
+        ))
+        let preflight = PreflightService(
+            appConfigurationStore: appStore,
+            providerRegistry: registry,
+            extensionRegistryProvider: ThrowingExtensionRegistryProvider(error: CocoaError(.fileNoSuchFile))
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Proposal Reviewer / Architect",
+            mode: "tool_use",
+            backendProfileID: "codex_architect_high",
+            provider: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 8,
+            temperature: 0,
+            permissionProfile: "read_only",
+            mcpProfileID: "codex_architect_high",
+            requestedMCPServerIDs: ["context7", "xcode"],
+            skillRef: "skill",
+            skillRole: nil,
+            prompt: "Review the proposal as an architect",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_architect"],
+            runtimeProfileID: "codex_acp"
+        )
+
+        let plan = RunPlan(
+            workflowID: "simulated_mcp_skip",
+            workflowTitle: "Simulated MCP Skip",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let report = await preflight.runReport(
+            workflowURL: URL(fileURLWithPath: configuration.workflowSourcePath),
+            catalogURL: URL(fileURLWithPath: configuration.agentCatalogSourcePath),
+            plan: plan,
+            requiresRuntimeMCPValidation: false
+        )
+
+        #expect(report.status != .fail)
+        #expect(!report.blockingIssues.contains { $0.contains("Runtime extension registry is unavailable") })
+        #expect(report.warnings.contains { $0.contains("skipped for simulated execution mode") })
+        let mcpCheck = try #require(report.checks.first { $0.title == "Backend MCP — proposal_reviewer_architect" })
+        #expect(mcpCheck.status == .warn)
+    }
+
     @Test("Sample run launcher creates frozen provider binding snapshot")
     mutating func sampleRunLauncherCreatesFrozenProviderBindingSnapshot() async throws {
         let tempDirectory = try makeTempDirectory()
@@ -1321,5 +1619,73 @@ struct ProviderPlatformTests {
         let persisted = try JSONDecoder().decode(ProviderSettings.self, from: Data(contentsOf: fileURL))
         let persistedClaude = try #require(persisted.configuredProviders.first)
         #expect(persistedClaude.defaultModel == "opus")
+    }
+
+    @Test("Provider settings store surfaces malformed persisted settings load failures")
+    mutating func providerSettingsStoreSurfacesMalformedPersistedSettingsLoadFailures() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let fileURL = tempDirectory.appendingPathComponent("provider-settings.json")
+        try "{not-json".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let store = retain(ProviderSettingsStore(fileURL: fileURL))
+
+        let message = try #require(store.diagnosticsMessage)
+        #expect(message.contains("Failed to load persisted provider settings"))
+        #expect(store.settings.configuredProviders.isEmpty == false)
+    }
+
+    @Test("Provider settings store surfaces persistence failures")
+    mutating func providerSettingsStoreSurfacesPersistenceFailures() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let fileURL = tempDirectory.appendingPathComponent("provider-settings.json", isDirectory: true)
+        try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+
+        let store = retain(ProviderSettingsStore(
+            fileURL: fileURL,
+            initialSettings: ProviderSettings(
+                configuredProviders: [],
+                preferredProviderIDsByFamily: [:],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+
+        let message = try #require(store.diagnosticsMessage)
+        #expect(message.contains("Failed to persist provider settings during initialization"))
+    }
+
+    @Test("Gemini ACP health check uses the gemini CLI executable")
+    mutating func geminiACPHealthCheckUsesGeminiExecutable() async throws {
+        guard ProcessSupport.which("gemini") != nil else {
+            Issue.record("gemini is not installed on this machine; skipping environment-dependent Gemini ACP health check")
+            return
+        }
+
+        let provider = ConfiguredProvider(
+            family: .geminiACP,
+            displayName: "Gemini ACP",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gemini-2.5-pro"
+        )
+
+        let snapshot = await GeminiACPProviderAdapter().verify(
+            provider: provider,
+            secretStore: makeTestSecretStore("com.chainworks.tests.gemini-acp-health")
+        )
+
+        #expect(!snapshot.blockingIssues.contains { $0.contains("gemini-cli-acp") })
+        #expect(!snapshot.blockingIssues.contains { $0.contains("Executable 'gemini' is not available on PATH") })
+    }
+
+    @Test("Provider family resolver accepts canonical ACP family raw values")
+    func providerFamilyResolverAcceptsCanonicalACPValues() {
+        #expect(ProviderFamily.from(runtimeIdentifier: ProviderFamily.codexACP.rawValue) == .codexACP)
+        #expect(ProviderFamily.from(runtimeIdentifier: ProviderFamily.claudeACP.rawValue) == .claudeACP)
+        #expect(ProviderFamily.from(runtimeIdentifier: ProviderFamily.geminiACP.rawValue) == .geminiACP)
     }
 }

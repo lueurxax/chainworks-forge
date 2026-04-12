@@ -569,7 +569,8 @@ struct AppBootstrapView: View {
             executor: executor,
             catalog: catalog,
             stewardConfig: stewardConfig,
-            liveRuntimeConfiguration: liveRuntimeConfiguration
+            liveRuntimeConfiguration: liveRuntimeConfiguration,
+            providerRegistry: providerRegistry
         )
         executionService = service
         #if os(macOS)
@@ -1024,7 +1025,12 @@ struct AppBootstrapView: View {
         if let existingIdea = existingIdeas.first(where: { $0.title == title }) {
             if let seededWorkspaceRoot, !seededWorkspaceRoot.isEmpty {
                 existingIdea.workspaceRootPath = seededWorkspaceRoot
-                try? modelContext.save()
+                do {
+                    try modelContext.save()
+                } catch {
+                    ForgeLogger.app.error("Failed to persist seeded idea workspace root: \(error.localizedDescription)")
+                    UIAutomationDiagnostics.log("Failed to persist seeded idea workspace root: \(error.localizedDescription)")
+                }
             }
             return
         }
@@ -1036,7 +1042,12 @@ struct AppBootstrapView: View {
             workspaceRootPath: seededWorkspaceRoot?.isEmpty == false ? seededWorkspaceRoot : nil
         )
         modelContext.insert(idea)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            ForgeLogger.app.error("Failed to persist seeded UI test idea '\(title)': \(error.localizedDescription)")
+            UIAutomationDiagnostics.log("Failed to persist seeded UI test idea '\(title)': \(error.localizedDescription)")
+        }
     }
 
     @MainActor
@@ -1068,7 +1079,16 @@ struct AppBootstrapView: View {
         }()
 
         if idea.runs.contains(where: { $0.workflowID == "proposal_loop_live" }) {
-            try? modelContext.save()
+            do {
+                try modelContext.save()
+            } catch {
+                ForgeLogger.app.error(
+                    "Failed to persist seeded waiting-approval idea state for '\(title)': \(error.localizedDescription)"
+                )
+                UIAutomationDiagnostics.log(
+                    "Failed to persist seeded waiting-approval idea state for '\(title)': \(error.localizedDescription)"
+                )
+            }
             return
         }
 

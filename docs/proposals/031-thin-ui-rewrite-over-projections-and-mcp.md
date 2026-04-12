@@ -5,12 +5,12 @@
 | Date | 2026-04-01 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposal 027 (Go + Temporal control plane), Proposal 029 (MCP northbound control-plane server) |
-| Goal | Rewrite the UI so it becomes a thin view layer over service projections and MCP-driven control commands, with no orchestration logic left in the client. |
+| Depends on | Proposal 027, Proposal 029, Proposal 041, Proposal 042, Proposal 043 |
+| Goal | Make the first user-visible cutover from client-owned logic to a thin UI over GraphQL projections and MCP-driven control commands. |
 
 ## 1. Why this proposal exists
 
-Once orchestration moves into the Go service and MCP becomes the control surface, the UI should stop pretending to be a semi-independent runtime.
+Once server parity is proven, daemon lifecycle is productized, GraphQL projections are defined, and MCP is available as the control surface, the UI should stop pretending to be a semi-independent runtime.
 
 The UI should become:
 - a renderer of read models,
@@ -28,6 +28,8 @@ After Proposal 031:
 - UI state becomes disposable,
 - the client becomes easier to rewrite, swap, or replace.
 
+Proposal 031 is the first proposal in this roadmap that changes the user-visible ownership boundary.
+
 ## 3. Core decision
 
 ### 3.1 Commands through MCP
@@ -42,13 +44,12 @@ All operator mutations should flow through MCP:
 
 ### 3.2 Reads from projections
 View surfaces should render from:
-- control-plane projections
-- read-model queries
-- optional streaming query updates
-
-The UI may read through optimized service endpoints rather than forcing all list/detail rendering through MCP.
+- GraphQL projections
+- GraphQL queries
+- optional GraphQL subscriptions or equivalent server-owned streaming updates
 
 MCP remains the control path.
+GraphQL is the canonical read path.
 
 ## 4. UI surface plan
 
@@ -76,7 +77,7 @@ It should only render and invoke.
 
 ```text
 UI
-  -> read service projections
+  -> GraphQL queries/subscriptions
   -> invoke MCP control commands
   -> render results and status
 ```
@@ -94,6 +95,12 @@ UI
 ### Phase 3
 - remove obsolete local state stores and orchestration code
 - keep only UI-local presentation state
+
+This cutover must not happen before:
+
+- parity proof is green (Proposal 041)
+- daemon lifecycle is dependable (Proposal 042)
+- the query/projection contract is explicit (Proposal 043)
 
 ## 7. Design goals
 
@@ -142,10 +149,11 @@ Mitigation:
 Proposal 031 is complete when:
 
 1. the UI renders run/stage/approval/artifact/report state from service projections,
-2. operator actions are executed through MCP-backed commands,
-3. the client no longer owns orchestration logic,
-4. removing the client would not destroy workflow truth,
-5. the product remains usable and debuggable from the UI.
+2. GraphQL is the canonical read/query surface for the client,
+3. operator actions are executed through MCP-backed commands,
+4. the client no longer owns orchestration logic,
+5. removing the client would not destroy workflow truth,
+6. the product remains usable and debuggable from the UI.
 
 ## 11. Final recommendation
 
