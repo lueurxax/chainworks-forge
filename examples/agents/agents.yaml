@@ -469,7 +469,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.4
+    model: gpt-5
     effort: high
     temperature: 0.12
     max_turns: 18
@@ -499,7 +499,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.4
+    model: gpt-5
     effort: extra high
     temperature: 0.1
     max_turns: 16
@@ -510,7 +510,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.4
+    model: gpt-5
     effort: high
     temperature: 0.1
     max_turns: 24
@@ -521,7 +521,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.4
+    model: gpt-5
     effort: extra high
     temperature: 0.0
     max_turns: 18
@@ -551,7 +551,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.4
+    model: gpt-5
     effort: low
     temperature: 0.0
     max_turns: 8
