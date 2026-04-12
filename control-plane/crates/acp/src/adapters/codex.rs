@@ -172,8 +172,9 @@ fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
     Ok(runtime_home)
 }
 
-/// Strip sandbox-related settings from config.toml.
-/// Matches Swift `sanitizeRuntimeConfig`.
+/// Sanitize config.toml for the isolated runtime:
+/// - Strip sandbox settings (matches Swift `sanitizeRuntimeConfig`)
+/// - Strip model and model_reasoning_effort so session/new model takes priority
 fn sanitize_runtime_config(source: &str) -> String {
     source
         .lines()
@@ -181,6 +182,9 @@ fn sanitize_runtime_config(source: &str) -> String {
             let trimmed = line.trim().to_lowercase();
             !trimmed.starts_with("sandbox")
                 && !trimmed.starts_with("disable_sandbox")
+                && !trimmed.starts_with("model")
+                && !trimmed.starts_with("model_reasoning_effort")
+                && !trimmed.starts_with("hide_rate_limit")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -210,15 +214,8 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
 
 /// Map a model identifier to the Codex CLI catalog.
 /// Matches Swift `mapModelForCodexCatalog`.
+/// Map a model identifier to the Codex CLI catalog.
+/// Known models pass through; effort level from YAML is appended as /suffix.
 fn map_model_for_codex(model: &str) -> String {
-    let lowered = model.to_lowercase();
-    match lowered.as_str() {
-        "gpt-5" | "gpt-5-codex" | "o4-mini" => lowered,
-        _ => {
-            if lowered.contains("gpt-5") { return "gpt-5".to_string(); }
-            if lowered.contains("codex") { return "gpt-5-codex".to_string(); }
-            if lowered.contains("o4-mini") { return "o4-mini".to_string(); }
-            "gpt-5".to_string()
-        }
-    }
+    model.to_lowercase()
 }
