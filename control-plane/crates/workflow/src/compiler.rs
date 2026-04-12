@@ -60,6 +60,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
 struct AgentBinding {
     provider: String,
     model: Option<String>,
+    prompt: Option<String>,
 }
 
 fn build_agent_lookup(cat: &catalog::AgentCatalogFile) -> Result<HashMap<String, AgentBinding>> {
@@ -80,16 +81,24 @@ fn build_agent_lookup(cat: &catalog::AgentCatalogFile) -> Result<HashMap<String,
 
         let provider = normalize_provider(&profile.provider);
         let model = profile.model.clone();
+        let prompt = agent.prompt.clone();
 
-        lookup.insert(agent.id.clone(), AgentBinding { provider, model });
+        lookup.insert(agent.id.clone(), AgentBinding { provider, model, prompt });
     }
     Ok(lookup)
 }
 
 /// Normalize YAML provider names to ACP adapter names.
 /// `claude_acp` → `claude`, `codex_acp` → `codex`, `gemini_acp` → `gemini`, etc.
-/// If the name doesn't end with `_acp`, it's used as-is.
+/// Also handles runtime-profile flavored providers like `claude_agent_acp` and `gemini_cli_acp`.
+/// If the name doesn't end with a known ACP suffix, it's used as-is.
 fn normalize_provider(yaml_provider: &str) -> String {
+    if let Some(stripped) = yaml_provider.strip_suffix("_agent_acp") {
+        return stripped.to_string();
+    }
+    if let Some(stripped) = yaml_provider.strip_suffix("_cli_acp") {
+        return stripped.to_string();
+    }
     yaml_provider
         .strip_suffix("_acp")
         .unwrap_or(yaml_provider)
@@ -157,19 +166,18 @@ fn resolve_agent(
             agent_id: agent_id.to_string(),
             provider: binding.provider.clone(),
             model: binding.model.clone(),
+            prompt: binding.prompt.clone(),
         }),
         None => {
-            // Agent not in catalog — warn but don't fail. Use a placeholder
-            // so the plan still compiles. The orchestrator can decide at
-            // runtime whether to fail or use a default provider.
             warn!(
                 agent_id = agent_id,
                 "Agent not found in catalog; using placeholder binding"
             );
             Ok(ResolvedAgent {
                 agent_id: agent_id.to_string(),
-                provider: "claude".to_string(), // safe default
+                provider: "claude".to_string(),
                 model: None,
+                prompt: None,
             })
         }
     }

@@ -39,6 +39,8 @@ pub struct ResolvedAgent {
     /// Bare ACP provider name: "claude", "codex", "gemini", "auggie", "junie".
     pub provider: String,
     pub model: Option<String>,
+    /// System prompt from the agent catalog (agents[].prompt).
+    pub prompt: Option<String>,
 }
 
 /// A compiled agent task invocation.

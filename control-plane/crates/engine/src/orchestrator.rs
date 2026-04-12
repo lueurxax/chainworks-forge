@@ -207,6 +207,26 @@ impl Orchestrator {
             });
         }
 
+        // Build the prompt: agent system prompt from YAML + task context.
+        // Matches Swift's ClaudeAgentACPTransport.submitPrompt() pattern:
+        // "## System Instructions\n{agent.prompt}\n\n---\n\n{task_content}"
+        let agent_prompt = state.owner.prompt.as_deref().unwrap_or("");
+        let task_names: Vec<&str> = state.tasks.iter().map(|t| t.task_name.as_str()).collect();
+        let task_context = if task_names.is_empty() {
+            format!("Execute state '{}' (label: {}).", current_state_id, state.label)
+        } else {
+            format!(
+                "Execute the following tasks for state '{}': {}",
+                state.label,
+                task_names.join(", ")
+            )
+        };
+        let full_prompt = if agent_prompt.is_empty() {
+            task_context
+        } else {
+            format!("## System Instructions\n{agent_prompt}\n\n---\n\n{task_context}")
+        };
+
         self.work_queue
             .enqueue(
                 WorkItemKind::InvokeAgent,
@@ -218,6 +238,7 @@ impl Orchestrator {
                     "stage_execution_id": stage.id.to_string(),
                     "agent_id": state.owner.agent_id,
                     "provider": state.owner.provider,
+                    "prompt": full_prompt,
                 }),
             )
             .await?;

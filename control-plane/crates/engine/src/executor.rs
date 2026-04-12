@@ -168,13 +168,20 @@ impl BackgroundExecutor {
                 let run = db::repos::runs::find_by_id(&self.pool, run_id)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+                // Use the prompt from the work item payload if provided
+                // (workflow-driven runs include the agent's system prompt from YAML).
+                let prompt = payload["prompt"]
+                    .as_str()
+                    .unwrap_or(&format!("Execute stage {} for run {}", stage_id, run_id))
+                    .to_string();
+
                 let req = acp::ExecutionRequest {
                     run_id,
                     stage_id: stage_id.clone(),
                     agent_id: agent_id.clone(),
                     provider: provider.clone(),
                     workspace_root: run.workspace_root.clone(),
-                    prompt: format!("Execute stage {} for run {}", stage_id, run_id),
+                    prompt,
                 };
                 let result = self.acp.execute(req).await?;
 

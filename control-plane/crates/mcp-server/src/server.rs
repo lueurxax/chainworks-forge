@@ -208,6 +208,11 @@ impl McpServer {
                 }))
             }
 
+            "resources/templates/list" => {
+                // No parameterized resource templates yet.
+                JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": [] }))
+            }
+
             "resources/read" => {
                 let params = req.params.unwrap_or(serde_json::Value::Null);
                 let uri = match params["uri"].as_str() {

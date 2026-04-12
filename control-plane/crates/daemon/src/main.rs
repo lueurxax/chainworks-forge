@@ -14,8 +14,10 @@ use engine::work_queue::WorkQueue;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Init tracing
+    // 1. Init tracing — always write to stderr so MCP stdio mode
+    //    keeps stdout clean for JSON-RPC protocol messages.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
