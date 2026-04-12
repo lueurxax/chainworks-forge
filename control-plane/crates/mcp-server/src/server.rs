@@ -64,10 +64,19 @@ impl McpServer {
                 }
             };
 
-            let response = self.handle_request(request).await;
-            if let Ok(json) = serde_json::to_string(&response) {
-                // MCP rule: responses go to stdout, logs to stderr
-                let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+            // JSON-RPC 2.0: notifications (id absent or null) must not
+            // receive a response. Only handle + reply for requests.
+            let is_notification = request.id.is_none()
+                || matches!(&request.id, Some(serde_json::Value::Null));
+
+            if is_notification {
+                // Fire-and-forget: process but don't reply.
+                let _ = self.handle_request(request).await;
+            } else {
+                let response = self.handle_request(request).await;
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+                }
             }
         }
 
@@ -215,7 +224,9 @@ impl McpServer {
             }
 
             "notifications/initialized" => {
-                // Notification — no response needed, but return an empty result
+                info!("MCP client initialized notification received");
+                // JSON-RPC spec: the response for a notification is suppressed
+                // by the stdio loop, but we return a no-op here for completeness.
                 JsonRpcResponse::success(id, serde_json::json!(null))
             }
 

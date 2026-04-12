@@ -1,8 +1,9 @@
 use anyhow::Result;
+use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use db::repos::{runs, stages};
+use db::repos::{runs, stages, startup_repairs};
 use db::work_item::WorkItemKind;
 use domain::run::Run;
 use domain::stage::StageStatus;
@@ -88,6 +89,8 @@ impl RecoveryService {
             .filter(|s| s.status == StageStatus::Running)
             .collect();
 
+        let now = Utc::now();
+
         for stage in &running_stages {
             warn!(
                 run_id = %run.id,
@@ -96,6 +99,34 @@ impl RecoveryService {
             );
             // Mark as blocked so we can retry safely
             stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+
+            // Audit trail: record the repair action (proposal §6.3)
+            let repair_id = uuid::Uuid::new_v4().to_string();
+            let _ = startup_repairs::record(
+                &self.pool,
+                &repair_id,
+                &run.id.to_string(),
+                "stage_blocked",
+                now,
+                Some(&format!(
+                    "Stage '{}' stuck in Running — marked Blocked",
+                    stage.stage_id
+                )),
+            )
+            .await;
+
+            // Recovery recommendation: the operator should retry or cancel
+            let rec_id = uuid::Uuid::new_v4().to_string();
+            let _ = startup_repairs::recommend(
+                &self.pool,
+                &rec_id,
+                &run.id.to_string(),
+                Some(&stage.stage_id),
+                "retry_stage",
+                "Stage was stuck in Running at daemon startup — consider retry or manual review",
+                now,
+            )
+            .await;
         }
 
         if !running_stages.is_empty() {

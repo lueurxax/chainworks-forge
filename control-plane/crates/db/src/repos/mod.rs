@@ -5,4 +5,6 @@ pub mod approvals;
 pub mod artifacts;
 pub mod work_items;
 pub mod agent_executions;
+pub mod command_journal;
+pub mod startup_repairs;
 pub mod projections;

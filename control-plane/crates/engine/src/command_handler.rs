@@ -3,9 +3,9 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::info;
 
-use db::repos::{approvals, runs, stages};
+use db::repos::{approvals, command_journal, projections, runs, stages};
 use db::work_item::WorkItemKind;
-use domain::approval::{ApprovalDecision};
+use domain::approval::ApprovalDecision;
 use domain::commands::Command;
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
@@ -40,6 +40,60 @@ impl CommandHandler {
     }
 
     pub async fn handle(&self, cmd: Command) -> Result<CommandResult> {
+        // ── Command journal: record before execution (proposal §6.4) ────────
+        let journal_id = uuid::Uuid::new_v4().to_string();
+        let cmd_type = match &cmd {
+            Command::StartRun(_) => "StartRun",
+            Command::ApproveStage(_) => "ApproveStage",
+            Command::RejectStage(_) => "RejectStage",
+            Command::RetryStage(_) => "RetryStage",
+            Command::CancelRun(_) => "CancelRun",
+            Command::ResetSession(_) => "ResetSession",
+        };
+        let payload_json = serde_json::to_string(&cmd).unwrap_or_default();
+        let run_id_for_journal: Option<String> = match &cmd {
+            Command::StartRun(_) => None,
+            Command::ApproveStage(c) => Some(c.run_id.to_string()),
+            Command::RejectStage(c) => Some(c.run_id.to_string()),
+            Command::RetryStage(c) => Some(c.run_id.to_string()),
+            Command::CancelRun(c) => Some(c.run_id.to_string()),
+            Command::ResetSession(c) => Some(c.run_id.to_string()),
+        };
+        let now = Utc::now();
+        let _ = command_journal::record(
+            &self.pool,
+            &journal_id,
+            cmd_type,
+            &payload_json,
+            run_id_for_journal.as_deref(),
+            now,
+        )
+        .await;
+
+        let result = self.execute_command(cmd).await;
+
+        // Close the journal entry based on outcome.
+        let completed_at = Utc::now();
+        match &result {
+            Ok(_) => {
+                let _ =
+                    command_journal::complete_entry(&self.pool, &journal_id, completed_at).await;
+            }
+            Err(e) => {
+                let _ = command_journal::fail_entry(
+                    &self.pool,
+                    &journal_id,
+                    completed_at,
+                    &e.to_string(),
+                )
+                .await;
+            }
+        }
+
+        result
+    }
+
+    async fn execute_command(&self, cmd: Command) -> Result<CommandResult> {
         match cmd {
             Command::StartRun(c) => {
                 let now = Utc::now();
@@ -125,6 +179,9 @@ impl CommandHandler {
                     )
                     .await?;
 
+                // Refresh projections so reads reflect the resolved approval.
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
                 Ok(CommandResult::StageApproved {
                     approval_id: approval.id,
                 })
@@ -172,6 +229,9 @@ impl CommandHandler {
                     decision: ApprovalDecision::Rejected,
                 });
 
+                // Refresh projections so reads reflect the rejection.
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
                 Ok(CommandResult::StageRejected {
                     approval_id: approval.id,
                 })
@@ -213,6 +273,9 @@ impl CommandHandler {
                     )
                     .await?;
 
+                // Refresh projections so reads reflect the retry.
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
                 Ok(CommandResult::StageRetryScheduled {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
@@ -229,20 +292,15 @@ impl CommandHandler {
                 }
 
                 let now = Utc::now();
-                // Update run: set cancellation_requested_at and status to Cancelling
-                sqlx::query(
-                    "UPDATE runs SET status = ?1, cancellation_requested_at = ?2 WHERE id = ?3",
-                )
-                .bind(RunStatus::Cancelling.to_string())
-                .bind(now.to_rfc3339())
-                .bind(c.run_id.to_string())
-                .execute(&self.pool)
-                .await?;
+                runs::mark_cancelling(&self.pool, c.run_id, now).await?;
 
                 let _ = self.events.send(DomainEvent::RunStatusChanged {
                     run_id: c.run_id,
                     status: RunStatus::Cancelling,
                 });
+
+                // Refresh projections so reads reflect cancelling status.
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
 
                 Ok(CommandResult::RunCancelled { run_id: c.run_id })
             }
@@ -263,6 +321,9 @@ impl CommandHandler {
                         serde_json::json!({ "run_id": c.run_id.to_string(), "stage_id": c.stage_id }),
                     )
                     .await?;
+
+                // Refresh projections so reads reflect the reset.
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
 
                 Ok(CommandResult::SessionReset {
                     run_id: c.run_id,

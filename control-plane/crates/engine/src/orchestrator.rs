@@ -61,6 +61,15 @@ impl Orchestrator {
                 });
             }
 
+            RunEvaluation::Failed => {
+                info!(run_id = %run_id, "All stages terminal, none succeeded — marking failed");
+                runs::update_status(&self.pool, run_id, RunStatus::Failed).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Failed,
+                });
+            }
+
             RunEvaluation::WaitingApproval { stage_id } => {
                 info!(run_id = %run_id, stage_id = %stage_id, "Run waiting for approval");
                 if run.status != RunStatus::WaitingApproval {

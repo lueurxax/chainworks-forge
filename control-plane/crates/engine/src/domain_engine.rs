@@ -10,8 +10,10 @@ pub enum RunEvaluation {
     CanAdvance { next_stage_id: StageExecutionId },
     /// Run is waiting for approval
     WaitingApproval { stage_id: String },
-    /// Run is complete
+    /// Run is complete (at least one stage succeeded)
     Complete,
+    /// All stages are terminal but none succeeded — the run has failed
+    Failed,
     /// Run is blocked
     Blocked { reason: String },
     /// Run is already in a terminal state
@@ -31,8 +33,23 @@ impl DomainEngine {
             };
         }
 
-        if Self::is_run_complete(stages) {
-            return RunEvaluation::Complete;
+        // Check if all stages are in a terminal state.
+        let all_terminal = !stages.is_empty()
+            && stages.iter().all(|s| {
+                matches!(
+                    s.status,
+                    StageStatus::Completed | StageStatus::Skipped | StageStatus::Failed
+                )
+            });
+
+        if all_terminal {
+            // At least one stage must have succeeded for the run to be Complete.
+            let any_succeeded = stages.iter().any(|s| s.status == StageStatus::Completed);
+            if any_succeeded {
+                return RunEvaluation::Complete;
+            } else {
+                return RunEvaluation::Failed;
+            }
         }
 
         if Self::is_run_blocked(stages) {
@@ -64,7 +81,10 @@ impl DomainEngine {
             };
         }
 
-        RunEvaluation::Complete
+        // Empty stage list or unexpected state combination
+        RunEvaluation::Blocked {
+            reason: "No actionable stages".to_string(),
+        }
     }
 
     /// Check if a stage transition is legal
@@ -185,5 +205,25 @@ mod tests {
         let stage = make_stage(run.id, StageStatus::Blocked);
         let eval = DomainEngine::evaluate_run(&run, &[stage], &[]);
         assert!(matches!(eval, RunEvaluation::Blocked { .. }));
+    }
+
+    #[test]
+    fn failed_when_all_stages_failed() {
+        let run = make_run(RunStatus::Running);
+        let s1 = make_stage(run.id, StageStatus::Failed);
+        let mut s2 = make_stage(run.id, StageStatus::Failed);
+        s2.stage_id = "stage-2".into();
+        let eval = DomainEngine::evaluate_run(&run, &[s1, s2], &[]);
+        assert!(matches!(eval, RunEvaluation::Failed));
+    }
+
+    #[test]
+    fn complete_requires_at_least_one_success() {
+        let run = make_run(RunStatus::Running);
+        let s1 = make_stage(run.id, StageStatus::Completed);
+        let mut s2 = make_stage(run.id, StageStatus::Failed);
+        s2.stage_id = "stage-2".into();
+        let eval = DomainEngine::evaluate_run(&run, &[s1, s2], &[]);
+        assert!(matches!(eval, RunEvaluation::Complete));
     }
 }

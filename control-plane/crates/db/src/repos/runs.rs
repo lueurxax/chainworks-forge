@@ -142,6 +142,26 @@ pub async fn update_status(pool: &SqlitePool, id: RunId, status: RunStatus) -> R
     Ok(())
 }
 
+/// Transition a run into the Cancelling state with a cancellation timestamp.
+pub async fn mark_cancelling(
+    pool: &SqlitePool,
+    id: RunId,
+    requested_at: DateTime<Utc>,
+) -> Result<()> {
+    let id_str = id.to_string();
+    let status = RunStatus::Cancelling.to_string();
+    sqlx::query(
+        r#"UPDATE runs SET status = ?1, cancellation_requested_at = ?2 WHERE id = ?3"#,
+    )
+    .bind(status)
+    .bind(requested_at.to_rfc3339())
+    .bind(id_str)
+    .execute(pool)
+    .await
+    .context("mark run cancelling")?;
+    Ok(())
+}
+
 pub async fn mark_cancelled(pool: &SqlitePool, id: RunId, settled_at: DateTime<Utc>) -> Result<()> {
     let id_str = id.to_string();
     let settled_at_str = settled_at.to_rfc3339();
