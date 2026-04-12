@@ -71,7 +71,7 @@ impl BackgroundExecutor {
         }
     }
 
-    async fn run_loop(&self) {
+    async fn run_loop(self: &Arc<Self>) {
         info!("BackgroundExecutor: starting work loop");
         loop {
             match self.work_queue.claim_next().await {
@@ -79,16 +79,39 @@ impl BackgroundExecutor {
                     let item_id = item.id.clone();
                     let kind = item.kind.clone();
                     info!(item_id = %item_id, kind = %kind, "Processing work item");
-                    match self.process_item(item).await {
-                        Ok(()) => {
-                            if let Err(e) = self.work_queue.complete(&item_id).await {
-                                error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+
+                    // Spawn InvokeAgent items as concurrent tasks so parallel
+                    // fan-out tasks run simultaneously (matches Swift TaskGroup).
+                    // Other work item kinds run inline (fast, coordination-only).
+                    if matches!(kind, WorkItemKind::InvokeAgent) {
+                        let executor = Arc::clone(self);
+                        tokio::spawn(async move {
+                            match executor.process_item(item).await {
+                                Ok(()) => {
+                                    if let Err(e) = executor.work_queue.complete(&item_id).await {
+                                        error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
+                                    if let Err(e2) = executor.work_queue.fail(&item_id, &e.to_string()).await {
+                                        error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
+                                    }
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
-                            if let Err(e2) = self.work_queue.fail(&item_id, &e.to_string()).await {
-                                error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
+                        });
+                    } else {
+                        match self.process_item(item).await {
+                            Ok(()) => {
+                                if let Err(e) = self.work_queue.complete(&item_id).await {
+                                    error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                }
+                            }
+                            Err(e) => {
+                                error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
+                                if let Err(e2) = self.work_queue.fail(&item_id, &e.to_string()).await {
+                                    error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
+                                }
                             }
                         }
                     }
@@ -267,6 +290,11 @@ impl BackgroundExecutor {
                     }
                 }
 
+                // If this is a multi-task stage (fan-out), don't settle the stage
+                // here — let the orchestrator settle after ALL tasks complete.
+                // Only settle for single-task stages (backward compat).
+                let total_tasks = payload["total_tasks"].as_u64().unwrap_or(1);
+
                 // Settle the stage based on ACP result status.
                 let settlement_kind = match result.status {
                     domain::agent::AgentStatus::Completed => {
@@ -288,18 +316,23 @@ impl BackgroundExecutor {
                         domain::stage::StageStatus::Skipped
                     }
                 };
-                stages::settle(
-                    &self.pool,
-                    stage_execution_id,
-                    settlement_kind,
-                    completed_at,
-                )
-                .await?;
-                let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
-                    run_id,
-                    stage_execution_id,
-                    status: settled_stage_status,
-                });
+                if total_tasks <= 1 {
+                    // Single-task stage: settle immediately (original behavior).
+                    stages::settle(
+                        &self.pool,
+                        stage_execution_id,
+                        settlement_kind,
+                        completed_at,
+                    )
+                    .await?;
+                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
+                        run_id,
+                        stage_execution_id,
+                        status: settled_stage_status,
+                    });
+                }
+                // Multi-task stage: the orchestrator will settle after all
+                // tasks complete (checked via work item completion count).
 
                 // Rebuild projections so northbound reads reflect latest state.
                 projections::rebuild_all_for_run(&self.pool, run_id).await?;

@@ -87,11 +87,67 @@ impl Orchestrator {
             .filter(|s| s.stage_id == current_state_id)
             .last();
 
-        // ── Case 1: stage in progress — wait ────────────────────────────
+        // ── Case 1: stage in progress — wait or check task completion ──
         if let Some(stage) = current_stage {
             match stage.status {
-                StageStatus::Running | StageStatus::WaitingApproval => {
-                    return Ok(()); // still in progress
+                StageStatus::Running => {
+                    // For multi-task stages (fan-out), check if ALL InvokeAgent
+                    // work items for this stage have completed.
+                    let work_items = db::repos::work_items::list_by_run(&self.pool, run_id).await?;
+                    let stage_invokes: Vec<_> = work_items
+                        .iter()
+                        .filter(|w| {
+                            w.kind == db::work_item::WorkItemKind::InvokeAgent
+                                && w.stage_id.as_deref() == Some(&current_state_id)
+                        })
+                        .collect();
+                    let total = stage_invokes.len();
+                    let completed = stage_invokes
+                        .iter()
+                        .filter(|w| w.status == db::work_item::WorkItemStatus::Completed)
+                        .count();
+                    let failed = stage_invokes
+                        .iter()
+                        .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
+                        .count();
+
+                    if total > 0 && completed + failed == total {
+                        // All tasks finished — settle stage.
+                        let now = Utc::now();
+                        let (kind, status) = if failed > 0 {
+                            (domain::stage::StageSettlementKind::Failed, StageStatus::Failed)
+                        } else {
+                            (domain::stage::StageSettlementKind::Completed, StageStatus::Completed)
+                        };
+                        info!(
+                            run_id = %run_id,
+                            state = %current_state_id,
+                            total = total,
+                            completed = completed,
+                            failed = failed,
+                            "All tasks finished — settling stage"
+                        );
+                        stages::settle(&self.pool, stage.id, kind, now).await?;
+                        let _ = self.events.send(DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id: stage.id,
+                            status: status.clone(),
+                        });
+                        if status == StageStatus::Completed {
+                            return self
+                                .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                                .await;
+                        }
+                        // Failed — run blocked
+                        runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                        return Ok(());
+                    }
+
+                    // Tasks still running — wait
+                    return Ok(());
+                }
+                StageStatus::WaitingApproval => {
+                    return Ok(()); // wait for approval
                 }
                 StageStatus::Completed => {
                     // Stage done — evaluate transitions
@@ -188,7 +244,7 @@ impl Orchestrator {
             return Ok(());
         }
 
-        // Regular compute state — create stage, enqueue InvokeAgent
+        // Regular compute state — create stage and enqueue tasks.
         info!(run_id = %run_id, state = %current_state_id, provider = %state.owner.provider, "Entering compute state");
         let stage = self.create_stage_for_state(run_id, &current_state_id, state).await?;
         stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
@@ -207,26 +263,44 @@ impl Orchestrator {
             });
         }
 
-        // Build the prompt: agent system prompt from YAML + task context.
-        // Matches Swift's ClaudeAgentACPTransport.submitPrompt() pattern:
-        // "## System Instructions\n{agent.prompt}\n\n---\n\n{task_content}"
-        let agent_prompt = state.owner.prompt.as_deref().unwrap_or("");
-        let task_names: Vec<&str> = state.tasks.iter().map(|t| t.task_name.as_str()).collect();
-        let task_context = if task_names.is_empty() {
-            format!("Execute state '{}' (label: {}).", current_state_id, state.label)
+        if state.tasks.is_empty() {
+            // No tasks defined — run the owner agent as a single task
+            let prompt = build_task_prompt_for_owner(state);
+            self.enqueue_invoke_agent(run_id, &stage, &state.owner, &prompt, 0, 1).await?;
         } else {
-            format!(
-                "Execute the following tasks for state '{}': {}",
-                state.label,
-                task_names.join(", ")
-            )
-        };
-        let full_prompt = if agent_prompt.is_empty() {
-            task_context
-        } else {
-            format!("## System Instructions\n{agent_prompt}\n\n---\n\n{task_context}")
-        };
+            // Fan-out: enqueue one InvokeAgent per task.
+            // Parallel tasks run concurrently (executor spawns tokio tasks).
+            // All tasks are enqueued at once — the executor picks them up.
+            let total = state.tasks.len();
+            for (i, task) in state.tasks.iter().enumerate() {
+                let prompt = build_task_prompt(task);
+                info!(
+                    run_id = %run_id,
+                    task = %task.task_name,
+                    agent = %task.agent.agent_id,
+                    provider = %task.agent.provider,
+                    parallel = task.parallel,
+                    index = i,
+                    total = total,
+                    "Enqueuing task"
+                );
+                self.enqueue_invoke_agent(run_id, &stage, &task.agent, &prompt, i, total).await?;
+            }
+        }
 
+        Ok(())
+    }
+
+    /// Enqueue a single InvokeAgent work item for a task.
+    async fn enqueue_invoke_agent(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        agent: &workflow::plan::ResolvedAgent,
+        prompt: &str,
+        task_index: usize,
+        total_tasks: usize,
+    ) -> Result<()> {
         self.work_queue
             .enqueue(
                 WorkItemKind::InvokeAgent,
@@ -236,16 +310,16 @@ impl Orchestrator {
                     "run_id": run_id.to_string(),
                     "stage_id": stage.stage_id,
                     "stage_execution_id": stage.id.to_string(),
-                    "agent_id": state.owner.agent_id,
-                    "provider": state.owner.provider,
-                    "model": state.owner.model,
-                    "effort": state.owner.effort,
-                    "prompt": full_prompt,
+                    "agent_id": agent.agent_id,
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "effort": agent.effort,
+                    "prompt": prompt,
+                    "task_index": task_index,
+                    "total_tasks": total_tasks,
                 }),
             )
-            .await?;
-
-        Ok(())
+            .await
     }
 
     /// Create a StageExecution for the given state.
@@ -622,6 +696,28 @@ impl Orchestrator {
 /// Resolve `${VAR:-default}` patterns in artifact path templates.
 /// Falls back to the default value if the env var is not set.
 /// Also resolves bare `.` as workspace_root.
+/// Build prompt for a specific task (agent-level prompt + task name).
+fn build_task_prompt(task: &workflow::plan::CompiledTask) -> String {
+    let agent_prompt = task.agent.prompt.as_deref().unwrap_or("");
+    let task_desc = format!("Execute task: {}", task.task_name);
+    if agent_prompt.is_empty() {
+        task_desc
+    } else {
+        format!("## System Instructions\n{agent_prompt}\n\n---\n\n{task_desc}")
+    }
+}
+
+/// Build prompt for the owner agent when no explicit tasks are defined.
+fn build_task_prompt_for_owner(state: &workflow::plan::CompiledState) -> String {
+    let agent_prompt = state.owner.prompt.as_deref().unwrap_or("");
+    let task_context = format!("Execute state '{}' (label: {}).", state.id, state.label);
+    if agent_prompt.is_empty() {
+        task_context
+    } else {
+        format!("## System Instructions\n{agent_prompt}\n\n---\n\n{task_context}")
+    }
+}
+
 pub fn resolve_path_template(template: &str, workspace_root: &str) -> String {
     let mut result = template.to_string();
 
