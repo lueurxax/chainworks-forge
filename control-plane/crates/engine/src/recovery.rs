@@ -55,16 +55,6 @@ impl RecoveryService {
             }
         }
 
-        // Enqueue a global startup repair work item for any remaining stale state
-        self.work_queue
-            .enqueue(
-                WorkItemKind::StartupRepair,
-                None,
-                None,
-                serde_json::json!({ "reason": "daemon_startup" }),
-            )
-            .await?;
-
         info!(
             runs_inspected = %runs_inspected,
             runs_repaired = %runs_repaired,
