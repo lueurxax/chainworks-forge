@@ -96,7 +96,9 @@ impl Default for AcpSessionConfig<'_> {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Max silence between messages before we consider the session hung.
+/// Reset on every received line (including notifications).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -466,24 +468,24 @@ pub async fn run_acp_session(
     .await
     .context("ACP: send session/prompt")?;
 
-    let stream_start = Instant::now();
     let mut agent_failed = false;
     let mut line = String::new();
+    let mut last_activity = Instant::now();
 
     'streaming: loop {
-        let elapsed = stream_start.elapsed();
-        if elapsed >= PROMPT_TIMEOUT {
+        let idle = last_activity.elapsed();
+        if idle >= IDLE_TIMEOUT {
             bail!(
-                "ACP session/prompt timed out after {}s (session={session_id})",
-                PROMPT_TIMEOUT.as_secs()
+                "ACP session idle timeout: no message for {}s (session={session_id})",
+                IDLE_TIMEOUT.as_secs()
             );
         }
-        let remaining = PROMPT_TIMEOUT - elapsed;
+        let remaining = IDLE_TIMEOUT - idle;
 
         line.clear();
         let n = timeout(remaining, reader.read_line(&mut line))
             .await
-            .context("ACP prompt stream read timeout")?
+            .context("ACP session idle timeout — no message received")?
             .context("ACP prompt stream read_line error")?;
 
         if n == 0 {
@@ -506,6 +508,7 @@ pub async fn run_acp_session(
             Ok(v) => v,
             Err(_) => continue,
         };
+        last_activity = Instant::now();
         debug!(msg = %trimmed, "ACP ← subprocess (stream)");
 
         // Terminal response: has an `id` that matches `prompt_id`
