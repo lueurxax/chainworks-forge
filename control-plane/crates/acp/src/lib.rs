@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod manager;
 pub mod session;
+pub mod transport;
 
 pub use manager::AcpRuntimeManager;
 pub use session::{AcpSession, AcpSessionHandle};

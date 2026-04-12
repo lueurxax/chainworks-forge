@@ -312,3 +312,223 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
         "new stage execution must start as Pending"
     );
 }
+
+// ---------------------------------------------------------------------------
+// InvokeAgent end-to-end parity harness (P027 / ARCH-001 / REQ-009)
+//
+// Proves the full daemon path:
+//   BackgroundExecutor → AcpRuntimeManager → fixture ACP binary
+//   → artifact persistence → projection rebuild → stage settlement
+//
+// This is the "bounded real runtime-backed daemon slice" required by R4.
+// ---------------------------------------------------------------------------
+
+/// BackgroundExecutor.process_next_item() drives a real ACP subprocess that
+/// speaks the JSON-RPC 2.0 ACP protocol, persists the artifact it creates,
+/// settles the stage, and rebuilds projections — all through the same code
+/// path that runs in production.
+///
+/// The fixture is a Python script that completes the full ACP handshake
+/// (initialize → session/new → session/prompt) and creates `report.json`
+/// inside the workspace_root it receives via `session/new.params.cwd`.
+/// The transport discovers the new file via workspace diff and returns it
+/// as an artifact path.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_end_to_end_with_fixture_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use db::repos::projections;
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    // Write a Python ACP fixture script.  It speaks the full JSON-RPC 2.0 ACP
+    // protocol: initialize → session/new → session/prompt → (optional) session/close.
+    // During session/prompt it creates report.json in the cwd it received.
+    let script = tmp.path().join("acp_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None: sys.exit(1)
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+cwd = msg.get("params",{}).get("cwd","/tmp")
+session_id = "e2e-fixture-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+artifact = os.path.join(cwd, "report.json")
+with open(artifact, "w") as f:
+    f.write('{"summary":"ok"}\n')
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":"Done."}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+try:
+    recv()   # session/close — best-effort
+except Exception:
+    pass
+
+sys.exit(0)
+"#).unwrap();
+    {
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+
+    // Build an AcpRuntimeManager wired to the fixture adapter.
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    // Insert canonical domain entities.
+    // workspace_root points at the tempdir so the executor sends it to the
+    // fixture via session/new.params.cwd, and the transport scans it for artifacts.
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-e2e".into(),
+            workflow_title: "E2E Test Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "build_stage".into();
+    stage.label = "Build Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    // Wire up BackgroundExecutor.
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp,
+        events,
+    );
+
+    // Enqueue a fully-populated InvokeAgent work item.
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("build_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "build_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "fixture-agent",
+                "provider": "claude",
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Process the work item through the real executor path.
+    let processed = executor.process_next_item().await.unwrap();
+    assert!(processed, "process_next_item must return true when a work item is available");
+
+    // Stage must be settled as Completed.
+    let settled = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.status,
+        StageStatus::Completed,
+        "stage must be Completed after successful ACP session"
+    );
+
+    // Artifact must be persisted in the canonical artifacts table.
+    let persisted_artifacts = db::repos::artifacts::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted_artifacts.len(),
+        1,
+        "exactly one artifact must be persisted (report.json created by the fixture)"
+    );
+    let art = &persisted_artifacts[0];
+    assert!(
+        art.file_path.ends_with("report.json"),
+        "artifact file_path must point to report.json, got: {}",
+        art.file_path
+    );
+    assert_eq!(
+        art.format.to_string(),
+        "json",
+        "artifact format must be derived from the .json extension"
+    );
+    assert_eq!(
+        art.contract_id, "claude.output",
+        "contract_id must be provider-scoped, not a stub"
+    );
+
+    // Projections must reflect the settled stage and its artifact.
+    let stage_rows = projections::list_stages_projection(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+    let stage_proj = stage_rows
+        .iter()
+        .find(|s| s.stage_id == "build_stage")
+        .expect("build_stage must appear in stage projection after rebuild");
+    assert_eq!(
+        stage_proj.status,
+        StageStatus::Completed.to_string(),
+        "stage projection status must match settled status"
+    );
+    assert!(
+        stage_proj.has_artifacts,
+        "stage projection must reflect that an artifact was created"
+    );
+}

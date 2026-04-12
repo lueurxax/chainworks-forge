@@ -47,6 +47,30 @@ impl BackgroundExecutor {
         })
     }
 
+    /// Claim and process the next pending work item. Returns `Ok(true)` if an
+    /// item was processed, `Ok(false)` if the queue was empty.
+    /// Intended for test use — the production path uses `start()`.
+    pub async fn process_next_item(&self) -> Result<bool> {
+        match self.work_queue.claim_next().await? {
+            Some(item) => {
+                let item_id = item.id.clone();
+                let kind = item.kind.clone();
+                info!(item_id = %item_id, kind = %kind, "process_next_item: processing");
+                match self.process_item(item).await {
+                    Ok(()) => {
+                        self.work_queue.complete(&item_id).await?;
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        self.work_queue.fail(&item_id, &e.to_string()).await?;
+                        Err(e)
+                    }
+                }
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn run_loop(&self) {
         info!("BackgroundExecutor: starting work loop");
         loop {
@@ -90,21 +114,41 @@ impl BackgroundExecutor {
             WorkItemKind::InvokeAgent => {
                 let payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
                 let run_id = self.extract_run_id(&item)?;
+
                 let stage_id = payload["stage_id"]
                     .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing stage_id"))?
+                    .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing 'stage_id'"))?
                     .to_string();
+
                 let stage_execution_id_str = payload["stage_execution_id"]
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                let stage_execution_id: domain::ids::StageExecutionId = if stage_execution_id_str.is_empty() {
-                    domain::ids::StageExecutionId::new()
-                } else {
-                    stage_execution_id_str.parse().map_err(|e| anyhow::anyhow!("{}", e))?
-                };
-                let agent_id = payload["agent_id"].as_str().unwrap_or("default").to_string();
-                let provider = payload["provider"].as_str().unwrap_or("stub").to_string();
+                let stage_execution_id: domain::ids::StageExecutionId =
+                    if stage_execution_id_str.is_empty() {
+                        domain::ids::StageExecutionId::new()
+                    } else {
+                        stage_execution_id_str
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("{}", e))?
+                    };
+
+                // agent_id defaults to the stage_id — a reasonable per-stage identifier.
+                let agent_id = payload["agent_id"]
+                    .as_str()
+                    .unwrap_or(&stage_id)
+                    .to_string();
+
+                // provider is required — no "stub" fallback.
+                let provider = payload["provider"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "InvokeAgent payload missing 'provider' field; \
+                             set CHAINWORKS_DEFAULT_PROVIDER or include 'provider' in the payload"
+                        )
+                    })?
+                    .to_string();
 
                 let now = chrono::Utc::now();
                 let agent_exec_id = domain::ids::AgentExecutionId::new();
@@ -120,8 +164,9 @@ impl BackgroundExecutor {
                 };
                 agent_executions::insert(&self.pool, &agent_exec).await?;
 
-                // Invoke ACP adapter (stub returns mock result)
-                let run = db::repos::runs::find_by_id(&self.pool, run_id).await?
+                // Build the ACP request from the run record (workspace_root lives there).
+                let run = db::repos::runs::find_by_id(&self.pool, run_id)
+                    .await?
                     .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
                 let req = acp::ExecutionRequest {
                     run_id,
@@ -139,22 +184,43 @@ impl BackgroundExecutor {
                     agent_exec_id,
                     result.status.clone(),
                     completed_at,
-                ).await?;
+                )
+                .await?;
 
-                // Persist any artifacts from ACP result
+                // Persist artifacts returned by the ACP binary.
                 for path in &result.artifact_paths {
+                    // Derive name from the file path.
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("artifact")
+                        .to_string();
+
+                    // Derive format from extension (default to Json).
+                    let format = std::path::Path::new(path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(|ext| match ext {
+                            "md" | "markdown" => {
+                                Some(domain::artifact::ArtifactFormat::Markdown)
+                            }
+                            "diff" | "patch" => Some(domain::artifact::ArtifactFormat::Diff),
+                            "json" => Some(domain::artifact::ArtifactFormat::Json),
+                            _ => None,
+                        })
+                        .unwrap_or(domain::artifact::ArtifactFormat::Json);
+
+                    // contract_id is provider-scoped, not a hard-coded stub.
+                    let contract_id = format!("{}.output", provider);
+
                     let artifact = domain::artifact::Artifact {
                         id: domain::ids::ArtifactId::new(),
                         run_id,
                         stage_id: stage_id.clone(),
                         agent_id: agent_id.clone(),
-                        name: std::path::Path::new(path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("artifact")
-                            .to_string(),
-                        contract_id: "stub".to_string(),
-                        format: domain::artifact::ArtifactFormat::Json,
+                        name,
+                        contract_id,
+                        format,
                         file_path: path.clone(),
                         checksum_sha256: None,
                         size_bytes: None,
@@ -172,31 +238,59 @@ impl BackgroundExecutor {
                     });
                 }
 
-                // Settle stage as Completed
+                // Settle the stage based on ACP result status.
+                let settlement_kind = match result.status {
+                    domain::agent::AgentStatus::Completed => {
+                        domain::stage::StageSettlementKind::Completed
+                    }
+                    domain::agent::AgentStatus::Failed => {
+                        domain::stage::StageSettlementKind::Failed
+                    }
+                    _ => domain::stage::StageSettlementKind::Failed,
+                };
+                let settled_stage_status = match settlement_kind {
+                    domain::stage::StageSettlementKind::Completed => {
+                        domain::stage::StageStatus::Completed
+                    }
+                    domain::stage::StageSettlementKind::Failed => {
+                        domain::stage::StageStatus::Failed
+                    }
+                    domain::stage::StageSettlementKind::Skipped => {
+                        domain::stage::StageStatus::Skipped
+                    }
+                };
                 stages::settle(
                     &self.pool,
                     stage_execution_id,
-                    domain::stage::StageSettlementKind::Completed,
+                    settlement_kind,
                     completed_at,
-                ).await?;
+                )
+                .await?;
                 let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
                     run_id,
                     stage_execution_id,
-                    status: domain::stage::StageStatus::Completed,
+                    status: settled_stage_status,
                 });
 
-                // Rebuild projections
+                // Rebuild projections so northbound reads reflect latest state.
                 projections::rebuild_all_for_run(&self.pool, run_id).await?;
 
-                // Advance the run
-                self.work_queue.enqueue(
-                    WorkItemKind::AdvanceRun,
-                    Some(run_id),
-                    None,
-                    serde_json::json!({ "run_id": run_id.to_string() }),
-                ).await?;
+                // Re-evaluate the run.
+                self.work_queue
+                    .enqueue(
+                        WorkItemKind::AdvanceRun,
+                        Some(run_id),
+                        None,
+                        serde_json::json!({ "run_id": run_id.to_string() }),
+                    )
+                    .await?;
 
-                info!(run_id = %run_id, stage_id = %stage_id, "InvokeAgent completed");
+                info!(
+                    run_id = %run_id,
+                    stage_id = %stage_id,
+                    status = ?result.status,
+                    "InvokeAgent completed"
+                );
             }
 
             WorkItemKind::StartupRepair => {

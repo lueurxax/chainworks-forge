@@ -1,32 +1,43 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::info;
 
-use domain::agent::AgentStatus;
 use domain::ids::AgentExecutionId;
 
 use crate::adapters::AcpAdapter;
+use crate::transport::{run_acp_session, AcpSessionConfig};
 use crate::{ExecutionRequest, ExecutionResult};
 
-const EXEC_TIMEOUT_SECS: u64 = 300;
 const BINARY_ENV_VAR: &str = "CHAINWORKS_GEMINI_ACP_BINARY";
 
-/// Adapter for the Gemini CLI provider.
-/// Spawns the ACP binary specified by CHAINWORKS_GEMINI_ACP_BINARY, writes the
-/// serialized ExecutionRequest as JSON to its stdin, and collects artifact paths
-/// (one per line) from stdout. Exits non-zero → AgentStatus::Failed.
+/// Adapter for the Gemini CLI provider (`gemini --acp`).
+///
+/// Spawns the binary given by `CHAINWORKS_GEMINI_ACP_BINARY` (defaulting to
+/// `gemini` on PATH) with the `--acp` flag, and communicates using the ACP
+/// JSON-RPC 2.0 protocol over ndjson stdio.
+///
+/// Note: Gemini CLI requires the `--acp` flag to enter ACP server mode.
+/// Some early Gemini versions may not support `session/close` — the transport
+/// ignores errors from that phase gracefully.
 pub struct GeminiCliAdapter {
     binary_path: String,
 }
 
 impl GeminiCliAdapter {
+    /// Create a new adapter, resolving the binary from `CHAINWORKS_GEMINI_ACP_BINARY`
+    /// or falling back to `gemini` on PATH.
     pub fn new() -> Self {
-        let binary_path = std::env::var(BINARY_ENV_VAR).unwrap_or_default();
+        let binary_path = std::env::var(BINARY_ENV_VAR)
+            .unwrap_or_else(|_| "gemini".to_string());
         Self { binary_path }
+    }
+
+    /// Construct with an explicit binary path — for testing and runtime injection.
+    pub fn new_with_binary(path: impl Into<String>) -> Self {
+        Self {
+            binary_path: path.into(),
+        }
     }
 }
 
@@ -45,8 +56,8 @@ impl AcpAdapter for GeminiCliAdapter {
     async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
         if self.binary_path.is_empty() {
             bail!(
-                "GeminiCliAdapter: {} is not set — cannot invoke ACP subprocess",
-                BINARY_ENV_VAR
+                "GeminiCliAdapter: binary path is empty — set {BINARY_ENV_VAR} \
+                 or ensure gemini is on PATH"
             );
         }
 
@@ -56,63 +67,34 @@ impl AcpAdapter for GeminiCliAdapter {
             stage_id = %req.stage_id,
             agent_id = %req.agent_id,
             binary = %self.binary_path,
-            "Invoking Gemini ACP subprocess"
+            "Spawning Gemini ACP subprocess"
         );
 
         let agent_execution_id = AgentExecutionId::new();
-        let payload = serde_json::to_vec(&req).context("serialize ExecutionRequest")?;
 
+        // Gemini CLI requires --acp to enable ACP server mode.
         let mut child = Command::new(&self.binary_path)
+            .arg("--acp")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
-            .context("spawn Gemini ACP subprocess")?;
+            .with_context(|| {
+                format!("spawn Gemini ACP subprocess: {} --acp", self.binary_path)
+            })?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&payload)
-                .await
-                .context("write ExecutionRequest to Gemini ACP stdin")?;
-        }
-
-        let output = timeout(
-            Duration::from_secs(EXEC_TIMEOUT_SECS),
-            child.wait_with_output(),
-        )
-        .await
-        .context("Gemini ACP subprocess timed out after 300s")?
-        .context("wait_with_output for Gemini ACP subprocess")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(
-                run_id = %req.run_id,
-                stage_id = %req.stage_id,
-                exit_code = ?output.status.code(),
-                stderr = %stderr,
-                "Gemini ACP subprocess exited with failure"
-            );
-            return Ok(ExecutionResult {
-                agent_execution_id,
-                status: AgentStatus::Failed,
-                artifact_paths: vec![],
-                cost_cents: None,
-            });
-        }
-
-        // Collect artifact paths: one absolute path per stdout line.
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let artifact_paths: Vec<String> = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect();
+        // Gemini uses bypassPermissions mode; no _meta block needed.
+        let config = AcpSessionConfig {
+            model: "default",
+            mode: "bypassPermissions",
+            extra: None,
+        };
+        let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
 
         Ok(ExecutionResult {
             agent_execution_id,
-            status: AgentStatus::Completed,
+            status,
             artifact_paths,
             cost_cents: None,
         })

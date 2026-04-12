@@ -5,6 +5,7 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 
+use db::repos::projections;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpTool};
@@ -132,48 +133,85 @@ impl McpServer {
             }
 
             "resources/list" => {
-                // Expose the primary domain resource URI templates so MCP clients
-                // can discover what shadow-truth surfaces the daemon owns.
+                // Expose domain resource URI templates.
+                // Primary scheme matches the proposal contract:
+                //   run://{id}  idea://{id}  artifact://{id}  report://{run_id}
+                // The chainworks:// family is also kept for backward compatibility.
                 JsonRpcResponse::success(id, serde_json::json!({
                     "resources": [
+                        // ── Proposal-spec URI family (P027 §8.1) ──────────────
                         {
-                            "uri": "chainworks://runs",
-                            "name": "Active Runs",
-                            "description": "Workflow runs currently tracked by the control-plane daemon",
+                            "uri": "run://{run_id}",
+                            "name": "Run",
+                            "description": "Full state for a single workflow run (projection-backed shadow truth)",
                             "mimeType": "application/json"
                         },
                         {
-                            "uri": "chainworks://runs/{run_id}",
-                            "name": "Run Detail",
-                            "description": "Full state for a single run, sourced from the projection layer",
+                            "uri": "idea://{idea_id}",
+                            "name": "Idea",
+                            "description": "A single idea and its metadata",
+                            "mimeType": "application/json"
+                        },
+                        {
+                            "uri": "artifact://{artifact_id}",
+                            "name": "Artifact",
+                            "description": "A single artifact produced by an agent stage",
+                            "mimeType": "application/json"
+                        },
+                        {
+                            "uri": "report://{run_id}",
+                            "name": "Run Report",
+                            "description": "Execution report for a run: completed stages and their artifacts",
+                            "mimeType": "application/json"
+                        },
+                        // ── chainworks:// family (collection surfaces) ─────────
+                        {
+                            "uri": "chainworks://runs",
+                            "name": "Active Runs",
+                            "description": "All workflow runs tracked by the daemon (projection-backed)",
                             "mimeType": "application/json"
                         },
                         {
                             "uri": "chainworks://ideas",
                             "name": "Ideas",
-                            "description": "Idea backlog items that back-fill run origin metadata",
+                            "description": "Idea backlog items",
                             "mimeType": "application/json"
                         },
                         {
                             "uri": "chainworks://approvals/inbox",
                             "name": "Approval Inbox",
-                            "description": "Pending stage approvals surfaced from the approval_inbox projection",
+                            "description": "Pending stage approvals from the approval_inbox projection",
                             "mimeType": "application/json"
                         },
                         {
                             "uri": "chainworks://runs/{run_id}/stages",
                             "name": "Stage Executions",
-                            "description": "Stage execution list for a run, sourced from the stage_summaries projection",
+                            "description": "Stage list for a run (stage_summaries projection)",
                             "mimeType": "application/json"
                         },
                         {
                             "uri": "chainworks://runs/{run_id}/artifacts",
                             "name": "Artifacts",
-                            "description": "Artifact list for a run, sourced from the artifact_index projection",
+                            "description": "Artifact list for a run (artifact_index projection)",
                             "mimeType": "application/json"
                         }
                     ]
                 }))
+            }
+
+            "resources/read" => {
+                let params = req.params.unwrap_or(serde_json::Value::Null);
+                let uri = match params["uri"].as_str() {
+                    Some(u) => u.to_string(),
+                    None => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            "resources/read requires a 'uri' parameter".to_string(),
+                        )
+                    }
+                };
+                self.handle_resource_read(id, &uri).await
             }
 
             "notifications/initialized" => {
@@ -186,6 +224,156 @@ impl McpServer {
                 JsonRpcResponse::error(id, -32601, format!("Method not found: {method}"))
             }
         }
+    }
+
+    async fn handle_resource_read(
+        &self,
+        id: Option<serde_json::Value>,
+        uri: &str,
+    ) -> JsonRpcResponse {
+        let result: anyhow::Result<serde_json::Value> = self.read_resource(uri).await;
+        match result {
+            Ok(data) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": data.to_string()
+                    }]
+                }),
+            ),
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        }
+    }
+
+    async fn read_resource(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
+        // ── Proposal-spec URI scheme (P027 §8.1) ─────────────────────────────
+        if let Some(run_id) = uri.strip_prefix("run://") {
+            return match projections::find_run_projection(&self.pool, run_id).await? {
+                Some(row) => Ok(serde_json::to_value(row)?),
+                None => anyhow::bail!("Run not found: {run_id}"),
+            };
+        }
+
+        if let Some(idea_id_str) = uri.strip_prefix("idea://") {
+            let idea_id: domain::ids::IdeaId = idea_id_str
+                .parse::<uuid::Uuid>()
+                .map_err(|_| anyhow::anyhow!("Invalid idea id: {idea_id_str}"))?
+                .into();
+            return match db::repos::ideas::find_by_id(&self.pool, idea_id).await? {
+                Some(idea) => Ok(serde_json::json!({
+                    "id": idea.id.to_string(),
+                    "title": idea.title,
+                    "body": idea.body,
+                    "status": idea.status.to_string(),
+                    "created_at": idea.created_at.to_rfc3339(),
+                })),
+                None => anyhow::bail!("Idea not found: {idea_id_str}"),
+            };
+        }
+
+        if let Some(artifact_id_str) = uri.strip_prefix("artifact://") {
+            let artifact_id: domain::ids::ArtifactId = artifact_id_str
+                .parse::<uuid::Uuid>()
+                .map_err(|_| anyhow::anyhow!("Invalid artifact id: {artifact_id_str}"))?
+                .into();
+            return match db::repos::artifacts::find_by_id(&self.pool, artifact_id).await? {
+                Some(art) => Ok(serde_json::json!({
+                    "id": art.id.to_string(),
+                    "run_id": art.run_id.to_string(),
+                    "stage_id": art.stage_id,
+                    "name": art.name,
+                    "contract_id": art.contract_id,
+                    "format": art.format.to_string(),
+                    "file_path": art.file_path,
+                    "provider": art.provider,
+                    "report_kind": art.report_kind,
+                    "created_at": art.created_at.to_rfc3339(),
+                })),
+                None => anyhow::bail!("Artifact not found: {artifact_id_str}"),
+            };
+        }
+
+        if let Some(run_id) = uri.strip_prefix("report://") {
+            // Run report: projection summary + completed stages + their artifacts.
+            let run_proj = projections::find_run_projection(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
+            let run_id_parsed: domain::ids::RunId = run_id
+                .parse::<uuid::Uuid>()
+                .map_err(|_| anyhow::anyhow!("Invalid run id: {run_id}"))?
+                .into();
+            let stage_rows = projections::list_stages_projection(&self.pool, run_id).await?;
+            let artifact_rows =
+                projections::list_artifacts_projection(&self.pool, run_id).await?;
+            let run_artifacts = db::repos::artifacts::list_by_run(&self.pool, run_id_parsed)
+                .await?;
+
+            return Ok(serde_json::json!({
+                "run_id": run_id,
+                "status": run_proj.status,
+                "total_stages": run_proj.total_stages,
+                "completed_stages": run_proj.completed_stages,
+                "failed_stages": run_proj.failed_stages,
+                "has_artifacts": !artifact_rows.is_empty(),
+                "stages": stage_rows,
+                "artifact_index": artifact_rows,
+                "artifacts": run_artifacts.iter().map(|a| serde_json::json!({
+                    "id": a.id.to_string(),
+                    "name": a.name,
+                    "stage_id": a.stage_id,
+                    "contract_id": a.contract_id,
+                    "format": a.format.to_string(),
+                    "file_path": a.file_path,
+                    "provider": a.provider,
+                    "report_kind": a.report_kind,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+
+        // ── chainworks:// collection surfaces ────────────────────────────────
+        if uri == "chainworks://runs" {
+            let rows = projections::list_active_projection(&self.pool).await?;
+            return Ok(serde_json::to_value(rows)?);
+        }
+
+        if uri == "chainworks://ideas" {
+            let items = db::repos::ideas::list(&self.pool, false).await?;
+            return Ok(serde_json::to_value(
+                items
+                    .iter()
+                    .map(|i| serde_json::json!({
+                        "id": i.id.to_string(),
+                        "title": i.title,
+                        "status": i.status.to_string(),
+                        "created_at": i.created_at.to_rfc3339(),
+                    }))
+                    .collect::<Vec<_>>(),
+            )?);
+        }
+
+        if uri == "chainworks://approvals/inbox" {
+            let rows = projections::list_pending_inbox_projection(&self.pool).await?;
+            return Ok(serde_json::to_value(rows)?);
+        }
+
+        if let Some(run_id) = uri.strip_prefix("chainworks://runs/") {
+            if let Some(rid) = run_id.strip_suffix("/stages") {
+                let rows = projections::list_stages_projection(&self.pool, rid).await?;
+                return Ok(serde_json::to_value(rows)?);
+            } else if let Some(rid) = run_id.strip_suffix("/artifacts") {
+                let rows = projections::list_artifacts_projection(&self.pool, rid).await?;
+                return Ok(serde_json::to_value(rows)?);
+            } else {
+                return match projections::find_run_projection(&self.pool, run_id).await? {
+                    Some(row) => Ok(serde_json::to_value(row)?),
+                    None => anyhow::bail!("Run not found: {}", run_id),
+                };
+            }
+        }
+
+        anyhow::bail!("Unknown resource URI: {}", uri)
     }
 
     async fn dispatch_tool(

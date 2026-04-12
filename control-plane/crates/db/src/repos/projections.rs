@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
+use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 use domain::ids::RunId;
@@ -10,7 +11,7 @@ use domain::ids::RunId;
 
 /// A run row produced by joining `runs` with `run_summaries`.
 /// Used by the GraphQL list resolvers so reads go through the projection layer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RunProjectionRow {
     pub id: String,
     pub idea_id: String,
@@ -31,7 +32,7 @@ pub struct RunProjectionRow {
 }
 
 /// A stage row produced by joining `stage_executions` with `stage_summaries`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct StageSummaryRow {
     pub id: String,
     pub run_id: String,
@@ -176,6 +177,51 @@ pub async fn list_stages_projection(pool: &SqlitePool, run_id: &str) -> Result<V
             })
         })
         .collect()
+}
+
+/// Find a single run via the projection layer.
+///
+/// LEFT-JOINs `run_summaries` so that a run whose projection hasn't been
+/// rebuilt yet is still returned (with zero counts). Returns `None` only if
+/// the run does not exist in the canonical `runs` table.
+pub async fn find_run_projection(pool: &SqlitePool, run_id: &str) -> Result<Option<RunProjectionRow>> {
+    let row = sqlx::query(
+        r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
+                  r.artifact_root, r.started_at, r.completed_at,
+                  r.cancellation_requested_at, r.cancellation_settled_at,
+                  COALESCE(rs.status, r.status) AS status,
+                  COALESCE(rs.total_stages, 0) AS total_stages,
+                  COALESCE(rs.completed_stages, 0) AS completed_stages,
+                  COALESCE(rs.failed_stages, 0) AS failed_stages,
+                  COALESCE(rs.pending_approvals, 0) AS pending_approvals
+           FROM runs r
+           LEFT JOIN run_summaries rs ON rs.run_id = r.id
+           WHERE r.id = ?"#,
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| {
+        Ok(RunProjectionRow {
+            id: r.get("id"),
+            idea_id: r.get("idea_id"),
+            workflow_id: r.get("workflow_id"),
+            workflow_title: r.get("workflow_title"),
+            status: r.get("status"),
+            workspace_root: r.get("workspace_root"),
+            artifact_root: r.get("artifact_root"),
+            started_at: r.get("started_at"),
+            completed_at: r.get("completed_at"),
+            cancellation_requested_at: r.get("cancellation_requested_at"),
+            cancellation_settled_at: r.get("cancellation_settled_at"),
+            total_stages: r.get("total_stages"),
+            completed_stages: r.get("completed_stages"),
+            failed_stages: r.get("failed_stages"),
+            pending_approvals: r.get("pending_approvals"),
+        })
+    })
+    .transpose()
 }
 
 /// Rebuild run_summary for a single run from canonical tables.
@@ -375,7 +421,7 @@ pub async fn list_artifacts_projection(pool: &SqlitePool, run_id: &str) -> Resul
 }
 
 /// A row from the approval_inbox projection (pending approvals only).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ApprovalInboxRow {
     pub id: String,
     pub run_id: String,
@@ -388,7 +434,7 @@ pub struct ApprovalInboxRow {
 }
 
 /// A row from the artifact_index projection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ArtifactIndexRow {
     pub id: String,
     pub run_id: String,

@@ -69,8 +69,7 @@ impl QueryRoot {
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
         let pool = ctx.data::<SqlitePool>()?;
-        let run_id: RunId = id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-        let item = runs::find_by_id(pool, run_id).await?;
+        let item = projections::find_run_projection(pool, id.as_str()).await?;
         Ok(item.map(GqlRun::from))
     }
 

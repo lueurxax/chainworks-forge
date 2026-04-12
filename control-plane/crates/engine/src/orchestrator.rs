@@ -116,7 +116,11 @@ impl Orchestrator {
                         });
                     }
 
-                    // Enqueue agent invocation for this stage
+                    // Enqueue agent invocation for this stage.
+                    // Provider is sourced from CHAINWORKS_DEFAULT_PROVIDER so
+                    // a deployment can wire a specific runtime without code changes.
+                    let default_provider = std::env::var("CHAINWORKS_DEFAULT_PROVIDER")
+                        .unwrap_or_else(|_| "claude".to_string());
                     self.work_queue
                         .enqueue(
                             WorkItemKind::InvokeAgent,
@@ -126,6 +130,8 @@ impl Orchestrator {
                                 "run_id": run_id.to_string(),
                                 "stage_id": stage.stage_id,
                                 "stage_execution_id": stage.id.to_string(),
+                                "agent_id": stage.stage_id,
+                                "provider": default_provider,
                             }),
                         )
                         .await?;

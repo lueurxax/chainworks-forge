@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::adapters::auggie::AuggieAdapter;
 use crate::adapters::claude::ClaudeAgentAdapter;
+use crate::adapters::codex::CodexAdapter;
 use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::AcpAdapter;
@@ -25,11 +26,13 @@ impl AcpRuntimeManager {
         let mut adapters: HashMap<String, Arc<dyn AcpAdapter>> = HashMap::new();
 
         let claude = Arc::new(ClaudeAgentAdapter::new()) as Arc<dyn AcpAdapter>;
+        let codex = Arc::new(CodexAdapter::new()) as Arc<dyn AcpAdapter>;
         let gemini = Arc::new(GeminiCliAdapter::new()) as Arc<dyn AcpAdapter>;
         let auggie = Arc::new(AuggieAdapter::new()) as Arc<dyn AcpAdapter>;
         let junie = Arc::new(JunieAdapter::new()) as Arc<dyn AcpAdapter>;
 
         adapters.insert(claude.provider_name().to_string(), claude);
+        adapters.insert(codex.provider_name().to_string(), codex);
         adapters.insert(gemini.provider_name().to_string(), gemini);
         adapters.insert(auggie.provider_name().to_string(), auggie);
         adapters.insert(junie.provider_name().to_string(), junie);
@@ -68,6 +71,16 @@ impl AcpRuntimeManager {
     pub fn register(&mut self, adapter: Arc<dyn AcpAdapter>) {
         self.adapters
             .insert(adapter.provider_name().to_string(), adapter);
+    }
+
+    /// Create a manager pre-loaded with the given adapters.
+    /// Useful for injecting fixture adapters in integration tests.
+    pub fn new_with_adapters(adapters: Vec<Arc<dyn AcpAdapter>>) -> Self {
+        let adapters: HashMap<String, Arc<dyn AcpAdapter>> = adapters
+            .into_iter()
+            .map(|a| (a.provider_name().to_string(), a))
+            .collect();
+        Self { adapters }
     }
 }
 
