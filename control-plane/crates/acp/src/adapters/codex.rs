@@ -88,8 +88,8 @@ impl AcpAdapter for CodexAdapter {
         // Codex-specific session config:
         // - mode: "full-access"  (write-enabled autonomous execution)
         // - no _meta block        (Claude-specific plugin control, not applicable)
-        // - model from request (YAML backend_profile) or default "gpt-5"
-        let model_str = req.model.as_deref().unwrap_or("gpt-5").to_string();
+        // - model mapped to Codex CLI catalog (matches Swift mapModelForCodexCatalog)
+        let model_str = map_model_for_codex(req.model.as_deref().unwrap_or("gpt-5"));
         let config = AcpSessionConfig {
             model: &model_str,
             mode: "full-access",
@@ -104,5 +104,21 @@ impl AcpAdapter for CodexAdapter {
             artifact_paths,
             cost_cents: None,
         })
+    }
+}
+
+/// Map a model identifier to the Codex CLI catalog.
+/// Matches Swift `CodexACPTransport.mapModelForCodexCatalog`.
+/// Known models pass through; others are mapped to the closest known model.
+fn map_model_for_codex(model: &str) -> String {
+    let lowered = model.to_lowercase();
+    match lowered.as_str() {
+        "gpt-5" | "gpt-5-codex" | "o4-mini" => lowered,
+        _ => {
+            if lowered.contains("gpt-5") { return "gpt-5".to_string(); }
+            if lowered.contains("codex") { return "gpt-5-codex".to_string(); }
+            if lowered.contains("o4-mini") { return "o4-mini".to_string(); }
+            "gpt-5".to_string()
+        }
     }
 }
