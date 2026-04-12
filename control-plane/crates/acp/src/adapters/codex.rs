@@ -78,6 +78,10 @@ impl AcpAdapter for CodexAdapter {
 
         let mut child = Command::new(&self.binary_path)
             .envs(env)
+            // Suppress verbose codex_otel/codex_core/rmcp INFO tracing that
+            // floods stderr and causes memory pressure. codex-acp reads RUST_LOG
+            // via EnvFilter::from_default_env(). Only show warnings and errors.
+            .env("RUST_LOG", "warn")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
