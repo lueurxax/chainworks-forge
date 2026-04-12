@@ -22,3 +22,4 @@ DerivedDataCodex/
 # Local tool state
 .claude/
 traces/
+.forge-codex-acp/

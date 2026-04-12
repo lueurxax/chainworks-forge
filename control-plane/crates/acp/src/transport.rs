@@ -96,8 +96,8 @@ impl Default for AcpSessionConfig<'_> {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(600);
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Workspace snapshot — used for artifact discovery
