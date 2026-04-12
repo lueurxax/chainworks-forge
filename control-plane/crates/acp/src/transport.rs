@@ -27,6 +27,29 @@ use tracing::{debug, error, warn};
 
 use crate::ExecutionRequest;
 
+/// Strip ANSI escape sequences from a string for clean log output.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... m sequences
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if nc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Per-adapter session configuration
 // ---------------------------------------------------------------------------
@@ -166,7 +189,7 @@ async fn await_response(
         let parsed: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                warn!("ACP non-JSON line during handshake: {:.200} ({e})", trimmed);
+                debug!("ACP non-JSON line during handshake: {:.200} ({e})", trimmed);
                 continue;
             }
         };
@@ -310,23 +333,37 @@ pub async fn run_acp_session(
                     Ok(0) => break,
                     Ok(_) => {
                         let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            warn!(
+                        if trimmed.is_empty() { continue; }
+                        // Strip ANSI escape codes for clean log output.
+                        let clean = strip_ansi(trimmed);
+                        if clean.is_empty() { continue; }
+                        // Route to appropriate log level based on subprocess output.
+                        if clean.contains("ERROR") || clean.contains("Unhandled error") {
+                            error!(
                                 run_id = %run_id,
                                 stage_id = %stage_id,
                                 provider = %provider,
-                                "ACP stderr: {trimmed}"
+                                "{clean}"
                             );
-                            let timestamp = chrono::Utc::now().to_rfc3339();
-                            let _ = tokio::io::AsyncWriteExt::write_all(
-                                &mut log_file,
-                                format!(
-                                    "[{timestamp}] run_id={run_id} stage_id={stage_id} provider={provider} {trimmed}\n"
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
+                        } else if clean.contains("WARN") || clean.contains("usage_limit") {
+                            warn!(
+                                run_id = %run_id,
+                                provider = %provider,
+                                "{clean}"
+                            );
+                        } else {
+                            debug!(
+                                run_id = %run_id,
+                                provider = %provider,
+                                "{clean}"
+                            );
                         }
+                        let timestamp = chrono::Utc::now().to_rfc3339();
+                        let _ = tokio::io::AsyncWriteExt::write_all(
+                            &mut log_file,
+                            format!("[{timestamp}] [{provider}] {clean}\n").as_bytes(),
+                        )
+                        .await;
                     }
                     Err(_) => break,
                 }
@@ -563,7 +600,7 @@ pub async fn run_acp_session(
             );
         }
         _ => {
-            warn!(
+            debug!(
                 session_id = %session_id,
                 "ACP subprocess did not exit within {}s — force-killing",
                 SHUTDOWN_WAIT.as_secs()
