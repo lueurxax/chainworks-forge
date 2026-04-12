@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::info;
 
 use acp::AcpRuntimeManager;
 use db::pool::create_pool;
@@ -28,10 +28,6 @@ async fn main() -> Result<()> {
     let graphql_addr = std::env::var("GRAPHQL_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:4000".to_string());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "daemon".to_string());
-    let enable_mcp = std::env::var("ENABLE_MCP")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
     info!(
         database_url = %database_url,
         mode = %mode,
@@ -94,25 +90,24 @@ async fn main() -> Result<()> {
             mcp.run_stdio().await?;
         }
         _ => {
-            // Daemon mode: start GraphQL server
-            // Optionally start MCP server on a background task
-            if enable_mcp {
-                let mcp_pool = pool.clone();
-                let mcp_cmd = cmd_handler.clone();
-                tokio::spawn(async move {
-                    let mcp = mcp_server::server::McpServer::new(mcp_pool, mcp_cmd);
-                    if let Err(e) = mcp.run_stdio().await {
-                        warn!(error = %e, "MCP server exited with error");
-                    }
-                });
-            }
+            // Daemon mode: single process with GraphQL + MCP HTTP on the same port.
+            let mcp = std::sync::Arc::new(
+                mcp_server::server::McpServer::new(pool.clone(), cmd_handler.clone()),
+            );
+            let mcp_routes = mcp_server::http::routes(mcp);
+            info!("MCP HTTP transport mounted at /mcp");
 
             let schema = graphql_server::schema::build_schema(
                 pool.clone(),
                 cmd_handler.clone(),
                 events.clone(),
             );
-            graphql_server::server::start(schema, &graphql_addr).await?;
+            graphql_server::server::start_with_extra_routes(
+                schema,
+                &graphql_addr,
+                mcp_routes,
+            )
+            .await?;
         }
     }
 

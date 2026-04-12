@@ -83,7 +83,7 @@ impl McpServer {
         Ok(())
     }
 
-    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+    pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id.clone();
 
         match req.method.as_str() {
