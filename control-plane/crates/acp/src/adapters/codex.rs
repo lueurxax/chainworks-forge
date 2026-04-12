@@ -1,7 +1,10 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::info;
+use uuid::Uuid;
 
 use domain::ids::AgentExecutionId;
 
@@ -13,29 +16,22 @@ const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
 
 /// Adapter for the OpenAI Codex CLI provider (`codex-acp`).
 ///
-/// Spawns the binary given by `CHAINWORKS_CODEX_ACP_BINARY` (defaulting to
-/// `codex-acp` on PATH) and communicates using the ACP JSON-RPC 2.0 protocol
-/// over ndjson stdio.
-///
-/// Differences from the Claude adapter (matching `CodexACPTransport.swift`):
-/// - Mode is `"full-access"` (write-enabled) rather than `"bypassPermissions"`
-/// - Model catalog: `"gpt-5"`, `"gpt-5-codex"`, `"o4-mini"`; default `"gpt-5"`
-/// - No `_meta.claudeCode.options` block in `session/new`
-/// - Binary is `codex-acp`, invoked without extra arguments
+/// Matches Swift `CodexACPTransport`:
+/// - Prepares an isolated runtime home with auth.json + config.toml
+/// - Sets CODEX_HOME, HOME, TMPDIR, PATH env vars
+/// - Mode: `"full-access"`, no `_meta` block
+/// - Model mapped to Codex CLI catalog
 pub struct CodexAdapter {
     binary_path: String,
 }
 
 impl CodexAdapter {
-    /// Create a new adapter, resolving the binary from `CHAINWORKS_CODEX_ACP_BINARY`
-    /// or falling back to `codex-acp` on PATH.
     pub fn new() -> Self {
         let binary_path = std::env::var(BINARY_ENV_VAR)
             .unwrap_or_else(|_| "codex-acp".to_string());
         Self { binary_path }
     }
 
-    /// Construct with an explicit binary path — for testing and runtime injection.
     pub fn new_with_binary(path: impl Into<String>) -> Self {
         Self {
             binary_path: path.into(),
@@ -63,19 +59,25 @@ impl AcpAdapter for CodexAdapter {
             );
         }
 
+        // ── Prepare isolated runtime home (matches Swift prepareRuntimeHome) ──
+        let runtime_home = prepare_runtime_home(&req.workspace_root)?;
+
         info!(
             provider = "codex",
             run_id = %req.run_id,
             stage_id = %req.stage_id,
             agent_id = %req.agent_id,
-            binary = %self.binary_path,
+            runtime_home = %runtime_home.display(),
             "Spawning Codex ACP subprocess"
         );
 
         let agent_execution_id = AgentExecutionId::new();
 
-        // Codex ACP is invoked with no extra arguments (unlike `gemini --acp`).
+        // Build environment matching Swift makeSessionEnvironment
+        let env = make_session_environment(&runtime_home);
+
         let mut child = Command::new(&self.binary_path)
+            .envs(env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -85,10 +87,6 @@ impl AcpAdapter for CodexAdapter {
                 format!("spawn Codex ACP subprocess: {}", self.binary_path)
             })?;
 
-        // Codex-specific session config:
-        // - mode: "full-access"  (write-enabled autonomous execution)
-        // - no _meta block        (Claude-specific plugin control, not applicable)
-        // - model mapped to Codex CLI catalog (matches Swift mapModelForCodexCatalog)
         let model_str = map_model_for_codex(req.model.as_deref().unwrap_or("gpt-5"));
         let config = AcpSessionConfig {
             model: &model_str,
@@ -97,6 +95,9 @@ impl AcpAdapter for CodexAdapter {
         };
 
         let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
+
+        // Cleanup runtime home (best-effort, don't fail the run)
+        let _ = std::fs::remove_dir_all(&runtime_home);
 
         Ok(ExecutionResult {
             agent_execution_id,
@@ -107,9 +108,108 @@ impl AcpAdapter for CodexAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime home preparation (matches Swift CodexACPTransport)
+// ---------------------------------------------------------------------------
+
+/// Source Codex home: `$CODEX_HOME` or `~/.codex`
+fn source_codex_home() -> PathBuf {
+    if let Ok(explicit) = std::env::var("CODEX_HOME") {
+        if !explicit.is_empty() {
+            return PathBuf::from(explicit);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".codex")
+}
+
+/// Create an isolated runtime home directory with auth.json and config.toml
+/// copied from the source Codex home. Matches Swift `prepareRuntimeHome`.
+fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
+    let runtime_home = if workspace_root.is_empty() {
+        std::env::temp_dir()
+            .join("forge-codex-acp")
+            .join(Uuid::new_v4().to_string())
+    } else {
+        Path::new(workspace_root)
+            .join(".forge-codex-acp")
+            .join(Uuid::new_v4().to_string())
+    };
+
+    std::fs::create_dir_all(&runtime_home)
+        .with_context(|| format!("create runtime home: {}", runtime_home.display()))?;
+
+    let source_home = source_codex_home();
+
+    // Copy auth.json (credentials)
+    let source_auth = source_home.join("auth.json");
+    let runtime_auth = runtime_home.join("auth.json");
+    if source_auth.exists() {
+        std::fs::copy(&source_auth, &runtime_auth)
+            .with_context(|| "copy auth.json to runtime home")?;
+    } else {
+        info!("Codex: auth.json not found at {}; starting without copied auth",
+              source_auth.display());
+    }
+
+    // Copy config.toml (sanitized)
+    let source_config = source_home.join("config.toml");
+    let runtime_config = runtime_home.join("config.toml");
+    if source_config.exists() {
+        let data = std::fs::read_to_string(&source_config)
+            .with_context(|| "read config.toml")?;
+        let sanitized = sanitize_runtime_config(&data);
+        std::fs::write(&runtime_config, sanitized)
+            .with_context(|| "write sanitized config.toml")?;
+    }
+
+    // Create required subdirectories
+    for subdir in &["bin", "tmp", ".cache/clang/ModuleCache"] {
+        std::fs::create_dir_all(runtime_home.join(subdir)).ok();
+    }
+
+    Ok(runtime_home)
+}
+
+/// Strip sandbox-related settings from config.toml.
+/// Matches Swift `sanitizeRuntimeConfig`.
+fn sanitize_runtime_config(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim().to_lowercase();
+            !trimmed.starts_with("sandbox")
+                && !trimmed.starts_with("disable_sandbox")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build environment variables matching Swift `makeSessionEnvironment`.
+fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
+    let home = runtime_home.to_string_lossy().to_string();
+    let bin = runtime_home.join("bin").to_string_lossy().to_string();
+    let tmp = runtime_home.join("tmp").to_string_lossy().to_string();
+    let cache = runtime_home.join(".cache").to_string_lossy().to_string();
+
+    let path = format!(
+        "{}:{}",
+        bin,
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    vec![
+        ("CODEX_HOME".into(), home.clone()),
+        ("HOME".into(), home),
+        ("TMPDIR".into(), tmp),
+        ("PATH".into(), path),
+        ("XDG_CACHE_HOME".into(), cache),
+    ]
+}
+
 /// Map a model identifier to the Codex CLI catalog.
-/// Matches Swift `CodexACPTransport.mapModelForCodexCatalog`.
-/// Known models pass through; others are mapped to the closest known model.
+/// Matches Swift `mapModelForCodexCatalog`.
 fn map_model_for_codex(model: &str) -> String {
     let lowered = model.to_lowercase();
     match lowered.as_str() {
