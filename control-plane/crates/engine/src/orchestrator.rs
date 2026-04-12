@@ -622,7 +622,7 @@ impl Orchestrator {
 /// Resolve `${VAR:-default}` patterns in artifact path templates.
 /// Falls back to the default value if the env var is not set.
 /// Also resolves bare `.` as workspace_root.
-fn resolve_path_template(template: &str, workspace_root: &str) -> String {
+pub fn resolve_path_template(template: &str, workspace_root: &str) -> String {
     let mut result = template.to_string();
 
     // Resolve ${VAR:-default} patterns

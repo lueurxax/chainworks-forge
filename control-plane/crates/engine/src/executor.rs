@@ -250,6 +250,23 @@ impl BackgroundExecutor {
                     });
                 }
 
+                // Normalize artifacts: copy from artifact_root to canonical
+                // workspace paths defined in the YAML artifacts map.
+                // This ensures transition conditions always find files at
+                // the expected location regardless of where the agent wrote them.
+                if let (Some(wf_path), Some(ac_path)) =
+                    (&run.workflow_yaml_path, &run.agent_catalog_yaml_path)
+                {
+                    if let Ok(plan) = workflow::compiler::compile(wf_path, ac_path) {
+                        normalize_artifacts(
+                            &run.artifact_root,
+                            &run.workspace_root,
+                            run_id,
+                            &plan.artifact_paths,
+                        );
+                    }
+                }
+
                 // Settle the stage based on ACP result status.
                 let settlement_kind = match result.status {
                     domain::agent::AgentStatus::Completed => {
@@ -337,5 +354,58 @@ impl BackgroundExecutor {
     fn extract_run_id(&self, item: &WorkItem) -> Result<RunId> {
         item.run_id
             .ok_or_else(|| anyhow::anyhow!("Work item {} has no run_id", item.id))
+    }
+}
+
+/// Copy artifacts from artifact_root to canonical workspace paths from the YAML
+/// artifacts map. Scans artifact_root (and artifact_root/run_id/) for files whose
+/// names match a known artifact name, then copies to the workspace-relative path.
+fn normalize_artifacts(
+    artifact_root: &str,
+    workspace_root: &str,
+    run_id: RunId,
+    artifact_paths: &std::collections::HashMap<String, String>,
+) {
+    let run_dir = format!("{}/{}", artifact_root, run_id);
+    let search_dirs = [artifact_root.to_string(), run_dir];
+
+    for (artifact_name, path_template) in artifact_paths {
+        let canonical = crate::orchestrator::resolve_path_template(path_template, workspace_root);
+
+        // Already exists at canonical location — skip
+        if std::path::Path::new(&canonical).exists() {
+            continue;
+        }
+
+        // Search for the artifact in artifact_root locations
+        for dir in &search_dirs {
+            let candidate = format!("{}/{}", dir, artifact_name);
+            if std::path::Path::new(&candidate).exists() {
+                // Create parent directories
+                if let Some(parent) = std::path::Path::new(&canonical).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::copy(&candidate, &canonical) {
+                    Ok(_) => {
+                        info!(
+                            artifact = %artifact_name,
+                            from = %candidate,
+                            to = %canonical,
+                            "Normalized artifact to canonical path"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            artifact = %artifact_name,
+                            from = %candidate,
+                            to = %canonical,
+                            error = %e,
+                            "Failed to normalize artifact"
+                        );
+                    }
+                }
+                break;
+            }
+        }
     }
 }
