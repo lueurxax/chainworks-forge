@@ -447,16 +447,31 @@ impl Orchestrator {
                 .trim_matches('"');
 
             if let Some(path_template) = plan.artifact_paths.get(artifact_name) {
-                // Resolve env-style variables in path: ${VAR:-default}
+                // Check workspace-relative path first (canonical location from YAML)
                 let resolved = resolve_path_template(path_template, &run.workspace_root);
-                let exists = std::path::Path::new(&resolved).exists();
+                if std::path::Path::new(&resolved).exists() {
+                    info!(artifact = artifact_name, path = %resolved, "exists() = true (workspace)");
+                    return true;
+                }
+                // Fallback: check artifact_root (agents may write there instead)
+                let art_path = format!("{}/{}", run.artifact_root, artifact_name);
+                if std::path::Path::new(&art_path).exists() {
+                    info!(artifact = artifact_name, path = %art_path, "exists() = true (artifact_root)");
+                    return true;
+                }
+                // Fallback: check artifact_root with run_id subdirectory
+                let art_run_path = format!("{}/{}/{}", run.artifact_root, run.id, artifact_name);
+                if std::path::Path::new(&art_run_path).exists() {
+                    info!(artifact = artifact_name, path = %art_run_path, "exists() = true (artifact_root/run_id)");
+                    return true;
+                }
                 info!(
                     artifact = artifact_name,
-                    path = %resolved,
-                    exists = exists,
-                    "Transition exists() check"
+                    workspace_path = %resolved,
+                    artifact_root_path = %art_path,
+                    "exists() = false"
                 );
-                return exists;
+                return false;
             }
             // Artifact name not in catalog — check if it exists as a bare filename
             // in the workspace (fallback)
