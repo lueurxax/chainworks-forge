@@ -162,6 +162,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
+        effort: None,
         // workspace_root == cwd the fixture receives; it creates result.json there
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "test prompt".into(),
@@ -207,6 +208,7 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
+        effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "fail".into(),
     };
@@ -261,6 +263,7 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         agent_id: "gemini-agent".into(),
         provider: "gemini".into(),
         model: None,
+        effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "generate report".into(),
     };

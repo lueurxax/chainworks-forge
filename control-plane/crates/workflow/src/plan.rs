@@ -43,6 +43,8 @@ pub struct ResolvedAgent {
     /// Bare ACP provider name: "claude", "codex", "gemini", "auggie", "junie".
     pub provider: String,
     pub model: Option<String>,
+    /// Effort level from backend_profile (e.g. "high", "medium", "low").
+    pub effort: Option<String>,
     /// System prompt from the agent catalog (agents[].prompt).
     pub prompt: Option<String>,
 }

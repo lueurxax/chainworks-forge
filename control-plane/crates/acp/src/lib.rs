@@ -17,6 +17,7 @@ pub struct ExecutionRequest {
     pub agent_id: String,
     pub provider: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub workspace_root: String,
     pub prompt: String,
 }

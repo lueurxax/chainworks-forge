@@ -239,6 +239,7 @@ impl Orchestrator {
                     "agent_id": state.owner.agent_id,
                     "provider": state.owner.provider,
                     "model": state.owner.model,
+                    "effort": state.owner.effort,
                     "prompt": full_prompt,
                 }),
             )

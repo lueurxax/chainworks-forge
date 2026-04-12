@@ -68,6 +68,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
 struct AgentBinding {
     provider: String,
     model: Option<String>,
+    effort: Option<String>,
     prompt: Option<String>,
 }
 
@@ -89,9 +90,10 @@ fn build_agent_lookup(cat: &catalog::AgentCatalogFile) -> Result<HashMap<String,
 
         let provider = normalize_provider(&profile.provider);
         let model = profile.model.clone();
+        let effort = profile.effort.clone();
         let prompt = agent.prompt.clone();
 
-        lookup.insert(agent.id.clone(), AgentBinding { provider, model, prompt });
+        lookup.insert(agent.id.clone(), AgentBinding { provider, model, effort, prompt });
     }
     Ok(lookup)
 }
@@ -174,6 +176,7 @@ fn resolve_agent(
             agent_id: agent_id.to_string(),
             provider: binding.provider.clone(),
             model: binding.model.clone(),
+            effort: binding.effort.clone(),
             prompt: binding.prompt.clone(),
         }),
         None => {
@@ -185,6 +188,7 @@ fn resolve_agent(
                 agent_id: agent_id.to_string(),
                 provider: "claude".to_string(),
                 model: None,
+                effort: None,
                 prompt: None,
             })
         }

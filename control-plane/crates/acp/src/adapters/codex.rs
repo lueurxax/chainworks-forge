@@ -87,7 +87,10 @@ impl AcpAdapter for CodexAdapter {
                 format!("spawn Codex ACP subprocess: {}", self.binary_path)
             })?;
 
-        let model_str = map_model_for_codex(req.model.as_deref().unwrap_or("gpt-5"));
+        let model_str = build_codex_model_id(
+            req.model.as_deref().unwrap_or("gpt-5"),
+            req.effort.as_deref(),
+        );
         let config = AcpSessionConfig {
             model: &model_str,
             mode: "full-access",
@@ -172,9 +175,10 @@ fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
     Ok(runtime_home)
 }
 
-/// Sanitize config.toml for the isolated runtime:
-/// - Strip sandbox settings (matches Swift `sanitizeRuntimeConfig`)
-/// - Strip model and model_reasoning_effort so session/new model takes priority
+/// Sanitize config.toml for the isolated runtime.
+/// Matches Swift `sanitizeRuntimeConfig`:
+/// - Strip sandbox settings
+/// - Strip model/effort overrides so session/new model takes priority
 fn sanitize_runtime_config(source: &str) -> String {
     source
         .lines()
@@ -183,7 +187,6 @@ fn sanitize_runtime_config(source: &str) -> String {
             !trimmed.starts_with("sandbox")
                 && !trimmed.starts_with("disable_sandbox")
                 && !trimmed.starts_with("model")
-                && !trimmed.starts_with("model_reasoning_effort")
                 && !trimmed.starts_with("hide_rate_limit")
         })
         .collect::<Vec<_>>()
@@ -214,8 +217,16 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
 
 /// Map a model identifier to the Codex CLI catalog.
 /// Matches Swift `mapModelForCodexCatalog`.
-/// Map a model identifier to the Codex CLI catalog.
-/// Known models pass through; effort level from YAML is appended as /suffix.
-fn map_model_for_codex(model: &str) -> String {
-    model.to_lowercase()
+/// Build the Codex model ID by combining model + effort.
+/// Codex catalog uses `model/effort` format: `gpt-5.4/high`, `gpt-5.3-codex/medium`.
+/// If the model already contains `/`, it's used as-is.
+fn build_codex_model_id(model: &str, effort: Option<&str>) -> String {
+    let lowered = model.to_lowercase();
+    if lowered.contains('/') {
+        return lowered;
+    }
+    match effort {
+        Some(e) => format!("{}/{}", lowered, e.to_lowercase()),
+        None => lowered,
+    }
 }
