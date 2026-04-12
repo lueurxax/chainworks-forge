@@ -240,6 +240,7 @@ impl Orchestrator {
                     "stage_execution_id": stage.id.to_string(),
                     "agent_id": state.owner.agent_id,
                     "provider": state.owner.provider,
+                    "model": state.owner.model,
                     "prompt": full_prompt,
                 }),
             )

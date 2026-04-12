@@ -88,8 +88,10 @@ impl AcpAdapter for CodexAdapter {
         // Codex-specific session config:
         // - mode: "full-access"  (write-enabled autonomous execution)
         // - no _meta block        (Claude-specific plugin control, not applicable)
+        // - model from request (YAML backend_profile) or default "gpt-5"
+        let model_str = req.model.as_deref().unwrap_or("gpt-5").to_string();
         let config = AcpSessionConfig {
-            model: "gpt-5",
+            model: &model_str,
             mode: "full-access",
             extra: None,
         };

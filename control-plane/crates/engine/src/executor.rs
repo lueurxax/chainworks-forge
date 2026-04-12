@@ -175,11 +175,16 @@ impl BackgroundExecutor {
                     .unwrap_or(&format!("Execute stage {} for run {}", stage_id, run_id))
                     .to_string();
 
+                let model = payload["model"]
+                    .as_str()
+                    .map(String::from);
+
                 let req = acp::ExecutionRequest {
                     run_id,
                     stage_id: stage_id.clone(),
                     agent_id: agent_id.clone(),
                     provider: provider.clone(),
+                    model,
                     workspace_root: run.workspace_root.clone(),
                     prompt,
                 };

@@ -16,6 +16,7 @@ pub struct ExecutionRequest {
     pub stage_id: String,
     pub agent_id: String,
     pub provider: String,
+    pub model: Option<String>,
     pub workspace_root: String,
     pub prompt: String,
 }

@@ -251,24 +251,52 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                             return
                         }
 
-                        // Check if this is a JSON-RPC notification (has "method", no "id")
+                        // Provider-initiated requests also carry an "id". If we ignore an
+                        // unsupported request here, Codex may wait indefinitely for a client
+                        // response and the executor only sees a later stall/guardrail timeout.
                         if let method = json["method"] as? String {
                             let params = json["params"] as? [String: Any]
+                            if responseID != nil {
+                                if method == "session/request_permission" {
+                                    let permissionTool = ACPStreamEventMapper.extractPermissionToolNameForDiagnostics(from: params)
+                                    ForgeLogger.execution.info("CodexACP permission request: session=\(sessionID) tool=\(permissionTool)")
+                                    self.autoGrantPermission(
+                                        subprocess: subprocess,
+                                        requestID: json["id"],
+                                        params: params,
+                                        sessionID: sessionID
+                                    )
+                                } else {
+                                    let diagnostic = RuntimeProviderDiagnostic(
+                                        source: "codex_request",
+                                        severity: .error,
+                                        message: "Unsupported Codex ACP client request '\(method)' during prompt execution",
+                                        normalizedReason: "unsupported_client_request"
+                                    )
+                                    self.appendDiagnostic(diagnostic, to: sessionID)
+                                    ForgeLogger.execution.error("CodexACP unsupported provider request: session=\(sessionID) method=\(method)")
+                                    if let response = ACPProtocolSupport.unsupportedRequestResponse(
+                                        requestID: json["id"],
+                                        method: method
+                                    ) {
+                                        do {
+                                            try subprocess.sendJSON(response)
+                                        } catch {
+                                            ForgeLogger.execution.error("CodexACP unsupported-request response send failed for session \(sessionID): \(error.localizedDescription)")
+                                        }
+                                    }
+                                    self.invalidateSession(sessionID: sessionID)
+                                    continuation.finish(throwing: RuntimeTransportError.streamingFailed(
+                                        reason: "Unsupported Codex ACP client request during prompt execution: \(method)"
+                                    ))
+                                    return
+                                }
+                            }
                             // Log first few events to diagnose structure
                             if method == "session/update" {
                                 let updateKeys = (params?["update"] as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "no-update"
                                 let sessionUpdate = (params?["update"] as? [String: Any])?["sessionUpdate"] as? String ?? "no-sessionUpdate"
                                 ForgeLogger.execution.debug("CodexACP session/update: sessionUpdate=\(sessionUpdate) updateKeys=\(updateKeys)")
-                            }
-
-                            // Handle permission requests by auto-granting
-                            if method == "session/request_permission" {
-                                self.autoGrantPermission(
-                                    subprocess: subprocess,
-                                    requestID: json["id"],
-                                    params: params,
-                                    sessionID: sessionID
-                                )
                             }
 
                             for event in ACPStreamEventMapper.mapNotificationEvents(method: method, params: params) {
@@ -343,12 +371,12 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     // MARK: - Private: Model Mapping
 
     /// Map Forge model identifiers to the Codex CLI model catalog.
-    /// Known Codex models: `gpt-5`, `gpt-5-codex`, `o4-mini` pass through directly.
-    /// All other identifiers default to `gpt-5`.
+    /// Known Codex models pass through directly; others are mapped to the
+    /// closest known model.
     private static func mapModelForCodexCatalog(_ model: String) -> String {
         let lowered = model.lowercased()
         switch lowered {
-        case "gpt-5", "gpt-5-codex", "o4-mini":
+        case "gpt-5", "gpt-5.4", "gpt-5-codex", "o4-mini":
             return lowered
         default:
             if lowered.contains("gpt-5") { return "gpt-5" }
@@ -365,8 +393,24 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     private static func makeSessionEnvironment(runtimeHomeURL: URL?) -> [String: String] {
         guard let runtimeHomeURL else { return [:] }
+        let cacheRoot = runtimeHomeURL.appendingPathComponent(".cache", isDirectory: true)
+        let shimBinRoot = runtimeHomeURL.appendingPathComponent("bin", isDirectory: true)
+        let swiftPMConfigRoot = runtimeHomeURL.appendingPathComponent("Library/org.swift.swiftpm/configuration", isDirectory: true)
+        let swiftPMSecurityRoot = runtimeHomeURL.appendingPathComponent("Library/org.swift.swiftpm/security", isDirectory: true)
+        let swiftPMCacheRoot = runtimeHomeURL.appendingPathComponent("Library/Caches/org.swift.swiftpm", isDirectory: true)
+        let clangModuleCacheRoot = cacheRoot.appendingPathComponent("clang/ModuleCache", isDirectory: true)
+        let tempRoot = runtimeHomeURL.appendingPathComponent("tmp", isDirectory: true)
         return [
-            "CODEX_HOME": runtimeHomeURL.path
+            "CODEX_HOME": runtimeHomeURL.path,
+            "HOME": runtimeHomeURL.path,
+            "TMPDIR": tempRoot.path,
+            "PATH": "\(shimBinRoot.path):" + (ProcessInfo.processInfo.environment["PATH"] ?? ""),
+            "XDG_CACHE_HOME": cacheRoot.path,
+            "CLANG_MODULE_CACHE_PATH": clangModuleCacheRoot.path,
+            "SWIFTPM_CONFIGURATION_DIRECTORY": swiftPMConfigRoot.path,
+            "SWIFTPM_SECURITY_DIRECTORY": swiftPMSecurityRoot.path,
+            "SWIFTPM_CACHE_PATH": swiftPMCacheRoot.path,
+            "SWIFTPM_DISABLE_SANDBOX": "1"
         ]
     }
 
@@ -376,10 +420,19 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         tempRootURL: URL? = nil
     ) throws -> URL {
-        let tempRoot = tempRootURL ?? fileManager.temporaryDirectory
-        let runtimeHomeURL = tempRoot
-            .appendingPathComponent("forge-codex-acp", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let runtimeHomeURL: URL
+        if let workingDirectory,
+           !workingDirectory.isEmpty {
+            let workspaceRoot = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            runtimeHomeURL = workspaceRoot
+                .appendingPathComponent(".forge-codex-acp", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        } else {
+            let tempRoot = tempRootURL ?? fileManager.temporaryDirectory
+            runtimeHomeURL = tempRoot
+                .appendingPathComponent("forge-codex-acp", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        }
         try fileManager.createDirectory(at: runtimeHomeURL, withIntermediateDirectories: true)
 
         let sourceHomeURL = sourceCodexHomeURL(environment: environment)
@@ -395,10 +448,31 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         }
 
         if fileManager.fileExists(atPath: sourceConfigURL.path) {
-            try fileManager.copyItem(at: sourceConfigURL, to: runtimeConfigURL)
+            let configData = try Data(contentsOf: sourceConfigURL)
+            let sanitizedConfigData = sanitizeRuntimeConfig(configData)
+            try sanitizedConfigData.write(to: runtimeConfigURL)
         } else {
             ForgeLogger.execution.info("CodexACPTransport: config.toml not found at \(sourceConfigURL.path); starting isolated runtime home without copied runtime config")
         }
+
+        let writableExecRoots = [
+            runtimeHomeURL.appendingPathComponent("bin", isDirectory: true),
+            runtimeHomeURL.appendingPathComponent("Library/org.swift.swiftpm/configuration", isDirectory: true),
+            runtimeHomeURL.appendingPathComponent("Library/org.swift.swiftpm/security", isDirectory: true),
+            runtimeHomeURL.appendingPathComponent("Library/Caches/org.swift.swiftpm", isDirectory: true),
+            runtimeHomeURL.appendingPathComponent(".cache/clang/ModuleCache", isDirectory: true),
+            runtimeHomeURL.appendingPathComponent("tmp", isDirectory: true)
+        ]
+        for root in writableExecRoots {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        let swiftShimURL = runtimeHomeURL.appendingPathComponent("bin/swift", isDirectory: false)
+        try buildSwiftSandboxShim().write(to: swiftShimURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o755)],
+            ofItemAtPath: swiftShimURL.path
+        )
 
         ForgeLogger.execution.debug("CodexACPTransport: prepared isolated CODEX_HOME at \(runtimeHomeURL.path) for workingDir=\(workingDirectory ?? "nil")")
         return runtimeHomeURL
@@ -410,6 +484,54 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         }
         return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    private static func sanitizeRuntimeConfig(_ data: Data) -> Data {
+        guard let source = String(data: data, encoding: .utf8) else {
+            return data
+        }
+
+        let sanitizedLines = source.split(separator: "\n", omittingEmptySubsequences: false).filter { rawLine in
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("[") else { return true }
+            guard let key = line.split(separator: "=", maxSplits: 1).first?.trimmingCharacters(in: .whitespaces).lowercased() else {
+                return true
+            }
+            return key != "model" && key != "model_reasoning_effort"
+        }
+
+        let sanitized = sanitizedLines.joined(separator: "\n")
+        return Data(sanitized.utf8)
+    }
+
+    private static func buildSwiftSandboxShim() -> String {
+        """
+        #!/bin/zsh
+        set -euo pipefail
+
+        real_swift="/usr/bin/xcrun swift"
+
+        if [[ $# -eq 0 ]]; then
+          exec /usr/bin/xcrun swift
+        fi
+
+        subcommand="$1"
+        shift
+
+        case "$subcommand" in
+          build|test|package|run)
+            for arg in "$@"; do
+              if [[ "$arg" == "--disable-sandbox" ]]; then
+                exec /usr/bin/xcrun swift "$subcommand" "$@"
+              fi
+            done
+            exec /usr/bin/xcrun swift "$subcommand" --disable-sandbox "$@"
+            ;;
+          *)
+            exec /usr/bin/xcrun swift "$subcommand" "$@"
+            ;;
+        esac
+        """
     }
 
     static func cleanupRuntimeHomeIfPresent(_ runtimeHomeURL: URL?, fileManager: FileManager = .default) {
@@ -510,14 +632,38 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         params: [String: Any]?,
         sessionID: String
     ) {
+        let toolName = ACPStreamEventMapper.extractPermissionToolNameForDiagnostics(from: params)
         guard let response = ACPProtocolSupport.permissionSelectionResponse(
             requestID: requestID,
             params: params
         ) else {
+            appendDiagnostic(
+                RuntimeProviderDiagnostic(
+                    source: "codex_permission",
+                    severity: .error,
+                    message: "Failed to build permission response for tool '\(toolName)'",
+                    normalizedReason: "permission_response_build_failed"
+                ),
+                to: sessionID
+            )
             ForgeLogger.execution.error("CodexACP permission auto-grant failed: could not build response for session \(sessionID)")
             return
         }
-        try? subprocess.sendJSON(response)
+        do {
+            try subprocess.sendJSON(response)
+            ForgeLogger.execution.info("CodexACP permission granted: session=\(sessionID) tool=\(toolName)")
+        } catch {
+            appendDiagnostic(
+                RuntimeProviderDiagnostic(
+                    source: "codex_permission",
+                    severity: .error,
+                    message: "Failed to send permission response for tool '\(toolName)': \(error.localizedDescription)",
+                    normalizedReason: "permission_response_send_failed"
+                ),
+                to: sessionID
+            )
+            ForgeLogger.execution.error("CodexACP permission auto-grant send failed for session \(sessionID): \(error.localizedDescription)")
+        }
     }
 
     private func startStderrLogging(for subprocess: ACPSubprocessManager, prefix: String, sessionID: String) {

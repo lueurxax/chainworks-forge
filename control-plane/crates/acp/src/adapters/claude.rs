@@ -85,8 +85,14 @@ impl AcpAdapter for ClaudeAgentAdapter {
                 format!("spawn Claude ACP subprocess: {}", self.binary_path)
             })?;
 
+        let default_config = AcpSessionConfig::default();
+        let model_str = req.model.as_deref().unwrap_or(default_config.model).to_string();
+        let config = AcpSessionConfig {
+            model: &model_str,
+            ..default_config
+        };
         let (status, artifact_paths) =
-            run_acp_session(&mut child, &req, &AcpSessionConfig::default()).await?;
+            run_acp_session(&mut child, &req, &config).await?;
 
         Ok(ExecutionResult {
             agent_execution_id,
