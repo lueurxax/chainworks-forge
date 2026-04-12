@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::ExecutionRequest;
 
@@ -170,6 +170,7 @@ async fn await_response(
                 continue;
             }
         };
+        debug!(msg = %trimmed, "ACP ← subprocess (handshake)");
 
         // Extract response id — ACP may encode it as integer or string
         let msg_id: Option<u64> = match parsed.get("id") {
@@ -192,6 +193,7 @@ async fn await_response(
 
         if let Some(err) = parsed.get("error") {
             let msg = err["message"].as_str().unwrap_or("unknown ACP error");
+            error!("ACP error response for id={expected_id}: {msg}");
             bail!("ACP error response for id={expected_id}: {msg}");
         }
 
@@ -282,6 +284,55 @@ pub async fn run_acp_session(
         .stdout
         .take()
         .context("ACP subprocess has no stdout pipe")?;
+    if let Some(stderr) = child.stderr.take() {
+        let run_id = req.run_id;
+        let stage_id = req.stage_id.clone();
+        let provider = req.provider.clone();
+        let log_path = format!("{}/.chainworks/acp-stderr.log", req.workspace_root);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            let mut log_file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    // If we can't open the file, we still emit to logs.
+                    return;
+                }
+            };
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                provider = %provider,
+                                "ACP stderr: {trimmed}"
+                            );
+                            let timestamp = chrono::Utc::now().to_rfc3339();
+                            let _ = tokio::io::AsyncWriteExt::write_all(
+                                &mut log_file,
+                                format!(
+                                    "[{timestamp}] run_id={run_id} stage_id={stage_id} provider={provider} {trimmed}\n"
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
     let mut reader = BufReader::new(stdout);
     let mut req_counter: u64 = 0;
 
@@ -417,6 +468,7 @@ pub async fn run_acp_session(
             Ok(v) => v,
             Err(_) => continue,
         };
+        debug!(msg = %trimmed, "ACP ← subprocess (stream)");
 
         // Terminal response: has an `id` that matches `prompt_id`
         let msg_id: Option<u64> = match parsed.get("id") {
@@ -425,6 +477,45 @@ pub async fn run_acp_session(
             _ => None,
         };
 
+        // Check method FIRST — session/request_permission is a JSON-RPC
+        // request from the subprocess (has an id) that we must respond to.
+        // It must be handled before the terminal-response id check.
+        if let Some(method) = parsed["method"].as_str() {
+            match method {
+                "session/request_permission" => {
+                    // Auto-grant permissions so the agent can proceed unblocked.
+                    if let Some(req_id) = parsed.get("id") {
+                        let params = parsed
+                            .get("params")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        debug!(
+                            session_id = %session_id,
+                            "ACP: auto-granting permission request id={req_id}"
+                        );
+                        if let Some(grant) = build_permission_grant(req_id, &params) {
+                            if let Err(e) = send_ndjson(&mut stdin, &grant).await {
+                                warn!(
+                                    session_id = %session_id,
+                                    "ACP: failed to send permission grant: {e}"
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                "session/update" => {
+                    debug!(session_id = %session_id, "ACP: session/update notification");
+                    continue;
+                }
+                _ => {
+                    debug!(method = method, session_id = %session_id, "ACP: notification");
+                    continue;
+                }
+            }
+        }
+
+        // Terminal response: has an `id` that matches `prompt_id`
         if let Some(id) = msg_id {
             if id == prompt_id {
                 if parsed.get("error").is_some() {
@@ -441,35 +532,6 @@ pub async fn run_acp_session(
             }
             // Response for a different id — skip
             continue;
-        }
-
-        // Notification: no `id` field (or null id)
-        if let Some(method) = parsed["method"].as_str() {
-            match method {
-                "session/request_permission" => {
-                    // Auto-grant permissions so the agent can proceed unblocked.
-                    if let Some(req_id) = parsed.get("id") {
-                        let params = parsed
-                            .get("params")
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        if let Some(grant) = build_permission_grant(req_id, &params) {
-                            if let Err(e) = send_ndjson(&mut stdin, &grant).await {
-                                warn!(
-                                    session_id = %session_id,
-                                    "ACP: failed to send permission grant: {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-                "session/update" => {
-                    debug!(session_id = %session_id, "ACP: session/update notification");
-                }
-                other => {
-                    debug!(method = other, session_id = %session_id, "ACP: notification");
-                }
-            }
         }
     }
 
