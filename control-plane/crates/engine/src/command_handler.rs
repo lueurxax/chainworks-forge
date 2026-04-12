@@ -126,6 +126,13 @@ impl CommandHandler {
                     agent_catalog_yaml_path: c.agent_catalog_yaml_path,
                 };
                 runs::insert(&self.pool, &run).await?;
+                // Activate the idea when its first run starts.
+                db::repos::ideas::update_status(
+                    &self.pool,
+                    c.idea_id,
+                    domain::idea::IdeaStatus::Active,
+                )
+                .await?;
                 info!(run_id = %run_id, "Run started");
                 let _ = self.events.send(DomainEvent::RunStarted {
                     run_id,
