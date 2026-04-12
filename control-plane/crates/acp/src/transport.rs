@@ -488,11 +488,12 @@ pub async fn run_acp_session(
 
         if n == 0 {
             // Subprocess closed stdout before sending the terminal result.
-            warn!(
+            // Some providers (e.g. Codex) may exit without a JSON-RPC terminal
+            // response. Check exit status to decide: exit 0 → success.
+            debug!(
                 session_id = %session_id,
-                "ACP: stdout closed before terminal result — treating as agent failure"
+                "ACP: stdout EOF before terminal response — checking exit status"
             );
-            agent_failed = true;
             break 'streaming;
         }
 
@@ -591,13 +592,14 @@ pub async fn run_acp_session(
     drop(stdin);
 
     // Wait up to SHUTDOWN_WAIT for a graceful exit, then force-kill.
-    match timeout(SHUTDOWN_WAIT, child.wait()).await {
+    let exit_success = match timeout(SHUTDOWN_WAIT, child.wait()).await {
         Ok(Ok(status)) => {
             debug!(
                 exit_status = ?status,
                 session_id = %session_id,
-                "ACP subprocess exited gracefully"
+                "ACP subprocess exited"
             );
+            status.success()
         }
         _ => {
             debug!(
@@ -607,10 +609,18 @@ pub async fn run_acp_session(
             );
             let _ = child.kill().await;
             let _ = child.wait().await;
+            false
         }
-    }
+    };
 
+    // If agent explicitly failed (error response), report failure.
+    // If stdout EOF without terminal response but exit 0 → treat as success
+    // (some providers like Codex may exit cleanly without JSON-RPC end_turn).
     if agent_failed {
+        return Ok((AgentStatus::Failed, vec![]));
+    }
+    if !exit_success && !agent_failed {
+        warn!(session_id = %session_id, "ACP subprocess exited with non-zero status");
         return Ok((AgentStatus::Failed, vec![]));
     }
 
