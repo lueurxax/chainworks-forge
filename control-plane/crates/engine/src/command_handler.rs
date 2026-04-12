@@ -98,6 +98,17 @@ impl CommandHandler {
             Command::StartRun(c) => {
                 let now = Utc::now();
                 let run_id = RunId::new();
+                // If YAML paths are provided, compile the plan early to
+                // fail fast on invalid YAML before persisting anything.
+                let initial_state = if let (Some(wf), Some(ac)) =
+                    (&c.workflow_yaml_path, &c.agent_catalog_yaml_path)
+                {
+                    let plan = workflow::compiler::compile(wf, ac)?;
+                    Some(plan.initial_state)
+                } else {
+                    None
+                };
+
                 let run = Run {
                     id: run_id,
                     idea_id: c.idea_id,
@@ -110,6 +121,9 @@ impl CommandHandler {
                     completed_at: None,
                     cancellation_requested_at: None,
                     cancellation_settled_at: None,
+                    current_state: initial_state,
+                    workflow_yaml_path: c.workflow_yaml_path,
+                    agent_catalog_yaml_path: c.agent_catalog_yaml_path,
                 };
                 runs::insert(&self.pool, &run).await?;
                 info!(run_id = %run_id, "Run started");
@@ -261,6 +275,10 @@ impl CommandHandler {
                     settlement_kind: None,
                     started_at: now,
                     completed_at: None,
+                    owner_agent: old_stage.owner_agent.clone(),
+                    provider: old_stage.provider.clone(),
+                    model: old_stage.model.clone(),
+                    stage_type: old_stage.stage_type.clone(),
                 };
                 stages::insert(&self.pool, &new_stage).await?;
 

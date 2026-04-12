@@ -21,7 +21,9 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "workflow_id": { "type": "string" },
                     "workflow_title": { "type": "string" },
                     "workspace_root": { "type": "string" },
-                    "artifact_root": { "type": "string" }
+                    "artifact_root": { "type": "string" },
+                    "workflow_yaml_path": { "type": "string", "description": "Path to workflow YAML file (enables state-machine execution)" },
+                    "agent_catalog_yaml_path": { "type": "string", "description": "Path to agent catalog YAML file" }
                 }
             }),
         },
@@ -87,12 +89,21 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'artifact_root'"))?
                 .to_string();
 
+            let workflow_yaml_path = params["workflow_yaml_path"]
+                .as_str()
+                .map(String::from);
+            let agent_catalog_yaml_path = params["agent_catalog_yaml_path"]
+                .as_str()
+                .map(String::from);
+
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
                 workflow_id,
                 workflow_title,
                 workspace_root,
                 artifact_root,
+                workflow_yaml_path,
+                agent_catalog_yaml_path,
             });
             let result = cmd_handler.handle(cmd).await?;
             let run_id = match result {

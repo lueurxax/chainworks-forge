@@ -74,4 +74,11 @@ pub struct Run {
     pub completed_at: Option<DateTime<Utc>>,
     pub cancellation_requested_at: Option<DateTime<Utc>>,
     pub cancellation_settled_at: Option<DateTime<Utc>>,
+    // ── Workflow state machine fields ────────────────────────────────────
+    /// Current state in the workflow state machine (e.g. "state_4_proposal_reviewed").
+    pub current_state: Option<String>,
+    /// Path to the workflow YAML file (stored so the orchestrator can re-compile).
+    pub workflow_yaml_path: Option<String>,
+    /// Path to the agent catalog YAML file.
+    pub agent_catalog_yaml_path: Option<String>,
 }

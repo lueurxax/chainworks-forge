@@ -5,6 +5,11 @@ use sqlx::{Row, SqlitePool};
 use domain::ids::{IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 
+const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, workspace_root,
+             artifact_root, started_at, completed_at, cancellation_requested_at,
+             cancellation_settled_at, current_state, workflow_yaml_path,
+             agent_catalog_yaml_path"#;
+
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     let id = run.id.to_string();
     let idea_id = run.idea_id.to_string();
@@ -17,8 +22,9 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO runs (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root,
-                          started_at, completed_at, cancellation_requested_at, cancellation_settled_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                          started_at, completed_at, cancellation_requested_at, cancellation_settled_at,
+                          current_state, workflow_yaml_path, agent_catalog_yaml_path)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
     )
     .bind(id)
@@ -32,6 +38,9 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     .bind(completed_at)
     .bind(cancellation_requested_at)
     .bind(cancellation_settled_at)
+    .bind(&run.current_state)
+    .bind(&run.workflow_yaml_path)
+    .bind(&run.agent_catalog_yaml_path)
     .execute(pool)
     .await
     .context("insert run")?;
@@ -40,94 +49,40 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
 
 pub async fn find_by_id(pool: &SqlitePool, id: RunId) -> Result<Option<Run>> {
     let id_str = id.to_string();
-    let row = sqlx::query(
-        r#"SELECT id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root,
-                  started_at, completed_at, cancellation_requested_at, cancellation_settled_at
-           FROM runs WHERE id = ?1"#,
-    )
-    .bind(id_str)
-    .fetch_optional(pool)
-    .await
-    .context("find run by id")?;
+    let query = format!("SELECT {SELECT_COLS} FROM runs WHERE id = ?1");
+    let row = sqlx::query(&query)
+        .bind(id_str)
+        .fetch_optional(pool)
+        .await
+        .context("find run by id")?;
 
-    row.map(|r| {
-        parse_run_row(
-            r.get("id"),
-            r.get("idea_id"),
-            r.get("status"),
-            r.get("workflow_id"),
-            r.get("workflow_title"),
-            r.get("workspace_root"),
-            r.get("artifact_root"),
-            r.get("started_at"),
-            r.get("completed_at"),
-            r.get("cancellation_requested_at"),
-            r.get("cancellation_settled_at"),
-        )
-    })
-    .transpose()
+    row.map(|r| parse_run_row(&r)).transpose()
 }
 
 pub async fn list_by_idea(pool: &SqlitePool, idea_id: IdeaId) -> Result<Vec<Run>> {
     let idea_id_str = idea_id.to_string();
-    let rows = sqlx::query(
-        r#"SELECT id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root,
-                  started_at, completed_at, cancellation_requested_at, cancellation_settled_at
-           FROM runs WHERE idea_id = ?1 ORDER BY started_at DESC"#,
-    )
-    .bind(idea_id_str)
-    .fetch_all(pool)
-    .await
-    .context("list runs by idea")?;
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM runs WHERE idea_id = ?1 ORDER BY started_at DESC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(idea_id_str)
+        .fetch_all(pool)
+        .await
+        .context("list runs by idea")?;
 
-    rows.into_iter()
-        .map(|r| {
-            parse_run_row(
-                r.get("id"),
-                r.get("idea_id"),
-                r.get("status"),
-                r.get("workflow_id"),
-                r.get("workflow_title"),
-                r.get("workspace_root"),
-                r.get("artifact_root"),
-                r.get("started_at"),
-                r.get("completed_at"),
-                r.get("cancellation_requested_at"),
-                r.get("cancellation_settled_at"),
-            )
-        })
-        .collect()
+    rows.iter().map(|r| parse_run_row(r)).collect()
 }
 
 pub async fn list_active(pool: &SqlitePool) -> Result<Vec<Run>> {
-    let rows = sqlx::query(
-        r#"SELECT id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root,
-                  started_at, completed_at, cancellation_requested_at, cancellation_settled_at
-           FROM runs
-           WHERE status NOT IN ('completed', 'failed', 'cancelled')
-           ORDER BY started_at DESC"#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("list active runs")?;
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM runs WHERE status NOT IN ('completed', 'failed', 'cancelled') ORDER BY started_at DESC"
+    );
+    let rows = sqlx::query(&query)
+        .fetch_all(pool)
+        .await
+        .context("list active runs")?;
 
-    rows.into_iter()
-        .map(|r| {
-            parse_run_row(
-                r.get("id"),
-                r.get("idea_id"),
-                r.get("status"),
-                r.get("workflow_id"),
-                r.get("workflow_title"),
-                r.get("workspace_root"),
-                r.get("artifact_root"),
-                r.get("started_at"),
-                r.get("completed_at"),
-                r.get("cancellation_requested_at"),
-                r.get("cancellation_settled_at"),
-            )
-        })
-        .collect()
+    rows.iter().map(|r| parse_run_row(r)).collect()
 }
 
 pub async fn update_status(pool: &SqlitePool, id: RunId, status: RunStatus) -> Result<()> {
@@ -139,6 +94,18 @@ pub async fn update_status(pool: &SqlitePool, id: RunId, status: RunStatus) -> R
         .execute(pool)
         .await
         .context("update run status")?;
+    Ok(())
+}
+
+/// Update the current_state for a workflow-driven run.
+pub async fn update_current_state(pool: &SqlitePool, id: RunId, state: &str) -> Result<()> {
+    let id_str = id.to_string();
+    sqlx::query(r#"UPDATE runs SET current_state = ?1 WHERE id = ?2"#)
+        .bind(state)
+        .bind(id_str)
+        .execute(pool)
+        .await
+        .context("update run current_state")?;
     Ok(())
 }
 
@@ -196,19 +163,15 @@ pub async fn mark_completed(
     Ok(())
 }
 
-fn parse_run_row(
-    id: String,
-    idea_id: String,
-    status: String,
-    workflow_id: String,
-    workflow_title: String,
-    workspace_root: String,
-    artifact_root: String,
-    started_at: String,
-    completed_at: Option<String>,
-    cancellation_requested_at: Option<String>,
-    cancellation_settled_at: Option<String>,
-) -> Result<Run> {
+fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
+    let id: String = r.get("id");
+    let idea_id: String = r.get("idea_id");
+    let status: String = r.get("status");
+    let started_at: String = r.get("started_at");
+    let completed_at: Option<String> = r.get("completed_at");
+    let cancellation_requested_at: Option<String> = r.get("cancellation_requested_at");
+    let cancellation_settled_at: Option<String> = r.get("cancellation_settled_at");
+
     let run_id: RunId = id.parse::<uuid::Uuid>().context("parse run id")?.into();
     let idea_id_val: IdeaId = idea_id
         .parse::<uuid::Uuid>()
@@ -228,14 +191,17 @@ fn parse_run_row(
         id: run_id,
         idea_id: idea_id_val,
         status: run_status,
-        workflow_id,
-        workflow_title,
-        workspace_root,
-        artifact_root,
+        workflow_id: r.get("workflow_id"),
+        workflow_title: r.get("workflow_title"),
+        workspace_root: r.get("workspace_root"),
+        artifact_root: r.get("artifact_root"),
         started_at: started_at_dt,
         completed_at: completed_at_dt,
         cancellation_requested_at: cancellation_requested_at_dt,
         cancellation_settled_at: cancellation_settled_at_dt,
+        current_state: r.get("current_state"),
+        workflow_yaml_path: r.get("workflow_yaml_path"),
+        agent_catalog_yaml_path: r.get("agent_catalog_yaml_path"),
     })
 }
 

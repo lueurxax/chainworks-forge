@@ -92,4 +92,13 @@ pub struct StageExecution {
     pub settlement_kind: Option<StageSettlementKind>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    // ── Workflow-driven fields (populated when run is backed by YAML) ────
+    /// Agent ID from the workflow state's `owner` field.
+    pub owner_agent: Option<String>,
+    /// Resolved ACP provider name ("claude", "codex", "gemini", etc.).
+    pub provider: Option<String>,
+    /// Resolved model from the backend profile.
+    pub model: Option<String>,
+    /// State type from the workflow: "start", "end", "manual_gate", or None.
+    pub stage_type: Option<String>,
 }

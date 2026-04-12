@@ -117,6 +117,8 @@ impl MutationRoot {
             workflow_title,
             workspace_root,
             artifact_root,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
         });
 
         let result = cmd_handler.handle(cmd).await?;

@@ -55,6 +55,9 @@ async fn test_run_insert_and_find() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -87,6 +90,9 @@ async fn test_run_status_update() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     runs::update_status(&pool, run.id, RunStatus::Running).await.unwrap();
@@ -127,6 +133,9 @@ async fn test_projection_parity_after_rebuild() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -142,6 +151,10 @@ async fn test_projection_parity_after_rebuild() {
         settlement_kind: Some(domain::stage::StageSettlementKind::Completed),
         started_at: Utc::now(),
         completed_at: Some(Utc::now()),
+        owner_agent: None,
+        provider: None,
+        model: None,
+        stage_type: None,
     };
     let failed_stage = StageExecution {
         id: StageExecutionId::new(),
@@ -154,6 +167,10 @@ async fn test_projection_parity_after_rebuild() {
         settlement_kind: Some(domain::stage::StageSettlementKind::Failed),
         started_at: Utc::now(),
         completed_at: Some(Utc::now()),
+        owner_agent: None,
+        provider: None,
+        model: None,
+        stage_type: None,
     };
     stages::insert(&pool, &completed_stage).await.unwrap();
     stages::insert(&pool, &failed_stage).await.unwrap();
@@ -233,6 +250,9 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -247,6 +267,10 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             settlement_kind: Some(StageSettlementKind::Completed),
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
         };
         stages::insert(&pool, &stage).await.unwrap();
 
@@ -357,6 +381,9 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -379,6 +406,10 @@ async fn test_projection_parity_matches_canonical_repo_values() {
             settlement_kind: kind.clone(),
             started_at: Utc::now(),
             completed_at: if kind.is_some() { Some(Utc::now()) } else { None },
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
         };
         stages::insert(&pool, &s).await.unwrap();
     }
@@ -508,6 +539,9 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 

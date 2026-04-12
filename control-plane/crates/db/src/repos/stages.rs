@@ -15,8 +15,11 @@ pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
 
     sqlx::query(
         r#"
-        INSERT INTO stage_executions (id, run_id, stage_id, label, status, iteration, attempt_number, settlement_kind, started_at, completed_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        INSERT INTO stage_executions
+            (id, run_id, stage_id, label, status, iteration, attempt_number,
+             settlement_kind, started_at, completed_at,
+             owner_agent, provider, model, stage_type)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
     )
     .bind(id)
@@ -29,70 +32,47 @@ pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
     .bind(settlement_kind)
     .bind(started_at)
     .bind(completed_at)
+    .bind(&stage.owner_agent)
+    .bind(&stage.provider)
+    .bind(&stage.model)
+    .bind(&stage.stage_type)
     .execute(pool)
     .await
     .context("insert stage execution")?;
     Ok(())
 }
 
+const SELECT_COLS: &str = r#"id, run_id, stage_id, label, status, iteration, attempt_number,
+             settlement_kind, started_at, completed_at,
+             owner_agent, provider, model, stage_type"#;
+
 pub async fn find_by_id(
     pool: &SqlitePool,
     id: StageExecutionId,
 ) -> Result<Option<StageExecution>> {
     let id_str = id.to_string();
-    let row = sqlx::query(
-        r#"SELECT id, run_id, stage_id, label, status, iteration, attempt_number, settlement_kind, started_at, completed_at
-           FROM stage_executions WHERE id = ?1"#,
-    )
-    .bind(id_str)
-    .fetch_optional(pool)
-    .await
-    .context("find stage execution by id")?;
+    let query = format!("SELECT {SELECT_COLS} FROM stage_executions WHERE id = ?1");
+    let row = sqlx::query(&query)
+        .bind(id_str)
+        .fetch_optional(pool)
+        .await
+        .context("find stage execution by id")?;
 
-    row.map(|r| {
-        parse_stage_row(
-            r.get("id"),
-            r.get("run_id"),
-            r.get("stage_id"),
-            r.get("label"),
-            r.get("status"),
-            r.get("iteration"),
-            r.get("attempt_number"),
-            r.get("settlement_kind"),
-            r.get("started_at"),
-            r.get("completed_at"),
-        )
-    })
-    .transpose()
+    row.map(|r| parse_stage_row(&r)).transpose()
 }
 
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<StageExecution>> {
     let run_id_str = run_id.to_string();
-    let rows = sqlx::query(
-        r#"SELECT id, run_id, stage_id, label, status, iteration, attempt_number, settlement_kind, started_at, completed_at
-           FROM stage_executions WHERE run_id = ?1 ORDER BY started_at ASC"#,
-    )
-    .bind(run_id_str)
-    .fetch_all(pool)
-    .await
-    .context("list stage executions by run")?;
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM stage_executions WHERE run_id = ?1 ORDER BY started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(run_id_str)
+        .fetch_all(pool)
+        .await
+        .context("list stage executions by run")?;
 
-    rows.into_iter()
-        .map(|r| {
-            parse_stage_row(
-                r.get("id"),
-                r.get("run_id"),
-                r.get("stage_id"),
-                r.get("label"),
-                r.get("status"),
-                r.get("iteration"),
-                r.get("attempt_number"),
-                r.get("settlement_kind"),
-                r.get("started_at"),
-                r.get("completed_at"),
-            )
-        })
-        .collect()
+    rows.iter().map(|r| parse_stage_row(r)).collect()
 }
 
 pub async fn update_status(
@@ -139,18 +119,14 @@ pub async fn settle(
     Ok(())
 }
 
-fn parse_stage_row(
-    id: String,
-    run_id: String,
-    stage_id: String,
-    label: String,
-    status: String,
-    iteration: i64,
-    attempt_number: i64,
-    settlement_kind: Option<String>,
-    started_at: String,
-    completed_at: Option<String>,
-) -> Result<StageExecution> {
+fn parse_stage_row(r: &sqlx::sqlite::SqliteRow) -> Result<StageExecution> {
+    let id: String = r.get("id");
+    let run_id: String = r.get("run_id");
+    let status: String = r.get("status");
+    let settlement_kind: Option<String> = r.get("settlement_kind");
+    let started_at: String = r.get("started_at");
+    let completed_at: Option<String> = r.get("completed_at");
+
     let stage_exec_id: StageExecutionId = id
         .parse::<uuid::Uuid>()
         .context("parse stage execution id")?
@@ -177,13 +153,17 @@ fn parse_stage_row(
     Ok(StageExecution {
         id: stage_exec_id,
         run_id: run_id_val,
-        stage_id,
-        label,
+        stage_id: r.get("stage_id"),
+        label: r.get("label"),
         status: stage_status,
-        iteration,
-        attempt_number,
+        iteration: r.get("iteration"),
+        attempt_number: r.get("attempt_number"),
         settlement_kind: settlement,
         started_at: started_at_dt,
         completed_at: completed_at_dt,
+        owner_agent: r.get("owner_agent"),
+        provider: r.get("provider"),
+        model: r.get("model"),
+        stage_type: r.get("stage_type"),
     })
 }

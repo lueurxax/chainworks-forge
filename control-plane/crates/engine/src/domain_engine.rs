@@ -155,6 +155,9 @@ mod tests {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
         }
     }
 
@@ -170,6 +173,10 @@ mod tests {
             settlement_kind: None,
             started_at: Utc::now(),
             completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
         }
     }
 

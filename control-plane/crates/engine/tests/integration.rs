@@ -43,6 +43,9 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
     }
 }
 
@@ -58,6 +61,10 @@ fn make_stage(id: StageExecutionId, run_id: RunId, status: StageStatus) -> Stage
         settlement_kind: None,
         started_at: Utc::now(),
         completed_at: None,
+        owner_agent: None,
+        provider: None,
+        model: None,
+        stage_type: None,
     }
 }
 
@@ -431,6 +438,9 @@ sys.exit(0)
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
         },
     )
     .await

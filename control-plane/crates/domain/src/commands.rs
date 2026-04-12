@@ -19,6 +19,10 @@ pub struct StartRunCmd {
     pub workflow_title: String,
     pub workspace_root: String,
     pub artifact_root: String,
+    /// Path to the workflow YAML file (enables state-machine-driven execution).
+    pub workflow_yaml_path: Option<String>,
+    /// Path to the agent catalog YAML file.
+    pub agent_catalog_yaml_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
