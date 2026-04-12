@@ -165,18 +165,35 @@ impl CommandHandler {
                 )
                 .await?;
 
-                // Update stage to Running
+                // For manual_gate stages (workflow-driven), approval completes the
+                // gate — settle as Completed so the orchestrator can transition.
+                // For regular stages, set to Running so InvokeAgent can proceed.
                 let run_stages = stages::list_by_run(&self.pool, c.run_id).await?;
                 if let Some(stage) = run_stages
                     .iter()
                     .find(|s| s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval)
                 {
-                    stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
-                    let _ = self.events.send(DomainEvent::StageStatusChanged {
-                        run_id: c.run_id,
-                        stage_execution_id: stage.id,
-                        status: StageStatus::Running,
-                    });
+                    if stage.stage_type.as_deref() == Some("manual_gate") {
+                        stages::settle(
+                            &self.pool,
+                            stage.id,
+                            StageSettlementKind::Completed,
+                            now,
+                        )
+                        .await?;
+                        let _ = self.events.send(DomainEvent::StageStatusChanged {
+                            run_id: c.run_id,
+                            stage_execution_id: stage.id,
+                            status: StageStatus::Completed,
+                        });
+                    } else {
+                        stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
+                        let _ = self.events.send(DomainEvent::StageStatusChanged {
+                            run_id: c.run_id,
+                            stage_execution_id: stage.id,
+                            status: StageStatus::Running,
+                        });
+                    }
                 }
 
                 let _ = self.events.send(DomainEvent::ApprovalResolved {
