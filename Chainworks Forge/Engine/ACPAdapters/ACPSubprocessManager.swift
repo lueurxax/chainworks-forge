@@ -370,7 +370,9 @@ final class ACPSubprocessManager: @unchecked Sendable {
         let existing = (base ?? "")
             .split(separator: ":")
             .map(String.init)
-        let merged = preferred + existing
+        // Preserve caller-prepared PATH precedence. Runtime-specific shims such as the
+        // isolated Codex `swift` wrapper must stay ahead of generic discovery paths.
+        let merged = existing + preferred
         var unique: [String] = []
         for path in merged where !path.isEmpty && !unique.contains(path) {
             unique.append(path)

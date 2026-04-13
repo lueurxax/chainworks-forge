@@ -42,8 +42,12 @@ struct RunStageSnapshot: Identifiable, Sendable {
 
 struct RunLatestStageStatusSnapshot: Sendable {
     let stageID: String
+    let label: String
     let startedAt: Date
+    let completedAt: Date?
     let status: StageStatus
+    let iteration: Int
+    let attemptNumber: Int
 }
 
 @MainActor
@@ -278,8 +282,12 @@ enum RunLatestStageStatusLoader {
     private static func makeSnapshot(_ stage: StageExecution) -> RunLatestStageStatusSnapshot {
         RunLatestStageStatusSnapshot(
             stageID: stage.stageID,
+            label: stage.label,
             startedAt: stage.startedAt,
-            status: stage.status
+            completedAt: stage.completedAt,
+            status: stage.status,
+            iteration: stage.iteration,
+            attemptNumber: stage.attemptNumber
         )
     }
 }

@@ -74,33 +74,61 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
     static var acpMutationSideEffectDeadlineSeconds: TimeInterval = 30
     static var acpWeakReadLoopThreshold = 2
     static var acpWatchdogPollIntervalMilliseconds: UInt64 = 5_000
-    static var acpProposalReviewStallSilenceSeconds: TimeInterval {
-        get { acpWeakReadLoopSilenceSeconds }
-        set { acpWeakReadLoopSilenceSeconds = newValue }
-    }
-    static var acpProposalReviewReadLoopThreshold: Int {
-        get { acpWeakReadLoopThreshold }
-        set { acpWeakReadLoopThreshold = newValue }
-    }
-    static var acpProposalReviewStallPollIntervalMilliseconds: UInt64 {
-        get { acpWatchdogPollIntervalMilliseconds }
-        set { acpWatchdogPollIntervalMilliseconds = newValue }
-    }
-    static var codexACPMaxExecutionSeconds: TimeInterval = 600
-    static var codexACPMaxProposalExecutionSeconds: TimeInterval = 900
-    static var codexACPMaxToolCallCount = 250
+    static var acpProposalReviewIdleAfterProgressDeadlineSeconds: TimeInterval = 1_200
+    static var acpProposalReviewStallSilenceSeconds: TimeInterval = 120
+    static var acpProposalReviewReadLoopThreshold: Int = 2
+    static var acpProposalReviewStallPollIntervalMilliseconds: UInt64 = 5_000
+    static var codexACPMaxExecutionSeconds: TimeInterval = 900
+    static var codexACPMaxProposalExecutionSeconds: TimeInterval = 1_200
+    static var codexACPMaxProposalReviewExecutionSeconds: TimeInterval = 1_800
+    static var codexACPMaxToolCallCount = 300
     static var codexACPMaxAccumulatedTextBytes = 8_000_000
-    static var codexACPMaxRawToolPayloadBytes = 4_000_000
+    static var codexACPMaxRawToolPayloadBytes = 10_000_000
     static var codexACPMaxRuntimeHomeBytes = 64_000_000
     static var codexACPMaxInputTokens = 500_000
     static var codexACPMaxCachedInputTokens = 400_000
     static var codexACPGuardrailPollIntervalMilliseconds: UInt64 = 5_000
 
     static func codexACPExecutionAgeLimitSeconds(for agent: ResolvedAgent) -> TimeInterval {
+        if isProposalReviewAgent(agent) {
+            return codexACPMaxProposalReviewExecutionSeconds
+        }
         if agent.mode.hasPrefix("proposal_") {
             return codexACPMaxProposalExecutionSeconds
         }
         return codexACPMaxExecutionSeconds
+    }
+
+    static func acpIdleAfterProgressDeadlineSeconds(for agent: ResolvedAgent) -> TimeInterval {
+        if isProposalReviewAgent(agent) {
+            return acpProposalReviewIdleAfterProgressDeadlineSeconds
+        }
+        return acpIdleAfterProgressDeadlineSeconds
+    }
+
+    static func acpWeakReadLoopSilenceSeconds(for agent: ResolvedAgent) -> TimeInterval {
+        if isProposalReviewAgent(agent) {
+            return acpProposalReviewStallSilenceSeconds
+        }
+        return acpWeakReadLoopSilenceSeconds
+    }
+
+    static func acpWeakReadLoopThreshold(for agent: ResolvedAgent) -> Int {
+        if isProposalReviewAgent(agent) {
+            return acpProposalReviewReadLoopThreshold
+        }
+        return acpWeakReadLoopThreshold
+    }
+
+    static func acpWatchdogPollIntervalMilliseconds(for agent: ResolvedAgent) -> UInt64 {
+        if isProposalReviewAgent(agent) {
+            return acpProposalReviewStallPollIntervalMilliseconds
+        }
+        return acpWatchdogPollIntervalMilliseconds
+    }
+
+    private static func isProposalReviewAgent(_ agent: ResolvedAgent) -> Bool {
+        agent.mode.hasPrefix("proposal_review.") || agent.id.hasPrefix("proposal_reviewer_")
     }
 
     func execute(
@@ -109,12 +137,14 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         context: ExecutionContext
     ) async throws -> AgentResult {
         var lastResult: AgentResult?
+        var forcedFreshDisposition: SessionReuseDisposition?
         for attempt in 0...Self.maxTransportRetries {
             let result = try await executeAttempt(
                 task: task,
                 agent: agent,
                 context: context,
-                attemptIndex: attempt
+                attemptIndex: attempt,
+                forcedFreshDisposition: forcedFreshDisposition
             )
 
             if result.supervisionClassification != nil {
@@ -126,6 +156,8 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
             }
 
             lastResult = result
+            forcedFreshDisposition = retryFreshDisposition(for: result)
+            await bestEffortInvalidateLingeringRetryGeneration(result)
             if attempt < Self.maxTransportRetries {
                 try? await Task.sleep(for: .seconds(2))
             }
@@ -141,6 +173,10 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
                  "exec_command_create_process_failed",
                  "exec_command_failed":
                 return false
+            case "session_closed_without_transition", "session_closed":
+                if result.outputPresence == .none {
+                    return true
+                }
             default:
                 break
             }
@@ -192,13 +228,42 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         return isTransportError
     }
 
+    private func retryFreshDisposition(for result: AgentResult) -> SessionReuseDisposition {
+        if result.supervisionClassification != nil
+            || result.transportErrorKind == .timeout
+            || result.errorMessage?.localizedCaseInsensitiveContains("runaway guardrail") == true {
+            return .fresh_after_timeout
+        }
+        if let outcome = result.canonicalOutcome,
+           outcome == .limitExhaustedBeforeOutput || outcome == .limitExhaustedAfterOutput {
+            return .fresh_after_budget
+        }
+        return .fresh_after_transport_error
+    }
+
+    private func bestEffortInvalidateLingeringRetryGeneration(_ result: AgentResult) async {
+        guard let sessionManager,
+              let generationID = result.sessionGenerationID,
+              let lineageID = result.sessionLineageID else {
+            return
+        }
+
+        let reason = result.errorMessage?.isEmpty == false
+            ? "Retrying after terminal failure: \(result.errorMessage!)"
+            : "Retrying after terminal failure"
+
+        try? await sessionManager.invalidateGeneration(generationID: generationID, reason: reason)
+        try? await sessionManager.recordEvent(lineageID: lineageID, generationID: generationID, type: .invalidated)
+    }
+
     // MARK: - Execution Attempt Flow
 
     private func executeAttempt(
         task: AgentTask,
         agent: ResolvedAgent,
         context: ExecutionContext,
-        attemptIndex: Int
+        attemptIndex: Int,
+        forcedFreshDisposition: SessionReuseDisposition?
     ) async throws -> AgentResult {
         let startedAt = Date()
         let effectiveAgent = effectiveAgentForExecution(agent, context: context)
@@ -209,7 +274,12 @@ final class RuntimeAgentExecutor: AgentExecutor, @unchecked Sendable {
         // 1. Resolve Session (Proposal 018)
         let sessionInfo: SessionResolutionInfo
         do {
-            sessionInfo = try await resolveSession(task: task, agent: effectiveAgent, context: context)
+            sessionInfo = try await resolveSession(
+                task: task,
+                agent: effectiveAgent,
+                context: context,
+                forcedFreshDisposition: forcedFreshDisposition
+            )
         } catch {
             return AgentResult.failure(
                 "Session creation failed (attempt \(attemptIndex)): \(error.localizedDescription)",
@@ -316,13 +386,55 @@ await sessionInfo.execution.closeSession()
         _ agent: ResolvedAgent,
         context: ExecutionContext
     ) -> ResolvedAgent {
-        // Session reuse quarantine for codex_acp has been lifted.
-        // RuntimeSessionExecution still closes the provider session after each settled execute,
-        // so normal successful turns do not keep a long-lived reusable backend session alive.
-        // Any future codex-specific guardrails should be enforced at session supervision
-        // or budget checkpoints rather than by rewriting the agent's reuse scope here.
-        let _ = context
-        return agent
+        guard shouldForceFreshSessions(for: agent, context: context) else {
+            return agent
+        }
+
+        return ResolvedAgent(
+            id: agent.id,
+            title: agent.title,
+            mode: agent.mode,
+            backendProfileID: agent.backendProfileID,
+            provider: agent.provider,
+            model: agent.model,
+            effort: agent.effort,
+            maxTurns: agent.maxTurns,
+            temperature: agent.temperature,
+            permissionProfile: agent.permissionProfile,
+            mcpProfileID: agent.mcpProfileID,
+            requestedMCPServerIDs: agent.requestedMCPServerIDs,
+            skillRef: agent.skillRef,
+            skillRole: agent.skillRole,
+            resolvedSkill: agent.resolvedSkill,
+            prompt: agent.prompt,
+            outputContract: agent.outputContract,
+            requiresHumanApproval: agent.requiresHumanApproval,
+            inputs: agent.inputs,
+            outputs: agent.outputs,
+            worktreeWriteEnabled: agent.worktreeWriteEnabled,
+            sessionReuseScope: .none,
+            sessionFamilyID: agent.sessionFamilyID,
+            runtimeProfileID: agent.runtimeProfileID
+        )
+    }
+
+    private func shouldForceFreshSessions(
+        for agent: ResolvedAgent,
+        context: ExecutionContext
+    ) -> Bool {
+        guard agent.sessionReuseScope != .none else {
+            return false
+        }
+
+        if context.providerBinding?.adapterFamily == "codex_acp" {
+            return true
+        }
+
+        if context.providerBinding?.providerFamily == ProviderFamily.codexACP.rawValue {
+            return true
+        }
+
+        return agent.provider.lowercased().contains("codex")
     }
 
     private func processStreamWithSupervision(
@@ -373,7 +485,8 @@ await sessionInfo.execution.closeSession()
     private func resolveSession(
         task: AgentTask,
         agent: ResolvedAgent,
-        context: ExecutionContext
+        context: ExecutionContext,
+        forcedFreshDisposition: SessionReuseDisposition? = nil
     ) async throws -> SessionResolutionInfo {
         // Proposal 026: Resolve per-agent transport via factory
         let bridge = try sessionBridge(for: agent, binding: context.providerBinding)
@@ -409,6 +522,40 @@ await sessionInfo.execution.closeSession()
             scope: agent.sessionReuseScope,
             familyID: agent.sessionFamilyID
         )
+
+        if let forcedFreshDisposition {
+            let execution = try await createFreshExecutionWithCollisionGuard(
+                agent: agent,
+                task: task,
+                context: context,
+                lineageID: lid,
+                ownerKey: ownerKey,
+                fingerprint: fingerprint,
+                workingDirectory: workingDirectory,
+                workspaceMode: workspaceMode,
+                bridge: bridge
+            )
+            let gid = try await sessionManager.createGeneration(
+                lineageID: lid,
+                invocationOwnerKey: ownerKey,
+                providerSessionID: execution.sessionID,
+                bindingFingerprint: fingerprint,
+                workingDirectory: workingDirectory,
+                workspaceMode: workspaceMode,
+                runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context),
+                runtimeModel: resolvedRuntimeModel(agent: agent, context: context)
+            )
+            try await sessionManager.recordEvent(lineageID: lid, generationID: gid, type: .created)
+            return SessionResolutionInfo(
+                execution: execution,
+                lineageID: lid,
+                generationID: gid,
+                reuseDisposition: forcedFreshDisposition,
+                ownerKey: ownerKey,
+                fingerprint: fingerprint,
+                mcpResolution: mcpResolution
+            )
+        }
         
         let lineage = try await sessionManager.getLineage(id: lid)
         // ARCH-001: Pass real recovery-branch truth (§4.1.1, §6.6).
@@ -664,10 +811,12 @@ await sessionInfo.execution.closeSession()
     ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
         let monitorACPWatchdog = shouldMonitorACPSupervision(sessionInfo: sessionInfo)
         let monitorCodexRunaway = shouldMonitorCodexACPGuardrails(sessionInfo: sessionInfo)
-        let mutationObserver = MutationSideEffectObserver(workingDirectory: resolveWorkingDirectoryAndMode(agent: agent, context: context).0)
         guard monitorACPWatchdog || monitorCodexRunaway else {
             return stream
         }
+        let mutationObserver = monitorACPWatchdog
+            ? MutationSideEffectObserver(workingDirectory: resolveWorkingDirectoryAndMode(agent: agent, context: context).0)
+            : nil
 
         final class StallState: @unchecked Sendable {
             private let lock = NSLock()
@@ -900,15 +1049,15 @@ await sessionInfo.execution.closeSession()
                     switch (monitorACPWatchdog, monitorCodexRunaway) {
                     case (true, true):
                         return min(
-                            Self.acpWatchdogPollIntervalMilliseconds,
+                            Self.acpWatchdogPollIntervalMilliseconds(for: agent),
                             Self.codexACPGuardrailPollIntervalMilliseconds
                         )
                     case (true, false):
-                        return Self.acpWatchdogPollIntervalMilliseconds
+                        return Self.acpWatchdogPollIntervalMilliseconds(for: agent)
                     case (false, true):
                         return Self.codexACPGuardrailPollIntervalMilliseconds
                     case (false, false):
-                        return Self.acpWatchdogPollIntervalMilliseconds
+                        return Self.acpWatchdogPollIntervalMilliseconds(for: agent)
                     }
                 }()
                 while !Task.isCancelled {
@@ -948,9 +1097,9 @@ await sessionInfo.execution.closeSession()
                     }
 
                     if monitorACPWatchdog,
-                       snapshot.readLoopStartCount >= Self.acpWeakReadLoopThreshold,
+                       snapshot.readLoopStartCount >= Self.acpWeakReadLoopThreshold(for: agent),
                        snapshot.firstMutatingToolAt == nil,
-                       stalledFor >= Self.acpWeakReadLoopSilenceSeconds {
+                       stalledFor >= Self.acpWeakReadLoopSilenceSeconds(for: agent) {
                         state.markFinished()
                         producer.cancel()
                         continuation.finish(throwing: ACPWatchdogClassificationError(
@@ -965,7 +1114,7 @@ await sessionInfo.execution.closeSession()
                        let firstCompletedMutatingToolAt = snapshot.firstCompletedMutatingToolAt,
                        snapshot.mutationVerificationAttempted == false,
                        now.timeIntervalSince(firstCompletedMutatingToolAt) >= Self.acpMutationSideEffectDeadlineSeconds {
-                        let verification = mutationObserver.observeDelta()
+                        let verification = mutationObserver?.observeDelta() ?? MutationDeltaObservation(changed: true, firstChangedPath: nil)
                         state.recordMutationVerification(
                             observed: verification.changed,
                             firstVerifiedPath: verification.firstChangedPath
@@ -996,7 +1145,7 @@ await sessionInfo.execution.closeSession()
                     if monitorACPWatchdog,
                        snapshot.firstProgressAt != nil,
                        snapshot.firstMutatingToolAt == nil,
-                       stalledFor >= Self.acpIdleAfterProgressDeadlineSeconds {
+                       stalledFor >= Self.acpIdleAfterProgressDeadlineSeconds(for: agent) {
                         state.markFinished()
                         producer.cancel()
                         continuation.finish(throwing: ACPWatchdogClassificationError(
@@ -1101,10 +1250,11 @@ await sessionInfo.execution.closeSession()
             || normalized == "read"
             || normalized == "read_file"
             || normalized == "read_workspace"
-            || normalized == "execute"
-            || normalized == "permission:read"
-            || normalized == "permission:execute" {
+            || normalized == "execute" {
             return .weak
+        }
+        if normalized.hasPrefix("permission:") {
+            return .strong
         }
         return .strong
     }
@@ -1204,27 +1354,11 @@ await sessionInfo.execution.closeSession()
 
         var checkpoint: AgentSessionCheckpoint?
         if let gid = sessionInfo.generationID, let sessionManager = sessionManager {
+            let invalidationReason: String?
             if sessionBecameUnavailableMidStream {
-                try? await sessionManager.invalidateGeneration(
-                    generationID: gid,
-                    reason: "transport stream failure: \(rawErrorMessage)"
-                )
-                try? await sessionManager.recordEvent(
-                    lineageID: sessionInfo.lineageID!,
-                    generationID: gid,
-                    type: .invalidated
-                )
+                invalidationReason = "transport stream failure: \(rawErrorMessage)"
             } else if let supervisionOutcome {
-                let reason = "Supervision failure: \(supervisionOutcome.classification.rawValue)"
-                try? await sessionManager.invalidateGeneration(
-                    generationID: gid,
-                    reason: reason
-                )
-                try? await sessionManager.recordEvent(
-                    lineageID: sessionInfo.lineageID!,
-                    generationID: gid,
-                    type: .invalidated
-                )
+                invalidationReason = "Supervision failure: \(supervisionOutcome.classification.rawValue)"
             } else if canonicalOutcome == .completedWithTransportError || canonicalOutcome == .timedOutAfterOutput {
                 checkpoint = AgentSessionCheckpointBuilder.build(
                     executionResult: AgentResult.minimal(canonicalOutcome, sessionID: sessionInfo.execution.sessionID, duration: completedAt.timeIntervalSince(startedAt)),
@@ -1233,11 +1367,34 @@ await sessionInfo.execution.closeSession()
                     scope: agent.sessionReuseScope,
                     familyID: agent.sessionFamilyID
                 )
-                // DATA-001: Record checkpoint_created BEFORE invalidation (§6.4 rule 2)
-                let checkpointData = try? JSONEncoder().encode(checkpoint)
-                try? await sessionManager.recordCheckpointCreated(lineageID: sessionInfo.lineageID!, generationID: gid, checkpointData: checkpointData)
-                try? await sessionManager.invalidateGeneration(generationID: gid, reason: "Stream failure: \(rawErrorMessage)")
-                try? await sessionManager.recordEvent(lineageID: sessionInfo.lineageID!, generationID: gid, type: .invalidated)
+                invalidationReason = "Stream failure: \(rawErrorMessage)"
+            } else if canonicalOutcome == .timedOutBeforeOutput {
+                invalidationReason = "timeout: \(rawErrorMessage)"
+            } else {
+                // Any failed execution already closed the provider session; leaving the generation
+                // active here makes the next turn attempt to reuse a dead backend session.
+                invalidationReason = "Execution failure: \(rawErrorMessage)"
+            }
+
+            if let invalidationReason {
+                if checkpoint != nil {
+                    // DATA-001: Record checkpoint_created BEFORE invalidation (§6.4 rule 2)
+                    let checkpointData = try? JSONEncoder().encode(checkpoint)
+                    try? await sessionManager.recordCheckpointCreated(
+                        lineageID: sessionInfo.lineageID!,
+                        generationID: gid,
+                        checkpointData: checkpointData
+                    )
+                }
+                try? await sessionManager.invalidateGeneration(
+                    generationID: gid,
+                    reason: invalidationReason
+                )
+                try? await sessionManager.recordEvent(
+                    lineageID: sessionInfo.lineageID!,
+                    generationID: gid,
+                    type: .invalidated
+                )
             }
         }
 
@@ -1250,10 +1407,17 @@ await sessionInfo.execution.closeSession()
             failureSummary: failureMsg
         )
         let finalOutputPresence: OutputPresence = salvaged.isEmpty ? .none : .durableOutput
+        let resolvedModel = resolvedRuntimeModel(agent: agent, context: context)
+        let runtimeModel = observedRuntimeModel(
+            agent: agent,
+            context: context,
+            providerDiagnosticMessage: providerDiagnostic?.message,
+            fallbackErrorMessage: rawErrorMessage
+        )
         let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: nil,
-            succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, provider: resolvedRuntimeProvider(agent: agent, context: context), model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context),
+            succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, provider: resolvedRuntimeProvider(agent: agent, context: context), model: runtimeModel, effort: resolvedRuntimeEffort(agent: agent, context: context),
             supervision: buildSupervisionReceipt(eventBridge: eventBridge, outcome: supervisionOutcome),
             codexTelemetry: codexTelemetry,
             sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue,
@@ -1276,9 +1440,9 @@ await sessionInfo.execution.closeSession()
 
         return AgentResult(
             outputs: salvaged, logSnippet: "Stream failed but salvaged \(salvaged.count) artifacts. Error: \(failureMsg)", costCents: nil, succeeded: canonicalOutcome == .completed, errorMessage: failureMsg, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
-            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: runtimeTransport, costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
-            resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: canonicalOutcome, supervisionClassification: supervisionOutcome?.classification, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, providerStopReason: providerDiagnostic?.normalizedReason, outputPresence: finalOutputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: runtimeModel, effort: resolvedRuntimeEffort(agent: agent, context: context), transport: runtimeTransport, costCents: nil, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
+            resolvedModel: resolvedModel, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: canonicalOutcome, supervisionClassification: supervisionOutcome?.classification, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: transportKind, providerStopReason: providerDiagnostic?.normalizedReason, outputPresence: finalOutputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: runtimeModel,
             mcpProfileID: sessionInfo.mcpResolution.profileID,
             requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
             effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
@@ -1424,6 +1588,13 @@ await sessionInfo.execution.closeSession()
             hadExplicitFinalOutput: streamResult.finalContent != nil,
             accumulatedText: streamResult.accumulatedText
         )
+        let closedWithoutTransition = streamResult.sawSessionClosed
+            && streamResult.finishReason == nil
+            && initialOutputPresence == .none
+            && streamResult.finalContent == nil
+        let synthesizedProviderStopReason = providerDiagnostic?.normalizedReason
+            ?? streamResult.finishReason
+            ?? (closedWithoutTransition ? "session_closed_without_transition" : nil)
 
         let initialMissingOutputs = expectedOutputs.filter { outputs[$0] == nil }
         let initialError: String? = if !initialMissingOutputs.isEmpty {
@@ -1448,7 +1619,14 @@ await sessionInfo.execution.closeSession()
 
         let outputPresence: OutputPresence = outputs.isEmpty ? .none : .durableOutput
         let missingOutputs = expectedOutputs.filter { outputs[$0] == nil }
-        let finalOutcome: AgentCanonicalOutcome = !missingOutputs.isEmpty ? (canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome) : canonicalOutcome
+        let recoveredAfterSessionClosed = closedWithoutTransition && outputPresence == .durableOutput
+        let finalOutcome: AgentCanonicalOutcome = if !missingOutputs.isEmpty {
+            canonicalOutcome == .completed ? .failedBeforeOutput : canonicalOutcome
+        } else if recoveredAfterSessionClosed {
+            .completedWithTransportError
+        } else {
+            canonicalOutcome
+        }
         let finalError: String? = if !missingOutputs.isEmpty {
             providerDiagnostic?.message
                 ?? lazyArtifactFailure
@@ -1461,10 +1639,17 @@ await sessionInfo.execution.closeSession()
             nil
         }
 
+        let resolvedModel = resolvedRuntimeModel(agent: agent, context: context)
+        let runtimeModel = observedRuntimeModel(
+            agent: agent,
+            context: context,
+            providerDiagnosticMessage: providerDiagnostic?.message,
+            fallbackErrorMessage: finalError ?? streamResult.accumulatedText
+        )
         let receiptArtifacts = ExecutionReceiptBuilder.buildReceipt(
             agentID: agent.id, sessionID: sessionInfo.execution.sessionID, stageID: context.stageID, iteration: context.iteration, attemptNumber: context.attemptNumber,
             startedAt: startedAt, completedAt: completedAt, events: eventBridge.eventLog, toolCalls: eventBridge.toolCalls, finalContent: streamResult.finalContent,
-            succeeded: finalOutcome == .completed, errorMessage: finalError, provider: resolvedRuntimeProvider(agent: agent, context: context), model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context),
+            succeeded: finalOutcome == .completed, errorMessage: finalError, provider: resolvedRuntimeProvider(agent: agent, context: context), model: runtimeModel, effort: resolvedRuntimeEffort(agent: agent, context: context),
             codexTelemetry: codexTelemetry(eventBridge: eventBridge, sessionInfo: sessionInfo),
             sessionReuseDisposition: sessionInfo.reuseDisposition.rawValue,
             sessionReuseScope: agent.sessionReuseScope.rawValue,
@@ -1485,14 +1670,19 @@ await sessionInfo.execution.closeSession()
 
         let cost = estimateCost(streamResult: streamResult)
         let runtimeTransport = context.providerBinding?.transport ?? "unknown"
-        let resolvedTransportErrorKind: TransportErrorKind? = providerDiagnostic != nil && finalOutcome != .completed ? .provider : nil
-        let resolvedProviderStopReason = providerDiagnostic?.normalizedReason ?? streamResult.finishReason
+        let resolvedTransportErrorKind: TransportErrorKind? = if finalOutcome != .completed
+            && (providerDiagnostic != nil || closedWithoutTransition) {
+            .provider
+        } else {
+            nil
+        }
+        let resolvedProviderStopReason = synthesizedProviderStopReason
         return AgentResult(
             outputs: outputs, logSnippet: buildLogSnippet(agent: agent, sessionID: sessionInfo.execution.sessionID, streamResult: streamResult, startedAt: startedAt, completedAt: completedAt),
             costCents: cost, succeeded: finalOutcome == .completed, errorMessage: finalOutcome == .completed ? nil : finalError, sessionID: sessionInfo.execution.sessionID, durationSeconds: completedAt.timeIntervalSince(startedAt),
-            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: resolvedRuntimeModel(agent: agent, context: context), effort: resolvedRuntimeEffort(agent: agent, context: context), transport: runtimeTransport, costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
-            resolvedModel: resolvedRuntimeModel(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
-            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: resolvedTransportErrorKind, providerStopReason: resolvedProviderStopReason, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: resolvedRuntimeModel(agent: agent, context: context),
+            providerReceipt: UsageReceiptNormalizer.makeReceipt(providerFamily: resolvedProviderFamily(agent: agent, context: context), configuredProviderID: context.providerBinding?.configuredProviderID, model: runtimeModel, effort: resolvedRuntimeEffort(agent: agent, context: context), transport: runtimeTransport, costCents: cost, durationSeconds: completedAt.timeIntervalSince(startedAt), rawReceiptJSON: receiptArtifacts["\(agent.id)_receipt.json"]),
+            resolvedModel: resolvedModel, configuredProviderID: context.providerBinding?.configuredProviderID, adapterVersion: context.providerBinding?.adapterVersion,
+            canonicalOutcome: finalOutcome, sessionLineageID: sessionInfo.lineageID, sessionGenerationID: sessionInfo.generationID, sessionReuseDisposition: sessionInfo.reuseDisposition, sessionCheckpoint: checkpoint, transportErrorKind: resolvedTransportErrorKind, providerStopReason: resolvedProviderStopReason, outputPresence: outputPresence, runtimeProvider: resolvedRuntimeProvider(agent: agent, context: context), runtimeModel: runtimeModel,
             mcpProfileID: sessionInfo.mcpResolution.profileID,
             requestedMCPExtensions: sessionInfo.mcpResolution.requestedExtensions,
             effectiveMCPRuntimeExtensionIDs: sessionInfo.execution.actualEnabledExtensions ?? [],
@@ -1953,6 +2143,48 @@ await sessionInfo.execution.closeSession()
         context.providerBinding?.model ?? override?.model ?? agent.model
     }
 
+    private func observedRuntimeModel(
+        agent: ResolvedAgent,
+        context: ExecutionContext,
+        providerDiagnosticMessage: String?,
+        fallbackErrorMessage: String?
+    ) -> String {
+        if ProviderFamily.from(runtimeIdentifier: resolvedProviderFamily(agent: agent, context: context)) == .codexACP,
+           let observedModel = codexObservedModel(from: providerDiagnosticMessage ?? fallbackErrorMessage) {
+            return observedModel
+        }
+        return resolvedRuntimeModel(agent: agent, context: context)
+    }
+
+    private func codexObservedModel(from message: String?) -> String? {
+        guard let message, !message.isEmpty else { return nil }
+
+        let patterns = [
+            #"usage limit for ([A-Za-z0-9.\-]+)"#,
+            #"for model ([A-Za-z0-9.\-]+)"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let nsrange = NSRange(message.startIndex..<message.endIndex, in: message)
+            guard let match = regex.firstMatch(in: message, options: [], range: nsrange),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: message) else {
+                continue
+            }
+            let observedModel = message[range]
+                .trimmingCharacters(in: CharacterSet(charactersIn: " .,:;!?)\"]'"))
+                .lowercased()
+            if !observedModel.isEmpty {
+                return observedModel
+            }
+        }
+
+        return nil
+    }
+
     private func resolvedRuntimeEffort(agent: ResolvedAgent, context: ExecutionContext) -> String {
         context.providerBinding?.effort ?? override?.effort ?? agent.effort
     }
@@ -2039,13 +2271,6 @@ private struct MutationSideEffectObserver {
     private static func collectEntries(at workingDirectory: String) -> Set<String> {
         guard !workingDirectory.isEmpty else { return [] }
         let cwdURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
-        let gitDir = cwdURL.appendingPathComponent(".git")
-        if FileManager.default.fileExists(atPath: gitDir.path) {
-            if let output = try? execGitStatus(in: workingDirectory) {
-                return Set(output.split(separator: "\n").map(String.init))
-            }
-        }
-
         let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
         guard let enumerator = FileManager.default.enumerator(at: cwdURL, includingPropertiesForKeys: keys) else {
             return []
@@ -2062,19 +2287,6 @@ private struct MutationSideEffectObserver {
             entries.insert("\(relative)|\(Int(stamp))|\(size)")
         }
         return entries
-    }
-
-    private static func execGitStatus(in workingDirectory: String) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git", "-C", workingDirectory, "status", "--porcelain"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(decoding: data, as: UTF8.self)
     }
 }
 

@@ -413,7 +413,7 @@ struct RunsHomeView: View {
 
         Task { @MainActor in
             let compiler = RunPlanCompiler(modelContext: modelContext)
-            executionService.resumeInterruptedRuns(compiler: compiler)
+            executionService.resumeInterruptedRunsFromOperatorAction(compiler: compiler)
             maintenanceInFlight = false
             maintenanceNotice = interruptedRunCount == 0
                 ? "Interrupted runs reconciled."
@@ -428,6 +428,9 @@ struct RunsHomeView: View {
         Task { @MainActor in
             do {
                 let repository = RunRepository(context: modelContext)
+                let candidateRunIDs = Set(repository.terminalRunsEligibleForCleanup().map(\.id))
+                prepareUIForTerminalRunDeletion(candidateRunIDs)
+                await Task.yield()
                 let cleanupPlan = try repository.prepareTerminalRunCleanup()
 
                 if let selectedRunID, cleanupPlan.deletedRunIDs.contains(selectedRunID) {
@@ -461,6 +464,22 @@ struct RunsHomeView: View {
 
             maintenanceInFlight = false
         }
+    }
+
+    private func prepareUIForTerminalRunDeletion(_ runIDs: Set<UUID>) {
+        guard !runIDs.isEmpty else { return }
+
+        if let selectedRunID, runIDs.contains(selectedRunID) {
+            self.selectedRunID = nil
+        }
+        if let comparisonTargetRun, runIDs.contains(comparisonTargetRun.id) {
+            self.comparisonTargetRun = nil
+        }
+
+        showRecoverySheet = false
+        showComparisonPicker = false
+        showReportView = false
+        showBlockedRecovery = false
     }
 }
 

@@ -93,6 +93,7 @@ impl AcpAdapter for GeminiCliAdapter {
             model: &model_str,
             mode: "bypassPermissions",
             extra: None,
+            config_options: Vec::new(),
         };
         let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
 

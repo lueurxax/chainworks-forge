@@ -407,6 +407,12 @@ final class RecoveryCoordinator {
         let suggestedAction: RecoveryAction?
         if let interruptedContinuationAction {
             suggestedAction = interruptedContinuationAction
+        } else if let preferredStageRetry = preferredSuggestedAction(
+            failedStage: failedStage,
+            failedAgent: failedAgent,
+            availableActions: actions
+        ) {
+            suggestedAction = preferredStageRetry
         } else if let snapshotAction = persistedSnapshot?.recommendedAction.flatMap(recoveryAction(from:)) {
             suggestedAction = snapshotAction
         } else if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
@@ -675,6 +681,25 @@ final class RecoveryCoordinator {
         case .operatorInspection:
             return nil
         }
+    }
+
+    private func preferredSuggestedAction(
+        failedStage: StageExecution?,
+        failedAgent: AgentExecution?,
+        availableActions: [RecoveryAction]
+    ) -> RecoveryAction? {
+        guard let failedStage, let failedAgent else { return nil }
+        guard failedStage.stageID.contains("implementation_started") || failedStage.stageID.contains("state_7") else {
+            return nil
+        }
+        guard failedAgent.agentID == "lead_orchestrator" else { return nil }
+
+        let stageOnlyReachedOrchestrator = failedStage.agentExecutions.allSatisfy { $0.agentID == "lead_orchestrator" }
+        guard stageOnlyReachedOrchestrator else { return nil }
+
+        let stageRetry = RecoveryAction.retryStage(stageID: failedStage.stageID)
+        guard availableActions.contains(stageRetry) else { return nil }
+        return stageRetry
     }
 
     private func isAggregateStep(_ agent: AgentExecution) -> Bool {

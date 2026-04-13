@@ -62,7 +62,8 @@ fn strip_ansi(s: &str) -> String {
 pub struct AcpSessionConfig<'a> {
     /// Model identifier for the provider's model catalog.
     /// Claude: `"default"` / `"sonnet"` / `"haiku"` / `"opus"`.
-    /// Codex: `"gpt-5"` / `"gpt-5-codex"` / `"o4-mini"`.
+    /// Codex: base model id without effort suffix (e.g. `"gpt-5.4"`).
+    ///        Reasoning effort is set separately via `config_options`.
     pub model: &'a str,
 
     /// Execution mode.
@@ -73,6 +74,19 @@ pub struct AcpSessionConfig<'a> {
     /// Extra fields merged into `session/new` params.
     /// Claude requires `_meta.claudeCode.options`; Codex uses `None`.
     pub extra: Option<serde_json::Value>,
+
+    /// Session config options to apply after `session/new` via
+    /// `session/set_config_option`.
+    ///
+    /// Used by the Codex adapter to set `reasoning_effort` (the only reliable
+    /// way to pin it — passing `gpt-5.4/high` in the `model` field silently
+    /// falls back to `gpt-5.4/medium`).
+    ///
+    /// Each entry is `(configId, value)` sent as:
+    /// `{"sessionId": "...", "configId": "<id>", "value": "<value>"}`.
+    /// Errors are logged but do not fail the session (providers that don't
+    /// support the method respond with `Method not found`).
+    pub config_options: Vec<(String, String)>,
 }
 
 impl Default for AcpSessionConfig<'_> {
@@ -91,6 +105,7 @@ impl Default for AcpSessionConfig<'_> {
                     }
                 }
             })),
+            config_options: Vec::new(),
         }
     }
 }
@@ -450,6 +465,56 @@ pub async fn run_acp_session(
             anyhow::anyhow!("ACP session/new response missing 'sessionId' field")
         })?
         .to_string();
+
+    // ── Phase 2b: session/set_config_option (best-effort) ────────────────────
+    // For providers that support it (Codex), apply config options like
+    // `reasoning_effort` that can't be set via the `session/new` model field.
+    for (config_id, value) in &config.config_options {
+        let sco_id = next_id!();
+        if let Err(e) = send_ndjson(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": sco_id,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value,
+                }
+            }),
+        )
+        .await
+        {
+            warn!(
+                session_id = %session_id,
+                config_id = %config_id,
+                "ACP: failed to send session/set_config_option: {e}"
+            );
+            continue;
+        }
+
+        match await_response(&mut reader, sco_id, HANDSHAKE_TIMEOUT).await {
+            Ok(_) => {
+                debug!(
+                    session_id = %session_id,
+                    config_id = %config_id,
+                    value = %value,
+                    "ACP: session/set_config_option applied"
+                );
+            }
+            Err(e) => {
+                // Providers that don't support set_config_option (Claude,
+                // Gemini) return "Method not found". Log and continue.
+                warn!(
+                    session_id = %session_id,
+                    config_id = %config_id,
+                    value = %value,
+                    "ACP: session/set_config_option rejected: {e}"
+                );
+            }
+        }
+    }
 
     // ── Phase 3: session/prompt — streaming ──────────────────────────────────
     let prompt_id = next_id!();

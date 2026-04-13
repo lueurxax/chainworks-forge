@@ -91,14 +91,29 @@ impl AcpAdapter for CodexAdapter {
                 format!("spawn Codex ACP subprocess: {}", self.binary_path)
             })?;
 
-        let model_str = build_codex_model_id(
-            req.model.as_deref().unwrap_or("gpt-5"),
-            req.effort.as_deref(),
-        );
+        // Build the base model id (without /effort suffix) and extract the
+        // effort separately. Codex's session/new silently falls back to
+        // medium when given a combined "model/effort" string, so we pass a
+        // bare model and set reasoning_effort via session/set_config_option.
+        let raw_model = req.model.as_deref().unwrap_or("gpt-5");
+        let (base_model, effort_from_model) = split_codex_model_effort(raw_model);
+        let effort = req
+            .effort
+            .as_deref()
+            .map(|e| e.to_lowercase())
+            .or(effort_from_model);
+
+        let mut config_options: Vec<(String, String)> = Vec::new();
+        if let Some(e) = effort.as_deref() {
+            // Codex accepts low / medium / high / xhigh for reasoning_effort.
+            config_options.push(("reasoning_effort".into(), e.to_string()));
+        }
+
         let config = AcpSessionConfig {
-            model: &model_str,
+            model: &base_model,
             mode: "full-access",
             extra: None,
+            config_options,
         };
 
         let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
@@ -219,19 +234,47 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
     ]
 }
 
-/// Map a model identifier to the Codex CLI catalog.
-/// Matches Swift `mapModelForCodexCatalog`.
-/// Build the Codex model ID by combining model + effort.
-/// Codex catalog uses `model/effort` format: `gpt-5.4/high`, `gpt-5.3-codex/medium`.
-/// If the model already contains `/`, it's used as-is.
-/// Effort values from YAML must match the Codex catalog exactly (low/medium/high/xhigh).
-fn build_codex_model_id(model: &str, effort: Option<&str>) -> String {
+/// Split a raw Codex model spec into (base_model, effort).
+///
+/// Accepts both `"gpt-5.4"` (base only) and `"gpt-5.4/high"` (combined).
+/// For the combined form we lowercase both halves. The combined form arrives
+/// when callers still use the legacy `model/effort` encoding; we unpack it so
+/// the transport can set `reasoning_effort` via session config option.
+fn split_codex_model_effort(model: &str) -> (String, Option<String>) {
     let lowered = model.to_lowercase();
-    if lowered.contains('/') {
-        return lowered;
+    match lowered.split_once('/') {
+        Some((base, eff)) if !eff.is_empty() => (base.to_string(), Some(eff.to_string())),
+        _ => (lowered, None),
     }
-    match effort {
-        Some(e) => format!("{}/{}", lowered, e.to_lowercase()),
-        None => lowered,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_bare_model() {
+        assert_eq!(split_codex_model_effort("gpt-5.4"), ("gpt-5.4".into(), None));
+    }
+
+    #[test]
+    fn splits_combined_model() {
+        assert_eq!(
+            split_codex_model_effort("gpt-5.4/high"),
+            ("gpt-5.4".into(), Some("high".into()))
+        );
+    }
+
+    #[test]
+    fn lowercases_both_halves() {
+        assert_eq!(
+            split_codex_model_effort("GPT-5.4/Xhigh"),
+            ("gpt-5.4".into(), Some("xhigh".into()))
+        );
+    }
+
+    #[test]
+    fn handles_trailing_slash() {
+        assert_eq!(split_codex_model_effort("gpt-5.4/"), ("gpt-5.4/".into(), None));
     }
 }

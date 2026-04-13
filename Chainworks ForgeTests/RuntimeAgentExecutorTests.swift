@@ -48,6 +48,8 @@ struct RuntimeAgentExecutorTests {
     }
 
     private final class PromptCaptureTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
         private struct State {
             var createSessionResult: RuntimeSessionResponse?
             var createSessionError: Error?
@@ -321,6 +323,112 @@ struct RuntimeAgentExecutorTests {
 
         var submittedSessionIDs: [String] {
             get async { state.withLock { $0.submittedSessionIDs } }
+        }
+    }
+
+    private final class CodexUsageLimitTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        var mcpRuntimeNamespace: String? { "codex" }
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            RuntimeSessionResponse(
+                sessionId: "codex-usage-limit",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"codex-usage-limit"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"codex-usage-limit"}"#))
+                    continuation.finish(throwing: NSError(
+                        domain: "RuntimeTest",
+                        code: -32603,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: #"Internal error (code -32603) {"codex_error_info":"usage_limit_exceeded","message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again later."}"#
+                        ]
+                    ))
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+    }
+
+    private final class SessionClosedWithoutOutputRetryTransport: RuntimeTransportProtocol, @unchecked Sendable {
+        private struct State {
+            var createSessionCallCount = 0
+            var submitPromptCallCount = 0
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
+            let callCount = state.withLock { state -> Int in
+                state.createSessionCallCount += 1
+                return state.createSessionCallCount
+            }
+
+            return RuntimeSessionResponse(
+                sessionId: "session-closed-\(callCount)",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            )
+        }
+
+        func submitPrompt(
+            sessionID: String,
+            prompt: RuntimePromptRequest
+        ) -> AsyncThrowingStream<RuntimeStreamEvent, Error> {
+            let attempt = state.withLock { state -> Int in
+                state.submitPromptCallCount += 1
+                return state.submitPromptCallCount
+            }
+
+            return AsyncThrowingStream { continuation in
+                Task {
+                    continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.yield(.promptSubmitted(raw: #"{"session_id":"\#(sessionID)"}"#))
+
+                    if attempt == 1 {
+                        continuation.yield(.textChunk(text: "[thinking] Reviewing proposal context"))
+                        continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                        continuation.finish()
+                        return
+                    }
+
+                    continuation.yield(.finalOutput(content: """
+<<<CHAINWORKS_OUTPUT:proposal_review_po>>>
+{"score":8}
+<<<END_CHAINWORKS_OUTPUT>>>
+"""))
+                    continuation.yield(.finish(reason: "end_turn", totalTokens: 12, raw: "{}"))
+                    continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
+                    continuation.finish()
+                }
+            }
+        }
+
+        func closeSession(sessionID: String) async throws {}
+
+        var createSessionCallCount: Int {
+            get async { state.withLock { $0.createSessionCallCount } }
+        }
+
+        var submitPromptCallCount: Int {
+            get async { state.withLock { $0.submitPromptCallCount } }
         }
     }
 
@@ -1794,6 +1902,74 @@ struct RuntimeAgentExecutorTests {
         #expect(receipt.effort == "medium")
     }
 
+    @MainActor
+    @Test("Executor prefers provider-observed Codex model over planned model on usage-limit failure")
+    func runtimeExecutorPrefersProviderObservedCodexModelOnUsageLimitFailure() async throws {
+        let executor = RuntimeAgentExecutor(transport: CodexUsageLimitTransport())
+        let configuredProviderID = UUID()
+        let binding = ResolvedProviderBinding(
+            agentID: "code_writer",
+            backendProfileID: "codex_builder_high",
+            configuredProviderID: configuredProviderID,
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "v1",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            provider: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0,
+            permissionProfile: "CODE_WRITE",
+            skillRef: "code_writer_core",
+            skillRole: nil,
+            prompt: "Implement the approved proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["changed_files_manifest"],
+            worktreeWriteEnabled: true,
+            sessionReuseScope: .none
+        )
+        let task = AgentTask(
+            agent: "code_writer",
+            task: "continue_implementation",
+            inputs: nil,
+            outputs: ["changed_files_manifest"]
+        )
+        let base = makeContext()
+        let context = ExecutionContext(
+            workspace: base.workspace,
+            stageID: base.stageID,
+            stageLineageID: base.stageLineageID,
+            ownerExecutionLineageID: base.ownerExecutionLineageID,
+            iteration: base.iteration,
+            attemptNumber: base.attemptNumber,
+            inputArtifacts: base.inputArtifacts,
+            inputArtifactPaths: base.inputArtifactPaths,
+            variables: base.variables,
+            ideaBody: base.ideaBody,
+            providerBinding: binding
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(!result.succeeded)
+        #expect(result.runtimeModel == "gpt-5.3-codex-spark")
+        #expect(result.providerReceipt?.model == "gpt-5.3-codex-spark")
+        #expect(result.resolvedModel == "GPT-5.4")
+    }
+
     /// testRuntimeExecutorFailsWhenRequiredOutputsMissing — Section 12.1
     @MainActor
     @Test("Executor fails when required outputs are missing from stream")
@@ -2039,6 +2215,10 @@ struct RuntimeAgentExecutorTests {
         let result = try await executor.execute(task: task, agent: agent, context: context)
 
         #expect(!result.succeeded)
+        #expect(result.canonicalOutcome == .completedWithTransportError)
+        #expect(result.outputPresence == .durableOutput)
+        #expect(result.providerStopReason == "session_closed_without_transition")
+        #expect(result.errorMessage == "Execution produced output but transport errored afterward")
         #expect(result.outputs["implementation_progress"] != nil)
         #expect(result.outputs["implementation_self_assessment"] != nil)
         #expect(result.outputs["changed_files_manifest"] != nil)
@@ -2245,6 +2425,64 @@ struct RuntimeAgentExecutorTests {
 
         #expect(!result.succeeded)
         #expect(result.errorMessage?.contains("Session creation failed") == true)
+    }
+
+    @MainActor
+    @Test("Executor does not spawn git status while preparing mutation observer baseline")
+    func runtimeExecutorDoesNotSpawnGitStatusForMutationObserverBaseline() async throws {
+        let transport = PromptCaptureTransport()
+        await transport.configure(
+            sessionResult: RuntimeSessionResponse(
+                sessionId: "mutation-baseline-session",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-token",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            sessionError: nil,
+            events: [
+                .sessionStarted(raw: "{}"),
+                .promptSubmitted(raw: "{}"),
+                .finalOutput(content: "implementation complete"),
+                .sessionClosed(raw: "{}")
+            ]
+        )
+
+        let fakeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fake-git-\(UUID().uuidString)", isDirectory: true)
+        let binDir = fakeRoot.appendingPathComponent("bin", isDirectory: true)
+        let markerPath = fakeRoot.appendingPathComponent("git-invoked").path
+        let gitPath = binDir.appendingPathComponent("git").path
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeRoot) }
+
+        let script = """
+        #!/bin/sh
+        echo invoked > "\(markerPath)"
+        sleep 1
+        exit 0
+        """
+        try script.write(toFile: gitPath, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gitPath)
+
+        let originalPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        setenv("PATH", "\(binDir.path):\(originalPath)", 1)
+        defer { setenv("PATH", originalPath, 1) }
+
+        let worktreeRoot = fakeRoot.appendingPathComponent("repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        try Data("gitdir: /tmp/not-used".utf8).write(to: worktreeRoot.appendingPathComponent(".git"))
+
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let context = makeContext(worktreeRoot: worktreeRoot)
+        let agent = makeAgent(id: "code_writer", outputs: [], worktreeWriteEnabled: true)
+        let task = makeTask(agent: "code_writer", task: "continue_implementation")
+
+        _ = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(FileManager.default.fileExists(atPath: markerPath) == false)
     }
 
     @MainActor
@@ -2707,6 +2945,27 @@ struct RuntimeAgentExecutorTests {
         #expect(result.errorMessage?.contains("Required outputs missing") == true)
         #expect(await transport.createSessionCallCount == 1)
         #expect(await transport.submitPromptCallCount == 1)
+    }
+
+    @MainActor
+    @Test("Executor retries session-closed proposal review attempts that end before any final output")
+    func runtimeExecutorRetriesSessionClosedWithoutOutput() async throws {
+        let transport = SessionClosedWithoutOutputRetryTransport()
+        let executor = RuntimeAgentExecutor(transport: transport)
+        let agent = makeAgent(
+            id: "proposal_reviewer_product_owner",
+            mode: "proposal_review.product_owner",
+            outputs: ["proposal_review_po"]
+        )
+        let task = makeTask(agent: agent.id, task: "review_proposal_as_product_owner")
+        let context = makeContext()
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(result.outputs["proposal_review_po"] != nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
     }
 
     @MainActor
@@ -3213,6 +3472,56 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
+    @Test("Executor does not reuse Codex sessions across settled executions")
+    func runtimeExecutorDoesNotReuseCodexSessionsAcrossTurns() async throws {
+        let transport = StaleReuseTransport()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: try makeSessionManager())
+
+        let runID = UUID()
+        let context1 = makeContext(runID: runID, iteration: 1)
+        let context2 = makeContext(runID: runID, iteration: 2)
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            provider: "codex_acp",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "RW_IMPLEMENT",
+            skillRef: "code_writer",
+            skillRole: nil,
+            prompt: "Implement the approved changes.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["changed_files_manifest"],
+            worktreeWriteEnabled: true,
+            sessionReuseScope: .same_agent_family_within_run,
+            sessionFamilyID: "implementation_loop"
+        )
+        let task = AgentTask(
+            agent: "code_writer",
+            task: "implement_changes",
+            inputs: nil,
+            outputs: ["changed_files_manifest"]
+        )
+
+        let firstResult = try await executor.execute(task: task, agent: agent, context: context1)
+        #expect(firstResult.succeeded)
+        #expect(firstResult.sessionReuseDisposition == .fresh)
+
+        let secondResult = try await executor.execute(task: task, agent: agent, context: context2)
+        #expect(secondResult.succeeded)
+        #expect(secondResult.sessionReuseDisposition == .fresh)
+        #expect(secondResult.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["session-reused", "session-fresh-2"])
+    }
+
+    @MainActor
     @Test("Executor retries with a fresh session when a just-created ACP session is already inactive")
     func runtimeExecutorRecoversWhenFreshSessionImmediatelyDisappears() async throws {
         let transport = FreshSessionMissingTransport()
@@ -3257,8 +3566,8 @@ struct RuntimeAgentExecutorTests {
     }
 
     @MainActor
-    @Test("Executor preserves codex ACP session reuse scope instead of forcing none")
-    func executorPreservesCodexACPReuseScope() async throws {
+    @Test("Executor forces fresh Codex ACP sessions across settled executions")
+    func executorForcesFreshCodexACPSessions() async throws {
         let executor = RuntimeAgentExecutor(transport: PromptCaptureTransport())
 
         let baseContext = makeContext(iteration: 1)
@@ -3311,7 +3620,7 @@ struct RuntimeAgentExecutorTests {
         )
 
         let effectiveAgent = executor.effectiveAgentForExecution(agent, context: context)
-        #expect(effectiveAgent.sessionReuseScope == .same_invocation_owner)
+        #expect(effectiveAgent.sessionReuseScope == .none)
         #expect(effectiveAgent.runtimeProfileID == agent.runtimeProfileID)
     }
 
@@ -3395,9 +3704,154 @@ struct RuntimeAgentExecutorTests {
         #expect(await transport.submittedSessionIDs == ["codex-guard-1", "codex-guard-2"])
     }
 
+    @MainActor
+    @Test("Executor invalidates the active generation before retrying a codex runaway guardrail failure")
+    func executorInvalidatesGenerationBeforeRetryingCodexRunawayGuardrail() async throws {
+        let originalMaxToolCalls = RuntimeAgentExecutor.codexACPMaxToolCallCount
+        let originalPollInterval = RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds
+        RuntimeAgentExecutor.codexACPMaxToolCallCount = 3
+        RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = 10
+        defer {
+            RuntimeAgentExecutor.codexACPMaxToolCallCount = originalMaxToolCalls
+            RuntimeAgentExecutor.codexACPGuardrailPollIntervalMilliseconds = originalPollInterval
+        }
+
+        let sessionManager = try makeSessionManager()
+        let transport = CodexRunawayGuardrailTransport()
+        let executor = RuntimeAgentExecutor(transport: transport, sessionManager: sessionManager)
+        let runID = UUID()
+        let baseContext = makeContext(runID: runID, iteration: 1)
+        let codexBinding = ResolvedProviderBinding(
+            agentID: "proposal_writer",
+            backendProfileID: "codex_writer_high",
+            configuredProviderID: UUID(),
+            providerFamily: "codex",
+            providerIdentifier: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            transport: "cli",
+            adapterVersion: "test",
+            runtimeProfileID: "codex_acp",
+            adapterFamily: "codex_acp",
+            capabilityClass: .operatorGrade
+        )
+
+        let context = ExecutionContext(
+            workspace: baseContext.workspace,
+            stageID: baseContext.stageID,
+            stageLineageID: baseContext.stageLineageID,
+            ownerExecutionLineageID: baseContext.ownerExecutionLineageID,
+            iteration: baseContext.iteration,
+            attemptNumber: baseContext.attemptNumber,
+            inputArtifacts: baseContext.inputArtifacts,
+            inputArtifactPaths: baseContext.inputArtifactPaths,
+            variables: baseContext.variables,
+            ideaBody: baseContext.ideaBody,
+            providerBinding: codexBinding
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_writer",
+            title: "Proposal Writer",
+            mode: "proposal_authoring",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "AUTHOR",
+            skillRef: "proposal_writer_core",
+            skillRole: nil,
+            prompt: "Draft the proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: [],
+            sessionReuseScope: .same_invocation_owner
+        )
+        let task = AgentTask(
+            agent: "proposal_writer",
+            task: "draft_initial_proposal",
+            inputs: nil,
+            outputs: []
+        )
+
+        let result = try await executor.execute(task: task, agent: agent, context: context)
+
+        #expect(result.succeeded)
+        #expect(result.errorMessage == nil)
+        #expect(await transport.createSessionCallCount == 2)
+        #expect(await transport.submitPromptCallCount == 2)
+        #expect(await transport.submittedSessionIDs == ["codex-guard-1", "codex-guard-2"])
+
+        let lineageID = try await sessionManager.getOrCreateLineage(
+            runID: runID,
+            agentID: agent.id,
+            scope: agent.sessionReuseScope,
+            familyID: agent.sessionFamilyID
+        )
+        let lineage = try #require(try await sessionManager.getLineage(id: lineageID))
+        #expect(lineage.activeGenerationID == nil)
+        #expect(lineage.generations.count == 2)
+
+        let generations = lineage.generations.sorted { $0.generation < $1.generation }
+        #expect(generations[0].status == .invalidated)
+        #expect(generations[0].endReason?.localizedCaseInsensitiveContains("runaway guardrail") == true)
+        #expect(generations[1].status == .closed)
+        #expect(lineage.events.contains { $0.generationID == generations[0].id && $0.eventType == .invalidated })
+        #expect(lineage.events.contains { $0.generationID == generations[1].id && $0.eventType == .closed })
+    }
+
+    @MainActor
+    @Test("Session manager supersedes a lingering active generation when creating a fresh generation")
+    func sessionManagerSupersedesLingeringActiveGeneration() async throws {
+        let sessionManager = try makeSessionManager()
+        let runID = UUID()
+        let lineageID = try await sessionManager.getOrCreateLineage(
+            runID: runID,
+            agentID: "code_writer",
+            scope: .same_invocation_owner,
+            familyID: nil
+        )
+
+        let firstGenerationID = try await sessionManager.createGeneration(
+            lineageID: lineageID,
+            invocationOwnerKey: "owner-1",
+            providerSessionID: "session-1",
+            bindingFingerprint: "fingerprint-1",
+            workingDirectory: "/tmp/work-1",
+            workspaceMode: "read_write",
+            runtimeProvider: "codex_acp",
+            runtimeModel: "gpt-5.4"
+        )
+
+        let secondGenerationID = try await sessionManager.createGeneration(
+            lineageID: lineageID,
+            invocationOwnerKey: "owner-2",
+            providerSessionID: "session-2",
+            bindingFingerprint: "fingerprint-2",
+            workingDirectory: "/tmp/work-2",
+            workspaceMode: "read_write",
+            runtimeProvider: "codex_acp",
+            runtimeModel: "gpt-5.4"
+        )
+
+        let lineage = try #require(try await sessionManager.getLineage(id: lineageID))
+        #expect(lineage.activeGenerationID == secondGenerationID)
+        #expect(lineage.generations.count == 2)
+
+        let firstGeneration = try #require(lineage.generations.first(where: { $0.id == firstGenerationID }))
+        let secondGeneration = try #require(lineage.generations.first(where: { $0.id == secondGenerationID }))
+        #expect(firstGeneration.status == .invalidated)
+        #expect(firstGeneration.endReason == "Superseded by new generation")
+        #expect(secondGeneration.status == .active)
+        #expect(lineage.events.contains { $0.generationID == firstGenerationID && $0.eventType == .invalidated })
+    }
+
     @Test("Codex ACP proposal authoring gets a longer execution-age guardrail than implementation")
     func codexExecutionAgeGuardrailIsLongerForProposalAuthoring() {
         let proposalAuthoringAgent = makeAgent(id: "proposal_writer", mode: "proposal_authoring")
+        let proposalReviewerAgent = makeAgent(id: "proposal_reviewer_architect", mode: "proposal_review.architect")
         let implementationAgent = makeAgent(
             id: "code_writer",
             mode: "implementation",
@@ -3410,12 +3864,51 @@ struct RuntimeAgentExecutorTests {
             > RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: implementationAgent)
         )
         #expect(
-            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalAuthoringAgent) == 900
+            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalAuthoringAgent) == 1_200
+        )
+        #expect(
+            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalReviewerAgent)
+            > RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalAuthoringAgent)
+        )
+        #expect(
+            RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: proposalReviewerAgent) == 1_800
         )
         #expect(
             RuntimeAgentExecutor.codexACPExecutionAgeLimitSeconds(for: implementationAgent)
             == RuntimeAgentExecutor.codexACPMaxExecutionSeconds
         )
+    }
+
+    @Test("ACP proposal reviewers use a longer idle-after-progress watchdog than generic ACP agents")
+    func acpProposalReviewUsesLongerIdleAfterProgressWatchdog() {
+        let originalProposalReviewIdle = RuntimeAgentExecutor.acpProposalReviewIdleAfterProgressDeadlineSeconds
+        let originalGenericIdle = RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds
+        RuntimeAgentExecutor.acpProposalReviewIdleAfterProgressDeadlineSeconds = 1_200
+        RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds = 300
+        defer {
+            RuntimeAgentExecutor.acpProposalReviewIdleAfterProgressDeadlineSeconds = originalProposalReviewIdle
+            RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds = originalGenericIdle
+        }
+
+        let proposalReviewerAgent = makeAgent(id: "proposal_reviewer_architect", mode: "proposal_review.architect")
+        let implementationAgent = makeAgent(id: "code_writer", mode: "implementation")
+
+        #expect(
+            RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds(for: proposalReviewerAgent)
+            > RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds(for: implementationAgent)
+        )
+        #expect(RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds(for: proposalReviewerAgent) == 1_200)
+        #expect(RuntimeAgentExecutor.acpIdleAfterProgressDeadlineSeconds(for: implementationAgent) == 300)
+    }
+
+    @Test("Codex ACP default runaway tool-call ceiling allows moderate discovery-heavy turns")
+    func codexDefaultRunawayToolCallCeiling() {
+        #expect(RuntimeAgentExecutor.codexACPMaxToolCallCount == 300)
+    }
+
+    @Test("Codex ACP default raw payload ceiling allows larger implementation turns")
+    func codexDefaultRawPayloadCeiling() {
+        #expect(RuntimeAgentExecutor.codexACPMaxRawToolPayloadBytes == 10_000_000)
     }
 
     @MainActor

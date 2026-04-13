@@ -217,6 +217,14 @@ struct IdeaTests {
     }
 }
 
+@Suite("App Performance Contracts", .tags(.fast))
+struct AppPerformanceContractTests {
+    @Test("Window restoration stays disabled for the production app path")
+    func windowRestorationStaysDisabled() {
+        #expect(Chainworks_ForgeApp.shouldDisableWindowRestoration)
+    }
+}
+
 @Suite("Run Model", .serialized, .tags(.fast))
 @MainActor
 struct RunTests {

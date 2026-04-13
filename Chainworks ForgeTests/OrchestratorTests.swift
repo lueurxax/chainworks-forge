@@ -1827,6 +1827,169 @@ struct OrchestratorTests {
         #expect(latestExecution.modelTierUsed == "frontier")
     }
 
+    @Test("Implementation loop does not reuse Codex fast tier after a usage-limit retry in the same stage")
+    func implementationLoopDoesNotReuseCodexFastTierAfterSameStageUsageLimitRetry() async throws {
+        let workspace = makeWorkspace()
+        let run = makeRun(workspace: workspace)
+        run.contextStrategyProfileID = "selective_compression_and_escalation"
+        run.strategyAssignmentMode = "manual_override"
+        run.contextStrategySnapshotJSON = try JSONEncoder().encode(
+            try #require(
+                StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]?
+                    .runtimeProfile(profileID: "selective_compression_and_escalation")
+            )
+        )
+        run.providerBindingSnapshotJSON = try JSONEncoder().encode([
+            "code_writer": ResolvedProviderBinding(
+                agentID: "code_writer",
+                backendProfileID: "bp",
+                configuredProviderID: UUID(),
+                providerFamily: ProviderFamily.codexACP.rawValue,
+                providerIdentifier: ProviderFamily.codexACP.runtimeProviderIdentifier,
+                model: "GPT-5.4",
+                effort: "high",
+                transport: "cli",
+                adapterVersion: "v1",
+                runtimeProfileID: "codex_acp",
+                adapterFamily: "codex_acp",
+                capabilityClass: .operatorGrade
+            )
+        ])
+
+        let resumableStage = StageExecution(
+            stageID: "start",
+            label: "Start",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        resumableStage.lineageID = "start"
+        resumableStage.run = run
+        context.insert(resumableStage)
+
+        let priorExecution = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "implement",
+            startedAt: Date(timeIntervalSince1970: 11),
+            status: .failed,
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            effort: "high"
+        )
+        priorExecution.completedAt = Date(timeIntervalSince1970: 12)
+        priorExecution.modelTierUsed = "fast"
+        priorExecution.providerStopReason = "usage_limit_exceeded"
+        priorExecution.canonicalOutcome = .limitExhaustedBeforeOutput
+        priorExecution.transportErrorKind = .provider
+        priorExecution.outputPresence = .none
+        priorExecution.stageExecution = resumableStage
+        context.insert(priorExecution)
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "implementation",
+            backendProfileID: "bp",
+            provider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 10,
+            temperature: 0.0,
+            permissionProfile: "CODE_WRITE",
+            skillRef: "sk1",
+            skillRole: nil,
+            prompt: "implement",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["output_1"]
+        )
+
+        let plan = RunPlan(
+            workflowID: "wf",
+            workflowTitle: "WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Start",
+                    type: .start,
+                    ownerAgentID: "code_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "code_writer", task: "implement", inputs: nil, outputs: ["output_1"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .always)],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "code_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: ["code_writer": agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "h1",
+            catalogSnapshotHash: "h2",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: 1
+        )
+
+        let success = AgentResult(
+            outputs: ["output_1": Data("ok".utf8)],
+            logSnippet: "success",
+            costCents: nil,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput,
+            runtimeProvider: ProviderFamily.codexACP.runtimeProviderIdentifier,
+            runtimeModel: "GPT-5.4"
+        )
+        let box = SequencedExecutionBox(results: [success])
+
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: plan,
+            workspace: workspace,
+            executor: SequencedExecutor(box: box),
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        #expect(await box.models == ["GPT-5.4"])
+
+        let latestExecution = try #require(
+            resumableStage.agentExecutions
+                .filter { $0.agentID == "code_writer" && $0.startedAt > priorExecution.startedAt }
+                .sorted { $0.startedAt < $1.startedAt }
+                .last
+        )
+        #expect(latestExecution.modelTierUsed == "frontier")
+    }
+
     // MARK: - Multi-State Workflow
 
     @Test("Multi-state workflow executes agents in order")

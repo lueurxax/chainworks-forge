@@ -322,10 +322,8 @@ private struct WorkflowMapStageCard: View {
         )
         // Proposal 012 (L-05): Hover effect and tap popover
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) { isHovered = hovering }
+            isHovered = hovering
         }
-        .scaleEffect(isHovered ? 1.02 : 1.0)
-        .animation(.easeInOut(duration: 0.15), value: isHovered)
         .onTapGesture { showPopover = true }
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {

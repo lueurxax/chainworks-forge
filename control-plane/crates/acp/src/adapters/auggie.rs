@@ -78,7 +78,12 @@ impl AcpAdapter for AuggieAdapter {
                 format!("spawn Auggie ACP subprocess: {}", self.binary_path)
             })?;
 
-        let config = AcpSessionConfig { model: "default", mode: "bypassPermissions", extra: None };
+        let config = AcpSessionConfig {
+            model: "default",
+            mode: "bypassPermissions",
+            extra: None,
+            config_options: Vec::new(),
+        };
         let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
 
         Ok(ExecutionResult {

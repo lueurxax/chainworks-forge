@@ -774,25 +774,41 @@ struct BlockedRunRecoveryView: View {
                 _ = try coordinator.retryAgent(run: run, stageID: stageID, agentID: agentID)
                 ForgeLogger.recovery.debug("retryAgent succeeded, now calling resumeRun")
                 let compiler = RunPlanCompiler(modelContext: modelContext)
-                try executionService.resumeRun(run: run, compiler: compiler)
+                try executionService.resumeRunFromOperatorRecovery(
+                    run: run,
+                    compiler: compiler,
+                    source: .blockedRecovery("retryAgent:\(stageID):\(agentID)")
+                )
                 ForgeLogger.recovery.debug("resumeRun succeeded, dismissing")
                 dismiss()
 
             case .retryAggregateStep(let stageID, let agentID):
                 _ = try coordinator.retryAggregateStep(run: run, stageID: stageID, agentID: agentID)
                 let compiler = RunPlanCompiler(modelContext: modelContext)
-                try executionService.resumeRun(run: run, compiler: compiler)
+                try executionService.resumeRunFromOperatorRecovery(
+                    run: run,
+                    compiler: compiler,
+                    source: .blockedRecovery("retryAggregateStep:\(stageID):\(agentID)")
+                )
                 dismiss()
 
             case .retryStage(let stageID):
                 _ = try coordinator.retryStage(run: run, stageID: stageID)
                 let compiler = RunPlanCompiler(modelContext: modelContext)
-                try executionService.resumeRun(run: run, compiler: compiler)
+                try executionService.resumeRunFromOperatorRecovery(
+                    run: run,
+                    compiler: compiler,
+                    source: .blockedRecovery("retryStage:\(stageID)")
+                )
                 dismiss()
 
             case .resumeInterrupted:
                 let compiler = RunPlanCompiler(modelContext: modelContext)
-                try executionService.resumeRun(run: run, compiler: compiler)
+                try executionService.resumeRunFromOperatorRecovery(
+                    run: run,
+                    compiler: compiler,
+                    source: .blockedRecovery("resumeInterrupted")
+                )
                 dismiss()
 
             case .resumeFromApprovalGate(let stageID):

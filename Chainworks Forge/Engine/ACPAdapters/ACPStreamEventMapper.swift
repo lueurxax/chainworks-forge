@@ -133,6 +133,10 @@ enum ACPStreamEventMapper {
         mapNotificationEvents(method: method, params: params).first
     }
 
+    static func extractPermissionToolNameForDiagnostics(from params: [String: Any]?) -> String {
+        extractPermissionToolName(from: params)
+    }
+
     // MARK: - Result Mapping
 
     /// Map a JSON-RPC result (response to `session/prompt`) to a terminal `RuntimeStreamEvent`.

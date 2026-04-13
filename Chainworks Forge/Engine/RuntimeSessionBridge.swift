@@ -39,14 +39,11 @@ final class RuntimeSessionBridge: Sendable {
         context: ExecutionContext,
         override: LiveExecutionOverride?
     ) async throws -> RuntimeSessionExecution {
-        let pathAliases = Self.pathAliases(for: context)
-
         // Step 1: Build the structured execution packet
         let packet = Self.buildExecutionPacket(
             agent: agent,
             task: task,
-            context: context,
-            pathAliases: pathAliases
+            context: context
         )
 
         // Step 2: Resolve provider/model.
@@ -67,7 +64,7 @@ final class RuntimeSessionBridge: Sendable {
         let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
         let readOnlyRoot = context.projectRoot?.path ?? context.workspace.workspaceRoot.path
         let workingDirectory = useWorktree
-            ? (pathAliases.worktreeRootAlias?.path ?? context.workspace.worktreeRoot!.path)
+            ? context.workspace.worktreeRoot!.path
             : readOnlyRoot
         let mcpResolution = resolveMCPPolicy(agent: agent, context: context)
         let isACPRuntime = transport.mcpRuntimeNamespace != nil
@@ -87,7 +84,7 @@ final class RuntimeSessionBridge: Sendable {
             executionPolicy: RuntimeExecutionPolicy(
                 permissionProfileID: agent.permissionProfile,
                 workspaceMode: useWorktree ? "read_write" : "read_only",
-                gitOperationsAllowed: useWorktree,
+                gitOperationsAllowed: false,
                 releaseOperationsAllowed: false,
                 repoWritesAllowed: useWorktree
             ),
@@ -296,8 +293,7 @@ final class RuntimeSessionBridge: Sendable {
     static func buildExecutionPacket(
         agent: ResolvedAgent,
         task: AgentTask,
-        context: ExecutionContext,
-        pathAliases: ExecutionPathAliases? = nil
+        context: ExecutionContext
     ) -> ExecutionPacket {
         // Proposal 013: V2 resolver — catalog-driven contract resolution
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
@@ -313,13 +309,10 @@ final class RuntimeSessionBridge: Sendable {
         let workspaceRootPath = context.workspace.workspaceRoot.standardizedFileURL.path
         let artifactRootPath = context.workspace.artifactRoot.standardizedFileURL.path
         let worktreeRootPath = context.workspace.worktreeRoot?.standardizedFileURL.path
-        let workspaceRootDisplayPath = pathAliases?.workspaceRootAlias?.path ?? workspaceRootPath
-        let artifactRootDisplayPath = pathAliases?.artifactRootAlias?.path ?? artifactRootPath
-        let worktreeRootDisplayPath = pathAliases?.worktreeRootAlias?.path ?? worktreeRootPath
         let normalizeToWorktree = agent.worktreeWriteEnabled &&
-            worktreeRootDisplayPath != nil &&
+            worktreeRootPath != nil &&
             projectRootPath != nil &&
-            worktreeRootDisplayPath != projectRootPath
+            worktreeRootPath != projectRootPath
 
         // 1. System prompt
         let systemPrompt = buildSystemPrompt(
@@ -333,9 +326,7 @@ final class RuntimeSessionBridge: Sendable {
             agent: agent,
             task: task,
             context: context,
-            workspaceRootDisplayPath: workspaceRootDisplayPath,
-            artifactRootDisplayPath: artifactRootDisplayPath,
-            worktreeRootDisplayPath: worktreeRootDisplayPath,
+            worktreeRootPath: worktreeRootPath,
             expectedOutputs: expectedOutputs,
             catalog: context.catalog,
             lazyEvidenceToolAssets: lazyEvidenceToolAssets
@@ -346,9 +337,9 @@ final class RuntimeSessionBridge: Sendable {
 
         // Workspace context attachment
         let projectRootDescription = projectRootPath ?? "not provided"
-        let workspaceRootDescription = workspaceRootDisplayPath
-        let artifactRootDescription = artifactRootDisplayPath
-        let worktreeRootDescription = worktreeRootDisplayPath ?? "not provisioned"
+        let workspaceRootDescription = workspaceRootPath
+        let artifactRootDescription = artifactRootPath
+        let worktreeRootDescription = worktreeRootPath ?? "not provisioned"
         let useWorktree = agent.worktreeWriteEnabled && context.workspace.worktreeRoot != nil
         let boundaryNote = useWorktree
             ? "IMPORTANT: This agent has write access to the worktree root. All file operations must use explicit absolute paths within the worktree root."
@@ -379,12 +370,7 @@ final class RuntimeSessionBridge: Sendable {
                     data: data,
                     normalizeToWorktree: normalizeToWorktree,
                     projectRootPath: projectRootPath,
-                    workspaceRootPath: workspaceRootPath,
-                    artifactRootPath: artifactRootPath,
-                    worktreeRootPath: worktreeRootPath,
-                    workspaceRootDisplayPath: workspaceRootDisplayPath,
-                    artifactRootDisplayPath: artifactRootDisplayPath,
-                    worktreeRootDisplayPath: worktreeRootDisplayPath
+                    worktreeRootPath: worktreeRootPath
                 ) ?? "<binary data, \(data.count) bytes>"
                 attachments.append(RuntimeContextAttachment(
                     type: "artifact",
@@ -402,12 +388,7 @@ final class RuntimeSessionBridge: Sendable {
                         summary,
                         normalizeToWorktree: normalizeToWorktree,
                         projectRootPath: projectRootPath,
-                        workspaceRootPath: workspaceRootPath,
-                        artifactRootPath: artifactRootPath,
-                        worktreeRootPath: worktreeRootPath,
-                        workspaceRootDisplayPath: workspaceRootDisplayPath,
-                        artifactRootDisplayPath: artifactRootDisplayPath,
-                        worktreeRootDisplayPath: worktreeRootDisplayPath
+                        worktreeRootPath: worktreeRootPath
                     ),
                     path: nil
                 ))
@@ -458,12 +439,7 @@ final class RuntimeSessionBridge: Sendable {
                     data: data,
                     normalizeToWorktree: normalizeToWorktree,
                     projectRootPath: projectRootPath,
-                    workspaceRootPath: workspaceRootPath,
-                    artifactRootPath: artifactRootPath,
-                    worktreeRootPath: worktreeRootPath,
-                    workspaceRootDisplayPath: workspaceRootDisplayPath,
-                    artifactRootDisplayPath: artifactRootDisplayPath,
-                    worktreeRootDisplayPath: worktreeRootDisplayPath
+                    worktreeRootPath: worktreeRootPath
                 ) ?? "<binary data, \(data.count) bytes>"
                 attachments.append(RuntimeContextAttachment(
                     type: "artifact",
@@ -556,6 +532,7 @@ final class RuntimeSessionBridge: Sendable {
         parts.append("## Boundaries")
         parts.append("- You must return required outputs in the final response using the Chainworks output envelope. The app persists artifacts; do not rely on direct writes to the run artifact directory.")
         parts.append("- Never use shell redirection, heredocs, `cat >`, or direct writes into the artifact root. Only return required outputs via the final CHAINWORKS_OUTPUT envelope.")
+        parts.append("- When using `exec_command`, only call `write_stdin` if the command was started with `tty=true`. If you did not request `tty=true`, do not call `write_stdin`; rerun the command with `tty=true` instead.")
         parts.append("- Do not perform any git operations.")
         parts.append("- Do not rely on implicit working directory — use explicit absolute paths from the workspace context.")
         parts.append("- For read-only repo-backed stages, read source only from the Project Root provided in workspace_context.")
@@ -570,9 +547,7 @@ final class RuntimeSessionBridge: Sendable {
         agent: ResolvedAgent,
         task: AgentTask,
         context: ExecutionContext,
-        workspaceRootDisplayPath: String,
-        artifactRootDisplayPath: String,
-        worktreeRootDisplayPath: String?,
+        worktreeRootPath: String?,
         expectedOutputs: [String],
         catalog: AgentCatalog?,
         lazyEvidenceToolAssets: LazyEvidenceToolAssets?
@@ -668,12 +643,15 @@ final class RuntimeSessionBridge: Sendable {
             if !canonicalPaths.isEmpty {
                 parts.append("Canonical input artifact paths:")
                 for (name, path) in canonicalPaths {
-                    parts.append("- \(name): \(normalizeAbsolutePathForExecution(path, workspaceRootDisplayPath: workspaceRootDisplayPath, artifactRootDisplayPath: artifactRootDisplayPath, worktreeRootDisplayPath: worktreeRootDisplayPath, context: context))")
+                    parts.append("- \(name): \(path)")
                 }
             }
             parts.append("Do not re-discover repository structure unless a referenced path is missing or clearly stale.")
             parts.append("If a referenced path has drifted, do one brief remap and continue. Do not spend the turn on broad search churn.")
             parts.append("Prefer moving directly from the approved plan/backlog into concrete edits and tests instead of repeated search/read passes.")
+            parts.append("Before any `apply_patch` or edit, re-read the target file from the current worktree path so your patch context matches the live file, not the handoff snapshot.")
+            parts.append("Keep patches narrow. Prefer small hunks with minimal surrounding context instead of large anchored rewrites.")
+            parts.append("If `apply_patch` verification fails, do not retry the same patch blindly. Re-read the file, regenerate the hunk against the live contents, and continue with the smallest viable edit.")
             parts.append("Never emit shell commands that write required outputs into the run artifact directory. Required outputs must be returned only through the final CHAINWORKS_OUTPUT envelope.")
         }
 
@@ -731,46 +709,24 @@ final class RuntimeSessionBridge: Sendable {
         _ content: String,
         normalizeToWorktree: Bool,
         projectRootPath: String?,
-        workspaceRootPath: String,
-        artifactRootPath: String,
-        worktreeRootPath: String?,
-        workspaceRootDisplayPath: String,
-        artifactRootDisplayPath: String,
-        worktreeRootDisplayPath: String?
+        worktreeRootPath: String?
     ) -> String {
-        var normalized = content
-        if workspaceRootDisplayPath != workspaceRootPath {
-            normalized = normalized.replacingOccurrences(of: workspaceRootPath, with: workspaceRootDisplayPath)
-        }
-        if artifactRootDisplayPath != artifactRootPath {
-            normalized = normalized.replacingOccurrences(of: artifactRootPath, with: artifactRootDisplayPath)
-        }
-        if let worktreeRootPath,
-           let worktreeRootDisplayPath,
-           worktreeRootDisplayPath != worktreeRootPath {
-            normalized = normalized.replacingOccurrences(of: worktreeRootPath, with: worktreeRootDisplayPath)
-        }
         guard normalizeToWorktree,
               let projectRootPath,
-              let worktreeRootDisplayPath,
+              let worktreeRootPath,
               !projectRootPath.isEmpty,
-              !worktreeRootDisplayPath.isEmpty,
-              normalized.contains(projectRootPath) else {
-            return normalized
+              !worktreeRootPath.isEmpty,
+              content.contains(projectRootPath) else {
+            return content
         }
-        return normalized.replacingOccurrences(of: projectRootPath, with: worktreeRootDisplayPath)
+        return content.replacingOccurrences(of: projectRootPath, with: worktreeRootPath)
     }
 
     private static func normalizedAttachmentContent(
         data: Data,
         normalizeToWorktree: Bool,
         projectRootPath: String?,
-        workspaceRootPath: String,
-        artifactRootPath: String,
-        worktreeRootPath: String?,
-        workspaceRootDisplayPath: String,
-        artifactRootDisplayPath: String,
-        worktreeRootDisplayPath: String?
+        worktreeRootPath: String?
     ) -> String? {
         guard let content = String(data: data, encoding: .utf8) else {
             return nil
@@ -779,80 +735,8 @@ final class RuntimeSessionBridge: Sendable {
             content,
             normalizeToWorktree: normalizeToWorktree,
             projectRootPath: projectRootPath,
-            workspaceRootPath: workspaceRootPath,
-            artifactRootPath: artifactRootPath,
-            worktreeRootPath: worktreeRootPath,
-            workspaceRootDisplayPath: workspaceRootDisplayPath,
-            artifactRootDisplayPath: artifactRootDisplayPath,
-            worktreeRootDisplayPath: worktreeRootDisplayPath
+            worktreeRootPath: worktreeRootPath
         )
-    }
-
-    private static func normalizeAbsolutePathForExecution(
-        _ path: String,
-        workspaceRootDisplayPath: String,
-        artifactRootDisplayPath: String,
-        worktreeRootDisplayPath: String?,
-        context: ExecutionContext
-    ) -> String {
-        var normalized = path
-        let workspaceRootPath = context.workspace.workspaceRoot.standardizedFileURL.path
-        let artifactRootPath = context.workspace.artifactRoot.standardizedFileURL.path
-        let worktreeRootPath = context.workspace.worktreeRoot?.standardizedFileURL.path
-        if workspaceRootDisplayPath != workspaceRootPath {
-            normalized = normalized.replacingOccurrences(of: workspaceRootPath, with: workspaceRootDisplayPath)
-        }
-        if artifactRootDisplayPath != artifactRootPath {
-            normalized = normalized.replacingOccurrences(of: artifactRootPath, with: artifactRootDisplayPath)
-        }
-        if let worktreeRootPath,
-           let worktreeRootDisplayPath,
-           worktreeRootDisplayPath != worktreeRootPath {
-            normalized = normalized.replacingOccurrences(of: worktreeRootPath, with: worktreeRootDisplayPath)
-        }
-        return normalized
-    }
-
-    private static func pathAliases(for context: ExecutionContext) -> ExecutionPathAliases {
-        let workspaceRootAlias = aliasURLIfNeeded(
-            for: context.workspace.workspaceRoot,
-            stableLabel: "workspace-\(context.workspace.runID.uuidString)"
-        )
-        let artifactRootAlias = aliasURLIfNeeded(
-            for: context.workspace.artifactRoot,
-            stableLabel: "artifacts-\(context.workspace.runID.uuidString)"
-        )
-        let worktreeRootAlias = context.workspace.worktreeRoot.flatMap {
-            aliasURLIfNeeded(for: $0, stableLabel: "worktree-\(context.workspace.runID.uuidString)")
-        }
-        return ExecutionPathAliases(
-            workspaceRootAlias: workspaceRootAlias,
-            artifactRootAlias: artifactRootAlias,
-            worktreeRootAlias: worktreeRootAlias
-        )
-    }
-
-    private static func aliasURLIfNeeded(for url: URL, stableLabel: String) -> URL? {
-        let standardized = url.standardizedFileURL
-        guard standardized.path.contains(" ") else { return nil }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("chainworks-exec-aliases", isDirectory: true)
-        let aliasURL = root.appendingPathComponent(stableLabel, isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: aliasURL.path) {
-                let destination = try FileManager.default.destinationOfSymbolicLink(atPath: aliasURL.path)
-                if destination == standardized.path {
-                    return aliasURL
-                }
-                try FileManager.default.removeItem(at: aliasURL)
-            }
-            try FileManager.default.createSymbolicLink(atPath: aliasURL.path, withDestinationPath: standardized.path)
-            return aliasURL
-        } catch {
-            ForgeLogger.bridge.info("Failed to prepare execution path alias for \(standardized.path): \(error.localizedDescription)")
-            return nil
-        }
     }
 
     private static func buildLazyArtifactAttachmentContent(pointer: ArtifactPointer) -> String {
@@ -1083,12 +967,6 @@ struct ExecutionPacket: Sendable {
     let systemPrompt: String
     let taskDirective: String
     let contextAttachments: [RuntimeContextAttachment]
-}
-
-struct ExecutionPathAliases: Sendable {
-    let workspaceRootAlias: URL?
-    let artifactRootAlias: URL?
-    let worktreeRootAlias: URL?
 }
 
 // MARK: - RuntimeSessionExecution

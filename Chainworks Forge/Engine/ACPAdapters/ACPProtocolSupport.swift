@@ -75,6 +75,21 @@ enum ACPProtocolSupport {
         return nil
     }
 
+    static func unsupportedRequestResponse(
+        requestID: Any?,
+        method: String
+    ) -> [String: Any]? {
+        guard let requestID else { return nil }
+        return [
+            "jsonrpc": "2.0",
+            "id": requestID,
+            "error": [
+                "code": -32601,
+                "message": "Unsupported ACP client request: \(method)"
+            ]
+        ]
+    }
+
     static func stripANSIEscapeCodes(from text: String) -> String {
         let pattern = #"\u001B\[[0-9;]*[ -/]*[@-~]"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else {

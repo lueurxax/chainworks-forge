@@ -120,6 +120,21 @@ actor AgentSessionManager {
         guard let lineage = try genContext.fetch(FetchDescriptor<AgentSessionLineage>(predicate: predicate)).first else {
             throw NSError(domain: "AgentSessionManager", code: 404, userInfo: [NSLocalizedDescriptionKey: "Lineage not found"])
         }
+
+        if let activeGenerationID = lineage.activeGenerationID,
+           let previousActiveGeneration = lineage.generations.first(where: { $0.id == activeGenerationID && $0.status == .active }) {
+            previousActiveGeneration.status = .invalidated
+            previousActiveGeneration.endedAt = Date()
+            previousActiveGeneration.endReason = "Superseded by new generation"
+
+            let event = AgentSessionEvent(
+                generationID: previousActiveGeneration.id,
+                eventType: .invalidated,
+                detailsJSON: nil
+            )
+            event.lineage = lineage
+            genContext.insert(event)
+        }
         
         let generationCount = lineage.generations.count + 1
         let generation = AgentSessionGeneration(

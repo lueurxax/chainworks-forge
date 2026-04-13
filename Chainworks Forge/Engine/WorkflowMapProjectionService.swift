@@ -1,6 +1,14 @@
 import Foundation
 import SwiftData
 
+struct WorkflowMapCurrentStageSummary: Sendable {
+    let stageID: String
+    let label: String
+    let iteration: Int?
+    let attemptNumber: Int?
+    let status: StageStatus?
+}
+
 @MainActor
 final class WorkflowMapProjectionService {
     private struct PlanCacheKey: Hashable {
@@ -33,6 +41,38 @@ final class WorkflowMapProjectionService {
             for: run,
             latestPersistedStage: latestPersistedStage,
             liveTimeline: liveTimeline
+        )
+    }
+
+    func currentStageSummary(for run: Run) -> WorkflowMapCurrentStageSummary? {
+        let latestPersistedStage = RunLatestStageStatusLoader.load(for: run, modelContext: modelContext)
+        let liveTimeline = executionService.peekOrchestrator(for: run.id)?.liveTimeline ?? []
+        guard let stageID = deriveCurrentStageID(
+            for: run,
+            latestPersistedStage: latestPersistedStage,
+            liveTimeline: liveTimeline
+        ) else {
+            return nil
+        }
+
+        let cachedPlan = cachedPlanEntry(for: run)
+        let label = cachedPlan?.plan.states[stageID]?.label
+            ?? latestPersistedStage?.label
+            ?? run.cursorDerivedStageLabel
+
+        let cursor = run.transitionCursor
+        let cursorOwnsCurrentStage = cursor?.nextScheduledStateID == stageID
+
+        return WorkflowMapCurrentStageSummary(
+            stageID: stageID,
+            label: label.isEmpty ? stageID : label,
+            iteration: cursorOwnsCurrentStage
+                ? cursor?.nextScheduledIteration ?? latestPersistedStage?.iteration
+                : latestPersistedStage?.iteration,
+            attemptNumber: cursorOwnsCurrentStage
+                ? cursor?.nextScheduledAttemptNumber ?? latestPersistedStage?.attemptNumber
+                : latestPersistedStage?.attemptNumber,
+            status: latestPersistedStage?.stageID == stageID ? latestPersistedStage?.status : nil
         )
     }
 
@@ -173,6 +213,41 @@ final class WorkflowMapProjectionService {
             ?? sorted.last(where: { $0.status == .completed })?.stageID
     }
 
+    private func deriveCurrentStageID(
+        for run: Run,
+        latestPersistedStage: RunLatestStageStatusSnapshot?,
+        liveTimeline: [LiveExecutionTimelineEntry]
+    ) -> String? {
+        if let liveRetryStageID = latestLiveRetryStageIDIfNewerThanPersistedTerminalState(
+            run: run,
+            latestPersistedStage: latestPersistedStage,
+            liveTimeline: liveTimeline
+        ) {
+            return liveRetryStageID
+        }
+
+        if let cursor = run.transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled, .transitionStarted:
+                if let nextState = cursor.nextScheduledStateID {
+                    return nextState
+                }
+            case .terminal:
+                if let lastCompleted = cursor.lastCompletedStateID {
+                    return lastCompleted
+                }
+            case .awaitingFirstState:
+                break
+            }
+        }
+
+        if let latestPersistedStage, latestPersistedStage.status != .completed, latestPersistedStage.status != .skipped {
+            return latestPersistedStage.stageID
+        }
+
+        return latestPersistedStage?.stageID
+    }
+
     private func deriveRunStatus(
         for run: Run,
         persistedStages: [RunStageSnapshot],
@@ -239,7 +314,7 @@ final class WorkflowMapProjectionService {
         }
 
         if hasLiveRetryActivityNewerThanPersistedTerminalState(
-            persistedStageStartedAt: latestPersistedStage.map(\.startedAt),
+            persistedStageStartedAt: latestPersistedStage.map { $0.completedAt ?? $0.startedAt },
             liveTimeline: liveTimeline
         ) {
             return .running
@@ -339,7 +414,7 @@ final class WorkflowMapProjectionService {
                 }
                 return lhs.event.timestamp < rhs.event.timestamp
             }),
-            latestLiveEntry.event.timestamp > latestPersistedStage.startedAt
+            latestLiveEntry.event.timestamp > (latestPersistedStage.completedAt ?? latestPersistedStage.startedAt)
         else {
             return nil
         }

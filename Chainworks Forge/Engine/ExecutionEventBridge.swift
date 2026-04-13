@@ -118,6 +118,7 @@ final class ExecutionEventBridge: @unchecked Sendable {
         onEvent: @Sendable @escaping (ExecutionEvent) -> Void
     ) async throws -> ExecutionStreamResult {
         var finalContent: String?
+        var sawSessionClosed = false
 
         for try await event in stream {
             let appEvent = mapToAppEvent(event)
@@ -193,6 +194,8 @@ final class ExecutionEventBridge: @unchecked Sendable {
                 }
             case .error(let message):
                 throw ExecutionEventBridgeError.streamFailed(message: message)
+            case .sessionClosed:
+                sawSessionClosed = true
             case .unknown(let type, let data):
                 if type == "usage_update" {
                     withLock {
@@ -211,7 +214,8 @@ final class ExecutionEventBridge: @unchecked Sendable {
             toolCalls: toolCalls,
             succeeded: hasFinalOutput,
             finishReason: finishReason,
-            finishRaw: finishRaw
+            finishRaw: finishRaw,
+            sawSessionClosed: sawSessionClosed
         )
     }
 
@@ -569,6 +573,7 @@ struct ExecutionStreamResult: Sendable {
     let succeeded: Bool
     let finishReason: String?
     let finishRaw: String?
+    let sawSessionClosed: Bool
 }
 
 struct CodexReceiptTelemetry: Codable, Sendable, Equatable {

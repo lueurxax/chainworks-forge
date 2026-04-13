@@ -2539,28 +2539,27 @@ struct WorkflowRunProgressView: View {
         orchestrator?.liveTimeline.reversed() ?? []
     }
 
-    private var workflowMapProjection: WorkflowMapProjection? {
-        let service = WorkflowMapProjectionService(
+    private var workflowMapProjectionService: WorkflowMapProjectionService {
+        WorkflowMapProjectionService(
             modelContext: modelContext,
             executionService: executionService
         )
-        return service.projection(for: run)
+    }
+
+    private var workflowMapProjection: WorkflowMapProjection? {
+        workflowMapProjectionService.projection(for: run)
+    }
+
+    private var currentStageSummary: WorkflowMapCurrentStageSummary? {
+        workflowMapProjectionService.currentStageSummary(for: run)
     }
 
     private var pendingApprovalRequest: ApprovalRequest? {
         executionService.pendingApprovals.values.first { $0.runID == run.id }
     }
 
-    private var currentStageExecution: RunStageSnapshot? {
-        if let currentStageID = workflowMapProjection?.currentStageID,
-           let matchingStage = sortedStages.last(where: { $0.stageID == currentStageID }) {
-            return matchingStage
-        }
-        return sortedStages.last
-    }
-
     private var effectiveRunStatus: RunStatus {
-        workflowMapProjection?.runStatus ?? run.presentationStatus
+        workflowMapProjectionService.runStatus(for: run)
     }
 
     private var effectiveRunStatusLabel: String {
@@ -2568,7 +2567,7 @@ struct WorkflowRunProgressView: View {
     }
 
     private var effectiveCurrentStageLabel: String {
-        workflowMapProjection?.currentStageLabel ?? currentStageExecution?.label ?? run.cursorDerivedStageLabel
+        currentStageSummary?.label ?? run.cursorDerivedStageLabel
     }
 
     private var approvalContextArtifacts: [Artifact] {
@@ -2618,10 +2617,6 @@ struct WorkflowRunProgressView: View {
         }
 
         return nil
-    }
-
-    private var latestPersistedTimelineEntry: WorkflowMapPersistedTimelineEntry? {
-        workflowMapProjection?.persistedTimeline.first
     }
 
     private var latestPersistedSessionID: String? {
@@ -2777,8 +2772,8 @@ struct WorkflowRunProgressView: View {
                         color: runStatusColor,
                         size: .regular
                     )
-                    if let stage = currentStageExecution {
-                        Label(stage.label, systemImage: "square.stack.3d.up")
+                    if let currentStageSummary {
+                        Label(currentStageSummary.label, systemImage: "square.stack.3d.up")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
@@ -2827,12 +2822,10 @@ struct WorkflowRunProgressView: View {
                     .accessibilityIdentifier("open-run-in-runs-home-button")
                 }
 
-                if workflowMapProjection != nil {
-                    Button("Live Timeline", systemImage: "waveform.path.ecg") {
-                        showTimelineInspector = true
-                    }
-                    .buttonStyle(.bordered)
+                Button("Live Timeline", systemImage: "waveform.path.ecg") {
+                    showTimelineInspector = true
                 }
+                .buttonStyle(.bordered)
             }
         }
     }
@@ -2919,7 +2912,9 @@ struct WorkflowRunProgressView: View {
         ) {
             summaryMetricCard(
                 title: "Loop Iteration",
-                value: currentStageExecution.map { "\($0.iteration)" } ?? "0",
+                value: currentStageSummary.flatMap { summary in
+                    summary.iteration.map(String.init)
+                } ?? "0",
                 detail: "Current refinement/review cycle",
                 symbol: "repeat.circle"
             )
@@ -3001,7 +2996,12 @@ struct WorkflowRunProgressView: View {
             GroupBox("Progress") {
                 VStack(alignment: .leading, spacing: 8) {
                     LabeledContent("Current Stage", value: effectiveCurrentStageLabel)
-                    LabeledContent("Loop Iteration", value: currentStageExecution.map { "\($0.iteration)" } ?? "0")
+                    LabeledContent(
+                        "Loop Iteration",
+                        value: currentStageSummary.flatMap { summary in
+                            summary.iteration.map(String.init)
+                        } ?? "0"
+                    )
                     LabeledContent("Active Agents", value: "\(activeAgents.count)")
                     if activeAgents.isEmpty == false {
                         VStack(alignment: .leading, spacing: 6) {
@@ -3211,7 +3211,6 @@ struct WorkflowRunProgressView: View {
 
     private var latestMeaningfulEventText: String {
         latestLiveEvent?.event.detail
-            ?? latestPersistedTimelineEntry?.detail
             ?? latestPersistedCheckpointText
             ?? "Waiting for the next execution event"
     }

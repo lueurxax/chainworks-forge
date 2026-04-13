@@ -2927,13 +2927,21 @@ final class WorkflowOrchestrator {
             return inputs
         }
 
-        let sourceContext = try await SourceContextBuilder.build(
-            worktreeRoot: worktreeRoot,
-            repoRoot: config.repoRoot,
-            baseBranch: config.baseBranch,
-            baseRevision: run.baseRevision,
-            targetBranch: config.targetBranch
-        )
+        let sourceContext: SourceContextBuilder.SourceContext
+        do {
+            sourceContext = try await SourceContextBuilder.build(
+                worktreeRoot: worktreeRoot,
+                repoRoot: config.repoRoot,
+                baseBranch: config.baseBranch,
+                baseRevision: run.baseRevision,
+                targetBranch: config.targetBranch
+            )
+        } catch {
+            let message = "sourceContextBuildFailed stateID=\(currentStateID) task=\(task.task) agentID=\(agent.id) error=\(error.localizedDescription)"
+            RuntimeDiagnostics.log(message)
+            print(message)
+            return inputs
+        }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -3881,7 +3889,7 @@ final class WorkflowOrchestrator {
         guard task.task == "implement" || task.task == "continue_implementation" || task.task == "initial_implementation" else {
             return false
         }
-        guard let priorExecution = latestComparableExecution(for: agent, stageExecution: stageExecution) else {
+        guard let priorExecution = latestComparableExecution(for: agent, task: task, stageExecution: stageExecution) else {
             return false
         }
 
@@ -3891,8 +3899,27 @@ final class WorkflowOrchestrator {
 
     private func latestComparableExecution(
         for agent: ResolvedAgent,
+        task: AgentTask,
         stageExecution: StageExecution
     ) -> AgentExecution? {
+        let currentStageComparableExecutions = stageExecution.agentExecutions
+            .filter { candidate in
+                candidate.agentID == agent.id
+                    && candidate.taskName == task.task
+                    && candidate.completedAt != nil
+            }
+            .sorted { lhs, rhs in
+                let lhsCompleted = lhs.completedAt ?? lhs.startedAt
+                let rhsCompleted = rhs.completedAt ?? rhs.startedAt
+                if lhsCompleted == rhsCompleted {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                return lhsCompleted < rhsCompleted
+            }
+        if let latestCurrentStageExecution = currentStageComparableExecutions.last {
+            return latestCurrentStageExecution
+        }
+
         let comparableExecutions = run.stageExecutions
             .filter { candidate in
                 candidate.id != stageExecution.id
@@ -3901,6 +3928,7 @@ final class WorkflowOrchestrator {
             .flatMap(\.agentExecutions)
             .filter { candidate in
                 candidate.agentID == agent.id
+                    && candidate.taskName == task.task
                     && candidate.startedAt <= stageExecution.startedAt
             }
             .sorted { lhs, rhs in

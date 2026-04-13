@@ -63,6 +63,22 @@ private struct ApprovalResolutionDiagnostic: Codable, Sendable {
 @MainActor
 @Observable
 final class ExecutionService {
+    struct OperatorResumeSource: Sendable, CustomStringConvertible {
+        let value: String
+
+        var description: String { value }
+
+        static let runsHomeManualResume = OperatorResumeSource(value: "runs_home.manual_resume")
+
+        static func recoverySheet(_ action: String) -> OperatorResumeSource {
+            OperatorResumeSource(value: "recovery_sheet.\(action)")
+        }
+
+        static func blockedRecovery(_ action: String) -> OperatorResumeSource {
+            OperatorResumeSource(value: "blocked_recovery.\(action)")
+        }
+    }
+
     private static let stalledRunGraceInterval: TimeInterval = 30
     private static let maintenanceTickInterval: Duration = .seconds(5)
 
@@ -187,23 +203,33 @@ final class ExecutionService {
         }
     }
 
-    /// Re-attach orchestration to an existing run after an explicit recovery action created
-    /// a new ready/running execution path. This avoids leaving a run in inert `.ready`
-    /// after retry-in-place mutated SwiftData but no orchestrator was attached.
-    func resumeRun(run: Run, compiler: RunPlanCompiler) throws {
+    /// Re-attach orchestration to an existing run after an explicit operator recovery action
+    /// created a new ready/running execution path. This is intentionally operator-scoped:
+    /// startup normalization must never auto-resume blocked or interrupted runs.
+    func resumeRunFromOperatorRecovery(
+        run: Run,
+        compiler: RunPlanCompiler,
+        source: OperatorResumeSource
+    ) throws {
         guard activeOrchestrators[run.id] == nil else {
-            ForgeLogger.execution.info("resumeRun skipped: orchestrator already active for run \(run.id)")
+            ForgeLogger.execution.info(
+                "resumeRunFromOperatorRecovery skipped: orchestrator already active for run \(run.id) [source=\(source)]"
+            )
             return
         }
 
         let (plan, workspace) = try compiler.rebuildPlanFromSnapshot(run: run)
         guard let orchestrator = prepareOrchestrator(run: run, plan: plan, workspace: workspace) else {
-            ForgeLogger.execution.error("resumeRun failed: prepareOrchestrator returned nil for run \(run.id), status=\(run.status.rawValue)")
+            ForgeLogger.execution.error(
+                "resumeRunFromOperatorRecovery failed: prepareOrchestrator returned nil for run \(run.id), status=\(run.status.rawValue) [source=\(source)]"
+            )
             return
         }
 
         let resumeStateID = run.resumeContinuationStateID
-        ForgeLogger.execution.info("Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id)")
+        ForgeLogger.execution.info(
+            "Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id) [origin=operator_recovery source=\(source)]"
+        )
         prepareRunForLiveAttachment(run)
         synchronizeIdeaStatus(for: run)
 
@@ -216,7 +242,7 @@ final class ExecutionService {
 
     /// Resume interrupted runs on explicit operator action.
     /// Uses ResumeManager to classify which runs can be resumed.
-    func resumeInterruptedRuns(compiler: RunPlanCompiler) {
+    func resumeInterruptedRunsFromOperatorAction(compiler: RunPlanCompiler) {
         let resumeManager = ResumeManager(modelContext: modelContext)
 
         do {
@@ -230,6 +256,9 @@ final class ExecutionService {
 
                     let resumeStateID = run.resumeContinuationStateID
                     prepareRunForLiveAttachment(run)
+                    ForgeLogger.execution.info(
+                        "Starting orchestrator from state=\(resumeStateID ?? "nil") for run \(run.id) [origin=operator_bulk_resume source=\(OperatorResumeSource.runsHomeManualResume)]"
+                    )
                     Task { @MainActor in
                         await orchestrator.start(from: resumeStateID)
                     }
@@ -262,6 +291,11 @@ final class ExecutionService {
         guard let request = pendingApprovals[approvalID] else { return }
         let descriptor = FetchDescriptor<Run>()
         guard let run = (try? modelContext.fetch(descriptor))?.first(where: { $0.id == request.runID }) else { return }
+        guard approvalRequestStillPending(request, runs: [run]) else {
+            pendingApprovals.removeValue(forKey: approvalID)
+            refreshDockBadge()
+            return
+        }
 
         let priorApproval = run.approvals.first(where: { $0.id == approvalID || $0.stageID == request.stageID })
         let beforeDiagnostic = ApprovalResolutionDiagnostic(
@@ -638,10 +672,33 @@ final class ExecutionService {
             )
         }
 
-        pendingApprovals = rebuilt.merging(pendingApprovals) { persisted, active in
+        let activeStillPending = pendingApprovals.filter { _, request in
+            approvalRequestStillPending(request, runs: allRuns)
+        }
+
+        pendingApprovals = rebuilt.merging(activeStillPending) { persisted, active in
             active
         }
         refreshDockBadge()
+    }
+
+    private func approvalRequestStillPending(_ request: ApprovalRequest, runs: [Run]) -> Bool {
+        guard let run = runs.first(where: { $0.id == request.runID }),
+              run.status == .waitingApproval else {
+            return false
+        }
+
+        guard let stage = run.stageExecutions
+            .filter({ $0.stageID == request.stageID })
+            .sorted(by: Self.compareStageExecutions)
+            .last,
+              stage.status == .waitingApproval else {
+            return false
+        }
+
+        return run.approvals.contains {
+            $0.id == request.id && $0.stageID == request.stageID && $0.decision == .requested
+        }
     }
 
     private func reconcileStalledOrchestratorsIfNeeded(now: Date = Date()) {

@@ -991,6 +991,100 @@ struct RuntimeSessionBridgeTests {
         #expect(helperOutput == "sensitive raw audit")
     }
 
+    @Test("Packet keeps real workspace and artifact paths when workspace path contains spaces")
+    func packetKeepsRealPathsWhenWorkspacePathContainsSpaces() throws {
+        let agent = makeWriteAgent(id: "code_writer")
+        let task = AgentTask(
+            agent: "code_writer",
+            task: "continue_implementation",
+            inputs: ["implementation_plan"],
+            outputs: ["implementation_progress", "implementation_self_assessment", "changed_files_manifest", "tests_result"]
+        )
+        let runID = UUID()
+        let workspaceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bridge spaced \(runID.uuidString)", isDirectory: true)
+        let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
+        let worktreeRoot = workspaceRoot.appendingPathComponent("worktree root", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspaceRoot) }
+
+        let lazyArtifactPath = artifactRoot.appendingPathComponent("implementation_progress")
+        try Data("work in progress".utf8).write(to: lazyArtifactPath)
+        let inputArtifacts = [
+            "implementation_plan": Data("read \(lazyArtifactPath.path)".utf8),
+            "implementation_progress": Data("progress at \(lazyArtifactPath.path)".utf8)
+        ]
+
+        let stewardProfile = try #require(
+            StewardConfig.defaultConfig.contextStrategyProfiles["selective_compression_and_escalation"]
+        )
+        let strategyProfileData = try JSONEncoder().encode(stewardProfile)
+        let strategyProfile = try JSONDecoder().decode(ContextStrategyProfile.self, from: strategyProfileData)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: workspaceRoot,
+            artifactRoot: artifactRoot,
+            worktreeRoot: worktreeRoot
+        )
+
+        let handoffContext = ExecutionContext(
+            workspace: workspace,
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: inputArtifacts,
+            inputArtifactPaths: ["implementation_progress": lazyArtifactPath.path],
+            variables: [:],
+            ideaBody: "Ship the implementation",
+            providerBinding: nil
+        )
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: inputArtifacts,
+            inputArtifactPaths: ["implementation_progress": lazyArtifactPath.path],
+            variables: [:],
+            ideaBody: "Ship the implementation",
+            providerBinding: nil,
+            contextStrategyProfileID: "selective_compression_and_escalation",
+            contextStrategyProfile: strategyProfile,
+            handoffPacket: HandoffCompiler().compile(
+                profileID: "selective_compression_and_escalation",
+                profile: strategyProfile,
+                agent: agent,
+                task: task,
+                context: handoffContext
+            )
+        )
+
+        let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
+        let workspaceContext = try #require(packet.contextAttachments.first { $0.name == "workspace_context" })
+        let lazyManifest = try #require(packet.contextAttachments.first { $0.name == "lazy_evidence_manifest" })
+        let lazyAttachment = try #require(packet.contextAttachments.first { $0.name == "lazy_implementation_progress" })
+        let inlineArtifact = try #require(packet.contextAttachments.first { $0.name == "implementation_plan" })
+
+        #expect(workspaceContext.content?.contains("chainworks-exec-aliases") == false)
+        #expect(packet.taskDirective.contains("chainworks-exec-aliases") == false)
+        #expect(lazyManifest.content?.contains("chainworks-exec-aliases") == false)
+        #expect(lazyAttachment.content?.contains("chainworks-exec-aliases") == false)
+        #expect(inlineArtifact.content?.contains("chainworks-exec-aliases") == false)
+
+        #expect(workspaceContext.content?.contains(workspaceRoot.path) == true)
+        #expect(workspaceContext.content?.contains(artifactRoot.path) == true)
+        #expect(packet.taskDirective.contains(lazyArtifactPath.path))
+        #expect(lazyAttachment.content?.contains(lazyArtifactPath.path) == true)
+        #expect(inlineArtifact.content?.contains(lazyArtifactPath.path) == true)
+    }
+
     @Test("Proposal review packet requires exact JSON artifact names")
     func proposalReviewPacketRequiresExactJSONArtifactNames() {
         let agent = ResolvedAgent(
@@ -1336,6 +1430,71 @@ struct RuntimeSessionBridgeTests {
         let lastRequest = await transport.lastSessionRequest
         #expect(lastRequest?.workingDirectory == worktreeRoot.path)
         #expect(lastRequest?.executionPolicy?.workspaceMode == "read_write")
+        #expect(lastRequest?.executionPolicy?.gitOperationsAllowed == false)
+        #expect(lastRequest?.executionPolicy?.repoWritesAllowed == true)
+    }
+
+    @Test("Writable execution keeps real worktree cwd even when path contains spaces")
+    func sessionBridgeKeepsRealWorktreeCWDWhenPathContainsSpaces() async throws {
+        let transport = ObservableRuntimeTransport()
+        await transport.configure(
+            sessionResult: RuntimeSessionResponse(
+                sessionId: "bridge-worktree-spaces",
+                status: "active",
+                policyAcknowledgement: RuntimePolicyAcknowledgement(
+                    accepted: true,
+                    capabilityToken: "mock-worktree-spaces",
+                    backendPolicyVersion: "mock-v1"
+                )
+            ),
+            sessionError: nil,
+            events: []
+        )
+
+        let bridge = RuntimeSessionBridge(transport: transport)
+        let agent = makeWriteAgent()
+        let task = makeTask()
+        let runID = UUID()
+        let workspaceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bridge spaced \(runID.uuidString)", isDirectory: true)
+        let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
+        let worktreeRoot = workspaceRoot.appendingPathComponent("worktree root", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspaceRoot) }
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: workspaceRoot,
+            artifactRoot: artifactRoot,
+            worktreeRoot: worktreeRoot
+        )
+
+        let context = ExecutionContext(
+            workspace: workspace,
+            projectRoot: URL(fileURLWithPath: "/tmp/cryptosavingstracker", isDirectory: true),
+            stageID: "state_8_implementation_continued",
+            ownerExecutionLineageID: UUID(),
+            iteration: 1,
+            attemptNumber: 1,
+            inputArtifacts: [:],
+            variables: [:],
+            ideaBody: "Test idea",
+            providerBinding: nil
+        )
+
+        _ = try await bridge.executeInIsolatedSession(
+            agent: agent,
+            task: task,
+            context: context,
+            override: nil
+        )
+
+        let lastRequest = await transport.lastSessionRequest
+        #expect(lastRequest?.workingDirectory == worktreeRoot.path)
+        #expect(lastRequest?.workingDirectory?.contains("chainworks-exec-aliases") == false)
+        #expect(lastRequest?.executionPolicy?.gitOperationsAllowed == false)
+        #expect(lastRequest?.executionPolicy?.repoWritesAllowed == true)
     }
 
     @Test("Implementation-start orchestrator task includes explicit freeze-and-worktree guidance")
@@ -1468,6 +1627,9 @@ struct RuntimeSessionBridgeTests {
         #expect(packet.taskDirective.contains(backlogPath))
         #expect(packet.taskDirective.contains("Do not re-discover repository structure unless a referenced path is missing or clearly stale."))
         #expect(packet.taskDirective.contains("If a referenced path has drifted, do one brief remap and continue."))
+        #expect(packet.taskDirective.contains("Before any `apply_patch` or edit, re-read the target file from the current worktree path"))
+        #expect(packet.taskDirective.contains("Keep patches narrow. Prefer small hunks with minimal surrounding context"))
+        #expect(packet.taskDirective.contains("If `apply_patch` verification fails, do not retry the same patch blindly."))
     }
 
     @Test("Code writer packet remaps legacy project-root paths inside text artifacts to worktree root")
@@ -1548,8 +1710,8 @@ struct RuntimeSessionBridgeTests {
         )
 
         let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
-        #expect(packet.taskDirective.contains("Never use shell redirection, heredocs, `cat >`, or direct writes into the artifact root"))
-        #expect(packet.taskDirective.contains("Only return required outputs via the final CHAINWORKS_OUTPUT envelope"))
+        #expect(packet.systemPrompt.contains("Never use shell redirection, heredocs, `cat >`, or direct writes into the artifact root"))
+        #expect(packet.systemPrompt.contains("return required outputs via the final CHAINWORKS_OUTPUT envelope"))
     }
 
     // MARK: - LiveExecutionOverride Tests

@@ -30,4 +30,9 @@ struct Chainworks_ForgeAppTests {
         #expect(Chainworks_ForgeApp.requiresSharedModelContainer(for: surface))
         #expect(Chainworks_ForgeApp.shouldCreateFallbackWindow(for: surface))
     }
+
+    @Test("Unit-test host suppresses the main window scene")
+    func unitTestHostSuppressesMainWindowScene() {
+        #expect(Chainworks_ForgeApp.shouldSuppressUnitTestHostWindows)
+    }
 }

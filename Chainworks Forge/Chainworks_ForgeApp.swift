@@ -181,13 +181,13 @@ struct Chainworks_ForgeApp: App {
 
     @NSApplicationDelegateAdaptor(AutomationFallbackAppDelegate.self) private var automationFallbackAppDelegate
 
-    /// Disable macOS window/scene restoration when running under UI tests.
-    /// Without this, `WindowGroup` restores the previous session's window,
-    /// creating two overlapping windows that cause XCUITest element queries
-    /// to find (and click) elements hidden behind the wrong window — leading
-    /// to indefinite hangs.
+    /// Disable macOS window/scene restoration for the app.
+    /// Trace 3 showed AppKit persistent UI flush/snapshot work on the main thread
+    /// (`NSPersistentUIManager` / `NSPersistentUIWindowSnapshotter`) during
+    /// otherwise normal interaction. Chainworks Forge is a single-window tool and
+    /// does not rely on saved-window restoration, so fail closed and keep it off.
     init() {
-        if Self.isUIAutomationHost || ProcessInfo.processInfo.environment["CHAINWORKS_IN_MEMORY_STORE"] == "1" {
+        if Self.shouldDisableWindowRestoration {
             UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
             UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
             Self.clearSavedWindowState()
@@ -212,6 +212,9 @@ struct Chainworks_ForgeApp: App {
 }
 
 extension Chainworks_ForgeApp {
+    static var shouldDisableWindowRestoration: Bool { true }
+    static var shouldSuppressUnitTestHostWindows: Bool { isUnitTestHost }
+
     static func forcedUISurface(from environment: [String: String]) -> ContentView.UISurface? {
         environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
             .flatMap(ContentView.UISurface.init(rawValue:))
@@ -250,6 +253,25 @@ final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Chainworks_ForgeApp.shouldSuppressUnitTestHostWindows {
+            #if os(macOS)
+            NSApp.setActivationPolicy(.prohibited)
+            Task { @MainActor in
+                let delays: [Duration] = [.zero, .milliseconds(100), .milliseconds(350), .milliseconds(750)]
+                for delay in delays {
+                    if delay != .zero {
+                        try? await Task.sleep(for: delay)
+                    }
+                    for window in NSApp.windows {
+                        window.orderOut(nil)
+                        window.close()
+                    }
+                }
+            }
+            #endif
+            return
+        }
+
         guard Chainworks_ForgeApp.isUIAutomationHost else { return }
         let forcedUISurface = Chainworks_ForgeApp.forcedUISurface(from: Chainworks_ForgeApp.processEnvironment)
         let directSurfaceRequested = forcedUISurface != nil

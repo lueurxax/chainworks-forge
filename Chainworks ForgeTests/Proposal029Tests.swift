@@ -209,7 +209,7 @@ struct Proposal029Tests {
         }
     }
 
-    @Test("CodexACPTransport prepares isolated CODEX_HOME with auth and runtime config only")
+    @Test("CodexACPTransport prepares isolated CODEX_HOME with auth and sanitized runtime config only")
     func codexTransportPreparesIsolatedRuntimeHome() throws {
         let fileManager = FileManager.default
         let tempRoot = fileManager.temporaryDirectory
@@ -223,7 +223,15 @@ struct Proposal029Tests {
         let configURL = sourceHome.appendingPathComponent("config.toml", isDirectory: false)
         let stateURL = sourceHome.appendingPathComponent("state_5.sqlite", isDirectory: false)
         try Data("{\"token\":\"abc\"}".utf8).write(to: authURL)
-        try Data("[profiles]\n".utf8).write(to: configURL)
+        try Data(
+            """
+            model = "gpt-5.3-codex-spark"
+            model_reasoning_effort = "xhigh"
+            personality = "pragmatic"
+
+            [profiles]
+            """.utf8
+        ).write(to: configURL)
         try Data("sqlite".utf8).write(to: stateURL)
 
         let runtimeHome = try CodexACPTransport.prepareRuntimeHome(
@@ -237,6 +245,141 @@ struct Proposal029Tests {
         #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("auth.json").path))
         #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("config.toml").path))
         #expect(!fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("state_5.sqlite").path))
+        let runtimeConfig = try String(
+            contentsOf: runtimeHome.appendingPathComponent("config.toml"),
+            encoding: .utf8
+        )
+        #expect(!runtimeConfig.contains(#"model = "gpt-5.3-codex-spark""#))
+        #expect(!runtimeConfig.contains(#"model_reasoning_effort = "xhigh""#))
+        #expect(runtimeConfig.contains(#"personality = "pragmatic""#))
+    }
+
+    @Test("CodexACPTransport prepares writable cache roots for sandboxed exec tools")
+    func codexTransportPreparesWritableExecCaches() throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-caches-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let sourceHome = tempRoot.appendingPathComponent("source-home", isDirectory: true)
+        try fileManager.createDirectory(at: sourceHome, withIntermediateDirectories: true)
+        try Data("{\"token\":\"abc\"}".utf8).write(to: sourceHome.appendingPathComponent("auth.json"))
+
+        let runtimeHome = try CodexACPTransport.prepareRuntimeHome(
+            workingDirectory: "/tmp/work",
+            fileManager: fileManager,
+            environment: ["CODEX_HOME": sourceHome.path],
+            tempRootURL: tempRoot
+        )
+        defer { CodexACPTransport.cleanupRuntimeHomeIfPresent(runtimeHome, fileManager: fileManager) }
+
+        let expectedPaths = [
+            runtimeHome.appendingPathComponent("Library/org.swift.swiftpm/configuration", isDirectory: true),
+            runtimeHome.appendingPathComponent("Library/org.swift.swiftpm/security", isDirectory: true),
+            runtimeHome.appendingPathComponent("Library/Caches/org.swift.swiftpm", isDirectory: true),
+            runtimeHome.appendingPathComponent(".cache/clang/ModuleCache", isDirectory: true),
+            runtimeHome.appendingPathComponent("tmp", isDirectory: true)
+        ]
+
+        for path in expectedPaths {
+            #expect(fileManager.fileExists(atPath: path.path), "Expected writable exec cache path at \(path.path)")
+        }
+    }
+
+    @Test("CodexACPTransport injects a swift shim that disables nested SwiftPM sandboxing")
+    func codexTransportInjectsSwiftSandboxShim() async throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-swift-shim-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let sourceHome = tempRoot.appendingPathComponent("source-home", isDirectory: true)
+        try fileManager.createDirectory(at: sourceHome, withIntermediateDirectories: true)
+        try Data("{\"token\":\"abc\"}".utf8).write(to: sourceHome.appendingPathComponent("auth.json"))
+
+        let envDumpURL = tempRoot.appendingPathComponent("env.json", isDirectory: false)
+        let fakeCodexURL = tempRoot.appendingPathComponent("fake-codex-acp.py", isDirectory: false)
+        let script = """
+#!/usr/bin/env python3
+import json
+import os
+import sys
+
+with open(\(String(reflecting: envDumpURL.path)), "w", encoding="utf-8") as fh:
+    json.dump({"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}, fh)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    mid = req.get("method")
+    if mid == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":1}}), flush=True)
+    elif mid == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":{"sessionId":"fake-session"}}), flush=True)
+    elif mid == "session/close":
+        print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":{}}), flush=True)
+        sys.exit(0)
+"""
+        try script.write(to: fakeCodexURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodexURL.path)
+
+        let transport = CodexACPTransport(executablePath: fakeCodexURL.path)
+        let session = try await transport.createSession(request: RuntimeSessionRequest(
+            systemPrompt: "test",
+            workingDirectory: tempRoot.path,
+            model: "gpt-5",
+            provider: nil,
+            executionPolicy: nil,
+            metadata: nil,
+            requestedExtensions: nil
+        ))
+        defer {
+            Task {
+                try? await transport.closeSession(sessionID: session.sessionId)
+            }
+        }
+
+        let envDumpData = try Data(contentsOf: envDumpURL)
+        let envDump = try JSONSerialization.jsonObject(with: envDumpData) as? [String: String]
+        let pathValue = try #require(envDump?["PATH"])
+        let homeValue = try #require(envDump?["HOME"])
+
+        let firstPathComponent = pathValue.split(separator: ":").first.map(String.init)
+        let shimDirectory = try #require(firstPathComponent)
+        let shimPath = URL(fileURLWithPath: shimDirectory, isDirectory: true).appendingPathComponent("swift", isDirectory: false)
+        let shimContents = try String(contentsOf: shimPath, encoding: .utf8)
+
+        #expect(homeValue.contains(".forge-codex-acp"))
+        #expect(fileManager.fileExists(atPath: shimPath.path))
+        #expect(shimContents.contains("--disable-sandbox"))
+    }
+
+    @Test("CodexACPTransport places isolated runtime home inside working directory when available")
+    func codexTransportPlacesRuntimeHomeInsideWorkingDirectory() throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-workingdir-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let sourceHome = tempRoot.appendingPathComponent("source-home", isDirectory: true)
+        let workingDirectory = tempRoot.appendingPathComponent("workspace-root", isDirectory: true)
+        try fileManager.createDirectory(at: sourceHome, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+        try Data("{\"token\":\"abc\"}".utf8).write(to: sourceHome.appendingPathComponent("auth.json"))
+
+        let runtimeHome = try CodexACPTransport.prepareRuntimeHome(
+            workingDirectory: workingDirectory.path,
+            fileManager: fileManager,
+            environment: ["CODEX_HOME": sourceHome.path],
+            tempRootURL: tempRoot
+        )
+        defer { CodexACPTransport.cleanupRuntimeHomeIfPresent(runtimeHome, fileManager: fileManager) }
+
+        #expect(runtimeHome.path.hasPrefix(workingDirectory.path + "/.forge-codex-acp/"))
+        #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent(".cache/clang/ModuleCache").path))
+        #expect(fileManager.fileExists(atPath: runtimeHome.appendingPathComponent("tmp").path))
     }
 
 
@@ -287,6 +430,145 @@ for line in sys.stdin:
             Issue.record("Expected silent EOF to surface as a streaming failure")
         } catch {
             #expect(error.localizedDescription.contains("ended before final result"))
+        }
+    }
+
+    @Test("CodexACPTransport auto-grants ACP permission requests during prompt execution")
+    func codexTransportAutoGrantsPermissionRequests() async throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-permission-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let scriptURL = tempRoot.appendingPathComponent("fake-codex-acp.py")
+        let script = """
+#!/usr/bin/env python3
+import json, sys
+prompt_request_id = None
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"sessionId": "permission-session"}}), flush=True)
+    elif method == "session/prompt":
+        prompt_request_id = req["id"]
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": 9001,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {"name": "execute"},
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once"},
+                    {"optionId": "reject_once", "kind": "reject_once"}
+                ]
+            }
+        }), flush=True)
+    elif req.get("id") == 9001:
+        outcome = (req.get("result") or {}).get("outcome") or {}
+        if outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow_once":
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": prompt_request_id,
+                "result": {"stopReason": "end_turn"}
+            }), flush=True)
+            sys.exit(0)
+        sys.exit(2)
+"""
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let transport = CodexACPTransport(executablePath: scriptURL.path)
+        let session = try await transport.createSession(request: RuntimeSessionRequest(
+            systemPrompt: "test",
+            workingDirectory: tempRoot.path,
+            model: "gpt-5",
+            provider: nil,
+            executionPolicy: nil,
+            metadata: nil,
+            requestedExtensions: nil
+        ))
+
+        let stream = transport.submitPrompt(
+            sessionID: session.sessionId,
+            prompt: RuntimePromptRequest(content: "hello", context: nil)
+        )
+
+        var sawPermission = false
+        var sawFinish = false
+        for try await event in stream {
+            switch event {
+            case .toolCallStarted(let toolName, _):
+                if toolName == "permission:execute" {
+                    sawPermission = true
+                }
+            case .finish:
+                sawFinish = true
+            default:
+                break
+            }
+        }
+
+        #expect(sawPermission)
+        #expect(sawFinish)
+    }
+
+    @Test("CodexACPTransport fails fast on unsupported provider requests instead of hanging until watchdog timeout")
+    func codexTransportFailsFastOnUnsupportedProviderRequests() async throws {
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("p029-codex-unsupported-request-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let scriptURL = tempRoot.appendingPathComponent("fake-codex-acp.py")
+        let script = """
+#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"sessionId": "unsupported-request-session"}}), flush=True)
+    elif method == "session/prompt":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": 777,
+            "method": "session/request_input",
+            "params": {"prompt": "need more input"}
+        }), flush=True)
+    elif req.get("id") == 777:
+        sys.exit(0)
+"""
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let transport = CodexACPTransport(executablePath: scriptURL.path)
+        let session = try await transport.createSession(request: RuntimeSessionRequest(
+            systemPrompt: "test",
+            workingDirectory: tempRoot.path,
+            model: "gpt-5",
+            provider: nil,
+            executionPolicy: nil,
+            metadata: nil,
+            requestedExtensions: nil
+        ))
+
+        let stream = transport.submitPrompt(
+            sessionID: session.sessionId,
+            prompt: RuntimePromptRequest(content: "hello", context: nil)
+        )
+
+        do {
+            for try await _ in stream {}
+            Issue.record("Expected unsupported provider request to fail fast")
+        } catch {
+            #expect(error.localizedDescription.contains("Unsupported Codex ACP client request"))
         }
     }
 

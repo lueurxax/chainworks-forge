@@ -96,6 +96,34 @@ struct WorkflowMapProjectionTests {
         #expect(RunLatestStageStatusLoader.loadInvocationCountForTesting == 1)
     }
 
+    @Test("Lightweight current stage summary avoids full stage snapshot loading")
+    mutating func lightweightCurrentStageSummaryAvoidsFullSnapshotLoading() throws {
+        let container = PreviewSupport.makeModelContainer(seed: { context in
+            PreviewSupport.seedWorkflowMapPreviewData(context: context)
+        })
+        let executionService = PreviewSupport.makeExecutionService(modelContext: container.mainContext)
+        let service = WorkflowMapProjectionService(
+            modelContext: container.mainContext,
+            executionService: executionService
+        )
+
+        let descriptor = FetchDescriptor<Run>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
+        let run = try #require(container.mainContext.fetch(descriptor).first)
+
+        RunStageSnapshotLoader.resetLoadInvocationCountForTesting()
+        RunStageSnapshotLoader.resetCacheForTesting()
+        RunLatestStageStatusLoader.resetLoadInvocationCountForTesting()
+        RunLatestStageStatusLoader.resetCacheForTesting()
+
+        let summary = service.currentStageSummary(for: run)
+
+        #expect(summary != nil)
+        #expect(summary?.stageID.isEmpty == false)
+        #expect(summary?.label.isEmpty == false)
+        #expect(RunStageSnapshotLoader.loadInvocationCountForTesting == 0)
+        #expect(RunLatestStageStatusLoader.loadInvocationCountForTesting == 1)
+    }
+
     @Test("Projection run status prefers stored blocked truth over stale running stage without live retry")
     mutating func projectionRunStatusPrefersStoredBlockedTruthOverStaleRunningStage() throws {
         let context = try makeTestModelContext()

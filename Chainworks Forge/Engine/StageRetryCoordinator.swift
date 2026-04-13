@@ -106,8 +106,16 @@ final class StageRetryCoordinator {
             throw StageRetryError.stageNotFailed(stage.stageID)
         }
 
+        let now = Date()
+
         // Mark old stage as terminal
-        stage.completedAt = stage.completedAt ?? Date()
+        stage.completedAt = stage.completedAt ?? now
+        supersedeActiveAttempts(
+            in: run,
+            for: stage,
+            terminalStatus: stage.status == .failed ? .failed : .blocked,
+            now: now
+        )
 
         // Create new stage execution with incremented attempt
         let newStage = StageExecution(
@@ -126,6 +134,7 @@ final class StageRetryCoordinator {
 
         // Update run status
         run.status = .ready
+        rebindContinuationCursor(run: run, retryStage: newStage, previousCursor: run.transitionCursor, now: now)
 
         return newStage
     }
@@ -225,6 +234,75 @@ final class StageRetryCoordinator {
             validationFailureID: validationFailure?.id,
             source: .runtimePolicy
         )
+    }
+}
+
+// MARK: - Stage Retry Helpers
+
+@MainActor
+private extension StageRetryCoordinator {
+    func supersedeActiveAttempts(
+        in run: Run,
+        for supersededStage: StageExecution,
+        terminalStatus: StageStatus,
+        now: Date
+    ) {
+        let activeStatuses: Set<StageStatus> = [.pending, .ready, .running]
+        let activeAgentStatuses: Set<AgentStatus> = [.pending, .ready, .running]
+
+        let conflictingAttempts = run.stageExecutions.filter { candidate in
+            candidate.id != supersededStage.id
+                && candidate.stageID == supersededStage.stageID
+                && candidate.iteration == supersededStage.iteration
+                && activeStatuses.contains(candidate.status)
+        }
+
+        for conflictingStage in conflictingAttempts {
+            conflictingStage.status = terminalStatus
+            conflictingStage.completedAt = conflictingStage.completedAt ?? now
+
+            for agent in conflictingStage.agentExecutions where activeAgentStatuses.contains(agent.status) {
+                agent.status = .failed
+                agent.completedAt = agent.completedAt ?? now
+                agent.settledAt = agent.settledAt ?? now
+                agent.canonicalOutcome = agent.canonicalOutcome ?? .failedBeforeOutput
+                agent.transportErrorKind = agent.transportErrorKind ?? .unknown
+                agent.providerStopReason = agent.providerStopReason ?? "superseded_by_stage_retry"
+                agent.logSnippet = mergedSupersededExecutionLog(existing: agent.logSnippet)
+            }
+        }
+    }
+
+    func rebindContinuationCursor(
+        run: Run,
+        retryStage: StageExecution,
+        previousCursor: TransitionCursor?,
+        now: Date
+    ) {
+        let cursor = previousCursor ?? .initial()
+        let rebound = TransitionCursor(
+            sequenceNumber: cursor.sequenceNumber + 1,
+            lastCompletedStateID: cursor.lastCompletedStateID,
+            lastCompletedStageExecutionID: cursor.lastCompletedStageExecutionID,
+            nextScheduledStateID: retryStage.stageID,
+            nextScheduledIteration: retryStage.iteration,
+            nextScheduledAttemptNumber: retryStage.attemptNumber,
+            scheduledStageExecutionID: retryStage.id,
+            settlementPhase: .transitionSettled,
+            updatedAt: now
+        )
+        run.persistTransitionCursor(rebound)
+    }
+
+    func mergedSupersededExecutionLog(existing: String?) -> String {
+        let message = "Superseded by stage retry before completion."
+        guard let existing, existing.isEmpty == false else {
+            return message
+        }
+        if existing.contains(message) {
+            return existing
+        }
+        return "\(existing)\n\(message)"
     }
 }
 
