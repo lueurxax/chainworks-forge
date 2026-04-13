@@ -28,6 +28,10 @@ Historical reference material that is no longer part of the canonical runtime ar
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
 
+## Control Plane
+
+- [rust-control-plane.md](rust-control-plane.md) -- Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration
+
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification

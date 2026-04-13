@@ -395,7 +395,7 @@ Command:
 Important:
 
 - the artifact content rendering slice (formerly `proposal-027`) has been moved to `proposal-027r`
-- the stable documentation source of truth for the Rust control-plane is `docs/proposals/027-rust-sqlite-local-control-plane-extraction.md`
+- the stable documentation source of truth for the Rust control-plane is [rust-control-plane.md](rust-control-plane.md)
 
 ### `proposal-027r`
 
