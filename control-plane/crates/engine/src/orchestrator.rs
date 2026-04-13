@@ -265,7 +265,7 @@ impl Orchestrator {
 
         if state.tasks.is_empty() {
             // No tasks defined — run the owner agent as a single task
-            let prompt = build_task_prompt_for_owner(state);
+            let prompt = build_task_prompt_for_owner(state, &plan, run);
             self.enqueue_invoke_agent(run_id, &stage, &state.owner, &prompt, 0, 1).await?;
         } else {
             // Fan-out: enqueue one InvokeAgent per task.
@@ -273,7 +273,7 @@ impl Orchestrator {
             // All tasks are enqueued at once — the executor picks them up.
             let total = state.tasks.len();
             for (i, task) in state.tasks.iter().enumerate() {
-                let prompt = build_task_prompt(task);
+                let prompt = build_task_prompt(task, &plan, run);
                 info!(
                     run_id = %run_id,
                     task = %task.task_name,
@@ -871,26 +871,106 @@ fn to_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-/// Build prompt for a specific task (agent-level prompt + task name).
-fn build_task_prompt(task: &workflow::plan::CompiledTask) -> String {
-    let agent_prompt = task.agent.prompt.as_deref().unwrap_or("");
-    let task_desc = format!("Execute task: {}", task.task_name);
-    if agent_prompt.is_empty() {
-        task_desc
-    } else {
-        format!("## System Instructions\n{agent_prompt}\n\n---\n\n{task_desc}")
+/// Build prompt for a specific task. Mirrors Swift `RuntimeSessionBridge.buildTaskDirective`:
+/// - Agent system prompt
+/// - Task name
+/// - Input artifacts with resolved filesystem paths
+/// - Required outputs with resolved target paths (so the agent writes directly to canonical locations)
+/// - Workspace root
+/// - Boundaries (no shell redirection into artifact_root; use explicit absolute paths)
+fn build_task_prompt(
+    task: &workflow::plan::CompiledTask,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let agent_prompt = task.agent.prompt.as_deref().unwrap_or("").trim();
+    if !agent_prompt.is_empty() {
+        parts.push(format!("## System Instructions\n{agent_prompt}"));
+        parts.push(String::from("---"));
     }
+
+    parts.push(format!("## Task: {}", task.task_name));
+    parts.push(format!("Workspace root: {}", run.workspace_root));
+
+    // Input artifacts with resolved paths
+    if !task.inputs.is_empty() {
+        parts.push(String::from("\n### Input Artifacts"));
+        for input_name in &task.inputs {
+            if let Some(template) = plan.artifact_paths.get(input_name) {
+                let resolved = resolve_path_template(template, &run.workspace_root);
+                parts.push(format!("- `{input_name}` → `{resolved}`"));
+            } else {
+                parts.push(format!("- `{input_name}` (path not defined in catalog)"));
+            }
+        }
+    }
+
+    // Required outputs with resolved target paths — agent must write here
+    if !task.outputs.is_empty() {
+        parts.push(String::from("\n### Required Outputs"));
+        parts.push(String::from(
+            "Write each output to its canonical path below. \
+             Create parent directories if missing.",
+        ));
+        for output_name in &task.outputs {
+            if let Some(template) = plan.artifact_paths.get(output_name) {
+                let resolved = resolve_path_template(template, &run.workspace_root);
+                parts.push(format!("- `{output_name}` → `{resolved}`"));
+            } else {
+                parts.push(format!("- `{output_name}` (path not defined in catalog)"));
+            }
+        }
+    }
+
+    // Boundaries (subset of Swift's buildBoundaryBlock)
+    parts.push(String::from("\n### Boundaries"));
+    parts.push(String::from(
+        "- Use explicit absolute paths from the workspace root above.\n\
+         - Write required outputs to the canonical paths listed in Required Outputs.\n\
+         - Do not rely on implicit working directory.\n\
+         - Do not perform git operations unless the task explicitly requests them.",
+    ));
+
+    parts.join("\n")
 }
 
 /// Build prompt for the owner agent when no explicit tasks are defined.
-fn build_task_prompt_for_owner(state: &workflow::plan::CompiledState) -> String {
-    let agent_prompt = state.owner.prompt.as_deref().unwrap_or("");
-    let task_context = format!("Execute state '{}' (label: {}).", state.id, state.label);
-    if agent_prompt.is_empty() {
-        task_context
-    } else {
-        format!("## System Instructions\n{agent_prompt}\n\n---\n\n{task_context}")
+fn build_task_prompt_for_owner(
+    state: &workflow::plan::CompiledState,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let agent_prompt = state.owner.prompt.as_deref().unwrap_or("").trim();
+    if !agent_prompt.is_empty() {
+        parts.push(format!("## System Instructions\n{agent_prompt}"));
+        parts.push(String::from("---"));
     }
+
+    parts.push(format!("## State: {} — {}", state.id, state.label));
+    parts.push(format!("Workspace root: {}", run.workspace_root));
+
+    if !plan.artifact_paths.is_empty() {
+        parts.push(String::from("\n### Available Artifact Paths"));
+        parts.push(String::from(
+            "Reference these when producing outputs (write to canonical paths):",
+        ));
+        for (name, template) in plan.artifact_paths.iter().take(15) {
+            let resolved = resolve_path_template(template, &run.workspace_root);
+            parts.push(format!("- `{name}` → `{resolved}`"));
+        }
+        if plan.artifact_paths.len() > 15 {
+            parts.push(format!(
+                "...and {} more",
+                plan.artifact_paths.len() - 15
+            ));
+        }
+    }
+
+    parts.join("\n")
 }
 
 pub fn resolve_path_template(template: &str, workspace_root: &str) -> String {
