@@ -1,8 +1,9 @@
 use db::pool::create_pool;
-use db::repos::{artifacts, ideas, projections, runs, stages};
+use db::repos::{approvals, artifacts, ideas, projections, runs, stages};
+use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::idea::{Idea, IdeaStatus};
-use domain::ids::{ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::ids::{ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use chrono::Utc;
@@ -556,3 +557,159 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
     assert_eq!(row.completed_stages, 0);
     assert_eq!(row.failed_stages, 0);
 }
+
+/// R7 bar: executed approval_inbox projection-vs-canonical parity.
+/// Proves list_pending_inbox_projection() equals filtering canonical approvals
+/// repo by decision ∈ {Pending, Requested}.
+#[tokio::test]
+async fn test_approval_inbox_projection_parity_vs_canonical() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Approval parity idea".into(),
+            body: "body".into(),
+            workspace_root_path: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-approval-parity".into(),
+            workflow_title: "Approval Parity".into(),
+            workspace_root: "/tmp/ap".into(),
+            artifact_root: "/tmp/ap/art".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Insert approvals with ALL decision types so the projection filter
+    // has a real job to do.
+    let now = Utc::now();
+    let specs: &[(&str, ApprovalDecision)] = &[
+        ("gate_pending", ApprovalDecision::Pending),
+        ("gate_requested", ApprovalDecision::Requested),
+        ("gate_granted", ApprovalDecision::Granted),
+        ("gate_rejected", ApprovalDecision::Rejected),
+        ("gate_expired", ApprovalDecision::Expired),
+    ];
+    for (stage_id, decision) in specs {
+        let a = Approval {
+            id: ApprovalId::new(),
+            run_id,
+            stage_id: (*stage_id).to_string(),
+            decision: decision.clone(),
+            requested_at: now,
+            decided_at: if matches!(
+                decision,
+                ApprovalDecision::Granted | ApprovalDecision::Rejected
+            ) {
+                Some(now)
+            } else {
+                None
+            },
+            comment: None,
+            expires_at: None,
+        };
+        approvals::insert(&pool, &a).await.unwrap();
+    }
+
+    // Rebuild projections so approval_inbox reflects current canonical state.
+    projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+
+    // ── Canonical: read approvals repo directly and filter in-memory ──
+    let canonical_all = approvals::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        canonical_all.len(),
+        specs.len(),
+        "canonical repo must return all inserted approvals"
+    );
+    let mut canonical_pending: Vec<String> = canonical_all
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.decision,
+                ApprovalDecision::Pending | ApprovalDecision::Requested
+            )
+        })
+        .map(|a| a.id.to_string())
+        .collect();
+    canonical_pending.sort();
+
+    // ── Projection: read approval_inbox (projection layer) ──
+    let projection_rows = projections::list_pending_inbox_projection(&pool)
+        .await
+        .unwrap();
+    let mut projection_ids: Vec<String> =
+        projection_rows.iter().map(|r| r.id.clone()).collect();
+    projection_ids.sort();
+
+    // ── Hard parity assertion ──
+    assert_eq!(
+        projection_ids, canonical_pending,
+        "approval_inbox projection IDs must equal canonical filter: decision ∈ {{Pending, Requested}}"
+    );
+
+    // Field-level parity for each pending approval: projection decision
+    // string must equal canonical decision's string form.
+    for proj_row in &projection_rows {
+        let canonical = canonical_all
+            .iter()
+            .find(|a| a.id.to_string() == proj_row.id)
+            .expect("every projection row must have a canonical approval");
+        assert_eq!(
+            proj_row.decision,
+            canonical.decision.to_string(),
+            "projection decision must match canonical decision for approval {}",
+            proj_row.id
+        );
+        assert_eq!(
+            proj_row.stage_id, canonical.stage_id,
+            "projection stage_id must match canonical stage_id for approval {}",
+            proj_row.id
+        );
+        assert_eq!(
+            proj_row.run_id,
+            canonical.run_id.to_string(),
+            "projection run_id must match canonical run_id for approval {}",
+            proj_row.id
+        );
+    }
+
+    // Granted/Rejected/Expired approvals MUST NOT appear in the projection.
+    for approval in &canonical_all {
+        let in_projection = projection_rows.iter().any(|r| r.id == approval.id.to_string());
+        let should_be_in_projection = matches!(
+            approval.decision,
+            ApprovalDecision::Pending | ApprovalDecision::Requested
+        );
+        assert_eq!(
+            in_projection, should_be_in_projection,
+            "approval {} ({}) presence in projection mismatches canonical filter",
+            approval.id, approval.decision
+        );
+    }
+}
+

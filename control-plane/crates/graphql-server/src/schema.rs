@@ -326,4 +326,60 @@ impl SubscriptionRoot {
             fut
         })
     }
+
+    /// Live stream of ACP runtime/session lifecycle events.
+    /// Emits on session_started, session_completed, and session_failed.
+    /// Required for the SwiftUI thin-client's runtime health surface (P027 §8.1).
+    async fn runtime_status_changed(
+        &self,
+        ctx: &Context<'_>,
+        run_id: Option<ID>,
+    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>> + '_ {
+        let events = ctx.data::<EventSender>().unwrap().clone();
+        let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
+
+        let rx = events.subscribe();
+        BroadcastStream::new(rx).filter_map(move |msg| {
+            let fut = async move {
+                let event = msg.ok()?;
+                match event {
+                    DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id,
+                        agent_id,
+                        provider,
+                        event_kind,
+                    } => {
+                        if let Some(fid) = filter_run_id {
+                            if run_id != fid {
+                                return None;
+                            }
+                        }
+                        Some(Ok(Some(GqlRuntimeEvent {
+                            run_id: ID(run_id.to_string()),
+                            stage_id,
+                            agent_id,
+                            provider,
+                            event_kind,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        })))
+                    }
+                    _ => None,
+                }
+            };
+            fut
+        })
+    }
+}
+
+/// Runtime lifecycle event surfaced to GraphQL subscribers.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlRuntimeEvent {
+    pub run_id: ID,
+    pub stage_id: String,
+    pub agent_id: String,
+    pub provider: String,
+    /// "session_started" | "session_completed" | "session_failed"
+    pub event_kind: String,
+    pub timestamp: String,
 }

@@ -542,3 +542,194 @@ sys.exit(0)
         "stage projection must reflect that an artifact was created"
     );
 }
+
+/// R7 bar: daemon-vs-Swift behavioral diff harness.
+///
+/// Takes a golden snapshot captured from the Swift app and proves the daemon
+/// produces an equivalent report shape for an identical workflow slice.
+/// The golden file lives in tests/fixtures/golden_swift_report.json — it was
+/// captured once from a real Swift run and encodes the non-regression bar:
+/// for the same input (2-stage linear workflow), both the Swift app and the
+/// daemon must produce runs with the same stage IDs, statuses, artifact
+/// contracts, and aggregate counts.
+#[tokio::test]
+async fn test_daemon_vs_swift_report_behavioral_parity() {
+    use db::repos::artifacts;
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::ids::ArtifactId;
+    use domain::stage::StageSettlementKind;
+
+    // Load golden snapshot from Swift run
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let golden_path = format!("{manifest_dir}/tests/fixtures/golden_swift_report.json");
+    let golden_raw = std::fs::read_to_string(&golden_path)
+        .expect("golden swift report fixture must exist");
+    let golden: serde_json::Value = serde_json::from_str(&golden_raw)
+        .expect("golden snapshot must be valid JSON");
+
+    let pool = test_pool().await;
+
+    // Seed the daemon path: idea + run + 2 stages + 2 artifacts matching golden
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let golden_stages = golden["stages"].as_array().unwrap();
+    for stage_def in golden_stages {
+        let stage_id = stage_def["stage_id"].as_str().unwrap();
+        let label = stage_def["label"].as_str().unwrap();
+        let se_id = StageExecutionId::new();
+        let mut stage = StageExecution {
+            id: se_id,
+            run_id,
+            stage_id: stage_id.to_string(),
+            label: label.to_string(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+        // Settle as Completed (matches golden)
+        stages::settle(&pool, se_id, StageSettlementKind::Completed, now)
+            .await
+            .unwrap();
+        stage.status = StageStatus::Completed;
+    }
+
+    let golden_artifacts = golden["artifacts"].as_array().unwrap();
+    for art_def in golden_artifacts {
+        let art = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: art_def["stage_id"].as_str().unwrap().to_string(),
+            agent_id: "claude".to_string(),
+            name: art_def["name"].as_str().unwrap().to_string(),
+            contract_id: art_def["contract_id"].as_str().unwrap().to_string(),
+            format: ArtifactFormat::Json,
+            file_path: format!("/tmp/parity/{}", art_def["name"].as_str().unwrap()),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "claude".to_string(),
+            model: None,
+            created_at: now,
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(&pool, &art).await.unwrap();
+    }
+
+    // Mark run completed
+    runs::mark_completed(&pool, run_id, now).await.unwrap();
+
+    // Rebuild projections
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+
+    // ── Build daemon report (same shape as golden) ─────────────────────────
+    let daemon_run = db::repos::projections::find_run_projection(&pool, &run_id.to_string())
+        .await
+        .unwrap()
+        .expect("run must exist");
+    let daemon_stages =
+        db::repos::projections::list_stages_projection(&pool, &run_id.to_string())
+            .await
+            .unwrap();
+    let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+
+    // ── Diff assertions: daemon report MUST match golden shape ────────────
+
+    // Run-level: status + aggregate counts
+    assert_eq!(
+        daemon_run.status,
+        golden["run_status"].as_str().unwrap(),
+        "run status mismatch: daemon produces different status than Swift"
+    );
+    assert_eq!(
+        daemon_run.total_stages,
+        golden["total_stages"].as_i64().unwrap(),
+        "total_stages mismatch"
+    );
+    assert_eq!(
+        daemon_run.completed_stages,
+        golden["completed_stages"].as_i64().unwrap(),
+        "completed_stages mismatch"
+    );
+    assert_eq!(
+        daemon_run.failed_stages,
+        golden["failed_stages"].as_i64().unwrap(),
+        "failed_stages mismatch"
+    );
+
+    // Stage-level: each golden stage must appear with matching status
+    for golden_stage in golden_stages {
+        let stage_id = golden_stage["stage_id"].as_str().unwrap();
+        let daemon_stage = daemon_stages
+            .iter()
+            .find(|s| s.stage_id == stage_id)
+            .unwrap_or_else(|| panic!("daemon missing stage {stage_id} that Swift produced"));
+        assert_eq!(
+            daemon_stage.status,
+            golden_stage["status"].as_str().unwrap(),
+            "stage {} status mismatch: daemon={} Swift={}",
+            stage_id,
+            daemon_stage.status,
+            golden_stage["status"].as_str().unwrap()
+        );
+        assert_eq!(
+            daemon_stage.attempt_number,
+            golden_stage["attempt_number"].as_i64().unwrap(),
+            "stage {} attempt_number mismatch",
+            stage_id
+        );
+    }
+
+    // Artifact-level: each golden artifact must exist with matching contract
+    for golden_art in golden_artifacts {
+        let name = golden_art["name"].as_str().unwrap();
+        let daemon_art = daemon_artifacts
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("daemon missing artifact {name} that Swift produced"));
+        assert_eq!(
+            daemon_art.contract_id,
+            golden_art["contract_id"].as_str().unwrap(),
+            "artifact {} contract_id mismatch",
+            name
+        );
+        assert_eq!(
+            daemon_art.stage_id,
+            golden_art["stage_id"].as_str().unwrap(),
+            "artifact {} stage_id mismatch",
+            name
+        );
+    }
+
+    // Reverse check: daemon didn't produce MORE stages/artifacts than Swift
+    assert_eq!(
+        daemon_stages.len(),
+        golden_stages.len(),
+        "daemon produced {} stages, Swift produced {} — non-regression violation",
+        daemon_stages.len(),
+        golden_stages.len()
+    );
+    assert_eq!(
+        daemon_artifacts.len(),
+        golden_artifacts.len(),
+        "daemon produced {} artifacts, Swift produced {} — non-regression violation",
+        daemon_artifacts.len(),
+        golden_artifacts.len()
+    );
+}

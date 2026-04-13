@@ -33,4 +33,14 @@ pub enum DomainEvent {
         run_id: RunId,
         artifact_id: ArtifactId,
     },
+    /// Runtime/session lifecycle event: emitted when an ACP runtime session
+    /// starts, completes, or fails. Used by the runtime health subscription.
+    RuntimeStatusChanged {
+        run_id: RunId,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        /// "session_started" | "session_completed" | "session_failed"
+        event_kind: String,
+    },
 }

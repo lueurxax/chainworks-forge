@@ -211,7 +211,30 @@ impl BackgroundExecutor {
                     workspace_root: run.workspace_root.clone(),
                     prompt,
                 };
+                // Runtime event: session starting
+                let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
+                    run_id,
+                    stage_id: stage_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: provider.clone(),
+                    event_kind: "session_started".to_string(),
+                });
+
                 let result = self.acp.execute(req).await?;
+
+                // Runtime event: session finished (completed or failed)
+                let event_kind = match result.status {
+                    domain::agent::AgentStatus::Completed => "session_completed",
+                    domain::agent::AgentStatus::Failed => "session_failed",
+                    _ => "session_completed",
+                };
+                let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
+                    run_id,
+                    stage_id: stage_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: provider.clone(),
+                    event_kind: event_kind.to_string(),
+                });
 
                 let completed_at = chrono::Utc::now();
                 agent_executions::update_completed(
