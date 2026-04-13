@@ -28,6 +28,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         .context("loading agent catalog")?;
 
     let agent_lookup = build_agent_lookup(&cat)?;
+    let contract_lookup = build_contract_lookup(&cat);
 
     // Convert variables from serde_yaml::Value to serde_json::Value.
     let variables: HashMap<String, serde_json::Value> = wf
@@ -42,7 +43,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
 
     let mut states = HashMap::new();
     for (state_id, state_def) in &wf.states {
-        let compiled = compile_state(state_id, state_def, &agent_lookup, &variables)?;
+        let compiled = compile_state(state_id, state_def, &agent_lookup, &contract_lookup, &variables)?;
         states.insert(state_id.clone(), compiled);
     }
 
@@ -70,6 +71,57 @@ struct AgentBinding {
     model: Option<String>,
     effort: Option<String>,
     prompt: Option<String>,
+}
+
+/// Lookup from output artifact name → resolved schema.
+/// Built once per compile from the catalog's `contracts:` section by
+/// indexing each contract by its `normalized_artifact_name`.
+struct ContractLookup {
+    by_output: HashMap<String, OutputSchema>,
+}
+
+impl ContractLookup {
+    fn resolve(&self, output_name: &str) -> Option<OutputSchema> {
+        self.by_output.get(output_name).cloned()
+    }
+}
+
+fn build_contract_lookup(cat: &catalog::AgentCatalogFile) -> ContractLookup {
+    let mut by_output = HashMap::new();
+    let Some(contracts) = cat.contracts.as_ref() else {
+        return ContractLookup { by_output };
+    };
+    for (contract_id, def) in contracts.iter() {
+        if def.required_fields.is_empty() {
+            continue;
+        }
+        let schema = OutputSchema {
+            contract_id: contract_id.clone(),
+            format: def.format.clone().unwrap_or_else(|| "json".to_string()),
+            required_fields: def.required_fields.clone(),
+        };
+        // Primary key: normalized_artifact_name (stable, machine-readable).
+        if let Some(name) = &def.normalized_artifact_name {
+            by_output.insert(name.clone(), schema.clone());
+        }
+        // Fallback: strip `_v1`/`_v2` etc. from the contract name.
+        // e.g. `proposal_review_summary_v1` → `proposal_review_summary`
+        if let Some(stem) = strip_version_suffix(contract_id) {
+            by_output.entry(stem).or_insert(schema);
+        }
+    }
+    ContractLookup { by_output }
+}
+
+/// Strip a trailing `_v<N>` suffix from a contract identifier.
+fn strip_version_suffix(id: &str) -> Option<String> {
+    let idx = id.rfind("_v")?;
+    let tail = &id[idx + 2..];
+    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+        Some(id[..idx].to_string())
+    } else {
+        None
+    }
 }
 
 fn build_agent_lookup(cat: &catalog::AgentCatalogFile) -> Result<HashMap<String, AgentBinding>> {
@@ -123,17 +175,18 @@ fn compile_state(
     state_id: &str,
     state: &definition::WorkflowState,
     agents: &HashMap<String, AgentBinding>,
+    contracts: &ContractLookup,
     variables: &HashMap<String, serde_json::Value>,
 ) -> Result<CompiledState> {
     let owner = resolve_agent(&state.owner, agents)?;
 
     let tasks = state.run.as_ref()
-        .map(|rb| compile_run_block(rb, agents))
+        .map(|rb| compile_run_block(rb, agents, contracts))
         .transpose()?
         .unwrap_or_default();
 
     let post_approval_tasks = state.run_after_approval.as_ref()
-        .map(|rb| compile_run_block(rb, agents))
+        .map(|rb| compile_run_block(rb, agents, contracts))
         .transpose()?
         .unwrap_or_default();
 
@@ -198,27 +251,28 @@ fn resolve_agent(
 fn compile_run_block(
     rb: &definition::RunBlock,
     agents: &HashMap<String, AgentBinding>,
+    contracts: &ContractLookup,
 ) -> Result<Vec<CompiledTask>> {
     let mut tasks = Vec::new();
 
     // Sequential tasks
     if let Some(seq) = &rb.sequence {
         for at in seq {
-            tasks.push(compile_agent_task(at, agents, false)?);
+            tasks.push(compile_agent_task(at, agents, contracts, false)?);
         }
     }
 
     // Parallel tasks
     if let Some(par) = &rb.parallel {
         for at in par {
-            tasks.push(compile_agent_task(at, agents, true)?);
+            tasks.push(compile_agent_task(at, agents, contracts, true)?);
         }
     }
 
     // Then tasks (sequential after parallel)
     if let Some(then) = &rb.then {
         for at in then {
-            tasks.push(compile_agent_task(at, agents, false)?);
+            tasks.push(compile_agent_task(at, agents, contracts, false)?);
         }
     }
 
@@ -228,14 +282,28 @@ fn compile_run_block(
 fn compile_agent_task(
     at: &definition::AgentTask,
     agents: &HashMap<String, AgentBinding>,
+    contracts: &ContractLookup,
     parallel: bool,
 ) -> Result<CompiledTask> {
     let agent = resolve_agent(&at.agent, agents)?;
+    let outputs = at.outputs.clone().unwrap_or_default();
+
+    // Resolve output schemas: for each output, look up its contract via
+    // the normalized_artifact_name index. Agents get required-field lists
+    // in their task directive so they know what JSON structure to produce.
+    let mut output_schemas = HashMap::new();
+    for output_name in &outputs {
+        if let Some(schema) = contracts.resolve(output_name) {
+            output_schemas.insert(output_name.clone(), schema);
+        }
+    }
+
     Ok(CompiledTask {
         agent,
         task_name: at.task.clone(),
         inputs: at.inputs.clone().unwrap_or_default(),
-        outputs: at.outputs.clone().unwrap_or_default(),
+        outputs,
+        output_schemas,
         parallel,
     })
 }

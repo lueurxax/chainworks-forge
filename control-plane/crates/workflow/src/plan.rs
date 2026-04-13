@@ -56,8 +56,25 @@ pub struct CompiledTask {
     pub task_name: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// Resolved output schemas keyed by output artifact name.
+    /// Populated when the catalog `contracts:` section defines a contract
+    /// whose `normalized_artifact_name` matches the output, or when the
+    /// agent specifies an explicit `output_contract` field. Consumed by
+    /// the prompt builder to embed required field lists in task directives.
+    #[serde(default)]
+    pub output_schemas: HashMap<String, OutputSchema>,
     /// Whether this task runs in parallel with siblings.
     pub parallel: bool,
+}
+
+/// Resolved output schema from a catalog contract.
+/// Flows into the prompt builder so agents receive a "must produce JSON
+/// with these fields" directive alongside the task description.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputSchema {
+    pub contract_id: String,
+    pub format: String,
+    pub required_fields: Vec<String>,
 }
 
 /// A compiled transition with its condition string.

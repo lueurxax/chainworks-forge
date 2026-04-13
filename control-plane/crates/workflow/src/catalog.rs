@@ -15,11 +15,26 @@ pub struct AgentCatalogFile {
     pub paths: Option<HashMap<String, String>>,
     pub artifacts: Option<HashMap<String, String>>,
     pub skills: Option<serde_yaml::Value>,
-    pub contracts: Option<serde_yaml::Value>,
+    pub contracts: Option<HashMap<String, ContractDef>>,
     pub runtime_profiles: Option<HashMap<String, RuntimeProfile>>,
     pub backend_profiles: Option<HashMap<String, BackendProfile>>,
     pub permission_profiles: Option<serde_yaml::Value>,
     pub agents: Option<Vec<AgentEntry>>,
+}
+
+/// An output contract definition from the catalog's `contracts:` section.
+/// Defines the schema an agent's structured output must conform to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContractDef {
+    pub format: Option<String>,
+    pub machine_format: Option<String>,
+    pub validation_mode: Option<String>,
+    /// Stable artifact name — when an output artifact matches this,
+    /// the contract applies. Example: `proposal_review_summary`.
+    pub normalized_artifact_name: Option<String>,
+    pub raw_artifact_name: Option<String>,
+    #[serde(default)]
+    pub required_fields: Vec<String>,
 }
 
 /// A backend profile defining which ACP provider and model to use.

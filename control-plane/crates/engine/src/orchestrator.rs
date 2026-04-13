@@ -924,6 +924,37 @@ fn build_task_prompt(
         }
     }
 
+    // Output contracts — schema each output must conform to.
+    // Matches Swift RuntimeSessionBridge "Structured Output Requirements" block.
+    if !task.output_schemas.is_empty() {
+        parts.push(String::from("\n### Structured Output Requirements"));
+        parts.push(String::from(
+            "CRITICAL: Each required output file must contain exactly one \
+             top-level JSON object and nothing else.\n\
+             - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
+             - Do NOT emit markdown, prose, or companion files unless they \
+               are explicitly listed as required outputs.\n\
+             - If you want to explain your work, put the explanation inside \
+               JSON fields required by the contract.\n\
+             - Every listed field below MUST be present in the JSON, with \
+               its correct type.",
+        ));
+        // Sort for deterministic prompt output
+        let mut names: Vec<&String> = task.output_schemas.keys().collect();
+        names.sort();
+        for output_name in names {
+            let schema = &task.output_schemas[output_name];
+            parts.push(format!(
+                "\n#### `{}` → contract `{}` ({})",
+                output_name, schema.contract_id, schema.format
+            ));
+            parts.push(String::from("Required fields:"));
+            for field in &schema.required_fields {
+                parts.push(format!("- `{}`", field));
+            }
+        }
+    }
+
     // Boundaries (subset of Swift's buildBoundaryBlock)
     parts.push(String::from("\n### Boundaries"));
     parts.push(String::from(
