@@ -475,14 +475,15 @@ impl Orchestrator {
     }
 
     /// Condition evaluator for transition `when` expressions.
-    /// Matches Swift's `TransitionEvaluator` (ARCH-031 canonical patterns).
+    /// Matches Swift `TransitionEvaluator` (ARCH-031 canonical patterns).
     ///
     /// Supported:
-    /// - `"true"` → always true
-    /// - `exists('artifact_name')` → check filesystem via artifact_paths map
-    /// - `approval.granted == true` → check if approval was granted
+    /// - `"true"` / `"false"` → literals
+    /// - `exists('artifact_name')` → check filesystem
+    /// - `approval.granted == true` → check approvals
+    /// - `artifact.field {==,!=,<,<=,>,>=} value` → read JSON artifact field
+    /// - `vars.name` → runtime variable from plan
     /// - `expr and expr`, `expr or expr` → logical connectives
-    /// - Anything else → default true (with warning)
     async fn evaluate_condition(
         &self,
         condition: &str,
@@ -498,65 +499,25 @@ impl Orchestrator {
             return false;
         }
 
-        // Handle `and` / `or` connectives
-        if let Some(pos) = trimmed.find(" and ") {
-            let lhs = &trimmed[..pos];
-            let rhs = &trimmed[pos + 5..];
-            return Box::pin(self.evaluate_condition(lhs, run, plan)).await
-                && Box::pin(self.evaluate_condition(rhs, run, plan)).await;
+        // Handle `and` / `or` connectives (top-level split)
+        if let Some(split) = split_connective(trimmed, " and ") {
+            return Box::pin(self.evaluate_condition(split.0, run, plan)).await
+                && Box::pin(self.evaluate_condition(split.1, run, plan)).await;
         }
-        if let Some(pos) = trimmed.find(" or ") {
-            let lhs = &trimmed[..pos];
-            let rhs = &trimmed[pos + 4..];
-            return Box::pin(self.evaluate_condition(lhs, run, plan)).await
-                || Box::pin(self.evaluate_condition(rhs, run, plan)).await;
+        if let Some(split) = split_connective(trimmed, " or ") {
+            return Box::pin(self.evaluate_condition(split.0, run, plan)).await
+                || Box::pin(self.evaluate_condition(split.1, run, plan)).await;
         }
 
-        // exists('artifact_name') — resolve path from catalog artifacts map,
-        // then check if the file exists on disk (matches Swift TransitionEvaluator).
+        // exists('artifact_name')
         if trimmed.starts_with("exists(") && trimmed.ends_with(')') {
-            let artifact_name = trimmed
-                .trim_start_matches("exists(")
-                .trim_end_matches(')')
+            let artifact_name = trimmed[7..trimmed.len() - 1]
                 .trim_matches('\'')
                 .trim_matches('"');
-
-            if let Some(path_template) = plan.artifact_paths.get(artifact_name) {
-                // Check workspace-relative path first (canonical location from YAML)
-                let resolved = resolve_path_template(path_template, &run.workspace_root);
-                if std::path::Path::new(&resolved).exists() {
-                    info!(artifact = artifact_name, path = %resolved, "exists() = true (workspace)");
-                    return true;
-                }
-                // Fallback: check artifact_root (agents may write there instead)
-                let art_path = format!("{}/{}", run.artifact_root, artifact_name);
-                if std::path::Path::new(&art_path).exists() {
-                    info!(artifact = artifact_name, path = %art_path, "exists() = true (artifact_root)");
-                    return true;
-                }
-                // Fallback: check artifact_root with run_id subdirectory
-                let art_run_path = format!("{}/{}/{}", run.artifact_root, run.id, artifact_name);
-                if std::path::Path::new(&art_run_path).exists() {
-                    info!(artifact = artifact_name, path = %art_run_path, "exists() = true (artifact_root/run_id)");
-                    return true;
-                }
-                info!(
-                    artifact = artifact_name,
-                    workspace_path = %resolved,
-                    artifact_root_path = %art_path,
-                    "exists() = false"
-                );
-                return false;
-            }
-            // Artifact name not in catalog — check if it exists as a bare filename
-            // in the workspace (fallback)
-            warn!(
-                artifact = artifact_name,
-                "Artifact not found in catalog artifact_paths — defaulting to true"
-            );
-            return true;
+            return self.check_artifact_exists(artifact_name, run, plan);
         }
 
+        // approval.granted == true
         if trimmed == "approval.granted == true" {
             let approvals = approvals::list_by_run(&self.pool, run.id)
                 .await
@@ -566,12 +527,162 @@ impl Orchestrator {
                 .any(|a| a.decision == ApprovalDecision::Granted);
         }
 
-        // Unrecognized expression — default to true for forward progress
-        warn!(
-            condition = trimmed,
-            "Unrecognized transition condition — defaulting to true"
-        );
+        // Comparison expressions: lhs op rhs
+        // Try operators in order: <=, >=, !=, ==, <, >
+        for (op_str, op) in &[
+            (" <= ", CompOp::Le),
+            (" >= ", CompOp::Ge),
+            (" != ", CompOp::Ne),
+            (" == ", CompOp::Eq),
+            (" < ", CompOp::Lt),
+            (" > ", CompOp::Gt),
+        ] {
+            if let Some(pos) = trimmed.find(op_str) {
+                let lhs = trimmed[..pos].trim();
+                let rhs = trimmed[pos + op_str.len()..].trim();
+                let lv = self.resolve_value(lhs, run, plan);
+                let rv = self.resolve_value(rhs, run, plan);
+                let result = apply_comparison(&lv, *op, &rv);
+                info!(
+                    lhs = lhs,
+                    rhs = rhs,
+                    op = ?op,
+                    lhs_val = ?lv,
+                    rhs_val = ?rv,
+                    result = result,
+                    "Transition comparison"
+                );
+                return result;
+            }
+        }
+
+        // Unrecognized — fail closed (false), not open
+        warn!(condition = trimmed, "Unrecognized transition condition — returning false");
+        false
+    }
+
+    /// Check if an artifact exists on the filesystem.
+    fn check_artifact_exists(
+        &self,
+        artifact_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> bool {
+        if let Some(path_template) = plan.artifact_paths.get(artifact_name) {
+            let resolved = resolve_path_template(path_template, &run.workspace_root);
+            if std::path::Path::new(&resolved).exists() {
+                info!(artifact = artifact_name, path = %resolved, "exists() = true");
+                return true;
+            }
+            // Fallback: artifact_root
+            for suffix in &[artifact_name.to_string(), format!("{}/{}", run.id, artifact_name)] {
+                let path = format!("{}/{}", run.artifact_root, suffix);
+                if std::path::Path::new(&path).exists() {
+                    info!(artifact = artifact_name, path = %path, "exists() = true (artifact_root)");
+                    return true;
+                }
+            }
+            info!(artifact = artifact_name, "exists() = false");
+            return false;
+        }
+        warn!(artifact = artifact_name, "Artifact not in catalog — returning true");
         true
+    }
+
+    /// Resolve a value reference to a JSON Value.
+    /// Supports: `vars.name`, `artifact.field`, literals (int/float/string/bool).
+    fn resolve_value(
+        &self,
+        ref_str: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> serde_json::Value {
+        let trimmed = ref_str.trim();
+
+        // vars.* → plan variables
+        if let Some(var_name) = trimmed.strip_prefix("vars.") {
+            return plan.variables.get(var_name).cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+
+        // artifact.field → read JSON file, extract field
+        if trimmed.contains('.') && !trimmed.starts_with("vars.") {
+            let parts: Vec<&str> = trimmed.splitn(2, '.').collect();
+            if parts.len() == 2 {
+                let artifact_name = parts[0];
+                let field_name = parts[1];
+                if let Some(val) = self.read_artifact_field(artifact_name, field_name, run, plan) {
+                    return val;
+                }
+            }
+        }
+
+        // Literal: true/false
+        if trimmed == "true" { return serde_json::Value::Bool(true); }
+        if trimmed == "false" { return serde_json::Value::Bool(false); }
+
+        // Literal: number
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return serde_json::json!(n);
+        }
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return serde_json::json!(f);
+        }
+
+        // Literal: quoted string
+        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        {
+            return serde_json::Value::String(trimmed[1..trimmed.len()-1].to_string());
+        }
+
+        // Bare string
+        serde_json::Value::String(trimmed.to_string())
+    }
+
+    /// Read a field from a JSON artifact file on disk.
+    fn read_artifact_field(
+        &self,
+        artifact_name: &str,
+        field_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Option<serde_json::Value> {
+        // Find the artifact file path
+        let path = if let Some(template) = plan.artifact_paths.get(artifact_name) {
+            let resolved = resolve_path_template(template, &run.workspace_root);
+            if std::path::Path::new(&resolved).exists() {
+                resolved
+            } else {
+                // Try artifact_root
+                let alt = format!("{}/{}", run.artifact_root, artifact_name);
+                if std::path::Path::new(&alt).exists() { alt }
+                else {
+                    let alt2 = format!("{}/{}/{}", run.artifact_root, run.id, artifact_name);
+                    if std::path::Path::new(&alt2).exists() { alt2 }
+                    else { return None; }
+                }
+            }
+        } else {
+            return None;
+        };
+
+        // Read and parse JSON
+        let content = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+        // Extract field (supports nested with dot notation)
+        let val = json.get(field_name).cloned();
+        if val.is_some() {
+            return val;
+        }
+
+        // Try nested path: "a.b" → json["a"]["b"]
+        let mut current = &json;
+        for part in field_name.split('.') {
+            current = current.get(part)?;
+        }
+        Some(current.clone())
     }
 
     // =====================================================================
@@ -697,6 +808,69 @@ impl Orchestrator {
 /// Resolve `${VAR:-default}` patterns in artifact path templates.
 /// Falls back to the default value if the env var is not set.
 /// Also resolves bare `.` as workspace_root.
+// ---------------------------------------------------------------------------
+// Expression evaluation helpers (match Swift TransitionEvaluator)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum CompOp { Eq, Ne, Lt, Le, Gt, Ge }
+
+/// Split on a connective keyword, respecting parentheses depth.
+fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0i32;
+    let conn_len = connective.len();
+    let bytes = expr.as_bytes();
+    let conn_bytes = connective.as_bytes();
+
+    for i in 0..bytes.len() {
+        if bytes[i] == b'(' { depth += 1; }
+        else if bytes[i] == b')' { depth -= 1; }
+
+        if depth == 0 && i + conn_len <= bytes.len() && &bytes[i..i + conn_len] == conn_bytes {
+            let lhs = expr[..i].trim();
+            let rhs = expr[i + conn_len..].trim();
+            if !lhs.is_empty() && !rhs.is_empty() {
+                return Some((lhs, rhs));
+            }
+        }
+    }
+    None
+}
+
+/// Apply a comparison operator to two JSON values.
+fn apply_comparison(lhs: &serde_json::Value, op: CompOp, rhs: &serde_json::Value) -> bool {
+    
+
+    // Try numeric comparison first
+    let ln = to_f64(lhs);
+    let rn = to_f64(rhs);
+    if let (Some(l), Some(r)) = (ln, rn) {
+        return match op {
+            CompOp::Eq => (l - r).abs() < f64::EPSILON,
+            CompOp::Ne => (l - r).abs() >= f64::EPSILON,
+            CompOp::Lt => l < r,
+            CompOp::Le => l <= r,
+            CompOp::Gt => l > r,
+            CompOp::Ge => l >= r,
+        };
+    }
+
+    // String/bool equality
+    match op {
+        CompOp::Eq => lhs == rhs,
+        CompOp::Ne => lhs != rhs,
+        _ => false, // non-numeric values can't be ordered
+    }
+}
+
+fn to_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 /// Build prompt for a specific task (agent-level prompt + task name).
 fn build_task_prompt(task: &workflow::plan::CompiledTask) -> String {
     let agent_prompt = task.agent.prompt.as_deref().unwrap_or("");
