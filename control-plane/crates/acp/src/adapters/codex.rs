@@ -224,6 +224,7 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
 /// Build the Codex model ID by combining model + effort.
 /// Codex catalog uses `model/effort` format: `gpt-5.4/high`, `gpt-5.3-codex/medium`.
 /// If the model already contains `/`, it's used as-is.
+/// Effort values from YAML must match the Codex catalog exactly (low/medium/high/xhigh).
 fn build_codex_model_id(model: &str, effort: Option<&str>) -> String {
     let lowered = model.to_lowercase();
     if lowered.contains('/') {

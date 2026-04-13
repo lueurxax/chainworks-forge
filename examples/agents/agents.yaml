@@ -500,7 +500,7 @@ backend_profiles:
   codex_architect_high:
     provider: codex_acp
     model: gpt-5.4
-    effort: extra high
+    effort: xhigh
     temperature: 0.1
     max_turns: 16
     structured_output: required
@@ -522,7 +522,7 @@ backend_profiles:
   codex_audit_high:
     provider: codex_acp
     model: gpt-5.4
-    effort: extra high
+    effort: xhigh
     temperature: 0.0
     max_turns: 18
     structured_output: required

@@ -85,8 +85,12 @@ impl AcpAdapter for GeminiCliAdapter {
             })?;
 
         // Gemini uses bypassPermissions mode; no _meta block needed.
+        // Pass the model from YAML backend_profile; Gemini CLI accepts
+        // its own catalog (e.g. gemini-2.5-pro, gemini-3-pro) and falls
+        // back to auto-selection if unrecognized.
+        let model_str = req.model.as_deref().unwrap_or("default").to_string();
         let config = AcpSessionConfig {
-            model: "default",
+            model: &model_str,
             mode: "bypassPermissions",
             extra: None,
         };
