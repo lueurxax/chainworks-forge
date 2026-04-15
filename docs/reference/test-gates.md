@@ -498,6 +498,46 @@ Important:
 - it intentionally targets the explicit P037 proof cases instead of unrelated legacy retry/resume debt in broader suites
 - use it instead of ad hoc targeted test mixes when reproving watchdog behavior
 
+### `proposal-044`
+
+Post-approval task execution and release gate completion gate.
+
+Scope:
+
+- N-phase sequential ordering for `sequence` and multi-task `then` blocks
+- post-approval effective-task resolution and N-phase enqueuing
+- end-state task execution before run completion
+- multi-task `then` ordering (state_9: auditor → prepush → aggregation)
+- no regression on single-task `then` settlement (state_4)
+- no regression on simple manual gates (state_3, state_6)
+- worktree safety for post-approval release tasks
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-044
+```
+
+### `proposal-045`
+
+Deterministic release operations gate.
+
+Scope:
+
+- frozen `delivery_configuration_json` input-path persistence at run start
+- native `commit_and_push_to_github` execution without ACP
+- native `build_archive_and_push_connect` execution in sandbox/staging safe mode
+- structured release failure/success receipts and strict lineage-gated terminal backfill
+- canonical release artifact-path persistence for workflow transition truth
+- northbound readback for frozen delivery config and release evidence
+- protected-branch rejection (`main` / `master`)
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-045
+```
+
 ### `full`
 
 Expensive repo-wide sign-off gate.

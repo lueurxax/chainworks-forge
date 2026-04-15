@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
-use tracing::info;
+use tracing::{info, warn};
 
 use db::repos::{approvals, command_journal, projections, runs, stages};
 use db::work_item::WorkItemKind;
@@ -124,6 +124,13 @@ impl CommandHandler {
                     current_state: initial_state,
                     workflow_yaml_path: c.workflow_yaml_path,
                     agent_catalog_yaml_path: c.agent_catalog_yaml_path,
+                    // Worktree fields — provisioned later by the orchestrator
+                    // when the first write-enabled implementation state is entered.
+                    worktree_root: None,
+                    base_branch: None,
+                    base_revision: None,
+                    target_branch: None,
+                    delivery_configuration_json: c.delivery_configuration_json.clone(),
                 };
                 runs::insert(&self.pool, &run).await?;
                 // Activate the idea when its first run starts.
@@ -181,18 +188,37 @@ impl CommandHandler {
                     .find(|s| s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval)
                 {
                     if stage.stage_type.as_deref() == Some("manual_gate") {
-                        stages::settle(
-                            &self.pool,
-                            stage.id,
-                            StageSettlementKind::Completed,
-                            now,
-                        )
-                        .await?;
-                        let _ = self.events.send(DomainEvent::StageStatusChanged {
-                            run_id: c.run_id,
-                            stage_execution_id: stage.id,
-                            status: StageStatus::Completed,
-                        });
+                        // P044 §3d: If post-approval tasks exist, set stage to Running
+                        // so the orchestrator can enqueue them. Otherwise settle as Completed.
+                        let has_post_tasks = self
+                            .check_has_post_approval_tasks(c.run_id, &c.stage_id)
+                            .await;
+                        if has_post_tasks {
+                            stages::update_status(
+                                &self.pool,
+                                stage.id,
+                                StageStatus::Running,
+                            )
+                            .await?;
+                            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                                run_id: c.run_id,
+                                stage_execution_id: stage.id,
+                                status: StageStatus::Running,
+                            });
+                        } else {
+                            stages::settle(
+                                &self.pool,
+                                stage.id,
+                                StageSettlementKind::Completed,
+                                now,
+                            )
+                            .await?;
+                            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                                run_id: c.run_id,
+                                stage_execution_id: stage.id,
+                                status: StageStatus::Completed,
+                            });
+                        }
                     } else {
                         stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
                         let _ = self.events.send(DomainEvent::StageStatusChanged {
@@ -336,6 +362,18 @@ impl CommandHandler {
                 let now = Utc::now();
                 runs::mark_cancelling(&self.pool, c.run_id, now).await?;
 
+                // Worktree cleanup on cancel (Proposal 007).
+                if let Some(ref wt) = run.worktree_root {
+                    if let Err(e) = crate::worktree::WorktreeProvisioner::cleanup(wt, &run.workspace_root).await {
+                        tracing::warn!(
+                            run_id = %c.run_id,
+                            worktree = %wt,
+                            error = %e,
+                            "Worktree cleanup on cancel failed"
+                        );
+                    }
+                }
+
                 let _ = self.events.send(DomainEvent::RunStatusChanged {
                     run_id: c.run_id,
                     status: RunStatus::Cancelling,
@@ -371,6 +409,56 @@ impl CommandHandler {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
                 })
+            }
+        }
+    }
+
+    /// P044 §3d helper: Check whether the workflow plan for the given run has
+    /// `post_approval_tasks` on the state identified by `stage_id`.
+    ///
+    /// Returns `false` on any error (run not found, missing paths, plan compile
+    /// failure, state not found) so that the caller falls back to the existing
+    /// "settle as Completed" behaviour.
+    async fn check_has_post_approval_tasks(&self, run_id: RunId, stage_id: &str) -> bool {
+        let run = match runs::find_by_id(&self.pool, run_id).await {
+            Ok(Some(r)) => r,
+            _ => {
+                warn!(run_id = %run_id, "check_has_post_approval_tasks: run not found");
+                return false;
+            }
+        };
+
+        let workflow_path = match run.workflow_yaml_path.as_deref() {
+            Some(p) => p,
+            None => return false,
+        };
+        let catalog_path = match run.agent_catalog_yaml_path.as_deref() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let plan = match workflow::compiler::compile(workflow_path, catalog_path) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage_id,
+                    error = %e,
+                    "check_has_post_approval_tasks: failed to compile plan"
+                );
+                return false;
+            }
+        };
+
+        match plan.states.get(stage_id) {
+            Some(state) => !state.post_approval_tasks.is_empty(),
+            None => {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage_id,
+                    "check_has_post_approval_tasks: state not found in plan"
+                );
+                false
             }
         }
     }

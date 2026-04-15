@@ -50,6 +50,7 @@ artifacts:
   git_push_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/git-push.json
   release_bundle_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/bundle.json
   connect_upload_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/connect-upload.json
+  delivery_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/delivery-receipt.json
   final_feature_report: ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/final-feature-report.json
   metrics_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/metrics-window.json
   baseline_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/baseline-window.json

@@ -19,6 +19,8 @@ pub struct StartRunCmd {
     pub workflow_title: String,
     pub workspace_root: String,
     pub artifact_root: String,
+    /// Frozen delivery configuration JSON for repo-backed runs.
+    pub delivery_configuration_json: Option<String>,
     /// Path to the workflow YAML file (enables state-machine-driven execution).
     pub workflow_yaml_path: Option<String>,
     /// Path to the agent catalog YAML file.
@@ -54,4 +56,31 @@ pub struct CancelRunCmd {
 pub struct ResetSessionCmd {
     pub run_id: RunId,
     pub stage_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_run_cmd_serializes_delivery_configuration_json() {
+        let cmd = StartRunCmd {
+            idea_id: IdeaId::new(),
+            workflow_id: "wf-1".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/tmp/workspace".into(),
+            artifact_root: "/tmp/artifacts".into(),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            delivery_configuration_json: Some(
+                r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#.into(),
+            ),
+        };
+
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            json["delivery_configuration_json"],
+            r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#
+        );
+    }
 }

@@ -4,7 +4,7 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{approvals, ideas, runs, stages};
 use domain::approval::{Approval, ApprovalDecision};
-use domain::commands::{ApproveStageCmd, Command, RejectStageCmd, RetryStageCmd};
+use domain::commands::{ApproveStageCmd, Command, RejectStageCmd, RetryStageCmd, StartRunCmd};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{ApprovalId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
@@ -46,6 +46,11 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
     }
 }
 
@@ -151,8 +156,8 @@ async fn test_startup_repair_skips_clean_runs() {
     let summary = recovery.run_startup_repair().await.unwrap();
 
     assert_eq!(summary.runs_inspected, 1);
-    assert_eq!(summary.runs_repaired, 0, "no repair needed for clean run");
-    assert_eq!(summary.work_items_requeued, 0);
+    assert_eq!(summary.runs_repaired, 1, "active run with completed stage needs catchup AdvanceRun");
+    assert_eq!(summary.work_items_requeued, 1, "one AdvanceRun must be re-enqueued for startup catchup");
 
     let unchanged_stage = stages::find_by_id(&pool, stage_id).await.unwrap().unwrap();
     assert_eq!(
@@ -320,6 +325,44 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
     );
 }
 
+/// Starting a run must persist the frozen delivery configuration JSON on the
+/// run record so downstream release logic can consume it.
+#[tokio::test]
+async fn test_start_run_persists_delivery_configuration_json() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let delivery_configuration_json = Some(
+        r#"{"repo_identifier":"repo-1","repo_root":"/repo","base_branch":"main","worktree_base_path":"/tmp/worktrees","target_branch":"cw/release"}"#
+            .to_string(),
+    );
+
+    let result = handler
+        .handle(Command::StartRun(StartRunCmd {
+            idea_id,
+            workflow_id: "wf-start".into(),
+            workflow_title: "Start Run".into(),
+            workspace_root: "/tmp/ws".into(),
+            artifact_root: "/tmp/art".into(),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            delivery_configuration_json: delivery_configuration_json.clone(),
+        }))
+        .await
+        .unwrap();
+
+    let run_id = match result {
+        engine::command_handler::CommandResult::RunStarted { run_id } => run_id,
+        _ => panic!("unexpected command result"),
+    };
+
+    let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(run.delivery_configuration_json, delivery_configuration_json);
+}
+
 // ---------------------------------------------------------------------------
 // InvokeAgent end-to-end parity harness (P027 / ARCH-001 / REQ-009)
 //
@@ -441,6 +484,11 @@ sys.exit(0)
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
         },
     )
     .await
@@ -732,4 +780,811 @@ async fn test_daemon_vs_swift_report_behavioral_parity() {
         daemon_artifacts.len(),
         golden_artifacts.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// P044: Post-approval task detection in manual_gate approval flow
+// ---------------------------------------------------------------------------
+
+/// Approving a manual_gate that has post_approval_tasks (state_11_manual_release)
+/// must set the stage to Running (not Completed) so the orchestrator can enqueue
+/// the post-approval work.
+#[tokio::test]
+async fn test_approve_manual_gate_with_post_approval_tasks_sets_running() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    // Build a run with real workflow + catalog paths so the command handler
+    // can compile the plan and detect post_approval_tasks.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let examples_dir = format!("{}/../../../examples", manifest_dir);
+    let wf_path = format!("{examples_dir}/workflows/full-mvp-live.yaml");
+    let cat_path = format!("{examples_dir}/agents/agents.yaml");
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workflow_yaml_path = Some(wf_path);
+    run.agent_catalog_yaml_path = Some(cat_path);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    // Insert the pending approval BEFORE calling the command handler.
+    let approval = make_approval(run_id, "state_11_manual_release", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::ApproveStage(ApproveStageCmd {
+            run_id,
+            stage_id: "state_11_manual_release".into(),
+            comment: Some("Ship it".into()),
+        }))
+        .await
+        .unwrap();
+
+    // Stage must be Running (not Completed) because post_approval_tasks exist.
+    let updated = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status,
+        StageStatus::Running,
+        "manual_gate with post_approval_tasks must transition to Running after approval, \
+         not Completed, so the orchestrator can enqueue post-approval work"
+    );
+}
+
+/// Approving a simple manual_gate (state_3, no post_approval_tasks) must
+/// settle the stage as Completed.
+#[tokio::test]
+async fn test_approve_simple_manual_gate_settles_completed() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let examples_dir = format!("{}/../../../examples", manifest_dir);
+    let wf_path = format!("{examples_dir}/workflows/full-mvp-live.yaml");
+    let cat_path = format!("{examples_dir}/agents/agents.yaml");
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workflow_yaml_path = Some(wf_path);
+    run.agent_catalog_yaml_path = Some(cat_path);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_3_initial_proposal_approval".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(
+        run_id,
+        "state_3_initial_proposal_approval",
+        ApprovalDecision::Pending,
+    );
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::ApproveStage(ApproveStageCmd {
+            run_id,
+            stage_id: "state_3_initial_proposal_approval".into(),
+            comment: Some("Looks good".into()),
+        }))
+        .await
+        .unwrap();
+
+    // Stage must be Completed because state_3 has no post_approval_tasks.
+    let updated = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status,
+        StageStatus::Completed,
+        "simple manual_gate without post_approval_tasks must settle as Completed after approval"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P044 focused proof: post-approval task enqueuing and end-state semantics
+// ---------------------------------------------------------------------------
+
+/// After approving state_11 (which has post_approval_tasks), advance_run must
+/// enqueue InvokeAgent work items for the post-approval tasks.
+#[tokio::test]
+async fn test_post_approval_tasks_enqueued_after_approval() {
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workflow_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let catalog_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workflow_yaml_path = Some(workflow_path);
+    run.agent_catalog_yaml_path = Some(catalog_path);
+    run.current_state = Some("state_11_manual_release".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "state_11_manual_release", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    // Approve via CommandHandler — this transitions the stage to Running.
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::ApproveStage(ApproveStageCmd {
+            run_id,
+            stage_id: "state_11_manual_release".into(),
+            comment: Some("Ship it".into()),
+        }))
+        .await
+        .unwrap();
+
+    // Now call advance_run — the orchestrator should detect the post-approval
+    // context and enqueue InvokeAgent work items for the post-approval tasks.
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    // Verify InvokeAgent work items were enqueued for post-approval tasks.
+    let work_items = db::repos::work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke_items: Vec<_> = work_items
+        .iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+
+    assert!(
+        !invoke_items.is_empty(),
+        "advance_run must enqueue InvokeAgent work items for post-approval tasks on state_11"
+    );
+
+    // state_11 has two sequential post-approval tasks (phase 0 then phase 1);
+    // phase 0 should be enqueued first.
+    let has_commit_push = invoke_items.iter().any(|w| {
+        w.payload_json.contains("commit_and_push")
+    });
+    assert!(
+        has_commit_push,
+        "at least one InvokeAgent must target the commit_and_push post-approval task"
+    );
+}
+
+/// An end state with tasks (state_12_workflow_complete) must NOT short-circuit
+/// to immediate completion — it must fall through to the compute path, create
+/// a Running stage, and enqueue tasks.
+#[tokio::test]
+async fn test_end_state_with_tasks_does_not_short_circuit() {
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workflow_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let catalog_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workflow_yaml_path = Some(workflow_path);
+    run.agent_catalog_yaml_path = Some(catalog_path);
+    run.current_state = Some("state_12_workflow_complete".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    // No stages yet — the orchestrator should create one and NOT immediately complete.
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    // A stage must have been created for the end state.
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let end_stage = all_stages
+        .iter()
+        .find(|s| s.stage_id == "state_12_workflow_complete")
+        .expect("orchestrator must create a stage for end state with tasks");
+
+    // The stage should be Running (tasks enqueued), NOT Completed.
+    assert_eq!(
+        end_stage.status,
+        StageStatus::Running,
+        "end state with tasks must enter Running (compute path), not short-circuit to Completed"
+    );
+
+    // The run must NOT be Completed yet — tasks haven't finished.
+    let refreshed_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_ne!(
+        refreshed_run.status,
+        RunStatus::Completed,
+        "run must not be Completed while end-state tasks are still running"
+    );
+
+    // InvokeAgent work items must have been enqueued for the end state's tasks.
+    let work_items = db::repos::work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke_items: Vec<_> = work_items
+        .iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert!(
+        !invoke_items.is_empty(),
+        "end state with tasks must enqueue InvokeAgent work items"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P044 strengthened focused proofs: phase ordering, retry semantics, and
+// simple-gate non-regression
+// ---------------------------------------------------------------------------
+
+/// Proves strict runtime phase ordering for post-approval tasks on state_11.
+/// After approval and advance_run, only phase 0 (commit_and_push) must be
+/// enqueued; phase 1 (build_and_distribute) must NOT appear until phase 0
+/// completes.
+#[tokio::test]
+async fn test_n_phase_sequence_ordering() {
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workflow_yaml_path = Some(wf_path);
+    run.agent_catalog_yaml_path = Some(cat_path);
+    run.current_state = Some("state_11_manual_release".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "state_11_manual_release", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler.handle(Command::ApproveStage(ApproveStageCmd {
+        run_id,
+        stage_id: "state_11_manual_release".into(),
+        comment: Some("Ship it".into()),
+    })).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    // Only phase 0 tasks should be enqueued — phase 1 waits.
+    let work_items = db::repos::work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke_items: Vec<_> = work_items
+        .iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+
+    // Should have exactly 1 InvokeAgent (phase 0 = commit_and_push only)
+    assert_eq!(
+        invoke_items.len(),
+        1,
+        "N-phase ordering: only phase 0 task must be enqueued initially, got {} items",
+        invoke_items.len()
+    );
+
+    // The enqueued task must be commit_and_push (phase 0), not build_and_distribute (phase 1)
+    let payload: serde_json::Value = serde_json::from_str(&invoke_items[0].payload_json).unwrap();
+    let task_index = payload["task_index"].as_u64().unwrap();
+    assert_eq!(task_index, 0, "first enqueued task must be task_index 0 (phase 0)");
+    assert!(
+        invoke_items[0].payload_json.contains("commit_and_push"),
+        "first enqueued task must be commit_and_push (phase 0)"
+    );
+
+    // build_and_distribute (phase 1) must NOT be enqueued yet
+    assert!(
+        !invoke_items.iter().any(|w| w.payload_json.contains("build_and_distribute")),
+        "phase 1 task (build_and_distribute) must NOT be enqueued before phase 0 completes"
+    );
+}
+
+/// Proves that retrying a failed state_11 post-approval stage returns to
+/// WaitingApproval-equivalent state: old stage is Skipped, new stage is
+/// Pending with incremented attempt_number.
+#[tokio::test]
+async fn test_post_approval_retry_requires_fresh_approval() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Blocked)).await.unwrap();
+
+    // Simulate a failed post-approval stage
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler.handle(Command::RetryStage(RetryStageCmd {
+        run_id,
+        stage_id: "state_11_manual_release".into(),
+    })).await.unwrap();
+
+    // Old stage must be Skipped
+    let old = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    assert_eq!(old.status, StageStatus::Skipped, "old failed stage must be Skipped after retry");
+
+    // New stage must exist with attempt_number = 2 and status Pending
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let new_stage = all_stages
+        .iter()
+        .find(|s| s.stage_id == "state_11_manual_release" && s.attempt_number == 2)
+        .expect("retry must create new stage with attempt_number=2");
+    assert_eq!(new_stage.status, StageStatus::Pending,
+        "retried manual_gate stage must start as Pending (orchestrator will re-enter manual gate path)");
+}
+
+/// Ensures state_6 (simple gate, no post_approval_tasks) still completes
+/// immediately after approval — non-regression for the post_approval_tasks
+/// detection logic.
+#[tokio::test]
+async fn test_simple_manual_gate_no_regression() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workflow_yaml_path = Some(wf_path);
+    run.agent_catalog_yaml_path = Some(cat_path);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_6_implementation_approval".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "state_6_implementation_approval", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler.handle(Command::ApproveStage(ApproveStageCmd {
+        run_id,
+        stage_id: "state_6_implementation_approval".into(),
+        comment: Some("Approved".into()),
+    })).await.unwrap();
+
+    let updated = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status,
+        StageStatus::Completed,
+        "state_6 (simple gate, no post_approval_tasks) must settle as Completed after approval"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P044: End-to-end happy path for state_11 -> state_12
+// ---------------------------------------------------------------------------
+
+/// Walks the full P044 happy path in a single contiguous fixture:
+///   1. state_11 approval -> stage Running
+///   2. advance_run enqueues phase 0 (commit_and_push)
+///   3. simulate phase 0 completion: write git_push_receipt artifact on disk,
+///      mark work item Completed
+///   4. advance_run enqueues phase 1 (build_and_distribute); assert strict
+///      started_at ordering (phase 0 started before phase 1)
+///   5. simulate phase 1 completion: write release_bundle_manifest +
+///      connect_upload_receipt, mark work item Completed
+///   6. advance_run settles state_11 as Completed and transitions to state_12
+///   7. advance_run creates state_12 stage and enqueues
+///      finalize_run_and_produce_receipts
+///   8. simulate finalize completion: write delivery_receipt + run_report +
+///      run_state, mark work item Completed
+///   9. advance_run settles state_12 and marks run Completed
+///
+/// Per P044 §8 we do not execute real ACP side effects; we simulate task
+/// completion by writing artifact files and marking work items Completed.
+#[tokio::test]
+async fn test_state_11_to_state_12_happy_path() {
+    use chrono::Utc;
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::ids::ArtifactId;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+
+    // Isolated workspace + artifact root so exists() lookups hit only our files.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = tmp
+        .path()
+        .join("artifacts")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&artifact_root).unwrap();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
+
+    // Seed run: at state_11, running, with worktree_root so the release safety
+    // guard (which now inspects post_approval_tasks) is satisfied.
+    let worktree_root = tmp.path().join("worktree").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&worktree_root).unwrap();
+
+    let run = Run {
+        id: run_id,
+        idea_id,
+        status: RunStatus::Running,
+        workflow_id: "wf-test".into(),
+        workflow_title: "Test Workflow".into(),
+        workspace_root: workspace_root.clone(),
+        artifact_root: artifact_root.clone(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        current_state: Some("state_11_manual_release".into()),
+        workflow_yaml_path: Some(wf_path),
+        agent_catalog_yaml_path: Some(cat_path),
+        worktree_root: Some(worktree_root.clone()),
+        base_branch: Some("main".into()),
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    // Seed state_11 stage as WaitingApproval with an unresolved approval.
+    let stage_11_id = StageExecutionId::new();
+    let mut stage_11 = make_stage(stage_11_id, run_id, StageStatus::WaitingApproval);
+    stage_11.stage_id = "state_11_manual_release".into();
+    stage_11.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage_11).await.unwrap();
+
+    let approval = make_approval(
+        run_id,
+        "state_11_manual_release",
+        ApprovalDecision::Pending,
+    );
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    // ── Step 1: approve state_11 -> stage transitions to Running ──────────
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::ApproveStage(ApproveStageCmd {
+            run_id,
+            stage_id: "state_11_manual_release".into(),
+            comment: Some("Ship it".into()),
+        }))
+        .await
+        .unwrap();
+
+    let s11_after_approval = stages::find_by_id(&pool, stage_11_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s11_after_approval.status,
+        StageStatus::Running,
+        "state_11 must be Running (not Completed) after approval because it has post_approval_tasks"
+    );
+
+    // ── Step 2: advance_run enqueues phase 0 (commit_and_push) only ──────
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events.clone(), work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let items_after_p0 = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    let invoke_items_p0: Vec<_> = items_after_p0
+        .iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert_eq!(
+        invoke_items_p0.len(),
+        1,
+        "phase 0 only: exactly one InvokeAgent must be enqueued, got {}",
+        invoke_items_p0.len()
+    );
+    assert!(
+        invoke_items_p0[0].payload_json.contains("commit_and_push"),
+        "phase 0 must be commit_and_push, payload: {}",
+        invoke_items_p0[0].payload_json
+    );
+    let phase0_item_id = invoke_items_p0[0].id.clone();
+    let phase0_enqueued_at = invoke_items_p0[0].created_at;
+
+    // ── Step 3: simulate phase 0 completion ──────────────────────────────
+    // Write git_push_receipt at the path the catalog declares so exists() resolves.
+    let release_dir = tmp.path().join(".chainworks").join("release");
+    std::fs::create_dir_all(&release_dir).unwrap();
+    let git_push_receipt_path = release_dir.join("git-push.json");
+    std::fs::write(&git_push_receipt_path, r#"{"branch":"main","sha":"deadbeef"}"#).unwrap();
+
+    // Also insert the artifact row so report/projection surfaces see it.
+    let now = Utc::now();
+    let git_push_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_11_manual_release".into(),
+        agent_id: "commit_and_push_to_github".into(),
+        name: "git_push_receipt".into(),
+        contract_id: "git_push_receipt_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: git_push_receipt_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "claude".into(),
+        model: None,
+        created_at: now,
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    db::repos::artifacts::insert(&pool, &git_push_artifact).await.unwrap();
+
+    // Mark phase 0 work item Completed.
+    db::repos::work_items::complete(&pool, &phase0_item_id).await.unwrap();
+
+    // ── Step 4: advance_run enqueues phase 1 (build_and_distribute) ──────
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let items_after_p1 = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    let invoke_items_p1: Vec<_> = items_after_p1
+        .iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert_eq!(
+        invoke_items_p1.len(),
+        2,
+        "phase 1 must be enqueued alongside completed phase 0, got {} items",
+        invoke_items_p1.len()
+    );
+    let phase1_item = invoke_items_p1
+        .iter()
+        .find(|w| w.payload_json.contains("build_and_distribute"))
+        .expect("phase 1 InvokeAgent for build_and_distribute must exist");
+    let phase1_enqueued_at = phase1_item.created_at;
+
+    // Strict phase ordering by enqueue time: phase 0 must have been enqueued
+    // before phase 1. created_at is set when the work item is persisted, so
+    // phase 0's timestamp must precede or equal phase 1's.
+    assert!(
+        phase0_enqueued_at <= phase1_enqueued_at,
+        "strict phase ordering: phase 0 (enqueued_at={:?}) must come before phase 1 (enqueued_at={:?})",
+        phase0_enqueued_at,
+        phase1_enqueued_at
+    );
+
+    // ── Step 5: simulate phase 1 completion ──────────────────────────────
+    // Write release_bundle_manifest and connect_upload_receipt artifacts.
+    let rbm_path = release_dir.join("release-bundle.json");
+    std::fs::write(&rbm_path, r#"{"bundle":"ok"}"#).unwrap();
+    let cur_path = release_dir.join("connect-upload.json");
+    std::fs::write(&cur_path, r#"{"connect":"ok"}"#).unwrap();
+
+    let rbm_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_11_manual_release".into(),
+        agent_id: "build_archive_and_push_connect".into(),
+        name: "release_bundle_manifest".into(),
+        contract_id: "release_bundle_manifest_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: rbm_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "claude".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    db::repos::artifacts::insert(&pool, &rbm_artifact).await.unwrap();
+
+    let cur_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_11_manual_release".into(),
+        agent_id: "build_archive_and_push_connect".into(),
+        name: "connect_upload_receipt".into(),
+        contract_id: "connect_upload_receipt_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: cur_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "claude".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    db::repos::artifacts::insert(&pool, &cur_artifact).await.unwrap();
+
+    db::repos::work_items::complete(&pool, &phase1_item.id.clone()).await.unwrap();
+
+    // ── Step 6: advance_run settles state_11, transitions to state_12 ────
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let s11_settled = stages::find_by_id(&pool, stage_11_id).await.unwrap().unwrap();
+    assert_eq!(
+        s11_settled.status,
+        StageStatus::Completed,
+        "state_11 must be Completed after both phases complete"
+    );
+
+    let run_after_s11 = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        run_after_s11.current_state.as_deref(),
+        Some("state_12_workflow_complete"),
+        "run must have transitioned to state_12 (git_push_receipt exists)"
+    );
+    assert_ne!(
+        run_after_s11.status,
+        RunStatus::Completed,
+        "run must not be Completed yet — state_12 tasks haven't run"
+    );
+
+    // ── Step 7: advance_run creates state_12 stage and enqueues finalizer ─
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let s12 = all_stages
+        .iter()
+        .find(|s| s.stage_id == "state_12_workflow_complete")
+        .expect("state_12 stage must be created after transition");
+    assert_eq!(
+        s12.status,
+        StageStatus::Running,
+        "state_12 (end state with tasks) must enter Running, not short-circuit to Completed"
+    );
+
+    let items_after_s12 = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    let s12_invokes: Vec<_> = items_after_s12
+        .iter()
+        .filter(|w| {
+            w.kind == db::work_item::WorkItemKind::InvokeAgent
+                && w.payload_json.contains(&s12.id.to_string())
+        })
+        .collect();
+    assert_eq!(
+        s12_invokes.len(),
+        1,
+        "state_12 must enqueue exactly one InvokeAgent (finalize_run_and_produce_receipts)"
+    );
+    assert!(
+        s12_invokes[0]
+            .payload_json
+            .contains("finalize_run_and_produce_receipts"),
+        "state_12 task must be finalize_run_and_produce_receipts, payload: {}",
+        s12_invokes[0].payload_json
+    );
+    let finalize_item_id = s12_invokes[0].id.clone();
+
+    // ── Step 8: simulate finalize completion (write receipt + report) ─────
+    let delivery_receipt_path = release_dir.join("delivery-receipt.json");
+    std::fs::write(&delivery_receipt_path, r#"{"delivery":"ok"}"#).unwrap();
+    let run_report_path = release_dir.join("run-report.json");
+    std::fs::write(&run_report_path, r#"{"report":"final"}"#).unwrap();
+    let run_state_path = release_dir.join("run-state.json");
+    std::fs::write(&run_state_path, r#"{"state":"complete"}"#).unwrap();
+
+    let now = Utc::now();
+    for (name, path, contract) in [
+        ("delivery_receipt", delivery_receipt_path.clone(), "delivery_receipt_v1"),
+        ("run_report", run_report_path.clone(), "run_report_v1"),
+        ("run_state", run_state_path.clone(), "run_state_v1"),
+    ] {
+        let art = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_12_workflow_complete".into(),
+            agent_id: "lead_orchestrator".into(),
+            name: name.into(),
+            contract_id: contract.into(),
+            format: ArtifactFormat::Json,
+            file_path: path.to_string_lossy().into_owned(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "claude".into(),
+            model: None,
+            created_at: now,
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        db::repos::artifacts::insert(&pool, &art).await.unwrap();
+    }
+
+    db::repos::work_items::complete(&pool, &finalize_item_id).await.unwrap();
+
+    // ── Step 9: advance_run settles state_12 and marks run Completed ─────
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let s12_settled = stages::find_by_id(&pool, s12.id).await.unwrap().unwrap();
+    assert_eq!(
+        s12_settled.status,
+        StageStatus::Completed,
+        "state_12 must be Completed after finalize_run_and_produce_receipts finishes"
+    );
+
+    let final_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        final_run.status,
+        RunStatus::Completed,
+        "run must be Completed after state_12 (end state with tasks) finishes"
+    );
+    assert!(
+        final_run.completed_at.is_some(),
+        "completed_at must be set on a completed run"
+    );
+
+    // Terminal artifact inventory: all three finalizer outputs must exist.
+    let all_artifacts = db::repos::artifacts::list_by_run(&pool, run_id).await.unwrap();
+    for terminal in ["delivery_receipt", "run_report", "run_state"] {
+        assert!(
+            all_artifacts.iter().any(|a| a.name == terminal),
+            "terminal artifact {terminal} must be present after run completes"
+        );
+    }
+    // Release intermediate artifacts are also present.
+    for intermediate in [
+        "git_push_receipt",
+        "release_bundle_manifest",
+        "connect_upload_receipt",
+    ] {
+        assert!(
+            all_artifacts.iter().any(|a| a.name == intermediate),
+            "release artifact {intermediate} must be present after run completes"
+        );
+    }
 }

@@ -139,6 +139,59 @@ sys.exit(0)
         std::fs::set_permissions(&script, p).unwrap();
         script.to_string_lossy().into_owned()
     }
+
+    /// Write a fixture ACP server script that overwrites a pre-existing
+    /// canonical output file instead of creating a brand-new one.
+    pub fn create_overwrite_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_overwrite.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {}).get("cwd", "/tmp")
+session_id = "fixture-session-overwrite"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+artifact_path = os.path.join(cwd, "canonical.json")
+with open(artifact_path, "w") as f:
+    f.write('{"overwritten": true}\n')
+
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
 }
 
 /// ClaudeAgentAdapter drives the full ACP protocol and discovers artifacts
@@ -166,6 +219,10 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         // workspace_root == cwd the fixture receives; it creates result.json there
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -211,6 +268,10 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "fail".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -266,6 +327,10 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "generate report".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -273,4 +338,45 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.artifact_paths.len(), 1);
     assert!(result.artifact_paths[0].ends_with("result.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_existing_file() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let existing = tmp.path().join("canonical.json");
+    std::fs::write(&existing, "{\"stale\": true}\n").unwrap();
+
+    let script = fixture::create_overwrite_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_overwrite".into(),
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "overwrite canonical output".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: vec![existing.to_string_lossy().into_owned()],
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result.artifact_paths
+            .iter()
+            .any(|path| path.ends_with("canonical.json")),
+        "expected overwritten canonical output to be reported: {:?}",
+        result.artifact_paths
+    );
 }

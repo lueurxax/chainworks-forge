@@ -12,3 +12,4 @@ Archived material remains useful when an audit or proposal needs older owner cha
 ## Contents
 
 - [reference/README.md](reference/README.md) — archived reference docs that no longer describe the canonical system
+- [proposals/README.md](proposals/README.md) — historical proposal drafts, reviews, evidence packs, and superseded audit rounds

@@ -5,6 +5,7 @@ pub mod stage;
 pub mod agent;
 pub mod approval;
 pub mod artifact;
+pub mod validation;
 pub mod commands;
 pub mod events;
 

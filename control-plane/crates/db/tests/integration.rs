@@ -1,15 +1,195 @@
 use db::pool::create_pool;
-use db::repos::{approvals, artifacts, ideas, projections, runs, stages};
+use db::repos::{agent_executions, approvals, artifacts, ideas, projections, runs, stages, validation};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::idea::{Idea, IdeaStatus};
-use domain::ids::{ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::agent::{AgentExecution, AgentStatus};
+use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
+use domain::validation::{
+    ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
+    ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
+};
 use chrono::Utc;
 
 async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+}
+
+#[tokio::test]
+async fn stage_projection_validation_flag_is_attempt_scoped() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-validation".into(),
+        workflow_title: "Validation".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let failed_attempt = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "proposal_review".into(),
+        label: "Proposal review".into(),
+        status: StageStatus::Failed,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: Some(StageSettlementKind::Failed),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        owner_agent: Some("reviewer".into()),
+        provider: Some("claude".into()),
+        model: None,
+        stage_type: None,
+    };
+    let successful_retry = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "proposal_review".into(),
+        label: "Proposal review".into(),
+        status: StageStatus::Completed,
+        iteration: 2,
+        attempt_number: 2,
+        settlement_kind: Some(StageSettlementKind::Completed),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        owner_agent: Some("reviewer".into()),
+        provider: Some("claude".into()),
+        model: None,
+        stage_type: None,
+    };
+    stages::insert(&pool, &failed_attempt).await.unwrap();
+    stages::insert(&pool, &successful_retry).await.unwrap();
+
+    let failed_agent_execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: failed_attempt.id,
+        agent_id: "reviewer".into(),
+        provider: "claude".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        status: AgentStatus::Failed,
+    };
+    let retry_agent_execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: successful_retry.id,
+        agent_id: "reviewer".into(),
+        provider: "claude".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        status: AgentStatus::Completed,
+    };
+    agent_executions::insert(&pool, &failed_agent_execution).await.unwrap();
+    agent_executions::insert(&pool, &retry_agent_execution).await.unwrap();
+
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id: run.id,
+        stage_id: failed_attempt.stage_id.clone(),
+        agent_id: "reviewer".into(),
+        name: "validation_failure_reviewer".into(),
+        contract_id: "validation_failure_record".into(),
+        format: ArtifactFormat::Json,
+        file_path: "/tmp/art/validation-failure.json".into(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "claude".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: Some("validation_failure".into()),
+        report_version: Some(1),
+    };
+    artifacts::insert(&pool, &artifact).await.unwrap();
+
+    validation::insert(
+        &pool,
+        &ValidationFailureRecord {
+            id: "55555555-5555-5555-5555-555555555555".into(),
+            artifact_id: artifact.id,
+            timestamp: Utc::now(),
+            agent_id: "reviewer".into(),
+            stage_id: failed_attempt.stage_id.clone(),
+            stage_execution_id: failed_attempt.id,
+            agent_execution_id: failed_agent_execution.id,
+            run_id: run.id,
+            output_results: vec![OutputValidationResult {
+                output_name: "proposal_review".into(),
+                contract_id: Some("proposal_review_v1".into()),
+                status: ValidationStatus::Failed,
+                missing_fields: vec!["summary".into()],
+                validation_error: Some("Missing required fields: summary".into()),
+                raw_payload_size: 12,
+            }],
+            failure_summary: "proposal_review: Missing required fields: summary".into(),
+            failure_class: ValidationFailureClass::OutputContractMismatch,
+            contract_metadata: vec![ContractValidationMetadata {
+                output_name: "proposal_review".into(),
+                contract_id: "proposal_review_v1".into(),
+                machine_format: "json".into(),
+                validation_mode: "strict_structured".into(),
+                required_field_count: 1,
+                raw_artifact_name: Some("proposal_review_raw".into()),
+                normalized_artifact_name: Some("proposal_review".into()),
+            }],
+            raw_output_exists: true,
+            receipt_exists: false,
+            transcript_exists: true,
+            recovery_recommendation: RecoveryRecommendation {
+                action: "retry_failed_agent".into(),
+                explanation: "Retry the failed agent.".into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    projections::rebuild_all_for_run(&pool, run.id).await.unwrap();
+    let rows = projections::list_stages_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap();
+
+    let failed_row = rows
+        .iter()
+        .find(|row| row.id == failed_attempt.id.to_string())
+        .expect("failed attempt row");
+    let retry_row = rows
+        .iter()
+        .find(|row| row.id == successful_retry.id.to_string())
+        .expect("retry row");
+
+    assert!(failed_row.has_validation_failure);
+    assert!(!retry_row.has_validation_failure);
 }
 
 #[tokio::test]
@@ -59,6 +239,11 @@ async fn test_run_insert_and_find() {
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -94,6 +279,11 @@ async fn test_run_status_update() {
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     runs::update_status(&pool, run.id, RunStatus::Running).await.unwrap();
@@ -137,6 +327,11 @@ async fn test_projection_parity_after_rebuild() {
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -254,6 +449,11 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -385,6 +585,11 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -543,6 +748,11 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -600,6 +810,11 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
         },
     )
     .await
@@ -712,4 +927,3 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
         );
     }
 }
-

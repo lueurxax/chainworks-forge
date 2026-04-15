@@ -15,6 +15,7 @@ pub struct GqlRun {
     pub completed_at: Option<String>,
     pub cancellation_requested_at: Option<String>,
     pub cancellation_settled_at: Option<String>,
+    pub delivery_configuration_json: Option<String>,
     /// Stage counts from the projection layer; None when reading a single run by ID.
     pub total_stages: Option<i64>,
     pub completed_stages: Option<i64>,
@@ -36,6 +37,7 @@ impl From<Run> for GqlRun {
             completed_at: run.completed_at.map(|t| t.to_rfc3339()),
             cancellation_requested_at: run.cancellation_requested_at.map(|t| t.to_rfc3339()),
             cancellation_settled_at: run.cancellation_settled_at.map(|t| t.to_rfc3339()),
+            delivery_configuration_json: run.delivery_configuration_json,
             total_stages: None,
             completed_stages: None,
             failed_stages: None,
@@ -58,6 +60,7 @@ impl From<RunProjectionRow> for GqlRun {
             completed_at: r.completed_at,
             cancellation_requested_at: r.cancellation_requested_at,
             cancellation_settled_at: r.cancellation_settled_at,
+            delivery_configuration_json: None,
             total_stages: Some(r.total_stages),
             completed_stages: Some(r.completed_stages),
             failed_stages: Some(r.failed_stages),

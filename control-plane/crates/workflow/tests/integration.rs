@@ -1,8 +1,33 @@
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use workflow::compiler;
+
+static TEMP_FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn fixtures_dir() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
     format!("{manifest}/../../../examples")
+}
+
+fn write_temp_fixture(filename: &str, content: &str) -> String {
+    let unique = TEMP_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "workflow_contract_slice_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    fs::create_dir_all(&dir).expect("should create temp fixture directory");
+    let path = PathBuf::from(&dir).join(filename);
+    fs::write(&path, content).expect("should write temp fixture");
+    path.to_string_lossy().into_owned()
+}
+
+fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::plan::RunPlan {
+    let wf_path = write_temp_fixture("workflow.yaml", workflow_yaml);
+    let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
+    compiler::compile(&wf_path, &cat_path).expect("should compile plan")
 }
 
 #[test]
@@ -107,4 +132,277 @@ fn test_compile_full_mvp_live_plan() {
 
     // Verify variables were loaded
     assert!(plan.variables.contains_key("proposal_score_target"));
+}
+
+#[test]
+fn test_compile_n_phase_ordering() {
+    let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
+    let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+
+    let plan = compiler::compile(&wf_path, &cat_path).expect("should compile plan");
+
+    // ── state_11_manual_release: post_approval_tasks have sequential phases (0, 1) ──
+    let s11 = &plan.states["state_11_manual_release"];
+    assert!(
+        s11.is_manual_gate,
+        "state_11 must be a manual_gate"
+    );
+    assert_eq!(
+        s11.post_approval_tasks.len(),
+        2,
+        "state_11 must have 2 post-approval sequence tasks (commit_and_push, build_and_distribute)"
+    );
+    assert_eq!(
+        s11.post_approval_tasks[0].phase, 0,
+        "first post_approval task (commit_and_push) must be phase 0"
+    );
+    assert_eq!(
+        s11.post_approval_tasks[1].phase, 1,
+        "second post_approval task (build_and_distribute) must be phase 1"
+    );
+
+    // ── state_9_implementation_reviewed: parallel(0) → then(1, 2, 3) ──
+    let s9 = &plan.states["state_9_implementation_reviewed"];
+    // Parallel tasks: security_checker and docs_guardian at phase 0
+    let phase_0: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 0).collect();
+    assert_eq!(
+        phase_0.len(),
+        2,
+        "state_9 must have 2 parallel tasks at phase 0 (security_checker, docs_guardian)"
+    );
+    for t in &phase_0 {
+        assert!(t.parallel, "phase 0 tasks in state_9 must be marked parallel");
+    }
+
+    // Then tasks: auditor at phase 1, prepush at phase 2, aggregation at phase 3
+    let phase_1: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 1).collect();
+    assert_eq!(phase_1.len(), 1, "state_9 must have 1 task at phase 1 (auditor)");
+    assert_eq!(
+        phase_1[0].agent.agent_id, "proposal_implementation_auditor",
+        "phase 1 task must be the auditor"
+    );
+
+    let phase_2: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 2).collect();
+    assert_eq!(phase_2.len(), 1, "state_9 must have 1 task at phase 2 (prepush)");
+    assert_eq!(
+        phase_2[0].agent.agent_id, "prepush_code_reviewer",
+        "phase 2 task must be prepush_code_reviewer"
+    );
+
+    let phase_3: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 3).collect();
+    assert_eq!(phase_3.len(), 1, "state_9 must have 1 task at phase 3 (aggregation)");
+    assert_eq!(
+        phase_3[0].agent.agent_id, "lead_orchestrator",
+        "phase 3 task must be lead_orchestrator (aggregate)"
+    );
+
+    // ── state_4_proposal_reviewed: parallel(0) → then(1) ──
+    let s4 = &plan.states["state_4_proposal_reviewed"];
+    let s4_phase_0: Vec<_> = s4.tasks.iter().filter(|t| t.phase == 0).collect();
+    assert_eq!(
+        s4_phase_0.len(),
+        4,
+        "state_4 must have 4 parallel tasks at phase 0"
+    );
+    for t in &s4_phase_0 {
+        assert!(t.parallel, "phase 0 tasks in state_4 must be marked parallel");
+    }
+
+    let s4_phase_1: Vec<_> = s4.tasks.iter().filter(|t| t.phase == 1).collect();
+    assert_eq!(
+        s4_phase_1.len(),
+        1,
+        "state_4 must have 1 then-task at phase 1 (aggregate_proposal_reviews)"
+    );
+    assert_eq!(
+        s4_phase_1[0].task_name, "aggregate_proposal_reviews",
+        "phase 1 task in state_4 must be aggregate_proposal_reviews"
+    );
+    assert!(
+        !s4_phase_1[0].parallel,
+        "then-task must not be marked parallel"
+    );
+}
+
+#[test]
+fn test_output_contract_is_authoritative_and_carries_human_format() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+          outputs:
+            - proposal_review_po
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+contracts:
+  proposal_review_v1:
+    format: json
+    human_format: markdown
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_raw
+    normalized_artifact_name: proposal_review_normalized
+    required_fields:
+      - agent_id
+      - verdict
+  proposal_review_po:
+    format: text
+    human_format: prose
+    machine_format: yaml
+    validation_mode: lenient
+    raw_artifact_name: proposal_review_po_raw
+    normalized_artifact_name: proposal_review_po
+    required_fields:
+      - wrong_field
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+    outputs:
+      - proposal_review_po
+    output_contract: proposal_review_v1
+"#,
+    );
+
+    let task = &plan.states["start"].tasks[0];
+    let schema = task
+        .output_schemas
+        .get("proposal_review_po")
+        .expect("output schema should be resolved");
+
+    assert_eq!(schema.contract_id, "proposal_review_v1");
+    assert_eq!(schema.format, "json");
+    assert_eq!(schema.human_format.as_deref(), Some("markdown"));
+    assert_eq!(schema.machine_format.as_deref(), Some("json"));
+    assert_eq!(schema.validation_mode.as_deref(), Some("strict_structured"));
+    assert_eq!(
+        schema.normalized_artifact_name.as_deref(),
+        Some("proposal_review_normalized")
+    );
+    assert_eq!(
+        schema.raw_artifact_name.as_deref(),
+        Some("proposal_review_raw")
+    );
+    assert_eq!(schema.required_fields, vec!["agent_id", "verdict"]);
+}
+
+#[test]
+fn test_contract_binding_matches_normalized_and_raw_artifacts_exactly() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+          outputs:
+            - proposal_review_normalized
+            - proposal_review_raw
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+contracts:
+  proposal_review_v1:
+    format: json
+    human_format: markdown
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_raw
+    normalized_artifact_name: proposal_review_normalized
+    required_fields:
+      - agent_id
+      - verdict
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+    outputs:
+      - proposal_review_normalized
+      - proposal_review_raw
+"#,
+    );
+
+    let task = &plan.states["start"].tasks[0];
+    let normalized = task
+        .output_schemas
+        .get("proposal_review_normalized")
+        .expect("normalized schema should be resolved");
+    let raw = task
+        .output_schemas
+        .get("proposal_review_raw")
+        .expect("raw schema should be resolved");
+
+    assert_eq!(normalized.contract_id, "proposal_review_v1");
+    assert_eq!(raw.contract_id, "proposal_review_v1");
+    assert_eq!(normalized.normalized_artifact_name.as_deref(), Some("proposal_review_normalized"));
+    assert_eq!(raw.raw_artifact_name.as_deref(), Some("proposal_review_raw"));
+}
+
+#[test]
+fn test_contract_binding_uses_versioned_and_stem_fallbacks() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+          outputs:
+            - proposal_review
+            - proposal_review_v2
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+contracts:
+  proposal_review_v1:
+    format: json
+    human_format: markdown
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - agent_id
+      - verdict
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+    outputs:
+      - proposal_review
+      - proposal_review_v2
+"#,
+    );
+
+    let task = &plan.states["start"].tasks[0];
+    let stem = task
+        .output_schemas
+        .get("proposal_review")
+        .expect("stem fallback should resolve");
+    let versioned = task
+        .output_schemas
+        .get("proposal_review_v2")
+        .expect("versioned fallback should resolve");
+
+    assert_eq!(stem.contract_id, "proposal_review_v1");
+    assert_eq!(versioned.contract_id, "proposal_review_v1");
+    assert_eq!(stem.human_format.as_deref(), Some("markdown"));
+    assert_eq!(versioned.machine_format.as_deref(), Some("json"));
 }

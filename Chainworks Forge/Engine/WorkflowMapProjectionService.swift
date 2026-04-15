@@ -190,16 +190,14 @@ final class WorkflowMapProjectionService {
         if let cursor = run.transitionCursor {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
-                if let nextState = cursor.nextScheduledStateID {
-                    return nextState
-                }
+                return cursor.nextScheduledStateID
             case .terminal:
-                if let lastCompleted = cursor.lastCompletedStateID {
-                    return lastCompleted
-                }
+                return cursor.lastCompletedStateID
             case .awaitingFirstState:
                 break // Fall through to heuristic
             }
+
+            return nil
         }
 
         let sorted = persistedStages.sorted { $0.startedAt < $1.startedAt }
@@ -229,16 +227,14 @@ final class WorkflowMapProjectionService {
         if let cursor = run.transitionCursor {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
-                if let nextState = cursor.nextScheduledStateID {
-                    return nextState
-                }
+                return cursor.nextScheduledStateID
             case .terminal:
-                if let lastCompleted = cursor.lastCompletedStateID {
-                    return lastCompleted
-                }
+                return cursor.lastCompletedStateID
             case .awaitingFirstState:
                 break
             }
+
+            return nil
         }
 
         if let latestPersistedStage, latestPersistedStage.status != .completed, latestPersistedStage.status != .skipped {

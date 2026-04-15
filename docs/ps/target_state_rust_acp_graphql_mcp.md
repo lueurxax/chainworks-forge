@@ -36,7 +36,9 @@
 - artifact metadata truth,
 - recovery truth,
 - session lineage truth,
-- runtime binding truth.
+- runtime binding truth,
+- run compaction truth,
+- archive / supersession truth.
 
 ### 3.2 ACP — транспорт к агентам, но не источник доменной логики
 ACP-рантаймы отвечают за:
@@ -137,6 +139,13 @@ SwiftUI-клиент должен:
 
 Это **главный мозг** системы.
 
+Он также владеет:
+- run compaction policy,
+- artifact supersession rules,
+- archive eligibility rules,
+- projection rebuild after compaction,
+- canonical compact snapshot emission.
+
 ## 5.2 Workflow / Orchestration Layer
 На текущем target state orchestration живёт **внутри самого Rust-сервера**.
 
@@ -178,12 +187,17 @@ SwiftUI-клиент должен:
 - active sessions
 - proposal-loop metrics
 - unresolved backlog / score-lift view
+- compacted run summary
+- archived artifact summary
+- compaction report summary
 
 ## 5.5 GraphQL Layer
 GraphQL публикует:
 - query types,
 - subscriptions,
 - UI-safe mutations / command façades.
+
+Среди обязательных command façades должен существовать и server-owned maintenance command для run compaction.
 
 Важное правило:
 - GraphQL для UI — единственный клиентский API,
@@ -211,6 +225,9 @@ MCP server не должен публиковать внутренние низ�
 
 Он публикует **доменные действия**, а не внутренние ручки.
 
+Среди них должен быть и explicit compaction command, например:
+- `runs.compact`
+
 ## 5.7 Persistence Layer
 Минимальный target state:
 - **SQLite** для server-owned state,
@@ -218,6 +235,25 @@ MCP server не должен публиковать внутренние низ�
 - **SQLite + file paths** для metadata/projections.
 
 Никакой обязательной внешней инфраструктуры.
+
+## 5.8 Run Compaction and Artifact Governance
+Сервер обязан поддерживать server-owned maintenance command для compaction eligible runs.
+
+Этот слой отвечает за:
+- агрессивное уменьшение active artifact surface,
+- archive / supersession policy,
+- duplicate collapse,
+- link repair,
+- projection rebuild after compaction,
+- emission of canonical compact snapshots,
+- compaction reports.
+
+Важное правило target state:
+- compaction доступен только для `completed`, `failed`, `blocked` runs;
+- compaction не разрешён для `running`, `ready`, `waitingApproval`, `pending`.
+
+Модель может помогать с semantic clustering и human-readable summary,
+но destructive apply, archive truth и repair truth всегда остаются server-owned.
 
 ---
 
@@ -256,6 +292,7 @@ MCP — публичный control-plane интерфейс для внешни�
 - `reports.compare`
 - `runtime.health`
 - `experiments.start`
+- `runs.compact`
 
 Примеры resources:
 
@@ -279,6 +316,8 @@ GraphQL publishes read-oriented models such as:
 - `runtimeStatus`
 - `activeSessions`
 - `proposalMetrics(runId)`
+- `compactionStatus(runId)`
+- `compactionReport(runId)`
 
 Обязательная часть target state:
 - **GraphQL subscriptions** для live surfaces.
@@ -299,7 +338,8 @@ GraphQL publishes read-oriented models such as:
 - открывать детальные представления;
 - инициировать минимальный набор operator actions через GraphQL mutations;
 - показывать projections, а не вычислять их;
-- быть заменяемым.
+- быть заменяемым;
+- уметь запускать `Compact Run` для eligible runs и показывать compacted result.
 
 ## 7.2 Что клиент НЕ должен делать
 - считать, какой stage следующий;
@@ -320,6 +360,7 @@ GraphQL publishes read-oriented models such as:
 - retry / cancel / reset там, где это разрешил сервер
 - compare reports
 - открыть artifacts / evidence
+- compact completed / failed / blocked runs
 
 И всё это должно проходить через server-owned command semantics.
 
@@ -331,6 +372,11 @@ GraphQL publishes read-oriented models such as:
 - **Commands / mutations для UI**: GraphQL
 - **Commands / control для внешних клиентов**: MCP
 - **Reads / projections для UI**: GraphQL
+
+Compaction follows the same split:
+- UI triggers run compaction through GraphQL mutation
+- external operators/agents trigger it through MCP
+- all compaction semantics remain server-owned
 
 ### Важное уточнение
 MCP остаётся canonical внешним control plane,  
@@ -355,6 +401,9 @@ SQLite хранит:
 - reports metadata
 - experiment metadata
 - audit/events metadata where needed
+- run compaction records
+- artifact supersession / archive pointers
+- compact snapshot metadata
 
 ## 9.2 File artifact store
 Отдельно на диске:
@@ -365,6 +414,8 @@ SQLite хранит:
 - runtime receipts
 - evidence bundles
 - visual artifacts
+- archived compact bundles
+- run compaction snapshots
 
 В SQLite хранятся:
 - paths
@@ -479,6 +530,9 @@ Target state должен поддерживать:
 - recovery recommendations
 - proposal-loop quality metrics
 - report truth
+- compaction status
+- compact snapshot truth
+- archive/supersession truth
 
 ### 13.3 Operator observability
 - active run timeline
@@ -486,6 +540,9 @@ Target state должен поддерживать:
 - unresolved backlog
 - failed-stage evidence
 - runtime health panel
+- compaction report
+- compacted run summary
+- optional archived-artifact access path
 
 ### 13.4 GraphQL live UX
 Поскольку subscriptions считаются критически необходимыми, thin client должен иметь live surfaces без постоянного polling:
@@ -505,7 +562,8 @@ High-level путь:
 2. Потом MCP northbound control plane становится доступен.
 3. Потом GraphQL projections и subscriptions стабилизируются.
 4. Потом SwiftUI-клиент становится thin client.
-5. Потом старый client-owned orchestration слой умирает.
+5. Server-owned maintenance commands such as run compaction become the only valid compaction path.
+6. Потом старый client-owned orchestration слой умирает.
 
 ---
 
@@ -521,7 +579,8 @@ Target state не требует сейчас:
 - server cloud migration,
 - сложной auth federation,
 - строгих exactly-once guarantees,
-- полного отказа от локального режима.
+- полного отказа от локального режима,
+- compaction для running runs.
 
 ---
 
@@ -540,6 +599,8 @@ Target state не требует сейчас:
 9. UI можно переписать или заменить без риска потерять workflow semantics.
 10. Внешний агент-клиент может управлять системой через MCP без участия UI.
 11. Server-owned projections достаточны, чтобы UI не реконструировал правду сам.
+12. Server-owned run compaction exists for `completed`, `failed`, and `blocked` runs.
+13. Compaction emits a canonical compact snapshot, preserves archive truth, and materially reduces active artifact noise.
 
 ---
 
@@ -620,4 +681,5 @@ SwiftUI остаётся удобной оболочкой, но переста�
 - лучшую заменяемость UI,
 - лучшую автоматизируемость,
 - более явную product truth,
+- server-owned maintenance operations вроде run compaction,
 - и гораздо более здоровую архитектуру для дальнейшего роста.

@@ -107,12 +107,14 @@ import SwiftData
         if let cursor = transitionCursor {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
-                if let next = cursor.nextScheduledStateID { return next }
+                return cursor.nextScheduledStateID
             case .terminal:
-                if let last = cursor.lastCompletedStateID { return last }
+                return cursor.lastCompletedStateID
             case .awaitingFirstState:
                 break
             }
+
+            return nil
         }
         // Fallback for pre-P032 runs or initial state.
         let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }

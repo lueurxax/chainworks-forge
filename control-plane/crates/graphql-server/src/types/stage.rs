@@ -17,6 +17,7 @@ pub struct GqlStageExecution {
     /// Populated from the projection layer; None when the projection hasn't been built yet.
     pub has_artifacts: Option<bool>,
     pub has_pending_approval: Option<bool>,
+    pub has_validation_failure: Option<bool>,
 }
 
 impl From<StageExecution> for GqlStageExecution {
@@ -34,6 +35,7 @@ impl From<StageExecution> for GqlStageExecution {
             completed_at: s.completed_at.map(|t| t.to_rfc3339()),
             has_artifacts: None,
             has_pending_approval: None,
+            has_validation_failure: None,
         }
     }
 }
@@ -53,6 +55,7 @@ impl From<StageSummaryRow> for GqlStageExecution {
             completed_at: r.completed_at,
             has_artifacts: Some(r.has_artifacts),
             has_pending_approval: Some(r.has_pending_approval),
+            has_validation_failure: Some(r.has_validation_failure),
         }
     }
 }

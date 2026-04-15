@@ -132,6 +132,8 @@ pub struct OutputSchema {
 }
 ```
 
+`human_format` must be parsed from catalog YAML in `workflow/src/catalog.rs` and then carried through `workflow/src/compiler.rs` into `workflow/src/plan.rs`; it is part of full schema parity, not a compiler-only default.
+
 **Validation result:**
 
 ```rust
@@ -218,6 +220,8 @@ pub struct ValidationFailureRecord {
     pub timestamp: DateTime<Utc>,
     pub agent_id: String,
     pub stage_id: String,
+    pub stage_execution_id: String,
+    pub agent_execution_id: String,
     pub run_id: RunId,
     pub output_results: Vec<OutputValidationResult>,
     pub failure_summary: String,
@@ -275,6 +279,8 @@ CREATE TABLE IF NOT EXISTS validation_failure_records (
     run_id TEXT NOT NULL REFERENCES runs(id),
     stage_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
+    stage_execution_id TEXT NOT NULL REFERENCES stage_executions(id),
+    agent_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
     timestamp TEXT NOT NULL,
     failure_class TEXT NOT NULL,
     failure_summary TEXT NOT NULL,
@@ -283,8 +289,8 @@ CREATE TABLE IF NOT EXISTS validation_failure_records (
 );
 
 CREATE INDEX idx_vfr_run_id ON validation_failure_records(run_id);
-CREATE INDEX idx_vfr_run_stage ON validation_failure_records(run_id, stage_id);
-CREATE INDEX idx_vfr_run_stage_agent ON validation_failure_records(run_id, stage_id, agent_id);
+CREATE INDEX idx_vfr_run_stage_execution ON validation_failure_records(run_id, stage_execution_id);
+CREATE INDEX idx_vfr_run_stage_agent_execution ON validation_failure_records(run_id, stage_execution_id, agent_execution_id);
 ```
 
 ### 2g. Northbound Reader Wiring — Projection and Current MCP Surface
@@ -303,13 +309,14 @@ Validation status must reach operator/report readers through the **existing** da
 
 **Stage-level validation status:**
 
-Add `has_validation_failure BOOLEAN DEFAULT FALSE` to `stage_summaries` (the projection table). During `projections::rebuild_all_for_run`, derive from `validation_failure_records` join:
+Add `has_validation_failure BOOLEAN DEFAULT FALSE` to `stage_summaries` (the projection table). During `projections::rebuild_all_for_run`, derive from `validation_failure_records` by exact `stage_execution_id`, not by logical `stage_id`:
 
 ```sql
 UPDATE stage_summaries SET has_validation_failure = TRUE
 WHERE stage_execution_id IN (
-    SELECT DISTINCT se.id FROM stage_executions se
-    JOIN validation_failure_records vfr ON vfr.run_id = se.run_id AND vfr.stage_id = se.stage_id
+    SELECT DISTINCT vfr.stage_execution_id
+    FROM validation_failure_records vfr
+    WHERE vfr.run_id = stage_summaries.run_id
 );
 ```
 
@@ -325,10 +332,13 @@ The existing `reports.get` MCP tool already filters artifacts by `report_kind.is
 
 Concrete northbound path for decoded failure data:
 
-- `validation_failure_records` table (authoritative write path)
-- `GqlArtifact` decoding for `report_kind = "validation_failure"`
-- `report://{run_id}` artifact list (typed payload)
-- `GqlStageExecution.has_validation_failure` from `stage_summaries` for status + full record from artifact payload when `has_validation_failure == true`
+- `validation_failure_records.record_json` is the authoritative typed payload source
+- `db/src/repos/validation.rs` provides lookup by `agent_execution_id`, `stage_execution_id`, and artifact identity as needed by current readers
+- `graphql-server/src/types/artifact.rs` joins/loads `record_json` for `report_kind = "validation_failure"` and decodes it into the typed `validationFailureRecord`
+- `mcp-server/src/tools/reports.rs` includes the same decoded payload in `reports.get`
+- `mcp-server/src/server.rs` includes the same decoded payload in `report://{run_id}`
+- `GqlStageExecution.has_validation_failure` from `stage_summaries` remains the lightweight status bit; the decoded record is delivered through the artifact/report surfaces, not reconstructed from booleans
+- `validationFailureRecord` decoding includes stable reader fields (`failureSummary`, `missingFields`, `failureClass`, `recoveryRecommendation`, plus output-level metadata), not only `report_kind` presence.
 
 No new MCP tool is introduced.
 
@@ -343,8 +353,11 @@ In `db/repos/projections.rs` `rebuild_all_for_run`, add a step that sets `has_va
 | File | Change |
 |---|---|
 | `db/src/repos/projections.rs` | Derive `has_validation_failure` during projection rebuild |
+| `db/src/repos/validation.rs` | Provide attempt-aware reads of `ValidationFailureRecord.record_json` for GraphQL / MCP readers |
+| `graphql-server/src/types/artifact.rs` | Decode `validation_failure_records.record_json` into typed `validationFailureRecord` payload on `GqlArtifact` |
 | `graphql-server/src/types/stage.rs` | Add `has_validation_failure: bool` to `GqlStageExecution` |
-| `mcp-server/src/server.rs` | Ensure `chainworks://runs/{run_id}/stages` reads `has_validation_failure` from `StageSummaryRow`, and `report://{run_id}` includes validation-failure artifacts through the current report resource path |
+| `mcp-server/src/tools/reports.rs` | Include decoded `validationFailureRecord` payload in `reports.get` for `report_kind = "validation_failure"` |
+| `mcp-server/src/server.rs` | Ensure `chainworks://runs/{run_id}/stages` reads `has_validation_failure` from `StageSummaryRow`, and `report://{run_id}` includes validation-failure artifacts plus decoded `validationFailureRecord` payload through the current report resource path |
 
 ---
 
@@ -356,15 +369,18 @@ In `db/repos/projections.rs` `rebuild_all_for_run`, add a step that sets `has_va
 | `acp/src/lib.rs` | Extend `ExecutionResult` with `discovered_artifacts: Vec<DiscoveredArtifact>` |
 | `domain/src/validation.rs` | **NEW** — `ValidationFailureRecord`, `OutputValidationResult`, `RecoveryRecommendation` |
 | `engine/src/contracts.rs` | **NEW** — `validate_output()`, `validate_task_outputs()` with full validation-mode parity (`human_only`, `strict_structured`, `structured_with_human_companion`) |
-| `workflow/src/plan.rs` | Extend `OutputSchema` with `validation_mode`, `machine_format`, `normalized_artifact_name`, `raw_artifact_name` |
-| `workflow/src/compiler.rs` | Extract additional contract fields from catalog into `OutputSchema` |
+| `workflow/src/catalog.rs` | Extend `ContractDef` parsing with `human_format` so full schema parity is ingestible from YAML |
+| `workflow/src/plan.rs` | Extend `OutputSchema` with `validation_mode`, `machine_format`, `human_format`, `normalized_artifact_name`, `raw_artifact_name` |
+| `workflow/src/compiler.rs` | Extract additional contract fields from catalog into `OutputSchema`, including `human_format` |
 | `engine/src/executor.rs` | Persistence ordering: persist raw → validate → persist failure record → settle. Metadata binding from compiled plan. |
 | `db/migrations/005_validation_records.sql` | **NEW** — `validation_failure_records` table |
 | `db/src/repos/validation.rs` | **NEW** — CRUD for validation failure records |
-| `db/src/repos/projections.rs` | Derive `has_validation_failure` on `stage_summaries` during `rebuild_all_for_run` from `validation_failure_records` join |
+| `db/src/repos/projections.rs` | Derive `has_validation_failure` on `stage_summaries` during `rebuild_all_for_run` from `validation_failure_records` by exact `stage_execution_id` |
 | `db/migrations/005_validation_records.sql` | Also add `has_validation_failure BOOLEAN DEFAULT FALSE` to `stage_summaries` |
 | `graphql-server/src/types/stage.rs` | Add `has_validation_failure: bool` to `GqlStageExecution` (reads from projection `stage_summaries`, not raw `stage_executions`) |
-| `mcp-server/src/server.rs` | Bind validation status / validation-failure artifacts to the existing MCP resources `chainworks://runs/{run_id}/stages` and `report://{run_id}` |
+| `graphql-server/src/types/artifact.rs` | Surface decoded `ValidationFailureRecord` payload from `validation_failure_records.record_json` on validation-failure artifacts |
+| `mcp-server/src/tools/reports.rs` | Surface decoded `ValidationFailureRecord` payload in `reports.get` from `validation_failure_records.record_json` |
+| `mcp-server/src/server.rs` | Bind validation status / validation-failure artifacts to the existing MCP resources `chainworks://runs/{run_id}/stages` and `report://{run_id}`, using `validation_failure_records.record_json` as the typed payload source |
 | `engine/src/lib.rs` | Register `pub mod contracts` |
 
 ---
@@ -375,13 +391,14 @@ In `db/repos/projections.rs` `rebuild_all_for_run`, add a step that sets `has_va
 2. Filesystem-diff artifacts still discovered (backward compat). Envelope outputs override filesystem outputs with the same name.
 3. Discovered artifacts inherit `contract_id`, `format`, and `required_fields` from `CompiledTask.output_schemas` — not from provider-scoped stubs.
 4. If an agent returns `proposal_review_summary` via envelope with missing `average_score` field → raw output is persisted first, then `ValidationFailureRecord` is persisted with `failure_class: OutputContractMismatch` and `missing_fields: ["average_score"]`, then work item settles as Failed.
-5. `validation_failure_records` table has a row with indexed `run_id` + `stage_id` + `agent_id` for report/recovery queries.
-6. Projection-backed `stage_summaries.has_validation_failure` is `true` when a `validation_failure_records` row exists. GraphQL `GqlStageExecution.hasValidationFailure` and MCP resource `chainworks://runs/{run_id}/stages` both read from that projection. Validation failure artifacts appear in `reports.get` with `report_kind = "validation_failure"` and in the existing MCP report resource `report://{run_id}`. No new `stages.list` MCP tool is introduced (current MCP only has `stages.retry`). No operator path reads from `work_items.payload_json`.
+5. `validation_failure_records` table has an attempt-aware row keyed for report/recovery queries, including `stage_execution_id` and `agent_execution_id`, so failed first attempts remain inspectable without smearing later retries.
+6. Projection-backed `stage_summaries.has_validation_failure` is `true` only for the exact `stage_execution_id` that owns a `validation_failure_records` row. GraphQL `GqlStageExecution.hasValidationFailure` and MCP resource `chainworks://runs/{run_id}/stages` both read from that projection. A later successful retry in the same run does not inherit a stale flag from an earlier failed attempt.
 7. `human_only` validation mode → `Passed` (no machine check). `strict_structured` with missing JSON fields → `Failed`. `structured_with_human_companion` with missing JSON fields → `Failed`.
 8. Non-JSON `machine_format` with non-empty content → `Passed`. Empty content → `Failed`.
-9. `OutputSchema` in compiled plan carries `validation_mode` and `machine_format` from catalog contracts — not just `format` and `required_fields`.
+9. `OutputSchema` in compiled plan carries `validation_mode`, `machine_format`, and `human_format` from catalog contracts — not just `format` and `required_fields`.
 10. Recovery recommendation in `ValidationFailureRecord` suggests `retry_failed_agent` for contract mismatch, `operator_inspection` for no output produced.
 11. Persisted `ValidationFailureRecord` preserves `receipt_exists`, `transcript_exists`, and both raw/normalized artifact identity fields so failed-stage evidence, run reports, recovery, GraphQL, and MCP resources consume the same durable failure truth.
+12. `reports.get`, `report://{run_id}`, and `GqlArtifact` expose the decoded `ValidationFailureRecord` payload from `validation_failure_records.record_json`, not just artifact metadata or `report_kind` presence.
 
 ---
 

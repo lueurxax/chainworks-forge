@@ -311,6 +311,8 @@ fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
 ///
 /// New regular files created inside `req.workspace_root` during the session
 /// are returned as `artifact_paths` (workspace diff: post-session − pre-session).
+/// Declared `expected_output_paths` are also returned when they exist after the
+/// session, even if the agent overwrote a pre-existing canonical file.
 pub async fn run_acp_session(
     child: &mut Child,
     req: &ExecutionRequest,
@@ -398,7 +400,13 @@ pub async fn run_acp_session(
     }
 
     // Snapshot workspace *before* the session so we can diff for new files.
-    let pre_files = snapshot_workspace(&req.workspace_root);
+    // For write-enabled agents, snapshot the worktree instead (Proposal 007).
+    let snapshot_root = if req.worktree_write_enabled {
+        req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
+    } else {
+        &req.workspace_root
+    };
+    let pre_files = snapshot_workspace(snapshot_root);
 
     // ── Phase 1: initialize ──────────────────────────────────────────────────
     let init_id = next_id!();
@@ -428,9 +436,22 @@ pub async fn run_acp_session(
     let sn_id = next_id!();
     {
         // Build session/new params: fixed fields + adapter-specific extras.
+        // Proposal 007: agents with dedicated/shared worktree strategy use
+        // worktree_root as cwd — both write-enabled (code_writer) and
+        // read-only (commit_and_push, build_archive).
+        let uses_worktree_cwd = req.worktree_write_enabled
+            || matches!(
+                req.worktree_strategy.as_deref(),
+                Some("dedicated") | Some("shared_implementation_worktree")
+            );
+        let effective_cwd = if uses_worktree_cwd {
+            req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
+        } else {
+            &req.workspace_root
+        };
         let mut sn_params = serde_json::json!({
             "mcpServers": [],
-            "cwd": req.workspace_root,
+            "cwd": effective_cwd,
             "model": config.model,
             "mode": config.mode,
         });
@@ -693,11 +714,16 @@ pub async fn run_acp_session(
     }
 
     // ── Artifact discovery: workspace filesystem diff ────────────────────────
-    let post_files = snapshot_workspace(&req.workspace_root);
+    let post_files = snapshot_workspace(snapshot_root);
     let mut new_files: Vec<String> = post_files
         .difference(&pre_files)
         .cloned()
         .collect();
+    for path in &req.expected_output_paths {
+        if std::path::Path::new(path).is_file() && !new_files.iter().any(|p| p == path) {
+            new_files.push(path.clone());
+        }
+    }
     new_files.sort(); // deterministic ordering
 
     Ok((AgentStatus::Completed, new_files))

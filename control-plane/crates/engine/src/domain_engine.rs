@@ -158,6 +158,11 @@ mod tests {
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
         }
     }
 

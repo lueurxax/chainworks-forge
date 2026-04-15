@@ -47,6 +47,7 @@ pub struct StageSummaryRow {
     /// Populated from stage_summaries; false if projection not yet built.
     pub has_artifacts: bool,
     pub has_pending_approval: bool,
+    pub has_validation_failure: bool,
 }
 
 /// List active runs via the projection layer.
@@ -149,7 +150,8 @@ pub async fn list_stages_projection(pool: &SqlitePool, run_id: &str) -> Result<V
                   COALESCE(ss.status, se.status) AS status,
                   COALESCE(ss.attempt_number, se.attempt_number) AS attempt_number,
                   COALESCE(ss.has_artifacts, 0) AS has_artifacts,
-                  COALESCE(ss.has_pending_approval, 0) AS has_pending_approval
+                  COALESCE(ss.has_pending_approval, 0) AS has_pending_approval,
+                  COALESCE(ss.has_validation_failure, 0) AS has_validation_failure
            FROM stage_executions se
            LEFT JOIN stage_summaries ss ON ss.stage_execution_id = se.id
            WHERE se.run_id = ?
@@ -174,6 +176,7 @@ pub async fn list_stages_projection(pool: &SqlitePool, run_id: &str) -> Result<V
                 completed_at: r.get("completed_at"),
                 has_artifacts: r.get::<i64, _>("has_artifacts") != 0,
                 has_pending_approval: r.get::<i64, _>("has_pending_approval") != 0,
+                has_validation_failure: r.get::<i64, _>("has_validation_failure") != 0,
             })
         })
         .collect()
@@ -264,7 +267,7 @@ pub async fn rebuild_stage_summaries(pool: &SqlitePool, run_id: RunId) -> Result
 
     sqlx::query(
         r#"INSERT OR REPLACE INTO stage_summaries
-           (stage_execution_id, run_id, stage_id, label, status, attempt_number, has_artifacts, has_pending_approval, updated_at)
+           (stage_execution_id, run_id, stage_id, label, status, attempt_number, has_artifacts, has_pending_approval, has_validation_failure, updated_at)
            SELECT
              se.id,
              se.run_id,
@@ -274,6 +277,7 @@ pub async fn rebuild_stage_summaries(pool: &SqlitePool, run_id: RunId) -> Result
              se.attempt_number,
              EXISTS(SELECT 1 FROM artifacts art WHERE art.run_id = se.run_id AND art.stage_id = se.stage_id),
              EXISTS(SELECT 1 FROM approvals ap WHERE ap.run_id = se.run_id AND ap.stage_id = se.stage_id AND ap.decision IN ('pending','requested')),
+             EXISTS(SELECT 1 FROM validation_failure_records vfr WHERE vfr.run_id = se.run_id AND vfr.stage_execution_id = se.id),
              ?
            FROM stage_executions se
            WHERE se.run_id = ?"#,

@@ -8,7 +8,8 @@ use domain::run::{Run, RunStatus};
 const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, workspace_root,
              artifact_root, started_at, completed_at, cancellation_requested_at,
              cancellation_settled_at, current_state, workflow_yaml_path,
-             agent_catalog_yaml_path"#;
+             agent_catalog_yaml_path, worktree_root, base_branch, base_revision,
+             target_branch, delivery_configuration_json"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     let id = run.id.to_string();
@@ -23,8 +24,10 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
         r#"
         INSERT INTO runs (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root,
                           started_at, completed_at, cancellation_requested_at, cancellation_settled_at,
-                          current_state, workflow_yaml_path, agent_catalog_yaml_path)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                          current_state, workflow_yaml_path, agent_catalog_yaml_path,
+                          worktree_root, base_branch, base_revision, target_branch,
+                          delivery_configuration_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
         "#,
     )
     .bind(id)
@@ -41,6 +44,11 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     .bind(&run.current_state)
     .bind(&run.workflow_yaml_path)
     .bind(&run.agent_catalog_yaml_path)
+    .bind(&run.worktree_root)
+    .bind(&run.base_branch)
+    .bind(&run.base_revision)
+    .bind(&run.target_branch)
+    .bind(&run.delivery_configuration_json)
     .execute(pool)
     .await
     .context("insert run")?;
@@ -163,6 +171,30 @@ pub async fn mark_completed(
     Ok(())
 }
 
+/// Update worktree fields after provisioning (Proposal 007).
+pub async fn update_worktree_fields(
+    pool: &SqlitePool,
+    id: RunId,
+    worktree_root: &str,
+    base_branch: &str,
+    base_revision: &str,
+    target_branch: &str,
+) -> Result<()> {
+    let id_str = id.to_string();
+    sqlx::query(
+        r#"UPDATE runs SET worktree_root = ?1, base_branch = ?2, base_revision = ?3, target_branch = ?4 WHERE id = ?5"#,
+    )
+    .bind(worktree_root)
+    .bind(base_branch)
+    .bind(base_revision)
+    .bind(target_branch)
+    .bind(id_str)
+    .execute(pool)
+    .await
+    .context("update run worktree fields")?;
+    Ok(())
+}
+
 fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
     let id: String = r.get("id");
     let idea_id: String = r.get("idea_id");
@@ -202,6 +234,11 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
         current_state: r.get("current_state"),
         workflow_yaml_path: r.get("workflow_yaml_path"),
         agent_catalog_yaml_path: r.get("agent_catalog_yaml_path"),
+        worktree_root: r.get("worktree_root"),
+        base_branch: r.get("base_branch"),
+        base_revision: r.get("base_revision"),
+        target_branch: r.get("target_branch"),
+        delivery_configuration_json: r.get("delivery_configuration_json"),
     })
 }
 

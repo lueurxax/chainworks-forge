@@ -175,6 +175,18 @@ PROPOSAL_037_TESTS=(
   "Chainworks ForgeTests/RunTimelineInspectorViewTests"
 )
 
+PROPOSAL_044_TESTS=(
+  "test_approve_manual_gate_with_post_approval_tasks_sets_running"
+  "test_approve_simple_manual_gate_settles_completed"
+  "test_compile_n_phase_ordering"
+  "test_post_approval_tasks_enqueued_after_approval"
+  "test_end_state_with_tasks_does_not_short_circuit"
+  "test_n_phase_sequence_ordering"
+  "test_post_approval_retry_requires_fresh_approval"
+  "test_simple_manual_gate_no_regression"
+  "test_state_11_to_state_12_happy_path"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 LAST_BUILD_DERIVED_DATA_PATH=""
 
@@ -1181,6 +1193,8 @@ Available gates:
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
+  proposal-044    Proposal 044 post-approval task execution and release gate completion gate
+  proposal-045    Proposal 045 deterministic release operations gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1452,6 +1466,25 @@ case "$GATE" in
     guard_direct_run_insertion
     run_build "proposal-037"
     run_split_targeted_gate "proposal-037" "${PROPOSAL_037_TESTS[@]}"
+    ;;
+  proposal-044|p044)
+    log "Proposal 044 control-plane gate: post-approval + N-phase + end-state"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --workspace 2>&1
+    )
+    log "Proposal 044 control-plane gate passed"
+    ;;
+  proposal-045|p045)
+    log "Proposal 045 control-plane gate: deterministic release operations"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p engine --test integration test_start_run_persists_delivery_configuration_json -- --exact --nocapture &&
+      cargo test -p engine --test release -- --nocapture &&
+      cargo test -p graphql-server -- --nocapture &&
+      cargo test -p mcp-server -- --nocapture
+    )
+    log "Proposal 045 control-plane gate passed"
     ;;
   full)
     check_idle_environment strict

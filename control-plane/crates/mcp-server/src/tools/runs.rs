@@ -23,7 +23,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "workspace_root": { "type": "string" },
                     "artifact_root": { "type": "string" },
                     "workflow_yaml_path": { "type": "string", "description": "Path to workflow YAML file (enables state-machine execution)" },
-                    "agent_catalog_yaml_path": { "type": "string", "description": "Path to agent catalog YAML file" }
+                    "agent_catalog_yaml_path": { "type": "string", "description": "Path to agent catalog YAML file" },
+                    "delivery_configuration_json": { "type": "string", "description": "Frozen delivery configuration JSON for repo-backed runs" }
                 }
             }),
         },
@@ -95,6 +96,9 @@ pub async fn execute(
             let agent_catalog_yaml_path = params["agent_catalog_yaml_path"]
                 .as_str()
                 .map(String::from);
+            let delivery_configuration_json = params["delivery_configuration_json"]
+                .as_str()
+                .map(String::from);
 
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
@@ -102,6 +106,7 @@ pub async fn execute(
                 workflow_title,
                 workspace_root,
                 artifact_root,
+                delivery_configuration_json,
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
             });
@@ -141,5 +146,73 @@ pub async fn execute(
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::Utc;
+    use db::pool::create_pool;
+    use db::repos::{ideas, runs};
+    use domain::idea::{Idea, IdeaStatus};
+    use domain::ids::IdeaId;
+    use engine::event_bus;
+    use engine::work_queue::WorkQueue;
+    fn make_idea(id: IdeaId) -> Idea {
+        Idea {
+            id,
+            title: "Test idea".into(),
+            body: "body".into(),
+            workspace_root_path: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        }
+    }
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+    }
+
+    fn make_command_handler(pool: sqlx::SqlitePool) -> CommandHandler {
+        let events = event_bus::new_bus(64);
+        let work_queue = WorkQueue::new(pool.clone());
+        CommandHandler::new(pool, events, work_queue)
+    }
+
+    #[tokio::test]
+    async fn runs_start_persists_delivery_configuration_json() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let params = serde_json::json!({
+            "idea_id": idea_id.to_string(),
+            "workflow_id": "wf-start",
+            "workflow_title": "Start Run",
+            "workspace_root": "/tmp/ws",
+            "artifact_root": "/tmp/art",
+            "workflow_yaml_path": null,
+            "agent_catalog_yaml_path": null,
+            "delivery_configuration_json": "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+        });
+
+        let result = execute("runs.start", params, &pool, &handler).await.unwrap();
+        let run_id = result["id"].as_str().expect("run id");
+        let run = runs::find_by_id(&pool, run_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            run.delivery_configuration_json,
+            Some(
+                "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                    .to_string()
+            )
+        );
     }
 }

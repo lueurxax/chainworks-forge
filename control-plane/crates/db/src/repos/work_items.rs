@@ -42,11 +42,17 @@ pub async fn claim_next(pool: &SqlitePool) -> Result<Option<WorkItem>> {
     let now = Utc::now().to_rfc3339();
     let pending_status = WorkItemStatus::Pending.to_string();
 
+    // FIFO ordering with a deterministic tiebreaker. Without `rowid ASC`, two
+    // work items enqueued within the same RFC3339 millisecond can be returned
+    // in undefined order — a nondeterminism source that flakes tests which
+    // depend on enqueue order (e.g. release tests that expect commit before
+    // publish). `rowid` is SQLite's monotonic insert sequence, guaranteeing
+    // true FIFO semantics in the tiebreaker case.
     let row = sqlx::query(
         r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
            FROM work_items
            WHERE status = ?1 AND scheduled_at <= ?2
-           ORDER BY scheduled_at ASC
+           ORDER BY scheduled_at ASC, rowid ASC
            LIMIT 1"#,
     )
     .bind(&pending_status)

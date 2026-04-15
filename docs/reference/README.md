@@ -47,6 +47,7 @@ Historical reference material that is no longer part of the canonical runtime ar
 - [idea-lifecycle.md](idea-lifecycle.md) — Active vs archived idea contract, archive/restore eligibility, cross-surface truth
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
 - [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, evidence export
+- [045-deterministic-release-operations.md](045-deterministic-release-operations.md) — Deterministic Rust-native git/publish execution, canonical release artifacts, and `delivery_receipt` settlement
 - [mvp-sign-off.md](mvp-sign-off.md) — benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
 - [current-system-baseline.md](current-system-baseline.md) — current-head subsystem map and reusable baseline for review and planning work
 

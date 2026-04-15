@@ -3,6 +3,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{IdeaId, RunId};
 
+/// Frozen delivery configuration for repo-backed runs (Proposal 007).
+/// Matches Swift `DeliveryConfiguration`. Persisted as JSON on the Run.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeliveryConfiguration {
+    /// Repository identity (canonicalized).
+    pub repo_identifier: String,
+    /// Absolute path to the repository root.
+    pub repo_root: String,
+    /// Base branch for worktree creation (e.g. "main").
+    pub base_branch: String,
+    /// Base path for worktree directories.
+    pub worktree_base_path: String,
+    /// Target branch for the run's worktree.
+    pub target_branch: String,
+    /// Release target identifier.
+    #[serde(default)]
+    pub release_target_id: Option<String>,
+    /// Release mode: "sandbox" or "staging".
+    #[serde(default)]
+    pub release_mode: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -81,4 +103,17 @@ pub struct Run {
     pub workflow_yaml_path: Option<String>,
     /// Path to the agent catalog YAML file.
     pub agent_catalog_yaml_path: Option<String>,
+    // ── Worktree fields (Proposal 007) ──────────────────────────────────
+    /// Provisioned worktree root path. Set after `WorktreeProvisioner::provision()`.
+    pub worktree_root: Option<String>,
+    /// Base branch the worktree was created from (e.g. "main").
+    pub base_branch: Option<String>,
+    /// Base revision (commit hash) at the time of worktree provisioning.
+    pub base_revision: Option<String>,
+    /// Target branch created for the worktree (e.g. "cw/auth-flow/a1b2c3d4").
+    pub target_branch: Option<String>,
+    /// Frozen delivery configuration JSON (Proposal 007).
+    /// Set at run start for repo-backed runs. Consumed by WorktreeProvisioner,
+    /// RepoSafetyGuard, release agents, and evidence export.
+    pub delivery_configuration_json: Option<String>,
 }

@@ -69,7 +69,9 @@ impl QueryRoot {
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
         let pool = ctx.data::<SqlitePool>()?;
-        let item = projections::find_run_projection(pool, id.as_str()).await?;
+        let run_id: RunId =
+            id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let item = runs::find_by_id(pool, run_id).await?;
         Ok(item.map(GqlRun::from))
     }
 
@@ -104,6 +106,7 @@ impl MutationRoot {
         workflow_title: String,
         workspace_root: String,
         artifact_root: String,
+        delivery_configuration_json: Option<String>,
     ) -> Result<GqlRun> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -117,6 +120,7 @@ impl MutationRoot {
             workflow_title,
             workspace_root,
             artifact_root,
+            delivery_configuration_json,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
         });
@@ -382,4 +386,391 @@ pub struct GqlRuntimeEvent {
     /// "session_started" | "session_completed" | "session_failed"
     pub event_kind: String,
     pub timestamp: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_graphql::Request;
+    use chrono::Utc;
+    use db::pool::create_pool;
+    use db::repos::{artifacts, ideas, projections, runs};
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::idea::{Idea, IdeaStatus};
+    use domain::ids::{ArtifactId, IdeaId, RunId};
+    use domain::validation::{
+        ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
+        ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
+    };
+    use engine::event_bus;
+    use engine::work_queue::WorkQueue;
+    use std::sync::Arc;
+
+    fn make_idea(id: IdeaId) -> Idea {
+        Idea {
+            id,
+            title: "Test idea".into(),
+            body: "body".into(),
+            workspace_root_path: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        }
+    }
+
+    fn make_run(id: RunId, idea_id: IdeaId) -> domain::run::Run {
+        domain::run::Run {
+            id,
+            idea_id,
+            status: domain::run::RunStatus::Ready,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/tmp/ws".into(),
+            artifact_root: "/tmp/art".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: Some(
+                "{\"repo_identifier\":\"repo-3\",\"repo_root\":\"/repo-3\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                    .into(),
+            ),
+        }
+    }
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+    }
+
+    fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
+        let events = event_bus::new_bus(64);
+        let work_queue = WorkQueue::new(pool.clone());
+        Arc::new(CommandHandler::new(pool, events, work_queue))
+    }
+
+    async fn seed_validation_attempt(
+        pool: &sqlx::SqlitePool,
+        run_id: RunId,
+    ) -> (domain::ids::StageExecutionId, domain::ids::AgentExecutionId) {
+        let stage_id = domain::ids::StageExecutionId::new();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        db::repos::stages::insert(
+            pool,
+            &domain::stage::StageExecution {
+                id: stage_id,
+                run_id,
+                stage_id: "stage_1".to_string(),
+                label: "Stage 1".to_string(),
+                status: domain::stage::StageStatus::Failed,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: Some(domain::stage::StageSettlementKind::Failed),
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                owner_agent: Some("validation_agent".to_string()),
+                provider: Some("system".to_string()),
+                model: None,
+                stage_type: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::agent_executions::insert(
+            pool,
+            &domain::agent::AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: stage_id,
+                agent_id: "validation_agent".to_string(),
+                provider: "system".to_string(),
+                model: None,
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                status: domain::agent::AgentStatus::Failed,
+            },
+        )
+        .await
+        .unwrap();
+        (stage_id, agent_execution_id)
+    }
+
+    fn validation_failure_payload(run_id: RunId) -> serde_json::Value {
+        serde_json::json!({
+            "id": "33333333-3333-3333-3333-333333333333",
+            "timestamp": "2026-04-15T09:30:00Z",
+            "agentID": "validation_agent",
+            "stageID": "stage_1",
+            "runID": run_id.to_string(),
+            "outputResults": [{
+                "outputName": "report",
+                "contractID": "report_v1",
+                "status": "failed",
+                "missingFields": ["summary"],
+                "validationError": "Missing required fields: summary",
+                "rawPayloadSize": 17
+            }],
+            "failureSummary": "report: Missing required fields: summary",
+            "failureClass": "output_contract_mismatch",
+            "contractMetadata": [{
+                "outputName": "report",
+                "contractID": "report_v1",
+                "machineFormat": "json",
+                "validationMode": "strict_structured",
+                "requiredFieldCount": 1,
+                "rawArtifactName": "report_raw",
+                "normalizedArtifactName": "report"
+            }],
+            "rawOutputExists": true,
+            "receiptExists": false,
+            "transcriptExists": true,
+            "recoveryRecommendation": {
+                "action": "retry_failed_agent",
+                "explanation": "Retry the agent with the same inputs.",
+                "source": "runtime_policy"
+            }
+        })
+    }
+
+    fn validation_failure_record(
+        artifact_id: ArtifactId,
+        run_id: RunId,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_execution_id: domain::ids::AgentExecutionId,
+    ) -> ValidationFailureRecord {
+        ValidationFailureRecord {
+            id: "33333333-3333-3333-3333-333333333333".to_string(),
+            artifact_id,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-15T09:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            agent_id: "validation_agent".to_string(),
+            stage_id: "stage_1".to_string(),
+            stage_execution_id,
+            agent_execution_id,
+            run_id,
+            output_results: vec![OutputValidationResult {
+                output_name: "report".to_string(),
+                contract_id: Some("report_v1".to_string()),
+                status: ValidationStatus::Failed,
+                missing_fields: vec!["summary".to_string()],
+                validation_error: Some("Missing required fields: summary".to_string()),
+                raw_payload_size: 17,
+            }],
+            failure_summary: "report: Missing required fields: summary".to_string(),
+            failure_class: ValidationFailureClass::OutputContractMismatch,
+            contract_metadata: vec![ContractValidationMetadata {
+                output_name: "report".to_string(),
+                contract_id: "report_v1".to_string(),
+                machine_format: "json".to_string(),
+                validation_mode: "strict_structured".to_string(),
+                required_field_count: 1,
+                raw_artifact_name: Some("report_raw".to_string()),
+                normalized_artifact_name: Some("report".to_string()),
+            }],
+            raw_output_exists: true,
+            receipt_exists: false,
+            transcript_exists: true,
+            recovery_recommendation: RecoveryRecommendation {
+                action: "retry_failed_agent".to_string(),
+                explanation: "Retry the agent with the same inputs.".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn start_run_accepts_delivery_configuration_json() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let response = schema
+            .execute(Request::new(
+                r#"
+                mutation StartRun {
+                  startRun(
+                    ideaId: "IDEA_ID",
+                    workflowId: "wf-start",
+                    workflowTitle: "Start Run",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    deliveryConfigurationJson: "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                  ) {
+                    id
+                  }
+                }
+                "#
+                .replace("IDEA_ID", &idea_id.to_string()),
+            ))
+            .await;
+
+        assert!(response.errors.is_empty(), "mutation must succeed: {response:?}");
+        let json = response.data.into_json().unwrap();
+        let run_id = json["startRun"]["id"].as_str().unwrap();
+        let run = runs::find_by_id(&pool, run_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            run.delivery_configuration_json,
+            Some(
+                "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn run_query_exposes_delivery_configuration_json() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let start = schema
+            .execute(Request::new(
+                r#"
+                mutation StartRun {
+                  startRun(
+                    ideaId: "IDEA_ID",
+                    workflowId: "wf-query",
+                    workflowTitle: "Query Run",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    deliveryConfigurationJson: "{\"repo_identifier\":\"repo-2\",\"repo_root\":\"/repo-2\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                  ) {
+                    id
+                  }
+                }
+                "#
+                .replace("IDEA_ID", &idea_id.to_string()),
+            ))
+            .await;
+
+        assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
+        let run_id = start.data.into_json().unwrap()["startRun"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let response = schema
+            .execute(Request::new(
+                format!(
+                    r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    id
+                    deliveryConfigurationJson
+                  }}
+                }}
+                "#
+                )
+            ))
+            .await;
+
+        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        let json = response.data.into_json().unwrap();
+        assert_eq!(
+            json["run"]["deliveryConfigurationJson"],
+            serde_json::json!(
+                "{\"repo_identifier\":\"repo-2\",\"repo_root\":\"/repo-2\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn artifacts_query_decodes_validation_failure_record() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id)).await.unwrap();
+
+        let payload_path = std::env::temp_dir().join(format!("validation-failure-{}.json", run_id));
+        std::fs::write(&payload_path, serde_json::to_vec(&validation_failure_payload(run_id)).unwrap())
+            .unwrap();
+        let (stage_execution_id, agent_execution_id) = seed_validation_attempt(&pool, run_id).await;
+
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "stage_1".into(),
+            agent_id: "validation_agent".into(),
+            name: "validation_failure_validation_agent".into(),
+            contract_id: "validation_failure_record".into(),
+            format: ArtifactFormat::Json,
+            file_path: payload_path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "system".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("validation_failure".into()),
+            report_version: None,
+        };
+        artifacts::insert(&pool, &artifact)
+        .await
+        .unwrap();
+        let record = validation_failure_record(
+            artifact.id,
+            run_id,
+            stage_execution_id,
+            agent_execution_id,
+        );
+        db::repos::validation::insert(&pool, &record)
+            .await
+            .unwrap();
+
+        projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+
+        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let response = schema
+            .execute(Request::new(
+                format!(
+                    r#"
+                query Artifacts {{
+                  artifacts(runId: "{run_id}") {{
+                    name
+                    reportKind
+                    validationFailureRecord {{
+                      failureSummary
+                      failureClass
+                      outputResults {{
+                        outputName
+                        missingFields
+                      }}
+                    }}
+                  }}
+                }}
+                "#
+                )
+            ))
+            .await;
+
+        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        let json = response.data.into_json().unwrap();
+        let artifacts = json["artifacts"].as_array().unwrap();
+        let validation_failure = artifacts
+            .iter()
+            .find(|artifact| artifact["reportKind"] == serde_json::json!("validation_failure"))
+            .expect("validation failure artifact");
+
+        assert_eq!(
+            validation_failure["validationFailureRecord"]["failureSummary"],
+            serde_json::json!("report: Missing required fields: summary")
+        );
+        assert_eq!(
+            validation_failure["validationFailureRecord"]["outputResults"][0]["missingFields"],
+            serde_json::json!(["summary"])
+        );
+    }
 }

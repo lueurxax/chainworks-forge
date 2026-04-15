@@ -2,14 +2,30 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use sqlx::SqlitePool;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
 use acp::AcpRuntimeManager;
+use crate::release::{
+    connect::ConnectPublishService,
+    coordinator::ReleaseResult,
+    git::{GitPushReceipt, GitReleaseService, ReleaseManifest},
+    receipt::DeliveryReceiptBuilder,
+};
 use db::work_item::{WorkItem, WorkItemKind};
-use db::repos::{agent_executions, artifacts, projections, stages};
+use db::repos::{agent_executions, artifacts, ideas, projections, stages, validation};
+use domain::artifact::ArtifactFormat;
+use domain::agent::AgentStatus;
 use domain::ids::RunId;
+use domain::run::DeliveryConfiguration;
 
+use crate::contracts::{
+    artifact_format_for_companion_output, artifact_format_for_machine_output,
+    build_validation_failure_record, load_declared_output_bytes, validate_task_outputs,
+    DeclaredOutput,
+};
 use crate::event_bus::EventSender;
 use crate::orchestrator::Orchestrator;
 use crate::recovery::RecoveryService;
@@ -132,6 +148,7 @@ impl BackgroundExecutor {
             WorkItemKind::AdvanceRun => {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
+                self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
 
             WorkItemKind::InvokeAgent => {
@@ -200,16 +217,58 @@ impl BackgroundExecutor {
 
                 let model = payload["model"].as_str().map(String::from);
                 let effort = payload["effort"].as_str().map(String::from);
+                let worktree_write_enabled = payload["worktree_write_enabled"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let worktree_strategy = payload["worktree_strategy"]
+                    .as_str()
+                    .map(String::from);
+                let declared_outputs: Vec<DeclaredOutput> = serde_json::from_value(
+                    payload["declared_outputs"].clone(),
+                )
+                .unwrap_or_default();
+                let expected_output_paths: Vec<String> = declared_outputs
+                    .iter()
+                    .flat_map(|declared| {
+                        std::iter::once(declared.target_path.clone())
+                            .chain(declared.companion_path.clone().into_iter())
+                    })
+                    .collect();
+
+                if self.is_release_agent(&agent_id) {
+                    // Native release path: bypass ACP entirely and execute the
+                    // deterministic git/publish services.
+                    return self
+                        .process_release_agent(
+                            run_id,
+                            run.clone(),
+                            stage_id.clone(),
+                            stage_execution_id,
+                            agent_exec_id,
+                            agent_id.clone(),
+                            provider.clone(),
+                            model,
+                            effort,
+                            worktree_write_enabled,
+                            worktree_strategy,
+                            payload,
+                        )
+                        .await;
+                }
 
                 let req = acp::ExecutionRequest {
                     run_id,
                     stage_id: stage_id.clone(),
                     agent_id: agent_id.clone(),
                     provider: provider.clone(),
-                    model,
+                    model: model.clone(),
                     effort,
                     workspace_root: run.workspace_root.clone(),
                     prompt,
+                    worktree_root: run.worktree_root.clone(),
+                    worktree_write_enabled,
+                    worktree_strategy,
+                    expected_output_paths,
                 };
                 // Runtime event: session starting
                 let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
@@ -237,64 +296,97 @@ impl BackgroundExecutor {
                 });
 
                 let completed_at = chrono::Utc::now();
+                let mut persisted_paths = std::collections::HashSet::new();
+                let mut persisted_artifacts = self
+                    .persist_declared_output_artifacts(
+                        &declared_outputs,
+                        run_id,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        completed_at,
+                        &mut persisted_paths,
+                    )
+                    .await?;
+
+                for path in &result.artifact_paths {
+                    if persisted_paths.contains(path) {
+                        continue;
+                    }
+                    if let Some(artifact) = self
+                        .persist_generic_artifact(
+                            path,
+                            run_id,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            completed_at,
+                        )
+                        .await?
+                    {
+                        persisted_paths.insert(path.clone());
+                        persisted_artifacts.push(artifact);
+                    }
+                }
+
+                let validation_summary = if declared_outputs.is_empty() {
+                    None
+                } else {
+                    Some(validate_task_outputs(&load_declared_output_bytes(&declared_outputs)?))
+                };
+                let validation_failed = validation_summary
+                    .as_ref()
+                    .and_then(|summary| summary.failure_class.as_ref())
+                    .is_some();
+                let final_agent_status = if result.status == AgentStatus::Completed && !validation_failed {
+                    AgentStatus::Completed
+                } else {
+                    AgentStatus::Failed
+                };
+
+                if let Some(summary) = validation_summary {
+                    if summary.failure_class.is_some() {
+                        let validation_artifact = self
+                            .persist_validation_failure_artifact(
+                                &run,
+                                &stage_id,
+                                &agent_id,
+                                &provider,
+                                model.clone(),
+                                agent_exec_id,
+                                stage_execution_id,
+                                build_validation_failure_record(
+                                    domain::ids::ArtifactId::new(),
+                                    run_id,
+                                    stage_id.clone(),
+                                    stage_execution_id,
+                                    agent_id.clone(),
+                                    agent_exec_id,
+                                    summary,
+                                    persisted_artifacts
+                                        .iter()
+                                        .any(|artifact| artifact.name.contains("receipt")),
+                                    std::path::Path::new(&format!(
+                                        "{}/.chainworks/acp-stderr.log",
+                                        run.workspace_root
+                                    ))
+                                    .exists(),
+                                )?,
+                            )
+                            .await?;
+                        persisted_artifacts.push(validation_artifact);
+                    }
+                }
+
                 agent_executions::update_completed(
                     &self.pool,
                     agent_exec_id,
-                    result.status.clone(),
+                    final_agent_status.clone(),
                     completed_at,
                 )
                 .await?;
-
-                // Persist artifacts returned by the ACP binary.
-                for path in &result.artifact_paths {
-                    // Derive name from the file path.
-                    let name = std::path::Path::new(path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("artifact")
-                        .to_string();
-
-                    // Derive format from extension (default to Json).
-                    let format = std::path::Path::new(path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .and_then(|ext| match ext {
-                            "md" | "markdown" => {
-                                Some(domain::artifact::ArtifactFormat::Markdown)
-                            }
-                            "diff" | "patch" => Some(domain::artifact::ArtifactFormat::Diff),
-                            "json" => Some(domain::artifact::ArtifactFormat::Json),
-                            _ => None,
-                        })
-                        .unwrap_or(domain::artifact::ArtifactFormat::Json);
-
-                    // contract_id is provider-scoped, not a hard-coded stub.
-                    let contract_id = format!("{}.output", provider);
-
-                    let artifact = domain::artifact::Artifact {
-                        id: domain::ids::ArtifactId::new(),
-                        run_id,
-                        stage_id: stage_id.clone(),
-                        agent_id: agent_id.clone(),
-                        name,
-                        contract_id,
-                        format,
-                        file_path: path.clone(),
-                        checksum_sha256: None,
-                        size_bytes: None,
-                        provider: provider.clone(),
-                        model: None,
-                        created_at: completed_at,
-                        is_pinned: false,
-                        report_kind: None,
-                        report_version: None,
-                    };
-                    artifacts::insert(&self.pool, &artifact).await?;
-                    let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
-                        run_id,
-                        artifact_id: artifact.id,
-                    });
-                }
 
                 // Normalize artifacts: copy from artifact_root to canonical
                 // workspace paths defined in the YAML artifacts map.
@@ -319,7 +411,7 @@ impl BackgroundExecutor {
                 let total_tasks = payload["total_tasks"].as_u64().unwrap_or(1);
 
                 // Settle the stage based on ACP result status.
-                let settlement_kind = match result.status {
+                let settlement_kind = match final_agent_status {
                     domain::agent::AgentStatus::Completed => {
                         domain::stage::StageSettlementKind::Completed
                     }
@@ -373,7 +465,7 @@ impl BackgroundExecutor {
                 info!(
                     run_id = %run_id,
                     stage_id = %stage_id,
-                    status = ?result.status,
+                    status = ?final_agent_status,
                     "InvokeAgent completed"
                 );
             }
@@ -390,11 +482,13 @@ impl BackgroundExecutor {
             WorkItemKind::TriggerNextStage => {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
+                self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
 
             WorkItemKind::SettleStage => {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
+                self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
 
             WorkItemKind::RebuildProjection => {
@@ -411,6 +505,803 @@ impl BackgroundExecutor {
         item.run_id
             .ok_or_else(|| anyhow::anyhow!("Work item {} has no run_id", item.id))
     }
+
+    fn is_release_agent(&self, agent_id: &str) -> bool {
+        matches!(
+            agent_id,
+            "commit_and_push_to_github" | "build_archive_and_push_connect"
+        )
+    }
+
+    async fn process_release_agent(
+        &self,
+        run_id: RunId,
+        run: domain::run::Run,
+        stage_id: String,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_exec_id: domain::ids::AgentExecutionId,
+        agent_id: String,
+        provider: String,
+        model: Option<String>,
+        _effort: Option<String>,
+        _worktree_write_enabled: bool,
+        _worktree_strategy: Option<String>,
+        _payload: serde_json::Value,
+    ) -> Result<()> {
+        let delivery_config = self.load_delivery_configuration(&run).await?;
+        let worktree_root = run.worktree_root.clone().ok_or_else(|| {
+            anyhow::anyhow!("Release agent requires a provisioned worktree but none is available.")
+        })?;
+        let idea_title = ideas::find_by_id(&self.pool, run.idea_id)
+            .await?
+            .map(|idea| idea.title)
+            .unwrap_or_else(|| "Unknown".to_string());
+        let now = chrono::Utc::now();
+
+        let runtime_started = domain::events::DomainEvent::RuntimeStatusChanged {
+            run_id,
+            stage_id: stage_id.clone(),
+            agent_id: agent_id.clone(),
+            provider: provider.clone(),
+            event_kind: "session_started".to_string(),
+        };
+        let _ = self.events.send(runtime_started);
+
+        if agent_id == "commit_and_push_to_github" {
+            let commit_message = format!("[{}] {} :: {}", run_id, idea_title, stage_id);
+            let git_service = GitReleaseService;
+            match git_service
+                .commit_and_push(&worktree_root, &delivery_config.target_branch, &commit_message)
+                .await
+            {
+                Ok((manifest, receipt)) => {
+                    let _manifest_path = self
+                        .persist_json_artifact(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            "release_manifest",
+                            &manifest,
+                        )
+                        .await?;
+                    let _receipt_path = self
+                        .persist_json_artifact(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            "git_push_receipt",
+                            &receipt,
+                        )
+                        .await?;
+                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        event_kind: "session_completed".to_string(),
+                    });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run_id),
+                            None,
+                            serde_json::json!({ "run_id": run_id.to_string() }),
+                        )
+                        .await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        status = "completed",
+                        "Release agent completed"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    let release_result = ReleaseResult {
+                        git_manifest: None,
+                        git_receipt: None,
+                        bundle_manifest: None,
+                        upload_receipt: None,
+                        succeeded: false,
+                        failure_stage: Some("commit_and_push".to_string()),
+                        failure_reason: Some(error.to_string()),
+                    };
+                    if let Some(receipt_path) = self
+                        .persist_delivery_receipt_if_absent(
+                            &run,
+                            &delivery_config,
+                            &release_result,
+                            &idea_title,
+                            None,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                        )
+                        .await?
+                    {
+                        info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
+                    }
+
+                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        event_kind: "session_failed".to_string(),
+                    });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    let settlement_kind = domain::stage::StageSettlementKind::Failed;
+                    stages::settle(&self.pool, stage_execution_id, settlement_kind, now).await?;
+                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
+                        run_id,
+                        stage_execution_id,
+                        status: domain::stage::StageStatus::Failed,
+                    });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        error = %error,
+                        "Release git step failed"
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            let git_receipt: GitPushReceipt =
+                self.load_release_artifact(run_id, "git_push_receipt").await?;
+            let release_manifest: ReleaseManifest =
+                self.load_release_artifact(run_id, "release_manifest").await?;
+            let publish_service = ConnectPublishService;
+            match publish_service
+                .build_and_distribute(
+                    &worktree_root,
+                    &git_receipt,
+                    &release_manifest,
+                    &delivery_config,
+                )
+                .await
+            {
+                Ok((bundle_manifest, upload_receipt)) => {
+                    let bundle_path = self
+                        .persist_json_artifact(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            "release_bundle_manifest",
+                            &bundle_manifest,
+                        )
+                        .await?;
+                    let upload_path = self
+                        .persist_json_artifact(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            "connect_upload_receipt",
+                            &upload_receipt,
+                        )
+                        .await?;
+                    let release_result = ReleaseResult {
+                        git_manifest: Some(release_manifest),
+                        git_receipt: Some(git_receipt),
+                        bundle_manifest: Some(bundle_manifest),
+                        upload_receipt: Some(upload_receipt),
+                        succeeded: true,
+                        failure_stage: None,
+                        failure_reason: None,
+                    };
+                    let _ = self.persist_delivery_receipt_if_absent(
+                        &run,
+                        &delivery_config,
+                        &release_result,
+                        &idea_title,
+                        None,
+                        &stage_id,
+                        &provider,
+                        model.clone(),
+                    )
+                    .await?;
+                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        event_kind: "session_completed".to_string(),
+                    });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle(
+                        &self.pool,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Completed,
+                        now,
+                    )
+                    .await?;
+                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
+                        run_id,
+                        stage_execution_id,
+                        status: domain::stage::StageStatus::Completed,
+                    });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run_id),
+                            None,
+                            serde_json::json!({ "run_id": run_id.to_string() }),
+                        )
+                        .await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        bundle_path = %bundle_path,
+                        upload_path = %upload_path,
+                        "Release publish step completed"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    let release_result = ReleaseResult {
+                        git_manifest: Some(release_manifest),
+                        git_receipt: Some(git_receipt),
+                        bundle_manifest: None,
+                        upload_receipt: None,
+                        succeeded: false,
+                        failure_stage: Some("build_archive_and_push".to_string()),
+                        failure_reason: Some(error.to_string()),
+                    };
+                    if let Some(receipt_path) = self
+                        .persist_delivery_receipt_if_absent(
+                            &run,
+                            &delivery_config,
+                            &release_result,
+                            &idea_title,
+                            None,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                        )
+                        .await?
+                    {
+                        info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
+                    }
+                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        event_kind: "session_failed".to_string(),
+                    });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle(
+                        &self.pool,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        now,
+                    )
+                    .await?;
+                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
+                        run_id,
+                        stage_execution_id,
+                        status: domain::stage::StageStatus::Failed,
+                    });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        error = %error,
+                        "Release publish step failed"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn load_delivery_configuration(
+        &self,
+        run: &domain::run::Run,
+    ) -> Result<DeliveryConfiguration> {
+        let json = run
+            .delivery_configuration_json
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Release agent requires delivery_configuration_json"))?;
+        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Invalid delivery_configuration_json: {}", e))
+    }
+
+    async fn persist_declared_output_artifacts(
+        &self,
+        declared_outputs: &[DeclaredOutput],
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        persisted_paths: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<domain::artifact::Artifact>> {
+        let mut artifacts_out = Vec::new();
+        for declared in declared_outputs {
+            let default_contract_id = format!("{}.output", provider);
+            if let Some(artifact) = self
+                .persist_artifact_if_present(
+                    &declared.target_path,
+                    run_id,
+                    stage_id,
+                    agent_id,
+                    declared.output_name.as_str(),
+                    declared
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.contract_id.as_str())
+                        .unwrap_or(default_contract_id.as_str()),
+                    artifact_format_for_machine_output(declared.schema.as_ref()),
+                    provider,
+                    model.clone(),
+                    None,
+                    created_at,
+                )
+                .await?
+            {
+                persisted_paths.insert(declared.target_path.clone());
+                artifacts_out.push(artifact);
+            }
+
+            if let (Some(companion_name), Some(companion_path), Some(schema)) = (
+                declared.companion_output_name.as_deref(),
+                declared.companion_path.as_deref(),
+                declared.schema.as_ref(),
+            ) {
+                if let Some(artifact) = self
+                    .persist_artifact_if_present(
+                        companion_path,
+                        run_id,
+                        stage_id,
+                        agent_id,
+                        companion_name,
+                        &schema.contract_id,
+                        artifact_format_for_companion_output(schema),
+                        provider,
+                        model.clone(),
+                        None,
+                        created_at,
+                    )
+                    .await?
+                {
+                    persisted_paths.insert(companion_path.to_string());
+                    artifacts_out.push(artifact);
+                }
+            }
+        }
+        Ok(artifacts_out)
+    }
+
+    async fn persist_generic_artifact(
+        &self,
+        path: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<domain::artifact::Artifact>> {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact");
+        let format = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| match ext {
+                "md" | "markdown" => Some(ArtifactFormat::Markdown),
+                "diff" | "patch" => Some(ArtifactFormat::Diff),
+                "json" => Some(ArtifactFormat::Json),
+                "txt" => Some(ArtifactFormat::Report),
+                _ => None,
+            })
+            .unwrap_or(ArtifactFormat::Json);
+        self.persist_artifact_if_present(
+            path,
+            run_id,
+            stage_id,
+            agent_id,
+            name,
+            &format!("{}.output", provider),
+            format,
+            provider,
+            model,
+            None,
+            created_at,
+        )
+        .await
+    }
+
+    async fn persist_artifact_if_present(
+        &self,
+        path: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        name: &str,
+        contract_id: &str,
+        format: ArtifactFormat,
+        provider: &str,
+        model: Option<String>,
+        report_kind: Option<&str>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<domain::artifact::Artifact>> {
+        let artifact_path = std::path::Path::new(path);
+        if !artifact_path.is_file() {
+            return Ok(None);
+        }
+        let size_bytes = artifact_path
+            .metadata()
+            .ok()
+            .map(|meta| meta.len() as i64);
+        let artifact = domain::artifact::Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            contract_id: contract_id.to_string(),
+            format,
+            file_path: path.to_string(),
+            checksum_sha256: None,
+            size_bytes,
+            provider: provider.to_string(),
+            model,
+            created_at,
+            is_pinned: false,
+            report_kind: report_kind.map(str::to_string),
+            report_version: None,
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
+            run_id,
+            artifact_id: artifact.id,
+        });
+        Ok(Some(artifact))
+    }
+
+    async fn persist_validation_failure_artifact(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        _agent_execution_id: domain::ids::AgentExecutionId,
+        _stage_execution_id: domain::ids::StageExecutionId,
+        record: domain::validation::ValidationFailureRecord,
+    ) -> Result<domain::artifact::Artifact> {
+        let artifact_name = format!("validation_failure_{}_{}", agent_id, record.id);
+        let path = std::path::Path::new(&run.artifact_root)
+            .join(format!("{artifact_name}.json"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create validation artifact dir {}: {}", parent.display(), e))?;
+        }
+        let encoded = serde_json::to_string_pretty(&record)?;
+        std::fs::write(&path, encoded)
+            .map_err(|e| anyhow::anyhow!("write validation failure artifact {}: {}", path.display(), e))?;
+
+        let artifact = domain::artifact::Artifact {
+            id: record.artifact_id,
+            run_id: run.id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: artifact_name,
+            contract_id: "validation_failure_record".to_string(),
+            format: ArtifactFormat::Json,
+            file_path: path.to_string_lossy().into_owned(),
+            checksum_sha256: None,
+            size_bytes: Some(path.metadata().map(|meta| meta.len() as i64).unwrap_or(0)),
+            provider: provider.to_string(),
+            model,
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: Some("validation_failure".to_string()),
+            report_version: Some(1),
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        validation::insert(&self.pool, &record).await?;
+        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
+            run_id: run.id,
+            artifact_id: artifact.id,
+        });
+        Ok(artifact)
+    }
+
+    async fn load_release_artifact<T: DeserializeOwned>(
+        &self,
+        run_id: RunId,
+        name: &str,
+    ) -> Result<T> {
+        let rows = artifacts::list_by_run(&self.pool, run_id).await?;
+        let artifact = rows
+            .into_iter()
+            .rev()
+            .find(|artifact| artifact.name == name)
+            .ok_or_else(|| anyhow::anyhow!("ConnectPublishService requires git_push_receipt and release_manifest inputs."))?;
+        let json = std::fs::read_to_string(&artifact.file_path)
+            .map_err(|e| anyhow::anyhow!("read artifact {}: {}", artifact.file_path, e))?;
+        serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("decode artifact {}: {}", artifact.file_path, e))
+    }
+
+    async fn persist_json_artifact<T: Serialize>(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        name: &str,
+        value: &T,
+    ) -> Result<String> {
+        let path = self.resolve_release_artifact_path(run, name);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create artifact dir {}: {}", parent.display(), e))?;
+        }
+        let json = serde_json::to_string_pretty(value)?;
+        std::fs::write(&path, json)
+            .map_err(|e| anyhow::anyhow!("write artifact {}: {}", path, e))?;
+
+        let artifact = domain::artifact::Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: run.id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            contract_id: name.to_string(),
+            format: ArtifactFormat::Json,
+            file_path: path.clone(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: provider.to_string(),
+            model,
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
+            run_id: run.id,
+            artifact_id: artifact.id,
+        });
+        Ok(path)
+    }
+
+    async fn persist_delivery_receipt_if_absent(
+        &self,
+        run: &domain::run::Run,
+        delivery_config: &DeliveryConfiguration,
+        release_result: &ReleaseResult,
+        idea_title: &str,
+        review_status: Option<&str>,
+        stage_id: &str,
+        provider: &str,
+        model: Option<String>,
+    ) -> Result<Option<String>> {
+        let receipt = match DeliveryReceiptBuilder::build_receipt(
+            run,
+            delivery_config,
+            Some(release_result),
+            idea_title,
+            review_status,
+        ) {
+            Some(receipt) => receipt,
+            None => return Ok(None),
+        };
+        let path = self.resolve_release_artifact_path(run, "delivery_receipt");
+        if std::path::Path::new(&path).exists() {
+            return Ok(None);
+        }
+        let _ = self
+            .persist_json_artifact(
+                run,
+                stage_id,
+                "system_delivery",
+                provider,
+                model,
+                "delivery_receipt",
+                &receipt,
+            )
+            .await?;
+        Ok(Some(path))
+    }
+
+    fn resolve_release_artifact_path(&self, run: &domain::run::Run, name: &str) -> String {
+        if let (Some(workflow_yaml_path), Some(agent_catalog_yaml_path)) =
+            (&run.workflow_yaml_path, &run.agent_catalog_yaml_path)
+        {
+            if let Ok(plan) = workflow::compiler::compile(workflow_yaml_path, agent_catalog_yaml_path)
+            {
+                if let Some(template) = plan.artifact_paths.get(name) {
+                    return crate::orchestrator::resolve_path_template(
+                        template,
+                        &run.workspace_root,
+                    );
+                }
+            }
+        }
+        release_artifact_path(&run.artifact_root, name)
+    }
+
+    async fn backfill_delivery_receipt_if_eligible(&self, run_id: RunId) -> Result<()> {
+        let run = match db::repos::runs::find_by_id(&self.pool, run_id).await? {
+            Some(run) if run.status.is_terminal() => run,
+            _ => return Ok(()),
+        };
+
+        if artifacts::list_by_run(&self.pool, run_id)
+            .await?
+            .iter()
+            .any(|artifact| artifact.name == "delivery_receipt")
+        {
+            return Ok(());
+        }
+
+        let delivery_config = match self.load_delivery_configuration(&run).await {
+            Ok(config) => config,
+            Err(_) => return Ok(()),
+        };
+        let release_result = match self.reconstruct_release_result(&run).await? {
+            Some(result) => result,
+            None => return Ok(()),
+        };
+        let idea_title = ideas::find_by_id(&self.pool, run.idea_id)
+            .await?
+            .map(|idea| idea.title)
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let _ = self
+            .persist_delivery_receipt_if_absent(
+                &run,
+                &delivery_config,
+                &release_result,
+                &idea_title,
+                None,
+                run.current_state.as_deref().unwrap_or("state_12_finalization"),
+                "system",
+                None,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn reconstruct_release_result(
+        &self,
+        run: &domain::run::Run,
+    ) -> Result<Option<ReleaseResult>> {
+        let artifacts_by_run = artifacts::list_by_run(&self.pool, run.id).await?;
+        let git_manifest: Option<ReleaseManifest> =
+            self.decode_latest_artifact(&artifacts_by_run, "release_manifest")?;
+        let git_receipt: Option<GitPushReceipt> =
+            self.decode_latest_artifact(&artifacts_by_run, "git_push_receipt")?;
+        let bundle_manifest: Option<crate::release::connect::ReleaseBundleManifest> =
+            self.decode_latest_artifact(&artifacts_by_run, "release_bundle_manifest")?;
+        let upload_receipt: Option<crate::release::connect::ConnectUploadReceipt> =
+            self.decode_latest_artifact(&artifacts_by_run, "connect_upload_receipt")?;
+
+        let stage_executions = stages::list_by_run(&self.pool, run.id).await?;
+        let attempted_commit = stage_executions
+            .iter()
+            .any(|stage| stage.stage_id == "commit_and_push_to_github");
+        let attempted_publish = stage_executions
+            .iter()
+            .any(|stage| stage.stage_id == "build_archive_and_push_connect");
+        let failed_commit = stage_executions.iter().any(|stage| {
+            stage.stage_id == "commit_and_push_to_github"
+                && matches!(stage.status, domain::stage::StageStatus::Failed)
+        });
+        let failed_publish = stage_executions.iter().any(|stage| {
+            stage.stage_id == "build_archive_and_push_connect"
+                && matches!(stage.status, domain::stage::StageStatus::Failed)
+        });
+
+        if git_manifest.is_none() && git_receipt.is_none() {
+            if failed_commit || attempted_commit {
+                return Ok(Some(ReleaseResult {
+                    git_manifest: None,
+                    git_receipt: None,
+                    bundle_manifest: None,
+                    upload_receipt: None,
+                    succeeded: false,
+                    failure_stage: Some("commit_and_push".to_string()),
+                    failure_reason: None,
+                }));
+            }
+            return Ok(None);
+        }
+
+        if bundle_manifest.is_some() && upload_receipt.is_some() {
+            return Ok(Some(ReleaseResult {
+                git_manifest,
+                git_receipt,
+                bundle_manifest,
+                upload_receipt,
+                succeeded: true,
+                failure_stage: None,
+                failure_reason: None,
+            }));
+        }
+
+        if failed_publish || attempted_publish {
+            return Ok(Some(ReleaseResult {
+                git_manifest,
+                git_receipt,
+                bundle_manifest,
+                upload_receipt,
+                succeeded: false,
+                failure_stage: Some("build_archive_and_push".to_string()),
+                failure_reason: None,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn decode_latest_artifact<T: DeserializeOwned>(
+        &self,
+        artifacts_by_run: &[domain::artifact::Artifact],
+        name: &str,
+    ) -> Result<Option<T>> {
+        let artifact = match artifacts_by_run.iter().rev().find(|artifact| artifact.name == name) {
+            Some(artifact) => artifact,
+            None => return Ok(None),
+        };
+        let json = std::fs::read_to_string(&artifact.file_path)
+            .map_err(|e| anyhow::anyhow!("read artifact {}: {}", artifact.file_path, e))?;
+        let decoded = serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("decode artifact {}: {}", artifact.file_path, e))?;
+        Ok(Some(decoded))
+    }
+}
+
+fn release_artifact_path(artifact_root: &str, name: &str) -> String {
+    std::path::Path::new(artifact_root)
+        .join(format!("{name}.json"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Copy artifacts from artifact_root to canonical workspace paths from the YAML

@@ -20,6 +20,21 @@ pub struct ExecutionRequest {
     pub effort: Option<String>,
     pub workspace_root: String,
     pub prompt: String,
+    /// Provisioned worktree root path (Proposal 007). When set and
+    /// `worktree_write_enabled` is true, the ACP session uses this as cwd.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
+    /// Whether the agent has write access to the worktree.
+    #[serde(default)]
+    pub worktree_write_enabled: bool,
+    /// Worktree strategy from catalog (e.g. "dedicated", "shared_implementation_worktree").
+    #[serde(default)]
+    pub worktree_strategy: Option<String>,
+    /// Canonical output paths declared by the compiled workflow task.
+    /// These must be reported back even when the agent overwrites an existing
+    /// file instead of creating a brand-new one.
+    #[serde(default)]
+    pub expected_output_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

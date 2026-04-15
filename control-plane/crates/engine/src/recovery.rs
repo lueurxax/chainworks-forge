@@ -130,6 +130,42 @@ impl RecoveryService {
                 )
                 .await?;
             requeued += 1;
+        } else {
+            // Even if no stages are stuck in Running, the run may need
+            // advancement — e.g. daemon crashed after settling a stage as
+            // Completed but before evaluate_and_transition ran, or after
+            // a loop-back transition updated current_state but before
+            // enqueuing the follow-up AdvanceRun. Unconditionally enqueue
+            // an AdvanceRun for any active run. The advance handler is
+            // idempotent — if nothing needs doing, it returns Ok(()).
+            let has_pending_work = db::repos::work_items::list_by_run(&self.pool, run.id)
+                .await
+                .map(|items| {
+                    items.iter().any(|w| {
+                        matches!(
+                            w.status,
+                            db::work_item::WorkItemStatus::Pending
+                                | db::work_item::WorkItemStatus::Running
+                        )
+                    })
+                })
+                .unwrap_or(false);
+
+            if !has_pending_work {
+                info!(
+                    run_id = %run.id,
+                    "Active run with no pending/running work — enqueuing AdvanceRun"
+                );
+                self.work_queue
+                    .enqueue(
+                        WorkItemKind::AdvanceRun,
+                        Some(run.id),
+                        None,
+                        serde_json::json!({ "run_id": run.id.to_string(), "reason": "startup_catchup" }),
+                    )
+                    .await?;
+                requeued += 1;
+            }
         }
 
         Ok(requeued)

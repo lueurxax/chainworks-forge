@@ -47,6 +47,34 @@ pub struct ResolvedAgent {
     pub effort: Option<String>,
     /// System prompt from the agent catalog (agents[].prompt).
     pub prompt: Option<String>,
+    /// Resolved skill content for prompt injection.
+    /// Populated during compilation when `skill_ref` is set on the agent.
+    pub resolved_skill: Option<ResolvedSkill>,
+    /// Explicit output contract requested by the agent catalog entry.
+    pub output_contract: Option<String>,
+    /// Whether this agent has write access to a worktree (Proposal 007).
+    /// Derived from `worktree_policy.write_enabled` in the agent catalog.
+    #[serde(default)]
+    pub worktree_write_enabled: bool,
+    /// Worktree strategy from the catalog: "dedicated", "meta_only",
+    /// "shared_implementation_worktree". `None` = no worktree policy.
+    pub worktree_strategy: Option<String>,
+}
+
+/// A resolved skill, ready for prompt injection.
+///
+/// Matches Swift `ResolvedSkill`. The `injected_content` field is the final
+/// prompt fragment including the `## Skill: ...` header and role specialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedSkill {
+    /// Skill ID from the catalog (e.g. "proposal_review_triad").
+    pub id: String,
+    /// Skill type: "external", "inline", "builtin".
+    pub skill_type: String,
+    /// Final prompt fragment for injection. Includes the header and role block.
+    pub injected_content: String,
+    /// The role requested by the agent (e.g. "product_owner").
+    pub role: Option<String>,
 }
 
 /// A compiled agent task invocation.
@@ -57,14 +85,19 @@ pub struct CompiledTask {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     /// Resolved output schemas keyed by output artifact name.
-    /// Populated when the catalog `contracts:` section defines a contract
-    /// whose `normalized_artifact_name` matches the output, or when the
-    /// agent specifies an explicit `output_contract` field. Consumed by
-    /// the prompt builder to embed required field lists in task directives.
+    /// Populated from the agent's explicit `output_contract` first, then by
+    /// exact normalized/raw artifact-name matches, and finally by version
+    /// stem fallbacks. Consumed by the prompt builder to embed required field
+    /// lists and contract metadata in task directives.
     #[serde(default)]
     pub output_schemas: HashMap<String, OutputSchema>,
     /// Whether this task runs in parallel with siblings.
     pub parallel: bool,
+    /// Phase within the run block. Parallel tasks are phase 0; `then`
+    /// (sequential-after-parallel) tasks are phase 1. Phase 1 tasks are
+    /// only enqueued after all phase 0 tasks complete.
+    #[serde(default)]
+    pub phase: u32,
 }
 
 /// Resolved output schema from a catalog contract.
@@ -74,6 +107,11 @@ pub struct CompiledTask {
 pub struct OutputSchema {
     pub contract_id: String,
     pub format: String,
+    pub human_format: Option<String>,
+    pub machine_format: Option<String>,
+    pub validation_mode: Option<String>,
+    pub normalized_artifact_name: Option<String>,
+    pub raw_artifact_name: Option<String>,
     pub required_fields: Vec<String>,
 }
 

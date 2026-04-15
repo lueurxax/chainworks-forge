@@ -27,6 +27,7 @@ Those remain owned by:
 - [operator-experience.md](operator-experience.md) for the operator shell, reports, recovery, and comparison,
 - [provider-platform.md](provider-platform.md) for provider settings, diagnostics, and frozen provider truth,
 - [project-workspace-contract.md](project-workspace-contract.md) for idea-owned workspace and frozen run root rules,
+- [045-deterministic-release-operations.md](045-deterministic-release-operations.md) for deterministic native release execution and release receipt semantics,
 - [live-workflow-map.md](live-workflow-map.md) for run-detail topology rendering.
 
 ## Core rules
@@ -193,6 +194,7 @@ After approval, `ReleaseOpsCoordinator` drives:
 2. archive/build/upload through `ConnectPublishService`.
 
 Agents may recommend release, but they do not improvise git/archive/upload mechanics.
+The detailed release contract now lives in [045-deterministic-release-operations.md](045-deterministic-release-operations.md).
 
 ### Partial failure semantics
 

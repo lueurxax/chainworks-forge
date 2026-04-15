@@ -14,7 +14,7 @@ pub struct AgentCatalogFile {
     pub app: Option<serde_yaml::Value>,
     pub paths: Option<HashMap<String, String>>,
     pub artifacts: Option<HashMap<String, String>>,
-    pub skills: Option<serde_yaml::Value>,
+    pub skills: Option<HashMap<String, SkillDef>>,
     pub contracts: Option<HashMap<String, ContractDef>>,
     pub runtime_profiles: Option<HashMap<String, RuntimeProfile>>,
     pub backend_profiles: Option<HashMap<String, BackendProfile>>,
@@ -22,11 +22,33 @@ pub struct AgentCatalogFile {
     pub agents: Option<Vec<AgentEntry>>,
 }
 
+/// A skill definition from the catalog's `skills:` section.
+///
+/// Matches Swift `SkillRef` — three types:
+/// - `external_skill`: disk bundle with `SKILL.md` at `path`
+/// - `inline_skill`: uses `description` directly
+/// - `builtin_agent`: looked up by `name` in a hardcoded registry
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillDef {
+    /// Skill type: `"external_skill"` | `"inline_skill"` | `"builtin_agent"`
+    #[serde(rename = "type")]
+    pub skill_type: String,
+    /// Path to external skill bundle dir (relative to catalog YAML).
+    pub path: Option<String>,
+    /// Builtin skill name (e.g. `"docs-quality-guardian"`).
+    pub name: Option<String>,
+    /// Inline skill description (raw prompt text).
+    pub description: Option<String>,
+    /// Informational notes (not used at runtime).
+    pub notes: Option<String>,
+}
+
 /// An output contract definition from the catalog's `contracts:` section.
 /// Defines the schema an agent's structured output must conform to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContractDef {
     pub format: Option<String>,
+    pub human_format: Option<String>,
     pub machine_format: Option<String>,
     pub validation_mode: Option<String>,
     /// Stable artifact name — when an output artifact matches this,
@@ -60,6 +82,23 @@ pub struct RuntimeProfile {
     pub requires: Option<Vec<String>>,
 }
 
+/// A worktree policy from the catalog's agent `worktree_policy:` section.
+/// Matches Swift `WorktreePolicy` — determines how an agent interacts with
+/// the filesystem during implementation stages.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorktreePolicy {
+    /// Strategy: `"dedicated"` | `"meta_only"` | `"shared_implementation_worktree"`
+    pub strategy: String,
+    /// Path template for the worktree (e.g. `${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}`)
+    pub path: Option<String>,
+    /// Base branch to create the worktree from (e.g. `${CHAINWORKS_BASE_BRANCH:-main}`)
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Whether the agent has write access.
+    #[serde(default)]
+    pub write_enabled: bool,
+}
+
 /// An agent definition in the catalog.
 #[derive(Debug, Deserialize)]
 pub struct AgentEntry {
@@ -78,7 +117,7 @@ pub struct AgentEntry {
     pub requires_human_approval: Option<bool>,
     pub prompt: Option<String>,
     pub notes: Option<String>,
-    pub worktree_policy: Option<serde_yaml::Value>,
+    pub worktree_policy: Option<WorktreePolicy>,
     pub required_tools: Option<Vec<String>>,
 }
 
