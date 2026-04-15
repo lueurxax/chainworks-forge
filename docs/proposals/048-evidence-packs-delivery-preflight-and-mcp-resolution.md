@@ -97,16 +97,26 @@ pub struct StageTiming {
 }
 ```
 
-**Rust field provenance for full-parity packet:**
+**Rust payload scope decision (explicitly avoiding overclaim):**
 
-- `supervision_classification` must come from the stage's supervision lane and be written to the packet owner.
-- `canonical_outcome`, `transport_error_kind`, and `output_presence` must be carried from Rust execution result owners into `domain::AgentExecution` before settlement.
-- `output_envelopes` must come from `P046`-defined envelope persistence ownership (`StructuredOutputEnvelope` lineage + durable owner rows).
-- `recovery_snapshot` must come from Rust stage recovery context persisted on `domain::StageExecution`.
-- `validation_failure` must be sourced from `P046` `ValidationFailureRecord` ownership.
-- If any owner field above is not implemented, the packet contract must be narrowed explicitly and all reader contracts updated accordingly.
+`FailedStageEvidencePacket` is a **Rust V1 contract** in this proposal, not a blanket promise of immediate full stable parity.
 
-This is the **full stable failed-stage packet contract**, not a Rust-specific smaller variant. The Rust port keeps field parity with the current shell-owned report/recovery readers, including `transcript_exists`, `canonical_outcome`, `transport_error_kind`, `output_presence`, `output_envelopes`, and `recovery_snapshot`. If the Rust daemon intentionally wants a narrower packet in the future, that must be proposed as a reader-contract change rather than hidden inside this port.
+Durable fields required for V1:
+- `transcript_exists` from runtime artifact presence (`acp-stderr.log` path check).
+- `raw_outputs_exist` from artifact persistence outcome.
+- `receipt_exists` from persisted receipt artifact detection.
+- `supervision_classification` if and only if the supervision lane is persisted on `domain::StageExecution`; if absent in this wave, persist `None`.
+- `validation_failure` from `P046` `ValidationFailureRecord` ownership.
+- `output_envelopes` from `P046` `StructuredOutputEnvelope` ownership.
+- `failure_summary`, `failure_class`, `attempt_number`, `timestamps`, and attempt timing from stage/agent context.
+
+Fields that are not yet durable in Rust owners and therefore must remain nullable until an explicit V2 slice:
+- `canonical_outcome` (target owner: `domain::AgentExecution` outcome field)
+- `transport_error_kind` (target owner: `domain::AgentExecution` transport diagnostics)
+- `output_presence` (target owner: execution result + artifact presence policy)
+- `recovery_snapshot` (target owner: `domain::StageExecution`)
+
+If any of these owners are implemented, acceptance criteria and readers must be updated in the same change set. If they remain absent, `FailedStageEvidencePacket` readers MUST treat them as optional (`null`).
 
 **When built:** Immediately when a stage settles as `Failed` in the orchestrator (line ~220 in the existing settlement path). Not deferred to run completion.
 
@@ -251,21 +261,29 @@ Registry loads are evaluated at execution boundaries, not only daemon startup.
 - load again when creating the ACP session (`executor` boundary), then pass to `resolve_mcp_servers`
 - this ensures runtime edits are visible without restart and mirrors the stable owner chain timing.
 
-The daemon may wrap that registry in a Rust-native parsed type, but it must read the same canonical registry contract the Swift app already uses. The resolution function takes an explicit runtime binding and machine-local registry snapshot:
+The daemon may wrap that registry in a Rust-native parsed type, but it must read the same canonical registry contract the Swift app already uses. The resolution function takes an explicit provider/runtime binding and machine-local registry snapshot:
 
 ```rust
 pub fn load_mcp_runtime_registry() -> anyhow::Result<McpRuntimeRegistry>;
 
+pub struct McpRuntimeBinding {
+    pub runtime_id: Option<String>,
+    pub provider: Option<String>,
+}
+
 pub fn resolve_mcp_servers(
     requested_ids: &[String],
-    runtime_id: Option<&str>,
+    binding: &McpRuntimeBinding,
     registry: &McpRuntimeRegistry,  // machine-local, NOT catalog
 ) -> (McpResolutionReport, Vec<McpServerDef>);
 ```
 
 1. For each `requested_id` in `agent.requested_mcp_server_ids`:
    - Look up in `registry.servers[requested_id]`
-   - Check: server exists, is enabled, type is `"stdio"` (or `"platform"` for codex)
+   - Resolve runtime binding:
+     - if `binding.runtime_id` is set, treat registry entries under that runtime namespace as source of truth;
+     - otherwise, default to provider-resolved namespace for the selected binding.
+   - Check: server exists, is enabled, and type is `"stdio"` unless `binding.provider == Some("codex".to_string())` and the runtime policy allows `"platform"`.
    - If available → materialize `McpServerDef { name, command, args, env }`, add to `predicted_effective_extensions`
    - If missing or disabled → add to `denied_extensions` and `blocking_issues`
 2. Return `(report, server_defs)` — report for persistence, defs for transport
@@ -326,7 +344,11 @@ let mcp_servers: Vec<serde_json::Value> = req.mcp_servers.iter()
 ```rust
 pub mcp_servers: Vec<McpServerDef>,
 pub mcp_resolution_json: Option<String>,  // serialized McpResolutionReport for persistence
+pub mcp_runtime_binding: Option<McpRuntimeBinding>, // resolver context used for runtime-typed filtering
 ```
+
+This keeps the resolver context visible to transport-level diagnostics and prevents
+runtime/type assumptions from being re-derived from `required_tools` or other non-runtime surfaces.
 
 ---
 
@@ -367,7 +389,7 @@ pub mcp_resolution_json: Option<String>,  // serialized McpResolutionReport for 
 ## 4. Acceptance Criteria
 
 ### Failed-Stage Evidence
-1. When a stage settles as Failed, `evidence_packet_json` is populated on `stage_executions` with full `FailedStageEvidencePacket` JSON including `transcript_exists`, `output_presence`, `supervision_classification`, `canonical_outcome`, `transport_error_kind`, `output_envelopes`, and `recovery_snapshot`.
+1. When a stage settles as Failed, `evidence_packet_json` is populated on `stage_executions` with a `FailedStageEvidencePacket` including mandatory fields and optional placeholders for parity-deferred fields (`canonical_outcome`, `transport_error_kind`, `output_presence`, `recovery_snapshot`) as `null` until explicit owner persistence is implemented.
 2. Evidence artifact written to `failure-evidence/evidence-{stage_id}-attempt{n}.json` with `report_kind = "failed_stage_evidence"`.
 3. `reports.get` MCP tool returns the failure evidence artifact for the run.
 4. Evidence is built **at failure time**, not deferred to run completion.

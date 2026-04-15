@@ -3,7 +3,7 @@
 ## A. Repo-Local Proposal / Document Inventory
 | Evidence ID | Source / Path / Artifact | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
 |---|---|---|---|---|---|---|
-| DOC-01 | `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md` | 2026-04-15 | High | The current draft closes the stale blockers from the prior round: `P046` is now an explicit dependency, missing/disabled requested MCP servers are now fail-closed, and the canonical ACP registry path / override / legacy migration are now named directly. Three new blockers remain: failed-stage packet substrate, runtime-scoped MCP resolver inputs, and delivery-preflight JSON shape drift. | Review could keep repeating stale blockers and miss the current live ones. | Primary proposal source. |
+| DOC-01 | `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md` | 2026-04-15 | High | The current draft closes the stale blockers from the prior round: `P046` is now an explicit dependency, missing/disabled requested MCP servers are now fail-closed, and the canonical ACP registry path / override / legacy migration are now named directly. Two blockers remain: runtime-scoped MCP resolver inputs and delivery-preflight JSON shape drift; failed-stage packet scope is now explicitly Rust V1 with deferred fields. | Review could keep repeating stale blockers and miss the current live ones. | Primary proposal source. |
 | DOC-02 | `.review-baselines/current-system-baseline.md` | 2026-04-15 | High | Repo-backed delivery and operator/report surfaces remain baseline behavior, not speculative future scope. | Review could misclassify run-start validation and report readers as optional future-state concerns. | Intake baseline. |
 | DOC-03 | `docs/reference/output-contracts-failure-evidence-and-recovery.md` | 2026-04-15 | High | Stable failure evidence remains stage-owned and should be referenced through canonical evidence rather than inferred from loose scans. | Proposal can still overclaim parity if it does not name the owners that actually feed the packet. | Failed-stage evidence authority. |
 | DOC-04 | `docs/reference/acp-runtime-transport.md` | 2026-04-15 | High | ACP runtime truth is transport-neutral, but runtime selection and adapter realization still stay bound to the selected runtime family. | Proposal can under-specify runtime-scoped MCP resolution and still claim parity. | Runtime boundary authority. |
@@ -32,14 +32,14 @@
   - `P048` still claims parity with the current stable Swift owner chain unless it explicitly documents a contract change
   - the proposal is judged against the current working tree, not an older review cache
 - Blockers:
-  - the proposal does not yet name the Rust owners needed to build the full failed-stage packet it promises
+  - the proposal limits failed-stage packet scope to Rust V1 and explicitly marks selected fields deferred; those owners are still pending in Rust and should be called out before full stable parity
   - the MCP resolver contract still omits runtime-scoped inputs and live registry loading semantics
   - the delivery preflight JSON schema drifts from the stable frozen payload contract
 
 ## D. Affected Screens / Navigation / Entry-Point Slice
 | Evidence ID | Screen / Surface / Entry Point | Source (`Baseline | Targeted refresh | Proposal`) | Verified On | Confidence | Key Fact | Risk if Wrong | Relevance |
 |---|---|---|---|---|---|---|---|
-| NAV-01 | failed-stage report / recovery readers | Baseline + current repo | 2026-04-15 | High | Stable readers expect a stage-owned packet with richer source-field ownership than current Rust persists. | Proposal can still sound complete while leaving the packet unbuildable. | Critical failed-stage seam. |
+| NAV-01 | failed-stage report / recovery readers | Baseline + current repo | 2026-04-15 | High | Stable readers expect a stage-owned packet with richer source-field ownership than current Rust persists. | Proposal now marks fields as deferred; buildability risk now depends on when V2 owners are introduced. | Defer-to-V2 failed-stage seam. |
 | NAV-02 | runtime MCP validation and ACP session setup | Baseline + current repo | 2026-04-15 | High | Stable MCP realization depends on selected runtime namespace and fresh registry snapshots during preflight/session creation. | Proposal can still overclaim parity with an under-scoped resolver contract. | Critical MCP seam. |
 | NAV-03 | delivery preflight report and start-block reasons | Baseline + current repo | 2026-04-15 | High | Stable UI and evidence/export flows already assume `{id, label, passed, detail}` for frozen delivery preflight results. | Proposal can still drift a persisted contract without naming a migration. | Delivery-preflight seam. |
 
@@ -59,7 +59,7 @@
 ## F. Current Host-System Integration Surfaces
 | Evidence ID | Surface / Seam / Owner | Source (`Baseline | Targeted refresh | Current repo`) | Verified On | Confidence | Key Fact | Conflict / Proposal Risk | Relevance |
 |---|---|---|---|---|---|---|---|
-| INT-01 | failed-stage packet source-field owners | Baseline + current repo | 2026-04-15 | High | Current Rust durable owners do not yet cover the full packet shape the proposal promises. | Proposal still overclaims parity. | Critical blocker. |
+| INT-01 | failed-stage packet source-field owners | Baseline + current repo | 2026-04-15 | High | Current Rust durable owners do not yet cover deferred parity fields (`canonical_outcome`, `transport_error_kind`, `output_presence`, `recovery_snapshot`). | Full stable parity still requires V2 owner persistence. | Partial/Deferred blocker. |
 | INT-02 | runtime-scoped MCP resolution | Baseline + current repo | 2026-04-15 | High | Stable MCP resolution depends on selected runtime namespace and live registry snapshots. | Proposal still leaves both points implicit or weaker. | High blocker. |
 | INT-03 | frozen delivery-preflight JSON | Baseline + current repo | 2026-04-15 | High | Stable preflight payload fields are `id` and `label`, and current readers use them directly. | Proposal still drifts the contract. | Medium blocker. |
 
@@ -71,20 +71,20 @@
 | Canonical ACP registry path / override / Goose-era migration | Specified | DOC-01, MAP-04 | proposal lines 227-263 | Old registry-path blocker is closed. |
 | Runtime-scoped MCP resolution input contract | Partial | MAP-04, MAP-05, INT-02 | proposal resolver signature vs stable runtime owner chain | High live blocker remains. |
 | Live registry snapshot timing for preflight/session creation | Partial | MAP-04, MAP-05, INT-02 | proposal startup load wording vs current Swift reads | High live blocker remains. |
-| Full failed-stage packet source-field ownership | Contradicted by repo | MAP-01, MAP-02, MAP-03, INT-01 | packet contract vs current Rust durable rows | Critical live blocker remains. |
+| Failed-stage packet scope and deferred fields | Partially specified | MAP-01, MAP-02, MAP-03, INT-01 | packet contract now scoped to Rust V1 with deferred fields | V2 parity work remains pending. |
 | Delivery preflight persisted JSON shape | Contradicted by repo | MAP-06, MAP-07, INT-03 | proposal struct shape vs stable service/UI/export contract | Medium live blocker remains. |
 
 ## H. Testing Strategy
 | Evidence ID | Layer | Covered Surface | Current Coverage | Proposed Additions | Verified On | Confidence | Gap / Risk |
 |---|---|---|---|---|---|---|---|
-| TEST-01 | proposal acceptance | failed-stage evidence parity | current ACs require a full packet | ACs need the missing owner-field inventory, not just the packet type | 2026-04-15 | High | Critical blocker remains. |
+| TEST-01 | proposal acceptance | failed-stage evidence parity | current ACs require full stable packet fields | ACs are updated for Rust V1; a V2 pass needs additional owner-field coverage | 2026-04-15 | High | Watch for V2 completion. |
 | TEST-02 | proposal acceptance | runtime-scoped MCP resolution | current ACs cover fail-closed missing-server behavior and canonical path | ACs should also prove runtime-namespace-sensitive realization and live registry reload semantics | 2026-04-15 | High | High blocker remains. |
 | TEST-03 | proposal acceptance | delivery preflight parity | current ACs block run start on failure | ACs should keep the stable persisted result schema, not rename it implicitly | 2026-04-15 | High | Medium blocker remains. |
 
 ## I. Current Repo Reality / Contradictions
 | Evidence ID | Repo Surface | Proposal Claim | Current Repo Reality | Verified On | Confidence | Implication |
 |---|---|---|---|---|---|---|
-| REAL-01 | failed-stage packet parity | Rust can port the full stable packet in the named seams | current Rust durable owners do not persist most packet source fields | 2026-04-15 | High | One critical blocker remains. |
+| REAL-01 | failed-stage packet parity scope | Rust now scopes packet as V1 with deferred parity fields | deferred fields are intentionally nullable until explicit Rust owners are added | 2026-04-15 | High | Full stable parity remains a later slice. |
 | REAL-02 | runtime-scoped MCP resolution | `resolve_mcp_servers(requested_ids, registry)` is enough for parity | stable Swift resolution depends on provider binding/runtime namespace and fresh registry snapshots | 2026-04-15 | High | One high blocker remains. |
 | REAL-03 | delivery-preflight persisted shape | the proposal ports `DeliveryPreflightService` | stable service and readers use `id` / `label`, not `name` | 2026-04-15 | High | One medium blocker remains. |
 | REAL-04 | undeclared `P046` dependency | `P048` still relied on `ValidationFailureRecord` / envelopes implicitly | current draft now depends on `P046` explicitly | 2026-04-15 | High | Earlier blocker is stale. |

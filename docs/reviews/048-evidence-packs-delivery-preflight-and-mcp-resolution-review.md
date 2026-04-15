@@ -51,19 +51,17 @@
   - `control-plane/crates/graphql-server/src/types/stage.rs`
 - Current repo contradictions found:
   - the old review basis is stale: the current draft already fixes the prior undeclared `P046` dependency gap and now explicitly locks missing/disabled backend MCP servers as fail-closed against the canonical ACP registry contract
-  - three new live proposal-first blockers remain:
-    - the proposal promises the full stable failed-stage evidence packet without specifying the Rust owner fields needed to build it
+  - two new live proposal-first blockers remain:
     - the MCP resolution contract still omits runtime-scoped inputs and weakens current live-registry semantics
     - the delivery preflight result schema no longer matches the stable frozen JSON contract
 
 ## 1. Executive Summary
 - Overall readiness: `Red`
 - Confidence: `High`
-- Proposal completeness signal: `The stale red basis is gone, but the current draft still overclaims packet parity, under-specifies runtime-scoped MCP resolution, and drifts the delivery preflight JSON contract.`
+- Proposal completeness signal: `The stale red basis is gone; packet parity is now scoped explicitly in Rust V1 terms with nullable deferred fields, and remaining risks are MCP runtime scoping + preflight payload migration safety.`
 - Top residual implementation risks:
-  1. The promised `FailedStageEvidencePacket` cannot be built with current Rust durable owners as specified in the draft.
-  2. MCP resolution still lacks the runtime namespace / provider-binding inputs and live registry reload semantics that the stable Swift owner chain uses.
-  3. The delivery preflight payload shape diverges from the stable `DeliveryPreflightService.PreflightResult` contract that current UI and frozen run evidence already assume.
+  1. MCP resolution still lacks the runtime namespace / provider-binding inputs and live registry reload semantics that the stable Swift owner chain uses.
+  2. The delivery preflight payload shape diverges from the stable `DeliveryPreflightService.PreflightResult` contract that current UI and frozen run evidence already assume.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
@@ -81,7 +79,6 @@
   - current Rust ACP / DB / GraphQL / MCP read surfaces
 - Most important contradictions with current repo:
   - the earlier dependency / fail-policy / registry-path blockers are now closed in the draft
-  - the failed-stage packet still lacks its Rust source-field owner map
   - the MCP section still leaves out runtime-scoped inputs and live registry timing
   - the delivery preflight section still changes the stable persisted result schema
 
@@ -97,7 +94,7 @@ This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline eviden
 |---|---|---|---|---:|---:|---:|---:|
 | UI | Green | High | Complete | 0 | 0 | 0 | 0 |
 | UX | Green | High | Complete | 0 | 0 | 0 | 0 |
-| Architecture | Red | High | Complete | 1 | 1 | 1 | 0 |
+| Architecture | Red | High | Complete | 0 | 1 | 1 | 0 |
 
 ## 5. Findings by Discipline
 
@@ -109,18 +106,17 @@ This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline eviden
 
 ### 5.3 Architecture Findings
 
-#### ARCH-001 - The proposal still overclaims full failed-stage packet parity without naming the Rust owner fields needed to build it
-- Severity: `Critical`
+#### ARCH-001 - Failed-stage evidence packet is now explicitly scoped to Rust V1 with deferred parity fields
+- Severity: `Info`
 - Confidence: `High`
 - Evidence Completeness: `Complete`
 - Evidence IDs: `DOC-01`, `DOC-03`, `DOC-06`, `MAP-01`, `MAP-02`, `MAP-03`, `INT-01`
 - Proposal refs:
   - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:68`
+  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:98`
+  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:99`
   - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:100`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:102`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:315`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:327`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:345`
+  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:365`
 - Current repo refs:
   - `control-plane/crates/acp/src/lib.rs:13`
   - `control-plane/crates/domain/src/agent.rs:40`
@@ -131,16 +127,9 @@ This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline eviden
   - `control-plane/crates/engine/src/executor.rs:349`
   - `Chainworks Forge/Engine/FailedStageEvidenceBuilder.swift:12`
 - Why it matters:
-  - The draft now promises the **full stable** `FailedStageEvidencePacket`, including `supervision_classification`, `canonical_outcome`, `transport_error_kind`, `output_presence`, `output_envelopes`, and `recovery_snapshot`. But the current Rust substrate does not persist most of those source fields. `acp::ExecutionResult` only returns status, artifact paths, and cost; `domain::AgentExecution` only stores provider/model/status/timestamps; `domain::StageExecution` does not carry `recovery_snapshot`; and the file list adds MCP provenance to `domain/src/agent.rs` but no failed-stage packet source fields. That means the orchestrator cannot actually build the claimed parity packet at failure settlement from the owners named in the proposal.
+  - The draft now treats `FailedStageEvidencePacket` as a Rust V1 packet and explicitly marks parity-deferred fields (`canonical_outcome`, `transport_error_kind`, `output_presence`, `recovery_snapshot`) as optional until their Rust owners are added.
 - Required fix:
-  - Either narrow the packet contract explicitly, or add the missing owner map and persistence seam for the full parity packet.
-  - At minimum, the proposal needs to name where Rust will persist or reconstruct:
-    - `canonical_outcome`
-    - `transport_error_kind`
-    - `output_presence`
-    - `output_envelopes`
-    - `supervision_classification`
-    - `recovery_snapshot`
+  - If full stable parity is later required, add the explicit owner persistence and update this acceptance pack when those fields become non-null in Rust.
   - If those owners live across `acp::ExecutionResult`, `domain::AgentExecution`, `domain::StageExecution`, validation rows, and recovery logic, the file inventory and acceptance criteria must say so directly.
 
 #### ARCH-002 - MCP resolution still omits the runtime-scoped inputs and reload timing that the stable owner chain depends on
@@ -160,7 +149,7 @@ This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline eviden
   - `Chainworks Forge/Engine/RuntimeSessionBridge.swift:162`
   - `Chainworks Forge/Engine/PreflightService.swift:662`
   - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:37`
-- Why it matters:
+ - Why it matters:
   - The proposal correctly moved executable MCP definitions to the canonical machine-local ACP registry and correctly made missing/disabled requested servers fail-closed. But the current design still leaves out two runtime-critical details that the stable Swift owner chain already uses:
     - `resolve_mcp_servers(requested_ids, registry)` does not take the selected runtime namespace / provider binding, even though the proposal's own rules depend on it for cases like `type == "platform"` being valid only for Codex.
     - the proposal says the registry is loaded at daemon startup, while the stable system reads a fresh snapshot during preflight and again during ACP realization. Startup-only loading weakens current operator semantics because MCP registry edits would not be seen until daemon restart.
@@ -196,9 +185,6 @@ This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline eviden
 
 ## 6. Cross-Discipline Conflicts and Decisions
 - Conflict:
-  - the proposal claims full failed-stage packet parity while naming only a subset of the owner fields required to build it
-  - decision needed: full parity with new source-field owners, or intentionally narrower packet
-- Conflict:
   - the MCP section claims Swift-parity resolution, but its resolver signature and registry load timing are weaker than the current runtime-scoped owner chain
   - decision needed: runtime-scoped parity now, or explicit documented behavior change
 - Conflict:
@@ -208,8 +194,7 @@ This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline eviden
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P1 | Add the missing Rust owner map for the full failed-stage packet, or narrow the packet contract explicitly | Architecture | proposal author | Before next review | current ACP / executor / recovery seams | every promised packet field has a named durable source | `ARCH-001` |
-| P1 | Make MCP resolution explicitly runtime-scoped and align registry load timing with the stable owner chain | Architecture | proposal author | Before next review | current Swift MCP owner flow | resolver contract includes selected runtime inputs and load timing is unambiguous | `ARCH-002` |
+| P2 | Make MCP resolution explicitly runtime-scoped and align registry load timing with the stable owner chain | Architecture | proposal author | Before next review | current Swift MCP owner flow | resolver contract includes selected runtime inputs and load timing is unambiguous | `ARCH-002` |
 | P2 | Restore the stable delivery preflight JSON payload shape or document a reader migration | Architecture | proposal author | Before next review | current preflight UI/evidence readers | persisted delivery-preflight payload is no longer ambiguous | `ARCH-003` |
 
 ## 8. Validation and Measurement Plan
