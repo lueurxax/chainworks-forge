@@ -36,11 +36,15 @@ pub struct TaskValidationSummary {
 }
 
 pub fn validation_mode(schema: &OutputSchema) -> &str {
-    schema.validation_mode.as_deref().unwrap_or("strict_structured")
+    schema
+        .validation_mode
+        .as_deref()
+        .unwrap_or("strict_structured")
 }
 
 pub fn machine_format(schema: &OutputSchema) -> &str {
-    schema.machine_format
+    schema
+        .machine_format
         .as_deref()
         .unwrap_or(schema.format.as_str())
 }
@@ -120,9 +124,8 @@ pub fn validate_output(
             .cloned()
             .collect();
 
-        let validation_error = (!missing_fields.is_empty()).then(|| {
-            format!("Missing required fields: {}", missing_fields.join(", "))
-        });
+        let validation_error = (!missing_fields.is_empty())
+            .then(|| format!("Missing required fields: {}", missing_fields.join(", ")));
 
         OutputValidationResult {
             output_name: output_name.to_string(),
@@ -325,9 +328,7 @@ pub fn load_declared_output_bytes(
         .collect()
 }
 
-pub fn declared_output_paths(
-    declared_outputs: &[DeclaredOutput],
-) -> HashMap<String, String> {
+pub fn declared_output_paths(declared_outputs: &[DeclaredOutput]) -> HashMap<String, String> {
     declared_outputs
         .iter()
         .map(|declared| (declared.output_name.clone(), declared.target_path.clone()))
@@ -408,7 +409,10 @@ mod tests {
         )
         .expect("missing output should still produce a validation failure record");
 
-        assert_eq!(record.failure_class, ValidationFailureClass::NoOutputProduced);
+        assert_eq!(
+            record.failure_class,
+            ValidationFailureClass::NoOutputProduced
+        );
         assert_eq!(record.recovery_recommendation.action, "operator_inspection");
     }
 }

@@ -23,8 +23,7 @@ impl JunieAdapter {
     /// Create a new adapter, resolving the binary from `CHAINWORKS_JUNIE_ACP_BINARY`
     /// or falling back to `junie` on PATH.
     pub fn new() -> Self {
-        let binary_path = std::env::var(BINARY_ENV_VAR)
-            .unwrap_or_else(|_| "junie".to_string());
+        let binary_path = std::env::var(BINARY_ENV_VAR).unwrap_or_else(|_| "junie".to_string());
         Self { binary_path }
     }
 
@@ -71,9 +70,7 @@ impl AcpAdapter for JunieAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| {
-                format!("spawn Junie ACP subprocess: {}", self.binary_path)
-            })?;
+            .with_context(|| format!("spawn Junie ACP subprocess: {}", self.binary_path))?;
 
         let config = AcpSessionConfig {
             model: "default",

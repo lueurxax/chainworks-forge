@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use domain::commands::{Command, RetryStageCmd};
+use domain::commands::{CallerContext, Command, RetryStageCmd};
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
 
@@ -27,6 +27,7 @@ pub async fn execute(
     params: serde_json::Value,
     _pool: &SqlitePool,
     cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     match tool_name {
         "stages.retry" => {
@@ -39,9 +40,14 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
                 .to_string();
 
+            let caller =
+                CallerContext::mcp(&principal.id, &principal.class.to_string(), "stages.retry");
             let cmd = Command::RetryStage(RetryStageCmd { run_id, stage_id });
-            cmd_handler.handle(cmd).await?;
-            Ok(serde_json::json!({ "scheduled": true }))
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            Ok(serde_json::json!({
+                "scheduled": true,
+                "journal_id": commanded.journal_id,
+            }))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),

@@ -5,8 +5,8 @@
 //! the orchestrator needs to drive a run through the state machine without
 //! re-reading the YAML files.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A fully compiled run plan ready for execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +18,20 @@ pub struct RunPlan {
     /// Used by `exists('artifact_name')` transition conditions to check if an artifact
     /// has been produced on the filesystem.
     pub artifact_paths: HashMap<String, String>,
+    /// Frozen workflow cohort family from parsed workflow metadata.
+    pub workflow_family: Option<String>,
+    /// Frozen workflow risk class from parsed workflow metadata.
+    pub risk_class: Option<String>,
+    /// Frozen stack identifier from parsed workflow metadata.
+    pub stack: Option<String>,
+    /// SHA-256 over canonical parsed workflow snapshot JSON.
+    pub workflow_snapshot_hash: String,
+    /// SHA-256 over canonical parsed agent-catalog snapshot JSON.
+    pub catalog_snapshot_hash: String,
+    /// Canonical parsed workflow snapshot JSON.
+    pub workflow_snapshot_json: String,
+    /// Canonical parsed agent-catalog snapshot JSON.
+    pub catalog_snapshot_json: String,
 }
 
 /// A single compiled state in the workflow state machine.

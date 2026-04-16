@@ -42,7 +42,17 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
-        let (status, artifact_paths, discovered_artifacts, usage) = self.transport.prompt(req).await?;
+        let (status, artifact_paths, discovered_artifacts, usage) =
+            self.transport.prompt(req).await?;
+        let mcp_observation = self.transport.mcp_observation();
+        let actual_mcp_extensions = mcp_observation
+            .as_ref()
+            .map(|observation| observation.actual_extensions.clone())
+            .unwrap_or_default();
+        let actual_mcp_runtime_ids = mcp_observation
+            .as_ref()
+            .map(|observation| observation.actual_runtime_ids.clone())
+            .unwrap_or_default();
         Ok(ExecutionResult {
             agent_execution_id: AgentExecutionId::new(),
             status,
@@ -53,6 +63,10 @@ impl AcpSession {
             provider_session_id: Some(self.transport.session_id().to_string()),
             reused_existing_session: false,
             session_generation_id: None,
+            mcp_observation,
+            actual_mcp_extensions,
+            actual_mcp_runtime_ids,
+            mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
         })
     }
 

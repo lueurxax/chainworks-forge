@@ -1,22 +1,25 @@
-use anyhow::{anyhow, Result};
 use acp::AcpRuntimeManager;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use db::repos::{agent_executions, approvals, command_journal, projections, runs, sessions, stages};
+use db::repos::{
+    agent_executions, approvals, command_journal, ideas, projections, runs, sessions, stages,
+};
 use db::work_item::WorkItemKind;
 use domain::approval::ApprovalDecision;
-use domain::commands::Command;
+use domain::commands::{CallerContext, Command};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 
-use crate::event_bus::EventSender;
-use crate::work_queue::WorkQueue;
 use crate::cancellation;
+use crate::event_bus::EventSender;
+use crate::preflight::{run_delivery_preflight, DeliveryPreflightResult};
+use crate::work_queue::WorkQueue;
 
 pub struct CommandHandler {
     pool: SqlitePool,
@@ -27,11 +30,24 @@ pub struct CommandHandler {
 
 pub enum CommandResult {
     RunStarted { run_id: RunId },
+    StartRunBlockedByDeliveryPreflight(StartRunBlockedByDeliveryPreflight),
     StageApproved { approval_id: ApprovalId },
     StageRejected { approval_id: ApprovalId },
     StageRetryScheduled { run_id: RunId, stage_id: String },
     RunCancelled { run_id: RunId },
     SessionReset { run_id: RunId, stage_id: String },
+    StewardAnalysisQueued,
+}
+
+pub struct StartRunBlockedByDeliveryPreflight {
+    pub delivery_preflight: DeliveryPreflightResult,
+}
+
+/// P029: Wrapper that pairs the command result with the journal audit ID.
+/// `CommandHandler::handle` returns this instead of bare `CommandResult`.
+pub struct Commanded {
+    pub result: CommandResult,
+    pub journal_id: String,
 }
 
 impl CommandHandler {
@@ -58,7 +74,7 @@ impl CommandHandler {
         }
     }
 
-    pub async fn handle(&self, cmd: Command) -> Result<CommandResult> {
+    pub async fn handle(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal_id = uuid::Uuid::new_v4().to_string();
         let cmd_type = match &cmd {
@@ -68,8 +84,10 @@ impl CommandHandler {
             Command::RetryStage(_) => "RetryStage",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
+            Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
         };
-        let payload_json = serde_json::to_string(&cmd).unwrap_or_default();
+        let raw = serde_json::to_string(&cmd).unwrap_or_default();
+        let payload_json = crate::command_journal_redact::redact_for_journal(&cmd, &raw);
         let run_id_for_journal: Option<String> = match &cmd {
             Command::StartRun(_) => None,
             Command::ApproveStage(c) => Some(c.run_id.to_string()),
@@ -77,6 +95,7 @@ impl CommandHandler {
             Command::RetryStage(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
+            Command::RunStewardAnalysis(_) => None,
         };
         let now = Utc::now();
         let _ = command_journal::record(
@@ -86,6 +105,10 @@ impl CommandHandler {
             &payload_json,
             run_id_for_journal.as_deref(),
             now,
+            Some(&caller.surface.to_string()),
+            Some(&caller.principal_id),
+            Some(&caller.principal_class),
+            Some(&caller.caller_tool),
         )
         .await;
 
@@ -109,7 +132,10 @@ impl CommandHandler {
             }
         }
 
-        result
+        result.map(|r| Commanded {
+            result: r,
+            journal_id: journal_id.clone(),
+        })
     }
 
     async fn execute_command(&self, cmd: Command) -> Result<CommandResult> {
@@ -119,10 +145,34 @@ impl CommandHandler {
                 let run_id = RunId::new();
                 // Compile the plan early to fail fast on invalid YAML before
                 // persisting anything.
-                let plan = workflow::compiler::compile(
-                    &c.workflow_yaml_path,
-                    &c.agent_catalog_yaml_path,
-                )?;
+                let plan =
+                    workflow::compiler::compile(&c.workflow_yaml_path, &c.agent_catalog_yaml_path)?;
+                let delivery_preflight_json =
+                    if let Some(delivery_configuration_json) = &c.delivery_configuration_json {
+                        let delivery_config: domain::run::DeliveryConfiguration =
+                            serde_json::from_str(delivery_configuration_json)?;
+                        let preflight = run_delivery_preflight(&delivery_config);
+                        if !preflight.passed {
+                            return Ok(CommandResult::StartRunBlockedByDeliveryPreflight(
+                                StartRunBlockedByDeliveryPreflight {
+                                    delivery_preflight: preflight,
+                                },
+                            ));
+                        }
+                        Some(serde_json::to_string(&preflight)?)
+                    } else {
+                        None
+                    };
+                let idea = ideas::find_by_id(&self.pool, c.idea_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Idea {} not found", c.idea_id))?;
+                let project_key = idea
+                    .project_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("untagged")
+                    .to_string();
 
                 let run = Run {
                     id: run_id,
@@ -147,6 +197,17 @@ impl CommandHandler {
                     base_revision: None,
                     target_branch: None,
                     delivery_configuration_json: c.delivery_configuration_json.clone(),
+                    delivery_preflight_json,
+                    workflow_family: plan.workflow_family.clone(),
+                    project_key: Some(project_key),
+                    risk_class: plan.risk_class.clone(),
+                    stack: plan.stack.clone(),
+                    workflow_snapshot_hash: Some(plan.workflow_snapshot_hash.clone()),
+                    catalog_snapshot_hash: Some(plan.catalog_snapshot_hash.clone()),
+                    workflow_snapshot_json: Some(plan.workflow_snapshot_json.clone()),
+                    catalog_snapshot_json: Some(plan.catalog_snapshot_json.clone()),
+                    drift_detected_at: None,
+                    drift_details_json: None,
                 };
                 runs::insert(&self.pool, &run).await?;
                 // Activate the idea when its first run starts.
@@ -210,12 +271,8 @@ impl CommandHandler {
                             .check_has_post_approval_tasks(c.run_id, &c.stage_id)
                             .await;
                         if has_post_tasks {
-                            stages::update_status(
-                                &self.pool,
-                                stage.id,
-                                StageStatus::Running,
-                            )
-                            .await?;
+                            stages::update_status(&self.pool, stage.id, StageStatus::Running)
+                                .await?;
                             let _ = self.events.send(DomainEvent::StageStatusChanged {
                                 run_id: c.run_id,
                                 stage_execution_id: stage.id,
@@ -326,8 +383,7 @@ impl CommandHandler {
 
                 let now = Utc::now();
                 // Mark old stage as skipped
-                stages::settle(&self.pool, old_stage.id, StageSettlementKind::Skipped, now)
-                    .await?;
+                stages::settle(&self.pool, old_stage.id, StageSettlementKind::Skipped, now).await?;
 
                 // Create new stage execution with attempt+1
                 let new_stage = StageExecution {
@@ -345,6 +401,10 @@ impl CommandHandler {
                     provider: old_stage.provider.clone(),
                     model: old_stage.model.clone(),
                     stage_type: old_stage.stage_type.clone(),
+                    validation_failure_json: None,
+                    evidence_packet_json: None,
+                    recovery_snapshot_json: None,
+                    retry_reason: Some("operator_retry".into()),
                 };
                 stages::insert(&self.pool, &new_stage).await?;
 
@@ -380,7 +440,9 @@ impl CommandHandler {
 
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
-                    if let Err(e) = crate::worktree::WorktreeProvisioner::cleanup(wt, &run.workspace_root).await {
+                    if let Err(e) =
+                        crate::worktree::WorktreeProvisioner::cleanup(wt, &run.workspace_root).await
+                    {
                         tracing::warn!(
                             run_id = %c.run_id,
                             worktree = %wt,
@@ -405,6 +467,25 @@ impl CommandHandler {
                 Ok(CommandResult::RunCancelled { run_id: c.run_id })
             }
 
+            Command::RunStewardAnalysis(c) => {
+                let artifact_base = c
+                    .artifact_base
+                    .or_else(|| std::env::var("CHAINWORKS_META_ROOT").ok())
+                    .unwrap_or_else(|| ".chainworks".into());
+                self.work_queue
+                    .enqueue(
+                        WorkItemKind::StewardAnalysis,
+                        None,
+                        None,
+                        serde_json::json!({
+                            "reason": c.reason,
+                            "artifact_base": artifact_base,
+                        }),
+                    )
+                    .await?;
+                Ok(CommandResult::StewardAnalysisQueued)
+            }
+
             Command::ResetSession(c) => {
                 // Mark the stage as requiring a reset by setting it to Pending
                 let run_stages = stages::list_by_run(&self.pool, c.run_id).await?;
@@ -421,17 +502,20 @@ impl CommandHandler {
                             )
                             .await?;
                             if let Some(ref lineage_id) = execution.session_lineage_id {
-                                sessions::set_active_generation(&self.pool, lineage_id, None).await?;
+                                sessions::set_active_generation(&self.pool, lineage_id, None)
+                                    .await?;
                                 sessions::insert_event(
                                     &self.pool,
                                     &domain::session::SessionEvent {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         lineage_id: lineage_id.clone(),
                                         generation_id: generation_id.clone(),
-                                        event_type: domain::session::SessionEventType::OperatorReset,
+                                        event_type:
+                                            domain::session::SessionEventType::OperatorReset,
                                         recorded_at: Utc::now(),
                                         details_json: Some(
-                                            serde_json::json!({ "reason": "operator_reset" }).to_string(),
+                                            serde_json::json!({ "reason": "operator_reset" })
+                                                .to_string(),
                                         ),
                                     },
                                 )

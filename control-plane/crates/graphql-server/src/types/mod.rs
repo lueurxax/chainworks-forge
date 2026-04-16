@@ -3,3 +3,4 @@ pub mod artifact;
 pub mod idea;
 pub mod run;
 pub mod stage;
+pub mod steward;

@@ -567,6 +567,87 @@ Important:
 - this gate is the canonical proof path for the proposal-047 control-plane workspace slice
 - the runner also accepts the `p047` alias for parity with other proposal gates
 
+### `proposal-029-mcp`
+
+MCP northbound auth, capability filtering, and audit journaling gate.
+
+Scope:
+
+- Bearer auth on MCP HTTP, MCP stdio (initialize), and GraphQL
+- Per-principal tool/resource capability filtering (operator/agent/observer classes)
+- command_journal caller tracking (caller_surface, caller_principal_id, caller_principal_class, caller_tool)
+- command_journal_redact payload redaction
+- journal_id surfacing in MCP tools/call and GraphQL mutation payloads
+- No regression on existing tool/resource/query/mutation surfaces
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-029-mcp
+```
+
+### `proposal-048|p048`
+
+Evidence packs, delivery preflight, and MCP resolution gate.
+
+Scope:
+
+- durable P048 DB/domain persistence round-trip
+- delivery-preflight passing and blocked-start behavior
+- GraphQL delivery-preflight readback
+- MCP `runs.get` and `run://{run_id}` delivery-preflight readback
+- ACP `session/new.mcpServers` serialization
+- engine fail-closed MCP resolution persistence, including explicit empty actual truth and blocked-before-session observation
+- failed-stage evidence packet V1 shape
+- failed-stage evidence `reports.get` and `report://{run_id}` readback
+- typed GraphQL blocked preflight payload
+- GraphQL stage `executions` MCP truth parity
+- MCP `reports.get` execution-level MCP truth
+- MCP `report://{run_id}` execution-level MCP truth
+
+Use when:
+
+- changing delivery preflight, failed-stage evidence, MCP resolution, ACP MCP payloads, GraphQL blocked-start shape, or MCP report/resource readback
+- reproving the proposal-048 control-plane slice before implementation audit
+
+Host policy:
+
+- local Rust toolchain required; no iOS/macOS simulator needed
+### `proposal-049|p049`
+
+Steward analysis system gate for the Rust control-plane slice.
+
+Scope:
+
+- workflow metadata and parsed snapshot freezing
+- run-start frozen cohort/project/snapshot persistence
+- Steward config validation, non-empty threshold ownership, default fallback, parsed catalog hashing, and pending config-change bootstrap
+- P049-shaped `steward_analyses`, run-link, recommendation, failed-analysis, and work-item persistence
+- cohort classification, explicit primary cohort grouping, legacy-pre-P049 exclusion, deterministic metrics/dossiers, anomaly signals, and recommendation persistence
+- active-catalog Steward IO paths under `CHAINWORKS_META_ROOT`, including production `StewardAnalysis` work-item execution through ACP-backed `system_steward` and `steward_auditor` lanes
+- manual, post-run interval, and config-change trigger convergence on `WorkItemKind::StewardAnalysis`
+- run-owned drift detection persistence from startup recovery
+- GraphQL, MCP tool, and `steward-analysis://` readback surfaces
+
+Host policy:
+
+- local Rust toolchain required; no UI host or simulator needed
+- executes in-process against the `control-plane/` workspace
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-048
+./scripts/test-gate.sh proposal-049
+```
+
+Important:
+
+- this gate is the canonical proof path for [048-evidence-packs-delivery-preflight-and-mcp-resolution.md](../proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md)
+- the runner also accepts the `p048` alias for parity with other proposal gates
+- the runner also accepts the `p049` alias
+- `cargo test --workspace` is not a substitute for this gate because the gate documents the proposal-owned proof inventory
+
 ### `full`
 
 Expensive repo-wide sign-off gate.

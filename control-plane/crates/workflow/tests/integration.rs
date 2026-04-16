@@ -25,7 +25,12 @@ fn write_temp_fixture(filename: &str, content: &str) -> String {
 }
 
 fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::plan::RunPlan {
-    let wf_path = write_temp_fixture("workflow.yaml", workflow_yaml);
+    let workflow_yaml = if workflow_yaml.trim_start().starts_with("workflow:") {
+        workflow_yaml.to_string()
+    } else {
+        format!("workflow:\n  id: contract-fixture\n  family: contract_fixture\n{workflow_yaml}")
+    };
+    let wf_path = write_temp_fixture("workflow.yaml", &workflow_yaml);
     let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
     compiler::compile(&wf_path, &cat_path).expect("should compile plan")
 }
@@ -109,15 +114,32 @@ fn test_compile_full_mvp_live_plan() {
     assert_eq!(s1.owner.provider, "claude", "lead_orchestrator uses claude");
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
-    assert_eq!(s4.owner.provider, "claude", "state_4 owner=lead_orchestrator → claude");
+    assert_eq!(
+        s4.owner.provider, "claude",
+        "state_4 owner=lead_orchestrator → claude"
+    );
     // Parallel tasks should have mixed providers
-    let ux_task = s4.tasks.iter().find(|t| t.agent.agent_id == "proposal_reviewer_ux");
+    let ux_task = s4
+        .tasks
+        .iter()
+        .find(|t| t.agent.agent_id == "proposal_reviewer_ux");
     assert!(ux_task.is_some(), "should have UX reviewer task");
-    assert_eq!(ux_task.unwrap().agent.provider, "gemini", "UX reviewer uses gemini");
+    assert_eq!(
+        ux_task.unwrap().agent.provider,
+        "gemini",
+        "UX reviewer uses gemini"
+    );
 
-    let arch_task = s4.tasks.iter().find(|t| t.agent.agent_id == "proposal_reviewer_architect");
+    let arch_task = s4
+        .tasks
+        .iter()
+        .find(|t| t.agent.agent_id == "proposal_reviewer_architect");
     assert!(arch_task.is_some(), "should have architect reviewer task");
-    assert_eq!(arch_task.unwrap().agent.provider, "codex", "architect uses codex");
+    assert_eq!(
+        arch_task.unwrap().agent.provider,
+        "codex",
+        "architect uses codex"
+    );
 
     // Verify code_writer → codex
     let s7 = &plan.states["state_7_implementation_started"];
@@ -158,6 +180,127 @@ fn test_compile_full_mvp_live_plan() {
 }
 
 #[test]
+fn steward_metadata_contract_tests_freeze_workflow_metadata_and_parsed_snapshots() {
+    let plan = compile_from_strings(
+        r#"
+workflow:
+  id: steward-workflow
+  name: Steward Workflow
+  family: mvp_live
+  risk_class: high
+  stack: swiftui
+variables:
+  max_iterations: 2
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: steward
+"#,
+        r#"
+backend_profiles:
+  steward_profile:
+    provider: claude
+    model: steward-model
+agents:
+  - id: steward
+    backend_profile: steward_profile
+    prompt: "observe"
+"#,
+    );
+
+    assert_eq!(plan.workflow_family.as_deref(), Some("mvp_live"));
+    assert_eq!(plan.risk_class.as_deref(), Some("high"));
+    assert_eq!(plan.stack.as_deref(), Some("swiftui"));
+    assert!(
+        plan.workflow_snapshot_hash.len() == 64,
+        "workflow snapshot hash must be a hex sha256"
+    );
+    assert!(
+        plan.catalog_snapshot_hash.len() == 64,
+        "catalog snapshot hash must be a hex sha256"
+    );
+    assert!(
+        plan.workflow_snapshot_json
+            .contains("\"initial_state\":\"start\""),
+        "workflow snapshot must be parsed canonical JSON, not raw YAML"
+    );
+    assert!(
+        plan.catalog_snapshot_json.contains("\"backend_profiles\""),
+        "catalog snapshot must preserve parsed catalog truth"
+    );
+}
+
+#[test]
+fn steward_metadata_contract_tests_snapshot_hashes_are_canonical_over_yaml_ordering() {
+    let catalog_a = r#"
+backend_profiles:
+  steward_profile:
+    provider: claude
+    model: steward-model
+agents:
+  - id: steward
+    backend_profile: steward_profile
+    prompt: "observe"
+"#;
+    let catalog_b = r#"
+agents:
+  - prompt: "observe"
+    backend_profile: steward_profile
+    id: steward
+backend_profiles:
+  steward_profile:
+    model: steward-model
+    provider: claude
+"#;
+    let workflow_a = r#"
+workflow:
+  id: steward-workflow
+  name: Steward Workflow
+  family: mvp_live
+  risk_class: high
+  stack: swiftui
+variables:
+  max_iterations: 2
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: steward
+"#;
+    let workflow_b = r#"
+states:
+  start:
+    owner: steward
+    type: end
+    label: Start
+initial_state: start
+variables:
+  max_iterations: 2
+workflow:
+  stack: swiftui
+  risk_class: high
+  family: mvp_live
+  name: Steward Workflow
+  id: steward-workflow
+"#;
+
+    let workflow_a_path = write_temp_fixture("workflow-a.yaml", workflow_a);
+    let workflow_b_path = write_temp_fixture("workflow-b.yaml", workflow_b);
+    let catalog_a_path = write_temp_fixture("catalog-a.yaml", catalog_a);
+    let catalog_b_path = write_temp_fixture("catalog-b.yaml", catalog_b);
+    let plan_a = compiler::compile(&workflow_a_path, &catalog_a_path).expect("plan a compiles");
+    let plan_b = compiler::compile(&workflow_b_path, &catalog_b_path).expect("plan b compiles");
+
+    assert_eq!(plan_a.workflow_snapshot_json, plan_b.workflow_snapshot_json);
+    assert_eq!(plan_a.catalog_snapshot_json, plan_b.catalog_snapshot_json);
+    assert_eq!(plan_a.workflow_snapshot_hash, plan_b.workflow_snapshot_hash);
+    assert_eq!(plan_a.catalog_snapshot_hash, plan_b.catalog_snapshot_hash);
+}
+
+#[test]
 fn test_compile_n_phase_ordering() {
     let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
     let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
@@ -166,10 +309,7 @@ fn test_compile_n_phase_ordering() {
 
     // ── state_11_manual_release: post_approval_tasks have sequential phases (0, 1) ──
     let s11 = &plan.states["state_11_manual_release"];
-    assert!(
-        s11.is_manual_gate,
-        "state_11 must be a manual_gate"
-    );
+    assert!(s11.is_manual_gate, "state_11 must be a manual_gate");
     assert_eq!(
         s11.post_approval_tasks.len(),
         2,
@@ -194,26 +334,41 @@ fn test_compile_n_phase_ordering() {
         "state_9 must have 2 parallel tasks at phase 0 (security_checker, docs_guardian)"
     );
     for t in &phase_0 {
-        assert!(t.parallel, "phase 0 tasks in state_9 must be marked parallel");
+        assert!(
+            t.parallel,
+            "phase 0 tasks in state_9 must be marked parallel"
+        );
     }
 
     // Then tasks: auditor at phase 1, prepush at phase 2, aggregation at phase 3
     let phase_1: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 1).collect();
-    assert_eq!(phase_1.len(), 1, "state_9 must have 1 task at phase 1 (auditor)");
+    assert_eq!(
+        phase_1.len(),
+        1,
+        "state_9 must have 1 task at phase 1 (auditor)"
+    );
     assert_eq!(
         phase_1[0].agent.agent_id, "proposal_implementation_auditor",
         "phase 1 task must be the auditor"
     );
 
     let phase_2: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 2).collect();
-    assert_eq!(phase_2.len(), 1, "state_9 must have 1 task at phase 2 (prepush)");
+    assert_eq!(
+        phase_2.len(),
+        1,
+        "state_9 must have 1 task at phase 2 (prepush)"
+    );
     assert_eq!(
         phase_2[0].agent.agent_id, "prepush_code_reviewer",
         "phase 2 task must be prepush_code_reviewer"
     );
 
     let phase_3: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 3).collect();
-    assert_eq!(phase_3.len(), 1, "state_9 must have 1 task at phase 3 (aggregation)");
+    assert_eq!(
+        phase_3.len(),
+        1,
+        "state_9 must have 1 task at phase 3 (aggregation)"
+    );
     assert_eq!(
         phase_3[0].agent.agent_id, "lead_orchestrator",
         "phase 3 task must be lead_orchestrator (aggregate)"
@@ -228,7 +383,10 @@ fn test_compile_n_phase_ordering() {
         "state_4 must have 4 parallel tasks at phase 0"
     );
     for t in &s4_phase_0 {
-        assert!(t.parallel, "phase 0 tasks in state_4 must be marked parallel");
+        assert!(
+            t.parallel,
+            "phase 0 tasks in state_4 must be marked parallel"
+        );
     }
 
     let s4_phase_1: Vec<_> = s4.tasks.iter().filter(|t| t.phase == 1).collect();
@@ -371,8 +529,14 @@ agents:
 
     assert_eq!(normalized.contract_id, "proposal_review_v1");
     assert_eq!(raw.contract_id, "proposal_review_v1");
-    assert_eq!(normalized.normalized_artifact_name.as_deref(), Some("proposal_review_normalized"));
-    assert_eq!(raw.raw_artifact_name.as_deref(), Some("proposal_review_raw"));
+    assert_eq!(
+        normalized.normalized_artifact_name.as_deref(),
+        Some("proposal_review_normalized")
+    );
+    assert_eq!(
+        raw.raw_artifact_name.as_deref(),
+        Some("proposal_review_raw")
+    );
 }
 
 #[test]

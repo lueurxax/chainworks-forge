@@ -6,6 +6,8 @@ pub mod transport;
 pub use manager::AcpRuntimeManager;
 pub use session::{AcpSession, AcpSessionHandle};
 
+use std::collections::BTreeMap;
+
 use domain::agent::AgentStatus;
 use domain::ids::{AgentExecutionId, RunId};
 use serde::{Deserialize, Serialize};
@@ -52,6 +54,10 @@ pub struct ExecutionRequest {
     /// and the underlying ACP session handle.
     #[serde(default)]
     pub provider_session_id: Option<String>,
+    /// Executable MCP server payloads resolved from Chainworks extension ids
+    /// into provider-local runtime ids before ACP startup.
+    #[serde(default)]
+    pub mcp_servers: Vec<AcpMcpServerPayload>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +79,56 @@ pub struct ExecutionResult {
     /// existing live session.
     #[serde(default)]
     pub session_generation_id: Option<String>,
+    /// Transport-owned observation of the MCP runtime truth accepted for this
+    /// ACP session. When the provider does not return an explicit accepted
+    /// server list, this records an explicit predicted-after-success fallback
+    /// rather than silently treating predicted truth as observed truth.
+    #[serde(default)]
+    pub mcp_observation: Option<McpActualObservation>,
+    #[serde(default)]
+    pub actual_mcp_extensions: Vec<String>,
+    #[serde(default)]
+    pub actual_mcp_runtime_ids: Vec<String>,
+    #[serde(default)]
+    pub mcp_session_startup_latency_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AcpMcpServerPayload {
+    pub id: String,
+    #[serde(rename = "extensionId")]
+    pub extension_id: String,
+    pub transport: ResolvedMcpServerTransport,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResolvedMcpServerTransport {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+    Platform {
+        provider: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpActualObservation {
+    pub source: String,
+    pub trust_level: String,
+    pub actual_equals_predicted: bool,
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub actual_extensions: Vec<String>,
+    #[serde(default)]
+    pub actual_runtime_ids: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

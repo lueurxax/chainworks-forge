@@ -12,6 +12,7 @@ pub enum WorkItemKind {
     RebuildProjection,
     StartupRepair,
     TriggerNextStage,
+    StewardAnalysis,
 }
 
 impl std::fmt::Display for WorkItemKind {
@@ -23,6 +24,7 @@ impl std::fmt::Display for WorkItemKind {
             WorkItemKind::RebuildProjection => write!(f, "rebuild_projection"),
             WorkItemKind::StartupRepair => write!(f, "startup_repair"),
             WorkItemKind::TriggerNextStage => write!(f, "trigger_next_stage"),
+            WorkItemKind::StewardAnalysis => write!(f, "steward_analysis"),
         }
     }
 }
@@ -38,6 +40,7 @@ impl std::str::FromStr for WorkItemKind {
             "rebuild_projection" => Ok(WorkItemKind::RebuildProjection),
             "startup_repair" => Ok(WorkItemKind::StartupRepair),
             "trigger_next_stage" => Ok(WorkItemKind::TriggerNextStage),
+            "steward_analysis" => Ok(WorkItemKind::StewardAnalysis),
             other => Err(format!("Unknown WorkItemKind: {other}")),
         }
     }
@@ -92,4 +95,19 @@ pub struct WorkItem {
     pub scheduled_at: DateTime<Utc>,
     pub attempt_count: i64,
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkItemKind;
+
+    #[test]
+    fn steward_analysis_work_item_kind_roundtrips() {
+        let value = WorkItemKind::StewardAnalysis.to_string();
+        assert_eq!(value, "steward_analysis");
+        assert_eq!(
+            value.parse::<WorkItemKind>().unwrap(),
+            WorkItemKind::StewardAnalysis
+        );
+    }
 }

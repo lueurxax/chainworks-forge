@@ -190,11 +190,26 @@ fn parse_diff_stat(stat: &str) -> (usize, usize, usize) {
         for part in parts {
             let part = part.trim();
             if part.contains("file") {
-                files_changed = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                files_changed = part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
             } else if part.contains("insertion") {
-                insertions = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                insertions = part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
             } else if part.contains("deletion") {
-                deletions = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                deletions = part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
             }
         }
     }

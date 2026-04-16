@@ -30,6 +30,39 @@ impl Orchestrator {
         }
     }
 
+    async fn enqueue_steward_analysis(&self, completed_run_id: Option<RunId>) -> Result<()> {
+        let pending_config_change =
+            db::repos::steward::take_config_change_pending(&self.pool).await?;
+        let reason = if pending_config_change.is_some() {
+            db::repos::steward::reset_completed_run_counter(&self.pool).await?;
+            "config_change"
+        } else {
+            let (enabled, run_interval) =
+                db::repos::steward::post_run_trigger_config(&self.pool).await?;
+            if !enabled {
+                return Ok(());
+            }
+            let completed_count =
+                db::repos::steward::increment_completed_run_counter(&self.pool).await?;
+            if completed_count < run_interval {
+                return Ok(());
+            }
+            db::repos::steward::reset_completed_run_counter(&self.pool).await?;
+            "post_run_hook"
+        };
+        self.work_queue
+            .enqueue(
+                WorkItemKind::StewardAnalysis,
+                None,
+                None,
+                serde_json::json!({
+                    "reason": reason,
+                    "completed_run_id": completed_run_id.map(|id| id.to_string()),
+                }),
+            )
+            .await
+    }
+
     pub async fn advance_run(&self, run_id: RunId) -> Result<()> {
         let run = match runs::find_by_id(&self.pool, run_id).await? {
             Some(r) => r,
@@ -56,11 +89,7 @@ impl Orchestrator {
     // Workflow-driven state machine (matches Swift WorkflowOrchestrator)
     // =====================================================================
 
-    async fn advance_run_workflow(
-        &self,
-        run_id: RunId,
-        run: &domain::run::Run,
-    ) -> Result<()> {
+    async fn advance_run_workflow(&self, run_id: RunId, run: &domain::run::Run) -> Result<()> {
         let plan = workflow::compiler::compile(
             run.workflow_yaml_path.as_deref().unwrap(),
             run.agent_catalog_yaml_path.as_deref().unwrap(),
@@ -131,7 +160,10 @@ impl Orchestrator {
             // stage are settled (Completed/Failed), we must NOT skip — phase
             // advancement and stage settlement happen in the match block below.
             if !stage_is_stale
-                && matches!(stage.status, StageStatus::Running | StageStatus::WaitingApproval)
+                && matches!(
+                    stage.status,
+                    StageStatus::Running | StageStatus::WaitingApproval
+                )
             {
                 let should_skip = if stage.status == StageStatus::Running {
                     let se_id_str = stage.id.to_string();
@@ -142,10 +174,7 @@ impl Orchestrator {
                         .iter()
                         .filter(|w| {
                             w.kind == db::work_item::WorkItemKind::InvokeAgent
-                                && payload_matches_stage_execution(
-                                    &w.payload_json,
-                                    &se_id_str,
-                                )
+                                && payload_matches_stage_execution(&w.payload_json, &se_id_str)
                         })
                         .collect();
                     if invokes.is_empty() {
@@ -192,314 +221,348 @@ impl Orchestrator {
                 );
                 // Fall through to Case 2 (lazy creation)
             } else {
-            match stage.status {
-                StageStatus::Running => {
-                    // For multi-task stages (fan-out), check if ALL InvokeAgent
-                    // work items for THIS SPECIFIC stage execution have completed.
-                    // We filter by stage_execution_id (UUID) from each item's payload
-                    // rather than stage_id (logical name) to avoid cross-iteration
-                    // contamination — e.g. state_4 iter1 items being counted with
-                    // state_4 iter2 items.
-                    let se_id_str = stage.id.to_string();
-                    let work_items = db::repos::work_items::list_by_run(&self.pool, run_id).await?;
-                    let stage_invokes: Vec<_> = work_items
-                        .iter()
-                        .filter(|w| {
-                            w.kind == db::work_item::WorkItemKind::InvokeAgent
-                                && payload_matches_stage_execution(
-                                    &w.payload_json,
-                                    &se_id_str,
+                match stage.status {
+                    StageStatus::Running => {
+                        // For multi-task stages (fan-out), check if ALL InvokeAgent
+                        // work items for THIS SPECIFIC stage execution have completed.
+                        // We filter by stage_execution_id (UUID) from each item's payload
+                        // rather than stage_id (logical name) to avoid cross-iteration
+                        // contamination — e.g. state_4 iter1 items being counted with
+                        // state_4 iter2 items.
+                        let se_id_str = stage.id.to_string();
+                        let work_items =
+                            db::repos::work_items::list_by_run(&self.pool, run_id).await?;
+                        let stage_invokes: Vec<_> = work_items
+                            .iter()
+                            .filter(|w| {
+                                w.kind == db::work_item::WorkItemKind::InvokeAgent
+                                    && payload_matches_stage_execution(&w.payload_json, &se_id_str)
+                            })
+                            .collect();
+                        let total = stage_invokes.len();
+                        let completed = stage_invokes
+                            .iter()
+                            .filter(|w| w.status == db::work_item::WorkItemStatus::Completed)
+                            .count();
+                        let failed = stage_invokes
+                            .iter()
+                            .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
+                            .count();
+
+                        // Determine if this is a post-approval context (manual_gate
+                        // with a Granted approval) so we use the right task list.
+                        let is_post_approval = state.is_manual_gate && {
+                            let stage_approvals = approvals::list_by_run(&self.pool, run_id)
+                                .await
+                                .unwrap_or_default();
+                            stage_approvals.iter().any(|a| {
+                                a.stage_id == current_state_id
+                                    && a.decision == ApprovalDecision::Granted
+                            })
+                        };
+                        let effective = effective_tasks(state, is_post_approval);
+
+                        // ── Post-approval kickstart ─────────────────────────
+                        // When a manual_gate stage transitions to Running after
+                        // approval but has zero InvokeAgent work items yet,
+                        // enqueue phase 0 from the post-approval task list.
+                        if total == 0 && is_post_approval {
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                "Enqueuing post-approval phase 0 tasks"
+                            );
+                            let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+                                .await
+                                .ok()
+                                .flatten();
+                            let effective_total = effective.len();
+                            for (i, task) in
+                                effective.iter().enumerate().filter(|(_, t)| t.phase == 0)
+                            {
+                                let prompt =
+                                    build_task_prompt(task, &plan, run, idea_opt.as_ref(), None);
+                                self.enqueue_invoke_agent(
+                                    run_id,
+                                    stage,
+                                    task,
+                                    &prompt,
+                                    i,
+                                    effective_total,
+                                    &plan,
+                                    run,
                                 )
-                        })
-                        .collect();
-                    let total = stage_invokes.len();
-                    let completed = stage_invokes
-                        .iter()
-                        .filter(|w| w.status == db::work_item::WorkItemStatus::Completed)
-                        .count();
-                    let failed = stage_invokes
-                        .iter()
-                        .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
-                        .count();
-
-                    // Determine if this is a post-approval context (manual_gate
-                    // with a Granted approval) so we use the right task list.
-                    let is_post_approval = state.is_manual_gate && {
-                        let stage_approvals = approvals::list_by_run(&self.pool, run_id)
-                            .await
-                            .unwrap_or_default();
-                        stage_approvals.iter().any(|a| {
-                            a.stage_id == current_state_id
-                                && a.decision == ApprovalDecision::Granted
-                        })
-                    };
-                    let effective = effective_tasks(state, is_post_approval);
-
-                    // ── Post-approval kickstart ─────────────────────────
-                    // When a manual_gate stage transitions to Running after
-                    // approval but has zero InvokeAgent work items yet,
-                    // enqueue phase 0 from the post-approval task list.
-                    if total == 0 && is_post_approval {
-                        info!(
-                            run_id = %run_id,
-                            state = %current_state_id,
-                            "Enqueuing post-approval phase 0 tasks"
-                        );
-                        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-                            .await
-                            .ok()
-                            .flatten();
-                        let effective_total = effective.len();
-                        for (i, task) in effective
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, t)| t.phase == 0)
-                        {
-                            let prompt =
-                                build_task_prompt(task, &plan, run, idea_opt.as_ref(), None);
-                            self.enqueue_invoke_agent(
-                                run_id, stage, task, &prompt, i, effective_total, &plan, run,
-                            )
-                            .await?;
+                                .await?;
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
-                    }
 
-                    if total > 0 && completed + failed == total {
-                        // All enqueued tasks finished. Generalized N-phase
-                        // gating: determine which phase just completed, then
-                        // check if a subsequent phase exists and needs enqueuing.
+                        if total > 0 && completed + failed == total {
+                            // All enqueued tasks finished. Generalized N-phase
+                            // gating: determine which phase just completed, then
+                            // check if a subsequent phase exists and needs enqueuing.
 
-                        // Determine the current (just-completed) phase from
-                        // the work items that were enqueued.
-                        let current_phase: u32 = stage_invokes
-                            .iter()
-                            .filter_map(|w| {
-                                serde_json::from_str::<serde_json::Value>(&w.payload_json)
-                                    .ok()
-                                    .and_then(|v| v.get("task_index")?.as_u64())
-                                    .and_then(|idx| {
-                                        effective.get(idx as usize).map(|t| t.phase)
-                                    })
-                            })
-                            .max()
-                            .unwrap_or(0);
+                            // Determine the current (just-completed) phase from
+                            // the work items that were enqueued.
+                            let current_phase: u32 = stage_invokes
+                                .iter()
+                                .filter_map(|w| {
+                                    serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                        .ok()
+                                        .and_then(|v| v.get("task_index")?.as_u64())
+                                        .and_then(|idx| {
+                                            effective.get(idx as usize).map(|t| t.phase)
+                                        })
+                                })
+                                .max()
+                                .unwrap_or(0);
 
-                        // Find the next phase (if any) that hasn't been enqueued.
-                        let next_phase: Option<u32> = effective
-                            .iter()
-                            .map(|t| t.phase)
-                            .filter(|&p| p > current_phase)
-                            .min();
+                            // Find the next phase (if any) that hasn't been enqueued.
+                            let next_phase: Option<u32> = effective
+                                .iter()
+                                .map(|t| t.phase)
+                                .filter(|&p| p > current_phase)
+                                .min();
 
-                        // Check if any tasks from the next phase are already enqueued.
-                        let next_phase_already_enqueued = next_phase.map_or(true, |np| {
-                            stage_invokes.iter().any(|w| {
-                                serde_json::from_str::<serde_json::Value>(&w.payload_json)
-                                    .ok()
-                                    .and_then(|v| v.get("task_index")?.as_u64())
-                                    .map(|idx| {
-                                        effective.get(idx as usize).map_or(false, |t| t.phase == np)
-                                    })
-                                    .unwrap_or(false)
-                            })
-                        });
+                            // Check if any tasks from the next phase are already enqueued.
+                            let next_phase_already_enqueued = next_phase.map_or(true, |np| {
+                                stage_invokes.iter().any(|w| {
+                                    serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                        .ok()
+                                        .and_then(|v| v.get("task_index")?.as_u64())
+                                        .map(|idx| {
+                                            effective
+                                                .get(idx as usize)
+                                                .map_or(false, |t| t.phase == np)
+                                        })
+                                        .unwrap_or(false)
+                                })
+                            });
 
-                        if let Some(np) = next_phase {
-                            if !next_phase_already_enqueued {
-                                // Current phase complete — enqueue next phase.
-                                if failed > 0 {
-                                    warn!(
-                                        run_id = %run_id,
-                                        state = %current_state_id,
-                                        phase = current_phase,
-                                        failed = failed,
-                                        "Phase {} had failures — skipping phase {}, settling as Failed",
-                                        current_phase, np
-                                    );
-                                } else {
+                            if let Some(np) = next_phase {
+                                if !next_phase_already_enqueued {
+                                    // Current phase complete — enqueue next phase.
+                                    if failed > 0 {
+                                        warn!(
+                                            run_id = %run_id,
+                                            state = %current_state_id,
+                                            phase = current_phase,
+                                            failed = failed,
+                                            "Phase {} had failures — skipping phase {}, settling as Failed",
+                                            current_phase, np
+                                        );
+                                    } else {
+                                        info!(
+                                            run_id = %run_id,
+                                            state = %current_state_id,
+                                            completed_phase = current_phase,
+                                            next_phase = np,
+                                            "Phase {} complete — enqueuing phase {} tasks",
+                                            current_phase, np
+                                        );
+                                        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                        let effective_total = effective.len();
+                                        for (i, task) in effective.iter().enumerate() {
+                                            if task.phase != np {
+                                                continue;
+                                            }
+                                            let prompt = build_task_prompt(
+                                                task,
+                                                &plan,
+                                                run,
+                                                idea_opt.as_ref(),
+                                                None,
+                                            );
+                                            self.enqueue_invoke_agent(
+                                                run_id,
+                                                stage,
+                                                task,
+                                                &prompt,
+                                                i,
+                                                effective_total,
+                                                &plan,
+                                                run,
+                                            )
+                                            .await?;
+                                        }
+                                        return Ok(()); // wait for next phase to complete
+                                    }
+                                }
+                            }
+
+                            // All phases finished — settle stage.
+                            let now = Utc::now();
+                            let (kind, settle_status) = if failed > 0 {
+                                (
+                                    domain::stage::StageSettlementKind::Failed,
+                                    StageStatus::Failed,
+                                )
+                            } else {
+                                (
+                                    domain::stage::StageSettlementKind::Completed,
+                                    StageStatus::Completed,
+                                )
+                            };
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                total = total,
+                                completed = completed,
+                                failed = failed,
+                                "All tasks finished — settling stage"
+                            );
+                            if kind == domain::stage::StageSettlementKind::Failed {
+                                crate::recovery::persist_failed_stage_recovery_snapshot(
+                                    &self.pool, stage.id, now,
+                                )
+                                .await?;
+                                if let Some(evidence_artifact) =
+                                    crate::evidence::build_failed_stage_evidence_for_latest_execution(
+                                        &self.pool, run, stage, now,
+                                    )
+                                    .await?
+                                {
+                                    let _ = self.events.send(DomainEvent::ArtifactCreated {
+                                        run_id,
+                                        artifact_id: evidence_artifact.id,
+                                    });
+                                }
+                            }
+                            stages::settle(&self.pool, stage.id, kind, now).await?;
+                            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                                run_id,
+                                stage_execution_id: stage.id,
+                                status: settle_status.clone(),
+                            });
+                            if settle_status == StageStatus::Completed {
+                                // P044 §3h: End states with tasks complete the run
+                                // directly after their tasks finish. We must not
+                                // evaluate transitions — state_12 declares a
+                                // `when: "true"` self-transition that would loop
+                                // forever otherwise.
+                                if state.is_end {
                                     info!(
                                         run_id = %run_id,
                                         state = %current_state_id,
-                                        completed_phase = current_phase,
-                                        next_phase = np,
-                                        "Phase {} complete — enqueuing phase {} tasks",
-                                        current_phase, np
+                                        "End state with tasks complete — marking run Completed"
                                     );
-                                    let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-                                        .await
-                                        .ok()
-                                        .flatten();
-                                    let effective_total = effective.len();
-                                    for (i, task) in effective.iter().enumerate() {
-                                        if task.phase != np {
-                                            continue;
-                                        }
-                                        let prompt = build_task_prompt(
-                                            task,
-                                            &plan,
-                                            run,
-                                            idea_opt.as_ref(),
-                                            None,
-                                        );
-                                        self.enqueue_invoke_agent(
-                                            run_id,
-                                            stage,
-                                            task,
-                                            &prompt,
-                                            i,
-                                            effective_total,
-                                            &plan,
-                                            run,
-                                        )
-                                        .await?;
-                                    }
-                                    return Ok(()); // wait for next phase to complete
+                                    runs::mark_completed(&self.pool, run_id, now).await?;
+                                    self.enqueue_steward_analysis(Some(run_id)).await?;
+                                    self.cleanup_worktree_if_needed(&run).await;
+                                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                        run_id,
+                                        status: RunStatus::Completed,
+                                    });
+                                    return Ok(());
                                 }
+                                return self
+                                    .evaluate_and_transition(
+                                        run_id,
+                                        &current_state_id,
+                                        &plan,
+                                        &all_stages,
+                                    )
+                                    .await;
                             }
+                            // Failed — run blocked
+                            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                            return Ok(());
                         }
 
-                        // All phases finished — settle stage.
-                        let now = Utc::now();
-                        let (kind, settle_status) = if failed > 0 {
-                            (domain::stage::StageSettlementKind::Failed, StageStatus::Failed)
-                        } else {
-                            (domain::stage::StageSettlementKind::Completed, StageStatus::Completed)
-                        };
-                        info!(
-                            run_id = %run_id,
-                            state = %current_state_id,
-                            total = total,
-                            completed = completed,
-                            failed = failed,
-                            "All tasks finished — settling stage"
-                        );
-                        stages::settle(&self.pool, stage.id, kind, now).await?;
-                        let _ = self.events.send(DomainEvent::StageStatusChanged {
-                            run_id,
-                            stage_execution_id: stage.id,
-                            status: settle_status.clone(),
-                        });
-                        if settle_status == StageStatus::Completed {
-                            // P044 §3h: End states with tasks complete the run
-                            // directly after their tasks finish. We must not
-                            // evaluate transitions — state_12 declares a
-                            // `when: "true"` self-transition that would loop
-                            // forever otherwise.
-                            if state.is_end {
-                                info!(
-                                    run_id = %run_id,
-                                    state = %current_state_id,
-                                    "End state with tasks complete — marking run Completed"
-                                );
-                                runs::mark_completed(&self.pool, run_id, now).await?;
-                                self.cleanup_worktree_if_needed(&run).await;
-                                let _ = self.events.send(DomainEvent::RunStatusChanged {
-                                    run_id,
-                                    status: RunStatus::Completed,
-                                });
-                                return Ok(());
-                            }
-                            return self
-                                .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
-                                .await;
-                        }
-                        // Failed — run blocked
-                        runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                        // Tasks still running — wait
                         return Ok(());
                     }
-
-                    // Tasks still running — wait
-                    return Ok(());
-                }
-                StageStatus::WaitingApproval => {
-                    return Ok(()); // wait for approval
-                }
-                StageStatus::Completed => {
-                    // Stage done — evaluate transitions
-                    return self
-                        .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
-                        .await;
-                }
-                StageStatus::Failed | StageStatus::Blocked => {
-                    // Stage failed — update run status
-                    if run.status != RunStatus::Blocked {
-                        runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
-                        let _ = self.events.send(DomainEvent::RunStatusChanged {
-                            run_id,
-                            status: RunStatus::Blocked,
-                        });
+                    StageStatus::WaitingApproval => {
+                        return Ok(()); // wait for approval
                     }
-                    return Ok(());
-                }
-                StageStatus::Skipped => {
-                    // Skipped (e.g. retry) — re-evaluate
-                    return self
-                        .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
-                        .await;
-                }
-                StageStatus::Pending => {
-                    // P044 §3g: A retried manual_gate stage was inserted as
-                    // Pending by RetryStage. We must restore it to
-                    // WaitingApproval with a fresh Approval record on the
-                    // same stage execution instead of falling through to
-                    // Case 2, which would fork lineage by creating another
-                    // stage via create_stage_for_state.
-                    if state.is_manual_gate {
-                        info!(
-                            run_id = %run_id,
-                            state = %current_state_id,
-                            stage_execution_id = %stage.id,
-                            attempt = stage.attempt_number,
-                            "Retried manual gate — restoring to WaitingApproval with fresh approval"
-                        );
-                        stages::update_status(&self.pool, stage.id, StageStatus::WaitingApproval)
-                            .await?;
-
-                        let approval = Approval {
-                            id: ApprovalId::new(),
-                            run_id,
-                            stage_id: current_state_id.clone(),
-                            decision: ApprovalDecision::Requested,
-                            requested_at: Utc::now(),
-                            decided_at: None,
-                            comment: None,
-                            expires_at: None,
-                        };
-                        approvals::insert(&self.pool, &approval).await?;
-
-                        let _ = self.events.send(DomainEvent::StageStatusChanged {
-                            run_id,
-                            stage_execution_id: stage.id,
-                            status: StageStatus::WaitingApproval,
-                        });
-                        let _ = self.events.send(DomainEvent::ApprovalRequested {
-                            run_id,
-                            approval_id: approval.id,
-                            stage_id: current_state_id.clone(),
-                        });
-
-                        if run.status != RunStatus::WaitingApproval {
-                            runs::update_status(
-                                &self.pool,
-                                run_id,
-                                RunStatus::WaitingApproval,
-                            )
-                            .await?;
+                    StageStatus::Completed => {
+                        // Stage done — evaluate transitions
+                        return self
+                            .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                            .await;
+                    }
+                    StageStatus::Failed | StageStatus::Blocked => {
+                        // Stage failed — update run status
+                        if run.status != RunStatus::Blocked {
+                            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
                             let _ = self.events.send(DomainEvent::RunStatusChanged {
                                 run_id,
-                                status: RunStatus::WaitingApproval,
+                                status: RunStatus::Blocked,
                             });
                         }
                         return Ok(());
                     }
-                    // Non-manual-gate Pending stages are left to fall
-                    // through to Case 2 (preserves existing retry
-                    // semantics for compute states, which are not in
-                    // P044's scope).
+                    StageStatus::Skipped => {
+                        // Skipped (e.g. retry) — re-evaluate
+                        return self
+                            .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                            .await;
+                    }
+                    StageStatus::Pending => {
+                        // P044 §3g: A retried manual_gate stage was inserted as
+                        // Pending by RetryStage. We must restore it to
+                        // WaitingApproval with a fresh Approval record on the
+                        // same stage execution instead of falling through to
+                        // Case 2, which would fork lineage by creating another
+                        // stage via create_stage_for_state.
+                        if state.is_manual_gate {
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                stage_execution_id = %stage.id,
+                                attempt = stage.attempt_number,
+                                "Retried manual gate — restoring to WaitingApproval with fresh approval"
+                            );
+                            stages::update_status(
+                                &self.pool,
+                                stage.id,
+                                StageStatus::WaitingApproval,
+                            )
+                            .await?;
+
+                            let approval = Approval {
+                                id: ApprovalId::new(),
+                                run_id,
+                                stage_id: current_state_id.clone(),
+                                decision: ApprovalDecision::Requested,
+                                requested_at: Utc::now(),
+                                decided_at: None,
+                                comment: None,
+                                expires_at: None,
+                            };
+                            approvals::insert(&self.pool, &approval).await?;
+
+                            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                                run_id,
+                                stage_execution_id: stage.id,
+                                status: StageStatus::WaitingApproval,
+                            });
+                            let _ = self.events.send(DomainEvent::ApprovalRequested {
+                                run_id,
+                                approval_id: approval.id,
+                                stage_id: current_state_id.clone(),
+                            });
+
+                            if run.status != RunStatus::WaitingApproval {
+                                runs::update_status(&self.pool, run_id, RunStatus::WaitingApproval)
+                                    .await?;
+                                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                    run_id,
+                                    status: RunStatus::WaitingApproval,
+                                });
+                            }
+                            return Ok(());
+                        }
+                        // Non-manual-gate Pending stages are left to fall
+                        // through to Case 2 (preserves existing retry
+                        // semantics for compute states, which are not in
+                        // P044's scope).
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
             } // end if !stage_is_stale
         }
 
@@ -510,7 +573,8 @@ impl Orchestrator {
             if state.tasks.is_empty() {
                 // Bare end state — settle immediately (no tasks to run).
                 info!(run_id = %run_id, state = %current_state_id, "Reached bare end state");
-                self.create_stage_for_state(run_id, &current_state_id, state).await?;
+                self.create_stage_for_state(run_id, &current_state_id, state)
+                    .await?;
                 let now = Utc::now();
                 let end_stage = stages::list_by_run(&self.pool, run_id)
                     .await?
@@ -525,6 +589,7 @@ impl Orchestrator {
                 )
                 .await?;
                 runs::mark_completed(&self.pool, run_id, now).await?;
+                self.enqueue_steward_analysis(Some(run_id)).await?;
                 // Worktree cleanup on completion (Proposal 007).
                 self.cleanup_worktree_if_needed(&run).await;
                 let _ = self.events.send(DomainEvent::RunStatusChanged {
@@ -542,7 +607,9 @@ impl Orchestrator {
         // Manual gate — create stage as WaitingApproval + Approval record
         if state.is_manual_gate {
             info!(run_id = %run_id, state = %current_state_id, "Entering manual gate");
-            let stage = self.create_stage_for_state(run_id, &current_state_id, state).await?;
+            let stage = self
+                .create_stage_for_state(run_id, &current_state_id, state)
+                .await?;
             stages::update_status(&self.pool, stage.id, StageStatus::WaitingApproval).await?;
 
             let approval = Approval {
@@ -583,8 +650,7 @@ impl Orchestrator {
         // shared — NOT meta_only), provision one before creating the stage.
         let needs_git_worktree = {
             let needs_wt = |a: &workflow::plan::ResolvedAgent| -> bool {
-                a.worktree_write_enabled
-                    && a.worktree_strategy.as_deref() != Some("meta_only")
+                a.worktree_write_enabled && a.worktree_strategy.as_deref() != Some("meta_only")
             };
             state.tasks.iter().any(|t| needs_wt(&t.agent))
                 || state.post_approval_tasks.iter().any(|t| needs_wt(&t.agent))
@@ -593,7 +659,10 @@ impl Orchestrator {
         // Re-bind `run` as mutable reference so we can refresh it after provisioning.
         let mut run = run.clone();
         if needs_git_worktree && run.worktree_root.is_none() {
-            let idea_opt_for_slug = ideas::find_by_id(&self.pool, run.idea_id).await.ok().flatten();
+            let idea_opt_for_slug = ideas::find_by_id(&self.pool, run.idea_id)
+                .await
+                .ok()
+                .flatten();
             let idea_title = idea_opt_for_slug
                 .as_ref()
                 .map(|i| i.title.as_str())
@@ -627,9 +696,9 @@ impl Orchestrator {
                     )
                     .await?;
                     // Re-read run so prompt building sees worktree_root.
-                    run = runs::find_by_id(&self.pool, run_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("Run vanished after provisioning: {}", run_id))?;
+                    run = runs::find_by_id(&self.pool, run_id).await?.ok_or_else(|| {
+                        anyhow::anyhow!("Run vanished after provisioning: {}", run_id)
+                    })?;
                     info!(
                         run_id = %run_id,
                         worktree_root = %result.worktree_root,
@@ -656,7 +725,9 @@ impl Orchestrator {
 
         // Regular compute state — create stage and enqueue tasks.
         info!(run_id = %run_id, state = %current_state_id, provider = %state.owner.provider, "Entering compute state");
-        let stage = self.create_stage_for_state(run_id, &current_state_id, state).await?;
+        let stage = self
+            .create_stage_for_state(run_id, &current_state_id, state)
+            .await?;
         stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
 
         let _ = self.events.send(DomainEvent::StageStatusChanged {
@@ -677,7 +748,10 @@ impl Orchestrator {
         // prompts that consume `input.idea`. Without this, the agent only
         // sees a placeholder line ("path not defined in catalog") and has no
         // access to what the user actually asked for.
-        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id).await.ok().flatten();
+        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+            .await
+            .ok()
+            .flatten();
 
         // Proposal 007 §7.7: Validate worktree readiness before write-enabled execution.
         // Also validates for release agents that need worktree (strategy=dedicated,
@@ -685,11 +759,13 @@ impl Orchestrator {
         let any_agent_needs_worktree = needs_git_worktree
             || state.tasks.iter().any(|t| {
                 t.agent.worktree_strategy.as_deref() == Some("dedicated")
-                    || t.agent.worktree_strategy.as_deref() == Some("shared_implementation_worktree")
+                    || t.agent.worktree_strategy.as_deref()
+                        == Some("shared_implementation_worktree")
             })
             || state.post_approval_tasks.iter().any(|t| {
                 t.agent.worktree_strategy.as_deref() == Some("dedicated")
-                    || t.agent.worktree_strategy.as_deref() == Some("shared_implementation_worktree")
+                    || t.agent.worktree_strategy.as_deref()
+                        == Some("shared_implementation_worktree")
             })
             || matches!(
                 state.owner.worktree_strategy.as_deref(),
@@ -718,7 +794,8 @@ impl Orchestrator {
         // Proposal 007: gather source context (changed files manifest) for
         // write-enabled states so implementation agents see what's already changed.
         let source_ctx = if needs_git_worktree {
-            if let (Some(wt), Some(bb)) = (run.worktree_root.as_deref(), run.base_branch.as_deref()) {
+            if let (Some(wt), Some(bb)) = (run.worktree_root.as_deref(), run.base_branch.as_deref())
+            {
                 crate::worktree::build_source_context(wt, bb).await.ok()
             } else {
                 None
@@ -737,13 +814,16 @@ impl Orchestrator {
             // are enqueued immediately. Phase 1 tasks (`then` blocks — sequential
             // after parallel) are deferred until all phase 0 tasks complete.
             // This prevents aggregators from racing with the tasks they aggregate.
-            let phase0_tasks: Vec<_> = state.tasks.iter()
+            let phase0_tasks: Vec<_> = state
+                .tasks
+                .iter()
                 .enumerate()
                 .filter(|(_, t)| t.phase == 0)
                 .collect();
             let total = state.tasks.len();
             for (i, task) in &phase0_tasks {
-                let prompt = build_task_prompt(task, &plan, &run, idea_opt.as_ref(), source_ctx.as_ref());
+                let prompt =
+                    build_task_prompt(task, &plan, &run, idea_opt.as_ref(), source_ctx.as_ref());
                 info!(
                     run_id = %run_id,
                     task = %task.task_name,
@@ -755,10 +835,8 @@ impl Orchestrator {
                     total = total,
                     "Enqueuing task (phase 0)"
                 );
-                self.enqueue_invoke_agent(
-                    run_id, &stage, task, &prompt, *i, total, &plan, &run,
-                )
-                .await?;
+                self.enqueue_invoke_agent(run_id, &stage, task, &prompt, *i, total, &plan, &run)
+                    .await?;
             }
         }
 
@@ -885,7 +963,9 @@ impl Orchestrator {
     /// Best-effort: logs warnings on failure, never propagates errors.
     async fn cleanup_worktree_if_needed(&self, run: &domain::run::Run) {
         if let Some(ref wt) = run.worktree_root {
-            if let Err(e) = crate::worktree::WorktreeProvisioner::cleanup(wt, &run.workspace_root).await {
+            if let Err(e) =
+                crate::worktree::WorktreeProvisioner::cleanup(wt, &run.workspace_root).await
+            {
                 warn!(
                     run_id = %run.id,
                     worktree = %wt,
@@ -907,11 +987,7 @@ impl Orchestrator {
 
         // Determine iteration: count how many stages for this state_id already exist.
         let all_stages = stages::list_by_run(&self.pool, run_id).await?;
-        let iteration = all_stages
-            .iter()
-            .filter(|s| s.stage_id == state_id)
-            .count() as i64
-            + 1;
+        let iteration = all_stages.iter().filter(|s| s.stage_id == state_id).count() as i64 + 1;
 
         let stage = StageExecution {
             id: domain::ids::StageExecutionId::new(),
@@ -928,6 +1004,10 @@ impl Orchestrator {
             provider: Some(state.owner.provider.clone()),
             model: state.owner.model.clone(),
             stage_type: state.state_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
         };
         stages::insert(&self.pool, &stage).await?;
         Ok(stage)
@@ -981,11 +1061,9 @@ impl Orchestrator {
                 break; // don't evaluate any transitions when loop is done
             }
 
-            let matches = self.evaluate_condition(
-                &transition.condition,
-                &run,
-                plan,
-            ).await;
+            let matches = self
+                .evaluate_condition(&transition.condition, &run, plan)
+                .await;
             if matches {
                 info!(
                     run_id = %run_id,
@@ -1019,6 +1097,7 @@ impl Orchestrator {
         if state.transitions.is_empty() || state.is_end {
             let now = Utc::now();
             runs::mark_completed(&self.pool, run_id, now).await?;
+            self.enqueue_steward_analysis(Some(run_id)).await?;
             let _ = self.events.send(DomainEvent::RunStatusChanged {
                 run_id,
                 status: RunStatus::Completed,
@@ -1126,7 +1205,10 @@ impl Orchestrator {
         }
 
         // Unrecognized — fail closed (false), not open
-        warn!(condition = trimmed, "Unrecognized transition condition — returning false");
+        warn!(
+            condition = trimmed,
+            "Unrecognized transition condition — returning false"
+        );
         false
     }
 
@@ -1144,7 +1226,10 @@ impl Orchestrator {
                 return true;
             }
             // Fallback: artifact_root
-            for suffix in &[artifact_name.to_string(), format!("{}/{}", run.id, artifact_name)] {
+            for suffix in &[
+                artifact_name.to_string(),
+                format!("{}/{}", run.id, artifact_name),
+            ] {
                 let path = format!("{}/{}", run.artifact_root, suffix);
                 if std::path::Path::new(&path).exists() {
                     info!(artifact = artifact_name, path = %path, "exists() = true (artifact_root)");
@@ -1154,7 +1239,10 @@ impl Orchestrator {
             info!(artifact = artifact_name, "exists() = false");
             return false;
         }
-        warn!(artifact = artifact_name, "Artifact not in catalog — returning true");
+        warn!(
+            artifact = artifact_name,
+            "Artifact not in catalog — returning true"
+        );
         true
     }
 
@@ -1170,7 +1258,10 @@ impl Orchestrator {
 
         // vars.* → plan variables
         if let Some(var_name) = trimmed.strip_prefix("vars.") {
-            return plan.variables.get(var_name).cloned()
+            return plan
+                .variables
+                .get(var_name)
+                .cloned()
                 .unwrap_or(serde_json::Value::Null);
         }
 
@@ -1187,8 +1278,12 @@ impl Orchestrator {
         }
 
         // Literal: true/false
-        if trimmed == "true" { return serde_json::Value::Bool(true); }
-        if trimmed == "false" { return serde_json::Value::Bool(false); }
+        if trimmed == "true" {
+            return serde_json::Value::Bool(true);
+        }
+        if trimmed == "false" {
+            return serde_json::Value::Bool(false);
+        }
 
         // Literal: number
         if let Ok(n) = trimmed.parse::<i64>() {
@@ -1202,7 +1297,7 @@ impl Orchestrator {
         if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
             || (trimmed.starts_with('"') && trimmed.ends_with('"'))
         {
-            return serde_json::Value::String(trimmed[1..trimmed.len()-1].to_string());
+            return serde_json::Value::String(trimmed[1..trimmed.len() - 1].to_string());
         }
 
         // Bare string
@@ -1225,11 +1320,15 @@ impl Orchestrator {
             } else {
                 // Try artifact_root
                 let alt = format!("{}/{}", run.artifact_root, artifact_name);
-                if std::path::Path::new(&alt).exists() { alt }
-                else {
+                if std::path::Path::new(&alt).exists() {
+                    alt
+                } else {
                     let alt2 = format!("{}/{}/{}", run.artifact_root, run.id, artifact_name);
-                    if std::path::Path::new(&alt2).exists() { alt2 }
-                    else { return None; }
+                    if std::path::Path::new(&alt2).exists() {
+                        alt2
+                    } else {
+                        return None;
+                    }
                 }
             }
         } else {
@@ -1258,11 +1357,7 @@ impl Orchestrator {
     // Legacy flat-stage orchestration (no YAML workflow)
     // =====================================================================
 
-    async fn advance_run_flat(
-        &self,
-        run_id: RunId,
-        run: &domain::run::Run,
-    ) -> Result<()> {
+    async fn advance_run_flat(&self, run_id: RunId, run: &domain::run::Run) -> Result<()> {
         let all_stages = stages::list_by_run(&self.pool, run_id).await?;
         let all_approvals = approvals::list_by_run(&self.pool, run_id).await?;
 
@@ -1275,6 +1370,7 @@ impl Orchestrator {
                 info!(run_id = %run_id, "Run complete, marking completed");
                 let now = Utc::now();
                 runs::mark_completed(&self.pool, run_id, now).await?;
+                self.enqueue_steward_analysis(Some(run_id)).await?;
                 let _ = self.events.send(DomainEvent::RunStatusChanged {
                     run_id,
                     status: RunStatus::Completed,
@@ -1320,10 +1416,7 @@ impl Orchestrator {
             }
 
             RunEvaluation::CanAdvance { next_stage_id } => {
-                let stage = all_stages
-                    .iter()
-                    .find(|s| s.id == next_stage_id)
-                    .cloned();
+                let stage = all_stages.iter().find(|s| s.id == next_stage_id).cloned();
 
                 if let Some(stage) = stage {
                     info!(run_id = %run_id, stage_id = %stage.stage_id, "Activating next stage");
@@ -1382,7 +1475,14 @@ impl Orchestrator {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
-enum CompOp { Eq, Ne, Lt, Le, Gt, Ge }
+enum CompOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 
 /// Split on a connective keyword, respecting parentheses depth.
 fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a str)> {
@@ -1392,8 +1492,11 @@ fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a
     let conn_bytes = connective.as_bytes();
 
     for i in 0..bytes.len() {
-        if bytes[i] == b'(' { depth += 1; }
-        else if bytes[i] == b')' { depth -= 1; }
+        if bytes[i] == b'(' {
+            depth += 1;
+        } else if bytes[i] == b')' {
+            depth -= 1;
+        }
 
         if depth == 0 && i + conn_len <= bytes.len() && &bytes[i..i + conn_len] == conn_bytes {
             let lhs = expr[..i].trim();
@@ -1408,8 +1511,6 @@ fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a
 
 /// Apply a comparison operator to two JSON values.
 fn apply_comparison(lhs: &serde_json::Value, op: CompOp, rhs: &serde_json::Value) -> bool {
-    
-
     // Try numeric comparison first
     let ln = to_f64(lhs);
     let rn = to_f64(rhs);
@@ -1459,7 +1560,11 @@ fn effective_tasks<'a>(
 fn payload_matches_stage_execution(payload_json: &str, expected_se_id: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(payload_json)
         .ok()
-        .and_then(|v| v.get("stage_execution_id")?.as_str().map(|s| s == expected_se_id))
+        .and_then(|v| {
+            v.get("stage_execution_id")?
+                .as_str()
+                .map(|s| s == expected_se_id)
+        })
         .unwrap_or(false)
 }
 
@@ -1498,8 +1603,7 @@ fn build_declared_outputs(
             let companion_output_name = schema
                 .as_ref()
                 .filter(|schema| {
-                    crate::contracts::validation_mode(schema)
-                        == "structured_with_human_companion"
+                    crate::contracts::validation_mode(schema) == "structured_with_human_companion"
                 })
                 .and_then(|schema| schema.raw_artifact_name.clone());
             let companion_path = companion_output_name
@@ -1574,7 +1678,10 @@ fn build_task_prompt(
     if task.agent.worktree_write_enabled {
         if let Some(ref wt) = run.worktree_root {
             parts.push(format!("Worktree root: {}", wt));
-            parts.push(format!("Workspace root (read-only): {}", run.workspace_root));
+            parts.push(format!(
+                "Workspace root (read-only): {}",
+                run.workspace_root
+            ));
         } else {
             parts.push(format!("Workspace root: {}", run.workspace_root));
         }
@@ -1610,7 +1717,10 @@ fn build_task_prompt(
             if let Some(template) = plan.artifact_paths.get(input_name) {
                 let resolved = resolve_path_template(template, &run.workspace_root);
                 let normalized = normalize_path_for_worktree(
-                    &resolved, &run.workspace_root, wt_root, wt_enabled,
+                    &resolved,
+                    &run.workspace_root,
+                    wt_root,
+                    wt_enabled,
                 );
                 parts.push(format!("- `{input_name}` → `{normalized}`"));
             } else {
@@ -1645,10 +1755,8 @@ fn build_task_prompt(
                                 )
                             });
                         if let Some(companion_path) = companion_path {
-                            parts.push(format!(
-                                "- `{}` companion → `{}`",
-                                raw_name, companion_path
-                            ));
+                            parts
+                                .push(format!("- `{}` companion → `{}`", raw_name, companion_path));
                         }
                     }
                 }
@@ -1726,7 +1834,13 @@ fn build_task_prompt(
     }
 
     // ── Task-specific guidance (matching Swift RuntimeSessionBridge) ─────
-    append_task_specific_guidance(&mut parts, &task.task_name, &task.agent.agent_id, run, source_ctx);
+    append_task_specific_guidance(
+        &mut parts,
+        &task.task_name,
+        &task.agent.agent_id,
+        run,
+        source_ctx,
+    );
 
     parts.join("\n")
 }
@@ -1759,7 +1873,10 @@ fn build_task_prompt_for_owner(
     if state.owner.worktree_write_enabled {
         if let Some(ref wt) = run.worktree_root {
             parts.push(format!("Worktree root: {}", wt));
-            parts.push(format!("Workspace root (read-only): {}", run.workspace_root));
+            parts.push(format!(
+                "Workspace root (read-only): {}",
+                run.workspace_root
+            ));
         } else {
             parts.push(format!("Workspace root: {}", run.workspace_root));
         }
@@ -1792,15 +1909,15 @@ fn build_task_prompt_for_owner(
         for (name, template) in plan.artifact_paths.iter().take(15) {
             let resolved = resolve_path_template(template, &run.workspace_root);
             let normalized = normalize_path_for_worktree(
-                &resolved, &run.workspace_root, owner_wt_root, owner_wt_enabled,
+                &resolved,
+                &run.workspace_root,
+                owner_wt_root,
+                owner_wt_enabled,
             );
             parts.push(format!("- `{name}` → `{normalized}`"));
         }
         if plan.artifact_paths.len() > 15 {
-            parts.push(format!(
-                "...and {} more",
-                plan.artifact_paths.len() - 15
-            ));
+            parts.push(format!("...and {} more", plan.artifact_paths.len() - 15));
         }
     }
 
@@ -1860,9 +1977,7 @@ fn append_task_specific_guidance(
              paths as the authoritative starting point for implementation.",
         ));
         if let Some(ref wt) = run.worktree_root {
-            parts.push(format!(
-                "Implementation worktree: {wt}"
-            ));
+            parts.push(format!("Implementation worktree: {wt}"));
         }
         parts.push(String::from(
             "Do not re-discover repository structure unless a referenced path is \
@@ -1900,7 +2015,9 @@ fn append_task_specific_guidance(
         if let Some(ctx) = source_ctx {
             if !ctx.changed_files.is_empty() {
                 parts.push(String::new());
-                parts.push(String::from("### Changed Files (from prior implementation passes)"));
+                parts.push(String::from(
+                    "### Changed Files (from prior implementation passes)",
+                ));
                 for f in &ctx.changed_files {
                     parts.push(format!("- {f}"));
                 }

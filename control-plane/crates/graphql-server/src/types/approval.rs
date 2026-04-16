@@ -1,6 +1,6 @@
 use async_graphql::*;
-use domain::approval::Approval;
 use db::repos::projections::ApprovalInboxRow;
+use domain::approval::Approval;
 
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlApproval {

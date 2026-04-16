@@ -1,20 +1,28 @@
+use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{agent_executions, approvals, artifacts, ideas, projections, runs, stages, validation};
-use domain::approval::{Approval, ApprovalDecision};
-use domain::idea::{Idea, IdeaStatus};
+use db::repos::{
+    agent_executions, approvals, artifacts, ideas, projections, runs, stages, steward, validation,
+};
 use domain::agent::{AgentExecution, AgentStatus};
-use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
+use domain::idea::{Idea, IdeaStatus};
+use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
+use domain::steward::{
+    CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
+    StewardRecommendation,
+};
 use domain::validation::{
     ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
     ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
 };
-use chrono::Utc;
 
 async fn test_pool() -> sqlx::SqlitePool {
-    create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+    create_pool("sqlite::memory:")
+        .await
+        .expect("in-memory pool failed")
 }
 
 #[tokio::test]
@@ -55,6 +63,7 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         title: "Idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -82,6 +91,17 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -96,7 +116,9 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         created_at: Utc::now(),
         closed_at: None,
     };
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
 
     let created_at = Utc::now();
     db::repos::sessions::insert_generation(
@@ -166,6 +188,229 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
 }
 
 #[tokio::test]
+async fn steward_run_metadata_and_project_key_roundtrip() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Steward idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: Some("crypto-savings".into()),
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let loaded_idea = ideas::find_by_id(&pool, idea.id)
+        .await
+        .unwrap()
+        .expect("idea should roundtrip");
+    assert_eq!(loaded_idea.project_key.as_deref(), Some("crypto-savings"));
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-steward".into(),
+        workflow_title: "Steward Workflow".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("start".into()),
+        workflow_yaml_path: Some("/tmp/workflow.yaml".into()),
+        agent_catalog_yaml_path: Some("/tmp/catalog.yaml".into()),
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: Some("mvp_live".into()),
+        project_key: Some("crypto-savings".into()),
+        risk_class: Some("high".into()),
+        stack: Some("swiftui".into()),
+        workflow_snapshot_hash: Some("a".repeat(64)),
+        catalog_snapshot_hash: Some("b".repeat(64)),
+        workflow_snapshot_json: Some(r#"{"workflow":{"id":"wf-steward"}}"#.into()),
+        catalog_snapshot_json: Some(r#"{"agents":[]}"#.into()),
+        drift_detected_at: None,
+        drift_details_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let loaded = runs::find_by_id(&pool, run.id)
+        .await
+        .unwrap()
+        .expect("run should roundtrip");
+    assert_eq!(loaded.workflow_family.as_deref(), Some("mvp_live"));
+    assert_eq!(loaded.project_key.as_deref(), Some("crypto-savings"));
+    assert_eq!(loaded.risk_class.as_deref(), Some("high"));
+    assert_eq!(loaded.stack.as_deref(), Some("swiftui"));
+    assert_eq!(loaded.workflow_snapshot_hash, Some("a".repeat(64)));
+    assert_eq!(loaded.catalog_snapshot_hash, Some("b".repeat(64)));
+    assert!(loaded
+        .workflow_snapshot_json
+        .as_deref()
+        .unwrap()
+        .contains("wf-steward"));
+    assert!(loaded
+        .catalog_snapshot_json
+        .as_deref()
+        .unwrap()
+        .contains("agents"));
+}
+
+#[tokio::test]
+async fn steward_analysis_schema_roundtrips_p049_contract() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let analysis = StewardAnalysis {
+        id: "analysis-db".into(),
+        created_at: now,
+        window_start: now,
+        window_end: now,
+        run_count: 7,
+        cohort_keys_json: serde_json::json!({
+            "workflow_family": "mvp_live",
+            "risk_class": "high"
+        })
+        .to_string(),
+        cohort_quality: CohortQuality::Acceptable,
+        status: StewardAnalysisStatus::Completed,
+        degradation_count: 2,
+        improvement_count: 1,
+        workflow_snapshot_artifact_hash: "workflow-artifact-hash".into(),
+        agent_catalog_snapshot_hash: "catalog-hash".into(),
+        steward_config_snapshot_hash: "config-hash".into(),
+        metrics_snapshot_artifact_id: Some("steward/metrics-window.json".into()),
+        baseline_snapshot_artifact_id: Some("steward/baseline-window.json".into()),
+        agent_catalog_snapshot_artifact_id: Some("steward/catalog-snapshot.json".into()),
+        workflow_snapshot_artifact_id: Some("steward/workflow-snapshot.json".into()),
+        config_change_log_artifact_id: Some("steward/config-change-log.json".into()),
+        health_report_artifact_id: Some("steward/reports/health-report.json".into()),
+        degradation_alert_artifact_id: Some("steward/reports/degradation-alert.json".into()),
+        agent_tuning_artifact_id: Some("steward/proposals/agent-tuning.json".into()),
+        workflow_tuning_artifact_id: Some("steward/proposals/workflow-tuning.json".into()),
+        experiment_plan_artifact_id: Some("steward/proposals/experiment-plan.json".into()),
+        audit_report_artifact_id: Some("steward/reports/audit-report.json".into()),
+        trigger_reason: "manual".into(),
+        error_summary: None,
+    };
+    steward::insert_analysis(&pool, &analysis).await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Steward DB idea".into(),
+            body: "body".into(),
+            workspace_root_path: None,
+            project_key: Some("crypto-savings".into()),
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Completed,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/tmp/ws".into(),
+            artifact_root: "/tmp/art".into(),
+            started_at: now,
+            completed_at: Some(now),
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: Some("mvp_live".into()),
+            project_key: Some("crypto-savings".into()),
+            risk_class: Some("high".into()),
+            stack: Some("swiftui".into()),
+            workflow_snapshot_hash: Some("a".repeat(64)),
+            catalog_snapshot_hash: Some("b".repeat(64)),
+            workflow_snapshot_json: Some("{}".into()),
+            catalog_snapshot_json: Some("{}".into()),
+            drift_detected_at: None,
+            drift_details_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    steward::insert_run_link(
+        &pool,
+        &StewardAnalysisRunLink {
+            id: "link-db".into(),
+            analysis_id: analysis.id.clone(),
+            run_id: run_id.to_string(),
+            role: "implicated".into(),
+        },
+    )
+    .await
+    .unwrap();
+    steward::insert_recommendation(
+        &pool,
+        &StewardRecommendation {
+            id: "rec-db".into(),
+            analysis_id: analysis.id.clone(),
+            created_at: now,
+            category: "degradation".into(),
+            summary: "Regression detected".into(),
+            target_metric: "failed_run_rate".into(),
+            confidence_level: "medium".into(),
+            status: "proposed".into(),
+            source_artifact_name: Some("deterministic_signal".into()),
+            decision_comment: None,
+            decided_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let loaded = steward::find_analysis(&pool, &analysis.id)
+        .await
+        .unwrap()
+        .expect("analysis should roundtrip");
+    assert_eq!(loaded.run_count, 7);
+    assert_eq!(loaded.degradation_count, 2);
+    assert_eq!(loaded.trigger_reason, "manual");
+    assert_eq!(
+        loaded.workflow_snapshot_artifact_id.as_deref(),
+        Some("steward/workflow-snapshot.json")
+    );
+    let links = steward::list_run_links(&pool, &analysis.id).await.unwrap();
+    assert_eq!(links[0].role, "implicated");
+    let recommendations = steward::list_recommendations(&pool, &analysis.id)
+        .await
+        .unwrap();
+    assert_eq!(recommendations[0].target_metric, "failed_run_rate");
+    assert_eq!(
+        recommendations[0].source_artifact_name.as_deref(),
+        Some("deterministic_signal")
+    );
+}
+
+#[tokio::test]
 async fn agent_execution_provenance_round_trips_without_lineage_joins() {
     let pool = test_pool().await;
     let idea = Idea {
@@ -173,6 +418,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         title: "Idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -200,6 +446,17 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -218,6 +475,10 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         provider: Some("claude".into()),
         model: None,
         stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     };
     stages::insert(&pool, &stage).await.unwrap();
 
@@ -239,6 +500,16 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         session_family_id: Some("proposal_authoring_loop".into()),
         session_reuse_disposition: Some("reused_after_resume".into()),
         session_reset_reason: Some("operator_reset".into()),
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -275,7 +546,162 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         found.session_reuse_disposition.as_deref(),
         Some("reused_after_resume")
     );
-    assert_eq!(found.session_reset_reason.as_deref(), Some("operator_reset"));
+    assert_eq!(
+        found.session_reset_reason.as_deref(),
+        Some("operator_reset")
+    );
+}
+
+#[tokio::test]
+async fn proposal_048_persistence_fields_round_trip() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-p048".into(),
+        workflow_title: "P048".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: Some(r#"{"passed":true}"#.into()),
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let stage = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "stage-p048".into(),
+        label: "Stage P048".into(),
+        status: StageStatus::Failed,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: Some(StageSettlementKind::Failed),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        owner_agent: Some("agent-p048".into()),
+        provider: Some("codex".into()),
+        model: Some("gpt-5.4".into()),
+        stage_type: None,
+        validation_failure_json: Some(r#"{"failureClass":"output_contract_mismatch"}"#.into()),
+        evidence_packet_json: Some(r#"{"failure_summary":"bad output"}"#.into()),
+        recovery_snapshot_json: Some(r#"{"action":"retry_failed_agent"}"#.into()),
+        retry_reason: None,
+    };
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage.id,
+        agent_id: "agent-p048".into(),
+        provider: "codex".into(),
+        model: Some("gpt-5.4".into()),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        status: AgentStatus::Failed,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: Some("codex_with_mcp".into()),
+        requested_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+        predicted_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+        predicted_mcp_runtime_ids_json: Some(r#"["fs-runtime"]"#.into()),
+        actual_mcp_extensions_json: Some(r#"[]"#.into()),
+        actual_mcp_runtime_ids_json: Some(r#"[]"#.into()),
+        denied_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+        mcp_blocking_issues_json: Some(r#"["missing registry entry: filesystem"]"#.into()),
+        actual_mcp_observation_json: Some(
+            r#"{"source":"not_started_blocked_before_session_new"}"#.into(),
+        ),
+        mcp_session_startup_latency_ms: Some(42),
+    };
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let found_run = runs::find_by_id(&pool, run.id).await.unwrap().unwrap();
+    assert_eq!(
+        found_run.delivery_preflight_json,
+        run.delivery_preflight_json
+    );
+
+    let found_stage = stages::find_by_id(&pool, stage.id).await.unwrap().unwrap();
+    assert_eq!(
+        found_stage.validation_failure_json,
+        stage.validation_failure_json
+    );
+    assert_eq!(found_stage.evidence_packet_json, stage.evidence_packet_json);
+    assert_eq!(
+        found_stage.recovery_snapshot_json,
+        stage.recovery_snapshot_json
+    );
+
+    let found_execution = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        found_execution.backend_profile_id,
+        execution.backend_profile_id
+    );
+    assert_eq!(
+        found_execution.requested_mcp_extensions_json,
+        execution.requested_mcp_extensions_json
+    );
+    assert_eq!(
+        found_execution.predicted_mcp_runtime_ids_json,
+        execution.predicted_mcp_runtime_ids_json
+    );
+    assert_eq!(
+        found_execution.mcp_blocking_issues_json,
+        execution.mcp_blocking_issues_json
+    );
+    assert_eq!(
+        found_execution.actual_mcp_observation_json,
+        execution.actual_mcp_observation_json
+    );
+    assert_eq!(
+        found_execution.mcp_session_startup_latency_ms,
+        execution.mcp_session_startup_latency_ms
+    );
 }
 
 #[tokio::test]
@@ -286,6 +712,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         title: "Idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -313,6 +740,17 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -331,6 +769,10 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         provider: Some("claude".into()),
         model: None,
         stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     };
     let successful_retry = StageExecution {
         id: StageExecutionId::new(),
@@ -347,6 +789,10 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         provider: Some("claude".into()),
         model: None,
         stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     };
     stages::insert(&pool, &failed_attempt).await.unwrap();
     stages::insert(&pool, &successful_retry).await.unwrap();
@@ -369,6 +815,16 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         session_family_id: None,
         session_reuse_disposition: None,
         session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        mcp_session_startup_latency_ms: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -388,9 +844,23 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         session_family_id: None,
         session_reuse_disposition: None,
         session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        mcp_session_startup_latency_ms: None,
     };
-    agent_executions::insert(&pool, &failed_agent_execution).await.unwrap();
-    agent_executions::insert(&pool, &retry_agent_execution).await.unwrap();
+    agent_executions::insert(&pool, &failed_agent_execution)
+        .await
+        .unwrap();
+    agent_executions::insert(&pool, &retry_agent_execution)
+        .await
+        .unwrap();
 
     let artifact = Artifact {
         id: ArtifactId::new(),
@@ -454,7 +924,9 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
     .await
     .unwrap();
 
-    projections::rebuild_all_for_run(&pool, run.id).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
     let rows = projections::list_stages_projection(&pool, &run.id.to_string())
         .await
         .unwrap();
@@ -480,12 +952,15 @@ async fn test_idea_insert_and_find() {
         title: "Test Idea".into(),
         body: "Body content".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Draft,
         created_at: Utc::now(),
         archived_at: None,
     };
     ideas::insert(&pool, &idea).await.expect("insert failed");
-    let found = ideas::find_by_id(&pool, idea.id).await.expect("find failed");
+    let found = ideas::find_by_id(&pool, idea.id)
+        .await
+        .expect("find failed");
     assert!(found.is_some());
     assert_eq!(found.unwrap().title, "Test Idea");
 }
@@ -498,6 +973,7 @@ async fn test_run_insert_and_find() {
         title: "Idea for run".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -525,6 +1001,17 @@ async fn test_run_insert_and_find() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -540,6 +1027,7 @@ async fn test_run_status_update() {
         title: "Idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -566,9 +1054,22 @@ async fn test_run_status_update() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
-    runs::update_status(&pool, run.id, RunStatus::Running).await.unwrap();
+    runs::update_status(&pool, run.id, RunStatus::Running)
+        .await
+        .unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap().unwrap();
     assert_eq!(found.status, RunStatus::Running);
 }
@@ -588,6 +1089,7 @@ async fn test_projection_parity_after_rebuild() {
         title: "Parity idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -615,6 +1117,17 @@ async fn test_projection_parity_after_rebuild() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -634,6 +1147,10 @@ async fn test_projection_parity_after_rebuild() {
         provider: None,
         model: None,
         stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     };
     let failed_stage = StageExecution {
         id: StageExecutionId::new(),
@@ -650,12 +1167,18 @@ async fn test_projection_parity_after_rebuild() {
         provider: None,
         model: None,
         stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     };
     stages::insert(&pool, &completed_stage).await.unwrap();
     stages::insert(&pool, &failed_stage).await.unwrap();
 
     // Rebuild projections.
-    projections::rebuild_all_for_run(&pool, run.id).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
 
     // Query via projection layer and verify counts match canonical state.
     let projection_rows = projections::list_active_projection(&pool).await.unwrap();
@@ -664,15 +1187,34 @@ async fn test_projection_parity_after_rebuild() {
         .find(|r| r.id == run.id.to_string())
         .expect("run missing from projection layer after rebuild");
 
-    assert_eq!(row.status, run.status.to_string(), "projection status must match canonical status");
+    assert_eq!(
+        row.status,
+        run.status.to_string(),
+        "projection status must match canonical status"
+    );
     assert_eq!(row.total_stages, 2, "total_stages must count both stages");
-    assert_eq!(row.completed_stages, 1, "completed_stages must reflect one completed stage");
-    assert_eq!(row.failed_stages, 1, "failed_stages must reflect one failed stage");
-    assert_eq!(row.pending_approvals, 0, "pending_approvals must be zero without approvals");
+    assert_eq!(
+        row.completed_stages, 1,
+        "completed_stages must reflect one completed stage"
+    );
+    assert_eq!(
+        row.failed_stages, 1,
+        "failed_stages must reflect one failed stage"
+    );
+    assert_eq!(
+        row.pending_approvals, 0,
+        "pending_approvals must be zero without approvals"
+    );
 
     // Stage projection parity.
-    let stage_rows = projections::list_stages_projection(&pool, &run.id.to_string()).await.unwrap();
-    assert_eq!(stage_rows.len(), 2, "stage projection must surface both stages");
+    let stage_rows = projections::list_stages_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        stage_rows.len(),
+        2,
+        "stage projection must surface both stages"
+    );
 
     let stage_a = stage_rows.iter().find(|s| s.stage_id == "stage_a").unwrap();
     assert_eq!(stage_a.status, StageStatus::Completed.to_string());
@@ -711,6 +1253,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             title: "Durable idea".into(),
             body: "body".into(),
             workspace_root_path: None,
+            project_key: None,
             status: IdeaStatus::Active,
             created_at: Utc::now(),
             archived_at: None,
@@ -738,6 +1281,17 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -756,6 +1310,10 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             provider: None,
             model: None,
             stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
         };
         stages::insert(&pool, &stage).await.unwrap();
 
@@ -778,13 +1336,18 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             report_version: Some(1),
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
-        projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
 
         // Pool drops here — simulates process exit / connection close
         pool.close().await;
     }
 
-    assert!(db_file.exists(), "SQLite file must persist after pool close");
+    assert!(
+        db_file.exists(),
+        "SQLite file must persist after pool close"
+    );
 
     // ── Read phase (simulates daemon restart) ─────────────────────────────────
     {
@@ -804,7 +1367,11 @@ async fn test_file_backed_sqlite_durability_across_restart() {
         assert_eq!(run_stages[0].status, StageStatus::Completed);
 
         let run_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
-        assert_eq!(run_artifacts.len(), 1, "artifact must survive pool close/reopen");
+        assert_eq!(
+            run_artifacts.len(),
+            1,
+            "artifact must survive pool close/reopen"
+        );
         assert_eq!(run_artifacts[0].name, "report.json");
 
         // Projections survive and report correct values
@@ -816,10 +1383,13 @@ async fn test_file_backed_sqlite_durability_across_restart() {
         assert_eq!(proj.total_stages, 1);
         assert_eq!(proj.completed_stages, 1);
         // Verify artifact survives via artifact projection
-        let art_proj = projections::list_artifacts_projection(
-            &pool, &run_id.to_string()
-        ).await.unwrap();
-        assert!(!art_proj.is_empty(), "artifact projection must survive restart");
+        let art_proj = projections::list_artifacts_projection(&pool, &run_id.to_string())
+            .await
+            .unwrap();
+        assert!(
+            !art_proj.is_empty(),
+            "artifact projection must survive restart"
+        );
 
         pool.close().await;
     }
@@ -848,6 +1418,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         title: "Parity harness idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -875,14 +1446,33 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
     // Insert three stages with distinct statuses
     let stage_specs: &[(&str, StageStatus, Option<StageSettlementKind>)] = &[
-        ("alpha", StageStatus::Completed, Some(StageSettlementKind::Completed)),
-        ("beta",  StageStatus::Failed,    Some(StageSettlementKind::Failed)),
-        ("gamma", StageStatus::Pending,   None),
+        (
+            "alpha",
+            StageStatus::Completed,
+            Some(StageSettlementKind::Completed),
+        ),
+        (
+            "beta",
+            StageStatus::Failed,
+            Some(StageSettlementKind::Failed),
+        ),
+        ("gamma", StageStatus::Pending, None),
     ];
 
     for (sid, status, kind) in stage_specs {
@@ -896,11 +1486,19 @@ async fn test_projection_parity_matches_canonical_repo_values() {
             attempt_number: 1,
             settlement_kind: kind.clone(),
             started_at: Utc::now(),
-            completed_at: if kind.is_some() { Some(Utc::now()) } else { None },
+            completed_at: if kind.is_some() {
+                Some(Utc::now())
+            } else {
+                None
+            },
             owner_agent: None,
             provider: None,
             model: None,
             stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
         };
         stages::insert(&pool, &s).await.unwrap();
     }
@@ -929,7 +1527,9 @@ async fn test_projection_parity_matches_canonical_repo_values() {
     }
 
     // Rebuild projections
-    projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
 
     // ── Run summary projection vs canonical ──────────────────────────────────
     let canonical_stages = stages::list_by_run(&pool, run_id).await.unwrap();
@@ -948,12 +1548,18 @@ async fn test_projection_parity_matches_canonical_repo_values() {
     );
     assert_eq!(
         proj.completed_stages as usize,
-        canonical_stages.iter().filter(|s| s.status == StageStatus::Completed).count(),
+        canonical_stages
+            .iter()
+            .filter(|s| s.status == StageStatus::Completed)
+            .count(),
         "completed_stages projection must match canonical count"
     );
     assert_eq!(
         proj.failed_stages as usize,
-        canonical_stages.iter().filter(|s| s.status == StageStatus::Failed).count(),
+        canonical_stages
+            .iter()
+            .filter(|s| s.status == StageStatus::Failed)
+            .count(),
         "failed_stages projection must match canonical count"
     );
     // has_artifacts is surfaced per-stage (StageSummaryRow), not on RunProjectionRow.
@@ -1012,6 +1618,7 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         title: "Cold idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -1039,6 +1646,17 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1062,6 +1680,7 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
         title: "Idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -1111,10 +1730,23 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
-    projections::rebuild_all_for_run(&pool, run.id).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
     let found = projections::find_run_projection(&pool, &run.id.to_string())
         .await
         .unwrap()
@@ -1143,6 +1775,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             title: "Approval parity idea".into(),
             body: "body".into(),
             workspace_root_path: None,
+            project_key: None,
             status: IdeaStatus::Active,
             created_at: Utc::now(),
             archived_at: None,
@@ -1174,6 +1807,17 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -1211,7 +1855,9 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
     }
 
     // Rebuild projections so approval_inbox reflects current canonical state.
-    projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
 
     // ── Canonical: read approvals repo directly and filter in-memory ──
     let canonical_all = approvals::list_by_run(&pool, run_id).await.unwrap();
@@ -1236,8 +1882,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
     let projection_rows = projections::list_pending_inbox_projection(&pool)
         .await
         .unwrap();
-    let mut projection_ids: Vec<String> =
-        projection_rows.iter().map(|r| r.id.clone()).collect();
+    let mut projection_ids: Vec<String> = projection_rows.iter().map(|r| r.id.clone()).collect();
     projection_ids.sort();
 
     // ── Hard parity assertion ──
@@ -1274,7 +1919,9 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
 
     // Granted/Rejected/Expired approvals MUST NOT appear in the projection.
     for approval in &canonical_all {
-        let in_projection = projection_rows.iter().any(|r| r.id == approval.id.to_string());
+        let in_projection = projection_rows
+            .iter()
+            .any(|r| r.id == approval.id.to_string());
         let should_be_in_projection = matches!(
             approval.decision,
             ApprovalDecision::Pending | ApprovalDecision::Requested

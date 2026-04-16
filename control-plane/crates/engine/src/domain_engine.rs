@@ -1,7 +1,7 @@
 use domain::approval::Approval;
+use domain::ids::StageExecutionId;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
-use domain::ids::StageExecutionId;
 
 pub struct DomainEngine;
 
@@ -22,7 +22,11 @@ pub enum RunEvaluation {
 
 impl DomainEngine {
     /// Evaluate what the next action should be for a run
-    pub fn evaluate_run(run: &Run, stages: &[StageExecution], _approvals: &[Approval]) -> RunEvaluation {
+    pub fn evaluate_run(
+        run: &Run,
+        stages: &[StageExecution],
+        _approvals: &[Approval],
+    ) -> RunEvaluation {
         if run.status.is_terminal() {
             return RunEvaluation::Terminal;
         }
@@ -59,7 +63,9 @@ impl DomainEngine {
         }
 
         // Check if any stage is waiting for approval
-        let waiting = stages.iter().find(|s| s.status == StageStatus::WaitingApproval);
+        let waiting = stages
+            .iter()
+            .find(|s| s.status == StageStatus::WaitingApproval);
         if let Some(stage) = waiting {
             return RunEvaluation::WaitingApproval {
                 stage_id: stage.stage_id.clone(),
@@ -137,10 +143,10 @@ impl DomainEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use domain::ids::{IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
     use domain::stage::{StageExecution, StageStatus};
-    use domain::ids::{IdeaId, RunId, StageExecutionId};
-    use chrono::Utc;
 
     fn make_run(status: RunStatus) -> Run {
         Run {
@@ -164,6 +170,17 @@ mod tests {
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         }
     }
 
@@ -183,6 +200,10 @@ mod tests {
             provider: None,
             model: None,
             stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
         }
     }
 

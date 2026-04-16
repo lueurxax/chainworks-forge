@@ -561,26 +561,9 @@ Canonical wrapper:
 
 Script entry:
 
-```bash
-proposal-048|p048)
-  log "Proposal 048 control-plane gate: evidence + preflight + MCP"
-  (
-    cd "$ROOT_DIR/control-plane"
-    cargo test -p engine delivery_preflight_run_persistence_tests -- --nocapture &&
-    cargo test -p engine delivery_preflight_blocked_start_tests -- --nocapture &&
-    cargo test -p graphql-server delivery_preflight_graphql_contract_tests -- --nocapture &&
-    cargo test -p graphql-server delivery_preflight_run_readback_contract_tests -- --nocapture &&
-    cargo test -p mcp-server runs_delivery_preflight_contract_tests -- --nocapture &&
-    cargo test -p mcp-server run_resource_delivery_preflight_contract_tests -- --nocapture &&
-    cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture &&
-    cargo test -p mcp-server reports_failed_stage_evidence_contract_tests -- --nocapture &&
-    cargo test -p engine mcp_resolution_persistence_tests -- --nocapture &&
-    cargo test -p graphql-server execution_mcp_truth_contract_tests -- --nocapture &&
-    cargo test -p mcp-server reports_mcp_resolution_truth_tests -- --nocapture
-  )
-  log "Proposal 048 control-plane gate passed"
-  ;;
-```
+Do not duplicate the full command list in this proposal. The canonical command inventory lives in `scripts/test-gate.sh` and is summarized in `docs/reference/test-gates.md`; this proposal intentionally names only the stable wrapper, `./scripts/test-gate.sh proposal-048`.
+
+The wrapper must continue to cover the focused proof scope above, including ACP `session/new.mcpServers` serialization and execution-level MCP readback.
 
 ---
 

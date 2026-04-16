@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use async_graphql::*;
 use async_graphql::futures_util::StreamExt;
+use async_graphql::*;
 use sqlx::SqlitePool;
 use tokio_stream::wrappers::BroadcastStream;
 
-use db::repos::{approvals, ideas, runs, projections};
+use db::repos::{approvals, ideas, projections, runs, steward as steward_repo};
 use domain::commands::{
-    ApproveStageCmd, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd, StartRunCmd,
+    ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
+    StartRunCmd,
 };
 use domain::events::DomainEvent;
 use domain::ids::{IdeaId, RunId};
@@ -18,7 +19,10 @@ use crate::types::approval::GqlApproval;
 use crate::types::artifact::GqlArtifact;
 use crate::types::idea::GqlIdea;
 use crate::types::run::GqlRun;
-use crate::types::stage::GqlStageExecution;
+use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
+use crate::types::steward::{
+    GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
+};
 
 pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
@@ -26,11 +30,13 @@ pub fn build_schema(
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
     events: EventSender,
+    principal_table: auth::PrincipalTable,
 ) -> AppSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(pool)
         .data(cmd_handler)
         .data(events)
+        .data(principal_table)
         .finish()
 }
 
@@ -51,7 +57,9 @@ impl QueryRoot {
 
     async fn idea(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlIdea>> {
         let pool = ctx.data::<SqlitePool>()?;
-        let idea_id: IdeaId = id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let idea_id: IdeaId = id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let item = ideas::find_by_id(pool, idea_id).await?;
         Ok(item.map(GqlIdea::from))
     }
@@ -69,8 +77,9 @@ impl QueryRoot {
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
         let pool = ctx.data::<SqlitePool>()?;
-        let run_id: RunId =
-            id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let run_id: RunId = id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let item = runs::find_by_id(pool, run_id).await?;
         Ok(item.map(GqlRun::from))
     }
@@ -89,12 +98,187 @@ impl QueryRoot {
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
         let pool = ctx.data::<SqlitePool>()?;
-        let items = projections::list_stages_projection(pool, run_id.as_str()).await?;
+        let parsed_run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let items = db::repos::stages::list_by_run(pool, parsed_run_id).await?;
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
+    }
+
+    async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let stage_execution_id: domain::ids::StageExecutionId = id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let item = db::repos::stages::find_by_id(pool, stage_execution_id).await?;
+        Ok(item.map(GqlStageExecution::from))
+    }
+
+    async fn agent_executions(
+        &self,
+        ctx: &Context<'_>,
+        stage_execution_id: ID,
+    ) -> Result<Vec<GqlAgentExecution>> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let stage_execution_id: domain::ids::StageExecutionId = stage_execution_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let items = db::repos::agent_executions::find_by_stage(pool, stage_execution_id).await?;
+        Ok(items.into_iter().map(GqlAgentExecution::from).collect())
+    }
+
+    async fn steward_analyses(
+        &self,
+        ctx: &Context<'_>,
+        limit: Option<i32>,
+        status: Option<String>,
+    ) -> Result<Vec<GqlStewardAnalysis>> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let parsed_status = status
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(Error::new)?;
+        let items =
+            steward_repo::list_analyses(pool, limit.unwrap_or(50) as i64, parsed_status).await?;
+        let mut result = Vec::with_capacity(items.len());
+        for item in items {
+            let analysis_id = item.id.clone();
+            let links = steward_repo::list_run_links(pool, &analysis_id).await?;
+            let recommendations = steward_repo::list_recommendations(pool, &analysis_id).await?;
+            result.push(GqlStewardAnalysis::from_parts(item, links, recommendations));
+        }
+        Ok(result)
+    }
+
+    async fn steward_analysis(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> Result<Option<GqlStewardAnalysis>> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let item = steward_repo::find_analysis(pool, id.as_str()).await?;
+        if let Some(item) = item {
+            let links = steward_repo::list_run_links(pool, id.as_str()).await?;
+            let recommendations = steward_repo::list_recommendations(pool, id.as_str()).await?;
+            Ok(Some(GqlStewardAnalysis::from_parts(
+                item,
+                links,
+                recommendations,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn steward_analysis_run_links(
+        &self,
+        ctx: &Context<'_>,
+        analysis_id: ID,
+    ) -> Result<Vec<GqlStewardAnalysisRunLink>> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let items = steward_repo::list_run_links(pool, analysis_id.as_str()).await?;
+        Ok(items
+            .into_iter()
+            .map(GqlStewardAnalysisRunLink::from)
+            .collect())
+    }
+
+    async fn steward_recommendations(
+        &self,
+        ctx: &Context<'_>,
+        analysis_id: ID,
+    ) -> Result<Vec<GqlStewardRecommendation>> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let items = steward_repo::list_recommendations(pool, analysis_id.as_str()).await?;
+        Ok(items
+            .into_iter()
+            .map(GqlStewardRecommendation::from)
+            .collect())
     }
 }
 
 pub struct MutationRoot;
+
+#[derive(SimpleObject)]
+pub struct GqlDeliveryPreflight {
+    pub passed: bool,
+    pub timestamp: String,
+    pub checks: Vec<GqlDeliveryPreflightCheck>,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlDeliveryPreflightCheck {
+    pub id: String,
+    pub label: String,
+    pub passed: bool,
+    pub detail: Option<String>,
+}
+
+impl From<engine::preflight::DeliveryPreflightResult> for GqlDeliveryPreflight {
+    fn from(preflight: engine::preflight::DeliveryPreflightResult) -> Self {
+        GqlDeliveryPreflight {
+            passed: preflight.passed,
+            timestamp: preflight.timestamp.to_rfc3339(),
+            checks: preflight
+                .checks
+                .into_iter()
+                .map(|check| GqlDeliveryPreflightCheck {
+                    id: check.id,
+                    label: check.label,
+                    passed: check.passed,
+                    detail: check.detail,
+                })
+                .collect(),
+        }
+    }
+}
+
+// ── P029 payload wrappers ──────────────────────────────────────────────
+// Dedicated types for each mutation so journal_id doesn't pollute shared
+// Run/Approval types used by read queries.
+
+#[derive(SimpleObject)]
+pub struct StartRunStartedPayload {
+    pub run: GqlRun,
+    pub journal_id: ID,
+}
+
+#[derive(SimpleObject)]
+pub struct StartRunBlockedPayload {
+    pub delivery_preflight: GqlDeliveryPreflight,
+    pub journal_id: ID,
+}
+
+#[derive(Union)]
+pub enum StartRunPayload {
+    Started(StartRunStartedPayload),
+    Blocked(StartRunBlockedPayload),
+}
+
+#[derive(SimpleObject)]
+pub struct ApproveStagePayload {
+    pub approval: GqlApproval,
+    pub journal_id: ID,
+}
+
+#[derive(SimpleObject)]
+pub struct RejectStagePayload {
+    pub approval: GqlApproval,
+    pub journal_id: ID,
+}
+
+#[derive(SimpleObject)]
+pub struct RetryStagePayload {
+    pub retried: bool,
+    pub journal_id: ID,
+}
+
+#[derive(SimpleObject)]
+pub struct CancelRunPayload {
+    pub cancelled: bool,
+    pub journal_id: ID,
+}
 
 #[Object]
 impl MutationRoot {
@@ -109,12 +293,28 @@ impl MutationRoot {
         delivery_configuration_json: Option<String>,
         workflow_yaml_path: String,
         agent_catalog_yaml_path: String,
-    ) -> Result<GqlRun> {
+    ) -> Result<StartRunPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let iid: IdeaId =
-            idea_id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let principal =
+            ctx.data::<auth::Principal>()
+                .cloned()
+                .unwrap_or_else(|_| auth::Principal {
+                    id: "anonymous".into(),
+                    class: auth::PrincipalClass::Operator,
+                });
+
+        if !auth::is_tool_allowed(&principal, "runs.start") {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller =
+            CallerContext::graphql(&principal.id, &principal.class.to_string(), "startRun");
+
+        let iid: IdeaId = idea_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let cmd = Command::StartRun(StartRunCmd {
             idea_id: iid,
@@ -127,17 +327,26 @@ impl MutationRoot {
             agent_catalog_yaml_path,
         });
 
-        let result = cmd_handler.handle(cmd).await?;
-        let run_id = match result {
-            engine::command_handler::CommandResult::RunStarted { run_id } => run_id,
-            _ => return Err(Error::new("Unexpected command result")),
-        };
-
-        let run = runs::find_by_id(pool, run_id)
-            .await?
-            .ok_or_else(|| Error::new("Run not found after creation"))?;
-
-        Ok(GqlRun::from(run))
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+        match commanded.result {
+            engine::command_handler::CommandResult::RunStarted { run_id } => {
+                let run = runs::find_by_id(pool, run_id)
+                    .await?
+                    .ok_or_else(|| Error::new("Run not found after creation"))?;
+                Ok(StartRunPayload::Started(StartRunStartedPayload {
+                    run: GqlRun::from(run),
+                    journal_id: jid,
+                }))
+            }
+            engine::command_handler::CommandResult::StartRunBlockedByDeliveryPreflight(blocked) => {
+                Ok(StartRunPayload::Blocked(StartRunBlockedPayload {
+                    delivery_preflight: blocked.delivery_preflight.into(),
+                    journal_id: jid,
+                }))
+            }
+            _ => Err(Error::new("Unexpected command result")),
+        }
     }
 
     async fn approve_stage(
@@ -146,12 +355,28 @@ impl MutationRoot {
         run_id: ID,
         stage_id: String,
         comment: Option<String>,
-    ) -> Result<GqlApproval> {
+    ) -> Result<ApproveStagePayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let rid: RunId =
-            run_id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let principal =
+            ctx.data::<auth::Principal>()
+                .cloned()
+                .unwrap_or_else(|_| auth::Principal {
+                    id: "anonymous".into(),
+                    class: auth::PrincipalClass::Operator,
+                });
+
+        if !auth::is_tool_allowed(&principal, "approvals.resolve") {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller =
+            CallerContext::graphql(&principal.id, &principal.class.to_string(), "approveStage");
+
+        let rid: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let cmd = Command::ApproveStage(ApproveStageCmd {
             run_id: rid,
@@ -159,8 +384,9 @@ impl MutationRoot {
             comment,
         });
 
-        let result = cmd_handler.handle(cmd).await?;
-        let approval_id = match result {
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+        let approval_id = match commanded.result {
             engine::command_handler::CommandResult::StageApproved { approval_id } => approval_id,
             _ => return Err(Error::new("Unexpected command result")),
         };
@@ -169,7 +395,10 @@ impl MutationRoot {
             .await?
             .ok_or_else(|| Error::new("Approval not found after update"))?;
 
-        Ok(GqlApproval::from(approval))
+        Ok(ApproveStagePayload {
+            approval: GqlApproval::from(approval),
+            journal_id: jid,
+        })
     }
 
     async fn reject_stage(
@@ -178,12 +407,28 @@ impl MutationRoot {
         run_id: ID,
         stage_id: String,
         comment: Option<String>,
-    ) -> Result<GqlApproval> {
+    ) -> Result<RejectStagePayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let rid: RunId =
-            run_id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let principal =
+            ctx.data::<auth::Principal>()
+                .cloned()
+                .unwrap_or_else(|_| auth::Principal {
+                    id: "anonymous".into(),
+                    class: auth::PrincipalClass::Operator,
+                });
+
+        if !auth::is_tool_allowed(&principal, "approvals.resolve") {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller =
+            CallerContext::graphql(&principal.id, &principal.class.to_string(), "rejectStage");
+
+        let rid: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let cmd = Command::RejectStage(RejectStageCmd {
             run_id: rid,
@@ -191,8 +436,9 @@ impl MutationRoot {
             comment,
         });
 
-        let result = cmd_handler.handle(cmd).await?;
-        let approval_id = match result {
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+        let approval_id = match commanded.result {
             engine::command_handler::CommandResult::StageRejected { approval_id } => approval_id,
             _ => return Err(Error::new("Unexpected command result")),
         };
@@ -201,7 +447,10 @@ impl MutationRoot {
             .await?
             .ok_or_else(|| Error::new("Approval not found after update"))?;
 
-        Ok(GqlApproval::from(approval))
+        Ok(RejectStagePayload {
+            approval: GqlApproval::from(approval),
+            journal_id: jid,
+        })
     }
 
     async fn retry_stage(
@@ -209,30 +458,68 @@ impl MutationRoot {
         ctx: &Context<'_>,
         run_id: ID,
         stage_id: String,
-    ) -> Result<bool> {
+    ) -> Result<RetryStagePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let rid: RunId =
-            run_id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let principal =
+            ctx.data::<auth::Principal>()
+                .cloned()
+                .unwrap_or_else(|_| auth::Principal {
+                    id: "anonymous".into(),
+                    class: auth::PrincipalClass::Operator,
+                });
+
+        if !auth::is_tool_allowed(&principal, "stages.retry") {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller =
+            CallerContext::graphql(&principal.id, &principal.class.to_string(), "retryStage");
+
+        let rid: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let cmd = Command::RetryStage(RetryStageCmd {
             run_id: rid,
             stage_id,
         });
 
-        cmd_handler.handle(cmd).await?;
-        Ok(true)
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        Ok(RetryStagePayload {
+            retried: true,
+            journal_id: ID::from(commanded.journal_id),
+        })
     }
 
-    async fn cancel_run(&self, ctx: &Context<'_>, run_id: ID) -> Result<bool> {
+    async fn cancel_run(&self, ctx: &Context<'_>, run_id: ID) -> Result<CancelRunPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let rid: RunId =
-            run_id.parse().map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let principal =
+            ctx.data::<auth::Principal>()
+                .cloned()
+                .unwrap_or_else(|_| auth::Principal {
+                    id: "anonymous".into(),
+                    class: auth::PrincipalClass::Operator,
+                });
+
+        if !auth::is_tool_allowed(&principal, "runs.cancel") {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller =
+            CallerContext::graphql(&principal.id, &principal.class.to_string(), "cancelRun");
+
+        let rid: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let cmd = Command::CancelRun(CancelRunCmd { run_id: rid });
-        cmd_handler.handle(cmd).await?;
-        Ok(true)
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        Ok(CancelRunPayload {
+            cancelled: true,
+            journal_id: ID::from(commanded.journal_id),
+        })
     }
 }
 
@@ -276,7 +563,8 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         run_id: ID,
-    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>> + '_ {
+    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>> + '_
+    {
         let pool = ctx.data::<SqlitePool>().unwrap().clone();
         let events = ctx.data::<EventSender>().unwrap().clone();
         let filter_run_id: RunId = run_id.parse().unwrap_or_else(|_| RunId::new());
@@ -295,10 +583,9 @@ impl SubscriptionRoot {
                         if run_id != filter_run_id {
                             return None;
                         }
-                        let stage =
-                            db::repos::stages::find_by_id(&pool, stage_execution_id)
-                                .await
-                                .ok()??;
+                        let stage = db::repos::stages::find_by_id(&pool, stage_execution_id)
+                            .await
+                            .ok()??;
                         Some(Ok(Some(GqlStageExecution::from(stage))))
                     }
                     _ => None,
@@ -322,8 +609,7 @@ impl SubscriptionRoot {
                 let event = msg.ok()?;
                 match event {
                     DomainEvent::ApprovalRequested { approval_id, .. } => {
-                        let approval =
-                            approvals::find_by_id(&pool, approval_id).await.ok()??;
+                        let approval = approvals::find_by_id(&pool, approval_id).await.ok()??;
                         Some(Ok(Some(GqlApproval::from(approval))))
                     }
                     _ => None,
@@ -397,10 +683,14 @@ mod tests {
     use async_graphql::Request;
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifacts, ideas, projections, runs};
+    use db::repos::{artifacts, ideas, projections, runs, steward};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
+    use domain::steward::{
+        CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
+        StewardRecommendation,
+    };
     use domain::validation::{
         ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
@@ -415,6 +705,7 @@ mod tests {
             title: "Test idea".into(),
             body: "body".into(),
             workspace_root_path: None,
+            project_key: None,
             status: IdeaStatus::Active,
             created_at: Utc::now(),
             archived_at: None,
@@ -446,6 +737,17 @@ mod tests {
                 "{\"repo_identifier\":\"repo-3\",\"repo_root\":\"/repo-3\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
                     .into(),
             ),
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         }
     }
 
@@ -464,7 +766,9 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+        create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool failed")
     }
 
     fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
@@ -496,6 +800,10 @@ mod tests {
                 provider: Some("system".to_string()),
                 model: None,
                 stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
             },
         )
         .await
@@ -520,6 +828,18 @@ mod tests {
                 session_family_id: None,
                 session_reuse_disposition: Some("reused".into()),
                 session_reset_reason: Some("operator_reset".into()),
+                backend_profile_id: Some("codex_with_mcp".into()),
+                requested_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+                predicted_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+                predicted_mcp_runtime_ids_json: Some(r#"["fs-runtime"]"#.into()),
+                actual_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+                actual_mcp_runtime_ids_json: Some(r#"["fs-runtime"]"#.into()),
+                denied_mcp_extensions_json: Some("[]".into()),
+                mcp_blocking_issues_json: Some("[]".into()),
+                actual_mcp_observation_json: Some(
+                    r#"{"source":"provider_session_new_response"}"#.into(),
+                ),
+                mcp_session_startup_latency_ms: Some(17),
             },
         )
         .await
@@ -615,8 +935,24 @@ mod tests {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init should run");
+        let worktrees = tempfile::tempdir().unwrap();
+        let delivery_json = format!(
+            r#"{{"repo_identifier":"repo-1","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
+            repo.path().display(),
+            worktrees.path().display()
+        );
 
-        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
         let response = schema
             .execute(Request::new(
                 r#"
@@ -629,9 +965,71 @@ mod tests {
                     artifactRoot: "/tmp/art",
                     workflowYamlPath: "WORKFLOW_YAML_PATH",
                     agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                    deliveryConfigurationJson: DELIVERY_CONFIG
                   ) {
-                    id
+                    ... on StartRunStartedPayload { run { id } journalId }
+                    ... on StartRunBlockedPayload { deliveryPreflight { passed checks { id passed detail } } journalId }
+                  }
+                }
+                "#
+                .replace("IDEA_ID", &idea_id.to_string())
+                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
+                .replace(
+                    "DELIVERY_CONFIG",
+                    &serde_json::to_string(&delivery_json).unwrap(),
+                ),
+            ))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "mutation must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let run_id = json["startRun"]["run"]["id"].as_str().unwrap();
+        let run = runs::find_by_id(&pool, run_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(run.delivery_configuration_json, Some(delivery_json));
+    }
+
+    #[tokio::test]
+    async fn start_run_blocked_preflight_returns_typed_payload() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
+        let response = schema
+            .execute(Request::new(
+                r#"
+                mutation StartRun {
+                  startRun(
+                    ideaId: "IDEA_ID",
+                    workflowId: "wf-blocked",
+                    workflowTitle: "Blocked Run",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    workflowYamlPath: "WORKFLOW_YAML_PATH",
+                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
+                    deliveryConfigurationJson: "{\"repo_identifier\":\"repo-blocked\",\"repo_root\":\"/definitely/missing/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp\",\"target_branch\":\"cw/release\",\"release_target_id\":\"app-store\"}"
+                  ) {
+                    ... on StartRunStartedPayload { run { id } journalId }
+                    ... on StartRunBlockedPayload {
+                      deliveryPreflight {
+                        passed
+                        timestamp
+                        checks { id label passed detail }
+                      }
+                      journalId
+                    }
                   }
                 }
                 "#
@@ -641,20 +1039,21 @@ mod tests {
             ))
             .await;
 
-        assert!(response.errors.is_empty(), "mutation must succeed: {response:?}");
+        assert!(
+            response.errors.is_empty(),
+            "mutation must succeed: {response:?}"
+        );
         let json = response.data.into_json().unwrap();
-        let run_id = json["startRun"]["id"].as_str().unwrap();
-        let run = runs::find_by_id(&pool, run_id.parse().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(
-            run.delivery_configuration_json,
-            Some(
-                "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
-                    .to_string()
-            )
+        let preflight = &json["startRun"]["deliveryPreflight"];
+        assert_eq!(preflight["passed"], serde_json::json!(false));
+        assert!(
+            preflight["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == serde_json::json!("repo_root_exists")
+                    && check["passed"] == serde_json::json!(false)),
+            "typed preflight checks must include failing repo_root_exists: {preflight:?}"
         );
     }
 
@@ -663,8 +1062,24 @@ mod tests {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init should run");
+        let worktrees = tempfile::tempdir().unwrap();
+        let delivery_json = format!(
+            r#"{{"repo_identifier":"repo-2","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
+            repo.path().display(),
+            worktrees.path().display()
+        );
 
-        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
         let start = schema
             .execute(Request::new(
                 r#"
@@ -677,28 +1092,32 @@ mod tests {
                     artifactRoot: "/tmp/art",
                     workflowYamlPath: "WORKFLOW_YAML_PATH",
                     agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: "{\"repo_identifier\":\"repo-2\",\"repo_root\":\"/repo-2\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+                    deliveryConfigurationJson: DELIVERY_CONFIG
                   ) {
-                    id
+                    ... on StartRunStartedPayload { run { id } journalId }
+                    ... on StartRunBlockedPayload { deliveryPreflight { passed checks { id passed detail } } journalId }
                   }
                 }
                 "#
                 .replace("IDEA_ID", &idea_id.to_string())
                 .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
+                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
+                .replace(
+                    "DELIVERY_CONFIG",
+                    &serde_json::to_string(&delivery_json).unwrap(),
+                ),
             ))
             .await;
 
         assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
-        let run_id = start.data.into_json().unwrap()["startRun"]["id"]
+        let run_id = start.data.into_json().unwrap()["startRun"]["run"]["id"]
             .as_str()
             .unwrap()
             .to_string();
 
         let response = schema
-            .execute(Request::new(
-                format!(
-                    r#"
+            .execute(Request::new(format!(
+                r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -706,17 +1125,163 @@ mod tests {
                   }}
                 }}
                 "#
-                )
-            ))
+            )))
             .await;
 
-        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
         let json = response.data.into_json().unwrap();
         assert_eq!(
             json["run"]["deliveryConfigurationJson"],
-            serde_json::json!(
-                "{\"repo_identifier\":\"repo-2\",\"repo_root\":\"/repo-2\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
-            )
+            serde_json::json!(delivery_json)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_preflight_graphql_readback_tests() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init should run");
+        let worktrees = tempfile::tempdir().unwrap();
+        let delivery_json = format!(
+            r#"{{"repo_identifier":"repo-graphql-preflight","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
+            repo.path().display(),
+            worktrees.path().display()
+        );
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
+        let start = schema
+            .execute(Request::new(
+                r#"
+                mutation StartRun {
+                  startRun(
+                    ideaId: "IDEA_ID",
+                    workflowId: "wf-preflight-readback",
+                    workflowTitle: "Preflight Readback",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    workflowYamlPath: "WORKFLOW_YAML_PATH",
+                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
+                    deliveryConfigurationJson: DELIVERY_CONFIG
+                  ) {
+                    ... on StartRunStartedPayload { run { id deliveryPreflightJson } }
+                    ... on StartRunBlockedPayload { deliveryPreflight { passed } }
+                  }
+                }
+                "#
+                .replace("IDEA_ID", &idea_id.to_string())
+                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
+                .replace(
+                    "DELIVERY_CONFIG",
+                    &serde_json::to_string(&delivery_json).unwrap(),
+                ),
+            ))
+            .await;
+
+        assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
+        let start_json = start.data.into_json().unwrap();
+        let run_id = start_json["startRun"]["run"]["id"].as_str().unwrap();
+        assert!(start_json["startRun"]["run"]["deliveryPreflightJson"]
+            .as_str()
+            .unwrap()
+            .contains(r#""passed":true"#));
+
+        let response = schema
+            .execute(Request::new(format!(
+                r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    id
+                    deliveryPreflightJson
+                  }}
+                }}
+                "#
+            )))
+            .await;
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert!(json["run"]["deliveryPreflightJson"]
+            .as_str()
+            .unwrap()
+            .contains("repo_root_exists"));
+    }
+
+    #[tokio::test]
+    async fn execution_mcp_truth_contract_tests() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
+        let response = schema
+            .execute(Request::new(format!(
+                r#"
+                query StageExecutions {{
+                  stages(runId: "{run_id}") {{
+                    id
+                    executions {{
+                      backendProfileId
+                      requestedMcpExtensionsJson
+                      predictedMcpRuntimeIdsJson
+                      actualMcpRuntimeIdsJson
+                      mcpBlockingIssuesJson
+                    }}
+                  }}
+                  agentExecutions(stageExecutionId: "{stage_execution_id}") {{
+                    backendProfileId
+                    actualMcpObservationJson
+                  }}
+                }}
+                "#
+            )))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let execution = &json["stages"][0]["executions"][0];
+        assert_eq!(
+            execution["backendProfileId"],
+            serde_json::json!("codex_with_mcp")
+        );
+        assert_eq!(
+            execution["requestedMcpExtensionsJson"],
+            serde_json::json!(r#"["filesystem"]"#)
+        );
+        assert_eq!(
+            execution["actualMcpRuntimeIdsJson"],
+            serde_json::json!(r#"["fs-runtime"]"#)
+        );
+        assert_eq!(
+            json["agentExecutions"][0]["actualMcpObservationJson"],
+            serde_json::json!(r#"{"source":"provider_session_new_response"}"#)
         );
     }
 
@@ -749,11 +1314,14 @@ mod tests {
         .await
         .unwrap();
 
-        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
         let response = schema
-            .execute(Request::new(
-                format!(
-                    r#"
+            .execute(Request::new(format!(
+                r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -761,14 +1329,17 @@ mod tests {
                   }}
                 }}
                 "#
-                )
-            ))
+            )))
             .await;
 
-        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
         let json = response.data.into_json().unwrap();
         let parsed: serde_json::Value =
-            serde_json::from_str(json["run"]["cancellationSettlementLog"].as_str().unwrap()).unwrap();
+            serde_json::from_str(json["run"]["cancellationSettlementLog"].as_str().unwrap())
+                .unwrap();
         assert_eq!(
             parsed,
             serde_json::json!([
@@ -823,9 +1394,15 @@ mod tests {
         )
         .await
         .unwrap();
-        projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
 
-        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
         let response = schema
             .execute(Request::new(
                 r#"
@@ -836,11 +1413,14 @@ mod tests {
                     cancellationSettlementLog
                   }
                 }
-                "#
+                "#,
             ))
             .await;
 
-        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
         let json = response.data.into_json().unwrap();
         assert_eq!(
             json["runs"][0]["cancellationSettlementSummary"],
@@ -855,11 +1435,16 @@ mod tests {
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
 
         let payload_path = std::env::temp_dir().join(format!("validation-failure-{}.json", run_id));
-        std::fs::write(&payload_path, serde_json::to_vec(&validation_failure_payload(run_id)).unwrap())
-            .unwrap();
+        std::fs::write(
+            &payload_path,
+            serde_json::to_vec(&validation_failure_payload(run_id)).unwrap(),
+        )
+        .unwrap();
         let (stage_execution_id, agent_execution_id) = seed_validation_attempt(&pool, run_id).await;
 
         let artifact = Artifact {
@@ -880,26 +1465,23 @@ mod tests {
             report_kind: Some("validation_failure".into()),
             report_version: None,
         };
-        artifacts::insert(&pool, &artifact)
-        .await
-        .unwrap();
-        let record = validation_failure_record(
-            artifact.id,
-            run_id,
-            stage_execution_id,
-            agent_execution_id,
-        );
-        db::repos::validation::insert(&pool, &record)
+        artifacts::insert(&pool, &artifact).await.unwrap();
+        let record =
+            validation_failure_record(artifact.id, run_id, stage_execution_id, agent_execution_id);
+        db::repos::validation::insert(&pool, &record).await.unwrap();
+
+        projections::rebuild_all_for_run(&pool, run_id)
             .await
             .unwrap();
 
-        projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
-
-        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
         let response = schema
-            .execute(Request::new(
-                format!(
-                    r#"
+            .execute(Request::new(format!(
+                r#"
                 query Artifacts {{
                   artifacts(runId: "{run_id}") {{
                     name
@@ -917,11 +1499,13 @@ mod tests {
                   }}
                 }}
                 "#
-                )
-            ))
+            )))
             .await;
 
-        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
         let json = response.data.into_json().unwrap();
         let artifacts = json["artifacts"].as_array().unwrap();
         let validation_failure = artifacts
@@ -944,6 +1528,117 @@ mod tests {
         assert_eq!(
             validation_failure["validationFailureRecord"]["sessionResetReason"],
             serde_json::json!("operator_reset")
+        );
+    }
+
+    #[tokio::test]
+    async fn steward_graphql_readback_tests_exposes_analysis_rows() {
+        let pool = test_pool().await;
+        let now = Utc::now();
+        let analysis = StewardAnalysis {
+            id: "analysis-1".into(),
+            created_at: now,
+            window_start: now,
+            window_end: now,
+            run_count: 5,
+            cohort_keys_json: serde_json::json!({
+                "workflow_family": "mvp_live",
+                "risk_class": "high"
+            })
+            .to_string(),
+            cohort_quality: CohortQuality::Weak,
+            status: StewardAnalysisStatus::Inconclusive,
+            degradation_count: 1,
+            improvement_count: 0,
+            workflow_snapshot_artifact_hash: "workflow-hash".into(),
+            agent_catalog_snapshot_hash: "catalog-hash".into(),
+            steward_config_snapshot_hash: "config-hash".into(),
+            metrics_snapshot_artifact_id: Some("/tmp/steward/metrics-window.json".into()),
+            baseline_snapshot_artifact_id: Some("/tmp/steward/baseline-window.json".into()),
+            agent_catalog_snapshot_artifact_id: Some("/tmp/steward/catalog-snapshot.json".into()),
+            workflow_snapshot_artifact_id: Some("/tmp/steward/workflow-snapshot.json".into()),
+            config_change_log_artifact_id: Some("/tmp/steward/config-change-log.json".into()),
+            health_report_artifact_id: None,
+            degradation_alert_artifact_id: Some("/tmp/steward/degradation-alert.json".into()),
+            agent_tuning_artifact_id: None,
+            workflow_tuning_artifact_id: None,
+            experiment_plan_artifact_id: None,
+            audit_report_artifact_id: None,
+            trigger_reason: "manual".into(),
+            error_summary: None,
+        };
+        steward::insert_analysis(&pool, &analysis).await.unwrap();
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        steward::insert_run_link(
+            &pool,
+            &StewardAnalysisRunLink {
+                id: "link-1".into(),
+                analysis_id: "analysis-1".into(),
+                run_id: run_id.to_string(),
+                role: "implicated".into(),
+            },
+        )
+        .await
+        .unwrap();
+        steward::insert_recommendation(
+            &pool,
+            &StewardRecommendation {
+                id: "rec-1".into(),
+                analysis_id: "analysis-1".into(),
+                created_at: now,
+                category: "degradation".into(),
+                summary: "Lead time regressed".into(),
+                target_metric: "lead_time_median_seconds".into(),
+                confidence_level: "high".into(),
+                status: "proposed".into(),
+                source_artifact_name: Some("deterministic_signal".into()),
+                decision_comment: None,
+                decided_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+        );
+        let response = schema
+            .execute(Request::new(
+                r#"
+                query Steward {
+                  stewardAnalyses(limit: 10) {
+                    id
+                    status
+                    triggerReason
+                    cohortKeysJson
+                    cohortQuality
+                    runCount
+                    degradationCount
+                    artifactIds
+                    recommendations { id targetMetric status }
+                    linkedRuns { id runId role }
+                  }
+                  stewardAnalysis(id: "analysis-1") {
+                    id
+                    stewardConfigSnapshotHash
+                    recommendations { id summary }
+                    linkedRuns { id role }
+                  }
+                }
+                "#,
+            ))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap()["stewardAnalyses"][0]["id"],
+            "analysis-1"
         );
     }
 }

@@ -68,7 +68,11 @@ impl AcpRuntimeManager {
             .await
             .get(generation_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("No live ACP session registered for generation id '{generation_id}'"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No live ACP session registered for generation id '{generation_id}'"
+                )
+            })
     }
 
     pub async fn has_live_session(

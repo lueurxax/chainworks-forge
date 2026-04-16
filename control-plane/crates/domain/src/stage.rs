@@ -101,4 +101,12 @@ pub struct StageExecution {
     pub model: Option<String>,
     /// State type from the workflow: "start", "end", "manual_gate", or None.
     pub stage_type: Option<String>,
+    /// Canonical stage-owned validation failure JSON (Proposal 048).
+    pub validation_failure_json: Option<String>,
+    /// Canonical stage-owned failed-stage evidence packet JSON (Proposal 048).
+    pub evidence_packet_json: Option<String>,
+    /// Canonical stage-owned recovery action snapshot JSON (Proposal 048).
+    pub recovery_snapshot_json: Option<String>,
+    /// Stage-owned reason for retry creation, consumed by Steward metrics.
+    pub retry_reason: Option<String>,
 }

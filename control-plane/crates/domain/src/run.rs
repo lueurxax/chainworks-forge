@@ -117,4 +117,28 @@ pub struct Run {
     /// Set at run start for repo-backed runs. Consumed by WorktreeProvisioner,
     /// RepoSafetyGuard, release agents, and evidence export.
     pub delivery_configuration_json: Option<String>,
+    /// Frozen delivery preflight result JSON (Proposal 048).
+    /// Set when delivery configuration is validated successfully at run start.
+    pub delivery_preflight_json: Option<String>,
+    // ── Steward analysis fields (Proposal 049) ──────────────────────────
+    /// Frozen primary cohort family from parsed workflow metadata.
+    pub workflow_family: Option<String>,
+    /// Frozen project key copied from the owning Idea at run creation.
+    pub project_key: Option<String>,
+    /// Frozen risk class from parsed workflow metadata.
+    pub risk_class: Option<String>,
+    /// Frozen stack identifier from parsed workflow metadata.
+    pub stack: Option<String>,
+    /// SHA-256 over canonical parsed workflow snapshot JSON.
+    pub workflow_snapshot_hash: Option<String>,
+    /// SHA-256 over canonical parsed agent-catalog snapshot JSON.
+    pub catalog_snapshot_hash: Option<String>,
+    /// Canonical parsed workflow snapshot JSON captured at run creation.
+    pub workflow_snapshot_json: Option<String>,
+    /// Canonical parsed agent-catalog snapshot JSON captured at run creation.
+    pub catalog_snapshot_json: Option<String>,
+    /// Drift timestamp when a later daemon check detects definition/config drift.
+    pub drift_detected_at: Option<DateTime<Utc>>,
+    /// Canonical drift details JSON.
+    pub drift_details_json: Option<String>,
 }

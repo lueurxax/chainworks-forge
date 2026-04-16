@@ -1,25 +1,27 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use sqlx::SqlitePool;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sqlx::SqlitePool;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
-use acp::AcpRuntimeManager;
 use crate::release::{
     connect::ConnectPublishService,
     coordinator::ReleaseResult,
     git::{GitPushReceipt, GitReleaseService, ReleaseManifest},
     receipt::DeliveryReceiptBuilder,
 };
-use db::work_item::{WorkItem, WorkItemKind};
+use acp::AcpRuntimeManager;
 use db::repos::{agent_executions, artifacts, ideas, projections, sessions, stages, validation};
-use domain::artifact::ArtifactFormat;
+use db::work_item::{WorkItem, WorkItemKind};
 use domain::agent::AgentStatus;
+use domain::artifact::ArtifactFormat;
 use domain::ids::RunId;
 use domain::run::DeliveryConfiguration;
+use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
 use crate::contracts::{
     artifact_format_for_companion_output, artifact_format_for_machine_output,
@@ -30,8 +32,7 @@ use crate::event_bus::EventSender;
 use crate::orchestrator::Orchestrator;
 use crate::recovery::RecoveryService;
 use crate::session::fingerprint::{
-    binding_fingerprint, invocation_owner_key, BindingFingerprintInput,
-    InvocationOwnerKeyInput,
+    binding_fingerprint, invocation_owner_key, BindingFingerprintInput, InvocationOwnerKeyInput,
 };
 use crate::session::policy::{ensure_policy, SessionPolicyDecision, SessionPolicyInput};
 use crate::work_queue::WorkQueue;
@@ -42,6 +43,101 @@ pub struct BackgroundExecutor {
     orchestrator: Arc<Orchestrator>,
     acp: Arc<AcpRuntimeManager>,
     events: EventSender,
+    steward_runtime_inputs: Option<Arc<crate::steward::config::StewardRuntimeInputs>>,
+}
+
+struct BackgroundStewardAgentExecutor {
+    acp: Arc<AcpRuntimeManager>,
+    runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
+}
+
+#[async_trait::async_trait]
+impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExecutor {
+    async fn run_steward_agent(
+        &self,
+        invocation: crate::steward::service::StewardAgentInvocation,
+    ) -> Result<()> {
+        let catalog = workflow::catalog::load(
+            self.runtime_inputs
+                .agent_catalog_path
+                .to_string_lossy()
+                .as_ref(),
+        )?;
+        let agent = catalog
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.iter().find(|agent| agent.id == invocation.agent_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Steward agent '{}' not found in active catalog {}",
+                    invocation.agent_id,
+                    self.runtime_inputs.agent_catalog_path.display()
+                )
+            })?;
+        let profiles = catalog
+            .backend_profiles
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Active catalog has no backend_profiles"))?;
+        let profile = profiles.get(&agent.backend_profile).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Steward agent '{}' references unknown backend_profile '{}'",
+                agent.id,
+                agent.backend_profile
+            )
+        })?;
+        let provider = normalize_steward_provider(&profile.provider);
+        let requested_mcp_server_ids = profile.mcp.clone().unwrap_or_default();
+        let mcp_resolution = crate::mcp::resolve_mcp_servers(
+            &requested_mcp_server_ids,
+            Some(&agent.backend_profile),
+            &provider,
+        );
+        if !mcp_resolution.report.blocking_issues.is_empty() {
+            anyhow::bail!(
+                "Steward agent '{}' MCP resolution failed: {}",
+                agent.id,
+                serde_json::to_string(&mcp_resolution.report.blocking_issues)?
+            );
+        }
+
+        let expected_output_paths =
+            steward_expected_output_paths(&catalog, agent, &invocation.chainworks_meta_root);
+        let prompt =
+            build_steward_agent_prompt(&catalog, agent, &invocation, &expected_output_paths);
+        let result = self
+            .acp
+            .execute(acp::ExecutionRequest {
+                run_id: RunId::new(),
+                stage_id: format!("steward_{}", agent.id),
+                agent_id: agent.id.clone(),
+                provider,
+                model: profile.model.clone(),
+                effort: profile.effort.clone(),
+                workspace_root: invocation
+                    .chainworks_meta_root
+                    .to_string_lossy()
+                    .into_owned(),
+                prompt,
+                worktree_root: None,
+                worktree_write_enabled: false,
+                worktree_strategy: None,
+                expected_output_paths,
+                keep_session_alive: false,
+                reuse_existing_session: false,
+                session_generation_id: None,
+                provider_session_id: None,
+                mcp_servers: mcp_resolution.payloads,
+            })
+            .await?;
+        if result.status != AgentStatus::Completed {
+            anyhow::bail!(
+                "Steward agent '{}' finished with status {}",
+                agent.id,
+                result.status
+            );
+        }
+        Ok(())
+    }
 }
 
 fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
@@ -114,6 +210,105 @@ fn sanitize_artifact_name_for_path(name: &str) -> String {
     }
 }
 
+fn normalize_steward_provider(provider: &str) -> String {
+    match provider {
+        "claude_acp" | "claude_agent_acp" => "claude".to_string(),
+        "codex_acp" => "codex".to_string(),
+        "gemini_cli_acp" | "gemini_acp" => "gemini".to_string(),
+        "auggie_acp" => "auggie".to_string(),
+        "junie_acp" => "junie".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn steward_expected_output_paths(
+    catalog: &AgentCatalogFile,
+    agent: &AgentEntry,
+    meta_root: &std::path::Path,
+) -> Vec<String> {
+    agent
+        .outputs
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|output| steward_artifact_path(catalog, output, meta_root))
+        .collect()
+}
+
+fn steward_artifact_path(
+    catalog: &AgentCatalogFile,
+    artifact_name: &str,
+    meta_root: &std::path::Path,
+) -> String {
+    let meta_root = meta_root.to_string_lossy();
+    catalog
+        .artifacts
+        .as_ref()
+        .and_then(|artifacts| artifacts.get(artifact_name))
+        .map(|template| {
+            template
+                .replace("${CHAINWORKS_META_ROOT:-.chainworks}", &meta_root)
+                .replace("${CHAINWORKS_META_ROOT}", &meta_root)
+                .replace("$CHAINWORKS_META_ROOT", &meta_root)
+        })
+        .unwrap_or_else(|| {
+            meta_root.as_ref().to_string() + "/" + &sanitize_artifact_name_for_path(artifact_name)
+        })
+}
+
+fn build_steward_agent_prompt(
+    catalog: &AgentCatalogFile,
+    agent: &AgentEntry,
+    invocation: &crate::steward::service::StewardAgentInvocation,
+    expected_output_paths: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(prompt) = agent
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        parts.push(format!("## System Instructions\n{prompt}"));
+        parts.push("---".to_string());
+    }
+    if let Some(skill_ref) = agent.skill_ref.as_deref() {
+        if let Some(skill) = catalog
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.get(skill_ref))
+        {
+            if let Some(description) = skill.description.as_deref() {
+                parts.push(format!(
+                    "## Skill: {skill_ref}\nRole: {}\n{}",
+                    agent.skill_role.as_deref().unwrap_or("default"),
+                    description
+                ));
+            }
+        }
+    }
+    parts.push(format!(
+        "## Steward Active-Catalog IO\nAgent ID: {}\nCHAINWORKS_META_ROOT: {}\nRead inputs and write outputs under this root. Do not write outside it.",
+        agent.id,
+        invocation.chainworks_meta_root.display()
+    ));
+    if let Some(inputs) = agent.inputs.as_deref() {
+        let inputs = inputs
+            .iter()
+            .map(|input| steward_artifact_path(catalog, input, &invocation.chainworks_meta_root))
+            .collect::<Vec<_>>()
+            .join("\n- ");
+        parts.push(format!("Input artifact paths:\n- {inputs}"));
+    }
+    if !expected_output_paths.is_empty() {
+        parts.push(format!(
+            "Required output artifact paths:\n- {}",
+            expected_output_paths.join("\n- ")
+        ));
+    }
+    parts.join("\n\n")
+}
+
 impl BackgroundExecutor {
     pub fn new(
         pool: SqlitePool,
@@ -128,6 +323,25 @@ impl BackgroundExecutor {
             orchestrator,
             acp,
             events,
+            steward_runtime_inputs: None,
+        }
+    }
+
+    pub fn new_with_steward_runtime_inputs(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        orchestrator: Arc<Orchestrator>,
+        acp: Arc<AcpRuntimeManager>,
+        events: EventSender,
+        steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
+    ) -> Self {
+        Self {
+            pool,
+            work_queue,
+            orchestrator,
+            acp,
+            events,
+            steward_runtime_inputs: Some(steward_runtime_inputs),
         }
     }
 
@@ -185,7 +399,9 @@ impl BackgroundExecutor {
                                 }
                                 Err(e) => {
                                     error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
-                                    if let Err(e2) = executor.work_queue.fail(&item_id, &e.to_string()).await {
+                                    if let Err(e2) =
+                                        executor.work_queue.fail(&item_id, &e.to_string()).await
+                                    {
                                         error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                     }
                                 }
@@ -200,7 +416,9 @@ impl BackgroundExecutor {
                             }
                             Err(e) => {
                                 error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
-                                if let Err(e2) = self.work_queue.fail(&item_id, &e.to_string()).await {
+                                if let Err(e2) =
+                                    self.work_queue.fail(&item_id, &e.to_string()).await
+                                {
                                     error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                 }
                             }
@@ -290,30 +508,35 @@ impl BackgroundExecutor {
                 let permission_profile = payload["permission_profile"].as_str().map(String::from);
                 let skill_ref = payload["skill_ref"].as_str().map(String::from);
                 let skill_role = payload["skill_role"].as_str().map(String::from);
-                let skill_snapshot_hash =
-                    payload["skill_snapshot_hash"].as_str().map(String::from);
+                let skill_snapshot_hash = payload["skill_snapshot_hash"].as_str().map(String::from);
                 let requested_mcp_server_ids: Vec<String> =
                     serde_json::from_value(payload["requested_mcp_server_ids"].clone())
                         .unwrap_or_default();
+                let mcp_resolution = crate::mcp::resolve_mcp_servers(
+                    &requested_mcp_server_ids,
+                    backend_profile_id.as_deref(),
+                    &provider,
+                );
+                let requested_mcp_extensions_json =
+                    serde_json::to_string(&mcp_resolution.report.requested_extensions)?;
+                let predicted_mcp_extensions_json =
+                    serde_json::to_string(&mcp_resolution.report.predicted_effective_extensions)?;
+                let predicted_mcp_runtime_ids_json =
+                    serde_json::to_string(&mcp_resolution.report.predicted_effective_runtime_ids)?;
+                let denied_mcp_extensions_json =
+                    serde_json::to_string(&mcp_resolution.report.denied_extensions)?;
+                let mcp_blocking_issues_json =
+                    serde_json::to_string(&mcp_resolution.report.blocking_issues)?;
                 let output_contract = payload["output_contract"].as_str().map(String::from);
                 let max_turns = payload["max_turns"].as_i64();
                 let temperature = payload["temperature"].as_f64();
-                let worktree_write_enabled = payload["worktree_write_enabled"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let worktree_strategy = payload["worktree_strategy"]
-                    .as_str()
-                    .map(String::from);
-                let session_reuse_scope = payload["session_reuse_scope"]
-                    .as_str()
-                    .map(String::from);
-                let session_family_id = payload["session_family_id"]
-                    .as_str()
-                    .map(String::from);
-                let declared_outputs: Vec<DeclaredOutput> = serde_json::from_value(
-                    payload["declared_outputs"].clone(),
-                )
-                .unwrap_or_default();
+                let worktree_write_enabled =
+                    payload["worktree_write_enabled"].as_bool().unwrap_or(false);
+                let worktree_strategy = payload["worktree_strategy"].as_str().map(String::from);
+                let session_reuse_scope = payload["session_reuse_scope"].as_str().map(String::from);
+                let session_family_id = payload["session_family_id"].as_str().map(String::from);
+                let declared_outputs: Vec<DeclaredOutput> =
+                    serde_json::from_value(payload["declared_outputs"].clone()).unwrap_or_default();
                 let expected_output_paths: Vec<String> = declared_outputs
                     .iter()
                     .flat_map(|declared| {
@@ -385,11 +608,12 @@ impl BackgroundExecutor {
                     }),
                 };
 
-                let mut policy_decision: Option<SessionPolicyDecision> = if session_reuse_scope.is_some() {
-                    Some(ensure_policy(&self.pool, policy_input.clone()).await?)
-                } else {
-                    None
-                };
+                let mut policy_decision: Option<SessionPolicyDecision> =
+                    if session_reuse_scope.is_some() {
+                        Some(ensure_policy(&self.pool, policy_input.clone()).await?)
+                    } else {
+                        None
+                    };
                 if let Some(decision) = policy_decision.as_ref() {
                     if decision.should_reuse_live_session
                         && !self
@@ -489,8 +713,125 @@ impl BackgroundExecutor {
                     session_reset_reason: policy_decision
                         .as_ref()
                         .and_then(|decision| decision.session_reset_reason.clone()),
+                    backend_profile_id: backend_profile_id.clone(),
+                    requested_mcp_extensions_json: Some(requested_mcp_extensions_json.clone()),
+                    predicted_mcp_extensions_json: Some(predicted_mcp_extensions_json.clone()),
+                    predicted_mcp_runtime_ids_json: Some(predicted_mcp_runtime_ids_json.clone()),
+                    actual_mcp_extensions_json: None,
+                    actual_mcp_runtime_ids_json: None,
+                    denied_mcp_extensions_json: Some(denied_mcp_extensions_json.clone()),
+                    mcp_blocking_issues_json: Some(mcp_blocking_issues_json.clone()),
+                    actual_mcp_observation_json: None,
+                    mcp_session_startup_latency_ms: None,
                 };
                 agent_executions::insert(&self.pool, &agent_exec).await?;
+
+                if !mcp_resolution.report.blocking_issues.is_empty() {
+                    let completed_at = chrono::Utc::now();
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        completed_at,
+                    )
+                    .await?;
+                    let blocked_actual_extensions_json = "[]".to_string();
+                    let blocked_actual_runtime_ids_json = "[]".to_string();
+                    let blocked_actual_observation_json = serde_json::to_string(
+                        &serde_json::json!({
+                            "source": "mcp_resolution_blocked_before_session_new",
+                            "trust_level": "authoritative_no_session",
+                            "actual_equals_predicted": false,
+                            "provider_session_id": serde_json::Value::Null,
+                            "actual_extensions": [],
+                            "actual_runtime_ids": [],
+                            "requested_extensions": mcp_resolution.report.requested_extensions.clone(),
+                            "predicted_extensions": mcp_resolution.report.predicted_effective_extensions.clone(),
+                            "predicted_runtime_ids": mcp_resolution.report.predicted_effective_runtime_ids.clone(),
+                            "denied_extensions": mcp_resolution.report.denied_extensions.clone(),
+                            "blocking_issues": mcp_resolution.report.blocking_issues.clone(),
+                            "notes": [
+                                "ACP session/new was not attempted because MCP resolution failed closed before runtime startup."
+                            ],
+                        }),
+                    )?;
+                    agent_executions::update_mcp_actual(
+                        &self.pool,
+                        agent_exec_id,
+                        Some(&blocked_actual_extensions_json),
+                        Some(&blocked_actual_runtime_ids_json),
+                        Some(&blocked_actual_observation_json),
+                        None,
+                    )
+                    .await?;
+                    crate::recovery::persist_failed_stage_recovery_snapshot(
+                        &self.pool,
+                        stage_execution_id,
+                        completed_at,
+                    )
+                    .await?;
+                    let evidence_artifact =
+                        crate::evidence::build_and_persist_failed_stage_evidence(
+                            &self.pool,
+                            crate::evidence::FailedStageEvidenceInput {
+                                run: &run,
+                                stage_id: &stage_id,
+                                stage_execution_id,
+                                agent_id: &agent_id,
+                                agent_execution_id: agent_exec_id,
+                                provider: &provider,
+                                model: model.clone(),
+                                failed_at: completed_at,
+                            },
+                        )
+                        .await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::ArtifactCreated {
+                            run_id,
+                            artifact_id: evidence_artifact.id,
+                        });
+                    stages::settle(
+                        &self.pool,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        completed_at,
+                    )
+                    .await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "mcp_resolution_blocked".to_string(),
+                        });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Failed,
+                        });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run_id),
+                            None,
+                            serde_json::json!({ "run_id": run_id.to_string() }),
+                        )
+                        .await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        blocking_issues = ?mcp_resolution.report.blocking_issues,
+                        "InvokeAgent blocked before ACP startup by MCP resolution"
+                    );
+                    return Ok(());
+                }
 
                 if self.is_release_agent(&agent_id) {
                     // Native release path: bypass ACP entirely and execute the
@@ -539,17 +880,41 @@ impl BackgroundExecutor {
                     provider_session_id: policy_decision
                         .as_ref()
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
+                    mcp_servers: mcp_resolution.payloads,
                 };
                 // Runtime event: session starting
-                let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
-                    run_id,
-                    stage_id: stage_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: provider.clone(),
-                    event_kind: "session_started".to_string(),
-                });
+                let _ = self
+                    .events
+                    .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        event_kind: "session_started".to_string(),
+                    });
 
                 let result = self.acp.execute(req).await?;
+
+                if !requested_mcp_server_ids.is_empty() {
+                    let actual_mcp_extensions_json =
+                        serde_json::to_string(&result.actual_mcp_extensions)?;
+                    let actual_mcp_runtime_ids_json =
+                        serde_json::to_string(&result.actual_mcp_runtime_ids)?;
+                    let actual_mcp_observation_json = result
+                        .mcp_observation
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?;
+                    agent_executions::update_mcp_actual(
+                        &self.pool,
+                        agent_exec_id,
+                        Some(&actual_mcp_extensions_json),
+                        Some(&actual_mcp_runtime_ids_json),
+                        actual_mcp_observation_json.as_deref(),
+                        result.mcp_session_startup_latency_ms,
+                    )
+                    .await?;
+                }
 
                 if !declared_outputs.is_empty() {
                     materialize_declared_outputs_from_discovered_artifacts(
@@ -558,9 +923,10 @@ impl BackgroundExecutor {
                     )?;
                 }
 
-                if let (Some(decision), Some(provider_session_id)) =
-                    (policy_decision.as_ref(), result.provider_session_id.as_deref())
-                {
+                if let (Some(decision), Some(provider_session_id)) = (
+                    policy_decision.as_ref(),
+                    result.provider_session_id.as_deref(),
+                ) {
                     let actual_input_tokens = result
                         .usage
                         .as_ref()
@@ -578,10 +944,7 @@ impl BackgroundExecutor {
                             .usage
                             .as_ref()
                             .and_then(|usage| usage.cached_input_tokens),
-                        result
-                            .usage
-                            .as_ref()
-                            .and_then(|usage| usage.output_tokens),
+                        result.usage.as_ref().and_then(|usage| usage.output_tokens),
                         result
                             .usage
                             .as_ref()
@@ -603,13 +966,15 @@ impl BackgroundExecutor {
                     domain::agent::AgentStatus::Failed => "session_failed",
                     _ => "session_completed",
                 };
-                let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
-                    run_id,
-                    stage_id: stage_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: provider.clone(),
-                    event_kind: event_kind.to_string(),
-                });
+                let _ = self
+                    .events
+                    .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        run_id,
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        event_kind: event_kind.to_string(),
+                    });
 
                 let completed_at = chrono::Utc::now();
                 let mut persisted_paths = std::collections::HashSet::new();
@@ -664,20 +1029,48 @@ impl BackgroundExecutor {
                 let validation_summary = if declared_outputs.is_empty() {
                     None
                 } else {
-                    Some(validate_task_outputs(&load_declared_output_bytes(&declared_outputs)?))
+                    Some(validate_task_outputs(&load_declared_output_bytes(
+                        &declared_outputs,
+                    )?))
                 };
                 let validation_failed = validation_summary
                     .as_ref()
                     .and_then(|summary| summary.failure_class.as_ref())
                     .is_some();
-                let final_agent_status = if result.status == AgentStatus::Completed && !validation_failed {
-                    AgentStatus::Completed
-                } else {
-                    AgentStatus::Failed
-                };
+                let final_agent_status =
+                    if result.status == AgentStatus::Completed && !validation_failed {
+                        AgentStatus::Completed
+                    } else {
+                        AgentStatus::Failed
+                    };
 
                 if let Some(summary) = validation_summary {
                     if summary.failure_class.is_some() {
+                        let validation_failure_record = build_validation_failure_record(
+                            domain::ids::ArtifactId::new(),
+                            run_id,
+                            stage_id.clone(),
+                            stage_execution_id,
+                            agent_id.clone(),
+                            agent_exec_id,
+                            summary,
+                            persisted_artifacts
+                                .iter()
+                                .any(|artifact| artifact.name.contains("receipt")),
+                            std::path::Path::new(&format!(
+                                "{}/.chainworks/acp-stderr.log",
+                                run.workspace_root
+                            ))
+                            .exists(),
+                        )?;
+                        let validation_failure_json =
+                            serde_json::to_string_pretty(&validation_failure_record)?;
+                        stages::update_validation_failure_json(
+                            &self.pool,
+                            stage_execution_id,
+                            &validation_failure_json,
+                        )
+                        .await?;
                         let validation_artifact = self
                             .persist_validation_failure_artifact(
                                 &run,
@@ -687,23 +1080,7 @@ impl BackgroundExecutor {
                                 model.clone(),
                                 agent_exec_id,
                                 stage_execution_id,
-                                build_validation_failure_record(
-                                    domain::ids::ArtifactId::new(),
-                                    run_id,
-                                    stage_id.clone(),
-                                    stage_execution_id,
-                                    agent_id.clone(),
-                                    agent_exec_id,
-                                    summary,
-                                    persisted_artifacts
-                                        .iter()
-                                        .any(|artifact| artifact.name.contains("receipt")),
-                                    std::path::Path::new(&format!(
-                                        "{}/.chainworks/acp-stderr.log",
-                                        run.workspace_root
-                                    ))
-                                    .exists(),
-                                )?,
+                                validation_failure_record,
                             )
                             .await?;
                         persisted_artifacts.push(validation_artifact);
@@ -717,6 +1094,36 @@ impl BackgroundExecutor {
                     completed_at,
                 )
                 .await?;
+
+                if final_agent_status == AgentStatus::Failed {
+                    crate::recovery::persist_failed_stage_recovery_snapshot(
+                        &self.pool,
+                        stage_execution_id,
+                        completed_at,
+                    )
+                    .await?;
+                    let evidence_artifact =
+                        crate::evidence::build_and_persist_failed_stage_evidence(
+                            &self.pool,
+                            crate::evidence::FailedStageEvidenceInput {
+                                run: &run,
+                                stage_id: &stage_id,
+                                stage_execution_id,
+                                agent_id: &agent_id,
+                                agent_execution_id: agent_exec_id,
+                                provider: &provider,
+                                model: model.clone(),
+                                failed_at: completed_at,
+                            },
+                        )
+                        .await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::ArtifactCreated {
+                            run_id,
+                            artifact_id: evidence_artifact.id,
+                        });
+                }
 
                 // Normalize artifacts: copy from artifact_root to canonical
                 // workspace paths defined in the YAML artifacts map.
@@ -770,11 +1177,13 @@ impl BackgroundExecutor {
                         completed_at,
                     )
                     .await?;
-                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
-                        run_id,
-                        stage_execution_id,
-                        status: settled_stage_status,
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: settled_stage_status,
+                        });
                 }
                 // Multi-task stage: the orchestrator will settle after all
                 // tasks complete (checked via work item completion count).
@@ -825,6 +1234,38 @@ impl BackgroundExecutor {
                 let run_id = self.extract_run_id(&item)?;
                 projections::rebuild_all_for_run(&self.pool, run_id).await?;
                 info!(run_id = %run_id, "RebuildProjection complete");
+            }
+
+            WorkItemKind::StewardAnalysis => {
+                let payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
+                let reason = payload["reason"].as_str().unwrap_or("manual").to_string();
+                let artifact_base = payload["artifact_base"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var("CHAINWORKS_META_ROOT")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .unwrap_or_else(|| PathBuf::from(".chainworks"));
+                let runtime_inputs = self
+                    .steward_runtime_inputs
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Steward runtime inputs are not configured"))?;
+                let steward_agent_executor = BackgroundStewardAgentExecutor {
+                    acp: self.acp.clone(),
+                    runtime_inputs: runtime_inputs.clone(),
+                };
+                crate::steward::service::run_steward_analysis_with_executor(
+                    &self.pool,
+                    runtime_inputs,
+                    crate::steward::StewardAnalysisRequest {
+                        reason,
+                        artifact_base,
+                    },
+                    Some(&steward_agent_executor),
+                )
+                .await?;
             }
         }
 
@@ -881,7 +1322,11 @@ impl BackgroundExecutor {
             let commit_message = format!("[{}] {} :: {}", run_id, idea_title, stage_id);
             let git_service = GitReleaseService;
             match git_service
-                .commit_and_push(&worktree_root, &delivery_config.target_branch, &commit_message)
+                .commit_and_push(
+                    &worktree_root,
+                    &delivery_config.target_branch,
+                    &commit_message,
+                )
                 .await
             {
                 Ok((manifest, receipt)) => {
@@ -907,13 +1352,15 @@ impl BackgroundExecutor {
                             &receipt,
                         )
                         .await?;
-                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
-                        run_id,
-                        stage_id: stage_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        event_kind: "session_completed".to_string(),
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_completed".to_string(),
+                        });
                     agent_executions::update_completed(
                         &self.pool,
                         agent_exec_id,
@@ -964,13 +1411,15 @@ impl BackgroundExecutor {
                         info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
                     }
 
-                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
-                        run_id,
-                        stage_id: stage_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        event_kind: "session_failed".to_string(),
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_failed".to_string(),
+                        });
                     agent_executions::update_completed(
                         &self.pool,
                         agent_exec_id,
@@ -980,11 +1429,13 @@ impl BackgroundExecutor {
                     .await?;
                     let settlement_kind = domain::stage::StageSettlementKind::Failed;
                     stages::settle(&self.pool, stage_execution_id, settlement_kind, now).await?;
-                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
-                        run_id,
-                        stage_execution_id,
-                        status: domain::stage::StageStatus::Failed,
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Failed,
+                        });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     info!(
                         run_id = %run_id,
@@ -996,10 +1447,12 @@ impl BackgroundExecutor {
                 }
             }
         } else {
-            let git_receipt: GitPushReceipt =
-                self.load_release_artifact(run_id, "git_push_receipt").await?;
-            let release_manifest: ReleaseManifest =
-                self.load_release_artifact(run_id, "release_manifest").await?;
+            let git_receipt: GitPushReceipt = self
+                .load_release_artifact(run_id, "git_push_receipt")
+                .await?;
+            let release_manifest: ReleaseManifest = self
+                .load_release_artifact(run_id, "release_manifest")
+                .await?;
             let publish_service = ConnectPublishService;
             match publish_service
                 .build_and_distribute(
@@ -1042,24 +1495,27 @@ impl BackgroundExecutor {
                         failure_stage: None,
                         failure_reason: None,
                     };
-                    let _ = self.persist_delivery_receipt_if_absent(
-                        &run,
-                        &delivery_config,
-                        &release_result,
-                        &idea_title,
-                        None,
-                        &stage_id,
-                        &provider,
-                        model.clone(),
-                    )
-                    .await?;
-                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
-                        run_id,
-                        stage_id: stage_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        event_kind: "session_completed".to_string(),
-                    });
+                    let _ = self
+                        .persist_delivery_receipt_if_absent(
+                            &run,
+                            &delivery_config,
+                            &release_result,
+                            &idea_title,
+                            None,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                        )
+                        .await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_completed".to_string(),
+                        });
                     agent_executions::update_completed(
                         &self.pool,
                         agent_exec_id,
@@ -1074,11 +1530,13 @@ impl BackgroundExecutor {
                         now,
                     )
                     .await?;
-                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
-                        run_id,
-                        stage_execution_id,
-                        status: domain::stage::StageStatus::Completed,
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Completed,
+                        });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     self.work_queue
                         .enqueue(
@@ -1122,13 +1580,15 @@ impl BackgroundExecutor {
                     {
                         info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
                     }
-                    let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
-                        run_id,
-                        stage_id: stage_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        event_kind: "session_failed".to_string(),
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_failed".to_string(),
+                        });
                     agent_executions::update_completed(
                         &self.pool,
                         agent_exec_id,
@@ -1143,11 +1603,13 @@ impl BackgroundExecutor {
                         now,
                     )
                     .await?;
-                    let _ = self.events.send(domain::events::DomainEvent::StageStatusChanged {
-                        run_id,
-                        stage_execution_id,
-                        status: domain::stage::StageStatus::Failed,
-                    });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Failed,
+                        });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     info!(
                         run_id = %run_id,
@@ -1169,7 +1631,8 @@ impl BackgroundExecutor {
             .delivery_configuration_json
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Release agent requires delivery_configuration_json"))?;
-        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Invalid delivery_configuration_json: {}", e))
+        serde_json::from_str(json)
+            .map_err(|e| anyhow::anyhow!("Invalid delivery_configuration_json: {}", e))
     }
 
     async fn persist_declared_output_artifacts(
@@ -1260,7 +1723,8 @@ impl BackgroundExecutor {
         let mut artifacts_out = Vec::new();
 
         for discovered in discovered_artifacts {
-            if discovered.source_path.is_some() || declared_names.contains(discovered.name.as_str()) {
+            if discovered.source_path.is_some() || declared_names.contains(discovered.name.as_str())
+            {
                 continue;
             }
 
@@ -1307,10 +1771,12 @@ impl BackgroundExecutor {
                 report_version: None,
             };
             artifacts::insert(&self.pool, &artifact).await?;
-            let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
+            let _ = self
+                .events
+                .send(domain::events::DomainEvent::ArtifactCreated {
+                    run_id: run.id,
+                    artifact_id: artifact.id,
+                });
             artifacts_out.push(artifact);
         }
 
@@ -1376,10 +1842,7 @@ impl BackgroundExecutor {
         if !artifact_path.is_file() {
             return Ok(None);
         }
-        let size_bytes = artifact_path
-            .metadata()
-            .ok()
-            .map(|meta| meta.len() as i64);
+        let size_bytes = artifact_path.metadata().ok().map(|meta| meta.len() as i64);
         let artifact = domain::artifact::Artifact {
             id: domain::ids::ArtifactId::new(),
             run_id,
@@ -1399,10 +1862,12 @@ impl BackgroundExecutor {
             report_version: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
-            run_id,
-            artifact_id: artifact.id,
-        });
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id,
+                artifact_id: artifact.id,
+            });
         Ok(Some(artifact))
     }
 
@@ -1427,7 +1892,10 @@ impl BackgroundExecutor {
         let checkpoint_id: domain::ids::ArtifactId = checkpoint_id_raw
             .parse()
             .map_err(|e| anyhow::anyhow!("parse checkpoint artifact id: {}", e))?;
-        if artifacts::find_by_id(&self.pool, checkpoint_id).await?.is_some() {
+        if artifacts::find_by_id(&self.pool, checkpoint_id)
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
 
@@ -1437,11 +1905,7 @@ impl BackgroundExecutor {
             .join(format!("{checkpoint_id}.json"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!(
-                    "create session checkpoint dir {}: {}",
-                    parent.display(),
-                    e
-                )
+                anyhow::anyhow!("create session checkpoint dir {}: {}", parent.display(), e)
             })?;
         }
 
@@ -1460,7 +1924,11 @@ impl BackgroundExecutor {
         });
         let bytes = serde_json::to_vec_pretty(&payload)?;
         std::fs::write(&path, &bytes).map_err(|e| {
-            anyhow::anyhow!("write session checkpoint artifact {}: {}", path.display(), e)
+            anyhow::anyhow!(
+                "write session checkpoint artifact {}: {}",
+                path.display(),
+                e
+            )
         })?;
 
         let artifact = domain::artifact::Artifact {
@@ -1482,10 +1950,12 @@ impl BackgroundExecutor {
             report_version: Some(1),
         };
         artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
-            run_id: run.id,
-            artifact_id: artifact.id,
-        });
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
         Ok(())
     }
 
@@ -1501,15 +1971,20 @@ impl BackgroundExecutor {
         record: domain::validation::ValidationFailureRecord,
     ) -> Result<domain::artifact::Artifact> {
         let artifact_name = format!("validation_failure_{}_{}", agent_id, record.id);
-        let path = std::path::Path::new(&run.artifact_root)
-            .join(format!("{artifact_name}.json"));
+        let path = std::path::Path::new(&run.artifact_root).join(format!("{artifact_name}.json"));
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("create validation artifact dir {}: {}", parent.display(), e))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("create validation artifact dir {}: {}", parent.display(), e)
+            })?;
         }
         let encoded = serde_json::to_string_pretty(&record)?;
-        std::fs::write(&path, encoded)
-            .map_err(|e| anyhow::anyhow!("write validation failure artifact {}: {}", path.display(), e))?;
+        std::fs::write(&path, encoded).map_err(|e| {
+            anyhow::anyhow!(
+                "write validation failure artifact {}: {}",
+                path.display(),
+                e
+            )
+        })?;
 
         let artifact = domain::artifact::Artifact {
             id: record.artifact_id,
@@ -1531,10 +2006,12 @@ impl BackgroundExecutor {
         };
         artifacts::insert(&self.pool, &artifact).await?;
         validation::insert(&self.pool, &record).await?;
-        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
-            run_id: run.id,
-            artifact_id: artifact.id,
-        });
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
         Ok(artifact)
     }
 
@@ -1548,7 +2025,11 @@ impl BackgroundExecutor {
             .into_iter()
             .rev()
             .find(|artifact| artifact.name == name)
-            .ok_or_else(|| anyhow::anyhow!("ConnectPublishService requires git_push_receipt and release_manifest inputs."))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ConnectPublishService requires git_push_receipt and release_manifest inputs."
+                )
+            })?;
         let json = std::fs::read_to_string(&artifact.file_path)
             .map_err(|e| anyhow::anyhow!("read artifact {}: {}", artifact.file_path, e))?;
         serde_json::from_str(&json)
@@ -1593,10 +2074,12 @@ impl BackgroundExecutor {
             report_version: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
-            run_id: run.id,
-            artifact_id: artifact.id,
-        });
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
         Ok(path)
     }
 
@@ -1643,7 +2126,8 @@ impl BackgroundExecutor {
         if let (Some(workflow_yaml_path), Some(agent_catalog_yaml_path)) =
             (&run.workflow_yaml_path, &run.agent_catalog_yaml_path)
         {
-            if let Ok(plan) = workflow::compiler::compile(workflow_yaml_path, agent_catalog_yaml_path)
+            if let Ok(plan) =
+                workflow::compiler::compile(workflow_yaml_path, agent_catalog_yaml_path)
             {
                 if let Some(template) = plan.artifact_paths.get(name) {
                     return crate::orchestrator::resolve_path_template(
@@ -1690,7 +2174,9 @@ impl BackgroundExecutor {
                 &release_result,
                 &idea_title,
                 None,
-                run.current_state.as_deref().unwrap_or("state_12_finalization"),
+                run.current_state
+                    .as_deref()
+                    .unwrap_or("state_12_finalization"),
                 "system",
                 None,
             )
@@ -1776,7 +2262,11 @@ impl BackgroundExecutor {
         artifacts_by_run: &[domain::artifact::Artifact],
         name: &str,
     ) -> Result<Option<T>> {
-        let artifact = match artifacts_by_run.iter().rev().find(|artifact| artifact.name == name) {
+        let artifact = match artifacts_by_run
+            .iter()
+            .rev()
+            .find(|artifact| artifact.name == name)
+        {
             Some(artifact) => artifact,
             None => return Ok(None),
         };
@@ -1884,6 +2374,9 @@ mod tests {
             std::fs::read_to_string(machine_path).unwrap(),
             r#"{"status":"green"}"#
         );
-        assert_eq!(std::fs::read_to_string(companion_path).unwrap(), "# Review\n");
+        assert_eq!(
+            std::fs::read_to_string(companion_path).unwrap(),
+            "# Review\n"
+        );
     }
 }

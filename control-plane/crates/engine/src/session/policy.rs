@@ -42,27 +42,28 @@ pub async fn ensure_policy(
         .clone()
         .unwrap_or_else(|| input.agent_id.clone());
 
-    let lineage = match sessions::find_lineage_by_run_and_key(pool, &input.run_id, &lineage_key).await? {
-        Some(existing) => existing,
-        None => {
-            let lineage = SessionLineage {
-                id: uuid::Uuid::new_v4().to_string(),
-                run_id: input.run_id.clone(),
-                agent_id: input.agent_id.clone(),
-                lineage_id: lineage_key.clone(),
-                session_reuse_scope: input
-                    .session_reuse_scope
-                    .clone()
-                    .unwrap_or_else(|| "none".into()),
-                session_family_id: input.session_family_id.clone(),
-                active_generation_id: None,
-                created_at: Utc::now(),
-                closed_at: None,
-            };
-            sessions::insert_lineage(pool, &lineage).await?;
-            lineage
-        }
-    };
+    let lineage =
+        match sessions::find_lineage_by_run_and_key(pool, &input.run_id, &lineage_key).await? {
+            Some(existing) => existing,
+            None => {
+                let lineage = SessionLineage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    run_id: input.run_id.clone(),
+                    agent_id: input.agent_id.clone(),
+                    lineage_id: lineage_key.clone(),
+                    session_reuse_scope: input
+                        .session_reuse_scope
+                        .clone()
+                        .unwrap_or_else(|| "none".into()),
+                    session_family_id: input.session_family_id.clone(),
+                    active_generation_id: None,
+                    created_at: Utc::now(),
+                    closed_at: None,
+                };
+                sessions::insert_lineage(pool, &lineage).await?;
+                lineage
+            }
+        };
 
     let active = sessions::find_active_generation(pool, &lineage.id).await?;
     let generations = sessions::list_generations_for_lineage(pool, &lineage.id).await?;
@@ -269,14 +270,16 @@ async fn budget_signals_from_generation(
     );
     let transcript_growth_ratio =
         Some(generation.estimated_input_tokens as f64 / fresh_baseline_estimate as f64);
-    let cached_token_share = generation.latest_cached_input_tokens.and_then(|cached_tokens| {
-        (generation.estimated_input_tokens > 0)
-            .then_some(cached_tokens as f64 / generation.estimated_input_tokens as f64)
-    });
+    let cached_token_share = generation
+        .latest_cached_input_tokens
+        .and_then(|cached_tokens| {
+            (generation.estimated_input_tokens > 0)
+                .then_some(cached_tokens as f64 / generation.estimated_input_tokens as f64)
+        });
     let normalized_savings_versus_fresh = cached_token_share.map(|cache_share| {
         let fresh_cost_cents = fresh_baseline_estimate as f64 / 1000.0;
-        let reuse_cost_cents = generation.estimated_input_tokens as f64 / 1000.0
-            * (1.0 - cache_share * 0.5);
+        let reuse_cost_cents =
+            generation.estimated_input_tokens as f64 / 1000.0 * (1.0 - cache_share * 0.5);
         fresh_cost_cents - reuse_cost_cents
     });
     let compaction_churn_count =
@@ -294,9 +297,9 @@ async fn budget_signals_from_generation(
         transcript_growth_ratio,
         cached_token_share,
         normalized_savings_versus_fresh,
-        effective_prompt_size_fraction: generation
-            .latest_model_context_window
-            .and_then(|window| (window > 0).then_some(generation.estimated_input_tokens as f64 / window as f64)),
+        effective_prompt_size_fraction: generation.latest_model_context_window.and_then(|window| {
+            (window > 0).then_some(generation.estimated_input_tokens as f64 / window as f64)
+        }),
         compaction_churn_count,
     }
 }
@@ -314,14 +317,10 @@ fn map_last_generation_state(
     }
 
     match generation.end_reason.as_deref() {
-        Some(reason)
-            if checkpoint_artifact_id_from_end_reason(reason).is_some() =>
-        {
-            (
-                SessionReuseDisposition::ReusedAfterResume,
-                checkpoint_artifact_id_from_end_reason(reason),
-            )
-        }
+        Some(reason) if checkpoint_artifact_id_from_end_reason(reason).is_some() => (
+            SessionReuseDisposition::ReusedAfterResume,
+            checkpoint_artifact_id_from_end_reason(reason),
+        ),
         Some(reason) if reason.contains("budget") || reason.contains("cost") => {
             (SessionReuseDisposition::FreshAfterBudget, None)
         }
@@ -450,12 +449,16 @@ mod tests {
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{IdeaId, RunId};
     use domain::run::{Run, RunStatus};
-    use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition};
+    use domain::session::{
+        SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition,
+    };
 
     use super::{ensure_policy, SessionPolicyInput};
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+        create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool failed")
     }
 
     async fn seed_run(pool: &sqlx::SqlitePool) {
@@ -467,6 +470,7 @@ mod tests {
                 title: "Policy idea".into(),
                 body: "body".into(),
                 workspace_root_path: None,
+                project_key: None,
                 status: IdeaStatus::Active,
                 created_at: Utc::now(),
                 archived_at: None,
@@ -499,6 +503,17 @@ mod tests {
                 base_revision: None,
                 target_branch: None,
                 delivery_configuration_json: None,
+                delivery_preflight_json: None,
+                workflow_family: None,
+                project_key: None,
+                risk_class: None,
+                stack: None,
+                workflow_snapshot_hash: None,
+                catalog_snapshot_hash: None,
+                workflow_snapshot_json: None,
+                catalog_snapshot_json: None,
+                drift_detected_at: None,
+                drift_details_json: None,
             },
         )
         .await
@@ -632,7 +647,10 @@ mod tests {
         .unwrap();
 
         let decision = ensure_policy(&pool, base_input()).await.unwrap();
-        assert_eq!(decision.disposition, SessionReuseDisposition::FreshAfterReset);
+        assert_eq!(
+            decision.disposition,
+            SessionReuseDisposition::FreshAfterReset
+        );
         assert_eq!(decision.generation.generation, 2);
     }
 
@@ -689,7 +707,10 @@ mod tests {
         input.session_family_id = None;
 
         let decision = ensure_policy(&pool, input).await.unwrap();
-        assert_eq!(decision.disposition, SessionReuseDisposition::FreshSessionRequired);
+        assert_eq!(
+            decision.disposition,
+            SessionReuseDisposition::FreshSessionRequired
+        );
         assert_eq!(decision.generation.generation, 2);
     }
 
@@ -824,7 +845,10 @@ mod tests {
         .unwrap();
 
         let decision = ensure_policy(&pool, base_input()).await.unwrap();
-        assert_eq!(decision.disposition, SessionReuseDisposition::ReusedAfterResume);
+        assert_eq!(
+            decision.disposition,
+            SessionReuseDisposition::ReusedAfterResume
+        );
         assert_eq!(
             decision
                 .generation

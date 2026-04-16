@@ -168,14 +168,12 @@ pub async fn set_active_generation(
     lineage_id: &str,
     generation_id: Option<&str>,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_lineages SET active_generation_id = ?1 WHERE id = ?2"#,
-    )
-    .bind(generation_id)
-    .bind(lineage_id)
-    .execute(pool)
-    .await
-    .context("set active generation on lineage")?;
+    sqlx::query(r#"UPDATE session_lineages SET active_generation_id = ?1 WHERE id = ?2"#)
+        .bind(generation_id)
+        .bind(lineage_id)
+        .execute(pool)
+        .await
+        .context("set active generation on lineage")?;
     Ok(())
 }
 

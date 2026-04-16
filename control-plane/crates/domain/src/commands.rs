@@ -10,6 +10,7 @@ pub enum Command {
     RetryStage(RetryStageCmd),
     CancelRun(CancelRunCmd),
     ResetSession(ResetSessionCmd),
+    RunStewardAnalysis(RunStewardAnalysisCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +59,71 @@ pub struct CancelRunCmd {
 pub struct ResetSessionCmd {
     pub run_id: RunId,
     pub stage_id: String,
+}
+
+// ── P029: Caller identity for audit journaling ──────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallerSurface {
+    Mcp,
+    Graphql,
+}
+
+impl std::fmt::Display for CallerSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallerSurface::Mcp => write!(f, "mcp"),
+            CallerSurface::Graphql => write!(f, "graphql"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallerContext {
+    pub surface: CallerSurface,
+    pub principal_id: String,
+    pub principal_class: String,
+    pub caller_tool: String,
+}
+
+impl CallerContext {
+    pub fn mcp(principal_id: &str, principal_class: &str, tool_name: &str) -> Self {
+        CallerContext {
+            surface: CallerSurface::Mcp,
+            principal_id: principal_id.to_string(),
+            principal_class: principal_class.to_string(),
+            caller_tool: tool_name.to_string(),
+        }
+    }
+
+    pub fn graphql(principal_id: &str, principal_class: &str, mutation_name: &str) -> Self {
+        CallerContext {
+            surface: CallerSurface::Graphql,
+            principal_id: principal_id.to_string(),
+            principal_class: principal_class.to_string(),
+            caller_tool: mutation_name.to_string(),
+        }
+    }
+
+    /// Test/fixture stand-in. Tags rows as caller_surface='mcp' with a
+    /// synthetic operator principal. Plain pub fn (not cfg(test)) because
+    /// integration tests in engine/tests/, graphql-server/tests/, and
+    /// daemon/tests/ are separate crates.
+    pub fn test_fixture() -> Self {
+        CallerContext {
+            surface: CallerSurface::Mcp,
+            principal_id: "test-operator".to_string(),
+            principal_class: "operator".to_string(),
+            caller_tool: "test".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunStewardAnalysisCmd {
+    pub reason: String,
+    pub artifact_base: Option<String>,
 }
 
 #[cfg(test)]

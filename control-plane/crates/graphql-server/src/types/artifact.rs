@@ -1,8 +1,8 @@
 use async_graphql::*;
-use domain::artifact::Artifact;
-use domain::validation::ValidationFailureRecord;
 use db::repos::projections::ArtifactIndexRow;
 use db::repos::validation;
+use domain::artifact::Artifact;
+use domain::validation::ValidationFailureRecord;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 

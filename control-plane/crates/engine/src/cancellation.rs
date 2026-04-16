@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use acp::AcpRuntimeManager;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -97,10 +97,7 @@ async fn finalize_settlement(
         return Ok(());
     }
 
-    let log = run
-        .cancellation_settlement_log
-        .as_deref()
-        .unwrap_or("[]");
+    let log = run.cancellation_settlement_log.as_deref().unwrap_or("[]");
     let mut entries: Vec<CancellationSettlementEntry> =
         serde_json::from_str(log).context("parse cancellation settlement log")?;
     let executions = agent_executions::list_by_run(pool, run_id).await?;

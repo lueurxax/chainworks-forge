@@ -32,7 +32,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "properties": {
                     "title": { "type": "string", "description": "Idea title" },
                     "body": { "type": "string", "description": "Idea body / description" },
-                    "workspace_root_path": { "type": "string", "description": "Optional workspace root path" }
+                    "workspace_root_path": { "type": "string", "description": "Optional workspace root path" },
+                    "project_key": { "type": "string", "description": "Optional stable project cohort key" }
                 }
             }),
         },
@@ -63,12 +64,14 @@ pub async fn execute(
             let workspace_root_path = params["workspace_root_path"]
                 .as_str()
                 .map(|s| s.to_string());
+            let project_key = params["project_key"].as_str().map(|s| s.to_string());
 
             let idea = Idea {
                 id: IdeaId::new(),
                 title,
                 body,
                 workspace_root_path,
+                project_key,
                 status: IdeaStatus::Draft,
                 created_at: chrono::Utc::now(),
                 archived_at: None,

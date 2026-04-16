@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{artifacts, validation};
+use db::repos::{agent_executions, artifacts, validation};
 use domain::artifact::Artifact;
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
@@ -42,12 +42,63 @@ pub async fn execute(
                     reports.push(artifact_report_json(pool, &artifact).await?);
                 }
             }
+            reports.push(serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "run_id": run_id.to_string(),
+                "stage_id": "__run__",
+                "agent_id": "system",
+                "name": "mcp_execution_truth",
+                "contract_id": "mcp_execution_truth",
+                "format": "json",
+                "file_path": "",
+                "checksum_sha256": serde_json::Value::Null,
+                "size_bytes": serde_json::Value::Null,
+                "provider": "system",
+                "model": serde_json::Value::Null,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "is_pinned": false,
+                "report_kind": "mcp_execution_truth",
+                "report_version": 1,
+                "agent_executions": execution_mcp_truth_json(pool, run_id).await?,
+            }));
 
             Ok(serde_json::Value::Array(reports))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }
+}
+
+pub(crate) async fn execution_mcp_truth_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let executions = agent_executions::list_by_run(pool, run_id).await?;
+    Ok(serde_json::Value::Array(
+        executions
+            .into_iter()
+            .map(|execution| {
+                serde_json::json!({
+                    "agent_execution_id": execution.id.to_string(),
+                    "stage_execution_id": execution.stage_execution_id.to_string(),
+                    "agent_id": execution.agent_id,
+                    "provider": execution.provider,
+                    "model": execution.model,
+                    "status": execution.status.to_string(),
+                    "backend_profile_id": execution.backend_profile_id,
+                    "requested_mcp_extensions_json": execution.requested_mcp_extensions_json,
+                    "predicted_mcp_extensions_json": execution.predicted_mcp_extensions_json,
+                    "predicted_mcp_runtime_ids_json": execution.predicted_mcp_runtime_ids_json,
+                    "actual_mcp_extensions_json": execution.actual_mcp_extensions_json,
+                    "actual_mcp_runtime_ids_json": execution.actual_mcp_runtime_ids_json,
+                    "denied_mcp_extensions_json": execution.denied_mcp_extensions_json,
+                    "mcp_blocking_issues_json": execution.mcp_blocking_issues_json,
+                    "actual_mcp_observation_json": execution.actual_mcp_observation_json,
+                    "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
+                })
+            })
+            .collect(),
+    ))
 }
 
 fn is_release_report_artifact(name: &str) -> bool {
@@ -85,7 +136,21 @@ pub(crate) async fn artifact_report_json(
                 );
             }
         } else if let serde_json::Value::Object(ref mut map) = value {
-            map.insert("validation_failure_record".to_string(), serde_json::Value::Null);
+            map.insert(
+                "validation_failure_record".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+    }
+    if artifact.report_kind.as_deref() == Some("failed_stage_evidence") {
+        let payload = std::fs::read_to_string(&artifact.file_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "failed_stage_evidence".to_string(),
+                payload.unwrap_or(serde_json::Value::Null),
+            );
         }
     }
 
@@ -240,6 +305,7 @@ mod tests {
             title: "Test idea".into(),
             body: "body".into(),
             workspace_root_path: None,
+            project_key: None,
             status: IdeaStatus::Active,
             created_at: Utc::now(),
             archived_at: None,
@@ -330,7 +396,9 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+        create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool failed")
     }
 
     async fn seed_validation_attempt(
@@ -356,6 +424,10 @@ mod tests {
                 provider: Some("system".to_string()),
                 model: None,
                 stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
             },
         )
         .await
@@ -380,6 +452,18 @@ mod tests {
                 session_family_id: None,
                 session_reuse_disposition: Some("reused".into()),
                 session_reset_reason: Some("operator_reset".into()),
+                backend_profile_id: Some("codex_with_mcp".into()),
+                requested_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+                predicted_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+                predicted_mcp_runtime_ids_json: Some(r#"["fs-runtime"]"#.into()),
+                actual_mcp_extensions_json: Some(r#"["filesystem"]"#.into()),
+                actual_mcp_runtime_ids_json: Some(r#"["fs-runtime"]"#.into()),
+                denied_mcp_extensions_json: Some("[]".into()),
+                mcp_blocking_issues_json: Some("[]".into()),
+                actual_mcp_observation_json: Some(
+                    r#"{"source":"provider_session_new_response"}"#.into(),
+                ),
+                mcp_session_startup_latency_ms: Some(17),
             },
         )
         .await
@@ -418,6 +502,17 @@ mod tests {
                 "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
                     .into(),
             ),
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         }
     }
 
@@ -448,7 +543,9 @@ mod tests {
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
 
         artifacts::insert(&pool, &make_artifact(run_id, "release_manifest", None))
             .await
@@ -477,10 +574,7 @@ mod tests {
         .unwrap();
 
         let reports: Vec<Artifact> = serde_json::from_value(result).unwrap();
-        let names: Vec<String> = reports
-            .into_iter()
-            .map(|artifact| artifact.name)
-            .collect();
+        let names: Vec<String> = reports.into_iter().map(|artifact| artifact.name).collect();
 
         assert!(names.contains(&"release_manifest".to_string()));
         assert!(names.contains(&"delivery_receipt".to_string()));
@@ -494,7 +588,9 @@ mod tests {
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
 
         let payload = validation_failure_payload(run_id);
         let payload_path = std::env::temp_dir().join(format!("validation-failure-{}.json", run_id));
@@ -522,15 +618,10 @@ mod tests {
         artifacts::insert(&pool, &artifact).await.unwrap();
         validation::insert(
             &pool,
-            &validation_failure_record(
-                artifact.id,
-                run_id,
-                stage_execution_id,
-                agent_execution_id,
-            ),
+            &validation_failure_record(artifact.id, run_id, stage_execution_id, agent_execution_id),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let handler = make_command_handler(pool.clone());
         let result = execute(
@@ -563,6 +654,121 @@ mod tests {
         assert_eq!(
             validation_failure["validation_failure_record"]["sessionResetReason"],
             serde_json::json!("operator_reset")
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_mcp_resolution_truth_tests() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        seed_validation_attempt(&pool, run_id).await;
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let execution = &mcp_truth["agent_executions"][0];
+
+        assert_eq!(
+            execution["backend_profile_id"],
+            serde_json::json!("codex_with_mcp")
+        );
+        assert_eq!(
+            execution["requested_mcp_extensions_json"],
+            serde_json::json!(r#"["filesystem"]"#)
+        );
+        assert_eq!(
+            execution["actual_mcp_runtime_ids_json"],
+            serde_json::json!(r#"["fs-runtime"]"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_failed_stage_evidence_contract_tests() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let payload_path =
+            std::env::temp_dir().join(format!("failed-stage-evidence-{run_id}.json"));
+        std::fs::write(
+            &payload_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "report_kind": "failed_stage_evidence",
+                "run_id": run_id.to_string(),
+                "stage_id": "stage_1",
+                "failure_summary": "failed",
+                "recovery_snapshot": { "status": "available" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "stage_1".into(),
+                agent_id: "agent_1".into(),
+                name: "failed_stage_evidence_stage_1".into(),
+                contract_id: "failed_stage_evidence".into(),
+                format: ArtifactFormat::Json,
+                file_path: payload_path.to_string_lossy().to_string(),
+                checksum_sha256: None,
+                size_bytes: None,
+                provider: "system".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("failed_stage_evidence".into()),
+                report_version: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+        )
+        .await
+        .unwrap();
+        let reports = result.as_array().expect("reports array");
+        let evidence = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("failed_stage_evidence"))
+            .expect("failed-stage evidence report");
+
+        assert_eq!(
+            evidence["failed_stage_evidence"]["report_kind"],
+            serde_json::json!("failed_stage_evidence")
+        );
+        assert_eq!(
+            evidence["failed_stage_evidence"]["recovery_snapshot"]["status"],
+            serde_json::json!("available")
         );
     }
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::{projections, runs};
-use domain::commands::{CancelRunCmd, Command, StartRunCmd};
+use domain::commands::{CallerContext, CancelRunCmd, Command, StartRunCmd};
 use domain::ids::{IdeaId, RunId};
 use engine::command_handler::CommandHandler;
 
@@ -66,6 +66,7 @@ pub async fn execute(
     params: serde_json::Value,
     pool: &SqlitePool,
     cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     match tool_name {
         "runs.start" => {
@@ -102,6 +103,8 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
 
+            let caller =
+                CallerContext::mcp(&principal.id, &principal.class.to_string(), "runs.start");
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
                 workflow_id,
@@ -112,15 +115,32 @@ pub async fn execute(
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
             });
-            let result = cmd_handler.handle(cmd).await?;
-            let run_id = match result {
-                engine::command_handler::CommandResult::RunStarted { run_id } => run_id,
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            let run_id = match &commanded.result {
+                engine::command_handler::CommandResult::RunStarted { run_id } => *run_id,
+                engine::command_handler::CommandResult::StartRunBlockedByDeliveryPreflight(
+                    blocked,
+                ) => {
+                    return Ok(serde_json::json!({
+                        "blocked": true,
+                        "reason": "delivery_preflight_failed",
+                        "delivery_preflight": blocked.delivery_preflight,
+                        "journal_id": commanded.journal_id,
+                    }));
+                }
                 _ => return Err(anyhow::anyhow!("Unexpected result")),
             };
             let run = runs::find_by_id(pool, run_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Run not found"))?;
-            Ok(serde_json::to_value(&run)?)
+            let mut value = serde_json::to_value(&run)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "journal_id".to_string(),
+                    serde_json::Value::String(commanded.journal_id),
+                );
+            }
+            Ok(value)
         }
 
         "runs.get" => {
@@ -142,9 +162,14 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
+            let caller =
+                CallerContext::mcp(&principal.id, &principal.class.to_string(), "runs.cancel");
             let cmd = Command::CancelRun(CancelRunCmd { run_id });
-            cmd_handler.handle(cmd).await?;
-            Ok(serde_json::json!({ "cancelled": true }))
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            Ok(serde_json::json!({
+                "cancelled": true,
+                "journal_id": commanded.journal_id,
+            }))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
@@ -169,6 +194,7 @@ mod tests {
             title: "Test idea".into(),
             body: "body".into(),
             workspace_root_path: None,
+            project_key: None,
             status: IdeaStatus::Active,
             created_at: Utc::now(),
             archived_at: None,
@@ -176,7 +202,9 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+        create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool failed")
     }
 
     fn make_run(id: RunId, idea_id: IdeaId) -> Run {
@@ -204,6 +232,17 @@ mod tests {
                 "{\"repo_identifier\":\"repo-3\",\"repo_root\":\"/repo-3\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
                     .into(),
             ),
+            delivery_preflight_json: Some(r#"{"passed":true,"checks":[{"id":"repo_root_exists","passed":true}]}"#.into()),
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         }
     }
 
@@ -227,6 +266,13 @@ mod tests {
         CommandHandler::new(pool, events, work_queue)
     }
 
+    fn test_principal() -> auth::Principal {
+        auth::Principal {
+            id: "test-operator".into(),
+            class: auth::PrincipalClass::Operator,
+        }
+    }
+
     #[tokio::test]
     async fn runs_start_persists_delivery_configuration_json() {
         let pool = test_pool().await;
@@ -234,6 +280,18 @@ mod tests {
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
         let handler = make_command_handler(pool.clone());
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init should run");
+        let worktrees = tempfile::tempdir().unwrap();
+        let delivery_json = format!(
+            r#"{{"repo_identifier":"repo-1","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
+            repo.path().display(),
+            worktrees.path().display()
+        );
         let params = serde_json::json!({
             "idea_id": idea_id.to_string(),
             "workflow_id": "wf-start",
@@ -242,23 +300,19 @@ mod tests {
             "artifact_root": "/tmp/art",
             "workflow_yaml_path": test_workflow_yaml_path(),
             "agent_catalog_yaml_path": test_agent_catalog_yaml_path(),
-            "delivery_configuration_json": "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
+            "delivery_configuration_json": delivery_json
         });
 
-        let result = execute("runs.start", params, &pool, &handler).await.unwrap();
+        let result = execute("runs.start", params, &pool, &handler, &test_principal())
+            .await
+            .unwrap();
         let run_id = result["id"].as_str().expect("run id");
         let run = runs::find_by_id(&pool, run_id.parse().unwrap())
             .await
             .unwrap()
             .unwrap();
 
-        assert_eq!(
-            run.delivery_configuration_json,
-            Some(
-                "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
-                    .to_string()
-            )
-        );
+        assert_eq!(run.delivery_configuration_json, Some(delivery_json));
     }
 
     #[tokio::test]
@@ -292,6 +346,7 @@ mod tests {
             serde_json::json!({ "run_id": run.id.to_string() }),
             &pool,
             &handler,
+            &test_principal(),
         )
         .await
         .unwrap();
@@ -312,6 +367,31 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_preflight_mcp_readback_tests() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run = make_run(RunId::new(), idea_id);
+        runs::insert(&pool, &run).await.unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "runs.get",
+            serde_json::json!({ "run_id": run.id.to_string() }),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result["delivery_preflight_json"]
+            .as_str()
+            .unwrap()
+            .contains("repo_root_exists"));
     }
 
     #[tokio::test]
@@ -348,12 +428,20 @@ mod tests {
             ..make_run(RunId::new(), idea_id)
         };
         runs::insert(&pool, &run).await.unwrap();
-        db::repos::projections::rebuild_all_for_run(&pool, run.id).await.unwrap();
-
-        let handler = make_command_handler(pool.clone());
-        let result = execute("runs.list", serde_json::json!({}), &pool, &handler)
+        db::repos::projections::rebuild_all_for_run(&pool, run.id)
             .await
             .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "runs.list",
+            serde_json::json!({}),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
 
         let item = result.as_array().unwrap().first().unwrap();
         assert_eq!(

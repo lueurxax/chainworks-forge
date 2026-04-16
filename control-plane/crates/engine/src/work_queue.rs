@@ -2,10 +2,10 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
-use db::repos::work_items;
-use domain::ids::RunId;
 use chrono::Utc;
+use db::repos::work_items;
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use domain::ids::RunId;
 
 #[derive(Clone)]
 pub struct WorkQueue {

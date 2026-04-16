@@ -27,8 +27,7 @@ async fn main() -> Result<()> {
     // 2. Read config from env
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://./chainworks-control-plane.db".to_string());
-    let graphql_addr = std::env::var("GRAPHQL_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:4000".to_string());
+    let graphql_addr = std::env::var("GRAPHQL_ADDR").unwrap_or_else(|_| "0.0.0.0:4000".to_string());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "daemon".to_string());
     info!(
         database_url = %database_url,
@@ -39,6 +38,26 @@ async fn main() -> Result<()> {
     // 3. Create SQLite pool (runs migrations)
     let pool = create_pool(&database_url).await?;
     info!("Database pool created and migrations applied");
+
+    let steward_config_path = std::env::var("STEWARD_CONFIG_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let steward_catalog_path = std::env::var("AGENT_CATALOG_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let steward_runtime_inputs = Arc::new(
+        daemon::steward_runtime::bootstrap_steward_runtime(
+            &pool,
+            steward_config_path.as_deref(),
+            steward_catalog_path.as_deref(),
+        )
+        .await?,
+    );
+    info!(
+        steward_config_hash = %steward_runtime_inputs.steward_config_hash,
+        agent_catalog_hash = %steward_runtime_inputs.agent_catalog_hash,
+        "Steward runtime config loaded"
+    );
 
     // 4. Create EventBus
     let events = new_bus(1024);
@@ -65,12 +84,13 @@ async fn main() -> Result<()> {
     ));
 
     // 9. Create BackgroundExecutor and start it
-    let executor = Arc::new(BackgroundExecutor::new(
+    let executor = Arc::new(BackgroundExecutor::new_with_steward_runtime_inputs(
         pool.clone(),
         work_queue.clone(),
         orchestrator.clone(),
         acp.clone(),
         events.clone(),
+        steward_runtime_inputs.clone(),
     ));
     let _executor_handle = executor.start();
     info!("BackgroundExecutor started");
@@ -85,18 +105,29 @@ async fn main() -> Result<()> {
         "Startup recovery complete"
     );
 
-    // 11. Mode dispatch
+    // 11. Load principal table (auto-bootstraps if missing)
+    let principals_path = std::path::Path::new("principals.json");
+    let principal_table = auth::PrincipalTable::load_or_bootstrap(principals_path)?;
+    info!("Principal table loaded from {}", principals_path.display());
+
+    // 12. Mode dispatch
     match mode.as_str() {
         "mcp" => {
             // Run McpServer::run_stdio() and exit
-            let mcp = mcp_server::server::McpServer::new(pool.clone(), cmd_handler.clone());
+            let mcp = mcp_server::server::McpServer::new(
+                pool.clone(),
+                cmd_handler.clone(),
+                principal_table,
+            );
             mcp.run_stdio().await?;
         }
         _ => {
             // Daemon mode: single process with GraphQL + MCP HTTP on the same port.
-            let mcp = std::sync::Arc::new(
-                mcp_server::server::McpServer::new(pool.clone(), cmd_handler.clone()),
-            );
+            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new(
+                pool.clone(),
+                cmd_handler.clone(),
+                principal_table,
+            ));
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
@@ -105,12 +136,8 @@ async fn main() -> Result<()> {
                 cmd_handler.clone(),
                 events.clone(),
             );
-            graphql_server::server::start_with_extra_routes(
-                schema,
-                &graphql_addr,
-                mcp_routes,
-            )
-            .await?;
+            graphql_server::server::start_with_extra_routes(schema, &graphql_addr, mcp_routes)
+                .await?;
         }
     }
 

@@ -89,18 +89,12 @@ pub fn evaluate(signals: &BudgetSignals, config: &BudgetConfig) -> BudgetDecisio
             reason: "effective_prompt_size_fraction exceeded 0.5".into(),
         };
     }
-    if signals.cached_token_share.unwrap_or(1.0) < 0.2
-        && signals.estimated_input_tokens > 50_000
-    {
+    if signals.cached_token_share.unwrap_or(1.0) < 0.2 && signals.estimated_input_tokens > 50_000 {
         return BudgetDecision::Compact {
             reason: "low_cached_token_share_with_large_prompt".into(),
         };
     }
-    if signals
-        .transcript_growth_ratio
-        .unwrap_or(1.0)
-        > config.max_transcript_growth_ratio
-    {
+    if signals.transcript_growth_ratio.unwrap_or(1.0) > config.max_transcript_growth_ratio {
         return BudgetDecision::Compact {
             reason: format!(
                 "transcript_growth_ratio {} exceeded {}",
@@ -109,11 +103,7 @@ pub fn evaluate(signals: &BudgetSignals, config: &BudgetConfig) -> BudgetDecisio
             ),
         };
     }
-    if signals
-        .normalized_savings_versus_fresh
-        .unwrap_or(0.0)
-        < -0.05
-    {
+    if signals.normalized_savings_versus_fresh.unwrap_or(0.0) < -0.05 {
         return BudgetDecision::Invalidate {
             reason: "normalized_savings_versus_fresh below -0.05".into(),
         };
@@ -208,6 +198,9 @@ mod tests {
 
     #[test]
     fn continues_when_all_budget_signals_have_headroom() {
-        assert_eq!(evaluate(&base_signals(), &default_config()), BudgetDecision::ContinueReuse);
+        assert_eq!(
+            evaluate(&base_signals(), &default_config()),
+            BudgetDecision::ContinueReuse
+        );
     }
 }

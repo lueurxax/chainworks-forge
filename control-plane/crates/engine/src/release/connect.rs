@@ -78,11 +78,7 @@ impl ConnectPublishService {
             .output()
         {
             Ok(output) if output.status.success() => None,
-            Ok(output) => Some(
-                String::from_utf8_lossy(&output.stderr)
-                    .trim()
-                    .to_string(),
-            ),
+            Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
             Err(err) => Some(err.to_string()),
         };
 
@@ -96,7 +92,9 @@ impl ConnectPublishService {
         let checksum = stable_checksum(&checksum_input);
         let size_bytes = directory_size(Path::new(worktree_root));
         let archive_path = Path::new(worktree_root).join(".build");
-        let archive_path = archive_path.exists().then(|| archive_path.to_string_lossy().into_owned());
+        let archive_path = archive_path
+            .exists()
+            .then(|| archive_path.to_string_lossy().into_owned());
 
         let bundle = ReleaseBundleManifest {
             bundle_identifier: format!("com.chainworks.forge.{}", release_mode),
@@ -117,7 +115,8 @@ impl ConnectPublishService {
             } else {
                 "success".to_string()
             },
-            failure_reason: build_warning.map(|warning| format!("Build completed with warnings: {warning}")),
+            failure_reason: build_warning
+                .map(|warning| format!("Build completed with warnings: {warning}")),
             timestamp: Utc::now(),
         };
 

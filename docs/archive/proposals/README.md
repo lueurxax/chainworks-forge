@@ -19,3 +19,4 @@ Archived proposal material is useful when you need:
 
 - [044/README.md](044/README.md) — original `P044` proposal draft, review pack, evidence pack, and audit rounds prior to conversion into stable reference documentation
 - [045/README.md](045/README.md) — original `P045` proposal draft, review pack, evidence pack, and audit rounds prior to conversion into stable reference documentation
+- [047/README.md](047/README.md) — original `P047` proposal draft, review pack, evidence pack, and audit rounds prior to conversion into stable reference documentation

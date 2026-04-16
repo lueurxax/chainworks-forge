@@ -2,7 +2,7 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::approvals;
-use domain::commands::{ApproveStageCmd, Command, RejectStageCmd};
+use domain::commands::{ApproveStageCmd, CallerContext, Command, RejectStageCmd};
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
 
@@ -44,6 +44,7 @@ pub async fn execute(
     params: serde_json::Value,
     pool: &SqlitePool,
     cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     match tool_name {
         "approvals.list" => {
@@ -65,6 +66,11 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
             let comment = params["comment"].as_str().map(|s| s.to_string());
 
+            let caller = CallerContext::mcp(
+                &principal.id,
+                &principal.class.to_string(),
+                "approvals.resolve",
+            );
             let cmd = match decision {
                 "granted" => Command::ApproveStage(ApproveStageCmd {
                     run_id,
@@ -79,8 +85,11 @@ pub async fn execute(
                 other => return Err(anyhow::anyhow!("Unknown decision: {other}")),
             };
 
-            cmd_handler.handle(cmd).await?;
-            Ok(serde_json::json!({ "resolved": true }))
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            Ok(serde_json::json!({
+                "resolved": true,
+                "journal_id": commanded.journal_id,
+            }))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),

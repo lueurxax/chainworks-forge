@@ -22,16 +22,15 @@ pub async fn start(schema: AppSchema, addr: &str) -> Result<()> {
 
 /// Start the GraphQL server with additional axum routes merged in.
 /// Used by the daemon to mount MCP HTTP transport on the same port.
-pub async fn start_with_extra_routes(
-    schema: AppSchema,
-    addr: &str,
-    extra: Router,
-) -> Result<()> {
+pub async fn start_with_extra_routes(schema: AppSchema, addr: &str, extra: Router) -> Result<()> {
     let graphql_service = GraphQL::new(schema.clone());
     let subscription_service = GraphQLSubscription::new(schema);
 
     let app = Router::new()
-        .route("/graphql", get(graphql_playground).post_service(graphql_service))
+        .route(
+            "/graphql",
+            get(graphql_playground).post_service(graphql_service),
+        )
         .route_service("/graphql/ws", subscription_service)
         .merge(extra);
 

@@ -25,7 +25,7 @@ use tokio::process::Child;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
-use crate::{DiscoveredArtifact, ExecutionRequest, UsageSnapshot};
+use crate::{DiscoveredArtifact, ExecutionRequest, McpActualObservation, UsageSnapshot};
 
 /// Strip ANSI escape sequences from a string for clean log output.
 fn strip_ansi(s: &str) -> String {
@@ -108,6 +108,37 @@ impl Default for AcpSessionConfig<'_> {
             config_options: Vec::new(),
         }
     }
+}
+
+pub fn build_session_new_params(
+    req: &ExecutionRequest,
+    config: &AcpSessionConfig<'_>,
+) -> Result<Value> {
+    let uses_worktree_cwd = req.worktree_write_enabled
+        || matches!(
+            req.worktree_strategy.as_deref(),
+            Some("dedicated") | Some("shared_implementation_worktree")
+        );
+    let effective_cwd = if uses_worktree_cwd {
+        req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
+    } else {
+        &req.workspace_root
+    };
+    let mut sn_params = serde_json::json!({
+        "mcpServers": serde_json::to_value(&req.mcp_servers)
+            .context("ACP: serialize resolved MCP server payloads")?,
+        "cwd": effective_cwd,
+        "model": config.model,
+        "mode": config.mode,
+    });
+    if let (Some(extra), Some(base_obj)) = (&config.extra, sn_params.as_object_mut()) {
+        if let Some(extra_obj) = extra.as_object() {
+            for (k, v) in extra_obj {
+                base_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Ok(sn_params)
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -218,7 +249,10 @@ fn extract_scalar_i64(value: &Value) -> Option<i64> {
 fn extract_usage_snapshot(parsed: &Value) -> Option<UsageSnapshot> {
     let snapshot = UsageSnapshot {
         cost_cents: extract_int_from_value(parsed, &["cost_cents", "costCents"]),
-        input_tokens: extract_int_from_value(parsed, &["input_tokens", "inputTokens", "token_count"]),
+        input_tokens: extract_int_from_value(
+            parsed,
+            &["input_tokens", "inputTokens", "token_count"],
+        ),
         cached_input_tokens: extract_int_from_value(
             parsed,
             &["cached_input_tokens", "cachedInputTokens"],
@@ -244,8 +278,99 @@ fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSna
     current.input_tokens = incoming.input_tokens.or(current.input_tokens);
     current.cached_input_tokens = incoming.cached_input_tokens.or(current.cached_input_tokens);
     current.output_tokens = incoming.output_tokens.or(current.output_tokens);
-    current.model_context_window =
-        incoming.model_context_window.or(current.model_context_window);
+    current.model_context_window = incoming
+        .model_context_window
+        .or(current.model_context_window);
+}
+
+fn observe_mcp_actuals(
+    session_new_result: &Value,
+    req: &ExecutionRequest,
+    provider_session_id: &str,
+) -> Option<McpActualObservation> {
+    if req.mcp_servers.is_empty() {
+        return None;
+    }
+
+    let predicted_extensions: Vec<String> = req
+        .mcp_servers
+        .iter()
+        .map(|server| server.extension_id.clone())
+        .collect();
+    let predicted_runtime_ids: Vec<String> = req
+        .mcp_servers
+        .iter()
+        .map(|server| server.id.clone())
+        .collect();
+
+    let accepted_servers = session_new_result
+        .get("acceptedMcpServers")
+        .or_else(|| session_new_result.get("actualMcpServers"))
+        .or_else(|| session_new_result.get("mcpServers"));
+
+    if let Some(Value::Array(servers)) = accepted_servers {
+        let mut actual_extensions = Vec::new();
+        let mut actual_runtime_ids = Vec::new();
+        for server in servers {
+            match server {
+                Value::String(id) => actual_runtime_ids.push(id.clone()),
+                Value::Object(map) => {
+                    if let Some(id) = map
+                        .get("id")
+                        .or_else(|| map.get("runtimeId"))
+                        .or_else(|| map.get("runtime_id"))
+                        .and_then(Value::as_str)
+                    {
+                        actual_runtime_ids.push(id.to_string());
+                    }
+                    if let Some(extension_id) = map
+                        .get("extensionId")
+                        .or_else(|| map.get("extension_id"))
+                        .or_else(|| map.get("extension"))
+                        .and_then(Value::as_str)
+                    {
+                        actual_extensions.push(extension_id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if actual_extensions.is_empty() {
+            actual_extensions = actual_runtime_ids
+                .iter()
+                .filter_map(|runtime_id| {
+                    req.mcp_servers
+                        .iter()
+                        .find(|server| &server.id == runtime_id)
+                        .map(|server| server.extension_id.clone())
+                })
+                .collect();
+        }
+        let actual_equals_predicted = actual_extensions == predicted_extensions
+            && actual_runtime_ids == predicted_runtime_ids;
+        return Some(McpActualObservation {
+            source: "provider_session_new_response".to_string(),
+            trust_level: "provider_reported".to_string(),
+            actual_equals_predicted,
+            provider_session_id: Some(provider_session_id.to_string()),
+            actual_extensions,
+            actual_runtime_ids,
+            notes: Vec::new(),
+        });
+    }
+
+    Some(McpActualObservation {
+        source: "predicted_after_successful_session_new".to_string(),
+        trust_level: "assumed_after_successful_session_new".to_string(),
+        actual_equals_predicted: true,
+        provider_session_id: Some(provider_session_id.to_string()),
+        actual_extensions: predicted_extensions,
+        actual_runtime_ids: predicted_runtime_ids,
+        notes: vec![
+            "ACP provider did not return an accepted MCP server list; actual truth is an explicit fallback to the predicted payload after session/new succeeded."
+                .to_string(),
+        ],
+    })
 }
 
 fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
@@ -286,10 +411,7 @@ fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
 // ndjson write
 // ---------------------------------------------------------------------------
 
-async fn send_ndjson(
-    stdin: &mut tokio::process::ChildStdin,
-    msg: &Value,
-) -> Result<()> {
+async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Value) -> Result<()> {
     let mut line = serde_json::to_string(msg).context("serialize ACP JSON-RPC message")?;
     line.push('\n');
     stdin
@@ -357,9 +479,7 @@ async fn await_response(
         };
 
         if id != expected_id {
-            debug!(
-                "ACP: skipping response id={id} (expected {expected_id}) during handshake"
-            );
+            debug!("ACP: skipping response id={id} (expected {expected_id}) during handshake");
             continue;
         }
 
@@ -427,6 +547,8 @@ pub struct AcpTransportSession {
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     session_id: String,
+    mcp_observation: Option<McpActualObservation>,
+    mcp_session_startup_latency_ms: Option<i64>,
     snapshot_root: String,
     baseline_files: HashSet<String>,
     request_counter: u64,
@@ -439,6 +561,7 @@ impl AcpTransportSession {
         req: &ExecutionRequest,
         config: &AcpSessionConfig<'_>,
     ) -> Result<Self> {
+        let startup_started = Instant::now();
         let mut stdin = child
             .stdin
             .take()
@@ -547,30 +670,9 @@ impl AcpTransportSession {
             .context("ACP: initialize handshake")?;
 
         let sn_id = next_id!();
+        let sn_params =
+            build_session_new_params(req, config).context("ACP: build session/new params")?;
         {
-            let uses_worktree_cwd = req.worktree_write_enabled
-                || matches!(
-                    req.worktree_strategy.as_deref(),
-                    Some("dedicated") | Some("shared_implementation_worktree")
-                );
-            let effective_cwd = if uses_worktree_cwd {
-                req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
-            } else {
-                &req.workspace_root
-            };
-            let mut sn_params = serde_json::json!({
-                "mcpServers": [],
-                "cwd": effective_cwd,
-                "model": config.model,
-                "mode": config.mode,
-            });
-            if let (Some(extra), Some(base_obj)) = (&config.extra, sn_params.as_object_mut()) {
-                if let Some(extra_obj) = extra.as_object() {
-                    for (k, v) in extra_obj {
-                        base_obj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
             send_ndjson(
                 &mut stdin,
                 &serde_json::json!({
@@ -592,6 +694,10 @@ impl AcpTransportSession {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("ACP session/new response missing 'sessionId' field"))?
             .to_string();
+        let mcp_observation = observe_mcp_actuals(&sn_result, req, &session_id);
+        let mcp_session_startup_latency_ms = mcp_observation
+            .as_ref()
+            .map(|_| startup_started.elapsed().as_millis() as i64);
 
         for (config_id, value) in &config.config_options {
             let sco_id = next_id!();
@@ -643,6 +749,8 @@ impl AcpTransportSession {
             stdin,
             reader,
             session_id,
+            mcp_observation,
+            mcp_session_startup_latency_ms,
             snapshot_root,
             baseline_files,
             request_counter: req_counter,
@@ -654,10 +762,23 @@ impl AcpTransportSession {
         &self.session_id
     }
 
+    pub fn mcp_observation(&self) -> Option<McpActualObservation> {
+        self.mcp_observation.clone()
+    }
+
+    pub fn mcp_session_startup_latency_ms(&self) -> Option<i64> {
+        self.mcp_session_startup_latency_ms
+    }
+
     pub async fn prompt(
         &mut self,
         req: &ExecutionRequest,
-    ) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>, Option<UsageSnapshot>)> {
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Option<UsageSnapshot>,
+    )> {
         self.request_counter += 1;
         let prompt_id = self.request_counter;
         send_ndjson(
@@ -800,7 +921,10 @@ impl AcpTransportSession {
                 .and_then(|name| name.to_str())
                 .unwrap_or("artifact")
                 .to_string();
-            if discovered_artifacts.iter().any(|artifact| artifact.name == name) {
+            if discovered_artifacts
+                .iter()
+                .any(|artifact| artifact.name == name)
+            {
                 continue;
             }
             if let Ok(content) = std::fs::read(path_obj) {
@@ -812,7 +936,12 @@ impl AcpTransportSession {
             }
         }
 
-        Ok((AgentStatus::Completed, new_files, discovered_artifacts, latest_usage_snapshot))
+        Ok((
+            AgentStatus::Completed,
+            new_files,
+            discovered_artifacts,
+            latest_usage_snapshot,
+        ))
     }
 
     pub async fn close(&mut self) -> Result<()> {

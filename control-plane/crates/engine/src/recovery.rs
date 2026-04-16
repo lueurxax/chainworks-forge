@@ -24,6 +24,40 @@ pub struct RecoverySummary {
     pub work_items_requeued: usize,
 }
 
+pub async fn persist_failed_stage_recovery_snapshot(
+    pool: &SqlitePool,
+    stage_execution_id: domain::ids::StageExecutionId,
+    failed_at: chrono::DateTime<Utc>,
+) -> Result<String> {
+    let snapshot = match stages::find_by_id(pool, stage_execution_id).await? {
+        Some(stage) => {
+            let executions = agent_executions::find_by_stage(pool, stage_execution_id).await?;
+            let latest_execution = executions.last();
+            serde_json::json!({
+                "status": "available",
+                "action": "retry_stage",
+                "reason": "stage_settled_failed",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "run_id": stage.run_id.to_string(),
+                "stage_id": stage.stage_id,
+                "failed_at": failed_at,
+                "latest_agent_execution_id": latest_execution.map(|execution| execution.id.to_string()),
+                "latest_agent_status": latest_execution.map(|execution| execution.status.to_string()),
+                "validation_failure_present": stage.validation_failure_json.is_some(),
+            })
+        }
+        None => serde_json::json!({
+            "status": "unavailable",
+            "reason": "stage_execution_not_found",
+            "stage_execution_id": stage_execution_id.to_string(),
+            "failed_at": failed_at,
+        }),
+    };
+    let encoded = serde_json::to_string_pretty(&snapshot)?;
+    stages::update_recovery_snapshot_json(pool, stage_execution_id, &encoded).await?;
+    Ok(encoded)
+}
+
 impl RecoveryService {
     pub fn new(pool: SqlitePool, work_queue: WorkQueue, events: EventSender) -> Self {
         Self {
@@ -93,6 +127,15 @@ impl RecoveryService {
             );
             // Mark as blocked so we can retry safely
             stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+            let drift_details = serde_json::json!({
+                "source": "startup_repair",
+                "reason": "stage_stuck_running",
+                "stage_execution_id": stage.id.to_string(),
+                "stage_id": stage.stage_id,
+                "action": "marked_blocked_for_operator_retry",
+            });
+            runs::update_drift_detection(&self.pool, run.id, now, &drift_details.to_string())
+                .await?;
 
             // Audit trail: record the repair action (proposal §6.3)
             let repair_id = uuid::Uuid::new_v4().to_string();
@@ -104,8 +147,7 @@ impl RecoveryService {
                 now,
                 Some(&format!(
                     "Stage '{}' stuck in Running — marked Blocked{}",
-                    stage.stage_id,
-                    provenance_suffix
+                    stage.stage_id, provenance_suffix
                 )),
             )
             .await;
@@ -202,7 +244,10 @@ impl RecoveryService {
         if details.is_empty() {
             None
         } else {
-            Some(format!("; latest execution provenance: {}", details.join(", ")))
+            Some(format!(
+                "; latest execution provenance: {}",
+                details.join(", ")
+            ))
         }
     }
 }

@@ -40,6 +40,9 @@ pub struct Idea {
     pub title: String,
     pub body: String,
     pub workspace_root_path: Option<String>,
+    /// Optional stable project cohort key. New P049 runs freeze this onto Run;
+    /// missing values fall back to `untagged` at run creation.
+    pub project_key: Option<String>,
     pub status: IdeaStatus,
     pub created_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,

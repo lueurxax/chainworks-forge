@@ -26,8 +26,7 @@ pub struct CodexAdapter {
 
 impl CodexAdapter {
     pub fn new() -> Self {
-        let binary_path = std::env::var(BINARY_ENV_VAR)
-            .unwrap_or_else(|_| "codex-acp".to_string());
+        let binary_path = std::env::var(BINARY_ENV_VAR).unwrap_or_else(|_| "codex-acp".to_string());
         Self { binary_path }
     }
 
@@ -84,9 +83,7 @@ impl AcpAdapter for CodexAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| {
-                format!("spawn Codex ACP subprocess: {}", self.binary_path)
-            })?;
+            .with_context(|| format!("spawn Codex ACP subprocess: {}", self.binary_path))?;
 
         // Build the base model id (without /effort suffix) and extract the
         // effort separately. Codex's session/new silently falls back to
@@ -112,7 +109,8 @@ impl AcpAdapter for CodexAdapter {
             extra: None,
             config_options,
         };
-        let session = AcpSession::start_with_cleanup(child, req, &config, Some(runtime_home)).await?;
+        let session =
+            AcpSession::start_with_cleanup(child, req, &config, Some(runtime_home)).await?;
 
         Ok(AcpSessionHandle::new(session))
     }
@@ -159,16 +157,17 @@ fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
         std::fs::copy(&source_auth, &runtime_auth)
             .with_context(|| "copy auth.json to runtime home")?;
     } else {
-        info!("Codex: auth.json not found at {}; starting without copied auth",
-              source_auth.display());
+        info!(
+            "Codex: auth.json not found at {}; starting without copied auth",
+            source_auth.display()
+        );
     }
 
     // Copy config.toml (sanitized)
     let source_config = source_home.join("config.toml");
     let runtime_config = runtime_home.join("config.toml");
     if source_config.exists() {
-        let data = std::fs::read_to_string(&source_config)
-            .with_context(|| "read config.toml")?;
+        let data = std::fs::read_to_string(&source_config).with_context(|| "read config.toml")?;
         let sanitized = sanitize_runtime_config(&data);
         std::fs::write(&runtime_config, sanitized)
             .with_context(|| "write sanitized config.toml")?;
@@ -207,11 +206,7 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
     let tmp = runtime_home.join("tmp").to_string_lossy().to_string();
     let cache = runtime_home.join(".cache").to_string_lossy().to_string();
 
-    let path = format!(
-        "{}:{}",
-        bin,
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = format!("{}:{}", bin, std::env::var("PATH").unwrap_or_default());
 
     vec![
         ("CODEX_HOME".into(), home.clone()),
@@ -242,7 +237,10 @@ mod tests {
 
     #[test]
     fn splits_bare_model() {
-        assert_eq!(split_codex_model_effort("gpt-5.4"), ("gpt-5.4".into(), None));
+        assert_eq!(
+            split_codex_model_effort("gpt-5.4"),
+            ("gpt-5.4".into(), None)
+        );
     }
 
     #[test]
@@ -263,6 +261,9 @@ mod tests {
 
     #[test]
     fn handles_trailing_slash() {
-        assert_eq!(split_codex_model_effort("gpt-5.4/"), ("gpt-5.4/".into(), None));
+        assert_eq!(
+            split_codex_model_effort("gpt-5.4/"),
+            ("gpt-5.4/".into(), None)
+        );
     }
 }

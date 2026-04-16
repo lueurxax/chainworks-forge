@@ -8,9 +8,9 @@
 //! 4. Resolve loop max values from variables
 //! 5. Return a `RunPlan`
 
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
-use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::catalog;
@@ -23,10 +23,30 @@ use crate::plan::*;
 /// agent referenced by the workflow exists in the catalog and has a
 /// resolvable backend profile.
 pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
-    let wf = definition::load(workflow_path)
-        .context("loading workflow definition")?;
-    let cat = catalog::load(catalog_path)
-        .context("loading agent catalog")?;
+    let wf = definition::load(workflow_path).context("loading workflow definition")?;
+    let cat = catalog::load(catalog_path).context("loading agent catalog")?;
+    let workflow_family = wf
+        .workflow
+        .as_ref()
+        .and_then(|m| m.family.clone())
+        .or_else(|| wf.workflow.as_ref().and_then(|m| m.id.clone()))
+        .ok_or_else(|| anyhow::anyhow!("workflow.family or workflow.id is required"))?;
+    let risk_class = wf
+        .workflow
+        .as_ref()
+        .and_then(|m| m.risk_class.clone())
+        .or_else(|| Some("standard".to_string()));
+    let stack = wf
+        .workflow
+        .as_ref()
+        .and_then(|m| m.stack.clone())
+        .or_else(|| Some("unknown".to_string()));
+    let workflow_snapshot_json =
+        canonical_json_string(&wf).context("serializing canonical workflow snapshot")?;
+    let catalog_snapshot_json =
+        canonical_json_string(&cat).context("serializing canonical agent catalog snapshot")?;
+    let workflow_snapshot_hash = sha256_string(&workflow_snapshot_json);
+    let catalog_snapshot_hash = sha256_string(&catalog_snapshot_json);
 
     // Catalog base directory — used to resolve relative skill bundle paths.
     let catalog_base = Path::new(catalog_path)
@@ -50,22 +70,32 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
 
     let mut states = HashMap::new();
     for (state_id, state_def) in &wf.states {
-        let compiled = compile_state(state_id, state_def, &agent_lookup, &contract_lookup, &variables)?;
+        let compiled = compile_state(
+            state_id,
+            state_def,
+            &agent_lookup,
+            &contract_lookup,
+            &variables,
+        )?;
         states.insert(state_id.clone(), compiled);
     }
 
     // Artifact name → path template from the catalog's `artifacts:` section.
-    let artifact_paths: HashMap<String, String> = cat
-        .artifacts
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let artifact_paths: HashMap<String, String> =
+        cat.artifacts.unwrap_or_default().into_iter().collect();
 
     Ok(RunPlan {
         initial_state: wf.initial_state,
         states,
         variables,
         artifact_paths,
+        workflow_family: Some(workflow_family),
+        risk_class,
+        stack,
+        workflow_snapshot_hash,
+        catalog_snapshot_hash,
+        workflow_snapshot_json,
+        catalog_snapshot_json,
     })
 }
 
@@ -108,13 +138,9 @@ impl ContractLookup {
             return self.by_contract_id.get(contract_id).cloned();
         }
 
-        self.by_output
-            .get(output_name)
-            .cloned()
-            .or_else(|| {
-                strip_version_suffix(output_name)
-                    .and_then(|stem| self.by_output.get(&stem).cloned())
-            })
+        self.by_output.get(output_name).cloned().or_else(|| {
+            strip_version_suffix(output_name).and_then(|stem| self.by_output.get(&stem).cloned())
+        })
     }
 }
 
@@ -163,7 +189,9 @@ fn register_contract_alias(
     alias: &str,
     schema: &OutputSchema,
 ) {
-    lookup.entry(alias.to_string()).or_insert_with(|| schema.clone());
+    lookup
+        .entry(alias.to_string())
+        .or_insert_with(|| schema.clone());
     if let Some(stem) = strip_version_suffix(alias) {
         lookup.entry(stem).or_insert_with(|| schema.clone());
     }
@@ -193,26 +221,44 @@ fn sha256_string(content: &str) -> String {
     format!("{digest:x}")
 }
 
+fn canonical_json_string<T: serde::Serialize>(value: &T) -> Result<String> {
+    let value = serde_json::to_value(value).context("convert to canonical json value")?;
+    serde_json::to_string(&sort_json_value(value)).context("serialize canonical json value")
+}
+
+fn sort_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sort_json_value).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, sort_json_value(value)))
+                .collect(),
+        ),
+        scalar => scalar,
+    }
+}
+
 fn build_agent_lookup(
     cat: &catalog::AgentCatalogFile,
     catalog_base: &Path,
 ) -> Result<HashMap<String, AgentBinding>> {
     let empty_profiles = HashMap::new();
-    let profiles = cat.backend_profiles.as_ref()
-        .unwrap_or(&empty_profiles);
-    let agents = cat.agents.as_ref()
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
+    let profiles = cat.backend_profiles.as_ref().unwrap_or(&empty_profiles);
+    let agents = cat.agents.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
     let empty_skills = HashMap::new();
     let skills = cat.skills.as_ref().unwrap_or(&empty_skills);
 
     let mut lookup = HashMap::new();
     for agent in agents {
-        let profile = profiles.get(&agent.backend_profile)
-            .ok_or_else(|| anyhow::anyhow!(
+        let profile = profiles.get(&agent.backend_profile).ok_or_else(|| {
+            anyhow::anyhow!(
                 "Agent '{}' references unknown backend_profile '{}'",
-                agent.id, agent.backend_profile
-            ))?;
+                agent.id,
+                agent.backend_profile
+            )
+        })?;
 
         let provider = normalize_provider(&profile.provider);
         let model = profile.model.clone();
@@ -276,30 +322,35 @@ fn build_agent_lookup(
             .map(|skill| sha256_string(&skill.injected_content));
 
         // Extract worktree policy fields (matching Swift RunPlanCompiler).
-        let (wt_write, wt_strategy) = agent.worktree_policy.as_ref()
+        let (wt_write, wt_strategy) = agent
+            .worktree_policy
+            .as_ref()
             .map(|wp| (wp.write_enabled, Some(wp.strategy.clone())))
             .unwrap_or((false, None));
 
-        lookup.insert(agent.id.clone(), AgentBinding {
-            backend_profile_id: agent.backend_profile.clone(),
-            provider,
-            model,
-            effort,
-            max_turns,
-            temperature,
-            prompt,
-            permission_profile,
-            skill_ref,
-            skill_role,
-            skill_snapshot_hash,
-            requested_mcp_server_ids,
-            output_contract,
-            resolved_skill,
-            worktree_write_enabled: wt_write,
-            worktree_strategy: wt_strategy,
-            session_reuse_scope,
-            session_family_id,
-        });
+        lookup.insert(
+            agent.id.clone(),
+            AgentBinding {
+                backend_profile_id: agent.backend_profile.clone(),
+                provider,
+                model,
+                effort,
+                max_turns,
+                temperature,
+                prompt,
+                permission_profile,
+                skill_ref,
+                skill_role,
+                skill_snapshot_hash,
+                requested_mcp_server_ids,
+                output_contract,
+                resolved_skill,
+                worktree_write_enabled: wt_write,
+                worktree_strategy: wt_strategy,
+                session_reuse_scope,
+                session_family_id,
+            },
+        );
     }
     Ok(lookup)
 }
@@ -334,12 +385,16 @@ fn compile_state(
 ) -> Result<CompiledState> {
     let owner = resolve_agent(&state.owner, agents)?;
 
-    let tasks = state.run.as_ref()
+    let tasks = state
+        .run
+        .as_ref()
         .map(|rb| compile_run_block(rb, agents, contracts))
         .transpose()?
         .unwrap_or_default();
 
-    let post_approval_tasks = state.run_after_approval.as_ref()
+    let post_approval_tasks = state
+        .run_after_approval
+        .as_ref()
         .map(|rb| compile_run_block(rb, agents, contracts))
         .transpose()?
         .unwrap_or_default();
@@ -357,7 +412,9 @@ fn compile_state(
         })
         .unwrap_or_default();
 
-    let loop_config = state.loop_config.as_ref()
+    let loop_config = state
+        .loop_config
+        .as_ref()
         .map(|lc| compile_loop(lc, variables));
 
     Ok(CompiledState {
@@ -374,10 +431,7 @@ fn compile_state(
     })
 }
 
-fn resolve_agent(
-    agent_id: &str,
-    agents: &HashMap<String, AgentBinding>,
-) -> Result<ResolvedAgent> {
+fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Result<ResolvedAgent> {
     match agents.get(agent_id) {
         Some(binding) => Ok(ResolvedAgent {
             agent_id: agent_id.to_string(),
@@ -572,30 +626,37 @@ fn resolve_skill(
     // Step 1: Load base content by type
     let (base_content, type_label) = match skill_type_str.as_str() {
         "external_skill" => {
-            let raw_path = skill_def.path.as_deref()
+            let raw_path = skill_def
+                .path
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("external_skill '{skill_id}' missing 'path'"))?;
             let bundle_dir = catalog_base.join(raw_path);
             let skill_md = bundle_dir.join("SKILL.md");
-            let content = std::fs::read_to_string(&skill_md)
-                .with_context(|| format!(
+            let content = std::fs::read_to_string(&skill_md).with_context(|| {
+                format!(
                     "reading SKILL.md for external skill '{skill_id}' at {}",
                     skill_md.display()
-                ))?;
+                )
+            })?;
             if content.trim().is_empty() {
                 anyhow::bail!("SKILL.md is empty for external skill '{skill_id}'");
             }
             (content, "external")
         }
         "inline_skill" => {
-            let desc = skill_def.description.as_deref()
-                .ok_or_else(|| anyhow::anyhow!("inline_skill '{skill_id}' missing 'description'"))?;
+            let desc = skill_def.description.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("inline_skill '{skill_id}' missing 'description'")
+            })?;
             (desc.to_string(), "inline")
         }
         "builtin_agent" => {
-            let name = skill_def.name.as_deref()
+            let name = skill_def
+                .name
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("builtin_agent '{skill_id}' missing 'name'"))?;
-            let content = builtin_skill_content(name)
-                .ok_or_else(|| anyhow::anyhow!("unknown builtin skill '{name}' (skill_id='{skill_id}')"))?;
+            let content = builtin_skill_content(name).ok_or_else(|| {
+                anyhow::anyhow!("unknown builtin skill '{name}' (skill_id='{skill_id}')")
+            })?;
             (content.to_string(), "builtin")
         }
         other => {
@@ -604,18 +665,11 @@ fn resolve_skill(
     };
 
     // Step 2: Apply role specialization
-    let specialized = apply_role_specialization(
-        skill_id,
-        &base_content,
-        skill_role,
-        skill_def,
-        catalog_base,
-    );
+    let specialized =
+        apply_role_specialization(skill_id, &base_content, skill_role, skill_def, catalog_base);
 
     // Step 3: Wrap with injection header (matches Swift SkillInjector)
-    let injected_content = format!(
-        "## Skill: {skill_id}\nType: {type_label}\n\n{specialized}"
-    );
+    let injected_content = format!("## Skill: {skill_id}\nType: {type_label}\n\n{specialized}");
 
     Ok(ResolvedSkill {
         id: skill_id.to_string(),
@@ -657,9 +711,7 @@ fn apply_role_specialization(
             if let Ok(role_content) = std::fs::read_to_string(&role_file) {
                 let trimmed = role_content.trim();
                 if !trimmed.is_empty() {
-                    return format!(
-                        "{base_content}\n\n## Active Role: {role}\n\n{trimmed}"
-                    );
+                    return format!("{base_content}\n\n## Active Role: {role}\n\n{trimmed}");
                 }
             }
         }
@@ -738,9 +790,7 @@ fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {
         serde_yaml::Value::Mapping(map) => {
             let obj: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .filter_map(|(k, v)| {
-                    k.as_str().map(|s| (s.to_string(), yaml_to_json(v)))
-                })
+                .filter_map(|(k, v)| k.as_str().map(|s| (s.to_string(), yaml_to_json(v))))
                 .collect();
             serde_json::Value::Object(obj)
         }

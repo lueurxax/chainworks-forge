@@ -34,9 +34,7 @@ impl ReleaseOpsCoordinator {
         worktree_root: &str,
         commit_message: &str,
     ) -> Result<ReleaseResult> {
-        let target_branch = delivery_config
-            .target_branch
-            .as_str();
+        let target_branch = delivery_config.target_branch.as_str();
         if target_branch.trim().is_empty() {
             bail!("delivery configuration is missing a target branch");
         }

@@ -18,8 +18,9 @@ pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
         INSERT INTO stage_executions
             (id, run_id, stage_id, label, status, iteration, attempt_number,
              settlement_kind, started_at, completed_at,
-             owner_agent, provider, model, stage_type)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             owner_agent, provider, model, stage_type,
+             validation_failure_json, evidence_packet_json, recovery_snapshot_json, retry_reason)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         "#,
     )
     .bind(id)
@@ -36,6 +37,10 @@ pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
     .bind(&stage.provider)
     .bind(&stage.model)
     .bind(&stage.stage_type)
+    .bind(&stage.validation_failure_json)
+    .bind(&stage.evidence_packet_json)
+    .bind(&stage.recovery_snapshot_json)
+    .bind(&stage.retry_reason)
     .execute(pool)
     .await
     .context("insert stage execution")?;
@@ -44,12 +49,10 @@ pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
 
 const SELECT_COLS: &str = r#"id, run_id, stage_id, label, status, iteration, attempt_number,
              settlement_kind, started_at, completed_at,
-             owner_agent, provider, model, stage_type"#;
+             owner_agent, provider, model, stage_type,
+             validation_failure_json, evidence_packet_json, recovery_snapshot_json, retry_reason"#;
 
-pub async fn find_by_id(
-    pool: &SqlitePool,
-    id: StageExecutionId,
-) -> Result<Option<StageExecution>> {
+pub async fn find_by_id(pool: &SqlitePool, id: StageExecutionId) -> Result<Option<StageExecution>> {
     let id_str = id.to_string();
     let query = format!("SELECT {SELECT_COLS} FROM stage_executions WHERE id = ?1");
     let row = sqlx::query(&query)
@@ -119,6 +122,48 @@ pub async fn settle(
     Ok(())
 }
 
+pub async fn update_validation_failure_json(
+    pool: &SqlitePool,
+    id: StageExecutionId,
+    validation_failure_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE stage_executions SET validation_failure_json = ?1 WHERE id = ?2"#)
+        .bind(validation_failure_json)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("update stage validation failure json")?;
+    Ok(())
+}
+
+pub async fn update_recovery_snapshot_json(
+    pool: &SqlitePool,
+    id: StageExecutionId,
+    recovery_snapshot_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE stage_executions SET recovery_snapshot_json = ?1 WHERE id = ?2"#)
+        .bind(recovery_snapshot_json)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("update stage recovery snapshot json")?;
+    Ok(())
+}
+
+pub async fn update_evidence_packet_json(
+    pool: &SqlitePool,
+    id: StageExecutionId,
+    evidence_packet_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE stage_executions SET evidence_packet_json = ?1 WHERE id = ?2"#)
+        .bind(evidence_packet_json)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("update stage evidence packet json")?;
+    Ok(())
+}
+
 fn parse_stage_row(r: &sqlx::sqlite::SqliteRow) -> Result<StageExecution> {
     let id: String = r.get("id");
     let run_id: String = r.get("run_id");
@@ -165,5 +210,9 @@ fn parse_stage_row(r: &sqlx::sqlite::SqliteRow) -> Result<StageExecution> {
         provider: r.get("provider"),
         model: r.get("model"),
         stage_type: r.get("stage_type"),
+        validation_failure_json: r.get("validation_failure_json"),
+        evidence_packet_json: r.get("evidence_packet_json"),
+        recovery_snapshot_json: r.get("recovery_snapshot_json"),
+        retry_reason: r.get("retry_reason"),
     })
 }

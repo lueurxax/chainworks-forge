@@ -9,7 +9,10 @@ const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, w
              artifact_root, started_at, completed_at, cancellation_requested_at,
              cancellation_settled_at, cancellation_settlement_log, current_state, workflow_yaml_path,
              agent_catalog_yaml_path, worktree_root, base_branch, base_revision,
-             target_branch, delivery_configuration_json"#;
+             target_branch, delivery_configuration_json, delivery_preflight_json,
+             workflow_family, project_key, risk_class, stack, workflow_snapshot_hash,
+             catalog_snapshot_hash, workflow_snapshot_json, catalog_snapshot_json,
+             drift_detected_at, drift_details_json"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     let id = run.id.to_string();
@@ -26,8 +29,11 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
                           started_at, completed_at, cancellation_requested_at, cancellation_settled_at,
                           cancellation_settlement_log, current_state, workflow_yaml_path, agent_catalog_yaml_path,
                           worktree_root, base_branch, base_revision, target_branch,
-                          delivery_configuration_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                          delivery_configuration_json, delivery_preflight_json, workflow_family, project_key,
+                          risk_class, stack, workflow_snapshot_hash, catalog_snapshot_hash,
+                          workflow_snapshot_json, catalog_snapshot_json, drift_detected_at, drift_details_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
         "#,
     )
     .bind(id)
@@ -50,6 +56,17 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     .bind(&run.base_revision)
     .bind(&run.target_branch)
     .bind(&run.delivery_configuration_json)
+    .bind(&run.delivery_preflight_json)
+    .bind(&run.workflow_family)
+    .bind(&run.project_key)
+    .bind(&run.risk_class)
+    .bind(&run.stack)
+    .bind(&run.workflow_snapshot_hash)
+    .bind(&run.catalog_snapshot_hash)
+    .bind(&run.workflow_snapshot_json)
+    .bind(&run.catalog_snapshot_json)
+    .bind(run.drift_detected_at.map(|t| t.to_rfc3339()))
+    .bind(&run.drift_details_json)
     .execute(pool)
     .await
     .context("insert run")?;
@@ -70,9 +87,8 @@ pub async fn find_by_id(pool: &SqlitePool, id: RunId) -> Result<Option<Run>> {
 
 pub async fn list_by_idea(pool: &SqlitePool, idea_id: IdeaId) -> Result<Vec<Run>> {
     let idea_id_str = idea_id.to_string();
-    let query = format!(
-        "SELECT {SELECT_COLS} FROM runs WHERE idea_id = ?1 ORDER BY started_at DESC"
-    );
+    let query =
+        format!("SELECT {SELECT_COLS} FROM runs WHERE idea_id = ?1 ORDER BY started_at DESC");
     let rows = sqlx::query(&query)
         .bind(idea_id_str)
         .fetch_all(pool)
@@ -90,6 +106,20 @@ pub async fn list_active(pool: &SqlitePool) -> Result<Vec<Run>> {
         .fetch_all(pool)
         .await
         .context("list active runs")?;
+
+    rows.iter().map(|r| parse_run_row(r)).collect()
+}
+
+pub async fn list_completed(pool: &SqlitePool, limit: i64) -> Result<Vec<Run>> {
+    let limit = limit.clamp(1, 1000);
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM runs WHERE status = 'completed' ORDER BY completed_at DESC, started_at DESC LIMIT ?1"
+    );
+    let rows = sqlx::query(&query)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list completed runs")?;
 
     rows.iter().map(|r| parse_run_row(r)).collect()
 }
@@ -118,6 +148,22 @@ pub async fn update_current_state(pool: &SqlitePool, id: RunId, state: &str) -> 
     Ok(())
 }
 
+pub async fn update_drift_detection(
+    pool: &SqlitePool,
+    id: RunId,
+    detected_at: DateTime<Utc>,
+    details_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE runs SET drift_detected_at = ?1, drift_details_json = ?2 WHERE id = ?3"#)
+        .bind(detected_at.to_rfc3339())
+        .bind(details_json)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("update run drift detection")?;
+    Ok(())
+}
+
 /// Transition a run into the Cancelling state with a cancellation timestamp.
 pub async fn mark_cancelling(
     pool: &SqlitePool,
@@ -126,15 +172,13 @@ pub async fn mark_cancelling(
 ) -> Result<()> {
     let id_str = id.to_string();
     let status = RunStatus::Cancelling.to_string();
-    sqlx::query(
-        r#"UPDATE runs SET status = ?1, cancellation_requested_at = ?2 WHERE id = ?3"#,
-    )
-    .bind(status)
-    .bind(requested_at.to_rfc3339())
-    .bind(id_str)
-    .execute(pool)
-    .await
-    .context("mark run cancelling")?;
+    sqlx::query(r#"UPDATE runs SET status = ?1, cancellation_requested_at = ?2 WHERE id = ?3"#)
+        .bind(status)
+        .bind(requested_at.to_rfc3339())
+        .bind(id_str)
+        .execute(pool)
+        .await
+        .context("mark run cancelling")?;
     Ok(())
 }
 
@@ -142,15 +186,13 @@ pub async fn mark_cancelled(pool: &SqlitePool, id: RunId, settled_at: DateTime<U
     let id_str = id.to_string();
     let settled_at_str = settled_at.to_rfc3339();
     let status = RunStatus::Cancelled.to_string();
-    sqlx::query(
-        r#"UPDATE runs SET status = ?1, cancellation_settled_at = ?2 WHERE id = ?3"#,
-    )
-    .bind(status)
-    .bind(settled_at_str)
-    .bind(id_str)
-    .execute(pool)
-    .await
-    .context("mark run cancelled")?;
+    sqlx::query(r#"UPDATE runs SET status = ?1, cancellation_settled_at = ?2 WHERE id = ?3"#)
+        .bind(status)
+        .bind(settled_at_str)
+        .bind(id_str)
+        .execute(pool)
+        .await
+        .context("mark run cancelled")?;
     Ok(())
 }
 
@@ -256,6 +298,8 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
         parse_optional_dt(cancellation_requested_at, "run cancellation_requested_at")?;
     let cancellation_settled_at_dt =
         parse_optional_dt(cancellation_settled_at, "run cancellation_settled_at")?;
+    let drift_detected_at: Option<String> = r.get("drift_detected_at");
+    let drift_detected_at_dt = parse_optional_dt(drift_detected_at, "run drift_detected_at")?;
 
     Ok(Run {
         id: run_id,
@@ -278,6 +322,17 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
         base_revision: r.get("base_revision"),
         target_branch: r.get("target_branch"),
         delivery_configuration_json: r.get("delivery_configuration_json"),
+        delivery_preflight_json: r.get("delivery_preflight_json"),
+        workflow_family: r.get("workflow_family"),
+        project_key: r.get("project_key"),
+        risk_class: r.get("risk_class"),
+        stack: r.get("stack"),
+        workflow_snapshot_hash: r.get("workflow_snapshot_hash"),
+        catalog_snapshot_hash: r.get("catalog_snapshot_hash"),
+        workflow_snapshot_json: r.get("workflow_snapshot_json"),
+        catalog_snapshot_json: r.get("catalog_snapshot_json"),
+        drift_detected_at: drift_detected_at_dt,
+        drift_details_json: r.get("drift_details_json"),
     })
 }
 

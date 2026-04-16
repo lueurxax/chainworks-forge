@@ -187,6 +187,12 @@ PROPOSAL_044_TESTS=(
   "test_state_11_to_state_12_happy_path"
 )
 
+PROPOSAL_029_MCP_TESTS=(
+  "auth::tests"
+  "mcp_server::tests"
+  "graphql_server::tests"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 LAST_BUILD_DERIVED_DATA_PATH=""
 
@@ -1190,12 +1196,15 @@ Available gates:
   proposal-027    Proposal 027 Rust+SQLite local control-plane extraction gate
   proposal-027r   Proposal 027 unified read-only JSON/markdown rendering gate (legacy renderer)
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
+  proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
   proposal-044    Proposal 044 post-approval task execution and release gate completion gate
   proposal-045    Proposal 045 deterministic release operations gate
   proposal-047    Proposal 047 control-plane workspace verification gate
+  proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
+  proposal-049    Proposal 049 steward analysis system gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1433,6 +1442,14 @@ case "$GATE" in
     run_build "proposal-029"
     run_targeted_tests "proposal-029" "${PROPOSAL_029_TESTS[@]}"
     ;;
+  proposal-029-mcp|p029-mcp)
+    log "Proposal 029-MCP control-plane gate: auth + capability + audit"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --workspace 2>&1
+    )
+    log "Proposal 029-MCP control-plane gate passed"
+    ;;
   proposal-032|p032)
     check_idle_environment allow_app
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
@@ -1494,6 +1511,40 @@ case "$GATE" in
       cargo test --workspace 2>&1
     )
     log "Proposal 047 control-plane gate passed"
+    ;;
+  proposal-048|p048)
+    log "Proposal 048 control-plane gate: evidence packs, delivery preflight, and MCP resolution"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p db --test integration proposal_048_persistence_fields_round_trip -- --exact --nocapture &&
+      cargo test -p engine --test integration delivery_preflight -- --nocapture &&
+      cargo test -p graphql-server --lib delivery_preflight_graphql_readback_tests -- --nocapture &&
+      cargo test -p mcp-server --lib delivery_preflight_mcp_readback_tests -- --nocapture &&
+      cargo test -p acp --test integration mcp_servers_session_new_serialization_tests -- --exact --nocapture &&
+      cargo test -p engine --test integration mcp_resolution_persistence_tests -- --nocapture &&
+      cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture &&
+      cargo test -p mcp-server --lib reports_failed_stage_evidence_contract_tests -- --nocapture &&
+      cargo test -p mcp-server --lib report_resource_decodes_failed_stage_evidence_payload -- --nocapture &&
+      cargo test -p graphql-server --lib start_run_blocked_preflight_returns_typed_payload -- --nocapture &&
+      cargo test -p graphql-server --lib execution_mcp_truth_contract_tests -- --nocapture &&
+      cargo test -p mcp-server --lib reports_mcp_resolution_truth_tests -- --nocapture &&
+      cargo test -p mcp-server --lib report_resource_exposes_mcp_execution_truth -- --nocapture
+	    )
+	    log "Proposal 048 control-plane gate passed"
+	    ;;
+	  proposal-049|p049)
+    log "Proposal 049 control-plane gate: steward analysis system"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p workflow steward_metadata_contract_tests -- --nocapture &&
+      cargo test -p db steward -- --nocapture &&
+      cargo test -p daemon steward_runtime_bootstrap_tests -- --nocapture &&
+      cargo test -p engine steward -- --nocapture &&
+      cargo test -p engine test_start_run_persists_delivery_configuration_json -- --exact --nocapture &&
+      cargo test -p graphql-server steward_graphql -- --nocapture &&
+      cargo test -p mcp-server steward_mcp -- --nocapture
+    )
+    log "Proposal 049 control-plane gate passed"
     ;;
   full)
     check_idle_environment strict

@@ -30,6 +30,7 @@ fn make_idea(id: IdeaId) -> Idea {
         title: "Release idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -69,6 +70,17 @@ fn make_run(id: RunId, idea_id: IdeaId, workspace_root: &str, artifact_root: &st
             })
             .expect("delivery config json"),
         ),
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     }
 }
 
@@ -88,6 +100,10 @@ fn make_stage(id: StageExecutionId, run_id: RunId, stage_id: &str) -> StageExecu
         provider: Some("claude".into()),
         model: Some("test".into()),
         stage_type: Some("release".into()),
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     }
 }
 
@@ -122,9 +138,15 @@ fn init_release_repo_on_branch(root: &Path, branch: &str) -> (String, String) {
     std::fs::write(repo_dir.join("README.md"), "initial\n").unwrap();
     git(&repo_dir, &["add", "-A"]);
     git(&repo_dir, &["commit", "-m", "initial"]);
-    git(&repo_dir, &["remote", "add", "origin", remote_dir.to_str().unwrap()]);
+    git(
+        &repo_dir,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
     std::fs::write(repo_dir.join("release.txt"), "changed\n").unwrap();
-    (repo_dir.to_string_lossy().into_owned(), remote_dir.to_string_lossy().into_owned())
+    (
+        repo_dir.to_string_lossy().into_owned(),
+        remote_dir.to_string_lossy().into_owned(),
+    )
 }
 
 fn init_release_repo(root: &Path) -> (String, String) {
@@ -223,20 +245,25 @@ async fn git_release_service_commits_and_pushes_to_expected_branch() {
 async fn git_release_service_rejects_main_and_master_targets() {
     let tmp = tempfile::tempdir().unwrap();
     let (main_repo_dir, _remote_dir) = init_release_repo_on_branch(tmp.path(), "main");
-    let (master_repo_dir, _remote_dir2) = init_release_repo_on_branch(&tmp.path().join("master"), "master");
+    let (master_repo_dir, _remote_dir2) =
+        init_release_repo_on_branch(&tmp.path().join("master"), "master");
 
     let service = GitReleaseService;
     let main_error = service
         .commit_and_push(&main_repo_dir, "main", "release commit")
         .await
         .expect_err("main must be rejected");
-    assert!(main_error.to_string().contains("push target 'main' is not allowed"));
+    assert!(main_error
+        .to_string()
+        .contains("push target 'main' is not allowed"));
 
     let master_error = service
         .commit_and_push(&master_repo_dir, "master", "release commit")
         .await
         .expect_err("master must be rejected");
-    assert!(master_error.to_string().contains("push target 'master' is not allowed"));
+    assert!(master_error
+        .to_string()
+        .contains("push target 'master' is not allowed"));
 }
 
 #[tokio::test]
@@ -330,6 +357,17 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
             })
             .unwrap(),
         ),
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     let delivery_config = DeliveryConfiguration {
         repo_identifier: "repo/test".into(),
@@ -341,15 +379,13 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
         release_mode: Some("sandbox".into()),
     };
 
-    let receipt = DeliveryReceiptBuilder::build_receipt(
-        &run,
-        &delivery_config,
-        None,
-        "Release idea",
-        None,
-    );
+    let receipt =
+        DeliveryReceiptBuilder::build_receipt(&run, &delivery_config, None, "Release idea", None);
 
-    assert!(receipt.is_none(), "metadata-only receipt must not be synthesized");
+    assert!(
+        receipt.is_none(),
+        "metadata-only receipt must not be synthesized"
+    );
 }
 
 #[tokio::test]
@@ -435,10 +471,20 @@ async fn background_executor_routes_release_agents_natively() {
     assert!(executor.process_next_item().await.unwrap());
 
     let after_git = artifacts::list_by_run(&pool, run_id).await.unwrap();
-    let release_manifest = after_git.iter().find(|a| a.name == "release_manifest").unwrap();
-    let git_push_receipt = after_git.iter().find(|a| a.name == "git_push_receipt").unwrap();
-    assert!(release_manifest.file_path.ends_with(".chainworks/release/manifest.json"));
-    assert!(git_push_receipt.file_path.ends_with(".chainworks/release/git-push.json"));
+    let release_manifest = after_git
+        .iter()
+        .find(|a| a.name == "release_manifest")
+        .unwrap();
+    let git_push_receipt = after_git
+        .iter()
+        .find(|a| a.name == "git_push_receipt")
+        .unwrap();
+    assert!(release_manifest
+        .file_path
+        .ends_with(".chainworks/release/manifest.json"));
+    assert!(git_push_receipt
+        .file_path
+        .ends_with(".chainworks/release/git-push.json"));
     assert!(!after_git.iter().any(|a| a.name == "delivery_receipt"));
 
     assert!(executor.process_next_item().await.unwrap());
@@ -452,8 +498,12 @@ async fn background_executor_routes_release_agents_natively() {
         .iter()
         .find(|a| a.name == "connect_upload_receipt")
         .unwrap();
-    assert!(release_bundle_manifest.file_path.ends_with(".chainworks/release/bundle.json"));
-    assert!(connect_upload_receipt.file_path.ends_with(".chainworks/release/connect-upload.json"));
+    assert!(release_bundle_manifest
+        .file_path
+        .ends_with(".chainworks/release/bundle.json"));
+    assert!(connect_upload_receipt
+        .file_path
+        .ends_with(".chainworks/release/connect-upload.json"));
     assert!(final_artifacts.iter().any(|a| a.name == "delivery_receipt"));
 
     let delivery = final_artifacts
@@ -538,14 +588,21 @@ async fn background_executor_persists_delivery_receipt_on_git_failure() {
         .await
         .unwrap();
 
-    let err = executor.process_next_item().await.expect_err("git step should fail");
+    let err = executor
+        .process_next_item()
+        .await
+        .expect_err("git step should fail");
     assert!(err
         .to_string()
         .contains("push target 'main' is not allowed"));
 
     let persisted = artifacts::list_by_run(&pool, run_id).await.unwrap();
-    assert!(!persisted.iter().any(|artifact| artifact.name == "release_manifest"));
-    assert!(!persisted.iter().any(|artifact| artifact.name == "git_push_receipt"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "release_manifest"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "git_push_receipt"));
     let delivery = persisted
         .iter()
         .find(|artifact| artifact.name == "delivery_receipt")
@@ -557,7 +614,10 @@ async fn background_executor_persists_delivery_receipt_on_git_failure() {
         serde_json::from_str(&std::fs::read_to_string(&delivery.file_path).unwrap()).unwrap();
     let release_result = receipt.release_result.expect("release result");
     assert_eq!(release_result.succeeded, false);
-    assert_eq!(release_result.failure_stage.as_deref(), Some("commit_and_push"));
+    assert_eq!(
+        release_result.failure_stage.as_deref(),
+        Some("commit_and_push")
+    );
     assert!(release_result.commit_sha.is_none());
 }
 
@@ -600,7 +660,11 @@ async fn background_executor_persists_delivery_receipt_on_publish_failure() {
     .unwrap();
     stages::insert(
         &pool,
-        &make_stage(publish_stage_exec_id, run_id, "build_archive_and_push_connect"),
+        &make_stage(
+            publish_stage_exec_id,
+            run_id,
+            "build_archive_and_push_connect",
+        ),
     )
     .await
     .unwrap();
@@ -666,10 +730,18 @@ async fn background_executor_persists_delivery_receipt_on_publish_failure() {
     assert!(err.to_string().contains("unsupported release mode"));
 
     let persisted = artifacts::list_by_run(&pool, run_id).await.unwrap();
-    assert!(persisted.iter().any(|artifact| artifact.name == "release_manifest"));
-    assert!(persisted.iter().any(|artifact| artifact.name == "git_push_receipt"));
-    assert!(!persisted.iter().any(|artifact| artifact.name == "release_bundle_manifest"));
-    assert!(!persisted.iter().any(|artifact| artifact.name == "connect_upload_receipt"));
+    assert!(persisted
+        .iter()
+        .any(|artifact| artifact.name == "release_manifest"));
+    assert!(persisted
+        .iter()
+        .any(|artifact| artifact.name == "git_push_receipt"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "release_bundle_manifest"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "connect_upload_receipt"));
     let delivery = persisted
         .iter()
         .rev()
@@ -824,7 +896,12 @@ async fn advance_run_backfills_delivery_receipt_when_terminal_release_lineage_ex
         serde_json::from_str(&std::fs::read_to_string(&delivery.file_path).unwrap()).unwrap();
     assert_eq!(receipt.release_result.as_ref().unwrap().succeeded, true);
     assert_eq!(
-        receipt.release_result.as_ref().unwrap().commit_sha.as_deref(),
+        receipt
+            .release_result
+            .as_ref()
+            .unwrap()
+            .commit_sha
+            .as_deref(),
         Some("abc123")
     );
 }
@@ -880,11 +957,14 @@ async fn advance_run_does_not_backfill_delivery_receipt_without_release_lineage(
     assert!(executor.process_next_item().await.unwrap());
 
     let final_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
-    assert!(!final_artifacts.iter().any(|artifact| artifact.name == "delivery_receipt"));
+    assert!(!final_artifacts
+        .iter()
+        .any(|artifact| artifact.name == "delivery_receipt"));
 }
 
 #[tokio::test]
-async fn background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt() {
+async fn background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt(
+) {
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, _remote_dir) = init_release_repo(tmp.path());
@@ -954,9 +1034,15 @@ async fn background_executor_fails_closed_without_delivery_configuration_json_an
         .contains("Release agent requires delivery_configuration_json"));
 
     let persisted = artifacts::list_by_run(&pool, run_id).await.unwrap();
-    assert!(!persisted.iter().any(|artifact| artifact.name == "delivery_receipt"));
-    assert!(!persisted.iter().any(|artifact| artifact.name == "release_manifest"));
-    assert!(!persisted.iter().any(|artifact| artifact.name == "git_push_receipt"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "delivery_receipt"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "release_manifest"));
+    assert!(!persisted
+        .iter()
+        .any(|artifact| artifact.name == "git_push_receipt"));
 }
 
 #[tokio::test]
@@ -998,7 +1084,11 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
     .unwrap();
     stages::insert(
         &pool,
-        &make_stage(publish_stage_exec_id, run_id, "build_archive_and_push_connect"),
+        &make_stage(
+            publish_stage_exec_id,
+            run_id,
+            "build_archive_and_push_connect",
+        ),
     )
     .await
     .unwrap();
@@ -1057,8 +1147,8 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
 
     assert!(executor.process_next_item().await.unwrap());
 
-    let preexisting_receipt_path = Path::new(&repo_dir)
-        .join(".chainworks/release/delivery-receipt.json");
+    let preexisting_receipt_path =
+        Path::new(&repo_dir).join(".chainworks/release/delivery-receipt.json");
     std::fs::create_dir_all(preexisting_receipt_path.parent().unwrap()).unwrap();
     let sentinel_receipt = engine::release::receipt::DeliveryReceipt {
         run_id: run_id.to_string(),

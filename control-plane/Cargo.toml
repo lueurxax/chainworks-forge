@@ -3,6 +3,7 @@ members = [
     "crates/domain",
     "crates/db",
     "crates/acp",
+    "crates/auth",
     "crates/engine",
     "crates/graphql-server",
     "crates/mcp-server",

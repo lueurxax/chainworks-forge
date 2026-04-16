@@ -27,8 +27,7 @@ impl GeminiCliAdapter {
     /// Create a new adapter, resolving the binary from `CHAINWORKS_GEMINI_ACP_BINARY`
     /// or falling back to `gemini` on PATH.
     pub fn new() -> Self {
-        let binary_path = std::env::var(BINARY_ENV_VAR)
-            .unwrap_or_else(|_| "gemini".to_string());
+        let binary_path = std::env::var(BINARY_ENV_VAR).unwrap_or_else(|_| "gemini".to_string());
         Self { binary_path }
     }
 
@@ -77,9 +76,7 @@ impl AcpAdapter for GeminiCliAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| {
-                format!("spawn Gemini ACP subprocess: {} --acp", self.binary_path)
-            })?;
+            .with_context(|| format!("spawn Gemini ACP subprocess: {} --acp", self.binary_path))?;
 
         // Gemini uses bypassPermissions mode; no _meta block needed.
         // Pass the model from YAML backend_profile; Gemini CLI accepts

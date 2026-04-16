@@ -110,9 +110,7 @@ fn parse_artifact_row(r: &sqlx::sqlite::SqliteRow) -> Result<Artifact> {
         .parse::<uuid::Uuid>()
         .context("parse artifact run_id")?
         .into();
-    let format_val: ArtifactFormat = format_str
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let format_val: ArtifactFormat = format_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let created_at_dt: DateTime<Utc> = DateTime::parse_from_rfc3339(&created_at_str)
         .context("parse artifact created_at")?
         .with_timezone(&Utc);

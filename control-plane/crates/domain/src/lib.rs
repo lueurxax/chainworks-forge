@@ -1,14 +1,15 @@
-pub mod ids;
-pub mod idea;
-pub mod run;
-pub mod stage;
 pub mod agent;
 pub mod approval;
 pub mod artifact;
-pub mod session;
-pub mod validation;
 pub mod commands;
 pub mod events;
+pub mod idea;
+pub mod ids;
+pub mod run;
+pub mod session;
+pub mod stage;
+pub mod steward;
+pub mod validation;
 
 #[cfg(test)]
 mod tests {
@@ -27,8 +28,11 @@ mod tests {
     #[test]
     fn stage_status_roundtrip() {
         for s in &[
-            StageStatus::Pending, StageStatus::Running, StageStatus::Completed,
-            StageStatus::Failed, StageStatus::Skipped,
+            StageStatus::Pending,
+            StageStatus::Running,
+            StageStatus::Completed,
+            StageStatus::Failed,
+            StageStatus::Skipped,
         ] {
             let s2: StageStatus = s.to_string().parse().unwrap();
             assert_eq!(s, &s2);

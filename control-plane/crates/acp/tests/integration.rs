@@ -419,6 +419,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -438,6 +439,54 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         "discovered artifact must be result.json, got: {:?}",
         result.artifact_paths[0]
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_servers_session_new_serialization_tests() {
+    use acp::transport::{build_session_new_params, AcpSessionConfig};
+    use acp::{AcpMcpServerPayload, ExecutionRequest, ResolvedMcpServerTransport};
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_test".into(),
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: vec![AcpMcpServerPayload {
+            id: "fs-runtime".into(),
+            extension_id: "filesystem".into(),
+            transport: ResolvedMcpServerTransport::Stdio {
+                command: "mcp-filesystem".into(),
+                args: vec!["--root".into(), "/tmp".into()],
+                env: [("MCP_TOKEN".to_string(), "secret".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        }],
+    };
+
+    let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
+    let server = &captured["mcpServers"][0];
+    assert_eq!(server["id"], "fs-runtime");
+    assert_eq!(server["extensionId"], "filesystem");
+    assert_eq!(server["transport"]["type"], "stdio");
+    assert_eq!(server["transport"]["command"], "mcp-filesystem");
+    assert_eq!(server["transport"]["args"][0], "--root");
+    assert_eq!(server["transport"]["env"]["MCP_TOKEN"], "secret");
 }
 
 /// ClaudeAgentAdapter returns AgentStatus::Failed when the ACP session returns
@@ -472,6 +521,7 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -535,6 +585,7 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -576,12 +627,14 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
     assert_eq!(result.status, AgentStatus::Completed);
     assert!(
-        result.artifact_paths
+        result
+            .artifact_paths
             .iter()
             .any(|path| path.ends_with("canonical.json")),
         "expected overwritten canonical output to be reported: {:?}",
@@ -618,6 +671,7 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -650,7 +704,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
     let tmp = tempfile::tempdir().unwrap();
     let script = fixture::create_reuse_script(tmp.path());
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
-    let manager = AcpRuntimeManager::new_with_adapters(vec![Arc::new(adapter) as Arc<dyn AcpAdapter>]);
+    let manager =
+        AcpRuntimeManager::new_with_adapters(vec![Arc::new(adapter) as Arc<dyn AcpAdapter>]);
 
     let first_req = ExecutionRequest {
         run_id: RunId::new(),
@@ -669,6 +724,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -702,6 +758,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -750,6 +807,7 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        mcp_servers: Vec::new(),
     };
 
     let result = adapter.execute(req).await.unwrap();

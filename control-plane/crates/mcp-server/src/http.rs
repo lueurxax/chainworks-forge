@@ -43,31 +43,64 @@ async fn handle_mcp_post(
         return (StatusCode::BAD_REQUEST, "Empty body").into_response();
     }
 
+    // ── Resolve principal from Authorization header ──────────────────────
+    let principal = {
+        let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+        match auth_header {
+            Some(header_value) => match auth::extract_bearer_token(header_value) {
+                Ok(token) => match auth::resolve_bearer(token, &mcp.principal_table) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let resp = crate::protocol::JsonRpcResponse::error(
+                            None,
+                            -32000,
+                            "unauthorized".to_string(),
+                        );
+                        return json_response(StatusCode::OK, &resp, None);
+                    }
+                },
+                Err(_) => {
+                    let resp = crate::protocol::JsonRpcResponse::error(
+                        None,
+                        -32000,
+                        "unauthorized".to_string(),
+                    );
+                    return json_response(StatusCode::OK, &resp, None);
+                }
+            },
+            None => {
+                let resp = crate::protocol::JsonRpcResponse::error(
+                    None,
+                    -32000,
+                    "unauthorized".to_string(),
+                );
+                return json_response(StatusCode::OK, &resp, None);
+            }
+        }
+    };
+
     // Parse JSON-RPC request
     let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
         Ok(r) => r,
         Err(e) => {
-            let resp = crate::protocol::JsonRpcResponse::error(
-                None,
-                -32700,
-                format!("Parse error: {e}"),
-            );
+            let resp =
+                crate::protocol::JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
             return json_response(StatusCode::OK, &resp, None);
         }
     };
 
     let is_initialize = request.method == "initialize";
-    let is_notification = request.id.is_none()
-        || matches!(&request.id, Some(serde_json::Value::Null));
+    let is_notification =
+        request.id.is_none() || matches!(&request.id, Some(serde_json::Value::Null));
 
     // For notifications (no id), return 202 Accepted
     if is_notification {
-        let _ = mcp.handle_request(request).await;
+        let _ = mcp.handle_request(request, &principal).await;
         return StatusCode::ACCEPTED.into_response();
     }
 
     // Process the request
-    let response = mcp.handle_request(request).await;
+    let response = mcp.handle_request(request, &principal).await;
 
     // On initialize, generate a session ID
     let session_id = if is_initialize {

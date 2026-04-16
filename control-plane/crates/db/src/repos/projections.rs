@@ -1,9 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
+use domain::ids::RunId;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
-use domain::ids::RunId;
 
 // ---------------------------------------------------------------------------
 // Projection read types (ARCH-002 fix)
@@ -100,7 +100,10 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
 }
 
 /// List runs for a specific idea via the projection layer.
-pub async fn list_by_idea_projection(pool: &SqlitePool, idea_id: &str) -> Result<Vec<RunProjectionRow>> {
+pub async fn list_by_idea_projection(
+    pool: &SqlitePool,
+    idea_id: &str,
+) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
         r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
@@ -148,7 +151,10 @@ pub async fn list_by_idea_projection(pool: &SqlitePool, idea_id: &str) -> Result
 ///
 /// Primary table is `stage_executions`; `stage_summaries` is LEFT-JOINed so
 /// that stages whose projection hasn't been rebuilt yet are still returned.
-pub async fn list_stages_projection(pool: &SqlitePool, run_id: &str) -> Result<Vec<StageSummaryRow>> {
+pub async fn list_stages_projection(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<StageSummaryRow>> {
     let rows = sqlx::query(
         r#"SELECT se.id, se.run_id, se.stage_id, se.label, se.iteration, se.settlement_kind,
                   se.started_at, se.completed_at,
@@ -192,7 +198,10 @@ pub async fn list_stages_projection(pool: &SqlitePool, run_id: &str) -> Result<V
 /// LEFT-JOINs `run_summaries` so that a run whose projection hasn't been
 /// rebuilt yet is still returned (with zero counts). Returns `None` only if
 /// the run does not exist in the canonical `runs` table.
-pub async fn find_run_projection(pool: &SqlitePool, run_id: &str) -> Result<Option<RunProjectionRow>> {
+pub async fn find_run_projection(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<RunProjectionRow>> {
     let row = sqlx::query(
         r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
@@ -272,13 +281,11 @@ pub async fn rebuild_run_summary(pool: &SqlitePool, run_id: RunId) -> Result<()>
     .await?
     .and_then(|log| build_cancellation_settlement_summary(&log));
 
-    sqlx::query(
-        "UPDATE run_summaries SET cancellation_settlement_summary = ?1 WHERE run_id = ?2",
-    )
-    .bind(settlement_summary)
-    .bind(run_id.to_string())
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE run_summaries SET cancellation_settlement_summary = ?1 WHERE run_id = ?2")
+        .bind(settlement_summary)
+        .bind(run_id.to_string())
+        .execute(pool)
+        .await?;
 
     info!(run_id = %run_id, "Rebuilt run_summary projection");
     Ok(())
@@ -297,7 +304,12 @@ fn build_cancellation_settlement_summary(raw: &str) -> Option<String> {
     let total_count = entries.len();
     let close_ok = entries
         .iter()
-        .filter(|entry| entry.get("session_close_succeeded").and_then(|v| v.as_bool()) == Some(true))
+        .filter(|entry| {
+            entry
+                .get("session_close_succeeded")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        })
         .count();
 
     Some(format!(
@@ -429,7 +441,10 @@ pub async fn list_pending_inbox_projection(pool: &SqlitePool) -> Result<Vec<Appr
 ///
 /// Reads from `artifact_index` (projection) and JOINs with `artifacts` for
 /// full field set. The projection's `is_pinned` is authoritative.
-pub async fn list_artifacts_projection(pool: &SqlitePool, run_id: &str) -> Result<Vec<ArtifactIndexRow>> {
+pub async fn list_artifacts_projection(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<ArtifactIndexRow>> {
     let rows = sqlx::query(
         r#"SELECT ai.artifact_id AS id, ai.run_id, ai.stage_id, a.agent_id, ai.name,
                   a.contract_id, ai.format, ai.file_path, a.checksum_sha256, a.size_bytes,

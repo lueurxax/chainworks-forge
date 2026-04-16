@@ -49,21 +49,27 @@ impl WorktreeProvisioner {
         let base_branch = base_branch_override.unwrap_or("main").to_string();
         let base_revision = run_git(&["rev-parse", &base_branch], ws)
             .await
-            .with_context(|| format!("Base branch '{}' not found in {}", base_branch, workspace_root))?
+            .with_context(|| {
+                format!(
+                    "Base branch '{}' not found in {}",
+                    base_branch, workspace_root
+                )
+            })?
             .trim()
             .to_string();
 
         if base_revision.is_empty() {
-            anyhow::bail!("Could not resolve base branch '{}' to a commit", base_branch);
+            anyhow::bail!(
+                "Could not resolve base branch '{}' to a commit",
+                base_branch
+            );
         }
 
         // Step 3: Compute naming
         let slug = sanitize_slug(idea_title);
         let short_id = &run_id.to_string()[..8];
         let worktree_dir_name = format!("cw-{slug}-{short_id}");
-        let worktree_root = format!(
-            "{workspace_root}/.chainworks/worktrees/{worktree_dir_name}"
-        );
+        let worktree_root = format!("{workspace_root}/.chainworks/worktrees/{worktree_dir_name}");
         let target_branch = format!("cw/{slug}/{short_id}");
 
         // Idempotent: if path exists, verify and return existing data
@@ -166,10 +172,7 @@ pub struct SourceContext {
 
 /// Build source context from the current worktree state.
 /// Returns changed files and diff summary relative to the base branch.
-pub async fn build_source_context(
-    worktree_root: &str,
-    base_branch: &str,
-) -> Result<SourceContext> {
+pub async fn build_source_context(worktree_root: &str, base_branch: &str) -> Result<SourceContext> {
     let wt = Path::new(worktree_root);
 
     let changed_files_output = run_git(&["diff", "--name-only", base_branch], wt)
@@ -205,8 +208,9 @@ impl RepoSafetyGuard {
     /// Validate that a provisioned worktree exists and is ready for use.
     /// Called before launching a write-enabled agent session.
     pub fn validate_worktree_ready(worktree_root: Option<&str>) -> Result<()> {
-        let wt = worktree_root
-            .ok_or_else(|| anyhow::anyhow!("Write-enabled agent requires a provisioned worktree but none is set"))?;
+        let wt = worktree_root.ok_or_else(|| {
+            anyhow::anyhow!("Write-enabled agent requires a provisioned worktree but none is set")
+        })?;
         if wt.is_empty() {
             anyhow::bail!("Write-enabled agent has empty worktree_root");
         }
@@ -243,8 +247,8 @@ impl RepoSafetyGuard {
 
         // Check worktree boundary
         if let Some(wt) = worktree_root {
-            let wt_canon = std::fs::canonicalize(wt)
-                .unwrap_or_else(|_| std::path::PathBuf::from(wt));
+            let wt_canon =
+                std::fs::canonicalize(wt).unwrap_or_else(|_| std::path::PathBuf::from(wt));
             let wt_str = wt_canon.to_string_lossy();
             if resolved_str.starts_with(wt_str.as_ref()) {
                 return Ok(());
@@ -311,7 +315,11 @@ async fn run_git(args: &[&str], dir: &Path) -> Result<String> {
             "git {} failed (exit {}): {}",
             args.join(" "),
             output.status,
-            if stderr.trim().is_empty() { stdout.to_string() } else { stderr.to_string() }
+            if stderr.trim().is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            }
         );
     }
 

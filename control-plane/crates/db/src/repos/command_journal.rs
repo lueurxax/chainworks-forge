@@ -13,16 +13,24 @@ pub async fn record(
     payload_json: &str,
     run_id: Option<&str>,
     created_at: DateTime<Utc>,
+    caller_surface: Option<&str>,
+    caller_principal_id: Option<&str>,
+    caller_principal_class: Option<&str>,
+    caller_tool: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at)
-           VALUES (?1, ?2, ?3, 'pending', ?4, ?5)"#,
+        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool)
+           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9)"#,
     )
     .bind(id)
     .bind(command_type)
     .bind(payload_json)
     .bind(run_id)
     .bind(created_at.to_rfc3339())
+    .bind(caller_surface)
+    .bind(caller_principal_id)
+    .bind(caller_principal_class)
+    .bind(caller_tool)
     .execute(pool)
     .await
     .context("record command journal entry")?;
@@ -30,7 +38,11 @@ pub async fn record(
 }
 
 /// Mark a journal entry as successfully completed.
-pub async fn complete_entry(pool: &SqlitePool, id: &str, completed_at: DateTime<Utc>) -> Result<()> {
+pub async fn complete_entry(
+    pool: &SqlitePool,
+    id: &str,
+    completed_at: DateTime<Utc>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE command_journal SET result_status = 'completed', completed_at = ?1 WHERE id = ?2",
     )

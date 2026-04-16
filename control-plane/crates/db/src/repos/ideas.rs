@@ -13,14 +13,15 @@ pub async fn insert(pool: &SqlitePool, idea: &Idea) -> Result<()> {
 
     sqlx::query(
         r#"
-        INSERT INTO ideas (id, title, body, workspace_root_path, status, created_at, archived_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO ideas (id, title, body, workspace_root_path, project_key, status, created_at, archived_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
     )
     .bind(id)
     .bind(&idea.title)
     .bind(&idea.body)
     .bind(&idea.workspace_root_path)
+    .bind(&idea.project_key)
     .bind(status)
     .bind(created_at)
     .bind(archived_at)
@@ -33,7 +34,7 @@ pub async fn insert(pool: &SqlitePool, idea: &Idea) -> Result<()> {
 pub async fn find_by_id(pool: &SqlitePool, id: IdeaId) -> Result<Option<Idea>> {
     let id_str = id.to_string();
     let row = sqlx::query(
-        r#"SELECT id, title, body, workspace_root_path, status, created_at, archived_at
+        r#"SELECT id, title, body, workspace_root_path, project_key, status, created_at, archived_at
            FROM ideas WHERE id = ?1"#,
     )
     .bind(id_str)
@@ -47,6 +48,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: IdeaId) -> Result<Option<Idea>> {
             r.get("title"),
             r.get("body"),
             r.get("workspace_root_path"),
+            r.get("project_key"),
             r.get("status"),
             r.get("created_at"),
             r.get("archived_at"),
@@ -58,7 +60,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: IdeaId) -> Result<Option<Idea>> {
 pub async fn list(pool: &SqlitePool, include_archived: bool) -> Result<Vec<Idea>> {
     let rows = if include_archived {
         sqlx::query(
-            r#"SELECT id, title, body, workspace_root_path, status, created_at, archived_at
+            r#"SELECT id, title, body, workspace_root_path, project_key, status, created_at, archived_at
                FROM ideas ORDER BY created_at DESC"#,
         )
         .fetch_all(pool)
@@ -66,7 +68,7 @@ pub async fn list(pool: &SqlitePool, include_archived: bool) -> Result<Vec<Idea>
         .context("list ideas")?
     } else {
         sqlx::query(
-            r#"SELECT id, title, body, workspace_root_path, status, created_at, archived_at
+            r#"SELECT id, title, body, workspace_root_path, project_key, status, created_at, archived_at
                FROM ideas WHERE status != 'archived' ORDER BY created_at DESC"#,
         )
         .fetch_all(pool)
@@ -81,6 +83,7 @@ pub async fn list(pool: &SqlitePool, include_archived: bool) -> Result<Vec<Idea>
                 r.get("title"),
                 r.get("body"),
                 r.get("workspace_root_path"),
+                r.get("project_key"),
                 r.get("status"),
                 r.get("created_at"),
                 r.get("archived_at"),
@@ -115,6 +118,7 @@ fn parse_idea_row(
     title: String,
     body: String,
     workspace_root_path: Option<String>,
+    project_key: Option<String>,
     status: String,
     created_at: String,
     archived_at: Option<String>,
@@ -137,6 +141,7 @@ fn parse_idea_row(
         title,
         body,
         workspace_root_path,
+        project_key,
         status: idea_status,
         created_at: created_at_dt,
         archived_at: archived_at_dt,

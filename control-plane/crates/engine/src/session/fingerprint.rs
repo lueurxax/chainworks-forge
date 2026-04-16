@@ -84,8 +84,7 @@ fn sha256_hex(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_fingerprint, invocation_owner_key, BindingFingerprintInput,
-        InvocationOwnerKeyInput,
+        binding_fingerprint, invocation_owner_key, BindingFingerprintInput, InvocationOwnerKeyInput,
     };
 
     #[test]
@@ -126,7 +125,10 @@ mod tests {
     #[test]
     fn binding_fingerprint_changes_when_prompt_or_io_contract_changes() {
         let outputs_a = vec!["proposal.md".to_string()];
-        let outputs_b = vec!["proposal.md".to_string(), "proposal_review_summary.json".to_string()];
+        let outputs_b = vec![
+            "proposal.md".to_string(),
+            "proposal_review_summary.json".to_string(),
+        ];
         let inputs = vec!["idea.md".to_string()];
         let mcp = vec!["filesystem".to_string()];
 

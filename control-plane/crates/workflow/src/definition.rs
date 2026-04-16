@@ -5,11 +5,11 @@
 //! compilation is modeled; presentation-only fields are ignored via
 //! `deny_unknown_fields` being OFF.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::Deserialize;
 
 /// Root of a workflow YAML file.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowFile {
     pub schema_version: Option<u32>,
     pub workflow: Option<WorkflowMeta>,
@@ -21,11 +21,14 @@ pub struct WorkflowFile {
     pub failure_policy: Option<serde_yaml::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowMeta {
     pub id: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub family: Option<String>,
+    pub risk_class: Option<String>,
+    pub stack: Option<String>,
     pub uses_agent_catalog: Option<String>,
     pub required_providers: Option<Vec<String>>,
     pub execution: Option<serde_yaml::Value>,
@@ -33,7 +36,7 @@ pub struct WorkflowMeta {
 }
 
 /// A single state in the workflow state machine.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowState {
     pub label: String,
     /// "start", "end", "manual_gate", or absent (regular compute state).
@@ -74,7 +77,7 @@ impl WorkflowState {
 }
 
 /// The execution block within a state: sequential, parallel, or fan-out/fan-in.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RunBlock {
     pub sequence: Option<Vec<AgentTask>>,
     pub parallel: Option<Vec<AgentTask>>,
@@ -83,7 +86,7 @@ pub struct RunBlock {
 }
 
 /// A single agent invocation within a run block.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentTask {
     pub agent: String,
     pub task: String,
@@ -92,7 +95,7 @@ pub struct AgentTask {
 }
 
 /// A transition to another state, guarded by a condition.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Transition {
     pub to: String,
     /// Condition expression: `"true"`, `exists('artifact')`, `field == value`, etc.
@@ -100,7 +103,7 @@ pub struct Transition {
 }
 
 /// Loop configuration for revision cycles.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LoopConfig {
     /// Name of the counter variable (e.g. `proposal_revision_count`).
     pub counter: String,

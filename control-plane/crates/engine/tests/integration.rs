@@ -2,21 +2,29 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{agent_executions, approvals, artifacts, ideas, runs, sessions, stages, work_items};
-use domain::approval::{Approval, ApprovalDecision};
-use domain::commands::{ApproveStageCmd, Command, RejectStageCmd, RetryStageCmd, StartRunCmd};
+use db::repos::{
+    agent_executions, approvals, artifacts, ideas, runs, sessions, stages, work_items,
+};
 use domain::agent::{AgentExecution, AgentStatus};
+use domain::approval::{Approval, ApprovalDecision};
+use domain::commands::{
+    ApproveStageCmd, CallerContext, Command, RejectStageCmd, RetryStageCmd, RunStewardAnalysisCmd,
+    StartRunCmd,
+};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
+use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
 
 async fn test_pool() -> sqlx::SqlitePool {
-    create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+    create_pool("sqlite::memory:")
+        .await
+        .expect("in-memory pool failed")
 }
 
 fn make_idea(id: IdeaId) -> Idea {
@@ -25,6 +33,7 @@ fn make_idea(id: IdeaId) -> Idea {
         title: "Test idea".into(),
         body: "body".into(),
         workspace_root_path: None,
+        project_key: None,
         status: IdeaStatus::Active,
         created_at: Utc::now(),
         archived_at: None,
@@ -53,7 +62,62 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     }
+}
+
+fn steward_test_runtime_inputs() -> engine::steward::config::StewardRuntimeInputs {
+    let mut config = engine::steward::config::StewardConfig::default_config();
+    config.windows.observation_window_size = 5;
+    config.windows.baseline_window_size = 5;
+    config.windows.minimum_window_size = 5;
+    engine::steward::config::synthetic_runtime_inputs(
+        config,
+        serde_json::json!({
+            "schema_version": 1,
+            "agents": [{"id": "system_steward"}, {"id": "steward_auditor"}],
+            "artifacts": {
+                "metrics_window": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/metrics-window.json"
+            }
+        }),
+    )
+    .unwrap()
+}
+
+fn analysis_root(base: &std::path::Path, analysis_id: &str) -> std::path::PathBuf {
+    base.join("steward").join("analyses").join(analysis_id)
+}
+
+async fn insert_steward_completed_run(
+    pool: &sqlx::SqlitePool,
+    idea_id: IdeaId,
+    completed_at: chrono::DateTime<Utc>,
+    lead_time_seconds: i64,
+) -> RunId {
+    let run_id = RunId::new();
+    let mut run = make_run(run_id, idea_id, RunStatus::Completed);
+    run.workflow_family = Some("mvp_live".into());
+    run.project_key = Some("crypto-savings".into());
+    run.risk_class = Some("high".into());
+    run.stack = Some("swiftui".into());
+    run.workflow_snapshot_hash = Some("a".repeat(64));
+    run.catalog_snapshot_hash = Some("b".repeat(64));
+    run.workflow_snapshot_json = Some(r#"{"workflow":{"id":"mvp_live"}}"#.into());
+    run.catalog_snapshot_json = Some(r#"{"agents":[]}"#.into());
+    run.started_at = completed_at - chrono::Duration::seconds(lead_time_seconds);
+    run.completed_at = Some(completed_at);
+    runs::insert(pool, &run).await.unwrap();
+    run_id
 }
 
 fn make_stage(id: StageExecutionId, run_id: RunId, status: StageStatus) -> StageExecution {
@@ -72,6 +136,10 @@ fn make_stage(id: StageExecutionId, run_id: RunId, status: StageStatus) -> Stage
         provider: None,
         model: None,
         stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
     }
 }
 
@@ -108,7 +176,10 @@ fn test_agent_catalog_yaml_path() -> String {
     )
 }
 
-fn make_agent_execution(stage_execution_id: StageExecutionId, status: AgentStatus) -> AgentExecution {
+fn make_agent_execution(
+    stage_execution_id: StageExecutionId,
+    status: AgentStatus,
+) -> AgentExecution {
     AgentExecution {
         id: AgentExecutionId::new(),
         stage_execution_id,
@@ -127,6 +198,16 @@ fn make_agent_execution(stage_execution_id: StageExecutionId, status: AgentStatu
         session_family_id: None,
         session_reuse_disposition: None,
         session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        mcp_session_startup_latency_ms: None,
     }
 }
 
@@ -139,7 +220,7 @@ fn make_agent_execution(stage_execution_id: StageExecutionId, status: AgentStatu
 /// RecoveryService must mark stuck-Running stages as Blocked and re-enqueue
 /// AdvanceRun, mirroring Swift ResumeManager.normalizeInterruptedRunsForManualResume.
 #[tokio::test]
-async fn test_startup_repair_clears_stuck_running_stage() {
+async fn steward_drift_tests_startup_repair_clears_stuck_running_stage_and_marks_drift() {
     let pool = test_pool().await;
 
     let idea_id = IdeaId::new();
@@ -147,8 +228,12 @@ async fn test_startup_repair_clears_stuck_running_stage() {
     let stage_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
-    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running))
+        .await
+        .unwrap();
 
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
@@ -156,9 +241,15 @@ async fn test_startup_repair_clears_stuck_running_stage() {
 
     let summary = recovery.run_startup_repair().await.unwrap();
 
-    assert_eq!(summary.runs_inspected, 1, "one active run must be inspected");
+    assert_eq!(
+        summary.runs_inspected, 1,
+        "one active run must be inspected"
+    );
     assert_eq!(summary.runs_repaired, 1, "stuck run must be repaired");
-    assert!(summary.work_items_requeued >= 1, "at least one AdvanceRun must be re-enqueued");
+    assert!(
+        summary.work_items_requeued >= 1,
+        "at least one AdvanceRun must be re-enqueued"
+    );
 
     let repaired_stage = stages::find_by_id(&pool, stage_id).await.unwrap().unwrap();
     assert_eq!(
@@ -166,6 +257,15 @@ async fn test_startup_repair_clears_stuck_running_stage() {
         StageStatus::Blocked,
         "stage stuck in Running must become Blocked after startup repair"
     );
+    let repaired_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert!(
+        repaired_run.drift_detected_at.is_some(),
+        "startup recovery drift classification must persist run-owned drift timestamp"
+    );
+    let drift_details: serde_json::Value =
+        serde_json::from_str(&repaired_run.drift_details_json.unwrap()).unwrap();
+    assert_eq!(drift_details["source"], "startup_repair");
+    assert_eq!(drift_details["reason"], "stage_stuck_running");
 }
 
 /// A run with no stuck stages must not be counted as repaired.
@@ -178,14 +278,13 @@ async fn test_startup_repair_skips_clean_runs() {
     let stage_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
     // Stage is already Completed — nothing to repair.
-    stages::insert(
-        &pool,
-        &make_stage(stage_id, run_id, StageStatus::Completed),
-    )
-    .await
-    .unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
 
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
@@ -194,8 +293,14 @@ async fn test_startup_repair_skips_clean_runs() {
     let summary = recovery.run_startup_repair().await.unwrap();
 
     assert_eq!(summary.runs_inspected, 1);
-    assert_eq!(summary.runs_repaired, 1, "active run with completed stage needs catchup AdvanceRun");
-    assert_eq!(summary.work_items_requeued, 1, "one AdvanceRun must be re-enqueued for startup catchup");
+    assert_eq!(
+        summary.runs_repaired, 1,
+        "active run with completed stage needs catchup AdvanceRun"
+    );
+    assert_eq!(
+        summary.work_items_requeued, 1,
+        "one AdvanceRun must be re-enqueued for startup catchup"
+    );
 
     let unchanged_stage = stages::find_by_id(&pool, stage_id).await.unwrap().unwrap();
     assert_eq!(
@@ -216,8 +321,12 @@ async fn test_startup_repair_recommendation_includes_execution_session_provenanc
     let stage_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
-    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running))
+        .await
+        .unwrap();
 
     let mut execution = make_agent_execution(stage_id, AgentStatus::Running);
     execution.session_reuse_disposition = Some("fresh_after_reset".into());
@@ -261,11 +370,21 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
     let stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
-    stages::insert(&pool, &make_stage(stage_exec_id, run_id, StageStatus::Running)).await.unwrap();
-    agent_executions::insert(&pool, &make_agent_execution(stage_exec_id, AgentStatus::Running))
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
         .await
         .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Running),
+    )
+    .await
+    .unwrap();
+    agent_executions::insert(
+        &pool,
+        &make_agent_execution(stage_exec_id, AgentStatus::Running),
+    )
+    .await
+    .unwrap();
 
     work_items::enqueue(
         &pool,
@@ -287,7 +406,10 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::CancelRun(domain::commands::CancelRunCmd { run_id }))
+        .handle(
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
@@ -302,14 +424,19 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
     assert_eq!(entries.as_array().unwrap().len(), 1);
     assert!(entries[0]["session_close_succeeded"].is_null());
 
-    let executions = agent_executions::find_by_stage(&pool, stage_exec_id).await.unwrap();
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
     assert_eq!(executions[0].status, AgentStatus::Cancelled);
     assert!(executions[0].completed_at.is_some());
 
     let items = work_items::list_by_run(&pool, run_id).await.unwrap();
     assert_eq!(items[0].status, db::work_item::WorkItemStatus::Cancelled);
 
-    let stage = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stage.status, StageStatus::Failed);
 }
 
@@ -322,7 +449,9 @@ async fn test_invoke_agent_uses_stage_execution_id_as_owner_execution_lineage() 
     let stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
     stage.stage_id = "owner_branch_stage".into();
     stages::insert(&pool, &stage).await.unwrap();
@@ -368,15 +497,28 @@ async fn test_cancel_run_eventually_finalizes_to_cancelled() {
     let stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
-    stages::insert(&pool, &make_stage(stage_exec_id, run_id, StageStatus::Running)).await.unwrap();
-    agent_executions::insert(&pool, &make_agent_execution(stage_exec_id, AgentStatus::Running))
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
         .await
         .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Running),
+    )
+    .await
+    .unwrap();
+    agent_executions::insert(
+        &pool,
+        &make_agent_execution(stage_exec_id, AgentStatus::Running),
+    )
+    .await
+    .unwrap();
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::CancelRun(domain::commands::CancelRunCmd { run_id }))
+        .handle(
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
@@ -397,7 +539,10 @@ async fn test_cancel_run_eventually_finalizes_to_cancelled() {
         .as_ref()
         .expect("settlement log");
     let entries: serde_json::Value = serde_json::from_str(log).unwrap();
-    assert_eq!(entries[0]["session_close_attempted"], serde_json::json!(false));
+    assert_eq!(
+        entries[0]["session_close_attempted"],
+        serde_json::json!(false)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +565,9 @@ async fn test_approve_stage_resolves_approval_and_advances_stage() {
     let stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
 
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
     stage.stage_id = "review_stage".into();
@@ -431,16 +578,22 @@ async fn test_approve_stage_resolves_approval_and_advances_stage() {
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::ApproveStage(ApproveStageCmd {
-            run_id,
-            stage_id: "review_stage".into(),
-            comment: Some("LGTM".into()),
-        }))
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "review_stage".into(),
+                comment: Some("LGTM".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
     // Approval must now be Granted.
-    let resolved = approvals::find_by_id(&pool, approval.id).await.unwrap().unwrap();
+    let resolved = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         resolved.decision,
         ApprovalDecision::Granted,
@@ -449,7 +602,10 @@ async fn test_approve_stage_resolves_approval_and_advances_stage() {
     assert!(resolved.decided_at.is_some(), "decided_at must be set");
 
     // Stage must have transitioned to Running.
-    let updated_stage = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let updated_stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         updated_stage.status,
         StageStatus::Running,
@@ -468,7 +624,9 @@ async fn test_reject_stage_resolves_approval_and_blocks_stage() {
     let stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
 
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
     stage.stage_id = "gated_stage".into();
@@ -479,16 +637,22 @@ async fn test_reject_stage_resolves_approval_and_blocks_stage() {
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::RejectStage(RejectStageCmd {
-            run_id,
-            stage_id: "gated_stage".into(),
-            comment: Some("Not ready".into()),
-        }))
+        .handle(
+            Command::RejectStage(RejectStageCmd {
+                run_id,
+                stage_id: "gated_stage".into(),
+                comment: Some("Not ready".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
     // Approval must now be Rejected.
-    let resolved = approvals::find_by_id(&pool, approval.id).await.unwrap().unwrap();
+    let resolved = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         resolved.decision,
         ApprovalDecision::Rejected,
@@ -496,7 +660,10 @@ async fn test_reject_stage_resolves_approval_and_blocks_stage() {
     );
 
     // Stage must have transitioned to Blocked.
-    let updated_stage = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let updated_stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         updated_stage.status,
         StageStatus::Blocked,
@@ -515,7 +682,9 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
     let old_stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
 
     let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
     stage.stage_id = "flaky_stage".into();
@@ -524,15 +693,21 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::RetryStage(RetryStageCmd {
-            run_id,
-            stage_id: "flaky_stage".into(),
-        }))
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "flaky_stage".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
     // Old stage must be settled as Skipped.
-    let old = stages::find_by_id(&pool, old_stage_exec_id).await.unwrap().unwrap();
+    let old = stages::find_by_id(&pool, old_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         old.status,
         StageStatus::Skipped,
@@ -568,39 +743,1036 @@ async fn test_start_run_persists_delivery_configuration_json() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let handler = make_command_handler(pool.clone());
-    let delivery_configuration_json = Some(
-        r#"{"repo_identifier":"repo-1","repo_root":"/repo","base_branch":"main","worktree_base_path":"/tmp/worktrees","target_branch":"cw/release"}"#
-            .to_string(),
-    );
+    let repo = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch", "main"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git init should run");
+    let worktrees = tempfile::tempdir().unwrap();
+    let delivery_configuration_json = Some(format!(
+        r#"{{
+            "repo_identifier":"repo-1",
+            "repo_root":"{}",
+            "base_branch":"main",
+            "worktree_base_path":"{}",
+            "target_branch":"cw/release",
+            "release_target_id":"app-store"
+        }}"#,
+        repo.path().display(),
+        worktrees.path().display()
+    ));
 
-    let result = handler
-        .handle(Command::StartRun(StartRunCmd {
-            idea_id,
-            workflow_id: "wf-start".into(),
-            workflow_title: "Start Run".into(),
-            workspace_root: "/tmp/ws".into(),
-            artifact_root: "/tmp/art".into(),
-            workflow_yaml_path: test_workflow_yaml_path(),
-            agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
-            delivery_configuration_json: delivery_configuration_json.clone(),
-        }))
+    let commanded = handler
+        .handle(
+            Command::StartRun(StartRunCmd {
+                idea_id,
+                workflow_id: "wf-start".into(),
+                workflow_title: "Start Run".into(),
+                workspace_root: "/tmp/ws".into(),
+                artifact_root: "/tmp/art".into(),
+                workflow_yaml_path: test_workflow_yaml_path(),
+                agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
+                delivery_configuration_json: delivery_configuration_json.clone(),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
-    let run_id = match result {
+    let run_id = match commanded.result {
         engine::command_handler::CommandResult::RunStarted { run_id } => run_id,
         _ => panic!("unexpected command result"),
     };
 
     let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
     assert_eq!(run.delivery_configuration_json, delivery_configuration_json);
+    assert_eq!(
+        run.workflow_family.as_deref(),
+        Some("proposal_to_release"),
+        "new runs must freeze workflow family from parsed workflow metadata with id fallback"
+    );
+    assert_eq!(run.project_key.as_deref(), Some("untagged"));
+    assert_eq!(run.risk_class.as_deref(), Some("standard"));
+    assert_eq!(run.stack.as_deref(), Some("unknown"));
+    assert_eq!(
+        run.workflow_snapshot_hash.as_deref().map(str::len),
+        Some(64)
+    );
+    assert_eq!(run.catalog_snapshot_hash.as_deref().map(str::len), Some(64));
+    assert!(run
+        .workflow_snapshot_json
+        .as_deref()
+        .unwrap_or_default()
+        .contains("proposal_to_release"));
+    assert!(run
+        .catalog_snapshot_json
+        .as_deref()
+        .unwrap_or_default()
+        .contains("backend_profiles"));
+}
+
+#[tokio::test]
+async fn steward_pipeline_tests_persists_analysis_and_deterministic_artifacts() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let completed_at = Utc::now();
+
+    for idx in 0..10 {
+        let mut run = make_run(RunId::new(), idea_id, RunStatus::Completed);
+        run.workflow_family = Some("mvp_live".into());
+        run.project_key = Some("crypto-savings".into());
+        run.risk_class = Some("high".into());
+        run.stack = Some("swiftui".into());
+        run.workflow_snapshot_hash = Some("a".repeat(64));
+        run.catalog_snapshot_hash = Some("b".repeat(64));
+        run.workflow_snapshot_json = Some(r#"{"workflow":{"id":"mvp_live"}}"#.into());
+        run.catalog_snapshot_json = Some(r#"{"agents":[]}"#.into());
+        run.completed_at = Some(completed_at - chrono::Duration::seconds(idx));
+        runs::insert(&pool, &run).await.unwrap();
+    }
+
+    let mut legacy = make_run(RunId::new(), idea_id, RunStatus::Completed);
+    legacy.completed_at = Some(completed_at - chrono::Duration::seconds(20));
+    runs::insert(&pool, &legacy).await.unwrap();
+
+    let artifact_base = tempfile::tempdir().unwrap();
+    let runtime_inputs = steward_test_runtime_inputs();
+    let analysis = engine::steward::run_steward_analysis(
+        &pool,
+        &runtime_inputs,
+        engine::steward::StewardAnalysisRequest::manual(artifact_base.path()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(analysis.status.to_string(), "completed");
+    assert_eq!(analysis.cohort_quality.to_string(), "strong");
+    assert_eq!(analysis.run_count, 5);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&analysis.cohort_keys_json).unwrap(),
+        serde_json::json!({
+            "risk_class": "high",
+            "workflow_family": "mvp_live"
+        })
+    );
+    assert_eq!(
+        analysis.agent_catalog_snapshot_hash,
+        runtime_inputs.agent_catalog_hash
+    );
+    assert_eq!(
+        analysis.steward_config_snapshot_hash,
+        runtime_inputs.steward_config_hash
+    );
+
+    let persisted = db::repos::steward::find_analysis(&pool, &analysis.id)
+        .await
+        .unwrap()
+        .expect("analysis should persist");
+    assert_eq!(
+        persisted.metrics_snapshot_artifact_id,
+        analysis.metrics_snapshot_artifact_id
+    );
+
+    let root = analysis_root(artifact_base.path(), &analysis.id);
+    let metrics_path = root
+        .join("active-catalog-io")
+        .join("steward")
+        .join("metrics-window.json");
+    let metrics_json = std::fs::read_to_string(metrics_path).unwrap();
+    let metrics: serde_json::Value = serde_json::from_str(&metrics_json).unwrap();
+    assert_eq!(metrics["run_count"], 5);
+    assert_eq!(metrics["legacy_pre_p049_excluded_count"], 1);
+
+    let workflow_snapshot_path = root
+        .join("active-catalog-io")
+        .join("steward")
+        .join("workflow-snapshot.json");
+    let workflow_snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workflow_snapshot_path).unwrap()).unwrap();
+    assert_eq!(
+        workflow_snapshot["primary_workflow_family"],
+        serde_json::json!("mvp_live")
+    );
+    assert_eq!(workflow_snapshot["snapshot_count"], serde_json::json!(1));
+    assert!(
+        root.join("active-catalog-io")
+            .join("steward")
+            .join("catalog-snapshot.json")
+            .exists(),
+        "analysis must materialize current daemon-owned catalog snapshot"
+    );
+}
+
+#[tokio::test]
+async fn steward_pipeline_tests_persists_failed_analysis_when_deterministic_slice_errors() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let completed_at = Utc::now();
+    let mut run = make_run(RunId::new(), idea_id, RunStatus::Completed);
+    run.workflow_family = Some("mvp_live".into());
+    run.project_key = Some("crypto-savings".into());
+    run.risk_class = Some("high".into());
+    run.stack = Some("swiftui".into());
+    run.workflow_snapshot_hash = Some("a".repeat(64));
+    run.catalog_snapshot_hash = Some("b".repeat(64));
+    run.workflow_snapshot_json = Some("{not-json".into());
+    run.catalog_snapshot_json = Some(r#"{"agents":[]}"#.into());
+    run.completed_at = Some(completed_at);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let result = engine::steward::run_steward_analysis(
+        &pool,
+        &steward_test_runtime_inputs(),
+        engine::steward::StewardAnalysisRequest::manual(tempfile::tempdir().unwrap().path()),
+    )
+    .await;
+
+    assert!(result.is_err());
+    let failed = db::repos::steward::list_analyses(
+        &pool,
+        10,
+        Some(domain::steward::StewardAnalysisStatus::Failed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert!(failed[0]
+        .error_summary
+        .as_deref()
+        .unwrap_or_default()
+        .contains("parse workflow snapshot"));
+}
+
+#[tokio::test]
+async fn steward_pipeline_tests_detects_degradation_and_persists_recommendation() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let completed_at = Utc::now();
+
+    for idx in 0..5 {
+        insert_steward_completed_run(
+            &pool,
+            idea_id,
+            completed_at - chrono::Duration::seconds(idx),
+            200,
+        )
+        .await;
+    }
+    for idx in 5..10 {
+        insert_steward_completed_run(
+            &pool,
+            idea_id,
+            completed_at - chrono::Duration::seconds(idx),
+            100,
+        )
+        .await;
+    }
+
+    let mut runtime_inputs = steward_test_runtime_inputs();
+    runtime_inputs.steward_config.thresholds.insert(
+        "lead_time_median_seconds".into(),
+        engine::steward::config::StewardThreshold {
+            method: "median_percentage".into(),
+            trigger: 0.2,
+        },
+    );
+
+    let artifact_base = tempfile::tempdir().unwrap();
+    let analysis = engine::steward::run_steward_analysis(
+        &pool,
+        &runtime_inputs,
+        engine::steward::StewardAnalysisRequest::manual(artifact_base.path()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(analysis.degradation_count, 1);
+    let recommendations = db::repos::steward::list_recommendations(&pool, &analysis.id)
+        .await
+        .unwrap();
+    assert_eq!(recommendations.len(), 1);
+    assert_eq!(recommendations[0].target_metric, "lead_time_median_seconds");
+
+    let alerts_path =
+        analysis_root(artifact_base.path(), &analysis.id).join("degradation-alerts.json");
+    let alerts_json = std::fs::read_to_string(&alerts_path).unwrap();
+    assert!(
+        !alerts_json.contains("analysis_id"),
+        "deterministic alert artifacts must not embed random analysis ids"
+    );
+    let second = engine::steward::run_steward_analysis(
+        &pool,
+        &runtime_inputs,
+        engine::steward::StewardAnalysisRequest::manual(artifact_base.path()),
+    )
+    .await
+    .unwrap();
+    let second_alerts_json = std::fs::read_to_string(
+        analysis_root(artifact_base.path(), &second.id).join("degradation-alerts.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        alerts_json, second_alerts_json,
+        "deterministic alert artifact bytes must be stable across unchanged reruns"
+    );
+}
+
+#[tokio::test]
+async fn steward_metrics_tests_use_domain_decisions_and_frozen_stage_families() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let run_id = RunId::new();
+    let completed_at = Utc::now();
+    let mut run = make_run(run_id, idea_id, RunStatus::Completed);
+    run.workflow_family = Some("mvp_live".into());
+    run.project_key = Some("crypto-savings".into());
+    run.risk_class = Some("high".into());
+    run.stack = Some("swiftui".into());
+    run.workflow_snapshot_hash = Some("a".repeat(64));
+    run.catalog_snapshot_hash = Some("b".repeat(64));
+    run.workflow_snapshot_json = Some(
+        serde_json::json!({
+            "workflow": {"id": "mvp_live"},
+            "states": {
+                "alpha": {"label": "Proposal drafting", "owner": "writer"},
+                "beta": {"label": "Build execution", "run": {"sequence": [{"agent": "code_writer", "task": "Implementation pass"}]}},
+                "gamma": {"label": "Independent quality audit", "owner": "reviewer"}
+            }
+        })
+        .to_string(),
+    );
+    run.catalog_snapshot_json = Some(r#"{"agents":[]}"#.into());
+    run.started_at = completed_at - chrono::Duration::seconds(100);
+    run.completed_at = Some(completed_at);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut granted = make_approval(run_id, "approval", ApprovalDecision::Granted);
+    granted.decided_at = Some(completed_at);
+    approvals::insert(&pool, &granted).await.unwrap();
+    let mut rejected = make_approval(run_id, "approval", ApprovalDecision::Rejected);
+    rejected.decided_at = Some(completed_at);
+    approvals::insert(&pool, &rejected).await.unwrap();
+
+    for (stage_id, cost) in [("alpha", 10), ("beta", 20), ("gamma", 30)] {
+        let stage_execution_id = StageExecutionId::new();
+        let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Completed);
+        stage.stage_id = stage_id.into();
+        stage.started_at = completed_at - chrono::Duration::seconds(10);
+        stage.completed_at = Some(completed_at);
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let lineage_id = format!("lineage-{stage_id}");
+        let generation_id = format!("generation-{stage_id}");
+        sessions::insert_lineage(
+            &pool,
+            &domain::session::SessionLineage {
+                id: lineage_id.clone(),
+                run_id: run_id.to_string(),
+                agent_id: "agent".into(),
+                lineage_id: stage_id.into(),
+                session_reuse_scope: "same_invocation_owner".into(),
+                session_family_id: None,
+                active_generation_id: Some(generation_id.clone()),
+                created_at: completed_at,
+                closed_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        sessions::insert_generation(
+            &pool,
+            &domain::session::SessionGeneration {
+                id: generation_id.clone(),
+                lineage_id,
+                generation: 1,
+                invocation_owner_key: "owner".into(),
+                provider_session_id: Some("provider-session".into()),
+                binding_fingerprint: "fingerprint".into(),
+                rehydrated_from_checkpoint_artifact_id: None,
+                working_directory: "/tmp/ws".into(),
+                workspace_mode: "read_only".into(),
+                runtime_provider: "claude".into(),
+                runtime_model: "opus".into(),
+                status: domain::session::SessionGenerationStatus::Closed,
+                turn_count: 1,
+                estimated_input_tokens: 0,
+                latest_cached_input_tokens: None,
+                latest_output_tokens: None,
+                latest_model_context_window: None,
+                cumulative_prompt_tokens: 0,
+                cumulative_cost_cents: cost,
+                created_at: completed_at,
+                last_activity_at: None,
+                ended_at: Some(completed_at),
+                end_reason: Some("completed".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut execution = make_agent_execution(stage_execution_id, AgentStatus::Completed);
+        execution.session_generation_id = Some(generation_id);
+        agent_executions::insert(&pool, &execution).await.unwrap();
+    }
+
+    let metrics = engine::steward::metrics::collect_metrics(
+        &pool,
+        &[run],
+        Some(&engine::steward::cohort::CohortKey {
+            workflow_family: "mvp_live".into(),
+            risk_class: "high".into(),
+        }),
+        0,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(metrics.approval_rejection_rate, 0.5);
+    assert_eq!(metrics.cost_by_stage_family.get("proposal"), Some(&10));
+    assert_eq!(
+        metrics.cost_by_stage_family.get("implementation"),
+        Some(&20)
+    );
+    assert_eq!(metrics.cost_by_stage_family.get("audit"), Some(&30));
+}
+
+struct FakeStewardAgentExecutor;
+
+#[async_trait::async_trait]
+impl engine::steward::service::StewardAgentExecutor for FakeStewardAgentExecutor {
+    async fn run_steward_agent(
+        &self,
+        invocation: engine::steward::service::StewardAgentInvocation,
+    ) -> anyhow::Result<()> {
+        let steward_root = invocation.chainworks_meta_root.join("steward");
+        match invocation.agent_id.as_str() {
+            "system_steward" => {
+                std::fs::create_dir_all(steward_root.join("reports"))?;
+                std::fs::create_dir_all(steward_root.join("proposals"))?;
+                std::fs::write(
+                    steward_root.join("reports").join("health-report.json"),
+                    r#"{"analysis_id":"test","confidence":"high"}"#,
+                )?;
+                std::fs::write(
+                    steward_root.join("proposals").join("agent-tuning.json"),
+                    r#"{"analysis_id":"test","status":"proposed"}"#,
+                )?;
+            }
+            "steward_auditor" => {
+                std::fs::create_dir_all(steward_root.join("reports"))?;
+                std::fs::write(
+                    steward_root.join("reports").join("audit-report.json"),
+                    r#"{"analysis_id":"test","confidence":"high"}"#,
+                )?;
+            }
+            other => anyhow::bail!("unexpected steward agent {other}"),
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn steward_pipeline_tests_runs_optional_catalog_lanes_after_inputs_exist() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let completed_at = Utc::now();
+    for idx in 0..10 {
+        insert_steward_completed_run(
+            &pool,
+            idea_id,
+            completed_at - chrono::Duration::seconds(idx),
+            120,
+        )
+        .await;
+    }
+
+    let artifact_base = tempfile::tempdir().unwrap();
+    let runtime_inputs = steward_test_runtime_inputs();
+    let analysis = engine::steward::service::run_steward_analysis_with_executor(
+        &pool,
+        &runtime_inputs,
+        engine::steward::StewardAnalysisRequest::manual(artifact_base.path()),
+        Some(&FakeStewardAgentExecutor),
+    )
+    .await
+    .unwrap();
+
+    assert!(analysis.health_report_artifact_id.is_some());
+    assert!(analysis.audit_report_artifact_id.is_some());
+    assert!(analysis.agent_tuning_artifact_id.is_some());
+    let root = analysis_root(artifact_base.path(), &analysis.id)
+        .join("active-catalog-io")
+        .join("steward");
+    assert!(root.join("reports").join("health-report.json").exists());
+    assert!(root.join("reports").join("audit-report.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn steward_executor_tests_work_item_runs_active_catalog_agents_through_acp() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let completed_at = Utc::now();
+    for idx in 0..10 {
+        insert_steward_completed_run(
+            &pool,
+            idea_id,
+            completed_at - chrono::Duration::seconds(idx),
+            120,
+        )
+        .await;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("steward_acp_fixture.py");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+msg = recv()
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+msg = recv()
+cwd = msg.get("params", {}).get("cwd")
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "steward-fixture"}})
+msg = recv()
+reports = os.path.join(cwd, "steward", "reports")
+proposals = os.path.join(cwd, "steward", "proposals")
+os.makedirs(reports, exist_ok=True)
+os.makedirs(proposals, exist_ok=True)
+with open(os.path.join(reports, "health-report.json"), "w") as f:
+    f.write('{"status":"healthy"}')
+with open(os.path.join(reports, "audit-report.json"), "w") as f:
+    f.write('{"status":"audited"}')
+with open(os.path.join(proposals, "agent-tuning.json"), "w") as f:
+    f.write('{"status":"proposed"}')
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": "steward-fixture"}})
+recv()
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let catalog_path = temp.path().join("agents.yaml");
+    std::fs::write(
+        &catalog_path,
+        r#"
+backend_profiles:
+  steward_profile:
+    provider: claude_acp
+    model: fixture
+    mcp: []
+artifacts:
+  metrics_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/metrics-window.json
+  baseline_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/baseline-window.json
+  sdlc_health_report: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/health-report.json
+  stewardship_audit_report: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/audit-report.json
+  agent_tuning_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/proposals/agent-tuning.json
+skills:
+  steward_core:
+    type: inline_skill
+    description: Steward fixture skill.
+agents:
+  - id: system_steward
+    backend_profile: steward_profile
+    skill_ref: steward_core
+    inputs: [metrics_window, baseline_window]
+    outputs: [sdlc_health_report, agent_tuning_proposal]
+    prompt: "Run system steward."
+  - id: steward_auditor
+    backend_profile: steward_profile
+    skill_ref: steward_core
+    inputs: [sdlc_health_report]
+    outputs: [stewardship_audit_report]
+    prompt: "Run steward auditor."
+"#,
+    )
+    .unwrap();
+
+    let (catalog_json, catalog_hash) =
+        engine::steward::config::load_agent_catalog_json(&catalog_path).unwrap();
+    let mut runtime_inputs = steward_test_runtime_inputs();
+    runtime_inputs.agent_catalog_path = catalog_path;
+    runtime_inputs.agent_catalog_json = catalog_json;
+    runtime_inputs.agent_catalog_hash = catalog_hash;
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_string_lossy().into_owned(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let executor = BackgroundExecutor::new_with_steward_runtime_inputs(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp,
+        events,
+        Arc::new(runtime_inputs),
+    );
+
+    let artifact_base = temp.path().join("artifacts");
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::StewardAnalysis,
+            None,
+            None,
+            serde_json::json!({
+                "reason": "manual",
+                "artifact_base": artifact_base.to_string_lossy()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+    let analyses = db::repos::steward::list_analyses(&pool, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(analyses.len(), 1);
+    assert!(analyses[0].health_report_artifact_id.is_some());
+    assert!(analyses[0].audit_report_artifact_id.is_some());
+    assert!(analyses[0].agent_tuning_artifact_id.is_some());
+}
+
+#[tokio::test]
+async fn steward_trigger_tests_manual_command_enqueues_shared_work_item() {
+    let pool = test_pool().await;
+    let handler = make_command_handler(pool.clone());
+
+    let result = handler
+        .handle(
+            Command::RunStewardAnalysis(RunStewardAnalysisCmd {
+                reason: "manual".into(),
+                artifact_base: Some("/tmp/steward-artifacts".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result.result,
+        engine::command_handler::CommandResult::StewardAnalysisQueued
+    ));
+    let item = work_items::claim_next(&pool)
+        .await
+        .unwrap()
+        .expect("manual trigger should enqueue a work item");
+    assert_eq!(item.kind, db::work_item::WorkItemKind::StewardAnalysis);
+    let payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+    assert_eq!(payload["reason"], "manual");
+    assert_eq!(payload["artifact_base"], "/tmp/steward-artifacts");
+}
+
+#[tokio::test]
+async fn steward_trigger_tests_completed_run_consumes_config_change_pending_first() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: steward-trigger
+  family: steward_family
+  risk_class: standard
+  stack: rust
+initial_state: done
+states:
+  done:
+    label: Done
+    type: end
+    owner: lead
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+backend_profiles:
+  lead_profile:
+    provider: claude
+agents:
+  - id: lead
+    backend_profile: lead_profile
+"#,
+    )
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("done".into());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+    db::repos::steward::mark_config_change_pending(
+        &pool,
+        Some("config-hash"),
+        Some("catalog-hash"),
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let item = work_items::claim_next(&pool)
+        .await
+        .unwrap()
+        .expect("completed run should enqueue steward analysis");
+    assert_eq!(item.kind, db::work_item::WorkItemKind::StewardAnalysis);
+    let payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+    assert_eq!(payload["reason"], "config_change");
+    assert!(
+        db::repos::steward::take_config_change_pending(&pool)
+            .await
+            .unwrap()
+            .is_none(),
+        "config-change pending flag must be consumed once"
+    );
+}
+
+#[tokio::test]
+async fn steward_trigger_tests_post_run_hook_honors_interval() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    db::repos::steward::set_post_run_trigger_config(&pool, true, 2)
+        .await
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: steward-trigger
+  family: steward_family
+  risk_class: standard
+  stack: rust
+initial_state: done
+states:
+  done:
+    label: Done
+    type: end
+    owner: lead
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+backend_profiles:
+  lead_profile:
+    provider: claude
+agents:
+  - id: lead
+    backend_profile: lead_profile
+"#,
+    )
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+
+    for idx in 0..2 {
+        let run_id = RunId::new();
+        let mut run = make_run(run_id, idea_id, RunStatus::Running);
+        run.current_state = Some("done".into());
+        run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+        run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+        runs::insert(&pool, &run).await.unwrap();
+        orchestrator.advance_run(run_id).await.unwrap();
+
+        let item = work_items::claim_next(&pool).await.unwrap();
+        if idx == 0 {
+            assert!(
+                item.is_none(),
+                "first completed run must only increment post-run counter"
+            );
+        } else {
+            let item = item.expect("second completed run should enqueue steward analysis");
+            assert_eq!(item.kind, db::work_item::WorkItemKind::StewardAnalysis);
+            let payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+            assert_eq!(payload["reason"], "post_run_hook");
+        }
+    }
+}
+
+#[tokio::test]
+async fn delivery_preflight_success_persists_run_owned_result() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch", "main"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git init should run");
+    let worktrees = tempfile::tempdir().unwrap();
+    let delivery_configuration_json = Some(format!(
+        r#"{{
+            "repo_identifier":"repo-1",
+            "repo_root":"{}",
+            "base_branch":"main",
+            "worktree_base_path":"{}",
+            "target_branch":"cw/release",
+            "release_target_id":"app-store"
+        }}"#,
+        repo.path().display(),
+        worktrees.path().display()
+    ));
+
+    let handler = make_command_handler(pool.clone());
+    let commanded = handler
+        .handle(
+            Command::StartRun(StartRunCmd {
+                idea_id,
+                workflow_id: "wf-start".into(),
+                workflow_title: "Start Run".into(),
+                workspace_root: "/tmp/ws".into(),
+                artifact_root: "/tmp/art".into(),
+                workflow_yaml_path: test_workflow_yaml_path(),
+                agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
+                delivery_configuration_json,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let run_id = match commanded.result {
+        engine::command_handler::CommandResult::RunStarted { run_id } => run_id,
+        _ => panic!("unexpected command result"),
+    };
+
+    let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    let preflight = run
+        .delivery_preflight_json
+        .as_deref()
+        .expect("delivery preflight should persist");
+    assert!(preflight.contains(r#""passed":true"#));
+    assert!(preflight.contains("repo_root_exists"));
+}
+
+#[tokio::test]
+async fn delivery_preflight_failure_blocks_before_run_creation() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let missing_repo = tempfile::tempdir().unwrap().path().join("missing");
+    let worktrees = tempfile::tempdir().unwrap();
+    let delivery_configuration_json = Some(format!(
+        r#"{{
+            "repo_identifier":"repo-1",
+            "repo_root":"{}",
+            "base_branch":"main",
+            "worktree_base_path":"{}",
+            "target_branch":"cw/release",
+            "release_target_id":"app-store"
+        }}"#,
+        missing_repo.display(),
+        worktrees.path().display()
+    ));
+
+    let handler = make_command_handler(pool.clone());
+    let commanded = handler
+        .handle(
+            Command::StartRun(StartRunCmd {
+                idea_id,
+                workflow_id: "wf-start".into(),
+                workflow_title: "Start Run".into(),
+                workspace_root: "/tmp/ws".into(),
+                artifact_root: "/tmp/art".into(),
+                workflow_yaml_path: test_workflow_yaml_path(),
+                agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
+                delivery_configuration_json,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    match commanded.result {
+        engine::command_handler::CommandResult::StartRunBlockedByDeliveryPreflight(blocked) => {
+            assert!(!blocked.delivery_preflight.passed);
+            assert!(blocked
+                .delivery_preflight
+                .checks
+                .iter()
+                .any(|check| check.id == "repo_root_exists" && !check.passed));
+        }
+        _ => panic!("expected delivery preflight block"),
+    }
+    assert!(runs::list_by_idea(&pool, idea_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mcp_resolution_persistence_tests() {
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let registry_path = tmp.path().join("mcp-config.yaml");
+    std::fs::write(&registry_path, "mcp: {}\n").unwrap();
+    let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
+    std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "mcp_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new()),
+        events,
+    );
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("mcp_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "mcp_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "mcp-agent",
+                "provider": "claude",
+                "backend_profile_id": "codex_with_missing_mcp",
+                "requested_mcp_server_ids": ["missing-extension"]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let processed = executor.process_next_item().await.unwrap();
+    if let Some(previous_registry) = previous_registry {
+        std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", previous_registry);
+    } else {
+        std::env::remove_var("CHAINWORKS_CODEX_CONFIG_PATH");
+    }
+
+    assert!(
+        processed,
+        "expected queued InvokeAgent work item to process"
+    );
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    let execution = executions.first().expect("agent execution should persist");
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert_eq!(
+        execution.requested_mcp_extensions_json.as_deref(),
+        Some(r#"["missing-extension"]"#)
+    );
+    assert_eq!(
+        execution.denied_mcp_extensions_json.as_deref(),
+        Some(r#"["missing-extension"]"#)
+    );
+    assert!(execution
+        .mcp_blocking_issues_json
+        .as_deref()
+        .unwrap()
+        .contains("missing-extension"));
+    assert_eq!(execution.actual_mcp_extensions_json.as_deref(), Some("[]"));
+    assert_eq!(execution.actual_mcp_runtime_ids_json.as_deref(), Some("[]"));
+    let observation: serde_json::Value =
+        serde_json::from_str(execution.actual_mcp_observation_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        observation["source"],
+        serde_json::json!("mcp_resolution_blocked_before_session_new")
+    );
+    assert_eq!(
+        observation["trust_level"],
+        serde_json::json!("authoritative_no_session")
+    );
+    assert_eq!(
+        observation["actual_equals_predicted"],
+        serde_json::json!(false)
+    );
+
+    let settled = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.status, StageStatus::Failed);
+    assert!(
+        settled.evidence_packet_json.is_some(),
+        "MCP blocked stage should get failed-stage evidence"
+    );
 }
 
 #[tokio::test]
 async fn test_reset_session_marks_generation_reset_and_next_policy_is_fresh_after_reset() {
     use db::repos::sessions;
     use domain::commands::ResetSessionCmd;
-    use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition};
+    use domain::session::{
+        SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition,
+    };
     use engine::session::policy::{ensure_policy, SessionPolicyInput};
 
     let pool = test_pool().await;
@@ -610,7 +1782,9 @@ async fn test_reset_session_marks_generation_reset_and_next_policy_is_fresh_afte
     let now = Utc::now();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
 
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
     stage.stage_id = "reset_stage".into();
@@ -666,14 +1840,20 @@ async fn test_reset_session_marks_generation_reset_and_next_policy_is_fresh_afte
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::ResetSession(ResetSessionCmd {
-            run_id,
-            stage_id: "reset_stage".into(),
-        }))
+        .handle(
+            Command::ResetSession(ResetSessionCmd {
+                run_id,
+                stage_id: "reset_stage".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
-    let stage = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stage.status, StageStatus::Pending);
 
     let lineage_after = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "worker")
@@ -705,7 +1885,10 @@ async fn test_reset_session_marks_generation_reset_and_next_policy_is_fresh_afte
     )
     .await
     .unwrap();
-    assert_eq!(decision.disposition, SessionReuseDisposition::FreshAfterReset);
+    assert_eq!(
+        decision.disposition,
+        SessionReuseDisposition::FreshAfterReset
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +2018,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -853,13 +2047,8 @@ sys.exit(0)
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = BackgroundExecutor::new(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator,
-        acp,
-        events,
-    );
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
 
     // Enqueue a fully-populated InvokeAgent work item.
     work_queue
@@ -880,7 +2069,10 @@ sys.exit(0)
 
     // Process the work item through the real executor path.
     let processed = executor.process_next_item().await.unwrap();
-    assert!(processed, "process_next_item must return true when a work item is available");
+    assert!(
+        processed,
+        "process_next_item must return true when a work item is available"
+    );
 
     // Stage must be settled as Completed.
     let settled = stages::find_by_id(&pool, stage_exec_id)
@@ -1030,6 +2222,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -1047,13 +2250,8 @@ sys.exit(0)
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = BackgroundExecutor::new(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator,
-        acp,
-        events,
-    );
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
 
     work_queue
         .enqueue(
@@ -1176,6 +2374,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -1193,13 +2402,8 @@ sys.exit(0)
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = BackgroundExecutor::new(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator,
-        acp,
-        events,
-    );
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
 
     work_queue
         .enqueue(
@@ -1261,7 +2465,9 @@ async fn test_invoke_agent_reuses_live_session_generation_end_to_end() {
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_reuse_fixture.py");
-    std::fs::write(&script, r#"#!/usr/bin/env python3
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
 import sys, json, os
 
 def send(obj):
@@ -1301,7 +2507,9 @@ msg = recv()
 if msg.get("method") != "session/close":
     sys.exit(1)
 sys.exit(0)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
@@ -1340,6 +2548,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -1388,10 +2607,11 @@ sys.exit(0)
         .unwrap();
     assert!(executor.process_next_item().await.unwrap());
 
-    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
-        .await
-        .unwrap()
-        .expect("lineage should exist after first turn");
+    let lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+            .await
+            .unwrap()
+            .expect("lineage should exist after first turn");
     let generation = sessions::find_active_generation(&pool, &lineage.id)
         .await
         .unwrap()
@@ -1431,14 +2651,24 @@ sys.exit(0)
 
     let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
     assert!(
-        daemon_artifacts.iter().any(|artifact| artifact.file_path.ends_with("first.json")),
+        daemon_artifacts
+            .iter()
+            .any(|artifact| artifact.file_path.ends_with("first.json")),
         "first turn artifact missing: {:?}",
-        daemon_artifacts.iter().map(|artifact| artifact.file_path.clone()).collect::<Vec<_>>()
+        daemon_artifacts
+            .iter()
+            .map(|artifact| artifact.file_path.clone())
+            .collect::<Vec<_>>()
     );
     assert!(
-        daemon_artifacts.iter().any(|artifact| artifact.file_path.ends_with("second.json")),
+        daemon_artifacts
+            .iter()
+            .any(|artifact| artifact.file_path.ends_with("second.json")),
         "second turn artifact missing: {:?}",
-        daemon_artifacts.iter().map(|artifact| artifact.file_path.clone()).collect::<Vec<_>>()
+        daemon_artifacts
+            .iter()
+            .map(|artifact| artifact.file_path.clone())
+            .collect::<Vec<_>>()
     );
 
     acp.close_session(&generation.id).await.unwrap();
@@ -1465,7 +2695,9 @@ async fn test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it() {
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_budget_fixture.py");
-    std::fs::write(&script, r#"#!/usr/bin/env python3
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
 import sys, json, os
 
 def send(obj):
@@ -1515,7 +2747,9 @@ msg = recv()
 if msg and msg.get("method") == "session/close":
     sys.exit(0)
 sys.exit(0)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
@@ -1553,6 +2787,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -1598,10 +2843,11 @@ sys.exit(0)
         .unwrap();
     assert!(executor.process_next_item().await.unwrap());
 
-    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
-        .await
-        .unwrap()
-        .expect("lineage should exist after first turn");
+    let lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+            .await
+            .unwrap()
+            .expect("lineage should exist after first turn");
     let generation = sessions::find_active_generation(&pool, &lineage.id)
         .await
         .unwrap()
@@ -1671,12 +2917,10 @@ sys.exit(0)
         domain::session::SessionReuseDisposition::ReusedAfterResume
     );
     assert!(!decision.should_reuse_live_session);
-    assert!(
-        decision
-            .generation
-            .rehydrated_from_checkpoint_artifact_id
-            .is_some()
-    );
+    assert!(decision
+        .generation
+        .rehydrated_from_checkpoint_artifact_id
+        .is_some());
 
     acp.close_session(&generation.id).await.unwrap();
 }
@@ -1702,7 +2946,9 @@ async fn test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_budget_cost_fixture.py");
-    std::fs::write(&script, r#"#!/usr/bin/env python3
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
 import sys, json, os
 
 def send(obj):
@@ -1753,7 +2999,9 @@ msg = recv()
 if msg and msg.get("method") == "session/close":
     sys.exit(0)
 sys.exit(0)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
@@ -1791,6 +3039,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -1836,10 +3095,11 @@ sys.exit(0)
         .unwrap();
     assert!(executor.process_next_item().await.unwrap());
 
-    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
-        .await
-        .unwrap()
-        .expect("lineage should exist after first turn");
+    let lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+            .await
+            .unwrap()
+            .expect("lineage should exist after first turn");
     let generation = sessions::find_active_generation(&pool, &lineage.id)
         .await
         .unwrap()
@@ -1918,7 +3178,9 @@ async fn test_cancel_run_finalize_closes_live_session_via_runtime_manager() {
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_cancel_fixture.py");
-    std::fs::write(&script, r#"#!/usr/bin/env python3
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
 import sys, json
 
 def send(obj):
@@ -1948,7 +3210,9 @@ msg = recv()
 if msg.get("method") != "session/close":
     sys.exit(1)
 sys.exit(0)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
@@ -1986,13 +3250,27 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
     .unwrap();
-    stages::insert(&pool, &make_stage(stage_exec_id, run_id, StageStatus::Running))
-        .await
-        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Running),
+    )
+    .await
+    .unwrap();
 
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
@@ -2029,10 +3307,11 @@ sys.exit(0)
         .unwrap();
     assert!(executor.process_next_item().await.unwrap());
 
-    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
-        .await
-        .unwrap()
-        .expect("lineage should exist after priming session");
+    let lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+            .await
+            .unwrap()
+            .expect("lineage should exist after priming session");
     let generation = sessions::find_active_generation(&pool, &lineage.id)
         .await
         .unwrap()
@@ -2056,8 +3335,20 @@ sys.exit(0)
         session_family_id: Some("proposal-loop".into()),
         session_reuse_disposition: Some("reused".into()),
         session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        mcp_session_startup_latency_ms: None,
     };
-    agent_executions::insert(&pool, &running_exec).await.unwrap();
+    agent_executions::insert(&pool, &running_exec)
+        .await
+        .unwrap();
     stages::update_status(&pool, stage_exec_id, StageStatus::Running)
         .await
         .unwrap();
@@ -2069,7 +3360,10 @@ sys.exit(0)
         acp.clone(),
     ));
     handler
-        .handle(Command::CancelRun(domain::commands::CancelRunCmd { run_id }))
+        .handle(
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
@@ -2090,8 +3384,14 @@ sys.exit(0)
             .expect("settlement log"),
     )
     .unwrap();
-    assert_eq!(entries[0]["session_close_attempted"], serde_json::json!(true));
-    assert_eq!(entries[0]["session_close_succeeded"], serde_json::json!(true));
+    assert_eq!(
+        entries[0]["session_close_attempted"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        entries[0]["session_close_succeeded"],
+        serde_json::json!(true)
+    );
     assert!(
         acp.close_session(&generation.id).await.is_err(),
         "session should already be closed by cancellation finalization"
@@ -2116,7 +3416,9 @@ async fn test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation() 
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_missing_live_handle_fixture.py");
-    std::fs::write(&script, r#"#!/usr/bin/env python3
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
 import sys, json, os
 
 def send(obj):
@@ -2149,7 +3451,9 @@ msg = recv()
 if msg and msg.get("method") == "session/close":
     sys.exit(0)
 sys.exit(0)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
@@ -2210,6 +3514,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -2269,13 +3584,8 @@ sys.exit(0)
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = BackgroundExecutor::new(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator,
-        acp,
-        events,
-    );
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
 
     work_queue
         .enqueue(
@@ -2298,17 +3608,20 @@ sys.exit(0)
 
     assert!(executor.process_next_item().await.unwrap());
 
-    let updated_lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
-        .await
-        .unwrap()
-        .expect("lineage should still exist");
+    let updated_lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+            .await
+            .unwrap()
+            .expect("lineage should still exist");
     let active_generation = sessions::find_active_generation(&pool, &updated_lineage.id)
         .await
         .unwrap()
         .expect("a fresh active generation should exist");
     assert_ne!(active_generation.id, "generation-1");
 
-    let executions = agent_executions::find_by_stage(&pool, stage_exec_id).await.unwrap();
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
     let execution = executions
         .iter()
         .find(|execution| execution.agent_id == "reuse-agent")
@@ -2320,14 +3633,17 @@ sys.exit(0)
 
     let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
     assert!(
-        daemon_artifacts.iter().any(|artifact| artifact.file_path.ends_with("fresh.json")),
+        daemon_artifacts
+            .iter()
+            .any(|artifact| artifact.file_path.ends_with("fresh.json")),
         "fresh artifact missing after missing-live-handle fallback"
     );
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact() {
+async fn test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact(
+) {
     use std::os::unix::fs::PermissionsExt;
 
     use acp::adapters::claude::ClaudeAgentAdapter;
@@ -2445,6 +3761,17 @@ sys.exit(0)
             base_revision: None,
             target_branch: None,
             delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
         },
     )
     .await
@@ -2506,13 +3833,8 @@ sys.exit(0)
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = BackgroundExecutor::new(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator,
-        acp,
-        events,
-    );
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
 
     work_queue
         .enqueue(
@@ -2535,10 +3857,11 @@ sys.exit(0)
 
     assert!(executor.process_next_item().await.unwrap());
 
-    let updated_lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
-        .await
-        .unwrap()
-        .expect("lineage should still exist");
+    let updated_lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+            .await
+            .unwrap()
+            .expect("lineage should still exist");
     let active_generation = sessions::find_active_generation(&pool, &updated_lineage.id)
         .await
         .unwrap()
@@ -2550,7 +3873,9 @@ sys.exit(0)
         Some(checkpoint_artifact_id.as_str())
     );
 
-    let executions = agent_executions::find_by_stage(&pool, stage_exec_id).await.unwrap();
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
     let execution = executions
         .iter()
         .find(|execution| execution.agent_id == "resume-agent")
@@ -2560,19 +3885,14 @@ sys.exit(0)
         Some("reused_after_resume")
     );
     assert_eq!(
-        execution
-            .rehydrated_from_checkpoint_artifact_id
-            .as_deref(),
+        execution.rehydrated_from_checkpoint_artifact_id.as_deref(),
         Some(checkpoint_artifact_id.as_str())
     );
 
-    let checkpoint_artifact = artifacts::find_by_id(
-        &pool,
-        checkpoint_artifact_id.parse().unwrap(),
-    )
-    .await
-    .unwrap()
-    .expect("checkpoint artifact should be persisted");
+    let checkpoint_artifact = artifacts::find_by_id(&pool, checkpoint_artifact_id.parse().unwrap())
+        .await
+        .unwrap()
+        .expect("checkpoint artifact should be persisted");
     assert_eq!(
         checkpoint_artifact.report_kind.as_deref(),
         Some("session_checkpoint")
@@ -2599,10 +3919,10 @@ async fn test_daemon_vs_swift_report_behavioral_parity() {
     // Load golden snapshot from Swift run
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let golden_path = format!("{manifest_dir}/tests/fixtures/golden_swift_report.json");
-    let golden_raw = std::fs::read_to_string(&golden_path)
-        .expect("golden swift report fixture must exist");
-    let golden: serde_json::Value = serde_json::from_str(&golden_raw)
-        .expect("golden snapshot must be valid JSON");
+    let golden_raw =
+        std::fs::read_to_string(&golden_path).expect("golden swift report fixture must exist");
+    let golden: serde_json::Value =
+        serde_json::from_str(&golden_raw).expect("golden snapshot must be valid JSON");
 
     let pool = test_pool().await;
 
@@ -2635,6 +3955,10 @@ async fn test_daemon_vs_swift_report_behavioral_parity() {
             provider: None,
             model: None,
             stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
         };
         stages::insert(&pool, &stage).await.unwrap();
         // Settle as Completed (matches golden)
@@ -2680,10 +4004,9 @@ async fn test_daemon_vs_swift_report_behavioral_parity() {
         .await
         .unwrap()
         .expect("run must exist");
-    let daemon_stages =
-        db::repos::projections::list_stages_projection(&pool, &run_id.to_string())
-            .await
-            .unwrap();
+    let daemon_stages = db::repos::projections::list_stages_projection(&pool, &run_id.to_string())
+        .await
+        .unwrap();
     let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
 
     // ── Diff assertions: daemon report MUST match golden shape ────────────
@@ -2811,16 +4134,22 @@ async fn test_approve_manual_gate_with_post_approval_tasks_sets_running() {
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::ApproveStage(ApproveStageCmd {
-            run_id,
-            stage_id: "state_11_manual_release".into(),
-            comment: Some("Ship it".into()),
-        }))
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+                comment: Some("Ship it".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
     // Stage must be Running (not Completed) because post_approval_tasks exist.
-    let updated = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let updated = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         updated.status,
         StageStatus::Running,
@@ -2865,16 +4194,22 @@ async fn test_approve_simple_manual_gate_settles_completed() {
 
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::ApproveStage(ApproveStageCmd {
-            run_id,
-            stage_id: "state_3_initial_proposal_approval".into(),
-            comment: Some("Looks good".into()),
-        }))
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "state_3_initial_proposal_approval".into(),
+                comment: Some("Looks good".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
     // Stage must be Completed because state_3 has no post_approval_tasks.
-    let updated = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let updated = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         updated.status,
         StageStatus::Completed,
@@ -2901,7 +4236,10 @@ async fn test_post_approval_tasks_enqueued_after_approval() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workflow_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let workflow_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        manifest_dir
+    );
     let catalog_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
 
     let mut run = make_run(run_id, idea_id, RunStatus::Running);
@@ -2921,11 +4259,14 @@ async fn test_post_approval_tasks_enqueued_after_approval() {
     // Approve via CommandHandler — this transitions the stage to Running.
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::ApproveStage(ApproveStageCmd {
-            run_id,
-            stage_id: "state_11_manual_release".into(),
-            comment: Some("Ship it".into()),
-        }))
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+                comment: Some("Ship it".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
@@ -2937,7 +4278,9 @@ async fn test_post_approval_tasks_enqueued_after_approval() {
     orchestrator.advance_run(run_id).await.unwrap();
 
     // Verify InvokeAgent work items were enqueued for post-approval tasks.
-    let work_items = db::repos::work_items::list_by_run(&pool, run_id).await.unwrap();
+    let work_items = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
     let invoke_items: Vec<_> = work_items
         .iter()
         .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
@@ -2950,9 +4293,9 @@ async fn test_post_approval_tasks_enqueued_after_approval() {
 
     // state_11 has two sequential post-approval tasks (phase 0 then phase 1);
     // phase 0 should be enqueued first.
-    let has_commit_push = invoke_items.iter().any(|w| {
-        w.payload_json.contains("commit_and_push")
-    });
+    let has_commit_push = invoke_items
+        .iter()
+        .any(|w| w.payload_json.contains("commit_and_push"));
     assert!(
         has_commit_push,
         "at least one InvokeAgent must target the commit_and_push post-approval task"
@@ -2974,7 +4317,10 @@ async fn test_end_state_with_tasks_does_not_short_circuit() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workflow_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let workflow_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        manifest_dir
+    );
     let catalog_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
 
     let mut run = make_run(run_id, idea_id, RunStatus::Running);
@@ -3012,7 +4358,9 @@ async fn test_end_state_with_tasks_does_not_short_circuit() {
     );
 
     // InvokeAgent work items must have been enqueued for the end state's tasks.
-    let work_items = db::repos::work_items::list_by_run(&pool, run_id).await.unwrap();
+    let work_items = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
     let invoke_items: Vec<_> = work_items
         .iter()
         .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
@@ -3044,7 +4392,10 @@ async fn test_n_phase_sequence_ordering() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let wf_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        manifest_dir
+    );
     let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
 
     let mut run = make_run(run_id, idea_id, RunStatus::Running);
@@ -3062,11 +4413,17 @@ async fn test_n_phase_sequence_ordering() {
     approvals::insert(&pool, &approval).await.unwrap();
 
     let handler = make_command_handler(pool.clone());
-    handler.handle(Command::ApproveStage(ApproveStageCmd {
-        run_id,
-        stage_id: "state_11_manual_release".into(),
-        comment: Some("Ship it".into()),
-    })).await.unwrap();
+    handler
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+                comment: Some("Ship it".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
 
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
@@ -3074,7 +4431,9 @@ async fn test_n_phase_sequence_ordering() {
     orchestrator.advance_run(run_id).await.unwrap();
 
     // Only phase 0 tasks should be enqueued — phase 1 waits.
-    let work_items = db::repos::work_items::list_by_run(&pool, run_id).await.unwrap();
+    let work_items = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
     let invoke_items: Vec<_> = work_items
         .iter()
         .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
@@ -3091,7 +4450,10 @@ async fn test_n_phase_sequence_ordering() {
     // The enqueued task must be commit_and_push (phase 0), not build_and_distribute (phase 1)
     let payload: serde_json::Value = serde_json::from_str(&invoke_items[0].payload_json).unwrap();
     let task_index = payload["task_index"].as_u64().unwrap();
-    assert_eq!(task_index, 0, "first enqueued task must be task_index 0 (phase 0)");
+    assert_eq!(
+        task_index, 0,
+        "first enqueued task must be task_index 0 (phase 0)"
+    );
     assert!(
         invoke_items[0].payload_json.contains("commit_and_push"),
         "first enqueued task must be commit_and_push (phase 0)"
@@ -3099,7 +4461,9 @@ async fn test_n_phase_sequence_ordering() {
 
     // build_and_distribute (phase 1) must NOT be enqueued yet
     assert!(
-        !invoke_items.iter().any(|w| w.payload_json.contains("build_and_distribute")),
+        !invoke_items
+            .iter()
+            .any(|w| w.payload_json.contains("build_and_distribute")),
         "phase 1 task (build_and_distribute) must NOT be enqueued before phase 0 completes"
     );
 }
@@ -3121,7 +4485,10 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     // Use real workflow + catalog so advance_run can compile the plan and
     // detect state_11_manual_release as a manual_gate with post_approval_tasks.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let wf_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        manifest_dir
+    );
     let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
     let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
     run.workflow_yaml_path = Some(wf_path);
@@ -3136,11 +4503,8 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     stage.stage_type = Some("manual_gate".into());
     stages::insert(&pool, &stage).await.unwrap();
 
-    let mut first_approval = make_approval(
-        run_id,
-        "state_11_manual_release",
-        ApprovalDecision::Granted,
-    );
+    let mut first_approval =
+        make_approval(run_id, "state_11_manual_release", ApprovalDecision::Granted);
     first_approval.decided_at = Some(Utc::now());
     approvals::insert(&pool, &first_approval).await.unwrap();
 
@@ -3148,14 +4512,20 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     // AdvanceRun. The old stage is Skipped, the new attempt is Pending.
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::RetryStage(RetryStageCmd {
-            run_id,
-            stage_id: "state_11_manual_release".into(),
-        }))
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
-    let old = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let old = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         old.status,
         StageStatus::Skipped,
@@ -3255,7 +4625,10 @@ async fn test_simple_manual_gate_no_regression() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let wf_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        manifest_dir
+    );
     let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
 
     let mut run = make_run(run_id, idea_id, RunStatus::Running);
@@ -3268,17 +4641,30 @@ async fn test_simple_manual_gate_no_regression() {
     stage.stage_type = Some("manual_gate".into());
     stages::insert(&pool, &stage).await.unwrap();
 
-    let approval = make_approval(run_id, "state_6_implementation_approval", ApprovalDecision::Pending);
+    let approval = make_approval(
+        run_id,
+        "state_6_implementation_approval",
+        ApprovalDecision::Pending,
+    );
     approvals::insert(&pool, &approval).await.unwrap();
 
     let handler = make_command_handler(pool.clone());
-    handler.handle(Command::ApproveStage(ApproveStageCmd {
-        run_id,
-        stage_id: "state_6_implementation_approval".into(),
-        comment: Some("Approved".into()),
-    })).await.unwrap();
+    handler
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "state_6_implementation_approval".into(),
+                comment: Some("Approved".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
 
-    let updated = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    let updated = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         updated.status,
         StageStatus::Completed,
@@ -3322,17 +4708,16 @@ async fn test_state_11_to_state_12_happy_path() {
     // Isolated workspace + artifact root so exists() lookups hit only our files.
     let tmp = tempfile::tempdir().unwrap();
     let workspace_root = tmp.path().to_string_lossy().into_owned();
-    let artifact_root = tmp
-        .path()
-        .join("artifacts")
-        .to_string_lossy()
-        .into_owned();
+    let artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
     std::fs::create_dir_all(&artifact_root).unwrap();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let wf_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        manifest_dir
+    );
     let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
 
     // Seed run: at state_11, running, with worktree_root so the release safety
@@ -3361,6 +4746,17 @@ async fn test_state_11_to_state_12_happy_path() {
         base_revision: None,
         target_branch: None,
         delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -3371,21 +4767,20 @@ async fn test_state_11_to_state_12_happy_path() {
     stage_11.stage_type = Some("manual_gate".into());
     stages::insert(&pool, &stage_11).await.unwrap();
 
-    let approval = make_approval(
-        run_id,
-        "state_11_manual_release",
-        ApprovalDecision::Pending,
-    );
+    let approval = make_approval(run_id, "state_11_manual_release", ApprovalDecision::Pending);
     approvals::insert(&pool, &approval).await.unwrap();
 
     // ── Step 1: approve state_11 -> stage transitions to Running ──────────
     let handler = make_command_handler(pool.clone());
     handler
-        .handle(Command::ApproveStage(ApproveStageCmd {
-            run_id,
-            stage_id: "state_11_manual_release".into(),
-            comment: Some("Ship it".into()),
-        }))
+        .handle(
+            Command::ApproveStage(ApproveStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+                comment: Some("Ship it".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
         .await
         .unwrap();
 
@@ -3431,7 +4826,11 @@ async fn test_state_11_to_state_12_happy_path() {
     let release_dir = tmp.path().join(".chainworks").join("release");
     std::fs::create_dir_all(&release_dir).unwrap();
     let git_push_receipt_path = release_dir.join("git-push.json");
-    std::fs::write(&git_push_receipt_path, r#"{"branch":"main","sha":"deadbeef"}"#).unwrap();
+    std::fs::write(
+        &git_push_receipt_path,
+        r#"{"branch":"main","sha":"deadbeef"}"#,
+    )
+    .unwrap();
 
     // Also insert the artifact row so report/projection surfaces see it.
     let now = Utc::now();
@@ -3453,10 +4852,14 @@ async fn test_state_11_to_state_12_happy_path() {
         report_kind: None,
         report_version: None,
     };
-    db::repos::artifacts::insert(&pool, &git_push_artifact).await.unwrap();
+    db::repos::artifacts::insert(&pool, &git_push_artifact)
+        .await
+        .unwrap();
 
     // Mark phase 0 work item Completed.
-    db::repos::work_items::complete(&pool, &phase0_item_id).await.unwrap();
+    db::repos::work_items::complete(&pool, &phase0_item_id)
+        .await
+        .unwrap();
 
     // ── Step 4: advance_run enqueues phase 1 (build_and_distribute) ──────
     orchestrator.advance_run(run_id).await.unwrap();
@@ -3515,7 +4918,9 @@ async fn test_state_11_to_state_12_happy_path() {
         report_kind: None,
         report_version: None,
     };
-    db::repos::artifacts::insert(&pool, &rbm_artifact).await.unwrap();
+    db::repos::artifacts::insert(&pool, &rbm_artifact)
+        .await
+        .unwrap();
 
     let cur_artifact = Artifact {
         id: ArtifactId::new(),
@@ -3535,14 +4940,21 @@ async fn test_state_11_to_state_12_happy_path() {
         report_kind: None,
         report_version: None,
     };
-    db::repos::artifacts::insert(&pool, &cur_artifact).await.unwrap();
+    db::repos::artifacts::insert(&pool, &cur_artifact)
+        .await
+        .unwrap();
 
-    db::repos::work_items::complete(&pool, &phase1_item.id.clone()).await.unwrap();
+    db::repos::work_items::complete(&pool, &phase1_item.id.clone())
+        .await
+        .unwrap();
 
     // ── Step 6: advance_run settles state_11, transitions to state_12 ────
     orchestrator.advance_run(run_id).await.unwrap();
 
-    let s11_settled = stages::find_by_id(&pool, stage_11_id).await.unwrap().unwrap();
+    let s11_settled = stages::find_by_id(&pool, stage_11_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         s11_settled.status,
         StageStatus::Completed,
@@ -3609,7 +5021,11 @@ async fn test_state_11_to_state_12_happy_path() {
 
     let now = Utc::now();
     for (name, path, contract) in [
-        ("delivery_receipt", delivery_receipt_path.clone(), "delivery_receipt_v1"),
+        (
+            "delivery_receipt",
+            delivery_receipt_path.clone(),
+            "delivery_receipt_v1",
+        ),
         ("run_report", run_report_path.clone(), "run_report_v1"),
         ("run_state", run_state_path.clone(), "run_state_v1"),
     ] {
@@ -3634,7 +5050,9 @@ async fn test_state_11_to_state_12_happy_path() {
         db::repos::artifacts::insert(&pool, &art).await.unwrap();
     }
 
-    db::repos::work_items::complete(&pool, &finalize_item_id).await.unwrap();
+    db::repos::work_items::complete(&pool, &finalize_item_id)
+        .await
+        .unwrap();
 
     // ── Step 9: advance_run settles state_12 and marks run Completed ─────
     orchestrator.advance_run(run_id).await.unwrap();
@@ -3658,7 +5076,9 @@ async fn test_state_11_to_state_12_happy_path() {
     );
 
     // Terminal artifact inventory: all three finalizer outputs must exist.
-    let all_artifacts = db::repos::artifacts::list_by_run(&pool, run_id).await.unwrap();
+    let all_artifacts = db::repos::artifacts::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
     for terminal in ["delivery_receipt", "run_report", "run_state"] {
         assert!(
             all_artifacts.iter().any(|a| a.name == terminal),

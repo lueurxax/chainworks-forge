@@ -7,6 +7,7 @@ edition = "2021"
 domain = { path = "../domain" }
 db = { path = "../db" }
 engine = { path = "../engine" }
+auth = { path = "../auth" }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }
 axum = { workspace = true }
@@ -20,3 +21,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

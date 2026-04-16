@@ -29,8 +29,8 @@ impl ClaudeAgentAdapter {
     /// Create a new adapter, resolving the binary from `CHAINWORKS_CLAUDE_ACP_BINARY`
     /// or falling back to `claude-agent-acp` on PATH.
     pub fn new() -> Self {
-        let binary_path = std::env::var(BINARY_ENV_VAR)
-            .unwrap_or_else(|_| "claude-agent-acp".to_string());
+        let binary_path =
+            std::env::var(BINARY_ENV_VAR).unwrap_or_else(|_| "claude-agent-acp".to_string());
         Self { binary_path }
     }
 
@@ -78,12 +78,14 @@ impl AcpAdapter for ClaudeAgentAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| {
-                format!("spawn Claude ACP subprocess: {}", self.binary_path)
-            })?;
+            .with_context(|| format!("spawn Claude ACP subprocess: {}", self.binary_path))?;
 
         let default_config = AcpSessionConfig::default();
-        let model_str = req.model.as_deref().unwrap_or(default_config.model).to_string();
+        let model_str = req
+            .model
+            .as_deref()
+            .unwrap_or(default_config.model)
+            .to_string();
         let config = AcpSessionConfig {
             model: &model_str,
             ..default_config

@@ -14,12 +14,18 @@ acp = { path = "../acp" }
 engine = { path = "../engine" }
 graphql-server = { path = "../graphql-server" }
 mcp-server = { path = "../mcp-server" }
+auth = { path = "../auth" }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = "0.10"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -4,11 +4,11 @@
 //! `AgentCatalog.swift` structs. Only the subset needed for agent→provider
 //! resolution is modeled.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::Deserialize;
 
 /// Root of an agent catalog YAML file.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentCatalogFile {
     pub schema_version: Option<u32>,
     pub app: Option<serde_yaml::Value>,
@@ -28,7 +28,7 @@ pub struct AgentCatalogFile {
 /// - `external_skill`: disk bundle with `SKILL.md` at `path`
 /// - `inline_skill`: uses `description` directly
 /// - `builtin_agent`: looked up by `name` in a hardcoded registry
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillDef {
     /// Skill type: `"external_skill"` | `"inline_skill"` | `"builtin_agent"`
     #[serde(rename = "type")]
@@ -45,7 +45,7 @@ pub struct SkillDef {
 
 /// An output contract definition from the catalog's `contracts:` section.
 /// Defines the schema an agent's structured output must conform to.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContractDef {
     pub format: Option<String>,
     pub human_format: Option<String>,
@@ -60,7 +60,7 @@ pub struct ContractDef {
 }
 
 /// A backend profile defining which ACP provider and model to use.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BackendProfile {
     pub provider: String,
     pub model: Option<String>,
@@ -73,7 +73,7 @@ pub struct BackendProfile {
 }
 
 /// A runtime profile defining ACP transport capabilities.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RuntimeProfile {
     pub capability_class: Option<String>,
     pub adapter_family: Option<String>,
@@ -85,7 +85,7 @@ pub struct RuntimeProfile {
 /// A worktree policy from the catalog's agent `worktree_policy:` section.
 /// Matches Swift `WorktreePolicy` — determines how an agent interacts with
 /// the filesystem during implementation stages.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorktreePolicy {
     /// Strategy: `"dedicated"` | `"meta_only"` | `"shared_implementation_worktree"`
     pub strategy: String,
@@ -100,7 +100,7 @@ pub struct WorktreePolicy {
 }
 
 /// An agent definition in the catalog.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentEntry {
     pub id: String,
     pub title: Option<String>,
