@@ -21,10 +21,12 @@ pub struct StartRunCmd {
     pub artifact_root: String,
     /// Frozen delivery configuration JSON for repo-backed runs.
     pub delivery_configuration_json: Option<String>,
+    /// Required by active run-start ingress when deterministic Steward snapshot truth is enabled.
     /// Path to the workflow YAML file (enables state-machine-driven execution).
-    pub workflow_yaml_path: Option<String>,
+    pub workflow_yaml_path: String,
+    /// Required by active run-start ingress when deterministic Steward snapshot truth is enabled.
     /// Path to the agent catalog YAML file.
-    pub agent_catalog_yaml_path: Option<String>,
+    pub agent_catalog_yaml_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,8 +72,8 @@ mod tests {
             workflow_title: "Workflow".into(),
             workspace_root: "/tmp/workspace".into(),
             artifact_root: "/tmp/artifacts".into(),
-            workflow_yaml_path: None,
-            agent_catalog_yaml_path: None,
+            workflow_yaml_path: "examples/workflows/workflow.yaml".into(),
+            agent_catalog_yaml_path: "examples/agents/agents.yaml".into(),
             delivery_configuration_json: Some(
                 r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#.into(),
             ),

@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Result};
+use acp::AcpRuntimeManager;
 use chrono::Utc;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use tracing::{info, warn};
 
-use db::repos::{approvals, command_journal, projections, runs, stages};
+use db::repos::{agent_executions, approvals, command_journal, projections, runs, sessions, stages};
 use db::work_item::WorkItemKind;
 use domain::approval::ApprovalDecision;
 use domain::commands::Command;
@@ -14,11 +16,13 @@ use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 
 use crate::event_bus::EventSender;
 use crate::work_queue::WorkQueue;
+use crate::cancellation;
 
 pub struct CommandHandler {
     pool: SqlitePool,
     events: EventSender,
     work_queue: WorkQueue,
+    acp: Option<Arc<AcpRuntimeManager>>,
 }
 
 pub enum CommandResult {
@@ -36,6 +40,21 @@ impl CommandHandler {
             pool,
             events,
             work_queue,
+            acp: None,
+        }
+    }
+
+    pub fn new_with_acp(
+        pool: SqlitePool,
+        events: EventSender,
+        work_queue: WorkQueue,
+        acp: Arc<AcpRuntimeManager>,
+    ) -> Self {
+        Self {
+            pool,
+            events,
+            work_queue,
+            acp: Some(acp),
         }
     }
 
@@ -98,16 +117,12 @@ impl CommandHandler {
             Command::StartRun(c) => {
                 let now = Utc::now();
                 let run_id = RunId::new();
-                // If YAML paths are provided, compile the plan early to
-                // fail fast on invalid YAML before persisting anything.
-                let initial_state = if let (Some(wf), Some(ac)) =
-                    (&c.workflow_yaml_path, &c.agent_catalog_yaml_path)
-                {
-                    let plan = workflow::compiler::compile(wf, ac)?;
-                    Some(plan.initial_state)
-                } else {
-                    None
-                };
+                // Compile the plan early to fail fast on invalid YAML before
+                // persisting anything.
+                let plan = workflow::compiler::compile(
+                    &c.workflow_yaml_path,
+                    &c.agent_catalog_yaml_path,
+                )?;
 
                 let run = Run {
                     id: run_id,
@@ -121,9 +136,10 @@ impl CommandHandler {
                     completed_at: None,
                     cancellation_requested_at: None,
                     cancellation_settled_at: None,
-                    current_state: initial_state,
-                    workflow_yaml_path: c.workflow_yaml_path,
-                    agent_catalog_yaml_path: c.agent_catalog_yaml_path,
+                    cancellation_settlement_log: None,
+                    current_state: Some(plan.initial_state),
+                    workflow_yaml_path: Some(c.workflow_yaml_path),
+                    agent_catalog_yaml_path: Some(c.agent_catalog_yaml_path),
                     // Worktree fields — provisioned later by the orchestrator
                     // when the first write-enabled implementation state is entered.
                     worktree_root: None,
@@ -360,7 +376,7 @@ impl CommandHandler {
                 }
 
                 let now = Utc::now();
-                runs::mark_cancelling(&self.pool, c.run_id, now).await?;
+                cancellation::begin_settlement(&self.pool, c.run_id, now).await?;
 
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
@@ -379,8 +395,12 @@ impl CommandHandler {
                     status: RunStatus::Cancelling,
                 });
 
-                // Refresh projections so reads reflect cancelling status.
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+                cancellation::spawn_finalize_settlement(
+                    self.pool.clone(),
+                    self.events.clone(),
+                    self.acp.clone(),
+                    c.run_id,
+                );
 
                 Ok(CommandResult::RunCancelled { run_id: c.run_id })
             }
@@ -389,6 +409,39 @@ impl CommandHandler {
                 // Mark the stage as requiring a reset by setting it to Pending
                 let run_stages = stages::list_by_run(&self.pool, c.run_id).await?;
                 if let Some(stage) = run_stages.iter().find(|s| s.stage_id == c.stage_id) {
+                    let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+                    for execution in executions {
+                        if let Some(ref generation_id) = execution.session_generation_id {
+                            sessions::end_generation(
+                                &self.pool,
+                                generation_id,
+                                domain::session::SessionGenerationStatus::Reset,
+                                "operator_reset",
+                                Utc::now(),
+                            )
+                            .await?;
+                            if let Some(ref lineage_id) = execution.session_lineage_id {
+                                sessions::set_active_generation(&self.pool, lineage_id, None).await?;
+                                sessions::insert_event(
+                                    &self.pool,
+                                    &domain::session::SessionEvent {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        lineage_id: lineage_id.clone(),
+                                        generation_id: generation_id.clone(),
+                                        event_type: domain::session::SessionEventType::OperatorReset,
+                                        recorded_at: Utc::now(),
+                                        details_json: Some(
+                                            serde_json::json!({ "reason": "operator_reset" }).to_string(),
+                                        ),
+                                    },
+                                )
+                                .await?;
+                            }
+                            if let Some(acp) = &self.acp {
+                                let _ = acp.close_session(generation_id).await;
+                            }
+                        }
+                    }
                     stages::update_status(&self.pool, stage.id, StageStatus::Pending).await?;
                 }
 

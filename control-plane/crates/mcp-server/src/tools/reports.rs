@@ -69,10 +69,19 @@ pub(crate) async fn artifact_report_json(
 
     if artifact.report_kind.as_deref() == Some("validation_failure") {
         if let Some(record) = validation::find_by_artifact_id(pool, artifact.id).await? {
+            let agent_execution_id = record.agent_execution_id;
+            let mut payload = ValidationFailureRecordPayload::from(record);
+            if let Some(execution) =
+                db::repos::agent_executions::find_by_id(pool, agent_execution_id).await?
+            {
+                payload.session_reuse_disposition = execution.session_reuse_disposition;
+                payload.session_reset_reason = execution.session_reset_reason;
+            }
+
             if let serde_json::Value::Object(ref mut map) = value {
                 map.insert(
                     "validation_failure_record".to_string(),
-                    serde_json::to_value(ValidationFailureRecordPayload::from(record))?,
+                    serde_json::to_value(payload)?,
                 );
             }
         } else if let serde_json::Value::Object(ref mut map) = value {
@@ -102,6 +111,8 @@ struct ValidationFailureRecordPayload {
     receipt_exists: bool,
     transcript_exists: bool,
     recovery_recommendation: RecoveryRecommendationPayload,
+    session_reuse_disposition: Option<String>,
+    session_reset_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -200,6 +211,8 @@ impl From<domain::validation::ValidationFailureRecord> for ValidationFailureReco
                 explanation: record.recovery_recommendation.explanation,
                 source: None,
             },
+            session_reuse_disposition: None,
+            session_reset_reason: None,
         }
     }
 }
@@ -358,6 +371,15 @@ mod tests {
                 started_at: Utc::now(),
                 completed_at: Some(Utc::now()),
                 status: domain::agent::AgentStatus::Failed,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: Some("reused".into()),
+                session_reset_reason: Some("operator_reset".into()),
             },
         )
         .await
@@ -384,6 +406,7 @@ mod tests {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
@@ -532,6 +555,14 @@ mod tests {
         assert_eq!(
             validation_failure["validation_failure_record"]["outputResults"][0]["missingFields"],
             serde_json::json!(["summary"])
+        );
+        assert_eq!(
+            validation_failure["validation_failure_record"]["sessionReuseDisposition"],
+            serde_json::json!("reused")
+        );
+        assert_eq!(
+            validation_failure["validation_failure_record"]["sessionResetReason"],
+            serde_json::json!("operator_reset")
         );
     }
 }

@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{approvals, ideas, runs, stages};
+use db::repos::{agent_executions, approvals, artifacts, ideas, runs, sessions, stages, work_items};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::commands::{ApproveStageCmd, Command, RejectStageCmd, RetryStageCmd, StartRunCmd};
+use domain::agent::{AgentExecution, AgentStatus};
 use domain::idea::{Idea, IdeaStatus};
-use domain::ids::{ApprovalId, IdeaId, RunId, StageExecutionId};
+use domain::ids::{AgentExecutionId, ApprovalId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
@@ -43,6 +44,7 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -90,6 +92,42 @@ fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
     Arc::new(CommandHandler::new(pool, events, work_queue))
+}
+
+fn test_workflow_yaml_path() -> String {
+    format!(
+        "{}/../../../examples/workflows/workflow.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn test_agent_catalog_yaml_path() -> String {
+    format!(
+        "{}/../../../examples/agents/agents.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn make_agent_execution(stage_execution_id: StageExecutionId, status: AgentStatus) -> AgentExecution {
+    AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id,
+        agent_id: "worker".into(),
+        provider: "claude".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        status,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +203,201 @@ async fn test_startup_repair_skips_clean_runs() {
         StageStatus::Completed,
         "clean stage must not be modified by startup repair"
     );
+}
+
+#[tokio::test]
+async fn test_startup_repair_recommendation_includes_execution_session_provenance() {
+    use sqlx::Row;
+
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running)).await.unwrap();
+
+    let mut execution = make_agent_execution(stage_id, AgentStatus::Running);
+    execution.session_reuse_disposition = Some("fresh_after_reset".into());
+    execution.session_reset_reason = Some("operator_reset".into());
+    execution.rehydrated_from_checkpoint_artifact_id = Some("checkpoint-artifact-1".into());
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_repaired, 1);
+
+    let row = sqlx::query(
+        r#"SELECT reason
+           FROM recovery_recommendations
+           WHERE run_id = ?1 AND stage_id = ?2
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id.to_string())
+    .bind("stage_test")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let reason: String = row.get("reason");
+    assert!(reason.contains("reuse_disposition=fresh_after_reset"));
+    assert!(reason.contains("reset_reason=operator_reset"));
+    assert!(reason.contains("checkpoint_artifact_id=checkpoint-artifact-1"));
+}
+
+#[tokio::test]
+async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_exec_id, run_id, StageStatus::Running)).await.unwrap();
+    agent_executions::insert(&pool, &make_agent_execution(stage_exec_id, AgentStatus::Running))
+        .await
+        .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "running-item".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: "{}".into(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::CancelRun(domain::commands::CancelRunCmd { run_id }))
+        .await
+        .unwrap();
+
+    let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(run.status, RunStatus::Cancelling);
+    assert!(run.cancellation_requested_at.is_some());
+    let log = run
+        .cancellation_settlement_log
+        .as_ref()
+        .expect("settlement log");
+    let entries: serde_json::Value = serde_json::from_str(log).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 1);
+    assert!(entries[0]["session_close_succeeded"].is_null());
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id).await.unwrap();
+    assert_eq!(executions[0].status, AgentStatus::Cancelled);
+    assert!(executions[0].completed_at.is_some());
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(items[0].status, db::work_item::WorkItemStatus::Cancelled);
+
+    let stage = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    assert_eq!(stage.status, StageStatus::Failed);
+}
+
+#[tokio::test]
+async fn test_invoke_agent_uses_stage_execution_id_as_owner_execution_lineage() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "owner_branch_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let owner_key = engine::session::fingerprint::invocation_owner_key(
+        &engine::session::fingerprint::InvocationOwnerKeyInput {
+            run_id: &run_id.to_string(),
+            agent_id: "worker",
+            stage_lineage_id: "owner_branch_stage",
+            task_name: "owner_branch_stage",
+            owner_execution_lineage_id: &stage_exec_id.to_string(),
+        },
+    );
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Running);
+    execution.owner_execution_lineage_id = Some(stage_exec_id.to_string());
+    execution.invocation_owner_key = Some(owner_key.clone());
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let found = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("agent execution");
+
+    assert_eq!(
+        found.owner_execution_lineage_id.as_deref(),
+        Some(stage_exec_id.to_string().as_str())
+    );
+    assert_eq!(
+        found.invocation_owner_key.as_deref(),
+        Some(owner_key.as_str())
+    );
+    assert!(owner_key.ends_with(stage_exec_id.to_string().as_str()));
+}
+
+#[tokio::test]
+async fn test_cancel_run_eventually_finalizes_to_cancelled() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_exec_id, run_id, StageStatus::Running)).await.unwrap();
+    agent_executions::insert(&pool, &make_agent_execution(stage_exec_id, AgentStatus::Running))
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::CancelRun(domain::commands::CancelRunCmd { run_id }))
+        .await
+        .unwrap();
+
+    let mut settled = None;
+    for _ in 0..20 {
+        let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+        if run.status == RunStatus::Cancelled {
+            settled = Some(run);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let run = settled.expect("run should finalize to cancelled");
+    assert!(run.cancellation_settled_at.is_some());
+    let log = run
+        .cancellation_settlement_log
+        .as_ref()
+        .expect("settlement log");
+    let entries: serde_json::Value = serde_json::from_str(log).unwrap();
+    assert_eq!(entries[0]["session_close_attempted"], serde_json::json!(false));
 }
 
 // ---------------------------------------------------------------------------
@@ -347,8 +580,8 @@ async fn test_start_run_persists_delivery_configuration_json() {
             workflow_title: "Start Run".into(),
             workspace_root: "/tmp/ws".into(),
             artifact_root: "/tmp/art".into(),
-            workflow_yaml_path: None,
-            agent_catalog_yaml_path: None,
+            workflow_yaml_path: test_workflow_yaml_path(),
+            agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
             delivery_configuration_json: delivery_configuration_json.clone(),
         }))
         .await
@@ -361,6 +594,118 @@ async fn test_start_run_persists_delivery_configuration_json() {
 
     let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
     assert_eq!(run.delivery_configuration_json, delivery_configuration_json);
+}
+
+#[tokio::test]
+async fn test_reset_session_marks_generation_reset_and_next_policy_is_fresh_after_reset() {
+    use db::repos::sessions;
+    use domain::commands::ResetSessionCmd;
+    use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition};
+    use engine::session::policy::{ensure_policy, SessionPolicyInput};
+
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running)).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "reset_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let lineage = SessionLineage {
+        id: "lineage-reset".into(),
+        run_id: run_id.to_string(),
+        agent_id: "worker".into(),
+        lineage_id: "worker".into(),
+        session_reuse_scope: "same_invocation_owner".into(),
+        session_family_id: None,
+        active_generation_id: Some("generation-reset".into()),
+        created_at: now,
+        closed_at: None,
+    };
+    sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    sessions::insert_generation(
+        &pool,
+        &SessionGeneration {
+            id: "generation-reset".into(),
+            lineage_id: lineage.id.clone(),
+            generation: 1,
+            invocation_owner_key: "owner".into(),
+            provider_session_id: Some("provider-session".into()),
+            binding_fingerprint: "fingerprint".into(),
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: "/tmp/ws".into(),
+            workspace_mode: "read_only".into(),
+            runtime_provider: "claude".into(),
+            runtime_model: "sonnet".into(),
+            status: SessionGenerationStatus::Active,
+            turn_count: 1,
+            estimated_input_tokens: 0,
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at: now,
+            last_activity_at: None,
+            ended_at: None,
+            end_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Running);
+    execution.session_lineage_id = Some(lineage.id.clone());
+    execution.session_generation_id = Some("generation-reset".into());
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::ResetSession(ResetSessionCmd {
+            run_id,
+            stage_id: "reset_stage".into(),
+        }))
+        .await
+        .unwrap();
+
+    let stage = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
+    assert_eq!(stage.status, StageStatus::Pending);
+
+    let lineage_after = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lineage_after.active_generation_id.is_none());
+
+    let generations = sessions::list_generations_for_lineage(&pool, &lineage.id)
+        .await
+        .unwrap();
+    assert_eq!(generations[0].status, SessionGenerationStatus::Reset);
+    assert_eq!(generations[0].end_reason.as_deref(), Some("operator_reset"));
+
+    let decision = ensure_policy(
+        &pool,
+        SessionPolicyInput {
+            run_id: run_id.to_string(),
+            agent_id: "worker".into(),
+            provider: "claude".into(),
+            model: "sonnet".into(),
+            working_directory: "/tmp/ws".into(),
+            workspace_mode: "read_only".into(),
+            session_reuse_scope: Some("same_invocation_owner".into()),
+            session_family_id: None,
+            invocation_owner_key: "new-owner".into(),
+            binding_fingerprint: "fingerprint".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(decision.disposition, SessionReuseDisposition::FreshAfterReset);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +826,7 @@ sys.exit(0)
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
@@ -589,6 +935,1649 @@ sys.exit(0)
         stage_proj.has_artifacts,
         "stage projection must reflect that an artifact was created"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let script = tmp.path().join("acp_envelope_undeclared_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None: sys.exit(1)
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+session_id = "undeclared-envelope-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{"type":"text","text":"<<<CHAINWORKS_OUTPUT:stdout_only_report>>>{\"summary\":\"ok\"}<<<END_CHAINWORKS_OUTPUT>>>"}]}}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+try:
+    recv()
+except Exception:
+    pass
+
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-undeclared-envelope".into(),
+            workflow_title: "Undeclared Envelope Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "undeclared_stage".into();
+    stage.label = "Undeclared Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp,
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("undeclared_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "undeclared_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "fixture-agent",
+                "provider": "claude",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let persisted_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+    let artifact = persisted_artifacts
+        .iter()
+        .find(|artifact| artifact.name == "stdout_only_report")
+        .expect("undeclared envelope output should persist as a generic artifact");
+    assert_eq!(artifact.contract_id, "claude.output");
+    assert!(std::path::Path::new(&artifact.file_path).is_file());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_persists_declared_machine_artifact_under_normalized_name() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let target_path = tmp.path().join("proposal_review_summary.json");
+
+    let script = tmp.path().join("acp_normalized_name_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None: sys.exit(1)
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+session_id = "normalized-name-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{"type":"text","text":"<<<CHAINWORKS_OUTPUT:review_alias>>>{\"summary\":\"ok\"}<<<END_CHAINWORKS_OUTPUT>>>"}]}}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+try:
+    recv()
+except Exception:
+    pass
+
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-normalized-name".into(),
+            workflow_title: "Normalized Name Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "normalized_stage".into();
+    stage.label = "Normalized Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp,
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("normalized_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "normalized_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "fixture-agent",
+                "provider": "claude",
+                "declared_outputs": [{
+                    "output_name": "review_alias",
+                    "target_path": target_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "proposal_review_v1",
+                        "format": "json",
+                        "human_format": serde_json::Value::Null,
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "normalized_artifact_name": "proposal_review_summary",
+                        "raw_artifact_name": serde_json::Value::Null,
+                        "required_fields": ["summary"]
+                    },
+                    "companion_output_name": serde_json::Value::Null,
+                    "companion_path": serde_json::Value::Null
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let persisted_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+    let artifact = persisted_artifacts
+        .iter()
+        .find(|artifact| artifact.contract_id == "proposal_review_v1")
+        .expect("declared output should persist");
+    assert_eq!(artifact.name, "proposal_review_summary");
+    assert!(artifact.file_path.ends_with("proposal_review_summary.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_reuses_live_session_generation_end_to_end() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("reuse.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let script = tmp.path().join("acp_reuse_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+cwd = msg.get("params",{}).get("cwd","/tmp")
+session_id = "reuse-engine-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+with open(os.path.join(cwd, "first.json"), "w") as f:
+    f.write('{"turn": 1}\n')
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+with open(os.path.join(cwd, "second.json"), "w") as f:
+    f.write('{"turn": 2}\n')
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+if msg.get("method") != "session/close":
+    sys.exit(1)
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_one_id = StageExecutionId::new();
+    let stage_two_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-reuse".into(),
+            workflow_title: "Reuse Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage_one = make_stage(stage_one_id, run_id, StageStatus::Running);
+    stage_one.stage_id = "reuse_stage_1".into();
+    stages::insert(&pool, &stage_one).await.unwrap();
+
+    let mut stage_two = make_stage(stage_two_id, run_id, StageStatus::Running);
+    stage_two.stage_id = "reuse_stage_2".into();
+    stages::insert(&pool, &stage_two).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("reuse_stage_1".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "reuse_stage_1",
+                "stage_execution_id": stage_one_id.to_string(),
+                "agent_id": "reuse-agent",
+                "provider": "claude",
+                "prompt": "reuse turn",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(executor.process_next_item().await.unwrap());
+
+    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+        .await
+        .unwrap()
+        .expect("lineage should exist after first turn");
+    let generation = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should exist after first turn");
+    assert_eq!(generation.turn_count, 1);
+    assert_eq!(
+        generation.provider_session_id.as_deref(),
+        Some("reuse-engine-session")
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("reuse_stage_2".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "reuse_stage_2",
+                "stage_execution_id": stage_two_id.to_string(),
+                "agent_id": "reuse-agent",
+                "provider": "claude",
+                "prompt": "reuse turn",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(executor.process_next_item().await.unwrap());
+    assert!(executor.process_next_item().await.unwrap());
+
+    let generation_after = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should still exist after second turn");
+    assert_eq!(generation_after.id, generation.id);
+
+    let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        daemon_artifacts.iter().any(|artifact| artifact.file_path.ends_with("first.json")),
+        "first turn artifact missing: {:?}",
+        daemon_artifacts.iter().map(|artifact| artifact.file_path.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        daemon_artifacts.iter().any(|artifact| artifact.file_path.ends_with("second.json")),
+        "second turn artifact missing: {:?}",
+        daemon_artifacts.iter().map(|artifact| artifact.file_path.clone()).collect::<Vec<_>>()
+    );
+
+    acp.close_session(&generation.id).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+    use engine::session::fingerprint::{
+        binding_fingerprint, invocation_owner_key, BindingFingerprintInput, InvocationOwnerKeyInput,
+    };
+    use engine::session::policy::{ensure_policy, SessionPolicyInput};
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("budget.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let script = tmp.path().join("acp_budget_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+cwd = msg.get("params",{}).get("cwd","/tmp")
+session_id = "budget-engine-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+with open(os.path.join(cwd, "budget.json"), "w") as f:
+    f.write('{"turn": 1}\n')
+send({
+    "jsonrpc":"2.0",
+    "method":"session/update",
+    "params":{
+        "update":{
+            "kind":"usage",
+            "usage":{
+                "input_tokens": 60000,
+                "cached_input_tokens": 6000,
+                "output_tokens": 1200,
+                "model_context_window": 200000
+            }
+        }
+    }
+})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+if msg and msg.get("method") == "session/close":
+    sys.exit(0)
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-budget".into(),
+            workflow_title: "Budget Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "budget_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+
+    let prompt = "budget turn from runtime telemetry";
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("budget_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "budget_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "budget-agent",
+                "provider": "claude",
+                "prompt": prompt,
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(executor.process_next_item().await.unwrap());
+
+    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+        .await
+        .unwrap()
+        .expect("lineage should exist after first turn");
+    let generation = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should exist after first turn");
+    assert_eq!(generation.turn_count, 1);
+    assert_eq!(generation.estimated_input_tokens, 60_000);
+    assert_eq!(generation.latest_cached_input_tokens, Some(6_000));
+    assert_eq!(generation.latest_output_tokens, Some(1_200));
+    assert_eq!(generation.latest_model_context_window, Some(200_000));
+    assert_eq!(generation.cumulative_prompt_tokens, 60_000);
+    assert!(generation.last_activity_at.is_some());
+    assert_eq!(
+        generation.provider_session_id.as_deref(),
+        Some("budget-engine-session")
+    );
+
+    let run_id_str = run_id.to_string();
+    let owner_key = invocation_owner_key(&InvocationOwnerKeyInput {
+        run_id: &run_id_str,
+        agent_id: "budget-agent",
+        stage_lineage_id: "budget_stage",
+        task_name: "budget_stage",
+        owner_execution_lineage_id: "follow-up-owner",
+    });
+    let fingerprint = binding_fingerprint(&BindingFingerprintInput {
+        agent_id: "budget-agent",
+        provider: "claude",
+        model: None,
+        effort: None,
+        prompt,
+        working_directory: &workspace_root,
+        workspace_mode: "read_only",
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        inputs: &Vec::new(),
+        outputs: &Vec::new(),
+        backend_profile: None,
+        permission_profile: None,
+        mcp_servers: &Vec::new(),
+        skill_snapshot_hash: None,
+        skill_ref: None,
+        skill_role: None,
+        output_contract: None,
+        max_turns: None,
+        temperature: None,
+    });
+    let decision = ensure_policy(
+        &pool,
+        SessionPolicyInput {
+            run_id: run_id.to_string(),
+            agent_id: "budget-agent".into(),
+            provider: "claude".into(),
+            model: "default".into(),
+            working_directory: workspace_root.clone(),
+            workspace_mode: "read_only".into(),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("proposal-loop".into()),
+            invocation_owner_key: owner_key,
+            binding_fingerprint: fingerprint,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        decision.disposition,
+        domain::session::SessionReuseDisposition::ReusedAfterResume
+    );
+    assert!(!decision.should_reuse_live_session);
+    assert!(
+        decision
+            .generation
+            .rehydrated_from_checkpoint_artifact_id
+            .is_some()
+    );
+
+    acp.close_session(&generation.id).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_cost_budget() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+    use engine::session::fingerprint::{
+        binding_fingerprint, invocation_owner_key, BindingFingerprintInput, InvocationOwnerKeyInput,
+    };
+    use engine::session::policy::{ensure_policy, SessionPolicyInput};
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("budget-cost.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let script = tmp.path().join("acp_budget_cost_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+session_id = "budget-cost-session"
+cwd = msg.get("params",{}).get("cwd","/tmp")
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+with open(os.path.join(cwd, "budget-cost.json"), "w") as f:
+    f.write('{"turn": 1}\n')
+send({
+    "jsonrpc":"2.0",
+    "method":"session/update",
+    "params":{
+        "update":{
+            "kind":"usage",
+            "usage":{
+                "cost_cents": 600,
+                "input_tokens": 2000,
+                "cached_input_tokens": 1000,
+                "output_tokens": 200,
+                "model_context_window": 200000
+            }
+        }
+    }
+})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+if msg and msg.get("method") == "session/close":
+    sys.exit(0)
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-budget-cost".into(),
+            workflow_title: "Budget Cost Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "budget_cost_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+
+    let prompt = "budget cost turn from runtime telemetry";
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("budget_cost_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "budget_cost_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "budget-agent",
+                "provider": "claude",
+                "prompt": prompt,
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(executor.process_next_item().await.unwrap());
+
+    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+        .await
+        .unwrap()
+        .expect("lineage should exist after first turn");
+    let generation = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should exist after first turn");
+    assert_eq!(generation.cumulative_cost_cents, 600);
+    assert_eq!(generation.estimated_input_tokens, 2_000);
+
+    let run_id_str = run_id.to_string();
+    let owner_key = invocation_owner_key(&InvocationOwnerKeyInput {
+        run_id: &run_id_str,
+        agent_id: "budget-agent",
+        stage_lineage_id: "budget_cost_stage",
+        task_name: "budget_cost_stage",
+        owner_execution_lineage_id: &stage_exec_id.to_string(),
+    });
+    let fingerprint = binding_fingerprint(&BindingFingerprintInput {
+        agent_id: "budget-agent",
+        provider: "claude",
+        model: None,
+        effort: None,
+        prompt,
+        working_directory: &workspace_root,
+        workspace_mode: "read_only",
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        inputs: &Vec::new(),
+        outputs: &Vec::new(),
+        backend_profile: None,
+        permission_profile: None,
+        mcp_servers: &Vec::new(),
+        skill_snapshot_hash: None,
+        skill_ref: None,
+        skill_role: None,
+        output_contract: None,
+        max_turns: None,
+        temperature: None,
+    });
+    let decision = ensure_policy(
+        &pool,
+        SessionPolicyInput {
+            run_id: run_id.to_string(),
+            agent_id: "budget-agent".into(),
+            provider: "claude".into(),
+            model: "default".into(),
+            working_directory: workspace_root.clone(),
+            workspace_mode: "read_only".into(),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("proposal-loop".into()),
+            invocation_owner_key: owner_key,
+            binding_fingerprint: fingerprint,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        decision.disposition,
+        domain::session::SessionReuseDisposition::FreshAfterBudget
+    );
+    assert!(!decision.should_reuse_live_session);
+
+    acp.close_session(&generation.id).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_cancel_run_finalize_closes_live_session_via_runtime_manager() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+    use std::os::unix::fs::PermissionsExt;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let script = tmp.path().join("acp_cancel_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+session_id = "cancel-engine-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+msg = recv()
+if msg.get("method") != "session/close":
+    sys.exit(1)
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-cancel".into(),
+            workflow_title: "Cancel Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root,
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    stages::insert(&pool, &make_stage(stage_exec_id, run_id, StageStatus::Running))
+        .await
+        .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events.clone(),
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("stage_test".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "stage_test",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "reuse-agent",
+                "provider": "claude",
+                "prompt": "prime session",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(executor.process_next_item().await.unwrap());
+
+    let lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+        .await
+        .unwrap()
+        .expect("lineage should exist after priming session");
+    let generation = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should exist after priming session");
+
+    let running_exec = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage_exec_id,
+        agent_id: "reuse-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: Some(stage_exec_id.to_string()),
+        session_lineage_id: Some(lineage.id.clone()),
+        session_generation_id: Some(generation.id.clone()),
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: Some(generation.invocation_owner_key.clone()),
+        session_reuse_scope: Some("same_agent_family_within_run".into()),
+        session_family_id: Some("proposal-loop".into()),
+        session_reuse_disposition: Some("reused".into()),
+        session_reset_reason: None,
+    };
+    agent_executions::insert(&pool, &running_exec).await.unwrap();
+    stages::update_status(&pool, stage_exec_id, StageStatus::Running)
+        .await
+        .unwrap();
+
+    let handler = Arc::new(CommandHandler::new_with_acp(
+        pool.clone(),
+        events,
+        work_queue.clone(),
+        acp.clone(),
+    ));
+    handler
+        .handle(Command::CancelRun(domain::commands::CancelRunCmd { run_id }))
+        .await
+        .unwrap();
+
+    let mut settled = None;
+    for _ in 0..25 {
+        let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+        if run.status == RunStatus::Cancelled {
+            settled = Some(run);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let run = settled.expect("run should finalize to cancelled");
+    let entries: serde_json::Value = serde_json::from_str(
+        run.cancellation_settlement_log
+            .as_deref()
+            .expect("settlement log"),
+    )
+    .unwrap();
+    assert_eq!(entries[0]["session_close_attempted"], serde_json::json!(true));
+    assert_eq!(entries[0]["session_close_succeeded"], serde_json::json!(true));
+    assert!(
+        acp.close_session(&generation.id).await.is_err(),
+        "session should already be closed by cancellation finalization"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+    use engine::session::fingerprint::{binding_fingerprint, BindingFingerprintInput};
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("missing-live-handle.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let script = tmp.path().join("acp_missing_live_handle_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+cwd = msg.get("params",{}).get("cwd","/tmp")
+session_id = "fresh-session-after-missing-live-handle"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+msg = recv()
+with open(os.path.join(cwd, "fresh.json"), "w") as f:
+    f.write('{"fresh": true}\n')
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+msg = recv()
+if msg and msg.get("method") == "session/close":
+    sys.exit(0)
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+    let fingerprint = binding_fingerprint(&BindingFingerprintInput {
+        agent_id: "reuse-agent",
+        provider: "claude",
+        model: None,
+        effort: None,
+        prompt: "fallback after missing live handle",
+        working_directory: &workspace_root,
+        workspace_mode: "read_only",
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        inputs: &Vec::new(),
+        outputs: &Vec::new(),
+        backend_profile: None,
+        permission_profile: None,
+        mcp_servers: &Vec::new(),
+        skill_snapshot_hash: None,
+        skill_ref: None,
+        skill_role: None,
+        output_contract: None,
+        max_turns: None,
+        temperature: None,
+    });
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-reuse".into(),
+            workflow_title: "Reuse Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: now,
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "reuse_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let lineage = domain::session::SessionLineage {
+        id: "lineage-1".into(),
+        run_id: run_id.to_string(),
+        agent_id: "reuse-agent".into(),
+        lineage_id: "proposal-loop".into(),
+        session_reuse_scope: "same_agent_family_within_run".into(),
+        session_family_id: Some("proposal-loop".into()),
+        active_generation_id: Some("generation-1".into()),
+        created_at: now,
+        closed_at: None,
+    };
+    sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    sessions::insert_generation(
+        &pool,
+        &domain::session::SessionGeneration {
+            id: "generation-1".into(),
+            lineage_id: lineage.id.clone(),
+            generation: 1,
+            invocation_owner_key: "owner".into(),
+            provider_session_id: Some("stale-provider-session".into()),
+            binding_fingerprint: fingerprint,
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: workspace_root.clone(),
+            workspace_mode: "read_only".into(),
+            runtime_provider: "claude".into(),
+            runtime_model: "default".into(),
+            status: domain::session::SessionGenerationStatus::Active,
+            turn_count: 1,
+            estimated_input_tokens: 0,
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at: now,
+            last_activity_at: None,
+            ended_at: None,
+            end_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp,
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("reuse_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "reuse_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "reuse-agent",
+                "provider": "claude",
+                "prompt": "fallback after missing live handle",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let updated_lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+        .await
+        .unwrap()
+        .expect("lineage should still exist");
+    let active_generation = sessions::find_active_generation(&pool, &updated_lineage.id)
+        .await
+        .unwrap()
+        .expect("a fresh active generation should exist");
+    assert_ne!(active_generation.id, "generation-1");
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id).await.unwrap();
+    let execution = executions
+        .iter()
+        .find(|execution| execution.agent_id == "reuse-agent")
+        .expect("agent execution should exist");
+    assert_eq!(
+        execution.session_reuse_disposition.as_deref(),
+        Some("fresh_after_transport_error")
+    );
+
+    let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        daemon_artifacts.iter().any(|artifact| artifact.file_path.ends_with("fresh.json")),
+        "fresh artifact missing after missing-live-handle fallback"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let workspace_root = tempdir.path().display().to_string();
+    let script = tempdir.path().join("acp_checkpoint_resume_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None: sys.exit(1)
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+cwd = msg.get("params",{}).get("cwd","/tmp")
+session_id = "checkpoint-resume-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+if msg is None: sys.exit(1)
+artifact = os.path.join(cwd, "resume.json")
+with open(artifact, "w") as f:
+    f.write('{"ok":true,"mode":"resume"}\n')
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":"Resumed."}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+try:
+    recv()
+except Exception:
+    pass
+
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+    let checkpoint_artifact_id = domain::ids::ArtifactId::new().to_string();
+    let fingerprint = engine::session::fingerprint::binding_fingerprint(
+        &engine::session::fingerprint::BindingFingerprintInput {
+            agent_id: "resume-agent",
+            provider: "claude",
+            model: None,
+            effort: None,
+            prompt: "resume from checkpoint",
+            working_directory: &workspace_root,
+            workspace_mode: "read_only",
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            inputs: &Vec::new(),
+            outputs: &Vec::new(),
+            backend_profile: None,
+            permission_profile: None,
+            mcp_servers: &Vec::new(),
+            skill_snapshot_hash: None,
+            skill_ref: None,
+            skill_role: None,
+            output_contract: None,
+            max_turns: None,
+            temperature: None,
+        },
+    );
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-resume".into(),
+            workflow_title: "Resume Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: now,
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "resume_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let lineage = domain::session::SessionLineage {
+        id: "lineage-resume".into(),
+        run_id: run_id.to_string(),
+        agent_id: "resume-agent".into(),
+        lineage_id: "proposal-loop".into(),
+        session_reuse_scope: "same_agent_family_within_run".into(),
+        session_family_id: Some("proposal-loop".into()),
+        active_generation_id: None,
+        created_at: now,
+        closed_at: None,
+    };
+    sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    sessions::insert_generation(
+        &pool,
+        &domain::session::SessionGeneration {
+            id: "generation-checkpoint".into(),
+            lineage_id: lineage.id.clone(),
+            generation: 1,
+            invocation_owner_key: "owner".into(),
+            provider_session_id: Some("provider-session".into()),
+            binding_fingerprint: fingerprint,
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: workspace_root.clone(),
+            workspace_mode: "read_only".into(),
+            runtime_provider: "claude".into(),
+            runtime_model: "default".into(),
+            status: domain::session::SessionGenerationStatus::Closed,
+            turn_count: 20,
+            estimated_input_tokens: 0,
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at: now,
+            last_activity_at: None,
+            ended_at: Some(now),
+            end_reason: Some(format!(
+                "budget_compaction_checkpoint:{checkpoint_artifact_id}"
+            )),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp,
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("resume_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "resume_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "resume-agent",
+                "provider": "claude",
+                "prompt": "resume from checkpoint",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "proposal-loop",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let updated_lineage = sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
+        .await
+        .unwrap()
+        .expect("lineage should still exist");
+    let active_generation = sessions::find_active_generation(&pool, &updated_lineage.id)
+        .await
+        .unwrap()
+        .expect("a resumed active generation should exist");
+    assert_eq!(
+        active_generation
+            .rehydrated_from_checkpoint_artifact_id
+            .as_deref(),
+        Some(checkpoint_artifact_id.as_str())
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id).await.unwrap();
+    let execution = executions
+        .iter()
+        .find(|execution| execution.agent_id == "resume-agent")
+        .expect("agent execution should exist");
+    assert_eq!(
+        execution.session_reuse_disposition.as_deref(),
+        Some("reused_after_resume")
+    );
+    assert_eq!(
+        execution
+            .rehydrated_from_checkpoint_artifact_id
+            .as_deref(),
+        Some(checkpoint_artifact_id.as_str())
+    );
+
+    let checkpoint_artifact = artifacts::find_by_id(
+        &pool,
+        checkpoint_artifact_id.parse().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("checkpoint artifact should be persisted");
+    assert_eq!(
+        checkpoint_artifact.report_kind.as_deref(),
+        Some("session_checkpoint")
+    );
+    assert!(std::path::Path::new(&checkpoint_artifact.file_path).exists());
 }
 
 /// R7 bar: daemon-vs-Swift behavioral diff harness.
@@ -1120,38 +3109,137 @@ async fn test_n_phase_sequence_ordering() {
 /// Pending with incremented attempt_number.
 #[tokio::test]
 async fn test_post_approval_retry_requires_fresh_approval() {
+    use engine::orchestrator::Orchestrator;
+
     let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_exec_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Blocked)).await.unwrap();
 
-    // Simulate a failed post-approval stage
+    // Use real workflow + catalog so advance_run can compile the plan and
+    // detect state_11_manual_release as a manual_gate with post_approval_tasks.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let wf_path = format!("{}/../../../examples/workflows/full-mvp-live.yaml", manifest_dir);
+    let cat_path = format!("{}/../../../examples/agents/agents.yaml", manifest_dir);
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.workflow_yaml_path = Some(wf_path);
+    run.agent_catalog_yaml_path = Some(cat_path);
+    run.current_state = Some("state_11_manual_release".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    // Simulate a failed post-approval stage with a resolved approval record
+    // from the first (failed) attempt.
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
     stage.stage_id = "state_11_manual_release".into();
     stage.stage_type = Some("manual_gate".into());
     stages::insert(&pool, &stage).await.unwrap();
 
-    let handler = make_command_handler(pool.clone());
-    handler.handle(Command::RetryStage(RetryStageCmd {
+    let mut first_approval = make_approval(
         run_id,
-        stage_id: "state_11_manual_release".into(),
-    })).await.unwrap();
+        "state_11_manual_release",
+        ApprovalDecision::Granted,
+    );
+    first_approval.decided_at = Some(Utc::now());
+    approvals::insert(&pool, &first_approval).await.unwrap();
 
-    // Old stage must be Skipped
+    // Step 1: RetryStage command creates the new attempt and enqueues
+    // AdvanceRun. The old stage is Skipped, the new attempt is Pending.
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(Command::RetryStage(RetryStageCmd {
+            run_id,
+            stage_id: "state_11_manual_release".into(),
+        }))
+        .await
+        .unwrap();
+
     let old = stages::find_by_id(&pool, stage_exec_id).await.unwrap().unwrap();
-    assert_eq!(old.status, StageStatus::Skipped, "old failed stage must be Skipped after retry");
+    assert_eq!(
+        old.status,
+        StageStatus::Skipped,
+        "old failed stage must be Skipped after retry"
+    );
 
-    // New stage must exist with attempt_number = 2 and status Pending
     let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
-    let new_stage = all_stages
+    let retried_stage = all_stages
         .iter()
         .find(|s| s.stage_id == "state_11_manual_release" && s.attempt_number == 2)
-        .expect("retry must create new stage with attempt_number=2");
-    assert_eq!(new_stage.status, StageStatus::Pending,
-        "retried manual_gate stage must start as Pending (orchestrator will re-enter manual gate path)");
+        .expect("retry must create new stage with attempt_number=2")
+        .clone();
+    assert_eq!(
+        retried_stage.status,
+        StageStatus::Pending,
+        "retried manual_gate stage must start as Pending before advance_run fires"
+    );
+
+    // Step 2: P044 §3g — advance_run must restore the retried stage to
+    // WaitingApproval on the same stage execution (no lineage fork) and
+    // create a fresh Approval record so the operator must re-approve.
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    // The retried stage (attempt=2) must now be WaitingApproval, preserved
+    // by ID — not superseded by a new create_stage_for_state execution.
+    let retried_after = stages::find_by_id(&pool, retried_stage.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried_after.status,
+        StageStatus::WaitingApproval,
+        "retried manual_gate stage must return to WaitingApproval after advance_run"
+    );
+    assert_eq!(
+        retried_after.attempt_number, 2,
+        "WaitingApproval stage must be the retried attempt, not a forked attempt=1"
+    );
+
+    // No additional attempt=1 stage must be created by create_stage_for_state.
+    let post_advance_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let attempts_for_state_11: Vec<_> = post_advance_stages
+        .iter()
+        .filter(|s| s.stage_id == "state_11_manual_release")
+        .collect();
+    assert_eq!(
+        attempts_for_state_11.len(),
+        2,
+        "retry must produce exactly 2 stage executions (Skipped + WaitingApproval), got {}: {:?}",
+        attempts_for_state_11.len(),
+        attempts_for_state_11
+            .iter()
+            .map(|s| (s.attempt_number, s.status.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // A NEW approval record must exist in Requested state. The original
+    // first_approval is still Granted; the new one must be distinct.
+    let all_approvals = approvals::list_by_run(&pool, run_id).await.unwrap();
+    let fresh_requests: Vec<_> = all_approvals
+        .iter()
+        .filter(|a| {
+            a.stage_id == "state_11_manual_release"
+                && a.decision == ApprovalDecision::Requested
+                && a.id != first_approval.id
+        })
+        .collect();
+    assert_eq!(
+        fresh_requests.len(),
+        1,
+        "retry must create exactly one fresh Requested approval record, got {}",
+        fresh_requests.len()
+    );
+
+    // Run status must reflect the pending approval checkpoint.
+    let refreshed_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        refreshed_run.status,
+        RunStatus::WaitingApproval,
+        "run status must be WaitingApproval after retried release gate awaits fresh approval"
+    );
 }
 
 /// Ensures state_6 (simple gate, no post_approval_tasks) still completes
@@ -1264,6 +3352,7 @@ async fn test_state_11_to_state_12_happy_path() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: Some("state_11_manual_release".into()),
         workflow_yaml_path: Some(wf_path),
         agent_catalog_yaml_path: Some(cat_path),

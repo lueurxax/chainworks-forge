@@ -40,13 +40,22 @@ pub struct CompiledState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedAgent {
     pub agent_id: String,
+    pub backend_profile_id: Option<String>,
     /// Bare ACP provider name: "claude", "codex", "gemini", "auggie", "junie".
     pub provider: String,
     pub model: Option<String>,
     /// Effort level from backend_profile (e.g. "high", "medium", "low").
     pub effort: Option<String>,
+    pub max_turns: Option<u32>,
+    pub temperature: Option<f64>,
     /// System prompt from the agent catalog (agents[].prompt).
     pub prompt: Option<String>,
+    pub permission_profile: Option<String>,
+    pub skill_ref: Option<String>,
+    pub skill_role: Option<String>,
+    pub skill_snapshot_hash: Option<String>,
+    #[serde(default)]
+    pub requested_mcp_server_ids: Vec<String>,
     /// Resolved skill content for prompt injection.
     /// Populated during compilation when `skill_ref` is set on the agent.
     pub resolved_skill: Option<ResolvedSkill>,
@@ -59,6 +68,10 @@ pub struct ResolvedAgent {
     /// Worktree strategy from the catalog: "dedicated", "meta_only",
     /// "shared_implementation_worktree". `None` = no worktree policy.
     pub worktree_strategy: Option<String>,
+    /// Session reuse scope declared in the agent catalog.
+    pub session_reuse_scope: Option<String>,
+    /// Session family ID declared in the agent catalog.
+    pub session_family_id: Option<String>,
 }
 
 /// A resolved skill, ready for prompt injection.

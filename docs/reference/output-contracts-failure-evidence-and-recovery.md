@@ -1,6 +1,6 @@
 # Output Contracts, Failure Evidence, and Narrow Recovery
 
-Stable reference for the implemented output-contract, failure-evidence, retry-lineage, and bounded proposal-resilience slice that was previously tracked by Proposal 013.
+Stable reference for the implemented output-contract, failure-evidence, retry-lineage, typed validation-failure reader, and bounded proposal-resilience slice consolidated from the old Proposal 013 slice and the later Rust control-plane work that was previously tracked by Proposal 046.
 
 ## Purpose
 
@@ -18,6 +18,7 @@ For implementation and proof status, use [../evidence/output-contracts-failure-e
 
 This reference covers:
 
+- the structured-output envelope and contract-validation substrate used by the Rust control plane,
 - catalog-backed output-contract authority,
 - strict proposal-review and aggregate summary contract enforcement,
 - canonical validation-failure and failed-stage evidence,
@@ -28,12 +29,25 @@ This reference covers:
 
 It does not replace:
 
+- transport-level envelope extraction and canonical binding details in [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md),
 - lower-layer settlement and transport truth in [execution-truth-and-recovery.md](execution-truth-and-recovery.md),
 - broader orchestrator topology in [workflow-execution-engine.md](workflow-execution-engine.md),
 - frozen run state and artifact boundaries in [runtime-contract.md](runtime-contract.md),
 - or operator-shell interaction rules in [operator-experience.md](operator-experience.md).
 
 ## Core Rules
+
+### Structured-output validation is implemented, not aspirational
+
+The Rust control plane now implements the structured-output substrate for this slice:
+
+- ACP extracts named `CHAINWORKS_OUTPUT` envelopes,
+- the workflow compiler carries the expanded contract schema,
+- the executor binds declared artifacts to canonical names and paths before persistence,
+- undeclared envelope outputs survive as generic artifacts,
+- and validation-failure evidence is durable and typed.
+
+The detailed owner chain for that substrate lives in [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md). This document treats that substrate as implemented baseline, then defines how failure evidence, retry truth, and narrow recovery consume it.
 
 ### One contract authority
 
@@ -110,6 +124,23 @@ Reports, exports, and recovery surfaces should reference the canonical failed-st
 
 Because canonical evidence may contain sensitive data, operator-visible summaries should default to summarized or redacted presentation until explicit inspection is requested.
 
+### Current northbound readers consume the typed failure record
+
+For this slice, the current northbound readers are:
+
+- GraphQL artifact reads,
+- MCP `reports.get`,
+- MCP `report://{run_id}`,
+- and stage projections for the lightweight `has_validation_failure` bit.
+
+The typed source of truth for failure detail is the durable `ValidationFailureRecord`, not loose artifact metadata.
+
+That means:
+
+- stage projections carry only the lightweight stage-status signal,
+- artifact and report readers decode the persisted typed failure record,
+- and no alternate metadata-only or heuristic reader lane should compete with the durable record.
+
 ### Same-run retry keeps lineage and inspectable history
 
 Same-run retry is distinct from clone-run.
@@ -183,8 +214,9 @@ After this slice, a blocked proposal-review or aggregate stage should make all o
 
 Use:
 
+- [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) for the implemented ACP envelope, canonical binding, validation-mode, and persistence-order substrate,
 - [execution-truth-and-recovery.md](execution-truth-and-recovery.md) for lower-layer outcome and settlement truth,
 - [workflow-execution-engine.md](workflow-execution-engine.md) for orchestrator and executor topology,
 - [runtime-contract.md](runtime-contract.md) for frozen snapshot and artifact boundaries,
 - [operator-experience.md](operator-experience.md) for shell and recovery presentation rules,
-- [test-gates.md](test-gates.md) for the canonical `proposal-013` proof lane.
+- [test-gates.md](test-gates.md) for the current verification lanes.

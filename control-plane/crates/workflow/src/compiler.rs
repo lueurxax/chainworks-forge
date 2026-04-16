@@ -74,14 +74,24 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
 // ---------------------------------------------------------------------------
 
 struct AgentBinding {
+    backend_profile_id: String,
     provider: String,
     model: Option<String>,
     effort: Option<String>,
+    max_turns: Option<u32>,
+    temperature: Option<f64>,
     prompt: Option<String>,
+    permission_profile: Option<String>,
+    skill_ref: Option<String>,
+    skill_role: Option<String>,
+    skill_snapshot_hash: Option<String>,
+    requested_mcp_server_ids: Vec<String>,
     output_contract: Option<String>,
     resolved_skill: Option<ResolvedSkill>,
     worktree_write_enabled: bool,
     worktree_strategy: Option<String>,
+    session_reuse_scope: Option<String>,
+    session_family_id: Option<String>,
 }
 
 /// Lookup from output artifact name or explicit contract ID → resolved schema.
@@ -159,15 +169,28 @@ fn register_contract_alias(
     }
 }
 
-/// Strip a trailing `_v<N>` suffix from a contract identifier.
+/// Strip a trailing version suffix from a contract identifier.
+///
+/// Accepted suffix families intentionally mirror the common stable forms used
+/// in the proposal contract: `_vN`, `-vN`, `_VN`, `-VN`.
 fn strip_version_suffix(id: &str) -> Option<String> {
-    let idx = id.rfind("_v")?;
-    let tail = &id[idx + 2..];
-    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
-        Some(id[..idx].to_string())
-    } else {
-        None
+    for marker in ["_v", "-v", "_V", "-V"] {
+        let Some(idx) = id.rfind(marker) else {
+            continue;
+        };
+        let tail = &id[idx + marker.len()..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            return Some(id[..idx].to_string());
+        }
     }
+    None
+}
+
+fn sha256_string(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(content.as_bytes());
+    format!("{digest:x}")
 }
 
 fn build_agent_lookup(
@@ -194,8 +217,16 @@ fn build_agent_lookup(
         let provider = normalize_provider(&profile.provider);
         let model = profile.model.clone();
         let effort = profile.effort.clone();
+        let max_turns = profile.max_turns;
+        let temperature = profile.temperature;
         let prompt = agent.prompt.clone();
         let output_contract = agent.output_contract.clone();
+        let session_reuse_scope = agent.session_reuse_scope.clone();
+        let session_family_id = agent.session_family_id.clone();
+        let permission_profile = agent.permission_profile.clone();
+        let skill_ref = agent.skill_ref.clone();
+        let skill_role = agent.skill_role.clone();
+        let requested_mcp_server_ids = profile.mcp.clone().unwrap_or_default();
 
         // Resolve skill if referenced.
         let resolved_skill = if let Some(skill_ref) = &agent.skill_ref {
@@ -240,6 +271,9 @@ fn build_agent_lookup(
         } else {
             None
         };
+        let skill_snapshot_hash = resolved_skill
+            .as_ref()
+            .map(|skill| sha256_string(&skill.injected_content));
 
         // Extract worktree policy fields (matching Swift RunPlanCompiler).
         let (wt_write, wt_strategy) = agent.worktree_policy.as_ref()
@@ -247,14 +281,24 @@ fn build_agent_lookup(
             .unwrap_or((false, None));
 
         lookup.insert(agent.id.clone(), AgentBinding {
+            backend_profile_id: agent.backend_profile.clone(),
             provider,
             model,
             effort,
+            max_turns,
+            temperature,
             prompt,
+            permission_profile,
+            skill_ref,
+            skill_role,
+            skill_snapshot_hash,
+            requested_mcp_server_ids,
             output_contract,
             resolved_skill,
             worktree_write_enabled: wt_write,
             worktree_strategy: wt_strategy,
+            session_reuse_scope,
+            session_family_id,
         });
     }
     Ok(lookup)
@@ -337,14 +381,24 @@ fn resolve_agent(
     match agents.get(agent_id) {
         Some(binding) => Ok(ResolvedAgent {
             agent_id: agent_id.to_string(),
+            backend_profile_id: Some(binding.backend_profile_id.clone()),
             provider: binding.provider.clone(),
             model: binding.model.clone(),
             effort: binding.effort.clone(),
+            max_turns: binding.max_turns,
+            temperature: binding.temperature,
             prompt: binding.prompt.clone(),
+            permission_profile: binding.permission_profile.clone(),
+            skill_ref: binding.skill_ref.clone(),
+            skill_role: binding.skill_role.clone(),
+            skill_snapshot_hash: binding.skill_snapshot_hash.clone(),
+            requested_mcp_server_ids: binding.requested_mcp_server_ids.clone(),
             resolved_skill: binding.resolved_skill.clone(),
             output_contract: binding.output_contract.clone(),
             worktree_write_enabled: binding.worktree_write_enabled,
             worktree_strategy: binding.worktree_strategy.clone(),
+            session_reuse_scope: binding.session_reuse_scope.clone(),
+            session_family_id: binding.session_family_id.clone(),
         }),
         None => {
             warn!(
@@ -353,14 +407,24 @@ fn resolve_agent(
             );
             Ok(ResolvedAgent {
                 agent_id: agent_id.to_string(),
+                backend_profile_id: None,
                 provider: "claude".to_string(),
                 model: None,
                 effort: None,
+                max_turns: None,
+                temperature: None,
                 prompt: None,
+                permission_profile: None,
+                skill_ref: None,
+                skill_role: None,
+                skill_snapshot_hash: None,
+                requested_mcp_server_ids: Vec::new(),
                 resolved_skill: None,
                 output_contract: None,
                 worktree_write_enabled: false,
                 worktree_strategy: None,
+                session_reuse_scope: None,
+                session_family_id: None,
             })
         }
     }

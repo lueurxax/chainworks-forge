@@ -46,15 +46,16 @@ async fn main() -> Result<()> {
     // 5. Create WorkQueue
     let work_queue = WorkQueue::new(pool.clone());
 
-    // 6. Create CommandHandler
-    let cmd_handler = Arc::new(CommandHandler::new(
+    // 6. Create AcpRuntimeManager
+    let acp = Arc::new(AcpRuntimeManager::new());
+
+    // 7. Create CommandHandler
+    let cmd_handler = Arc::new(CommandHandler::new_with_acp(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
+        acp.clone(),
     ));
-
-    // 7. Create AcpRuntimeManager
-    let acp = Arc::new(AcpRuntimeManager::new());
 
     // 8. Create Orchestrator
     let orchestrator = Arc::new(Orchestrator::new(

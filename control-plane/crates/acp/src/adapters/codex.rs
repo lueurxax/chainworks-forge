@@ -6,11 +6,10 @@ use tokio::process::Command;
 use tracing::info;
 use uuid::Uuid;
 
-use domain::ids::AgentExecutionId;
-
 use crate::adapters::AcpAdapter;
-use crate::transport::{run_acp_session, AcpSessionConfig};
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::session::{AcpSession, AcpSessionHandle};
+use crate::transport::AcpSessionConfig;
+use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
 
@@ -51,7 +50,7 @@ impl AcpAdapter for CodexAdapter {
         "codex"
     }
 
-    async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
         if self.binary_path.is_empty() {
             bail!(
                 "CodexAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -71,12 +70,10 @@ impl AcpAdapter for CodexAdapter {
             "Spawning Codex ACP subprocess"
         );
 
-        let agent_execution_id = AgentExecutionId::new();
-
         // Build environment matching Swift makeSessionEnvironment
         let env = make_session_environment(&runtime_home);
 
-        let mut child = Command::new(&self.binary_path)
+        let child = Command::new(&self.binary_path)
             .envs(env)
             // Suppress verbose codex_otel/codex_core/rmcp INFO tracing that
             // floods stderr and causes memory pressure. codex-acp reads RUST_LOG
@@ -115,18 +112,9 @@ impl AcpAdapter for CodexAdapter {
             extra: None,
             config_options,
         };
+        let session = AcpSession::start_with_cleanup(child, req, &config, Some(runtime_home)).await?;
 
-        let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
-
-        // Cleanup runtime home (best-effort, don't fail the run)
-        let _ = std::fs::remove_dir_all(&runtime_home);
-
-        Ok(ExecutionResult {
-            agent_execution_id,
-            status,
-            artifact_paths,
-            cost_cents: None,
-        })
+        Ok(AcpSessionHandle::new(session))
     }
 }
 

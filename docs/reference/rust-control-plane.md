@@ -8,6 +8,8 @@ Related stable docs:
 
 - [operator-experience.md](operator-experience.md)
 - [runtime-contract.md](runtime-contract.md)
+- [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md)
+- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
 - [test-gates.md](test-gates.md)
 
 ## Purpose

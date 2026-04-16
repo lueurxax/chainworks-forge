@@ -14,6 +14,7 @@ DerivedDataCodex/
 
 # Swift Package Manager
 .build/
+control-plane/target/
 
 # Temporary editor files
 *.swp
@@ -21,5 +22,8 @@ DerivedDataCodex/
 
 # Local tool state
 .claude/
+.chainworks/
 traces/
 .forge-codex-acp/
+control-plane/chainworks-control-plane.db
+control-plane/chainworks-control-plane.db-*

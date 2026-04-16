@@ -270,6 +270,20 @@ pub fn build_validation_failure_record(
         .failure_summary
         .clone()
         .context("validation failure record requires a failure summary")?;
+    let recovery_recommendation = match failure_class {
+        ValidationFailureClass::NoOutputProduced | ValidationFailureClass::PersistenceFailure => {
+            RecoveryRecommendation {
+                action: "operator_inspection".to_string(),
+                explanation: "Inspect the agent transcript, receipt, and declared output contract before deciding whether to retry.".to_string(),
+            }
+        }
+        ValidationFailureClass::EmptyOutput | ValidationFailureClass::OutputContractMismatch => {
+            RecoveryRecommendation {
+                action: "retry_failed_agent".to_string(),
+                explanation: "Retry the failed agent with the same declared outputs and inspect the validation failure payload.".to_string(),
+            }
+        }
+    };
 
     Ok(ValidationFailureRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -287,10 +301,7 @@ pub fn build_validation_failure_record(
         raw_output_exists: validation.raw_output_exists,
         receipt_exists,
         transcript_exists,
-        recovery_recommendation: RecoveryRecommendation {
-            action: "retry_failed_agent".to_string(),
-            explanation: "Retry the failed agent with the same declared outputs and inspect the validation failure payload.".to_string(),
-        },
+        recovery_recommendation,
     })
 }
 
@@ -367,5 +378,37 @@ mod tests {
             summary.failure_class,
             Some(ValidationFailureClass::NoOutputProduced)
         );
+    }
+
+    #[test]
+    fn build_validation_failure_record_uses_operator_inspection_for_missing_output() {
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: "/tmp/proposal_review.json".to_string(),
+            schema: Some(structured_schema()),
+            companion_output_name: Some("proposal_review_raw".to_string()),
+            companion_path: Some("/tmp/proposal_review.md".to_string()),
+        };
+        let summary = validate_task_outputs(&[CapturedOutput {
+            declared,
+            machine_bytes: None,
+            companion_bytes: None,
+        }]);
+
+        let record = build_validation_failure_record(
+            domain::ids::ArtifactId::new(),
+            domain::ids::RunId::new(),
+            "state_1".to_string(),
+            domain::ids::StageExecutionId::new(),
+            "agent".to_string(),
+            domain::ids::AgentExecutionId::new(),
+            summary,
+            false,
+            false,
+        )
+        .expect("missing output should still produce a validation failure record");
+
+        assert_eq!(record.failure_class, ValidationFailureClass::NoOutputProduced);
+        assert_eq!(record.recovery_recommendation.action, "operator_inspection");
     }
 }

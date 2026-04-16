@@ -155,6 +155,7 @@ mod tests {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,

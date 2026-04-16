@@ -538,6 +538,35 @@ Command:
 ./scripts/test-gate.sh proposal-045
 ```
 
+### `proposal-047|p047`
+
+Control-plane Rust workspace verification gate.
+
+Scope:
+
+- `control-plane` Rust workspace (`cargo test --workspace`)
+
+Use when:
+
+- validating the control-plane workspace test suite on the current head
+- reproving the proposal-047 control-plane slice without pulling in unrelated app or UI gates
+
+Host policy:
+
+- local Rust toolchain required; no iOS/macOS simulator needed
+- executes in-process against the `control-plane/` workspace
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-047
+```
+
+Important:
+
+- this gate is the canonical proof path for the proposal-047 control-plane workspace slice
+- the runner also accepts the `p047` alias for parity with other proposal gates
+
 ### `full`
 
 Expensive repo-wide sign-off gate.

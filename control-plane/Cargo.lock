@@ -666,6 +666,7 @@ dependencies = [
  "domain",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror 1.0.69",
@@ -3099,6 +3100,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tokio",
  "tracing",
 ]

@@ -5,7 +5,7 @@
 | Date | 2026-04-14 |
 | Status | Draft |
 | Author | Claude |
-| Depends on | [044-post-approval-task-execution-and-release-gate-completion.md](044-post-approval-task-execution-and-release-gate-completion.md) |
+| Depends on | [044-post-approval-task-execution-and-release-gate-completion.md](../044/044-post-approval-task-execution-and-release-gate-completion.md) |
 | Scope | (A) Port Swift `GitReleaseService`, `ConnectPublishService`, `ReleaseOpsCoordinator`, and `DeliveryReceiptBuilder` to the Rust daemon. (B) Add `delivery_configuration_json` input path through `StartRunCmd`, command_handler, and northbound surfaces so the frozen config reaches the run. |
 | Goal | Release agents execute through native Rust services (not ACP), a frozen `DeliveryConfiguration` flows from run creation to release execution, and a structured `delivery_receipt` artifact is persisted on happy paths plus release-attempt failure paths, with terminal backfill only when the stable Swift owner chain has enough release lineage to compute `currentReleaseResultSummary()`. |
 

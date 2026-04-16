@@ -4,6 +4,7 @@ pub mod stages;
 pub mod approvals;
 pub mod artifacts;
 pub mod validation;
+pub mod sessions;
 pub mod work_items;
 pub mod agent_executions;
 pub mod command_journal;

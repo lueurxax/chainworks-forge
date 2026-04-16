@@ -1195,6 +1195,7 @@ Available gates:
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
   proposal-044    Proposal 044 post-approval task execution and release gate completion gate
   proposal-045    Proposal 045 deterministic release operations gate
+  proposal-047    Proposal 047 control-plane workspace verification gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1485,6 +1486,14 @@ case "$GATE" in
       cargo test -p mcp-server -- --nocapture
     )
     log "Proposal 045 control-plane gate passed"
+    ;;
+  proposal-047|p047)
+    log "Proposal 047 control-plane gate: Rust workspace test suite"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --workspace 2>&1
+    )
+    log "Proposal 047 control-plane gate passed"
     ;;
   full)
     check_idle_environment strict

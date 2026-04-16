@@ -2,65 +2,129 @@
 
 | Field | Value |
 |---|---|
-| Date | 2026-04-14 |
+| Date | 2026-04-15 |
 | Status | Draft |
 | Author | Claude |
-| Depends on | [044-post-approval-task-execution-and-release-gate-completion.md](044-post-approval-task-execution-and-release-gate-completion.md), [../reference/045-deterministic-release-operations.md](../reference/045-deterministic-release-operations.md), [046-structured-output-envelope-and-contract-validation.md](046-structured-output-envelope-and-contract-validation.md) — P048's `FailedStageEvidencePacket` references `ValidationFailureRecord` and `StructuredOutputEnvelope` types defined and persisted by P046. Without P046, fields `validation_failure` and `output_envelopes` have no source. |
-| Scope | (A) Port `FailedStageEvidenceBuilder` to the Rust daemon as stage-owned failure evidence (not a second export truth lane). (B) Port `DeliveryPreflightService` as a run-creation-time frozen config validator (not a release-time readiness gate). (C) Port MCP resolution from `backend_profile.mcp` through `MCPPolicyResolver` semantics to ACP `mcpServers` (not from `required_tools`). |
-| Goal | Failed stages produce durable evidence packets for recovery/report readers; delivery config is validated before freezing at run start; agents receive their declared MCP servers from the stable `backend_profile.mcp` owner chain. |
+| Depends on | [044-post-approval-task-execution-and-release-gate-completion.md](../reference/044-post-approval-task-execution-and-release-gate-completion.md), [../reference/045-deterministic-release-operations.md](../reference/045-deterministic-release-operations.md), [../reference/structured-output-envelope-and-contract-validation.md](../reference/structured-output-envelope-and-contract-validation.md), [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) |
+| Scope | (A) add stage-owned failed-stage evidence packets, including stage-owned `recovery_snapshot`, without creating a second export truth lane; (B) add run-creation-time delivery preflight persistence and blocking semantics; (C) add execution-time MCP resolution and northbound exposure from the canonical Rust owner chain `backend_profile.mcp -> ResolvedAgent -> AgentExecution` |
+| Goal | The Rust control plane persists failed-stage evidence, stage-owned recovery truth, and delivery-preflight truth at the same ownership boundaries the current product expects, and it resolves MCP from the same canonical agent binding that the workflow compiler already emits. |
 
 ---
 
 ## 1. Context and Motivation
 
-### 1a. Evidence — Three Distinct Owners
+### 1a. Current Rust baseline
 
-The stable Swift codebase separates evidence into three distinct owners:
+This proposal is no longer designing against an empty substrate.
+
+The current Rust control plane already has the implemented structured-output and validation-failure slice:
+
+- output contracts compile through `workflow/src/compiler.rs` and `workflow/src/plan.rs`
+- validation failures persist durably through `validation_failure_records`
+- GraphQL artifact reads already expose typed `validationFailureRecord`
+- MCP `reports.get` and `report://{run_id}` already decode and return the same typed validation-failure payload
+
+That means P048 is a **delta proposal**, not a greenfield design. It must layer on top of the existing durable artifact, report, and validation-failure paths instead of describing them as absent or re-proposing them under a new owner chain.
+
+What is still missing at `HEAD` is narrower:
+
+1. stage-owned failed-stage evidence packets that summarize failure/recovery context beyond the validation-failure artifact alone, including the already-promoted stage-owned `recovery_snapshot`
+2. persisted delivery-preflight results at run creation time
+3. execution-level MCP requested/predicted/actual/denied truth and explicit northbound readers for that truth
+
+### 1b. Failed-stage evidence is not export-pack truth
+
+The stable product separates three evidence lanes:
 
 | Owner | Scope | Trigger | Persistence | Consumers |
 |---|---|---|---|---|
-| **FailedStageEvidenceBuilder** | Stage-level failure truth | Immediately on stage failure | `stageExecution.evidencePacketJSON` (on model) | Recovery UI, report readers, exports |
-| **EvidencePackBuilder** | Run-level export pack | After run completion | Disk directory: `evidence-pack-{runID}/` | Human review, CI/CD export |
-| **SignOffEvidencePackBuilder** | Cohort-level evaluation | At benchmark sign-off | Checksummed JSON packet | Evaluation audit trail |
+| `FailedStageEvidenceBuilder` | Stage-attempt failure truth | Immediately on failed settlement | Stage-owned packet + report lane | Recovery, reports, operator diagnostics |
+| `EvidencePackBuilder` | Run export pack | After run completion | Export directory | Human review, export workflows |
+| `SignOffEvidencePackBuilder` | Cohort-level evaluation | Sign-off time | Checksummed packet | Benchmark audit trail |
 
-The Rust daemon has **none of these**. P048 ports only **FailedStageEvidenceBuilder** — the stage-owned failure/recovery truth that report readers and recovery surfaces depend on. The run-level export (EvidencePackBuilder) and cohort sign-off (SignOffEvidencePackBuilder) remain out of scope — they are shell-owned export paths, not daemon-internal truth.
+P048 ports only the first lane.
 
-The daemon already has a `reports.get` MCP tool that returns artifacts with `report_kind` set. P048 does **not** create a second report lane; it ensures failed-stage evidence is persisted as an artifact readable through that existing lane.
+It must not:
 
-### 1b. Delivery Preflight — Run-Creation, Not Release-Time
+- invent a second canonical report namespace
+- treat export-pack filenames as storage truth
+- or duplicate the existing `report_kind` artifact lane
 
-Swift separates two validation moments:
+Instead, failed-stage evidence becomes:
 
-| Service | When | What | Frozen? |
-|---|---|---|---|
-| **DeliveryPreflightService** | Run creation (before start) | Validates mutable `DeliveryConfiguration` draft: repo exists, git repo valid, base branch exists, worktree base writable, release target set | Result frozen as `run.deliveryPreflightJSON` |
-| **PreflightService** | Pre-run (before start) | Validates full workflow: YAML, catalog, providers, MCP, skills, workspace | Ephemeral report, not persisted |
+1. durable stage-owned JSON on `stage_executions`
+2. a normal report artifact with `report_kind = "failed_stage_evidence"`
+3. readable through the existing northbound report surfaces
 
-Release-time readiness is **not** a preflight concern — it's governed by explicit artifact/stage inputs in the workflow YAML (P044's `run_after_approval` tasks consume required outputs) plus deterministic services from P045.
+### 1c. Delivery preflight is run-creation validation, not release readiness
 
-P048 ports `DeliveryPreflightService` as a run-creation validator. It does **not** create a release-time readiness gate.
+`DeliveryPreflightService` validates mutable delivery configuration before a run is allowed to start.
 
-### 1c. MCP Resolution — `backend_profile.mcp`, Not `required_tools`
+It is not:
 
-The stable MCP owner chain:
+- the broad `PreflightService` workflow validator
+- a release-time readiness gate
+- or a substitute for `run_after_approval` artifact requirements from [044-post-approval-task-execution-and-release-gate-completion.md](../reference/044-post-approval-task-execution-and-release-gate-completion.md)
 
+P048 therefore adds one frozen run-owned result:
+
+- `run.delivery_preflight_json`
+
+and one blocking behavior:
+
+- failed delivery preflight prevents `StartRun` from creating or starting the run
+
+### 1d. Canonical MCP owner contract
+
+The canonical Rust owner chain for MCP intent is:
+
+```text
+AgentEntry.backend_profile
+  -> backend_profile.mcp
+  -> workflow::compiler::ResolvedAgent.backend_profile_id
+  -> workflow::compiler::ResolvedAgent.requested_mcp_server_ids
+  -> executor-side MCP resolver
+  -> AgentExecution MCP provenance fields
+  -> northbound report / GraphQL readers
 ```
-backend_profile.mcp: [String]       (YAML source of truth)
-  → RunPlanCompiler                  (compiles into ResolvedAgent.requestedMCPServerIDs)
-  → MCPPolicyResolver.resolve()     (queries runtime registry, produces requested/predicted/denied)
-  → RuntimeSessionBridge             (materializes into [RuntimeMCPServerDefinition] for ACP)
-  → transport session/new { mcpServers: [...] }
-```
 
-`required_tools` is a **different** subsystem — it declares agent tool-use capabilities for artifact shape validation, not MCP server requirements. Agents without `required_tools` can still legitimately require MCP via `backend_profile.mcp`.
+This is already reflected in the current Rust compiler:
 
-The Rust daemon currently passes `"mcpServers": []` unconditionally. P048 ports the `backend_profile.mcp` → resolved MCP servers chain.
+- `workflow/src/compiler.rs` reads `profile.mcp`
+- `workflow/src/plan.rs` persists `ResolvedAgent.backend_profile_id`
+- `workflow/src/plan.rs` persists `ResolvedAgent.requested_mcp_server_ids`
+
+`required_tools` is not MCP authority.
+Older `mcp_profile` wording is retired for the Rust control-plane slice and must not be reused by this proposal.
+
+### 1e. Current northbound baseline
+
+The operator/read path at `HEAD` is uneven and must be named precisely.
+
+Current GraphQL:
+
+- `QueryRoot.run` / `GqlRun` expose run metadata and projection counts
+- `QueryRoot.stages` / `GqlStageExecution` expose stage summary plus `has_validation_failure`
+- `QueryRoot.artifacts` / `GqlArtifact.validationFailureRecord` expose the decoded typed validation-failure payload
+
+Current MCP:
+
+- `reports.get` returns report artifacts and injects typed `validation_failure_record`
+- `report://{run_id}` returns the same typed artifact payloads in the run report resource
+
+What does **not** exist yet as an explicit northbound contract:
+
+- execution-level MCP requested/predicted/actual/denied truth
+- run-level delivery-preflight result exposure
+- explicit placement rules for which new fields belong in GraphQL, which belong in report resources/tools, and which remain persistence-only
+
+P048 must close those gaps explicitly.
 
 ---
 
 ## 2. Design
 
-### 2a. Failed-Stage Evidence (FailedStageEvidenceBuilder Port)
+### 2a. Failed-stage evidence packet
 
 ```rust
 // engine/src/evidence.rs
@@ -68,24 +132,25 @@ The Rust daemon currently passes `"mcpServers": []` unconditionally. P048 ports 
 pub struct FailedStageEvidencePacket {
     pub id: String,
     pub timestamp: DateTime<Utc>,
+    pub stage_execution_id: String,
     pub stage_id: String,
     pub stage_label: String,
     pub stage_attempt_number: i64,
     pub failed_agent_id: Option<String>,
-    pub failed_agent_title: Option<String>,
+    pub failed_agent_title: Option<String>,  // nullable in V1 until Rust has a durable execution-time owner
     pub failure_summary: String,
-    pub failure_class: String,          // "output_contract_mismatch" | "agent_reported_failure" | "transport_failure" | "timeout" | "no_output_produced" | "empty_output"
-    pub supervision_classification: Option<String>,  // "idle_hang_before_first_progress" | "idle_hang_after_progress" | "idle_hang_read_loop" | "idle_hang_after_first_edit" | "mutation_side_effect_missing"
-    pub canonical_outcome: Option<String>,           // agent canonical outcome from executor (Rust-owned)
-    pub transport_error_kind: Option<String>,        // transport-level error classification (Rust-owned)
-    pub output_presence: Option<String>,             // "all_present" | "partial" | "none" (Rust-owned)
+    pub failure_class: String,
+    pub supervision_classification: Option<String>,
+    pub canonical_outcome: Option<String>,
+    pub transport_error_kind: Option<String>,
+    pub output_presence: Option<String>,
     pub raw_outputs_exist: bool,
     pub receipt_exists: bool,
     pub transcript_exists: bool,
-    pub validation_failure: Option<serde_json::Value>,  // ValidationFailureRecord from P046
-    pub output_envelopes: Vec<serde_json::Value>,       // StructuredOutputEnvelope records from P046
+    pub validation_failure: Option<serde_json::Value>,
+    pub output_envelopes: Vec<serde_json::Value>,
     pub timing: StageTiming,
-    pub recovery_snapshot: Option<serde_json::Value>,   // RecoveryActionSnapshot (retry reason, recommended action)
+    pub recovery_snapshot: Option<serde_json::Value>,
 }
 
 pub struct StageTiming {
@@ -97,39 +162,60 @@ pub struct StageTiming {
 }
 ```
 
-**Rust payload scope decision (explicitly avoiding overclaim):**
+Required V1 fields:
 
-`FailedStageEvidencePacket` is a **Rust V1 contract** in this proposal, not a blanket promise of immediate full stable parity.
+- stage identity and timing
+- failure summary and classification
+- raw/receipt/transcript existence
+- typed `validation_failure`
+- typed `output_envelopes`
+- stage-owned `recovery_snapshot`, copied from the same canonical stage record / recovery owner chain used by the current product
 
-Durable fields required for V1:
-- `transcript_exists` from runtime artifact presence (`acp-stderr.log` path check).
-- `raw_outputs_exist` from artifact persistence outcome.
-- `receipt_exists` from persisted receipt artifact detection.
-- `supervision_classification` if and only if the supervision lane is persisted on `domain::StageExecution`; if absent in this wave, persist `None`.
-- `validation_failure` from `P046` `ValidationFailureRecord` ownership.
-- `output_envelopes` from `P046` `StructuredOutputEnvelope` ownership.
-- `failure_summary`, `failure_class`, `attempt_number`, `timestamps`, and attempt timing from stage/agent context.
+Nullable/deferred V1 fields until explicit Rust owners exist:
 
-Fields that are not yet durable in Rust owners and therefore must remain nullable until an explicit V2 slice:
-- `canonical_outcome` (target owner: `domain::AgentExecution` outcome field)
-- `transport_error_kind` (target owner: `domain::AgentExecution` transport diagnostics)
-- `output_presence` (target owner: execution result + artifact presence policy)
-- `recovery_snapshot` (target owner: `domain::StageExecution`)
+- `failed_agent_title`
+- `canonical_outcome`
+- `transport_error_kind`
+- `output_presence`
 
-If any of these owners are implemented, acceptance criteria and readers must be updated in the same change set. If they remain absent, `FailedStageEvidencePacket` readers MUST treat them as optional (`null`).
+Build time:
 
-**When built:** Immediately when a stage settles as `Failed` in the orchestrator (line ~220 in the existing settlement path). Not deferred to run completion.
+- immediately when a stage attempt settles `Failed`
+- `recovery_snapshot` is loaded from the canonical stage-owned recovery field first; the failed-stage packet mirrors that truth and does not become a second recovery authority
 
-**Persistence:** Two locations (matching Swift):
-1. Serialized JSON stored on the `stage_executions` row (new column `evidence_packet_json TEXT`)
-2. Written to artifact canonical path `{artifact_root}/failure-evidence/evidence-{stage_id}-attempt{n}.json` with `report_kind = "failed_stage_evidence"` — readable via existing `reports.get` MCP tool
+Recovery snapshot producer contract:
 
-**DB migration addition:**
-```sql
-ALTER TABLE stage_executions ADD COLUMN evidence_packet_json TEXT;
+- `engine/src/recovery.rs` owns the deterministic next-action recovery snapshot for this Rust slice.
+- On failed stage settlement, `engine/src/orchestrator.rs` calls the recovery snapshot producer before it calls the failed-stage evidence builder.
+- The producer computes the snapshot from persisted run, stage, agent-execution, validation-failure, artifact, and retry/recovery state that already exists at failure-settlement time.
+- The producer persists that payload to `stage_executions.recovery_snapshot_json`.
+- `engine/src/evidence.rs` may read and embed `recovery_snapshot_json`, but it must not synthesize recovery truth when the stage-owned field is absent.
+- If the producer cannot compute a snapshot, it persists a typed snapshot with `status = "unavailable"` and a bounded `reason`; it does not leave the field silently null for newly failed P048-era stages.
+
+Stage-owned ownership for this slice stays aligned with the current execution-truth baseline:
+
+1. `stage_executions.validation_failure_json` is the canonical stage-owned copy of the typed `ValidationFailureRecord`
+2. `stage_executions.evidence_packet_json` is the stage-owned failed-stage evidence packet
+3. `stage_executions.recovery_snapshot_json` is the stage-owned next-action snapshot
+
+The failed-stage evidence packet may embed `validation_failure` and `recovery_snapshot` for report convenience, but those embedded copies do not replace the canonical stage-owned fields.
+
+Persistence:
+
+1. `stage_executions.validation_failure_json`
+2. `stage_executions.evidence_packet_json`
+3. `stage_executions.recovery_snapshot_json`
+4. a normal artifact with `report_kind = "failed_stage_evidence"`
+
+Canonical artifact path:
+
+```text
+{artifact_root}/failure-evidence/{stage_execution_id}/failed-stage-evidence.json
 ```
 
-### 2b. Delivery Preflight (DeliveryPreflightService Port)
+Friendly names such as `evidence-{stage_id}-attempt{n}.json` remain export-pack aliases only.
+
+### 2b. Delivery preflight
 
 ```rust
 // engine/src/preflight.rs
@@ -146,209 +232,223 @@ pub struct PreflightCheck {
     pub passed: bool,
     pub detail: Option<String>,
 }
-
-pub async fn validate_delivery_config(
-    config: &DeliveryConfiguration,
-) -> DeliveryPreflightResult;
 ```
 
-Stable payload remains `{ id, label, passed, detail }` so UI/evidence readers that expect `check.id` / `check.label` stay compatible.
-
-**Validation checks (matching Swift `DeliveryPreflightService.validate`):**
-1. Repository root exists on disk
-2. Valid git repo (`.git` directory or `git rev-parse --git-dir`)
-3. Base branch exists (`git rev-parse --verify refs/heads/{base_branch}`)
-4. Worktree base path is writable (`std::fs::create_dir_all` succeeds)
-5. Release target identifier is non-empty
-6. Repo identifier is non-empty
-
-**When called:** At run creation time, in `command_handler.rs` `StartRun`, **only** when `delivery_configuration_json` is provided.
-
-**Blocking semantics (matching Swift `deliveryPreflightBlocksStart`):** If preflight `passed == false`, the run **does not start**. The command handler returns an error with the failing checks. This matches the stable repo-backed gate: the Swift UI blocks run creation when `deliveryPreflightBlocksStart` is true (line 2248 in view code). The Rust daemon enforces the same gate:
-
 ```rust
-// command_handler.rs StartRun — after delivery preflight
-if let Some(ref config_json) = c.delivery_configuration_json {
-    let config: DeliveryConfiguration = serde_json::from_str(config_json)?;
-    let preflight = validate_delivery_config(&config).await;
-    if !preflight.passed {
-        let failing = preflight.checks.iter()
-            .filter(|c| !c.passed)
-            .map(|c| c.id.clone())
-            .collect::<Vec<_>>();
-        return Err(anyhow!("Delivery preflight failed: {}", failing.join(", ")));
-    }
-    // Persist passing result for evidence/export readers
-    run.delivery_preflight_json = Some(serde_json::to_string(&preflight)?);
+// engine/src/command_handler.rs
+
+pub struct StartRunBlockedByDeliveryPreflight {
+    pub delivery_preflight: DeliveryPreflightResult,
+}
+
+pub enum CommandResult {
+    RunStarted { run_id: RunId },
+    StartRunBlockedByDeliveryPreflight(StartRunBlockedByDeliveryPreflight),
+    // ...
 }
 ```
 
-**DB:** New column `delivery_preflight_json TEXT` on `runs` table. Only populated when preflight passes (failed preflight blocks run start entirely).
+Validation checks:
 
-**Not called at release time.** Release readiness is the workflow's concern (P044 `run_after_approval` tasks check their inputs).
+1. repo root exists
+2. repo root is a git repository
+3. base branch exists
+4. worktree base is writable
+5. release target identifier is non-empty
+6. repo identifier is non-empty
 
-### 2c. MCP Resolution (`backend_profile.mcp` Owner Chain)
+Call site:
 
-**Compilation (workflow compiler):**
+- `engine/src/command_handler.rs` during `StartRun`
+- only when `delivery_configuration_json` is present
 
-Add to `ResolvedAgent`:
+Blocking semantics:
+
+- failed preflight aborts `StartRun` before a run is created
+- the blocked-start transport contract is `CommandResult::StartRunBlockedByDeliveryPreflight`
+- `StartRunBlockedByDeliveryPreflight.delivery_preflight` carries the full typed `DeliveryPreflightResult`, including all failing and passing checks
+- passing preflight is persisted on the run as `delivery_preflight_json`
+
+Northbound transport contract for blocked starts:
+
+- GraphQL `startRun` does not use `errors[].extensions` for this domain outcome
+- GraphQL `startRun` returns an explicit result union:
+
 ```rust
-pub requested_mcp_server_ids: Vec<String>,
-pub requested_mcp_runtime_id: Option<String>,
-```
+pub union StartRunResult = StartRunSuccess | StartRunBlockedByDeliveryPreflightPayload;
 
-In `build_agent_lookup`, extract from backend profile:
-```rust
-let requested_mcp = profile.mcp.clone().unwrap_or_default();
-// ... into AgentBinding
-```
-
-**Resolution (executor, before ACP session) — full requested/predicted/actual/denied truth:**
-
-```rust
-// engine/src/mcp.rs
-
-/// Pre-session resolution report (matching Swift MCPPolicyResolutionReport).
-/// Captures predicted truth before execution.
-pub struct McpResolutionReport {
-    pub profile_id: String,
-    pub requested_extensions: Vec<String>,           // echo of agent.requested_mcp_server_ids
-    pub predicted_effective_extensions: Vec<String>,  // what should be available (pre-session)
-    pub predicted_effective_runtime_ids: Vec<String>, // mapped to runtime registry IDs
-    pub denied_extensions: Vec<String>,               // blocked / missing / disabled
-    pub warnings: Vec<String>,
-    pub blocking_issues: Vec<String>,
+pub struct StartRunSuccess {
+    pub run: GqlRun,
 }
 
-/// Post-session actual truth. Captured after ACP session completes.
-pub struct McpActualReport {
-    pub actual_extensions: Vec<String>,   // what the ACP session actually settled on
-    pub denied_extensions: Vec<String>,   // settled denied/unavailable set after runtime start
-    pub startup_latency_ms: Option<i64>,
+pub struct StartRunBlockedByDeliveryPreflightPayload {
+    pub delivery_preflight: GqlDeliveryPreflight,
 }
-
-pub struct McpServerDef {
-    pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
-}
-
-pub fn resolve_mcp_servers(
-    requested_ids: &[String],
-    runtime_id: Option<&str>,
-    registry: &McpRuntimeRegistry,  // machine-local, NOT catalog
-) -> (McpResolutionReport, Vec<McpServerDef>);
 ```
 
-**Resolution logic (matching `MCPPolicyResolver.resolve` + `RuntimeSessionBridge.resolveACPMCPServers`):**
+- `StartRunBlockedByDeliveryPreflightPayload.delivery_preflight` is derived directly from `StartRunBlockedByDeliveryPreflight`
+- MCP `runs.start` returns the same typed `delivery_preflight` payload instead of a generic string-only failure
+- no run resource is created on blocked preflight, so `runs.get` / `run://{run_id}` do not participate in blocked-start truth
 
-`backend_profile.mcp` provides the **requested intent** (server IDs). The **executable server definitions** (command, args, env) come from the **machine-local runtime extension registry** — not from catalog `runtime_profiles` or repo-local MCP config. This matches the Swift architecture:
-- `MCPPolicyResolver` (line 254-306) queries `runtimeRegistry.configsByRuntimeID[serverID]` — a machine-local registry populated from the user's MCP server configuration
-- `RuntimeSessionBridge.resolveACPMCPServers` (line 162-208) materializes `RuntimeMCPServerDefinition` from registry entries: `definition.cmd`, `definition.args`, `definition.envs`
-- The registry is **not** the YAML catalog — it's a separate machine-local configuration surface
+Northbound read contract for persisted run truth:
 
-Resolver input must include runtime namespace/provider binding so that `server_type` filtering follows selected runtime rules (`platform` servers only for the codex runtime binding).
+- when a run is created, `delivery_preflight_json` is the canonical persisted run-owned payload
+- that persisted payload must round-trip through GraphQL run reads, MCP `runs.get`, and the canonical MCP run resource `run://{run_id}`
+- blocked-start transport truth and persisted run truth are complementary surfaces and must not be collapsed into one ambiguous error string
 
-**For the Rust daemon V1**, the registry must preserve the current ACP registry contract instead of inventing a second machine-local authority. The machine-local executable registry is:
+### 2c. MCP resolution is a delta on top of the current compiler
 
-- canonical path: `~/.config/mcp/config.yaml`
-- explicit override: `CHAINWORKS_CODEX_CONFIG_PATH`
-- one-time legacy migration source when canonical file is absent: `~/.config/goose/config.yaml`
-
-Registry loads are evaluated at execution boundaries, not only daemon startup.
-- load during delivery preflight path, before session startup
-- load again when creating the ACP session (`executor` boundary), then pass to `resolve_mcp_servers`
-- this ensures runtime edits are visible without restart and mirrors the stable owner chain timing.
-
-The daemon may wrap that registry in a Rust-native parsed type, but it must read the same canonical registry contract the Swift app already uses. The resolution function takes an explicit provider/runtime binding and machine-local registry snapshot:
+The current compiler already persists:
 
 ```rust
-pub fn load_mcp_runtime_registry() -> anyhow::Result<McpRuntimeRegistry>;
+pub struct ResolvedAgent {
+    pub backend_profile_id: Option<String>,
+    pub requested_mcp_server_ids: Vec<String>,
+    // ...
+}
+```
 
+P048 therefore does not need to invent a new request-intent owner.
+Its delta is:
+
+1. resolve executable MCP definitions at executor time
+2. persist requested/predicted/actual/denied/blocking truth on `AgentExecution`
+3. expose that truth northbound through explicit reader surfaces
+
+Proposed resolver contract:
+
+```rust
 pub struct McpRuntimeBinding {
     pub runtime_id: Option<String>,
     pub provider: Option<String>,
 }
 
-pub fn resolve_mcp_servers(
-    requested_ids: &[String],
-    binding: &McpRuntimeBinding,
-    registry: &McpRuntimeRegistry,  // machine-local, NOT catalog
-) -> (McpResolutionReport, Vec<McpServerDef>);
-```
-
-1. For each `requested_id` in `agent.requested_mcp_server_ids`:
-   - Look up in `registry.servers[requested_id]`
-   - Resolve runtime binding:
-     - if `binding.runtime_id` is set, treat registry entries under that runtime namespace as source of truth;
-     - otherwise, default to provider-resolved namespace for the selected binding.
-   - Check: server exists, is enabled, and type is `"stdio"` unless `binding.provider == Some("codex".to_string())` and the runtime policy allows `"platform"`.
-   - If available → materialize `McpServerDef { name, command, args, env }`, add to `predicted_effective_extensions`
-   - If missing or disabled → add to `denied_extensions` and `blocking_issues`
-2. Return `(report, server_defs)` — report for persistence, defs for transport
-
-**McpRuntimeRegistry** (new type):
-```rust
-pub struct McpRuntimeRegistry {
-    pub servers: HashMap<String, McpServerConfig>,
+pub struct McpResolutionReport {
+    pub profile_id: String,
+    pub requested_extensions: Vec<String>,
+    pub predicted_effective_extensions: Vec<String>,
+    pub predicted_effective_runtime_ids: Vec<String>,
+    pub denied_extensions: Vec<String>,
+    pub warnings: Vec<String>,
+    pub blocking_issues: Vec<String>,
 }
-pub struct McpServerConfig {
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
-    pub enabled: bool,
-    pub server_type: String,  // "stdio" | "platform"
+
+pub struct McpActualReport {
+    pub actual_extensions: Vec<String>,
+    pub actual_runtime_ids: Vec<String>,
+    pub denied_extensions: Vec<String>,
+    pub blocking_issues: Vec<String>,
+    pub startup_latency_ms: Option<i64>,
 }
 ```
 
-Loaded via `load_mcp_runtime_registry()` at preflight/executor boundaries from the existing ACP registry contract (`~/.config/mcp/config.yaml`, optional `CHAINWORKS_CODEX_CONFIG_PATH` override, one-time migration from `~/.config/goose/config.yaml`). The catalog's `runtime_profiles` section is **not** the source of executable server definitions.
+Machine-local executable registry source:
 
-**Persistence (matching Swift `AgentExecution` / report-comparison MCP fields):**
+- canonical path: `~/.config/mcp/config.yaml`
+- explicit override: `CHAINWORKS_CODEX_CONFIG_PATH`
+- one-time legacy migration source when canonical file is absent: `~/.config/goose/config.yaml`
 
-After resolution, persist on the agent execution record (or work_item payload):
-- `requested_mcp_extensions_json` — serialized `requested_extensions`
-- `predicted_mcp_extensions_json` — serialized `predicted_effective_extensions`
-- `predicted_mcp_runtime_ids_json` — serialized `predicted_effective_runtime_ids`
-- `denied_mcp_extensions_json` — serialized `denied_extensions`
+Resolution rules:
 
-After ACP session completes, update with actual:
-- `actual_mcp_extensions_json` — serialized `actual_extensions`
-- `actual_mcp_runtime_ids_json` — serialized settled runtime IDs when available
-- `denied_mcp_extensions_json` — updated to settled denied set if runtime startup narrowed availability further
-- `mcp_session_startup_latency_ms` — from transport metrics
+1. requested intent always comes from `ResolvedAgent.requested_mcp_server_ids`
+2. backend profile identity always comes from `ResolvedAgent.backend_profile_id`
+3. executable server definitions come from the machine-local MCP registry, not from catalog YAML
+4. runtime/provider binding determines `stdio` versus `platform` filtering
+5. missing or disabled entries are persisted into `denied_extensions` / `blocking_issues` and fail closed before ACP session startup
 
-Northbound/report path:
-- per-agent execution truth persists all four layers: requested → predicted → actual → denied
-- run report builders and comparison readers consume those persisted agent-execution layers instead of reconstructing MCP truth from raw `mcpServers`
-- MCP `report://{run_id}` resources in `mcp-server/src/server.rs`, `reports.get` in `mcp-server/src/tools/reports.rs`, and GraphQL stage/execution readers in `graphql-server/src/types/run.rs` + `graphql-server/src/types/stage.rs` surface the same four-layer truth for operator inspection
-
-This gives report/comparison readers the full chain: requested → predicted → actual → denied.
-
-**Transport integration:**
-
-In `acp/src/transport.rs`, replace `"mcpServers": []` with resolved server defs:
+Executable ACP payload contract:
 
 ```rust
-let mcp_servers: Vec<serde_json::Value> = req.mcp_servers.iter()
-    .map(|s| serde_json::json!({
-        "name": s.name,
-        "command": s.command,
-        "args": s.args,
-        "env": s.env,
-    }))
-    .collect();
+pub struct ResolvedMcpServer {
+    pub extension_id: String,
+    pub runtime_id: String,
+    pub transport: ResolvedMcpServerTransport,
+}
+
+pub enum ResolvedMcpServerTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    Platform {
+        provider: String,
+    },
+}
+
+pub struct AcpMcpServerPayload {
+    pub id: String,            // runtime_id; stable key in ACP session/new
+    pub extension_id: String,  // provenance only; not operator-facing by default
+    pub transport: ResolvedMcpServerTransport,
+}
 ```
 
-**ExecutionRequest extension:**
-```rust
-pub mcp_servers: Vec<McpServerDef>,
-pub mcp_resolution_json: Option<String>,  // serialized McpResolutionReport for persistence
-pub mcp_runtime_binding: Option<McpRuntimeBinding>, // resolver context used for runtime-typed filtering
-```
+Internal handoff rules:
 
-This keeps the resolver context visible to transport-level diagnostics and prevents
-runtime/type assumptions from being re-derived from `required_tools` or other non-runtime surfaces.
+- `engine/src/mcp.rs` resolves requested extension IDs into `ResolvedMcpServer` values.
+- `acp::ExecutionRequest` carries `mcp_servers: Vec<AcpMcpServerPayload>` plus the persisted resolver report.
+- `acp/src/transport.rs` serializes those payloads into the ACP `session/new` `mcpServers` array before `session/prompt`.
+- The `mcpServers[].id` key is the runtime ID because the executable registry owns runtime identity and de-duplication.
+- The extension ID is preserved inside the internal payload and persisted provenance, but operator-facing readers expose extension/runtime IDs and blocking issues only.
+- Registry command/args/env are carried only in `ExecutionRequest` and the ACP transport payload; they are not exposed by GraphQL, MCP reports, or resource reads.
+- Missing, disabled, unsupported, or malformed registry entries produce `blocking_issues` and prevent ACP session startup; no partial `mcpServers` payload is sent for a blocked execution.
+
+Persisted execution truth on `AgentExecution`:
+
+- `requested_mcp_extensions_json`
+- `predicted_mcp_extensions_json`
+- `predicted_mcp_runtime_ids_json`
+- `actual_mcp_extensions_json`
+- `actual_mcp_runtime_ids_json`
+- `denied_mcp_extensions_json`
+- `mcp_blocking_issues_json`
+- `mcp_session_startup_latency_ms`
+
+### 2d. Northbound placement contract
+
+This proposal explicitly binds each new field family to a reader owner.
+
+| Surface | Owner | Fields exposed |
+|---|---|---|
+| GraphQL `startRun` mutation | `graphql-server/src/schema.rs` | explicit `StartRunResult` union: `StartRunSuccess { run: GqlRun! }` or `StartRunBlockedByDeliveryPreflightPayload { deliveryPreflight: GqlDeliveryPreflight! }`; this domain outcome does not ride `errors[].extensions` |
+| GraphQL run read | `graphql-server/src/types/run.rs` | `delivery_preflight_json` or a typed `deliveryPreflight` field derived from the persisted run-owned payload |
+| MCP `runs.start` | `mcp-server/src/tools/runs.rs` | same typed blocked-start `delivery_preflight` payload as GraphQL when start is rejected before run creation |
+| MCP `runs.get` | `mcp-server/src/tools/runs.rs` | persisted run-owned `delivery_preflight_json` or typed `delivery_preflight` field on successful created runs |
+| MCP `run://{run_id}` | `mcp-server/src/server.rs` | same persisted run-owned delivery-preflight payload as `runs.get` |
+| GraphQL stage summary | `graphql-server/src/types/stage.rs` | keeps summary-only fields such as `has_validation_failure`; does not become a dumping ground for full execution payloads |
+| GraphQL stage-to-execution relation | `graphql-server/src/types/stage.rs` | add `executions: [GqlAgentExecution!]!` on `GqlStageExecution`, sourced from persisted `AgentExecution` rows for that stage execution |
+| GraphQL execution read | `graphql-server/src/types/agent_execution.rs` plus `graphql-server/src/schema.rs` | `backend_profile_id`, requested/predicted/actual/denied MCP truth, runtime IDs, startup latency, persisted `mcp_blocking_issues_json` through `GqlAgentExecution` |
+| GraphQL artifact read | `graphql-server/src/types/artifact.rs` | decoded `validationFailureRecord` and failed-stage-evidence/report artifacts |
+| MCP `report://{run_id}` | `mcp-server/src/server.rs` | run summary, existing artifact payloads, and execution-level MCP truth array including blocking issues |
+| MCP `reports.get` | `mcp-server/src/tools/reports.rs` | same execution-level MCP truth, including blocking issues, and same typed failure/report artifacts as `report://{run_id}` |
+| Internal persistence only | DB rows / repo layer | raw executable registry definitions, transport command/args/env, and intermediate resolver internals that are not operator-facing |
+
+Required northbound invariant:
+
+- blocked delivery-preflight failures use one explicit transport contract across GraphQL `startRun` and MCP `runs.start`
+- GraphQL blocked-start truth is carried by the `StartRunResult` union, not by transport-level GraphQL errors
+- persisted `delivery_preflight_json` uses one explicit run-owned read contract across GraphQL run reads, MCP `runs.get`, and `run://{run_id}`
+- GraphQL and MCP must both read the same durable `AgentExecution` MCP fields
+- GraphQL execution-level MCP truth is reached through `GqlStageExecution.executions`, not through an implicit or conditional resolver path
+- typed validation-failure payloads remain owned by the existing artifact/report lane
+- failed-stage evidence rides the same artifact/report lane rather than a second bespoke reader
+
+### 2e. MCP preflight ownership
+
+P048 includes only execution-time MCP enforcement.
+
+Included:
+
+- executor-side resolver call
+- fail-closed session startup when requested MCP cannot be realized
+- persistence of denied/blocking MCP truth on `AgentExecution`
+
+Deferred:
+
+- broad `PreflightService`-style run-start MCP warnings
+- a separate MCP readiness summary lane on `StartRun`
+
+This keeps MCP authority at one boundary for V1: executor-time resolution against the current machine-local registry.
 
 ---
 
@@ -356,70 +456,127 @@ runtime/type assumptions from being re-derived from `required_tools` or other no
 
 | File | Change |
 |---|---|
-| **Failed-stage evidence** | |
-| `engine/src/evidence.rs` | **NEW** — `FailedStageEvidencePacket`, `build_evidence_packet()` |
-| `engine/src/orchestrator.rs` | Build and persist evidence packet on stage failure settlement |
-| `domain/src/stage.rs` | Add `evidence_packet_json: Option<String>` to `StageExecution` domain struct |
-| `db/migrations/006_evidence_and_preflight.sql` | Add `evidence_packet_json` to `stage_executions`, `delivery_preflight_json` to `runs`, MCP columns to `agent_executions` |
-| `db/src/repos/stages.rs` | Persist/read `evidence_packet_json` on `StageExecution` rows |
-| `mcp-server/src/server.rs` | Keep `report://{run_id}` / report resources reading the same durable failed-stage evidence artifact without creating a second report lane |
-| **Delivery preflight** | |
-| `engine/src/preflight.rs` | **NEW** — `validate_delivery_config()` |
-| `engine/src/command_handler.rs` | Call preflight at run creation when delivery config present |
+| `engine/src/evidence.rs` | **NEW** failed-stage evidence packet builder and serializers |
+| `engine/src/orchestrator.rs` | Compute/persist recovery snapshot, then build and persist failed-stage evidence on failed settlement |
+| `domain/src/stage.rs` | Add `validation_failure_json: Option<String>`, `evidence_packet_json: Option<String>`, and `recovery_snapshot_json: Option<String>` as the canonical stage-owned failure/recovery fields |
+| `db/src/repos/stages.rs` | Persist/read `validation_failure_json`, `evidence_packet_json`, and `recovery_snapshot_json` |
+| `engine/src/recovery.rs` | Own the deterministic failed-stage next-action recovery snapshot producer for `stage_executions.recovery_snapshot_json` |
+| `engine/src/preflight.rs` | **NEW** delivery-preflight validator |
+| `engine/src/command_handler.rs` | Run delivery preflight during `StartRun`, return typed blocked-start preflight payloads, and block failed starts before run creation |
 | `domain/src/run.rs` | Add `delivery_preflight_json: Option<String>` |
 | `db/src/repos/runs.rs` | Persist/read `delivery_preflight_json` |
-| **MCP resolution** | |
-| `engine/src/mcp.rs` | **NEW** — `resolve_mcp_servers()`, `McpResolutionReport`, `McpActualReport`, `McpRuntimeRegistry` |
-| `domain/src/agent.rs` | Add MCP provenance fields to `AgentExecution` domain struct: `requested_mcp_extensions_json`, `predicted_mcp_extensions_json`, `predicted_mcp_runtime_ids_json`, `actual_mcp_extensions_json`, `actual_mcp_runtime_ids_json`, `denied_mcp_extensions_json`, `mcp_session_startup_latency_ms` |
-| `db/src/repos/agent_executions.rs` | Persist/read MCP provenance fields, including predicted/actual runtime-ID JSON, on agent execution rows |
-| `workflow/src/plan.rs` | Add `requested_mcp_server_ids: Vec<String>` and runtime/provider binding to `ResolvedAgent` |
-| `workflow/src/compiler.rs` | Extract `mcp` and resolved runtime binding from backend profile into `ResolvedAgent` |
-| `acp/src/lib.rs` | Add `mcp_servers: Vec<McpServerDef>` to `ExecutionRequest` |
-| `acp/src/transport.rs` | Pass resolved MCP servers to `session/new` instead of `[]` |
-| `engine/src/executor.rs` | Resolve MCP servers before building ExecutionRequest |
-| `engine/src/preflight.rs` | Reload machine MCP registry during preflight-style validation checks |
-| `graphql-server/src/types/run.rs` | Thread per-execution MCP truth through run reads so northbound GraphQL stays bound to stage-owned agent execution rows rather than a pre-session-only summary |
-| `graphql-server/src/types/stage.rs` | Expose per-execution MCP requested/predicted/actual/denied truth on stage/agent execution reads, or introduce the concrete execution-level GraphQL type there if needed |
-| `mcp-server/src/server.rs` | Include per-execution MCP requested/predicted/actual/denied truth in `report://{run_id}` resource responses |
-| `mcp-server/src/tools/reports.rs` | Include the same per-execution MCP requested/predicted/actual/denied truth in `reports.get` responses so the tool and resource paths do not diverge |
-| `engine/src/lib.rs` | Register new modules |
+| `engine/src/mcp.rs` | **NEW** runtime-registry loader and MCP resolver |
+| `domain/src/agent.rs` | Add MCP provenance fields, including `mcp_blocking_issues_json`, to `AgentExecution` |
+| `db/src/repos/agent_executions.rs` | Persist/read MCP provenance JSON, blocking issues, and startup latency |
+| `workflow/src/compiler.rs` | Reuse current `backend_profile.mcp` compilation path; add any missing runtime-binding fields only if required |
+| `workflow/src/plan.rs` | Keep `backend_profile_id` and `requested_mcp_server_ids` canonical; add new runtime-binding fields only if needed |
+| `engine/src/executor.rs` | Resolve MCP before transport startup, persist requested/predicted/denied/blocking truth before session start, and persist actual truth after session startup |
+| `acp/src/lib.rs` | Carry `Vec<AcpMcpServerPayload>` and resolver metadata in `ExecutionRequest` |
+| `acp/src/transport.rs` | Serialize `ExecutionRequest.mcp_servers` into ACP `session/new.mcpServers` |
+| `graphql-server/src/types/run.rs` | Expose persisted run-owned delivery-preflight payload on run reads |
+| `graphql-server/src/types/stage.rs` | Keep summary fields and add explicit `executions: [GqlAgentExecution!]!` relation on `GqlStageExecution` |
+| `graphql-server/src/types/agent_execution.rs` | **NEW** typed execution-level MCP truth for northbound GraphQL |
+| `graphql-server/src/schema.rs` | Add the `GqlStageExecution.executions` field to the schema, wire it unconditionally to the execution-owned resolver path, and change `startRun` to return the explicit `StartRunResult` union rather than `Result<GqlRun>` or `errors[].extensions` for blocked delivery preflight |
+| `mcp-server/src/tools/runs.rs` | Return typed blocked-start delivery-preflight payloads from `runs.start` and expose persisted run-owned delivery-preflight payloads from `runs.get` |
+| `mcp-server/src/server.rs` | Extend `run://{run_id}` with persisted run-owned delivery-preflight payloads and extend `report://{run_id}` with execution-level MCP truth while keeping the existing typed artifact lane |
+| `mcp-server/src/tools/reports.rs` | Extend `reports.get` with the same execution-level MCP truth as `report://{run_id}` |
+| `db/migrations/00x_evidence_preflight_and_mcp.sql` | Add `stage_executions.validation_failure_json`, `stage_executions.evidence_packet_json`, `stage_executions.recovery_snapshot_json`, `runs.delivery_preflight_json`, and agent-execution MCP provenance columns including `mcp_blocking_issues_json` using the next free migration ordinal at implementation time. On current `HEAD`, `008_session_runtime_usage.sql` and `009_owner_execution_lineage.sql` already exist, so the current concrete slot would be `010_*`. |
+| `docs/reference/test-gates.md` | Add the repo-owned `proposal-048|p048` gate entry and its focused proof scope |
+| `scripts/test-gate.sh` | Add the canonical `proposal-048|p048` gate command |
+
+Migration rollout notes:
+
+- historical `stage_executions.validation_failure_json`, `stage_executions.evidence_packet_json`, `stage_executions.recovery_snapshot_json`, `runs.delivery_preflight_json`, and `agent_executions` MCP provenance columns including `mcp_blocking_issues_json` read as `None` / empty for pre-migration rows
+- readers do not synthesize missing historical truth out of band
+- northbound surfaces expose absence explicitly rather than guessing defaults for older rows
 
 ---
 
 ## 4. Acceptance Criteria
 
-### Failed-Stage Evidence
-1. When a stage settles as Failed, `evidence_packet_json` is populated on `stage_executions` with a `FailedStageEvidencePacket` including mandatory fields and optional placeholders for parity-deferred fields (`canonical_outcome`, `transport_error_kind`, `output_presence`, `recovery_snapshot`) as `null` until explicit owner persistence is implemented.
-2. Evidence artifact written to `failure-evidence/evidence-{stage_id}-attempt{n}.json` with `report_kind = "failed_stage_evidence"`.
-3. `reports.get` MCP tool returns the failure evidence artifact for the run.
-4. Evidence is built **at failure time**, not deferred to run completion.
-5. No second report/export truth lane is introduced — evidence flows through existing `reports.get`.
+### Failed-stage evidence
 
-### Delivery Preflight
-6. When `StartRun` includes `delivery_configuration_json`, preflight validation runs. If passed → `delivery_preflight_json` persisted on Run, run proceeds.
-7. **Preflight failure blocks run start** (e.g. repo root missing) → `StartRun` returns error, run is NOT created. Matches stable `deliveryPreflightBlocksStart` gate.
-8. No preflight runs at release time — release readiness is the workflow's concern.
-9. Persisted `DeliveryPreflightResult` and checks use `{ id, label, passed, detail }` for compatibility with current readers.
+1. A failed stage attempt persists `stage_executions.validation_failure_json` as the canonical stage-owned copy of the typed `ValidationFailureRecord`.
+2. A failed stage attempt persists `stage_executions.evidence_packet_json`.
+3. The same failure persists as a normal artifact with `report_kind = "failed_stage_evidence"`.
+4. The canonical artifact path is stage-execution-derived and collision-safe.
+5. Export-pack friendly filenames do not become canonical storage truth.
+6. `reports.get` and `report://{run_id}` expose failed-stage evidence through the existing report lane.
+7. The failed-stage evidence packet carries the same stage-owned `recovery_snapshot` as the canonical stage record; the packet mirrors that truth and does not invent a second recovery owner.
+8. `engine/src/recovery.rs` computes and persists `stage_executions.recovery_snapshot_json` before failed-stage evidence packet construction for newly failed P048-era stages.
 
-### MCP Resolution
-10. `code_writer` with `backend_profile.mcp: ["filesystem"]` → ACP `session/new` receives `mcpServers` with the filesystem server definition.
-11. Agents without `mcp` in their backend profile → `mcpServers: []` (unchanged).
-12. Requested server missing, disabled, or unsupported in the machine-local ACP registry → `denied_extensions` plus `blocking_issues` are persisted in the resolution report, preflight marks the MCP check failed, and runtime session creation fails closed before ACP session startup.
-13. MCP resolution reads requested intent from `backend_profile.mcp`, **not** from `required_tools`, and resolves executable definitions from the existing machine-local ACP registry contract (`~/.config/mcp/config.yaml`, optional `CHAINWORKS_CODEX_CONFIG_PATH`, one-time migration from `~/.config/goose/config.yaml`).
-14. `runtime_id`/provider binding is explicit in the resolver contract and enforces runtime-scoped typing (`platform` vs `stdio`) before session startup.
-15. MCP registry snapshot is refreshed at preflight and executor-start boundaries so operator edits are observed without daemon restart.
-16. `requested_mcp_extensions_json`, `predicted_mcp_extensions_json`, `predicted_mcp_runtime_ids_json`, `actual_mcp_extensions_json`, `actual_mcp_runtime_ids_json`, and `denied_mcp_extensions_json` are persisted on agent execution records. `mcp_session_startup_latency_ms` is updated post-session. Report/comparison readers, GraphQL stage/execution reads, `report://{run_id}`, and `reports.get` expose the full requested→predicted→actual→denied chain rather than collapsing to a pre-session effective set.
+### Delivery preflight
+
+9. `StartRun` with `delivery_configuration_json` runs delivery preflight before the run is created or started.
+10. Failed preflight blocks run creation/start and returns a typed blocked-start transport payload containing the full `DeliveryPreflightResult`.
+11. GraphQL `startRun` and MCP `runs.start` expose the same blocked-start delivery-preflight truth rather than collapsing to unrelated generic errors.
+12. GraphQL `startRun` uses an explicit result union/payload contract for blocked preflight and does not route this domain outcome through `errors[].extensions`.
+13. Passing preflight persists `delivery_preflight_json` on the run.
+14. GraphQL run reads, MCP `runs.get`, and `run://{run_id}` expose the same persisted run-owned delivery-preflight payload on successful created runs.
+15. No release-time readiness gate is introduced by this proposal.
+
+### MCP ownership and resolution
+
+16. Requested MCP intent is read only from `backend_profile.mcp` via the already-compiled `ResolvedAgent.requested_mcp_server_ids`.
+17. `McpResolutionReport.profile_id` is read only from `ResolvedAgent.backend_profile_id`.
+18. `required_tools` does not participate in MCP resolution.
+19. Missing/disabled/unsupported requested MCP entries fail closed before ACP session startup and persist denied extensions plus `mcp_blocking_issues_json`.
+20. Requested, predicted, actual, denied, and blocking MCP truth persists on `AgentExecution`.
+21. Registry reads happen at executor time so operator edits are visible without daemon restart.
+22. `ExecutionRequest.mcp_servers` carries executable ACP payloads keyed by runtime ID, while raw registry command/args/env remain internal to the engine/ACP transport boundary.
+
+### Northbound readers
+
+23. GraphQL run reads expose delivery-preflight truth from the persisted run-owned payload.
+24. GraphQL stage reads remain summary-oriented and add an explicit `executions: [GqlAgentExecution!]!` relation for execution-owned MCP truth.
+25. `GqlAgentExecution` exposes execution-level MCP truth, including blocking issues, from persisted `AgentExecution` rows; GraphQL does not rely on a conditional or implied resolver path.
+26. GraphQL artifact reads continue to expose the typed `validationFailureRecord`.
+27. `runs.get` and `run://{run_id}` expose the same persisted run-owned delivery-preflight truth as GraphQL run reads.
+28. `reports.get` and `report://{run_id}` expose the same execution-level MCP truth sourced from persisted `AgentExecution` rows.
+29. Raw registry command/args/env details remain internal persistence/runtime data and are not promoted into operator-facing reads.
 
 ---
 
 ## 5. Test Gate
+
+Repo-owned proof lane changes required by this proposal:
+
+- `docs/reference/test-gates.md` gains a `proposal-048|p048` entry
+- `scripts/test-gate.sh` gains the matching `proposal-048|p048` command
+- this gate is the canonical proof path for the P048 control-plane slice; later audits should not treat a generic workspace run as the only proof contract
+
+Focused proof scope for `proposal-048|p048`:
+
+1. delivery-preflight blocked-start contract plus successful `delivery_preflight_json` persistence
+2. GraphQL / `runs.get` / `run://{run_id}` parity for persisted run-owned delivery-preflight truth
+3. failed-stage evidence persistence on `stage_executions` plus `reports.get` / `report://{run_id}` readback
+4. ACP `mcpServers` realization plus fail-closed denied/blocking MCP truth persisted on `AgentExecution`
+5. GraphQL stage `executions` parity for execution-level MCP truth, not only MCP report-side truth
+
+Canonical wrapper:
+
+```bash
+./scripts/test-gate.sh proposal-048
+```
+
+Script entry:
 
 ```bash
 proposal-048|p048)
   log "Proposal 048 control-plane gate: evidence + preflight + MCP"
   (
     cd "$ROOT_DIR/control-plane"
-    cargo test --workspace 2>&1
+    cargo test -p engine delivery_preflight_run_persistence_tests -- --nocapture &&
+    cargo test -p engine delivery_preflight_blocked_start_tests -- --nocapture &&
+    cargo test -p graphql-server delivery_preflight_graphql_contract_tests -- --nocapture &&
+    cargo test -p graphql-server delivery_preflight_run_readback_contract_tests -- --nocapture &&
+    cargo test -p mcp-server runs_delivery_preflight_contract_tests -- --nocapture &&
+    cargo test -p mcp-server run_resource_delivery_preflight_contract_tests -- --nocapture &&
+    cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture &&
+    cargo test -p mcp-server reports_failed_stage_evidence_contract_tests -- --nocapture &&
+    cargo test -p engine mcp_resolution_persistence_tests -- --nocapture &&
+    cargo test -p graphql-server execution_mcp_truth_contract_tests -- --nocapture &&
+    cargo test -p mcp-server reports_mcp_resolution_truth_tests -- --nocapture
   )
   log "Proposal 048 control-plane gate passed"
   ;;
@@ -429,8 +586,8 @@ proposal-048|p048)
 
 ## 6. Out of Scope
 
-- **EvidencePackBuilder (run-level export)**: Shell-owned export path, not daemon internal truth. Separate proposal.
-- **SignOffEvidencePackBuilder (cohort sign-off)**: Benchmark evaluation lane, not per-run. Separate proposal.
-- **PreflightService (full workflow validation)**: Validates YAML, providers, skills. Broader than delivery config. Separate proposal.
-- **Release-time readiness checks**: Governed by workflow artifact inputs (P044) and deterministic services (P045), not preflight.
-- **MCP runtime registry redesign/management**: P048 resolves executable server definitions against the existing machine-local ACP registry contract. Redesigning that registry shape, ownership, or mutation workflows is a separate concern.
+- run-export evidence pack design
+- cohort/sign-off evidence pack design
+- broad workflow `PreflightService`
+- start-time MCP warning UX beyond executor fail-closed behavior
+- redesign of the machine-local MCP registry format or ownership

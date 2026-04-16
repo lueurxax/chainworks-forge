@@ -7,7 +7,7 @@ use domain::run::{Run, RunStatus};
 
 const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, workspace_root,
              artifact_root, started_at, completed_at, cancellation_requested_at,
-             cancellation_settled_at, current_state, workflow_yaml_path,
+             cancellation_settled_at, cancellation_settlement_log, current_state, workflow_yaml_path,
              agent_catalog_yaml_path, worktree_root, base_branch, base_revision,
              target_branch, delivery_configuration_json"#;
 
@@ -24,10 +24,10 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
         r#"
         INSERT INTO runs (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root,
                           started_at, completed_at, cancellation_requested_at, cancellation_settled_at,
-                          current_state, workflow_yaml_path, agent_catalog_yaml_path,
+                          cancellation_settlement_log, current_state, workflow_yaml_path, agent_catalog_yaml_path,
                           worktree_root, base_branch, base_revision, target_branch,
                           delivery_configuration_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
         "#,
     )
     .bind(id)
@@ -41,6 +41,7 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     .bind(completed_at)
     .bind(cancellation_requested_at)
     .bind(cancellation_settled_at)
+    .bind(&run.cancellation_settlement_log)
     .bind(&run.current_state)
     .bind(&run.workflow_yaml_path)
     .bind(&run.agent_catalog_yaml_path)
@@ -153,6 +154,42 @@ pub async fn mark_cancelled(pool: &SqlitePool, id: RunId, settled_at: DateTime<U
     Ok(())
 }
 
+pub async fn update_cancellation_settlement_log(
+    pool: &SqlitePool,
+    id: RunId,
+    settlement_log: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE runs SET cancellation_settlement_log = ?1 WHERE id = ?2"#)
+        .bind(settlement_log)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("update cancellation settlement log")?;
+    Ok(())
+}
+
+pub async fn finalize_cancellation(
+    pool: &SqlitePool,
+    id: RunId,
+    settled_at: DateTime<Utc>,
+    settlement_log: &str,
+) -> Result<()> {
+    let status = RunStatus::Cancelled.to_string();
+    sqlx::query(
+        r#"UPDATE runs
+           SET status = ?1, cancellation_settled_at = ?2, cancellation_settlement_log = ?3
+           WHERE id = ?4"#,
+    )
+    .bind(status)
+    .bind(settled_at.to_rfc3339())
+    .bind(settlement_log)
+    .bind(id.to_string())
+    .execute(pool)
+    .await
+    .context("finalize run cancellation")?;
+    Ok(())
+}
+
 pub async fn mark_completed(
     pool: &SqlitePool,
     id: RunId,
@@ -203,6 +240,7 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
     let completed_at: Option<String> = r.get("completed_at");
     let cancellation_requested_at: Option<String> = r.get("cancellation_requested_at");
     let cancellation_settled_at: Option<String> = r.get("cancellation_settled_at");
+    let cancellation_settlement_log: Option<String> = r.get("cancellation_settlement_log");
 
     let run_id: RunId = id.parse::<uuid::Uuid>().context("parse run id")?.into();
     let idea_id_val: IdeaId = idea_id
@@ -231,6 +269,7 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
         completed_at: completed_at_dt,
         cancellation_requested_at: cancellation_requested_at_dt,
         cancellation_settled_at: cancellation_settled_at_dt,
+        cancellation_settlement_log,
         current_state: r.get("current_state"),
         workflow_yaml_path: r.get("workflow_yaml_path"),
         agent_catalog_yaml_path: r.get("agent_catalog_yaml_path"),

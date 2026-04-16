@@ -50,6 +50,7 @@ pub enum WorkItemStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl std::fmt::Display for WorkItemStatus {
@@ -59,6 +60,7 @@ impl std::fmt::Display for WorkItemStatus {
             WorkItemStatus::Running => write!(f, "running"),
             WorkItemStatus::Completed => write!(f, "completed"),
             WorkItemStatus::Failed => write!(f, "failed"),
+            WorkItemStatus::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -72,6 +74,7 @@ impl std::str::FromStr for WorkItemStatus {
             "running" => Ok(WorkItemStatus::Running),
             "completed" => Ok(WorkItemStatus::Completed),
             "failed" => Ok(WorkItemStatus::Failed),
+            "cancelled" => Ok(WorkItemStatus::Cancelled),
             other => Err(format!("Unknown WorkItemStatus: {other}")),
         }
     }

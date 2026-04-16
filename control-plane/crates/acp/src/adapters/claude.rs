@@ -3,11 +3,10 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::info;
 
-use domain::ids::AgentExecutionId;
-
 use crate::adapters::AcpAdapter;
-use crate::transport::{run_acp_session, AcpSessionConfig};
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::session::{AcpSession, AcpSessionHandle};
+use crate::transport::AcpSessionConfig;
+use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CLAUDE_ACP_BINARY";
 
@@ -55,7 +54,7 @@ impl AcpAdapter for ClaudeAgentAdapter {
         "claude"
     }
 
-    async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
         if self.binary_path.is_empty() {
             bail!(
                 "ClaudeAgentAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -72,10 +71,8 @@ impl AcpAdapter for ClaudeAgentAdapter {
             "Spawning Claude ACP subprocess"
         );
 
-        let agent_execution_id = AgentExecutionId::new();
-
         // Claude Agent ACP is invoked with no extra arguments.
-        let mut child = Command::new(&self.binary_path)
+        let child = Command::new(&self.binary_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -91,14 +88,7 @@ impl AcpAdapter for ClaudeAgentAdapter {
             model: &model_str,
             ..default_config
         };
-        let (status, artifact_paths) =
-            run_acp_session(&mut child, &req, &config).await?;
-
-        Ok(ExecutionResult {
-            agent_execution_id,
-            status,
-            artifact_paths,
-            cost_cents: None,
-        })
+        let session = AcpSession::start(child, req, &config).await?;
+        Ok(AcpSessionHandle::new(session))
     }
 }

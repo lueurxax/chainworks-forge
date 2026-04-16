@@ -10,7 +10,7 @@
   - `docs/reference/full-mvp-delivery.md`
   - `docs/reference/rust-control-plane.md`
   - `docs/reference/test-gates.md`
-  - `docs/proposals/044-post-approval-task-execution-and-release-gate-completion.md`
+  - `docs/archive/proposals/044/044-post-approval-task-execution-and-release-gate-completion.md`
 - Reusable baseline used:
   - `.review-baselines/current-system-baseline.md`
   - `docs/reference/current-system-baseline.md`

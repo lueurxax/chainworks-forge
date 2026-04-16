@@ -96,6 +96,7 @@ pub struct Run {
     pub completed_at: Option<DateTime<Utc>>,
     pub cancellation_requested_at: Option<DateTime<Utc>>,
     pub cancellation_settled_at: Option<DateTime<Utc>>,
+    pub cancellation_settlement_log: Option<String>,
     // ── Workflow state machine fields ────────────────────────────────────
     /// Current state in the workflow state machine (e.g. "state_4_proposal_reviewed").
     pub current_state: Option<String>,

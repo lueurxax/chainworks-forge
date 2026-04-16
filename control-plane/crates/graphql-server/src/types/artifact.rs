@@ -50,6 +50,8 @@ pub struct GqlValidationFailureRecord {
     pub receipt_exists: bool,
     pub transcript_exists: bool,
     pub recovery_recommendation: GqlRecoveryRecommendation,
+    pub session_reuse_disposition: Option<String>,
+    pub session_reset_reason: Option<String>,
 }
 
 #[derive(SimpleObject, Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -152,7 +154,18 @@ impl GqlArtifact {
             .parse()
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let record = validation::find_by_artifact_id(pool, artifact_id).await?;
-        Ok(record.map(Into::into))
+        if let Some(record) = record {
+            let mut gql_record: GqlValidationFailureRecord = record.clone().into();
+            if let Some(execution) =
+                db::repos::agent_executions::find_by_id(pool, record.agent_execution_id).await?
+            {
+                gql_record.session_reuse_disposition = execution.session_reuse_disposition;
+                gql_record.session_reset_reason = execution.session_reset_reason;
+            }
+            Ok(Some(gql_record))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -218,6 +231,8 @@ impl From<ValidationFailureRecord> for GqlValidationFailureRecord {
                 explanation: record.recovery_recommendation.explanation,
                 source: None,
             },
+            session_reuse_disposition: None,
+            session_reset_reason: None,
         }
     }
 }

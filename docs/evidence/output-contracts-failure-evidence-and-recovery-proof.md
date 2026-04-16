@@ -1,90 +1,101 @@
 # Output Contracts, Failure Evidence, and Narrow Recovery Proof
 
-Current implementation and proof status for the output-contract, failure-evidence, retry-lineage, and bounded proposal-resilience slice consolidated from Proposal 013.
+Current implementation and proof status for the stable output-contract, structured-output validation, validation-failure evidence, typed reader, retry-lineage, and narrow recovery slice consolidated from the older Proposal 013 scope and the later Rust control-plane work that had been tracked by Proposal 046.
 
 ## Status
 
 | Field | Value |
 |---|---|
 | Slice | Output Contracts, Failure Evidence, and Narrow Recovery |
-| Source contract | [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) |
+| Source contracts | [../reference/structured-output-envelope-and-contract-validation.md](../reference/structured-output-envelope-and-contract-validation.md), [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) |
 | Current implementation status | Implemented |
-| Current readiness | Ready with Risks |
-| Primary proof owners | `Proposal013Tests`, `RuntimeSessionBridgeTests`, canonical `proposal-013` gate |
-| Last consolidated documentation refresh | `2026-03-31` |
+| Current readiness | Ready |
+| Primary proof owners | ACP integration tests, workflow integration tests, engine integration tests, DB integration tests, GraphQL artifact tests, MCP report/resource tests, `cargo test --workspace` in `control-plane/` |
+| Last consolidated documentation refresh | `2026-04-15` |
 
 ## What is considered proven
 
 The accepted proof story for this slice supports these claims:
 
-- proposal-review fan-out outputs are enforced against catalog-backed contract truth,
-- `proposal_review_summary` is validated as a first-class aggregate contract,
-- markdown or otherwise invalid reviewer and aggregate artifacts are preserved as evidence but rejected as canonical outputs,
-- failed-stage evidence survives post-generation validation failure,
-- same-run narrow retry remains available before clone-run when canonical stage evidence supports it,
-- reports and recovery surfaces read canonical failed-stage evidence rather than summary-only heuristics,
-- Tier 1 declarative contract fields are enforced or fail closed,
-- oversized proposal drafting uses explicit compaction truth rather than silent collapse,
-- and one canonical app-launched proof lane demonstrates blocked aggregate evidence plus narrow recovery through the shell-owned UI path.
+- ACP extracts named `CHAINWORKS_OUTPUT` envelopes instead of relying only on filesystem diffs,
+- envelope-owned outputs override same-name filesystem discoveries,
+- discovered outputs bind through the full resolver chain, including explicit contract, normalized/raw identity, version fallback, and stem fallback,
+- declared machine artifacts persist under normalized canonical identity rather than task-alias-only naming,
+- undeclared envelope outputs are persisted rather than dropped,
+- raw outputs survive long enough for inspection even when validation fails afterward,
+- `ValidationFailureRecord` is durable, typed, and attempt-scoped,
+- projection-backed `has_validation_failure` remains scoped to exact `stage_execution_id`,
+- GraphQL artifacts, MCP `reports.get`, and MCP `report://{run_id}` decode the full validation-failure payload,
+- and same-tree workspace regression coverage passed for the Rust control plane.
 
 ## Accepted current-head proof owners
 
-The strongest current-head proof owners are:
+The strongest current-head proof owners for this slice are:
 
-- `Proposal013Tests`
-- `RuntimeSessionBridgeTests`
-- `RecoveryCoordinatorTests`
-- `Chainworks_ForgeUITests.testProposal013AppProofSurface`
-- `scripts/test-gate.sh proposal-013`
+- `control-plane/crates/acp/tests/integration.rs`
+- `control-plane/crates/workflow/tests/integration.rs`
+- `control-plane/crates/engine/tests/integration.rs`
+- `control-plane/crates/db/tests/integration.rs`
+- `control-plane/crates/graphql-server/src/schema.rs`
+- `control-plane/crates/mcp-server/src/tools/reports.rs`
+- `control-plane/crates/mcp-server/src/server.rs`
+- `cargo test --workspace` from `control-plane/`
 
 High-signal proof examples on the current tree include:
 
-- strict rejection of markdown-only proposal-review artifacts,
-- strict rejection of markdown-only aggregate `proposal_review_summary`,
-- fixture-backed blocked aggregate proof with canonical evidence and narrow retry,
-- declarative coverage report persistence,
-- compaction policy truth,
-- and the app-launched Proposal 013 proof surface routed through the repo-owned UI-proof lane.
+- envelope extraction without filesystem artifacts,
+- explicit-contract plus normalized/raw/version/stem contract binding,
+- persisted undeclared envelope outputs,
+- persisted declared machine artifacts under normalized names,
+- missing-output failures mapping to `operator_inspection`,
+- retry isolation where a failed first attempt does not smear `has_validation_failure` onto a later retry,
+- GraphQL artifact decoding of `ValidationFailureRecord`,
+- MCP `reports.get` decoding of `ValidationFailureRecord`,
+- and `report://{run_id}` decoding of `ValidationFailureRecord`.
 
-## Canonical app-level proof lane
+## Canonical verification landmarks
 
-The accepted app-level proof owner for this slice is singular:
+Representative current-head proof points include:
 
-- `ContentView.UISurface`
-- `Chainworks_ForgeApp`
-- `UITestDirectSurfaces`
-- `Chainworks_ForgeUITests`
-- `scripts/test-gate.sh proposal-013`
+- `cargo test -p acp test_claude_adapter_extracts_chainworks_output_envelopes_without_filesystem_artifacts -- --exact`
+- `cargo test -p workflow test_contract_binding_uses_versioned_and_stem_fallbacks -- --exact`
+- `cargo test -p engine test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact -- --exact`
+- `cargo test -p engine test_invoke_agent_persists_declared_machine_artifact_under_normalized_name -- --exact`
+- `cargo test -p db stage_projection_validation_flag_is_attempt_scoped -- --exact`
+- `cargo test --workspace`
 
-A proposal-local surface counts only when it is routed through that owner chain.
-
-Standalone previews, ad-hoc harnesses, or orphaned UI scaffolds are useful development tools, but they do not satisfy slice acceptance by themselves.
+These landmarks are examples, not an exclusive list. The stable proof story is the combined current-head behavior across the owners listed above.
 
 ## Consolidation note
 
-The old Proposal 013 draft, review, evidence pack, research pack, and proposal-local implementation audits were implementation-trail artifacts.
+The old Proposal 046 draft, review, evidence pack, and proposal-local implementation audits were implementation-trail artifacts.
 
-They have been superseded by:
+Their durable content now lives in:
 
+- [../reference/structured-output-envelope-and-contract-validation.md](../reference/structured-output-envelope-and-contract-validation.md)
 - [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md)
 - this proof document
 
-This slice should now be treated as stable reference behavior rather than an active proposal dependency.
+This slice should be treated as implemented reference behavior rather than as an active proposal dependency.
 
 ## Remaining caution
 
-The remaining caution is about proof packaging, not slice ownership:
+No slice-level blocker remains.
 
-- the canonical UI owner on approved hosts is green,
-- but the `proposal-013` gate still relies on the built-in watchdog in `scripts/test-gate.sh` to terminate a stale post-success `xcodebuild` hang after success markers are already printed.
+Normal implementation risk still exists in future edits:
 
-That keeps readiness at `Ready with Risks` rather than fully frictionless `Ready`.
+- do not regress northbound readers back to metadata-only failure summaries,
+- do not flatten attempt-scoped validation truth to logical-stage scope,
+- and do not bypass normalized artifact identity with alias-only persistence for declared machine outputs.
+
+Those are maintenance watchpoints, not open readiness gaps.
 
 ## Recommended usage
 
 Use:
 
-- [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) for the stable contract,
-- [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) for lower-layer settlement truth,
-- [../reference/runtime-contract.md](../reference/runtime-contract.md) for snapshot and artifact rules,
-- [../reference/test-gates.md](../reference/test-gates.md) for the canonical `proposal-013` verification lane.
+- [../reference/structured-output-envelope-and-contract-validation.md](../reference/structured-output-envelope-and-contract-validation.md) for the canonical structured-output and contract-validation substrate,
+- [../reference/output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md) for durable failure evidence, narrow recovery, and declarative contract governance,
+- [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) for canonical outcome and attempt-scoped recovery truth,
+- [../reference/rust-control-plane.md](../reference/rust-control-plane.md) for daemon topology and northbound boundary ownership,
+- [../reference/test-gates.md](../reference/test-gates.md) for broader verification lanes.

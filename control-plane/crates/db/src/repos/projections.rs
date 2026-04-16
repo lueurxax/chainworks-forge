@@ -24,6 +24,7 @@ pub struct RunProjectionRow {
     pub completed_at: Option<String>,
     pub cancellation_requested_at: Option<String>,
     pub cancellation_settled_at: Option<String>,
+    pub cancellation_settlement_summary: Option<String>,
     /// Total stage count from run_summaries (0 if projection not yet built).
     pub total_stages: i64,
     pub completed_stages: i64,
@@ -60,6 +61,7 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
         r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
+                  rs.cancellation_settlement_summary,
                   COALESCE(rs.status, r.status) AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
@@ -87,6 +89,7 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
                 completed_at: r.get("completed_at"),
                 cancellation_requested_at: r.get("cancellation_requested_at"),
                 cancellation_settled_at: r.get("cancellation_settled_at"),
+                cancellation_settlement_summary: r.get("cancellation_settlement_summary"),
                 total_stages: r.get("total_stages"),
                 completed_stages: r.get("completed_stages"),
                 failed_stages: r.get("failed_stages"),
@@ -102,6 +105,7 @@ pub async fn list_by_idea_projection(pool: &SqlitePool, idea_id: &str) -> Result
         r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
+                  rs.cancellation_settlement_summary,
                   COALESCE(rs.status, r.status) AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
@@ -130,6 +134,7 @@ pub async fn list_by_idea_projection(pool: &SqlitePool, idea_id: &str) -> Result
                 completed_at: r.get("completed_at"),
                 cancellation_requested_at: r.get("cancellation_requested_at"),
                 cancellation_settled_at: r.get("cancellation_settled_at"),
+                cancellation_settlement_summary: r.get("cancellation_settlement_summary"),
                 total_stages: r.get("total_stages"),
                 completed_stages: r.get("completed_stages"),
                 failed_stages: r.get("failed_stages"),
@@ -192,6 +197,7 @@ pub async fn find_run_projection(pool: &SqlitePool, run_id: &str) -> Result<Opti
         r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
+                  rs.cancellation_settlement_summary,
                   COALESCE(rs.status, r.status) AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
@@ -218,6 +224,7 @@ pub async fn find_run_projection(pool: &SqlitePool, run_id: &str) -> Result<Opti
             completed_at: r.get("completed_at"),
             cancellation_requested_at: r.get("cancellation_requested_at"),
             cancellation_settled_at: r.get("cancellation_settled_at"),
+            cancellation_settlement_summary: r.get("cancellation_settlement_summary"),
             total_stages: r.get("total_stages"),
             completed_stages: r.get("completed_stages"),
             failed_stages: r.get("failed_stages"),
@@ -257,8 +264,45 @@ pub async fn rebuild_run_summary(pool: &SqlitePool, run_id: RunId) -> Result<()>
     .execute(pool)
     .await?;
 
+    let settlement_summary = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT cancellation_settlement_log FROM runs WHERE id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(pool)
+    .await?
+    .and_then(|log| build_cancellation_settlement_summary(&log));
+
+    sqlx::query(
+        "UPDATE run_summaries SET cancellation_settlement_summary = ?1 WHERE run_id = ?2",
+    )
+    .bind(settlement_summary)
+    .bind(run_id.to_string())
+    .execute(pool)
+    .await?;
+
     info!(run_id = %run_id, "Rebuilt run_summary projection");
     Ok(())
+}
+
+fn build_cancellation_settlement_summary(raw: &str) -> Option<String> {
+    let entries = serde_json::from_str::<Vec<serde_json::Value>>(raw).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+
+    let settled_count = entries
+        .iter()
+        .filter(|entry| entry.get("terminal_status").and_then(|v| v.as_str()) == Some("cancelled"))
+        .count();
+    let total_count = entries.len();
+    let close_ok = entries
+        .iter()
+        .filter(|entry| entry.get("session_close_succeeded").and_then(|v| v.as_bool()) == Some(true))
+        .count();
+
+    Some(format!(
+        "{settled_count}/{total_count} agents settled, {close_ok} sessions closed"
+    ))
 }
 
 /// Rebuild stage_summaries for all stages in a run.

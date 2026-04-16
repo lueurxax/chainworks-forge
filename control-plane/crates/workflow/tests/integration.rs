@@ -78,6 +78,19 @@ fn test_parse_agent_catalog() {
     assert!(agent_ids.contains(&"code_writer"));
     assert!(agent_ids.contains(&"proposal_writer"));
     assert!(agent_ids.contains(&"proposal_reviewer_ux"));
+
+    let proposal_writer = agents
+        .iter()
+        .find(|agent| agent.id == "proposal_writer")
+        .expect("proposal_writer in catalog");
+    assert_eq!(
+        proposal_writer.session_reuse_scope.as_deref(),
+        Some("same_agent_family_within_run")
+    );
+    assert_eq!(
+        proposal_writer.session_family_id.as_deref(),
+        Some("proposal_authoring_loop")
+    );
 }
 
 #[test]
@@ -111,6 +124,16 @@ fn test_compile_full_mvp_live_plan() {
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
     assert_eq!(cw_task.unwrap().agent.provider, "codex");
+
+    let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
+    assert_eq!(
+        proposal_writer.session_reuse_scope.as_deref(),
+        Some("same_agent_family_within_run")
+    );
+    assert_eq!(
+        proposal_writer.session_family_id.as_deref(),
+        Some("proposal_authoring_loop")
+    );
 
     // Verify manual gates
     let s3 = &plan.states["state_3_initial_proposal_approval"];
@@ -362,12 +385,13 @@ states:
     label: Start
     owner: reviewer
     run:
-      sequence:
+        sequence:
         - agent: reviewer
           task: write_review
           outputs:
             - proposal_review
             - proposal_review_v2
+            - proposal_review-v3
 "#,
         r#"
 backend_profiles:
@@ -400,9 +424,15 @@ agents:
         .output_schemas
         .get("proposal_review_v2")
         .expect("versioned fallback should resolve");
+    let hyphen_versioned = task
+        .output_schemas
+        .get("proposal_review-v3")
+        .expect("hyphenated versioned fallback should resolve");
 
     assert_eq!(stem.contract_id, "proposal_review_v1");
     assert_eq!(versioned.contract_id, "proposal_review_v1");
+    assert_eq!(hyphen_versioned.contract_id, "proposal_review_v1");
     assert_eq!(stem.human_format.as_deref(), Some("markdown"));
     assert_eq!(versioned.machine_format.as_deref(), Some("json"));
+    assert_eq!(hyphen_versioned.machine_format.as_deref(), Some("json"));
 }

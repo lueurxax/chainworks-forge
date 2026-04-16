@@ -3,7 +3,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use db::repos::{runs, stages, startup_repairs};
+use db::repos::{agent_executions, runs, stages, startup_repairs};
 use db::work_item::WorkItemKind;
 use domain::run::Run;
 use domain::stage::StageStatus;
@@ -82,6 +82,10 @@ impl RecoveryService {
         let now = Utc::now();
 
         for stage in &running_stages {
+            let provenance_suffix = self
+                .latest_execution_provenance_suffix(stage.id)
+                .await
+                .unwrap_or_default();
             warn!(
                 run_id = %run.id,
                 stage_id = %stage.stage_id,
@@ -99,8 +103,9 @@ impl RecoveryService {
                 "stage_blocked",
                 now,
                 Some(&format!(
-                    "Stage '{}' stuck in Running — marked Blocked",
-                    stage.stage_id
+                    "Stage '{}' stuck in Running — marked Blocked{}",
+                    stage.stage_id,
+                    provenance_suffix
                 )),
             )
             .await;
@@ -113,7 +118,10 @@ impl RecoveryService {
                 &run.id.to_string(),
                 Some(&stage.stage_id),
                 "retry_stage",
-                "Stage was stuck in Running at daemon startup — consider retry or manual review",
+                &format!(
+                    "Stage was stuck in Running at daemon startup — consider retry or manual review{}",
+                    provenance_suffix
+                ),
                 now,
             )
             .await;
@@ -169,5 +177,32 @@ impl RecoveryService {
         }
 
         Ok(requeued)
+    }
+
+    async fn latest_execution_provenance_suffix(
+        &self,
+        stage_execution_id: domain::ids::StageExecutionId,
+    ) -> Option<String> {
+        let executions = agent_executions::find_by_stage(&self.pool, stage_execution_id)
+            .await
+            .ok()?;
+        let execution = executions.last()?;
+        let mut details = Vec::new();
+
+        if let Some(disposition) = execution.session_reuse_disposition.as_deref() {
+            details.push(format!("reuse_disposition={disposition}"));
+        }
+        if let Some(reason) = execution.session_reset_reason.as_deref() {
+            details.push(format!("reset_reason={reason}"));
+        }
+        if let Some(checkpoint_id) = execution.rehydrated_from_checkpoint_artifact_id.as_deref() {
+            details.push(format!("checkpoint_artifact_id={checkpoint_id}"));
+        }
+
+        if details.is_empty() {
+            None
+        } else {
+            Some(format!("; latest execution provenance: {}", details.join(", ")))
+        }
     }
 }

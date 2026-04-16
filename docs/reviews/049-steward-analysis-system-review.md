@@ -3,198 +3,158 @@
 ## 0. Review Mode and Proposal Evidence Summary
 - Mode used: `proposal-readiness`
 - Evidence completeness: `Complete`
+- Reviewed on: `2026-04-15`
+- Reviewed tree: working tree with local modifications in `docs/proposals/049-steward-analysis-system.md`
 - Proposal / docs reviewed:
   - `docs/proposals/049-steward-analysis-system.md`
   - `.review-baselines/current-system-baseline.md`
-  - `docs/reference/current-system-baseline.md`
   - `docs/reference/forge-steward.md`
-  - `docs/reference/rust-control-plane.md`
-  - `docs/reference/yaml-dsl-parser.md`
-  - `docs/reference/architecture-decisions.md`
+  - prior `049` review / evidence artifacts as stale-basis comparators
+- Reusable baseline used:
+  - `.review-baselines/current-system-baseline.md`
+  - `docs/reference/forge-steward.md`
 - Baseline refreshed:
-  - targeted reread of the stable Steward V1 reference
-  - targeted reread of the current Rust daemon startup / northbound configuration owners
-  - targeted reread of current control-plane JSON artifact writing conventions
-  - targeted code refresh for current Swift dossier fallback / context-link behavior
+  - targeted reread of the current `P049` draft and working-tree diff
+  - targeted reread of stable Swift Steward V1 dossier / context-link behavior
+  - targeted code refresh for current Swift run-owned cohort / provenance ownership
+  - targeted code refresh for current Rust daemon startup, run command, run schema, work-item queue, and DB migration baseline
 - Baseline freshness: `Partially refreshed`
 - Proposal-specific integration context: none
 - External research used: `None`
 - Code areas inspected:
-  - `control-plane/crates/daemon/src/main.rs`
-  - `control-plane/crates/domain/src/commands.rs`
-  - `control-plane/crates/graphql-server/src/schema.rs`
-  - `control-plane/crates/mcp-server/src/tools/runs.rs`
-  - `control-plane/crates/mcp-server/src/tools/mod.rs`
-  - `control-plane/crates/mcp-server/src/server.rs`
-  - `control-plane/crates/engine/src/executor.rs`
+  - `Chainworks Forge/Models/Run.swift`
+  - `Chainworks Forge/Models/RunRepository.swift`
   - `Chainworks Forge/Engine/Steward/StewardAnalysisService.swift`
-  - `docs/reference/forge-steward.md`
+  - `control-plane/crates/domain/src/run.rs`
+  - `control-plane/crates/domain/src/commands.rs`
+  - `control-plane/crates/db/src/work_item.rs`
+  - `control-plane/crates/daemon/src/main.rs`
+  - `control-plane/crates/db/migrations/005_validation_records.sql`
+  - `control-plane/crates/db/migrations/006_session_lineage.sql`
 - Current repo contradictions found:
-  - the old `post_run_hook.enabled` blocker is stale: the current draft now correctly keeps the default at `false`
-  - the old config-hash blocker is stale: the current draft now correctly binds `§6b` to canonical parsed-object hashing
-  - the old manual-trigger blocker is stale: the current draft now correctly binds `§6c` to the existing namespaced MCP `tools/list` / `tools/call` surface
-  - one live input-owner gap remains: the proposal still does not define where the daemon gets the current `StewardConfig` and current `AgentCatalogFile` outside per-run YAML paths
-  - one live determinism gap remains: the proposal still promises sorted deterministic JSON while modeling artifact-facing maps as `HashMap` and naming only plain `serde_json`
-  - one live evidence-parity gap remains: the proposal still drops the stable context-dossier fallback when no runs are implicated
+  - the old no-signal dossier blocker is stale: the current draft now restores the bounded context-dossier fallback and `context` links
+  - the old deterministic-artifact blocker is stale: the current draft now names `BTreeMap` for artifact-visible maps and a canonical JSON writer owner
+  - the old daemon-global current-input blocker is stale: the current draft now defines `StewardRuntimeInputs`, daemon-owned config/catalog paths, and the shared queue path
+  - the current draft now aligns with the stable Swift run-owner model for Steward cohort / frozen provenance fields
+  - one live repo-baseline contradiction remains: the file inventory still asks for `db/migrations/005_steward.sql`, but the current Rust schema chain already uses `005_validation_records.sql` and `006_session_lineage.sql`
+  - one low-level internal inconsistency remains: `AnomalyDetector.detect(...)` still takes `HashMap<String, ThresholdEntry>` while the proposal moved `StewardConfig.thresholds` to `BTreeMap<String, ThresholdEntry>`
 - Remaining blockers:
-  - daemon-global Steward config/current-catalog owner chain is still unspecified
-  - deterministic JSON artifact contract is still under-specified
+  - migration numbering / file-inventory collision with the current DB baseline
 
 ## 1. Executive Summary
-- Overall readiness: `Red`
+- Overall readiness: `Amber`
 - Confidence: `High`
-- Proposal completeness signal: `Most prior red basis is closed, but two high-severity architecture gaps remain and one medium parity gap remains`
+- Proposal completeness signal: `Strong; the stale red basis is closed, but one repo-baseline collision and one low-level type mismatch remain`
 - Top residual implementation risks:
-  1. `§4e` / `§6b` require a parsed `StewardConfig` and parsed `AgentCatalogFile` at daemon startup and for manual Steward runs, but the current daemon still has no global owner for either input; only per-run workflow/catalog paths exist today.
-  2. The proposal promises deterministic JSON artifacts with sorted keys and identical reruns, yet its Rust data model is `HashMap`-heavy and its artifact contract only names plain `serde_json`. That is not sufficient to guarantee stable byte-for-byte output.
-  3. Stable Steward V1 still builds dossiers for the first five observation runs when no runs are implicated and persists those links as `context`; the proposal still narrows dossiers to implicated runs only.
+  1. Literal implementation of `db/migrations/005_steward.sql` would clash with the existing migration chain and force ad hoc renumbering outside the proposal text.
+  2. The lingering `HashMap` / `BTreeMap` split around thresholds weakens the proposal's otherwise tightened deterministic-contract story.
+  3. If the migration fix is made in one section only, the proposal can still hand implementation an inconsistent file-inventory / proof-plan story.
+- Top opportunities:
+  1. Rename the Steward migration to the next free slot and make the migration strategy explicit.
+  2. Normalize the thresholds container type across all code snippets.
+  3. Carry the now-correct run-owner, daemon-current-input, and canonical-writer contracts into implementation without reopening the older stale blockers.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
-  - daemon-side Steward V1 parity
-  - deterministic metrics, anomaly detection, cohorting, dossiers, and persisted recommendations
+  - Rust Steward V1 parity for metrics, anomaly detection, cohorting, dossiers, persisted analyses, and recommendations
   - both optional LLM lanes
-  - manual and automatic Steward trigger semantics
+  - post-run, config-change, and manual trigger wiring
+  - run-owned cohort / provenance bridge and daemon-owned current-input chain
 - Out of scope:
+  - Steward UI
+  - V2 recommender / V3 experimenter
+  - runtime consumption of `context_strategy_profiles`
   - implementation audit or gate execution
-  - new Steward UI
-  - V2 recommendation patches
-  - V3 experiments / decisions
 - Most important baseline refreshes performed:
-  - stable Steward V1 evidence completeness and dossier fallback
-  - current Rust daemon startup / run-start input ownership
-  - current control-plane JSON artifact writing conventions
+  - stable Swift dossier fallback and `context` link behavior
+  - stable Swift run-owned cohort / frozen provenance ownership
+  - current Rust daemon startup / work-item / migration baseline
 - Most important contradictions with current repo:
-  - the proposal now matches the stable default-off post-run trigger
-  - the proposal still assumes a daemon-global config/catalog substrate that the current control-plane does not yet own
-  - the proposal still over-promises deterministic JSON without a canonical map/serializer contract
-  - the proposal still omits the stable no-signal dossier fallback
+  - the only live repo-baseline contradiction is the proposed migration filename / sequence
+- Most important missing or partial states:
+  - thresholds container typing is still internally inconsistent across the draft
 
 ## 3. Proposal Readiness Verdict
-- `Readiness = Red`
+- `Readiness = Amber`
 - `Confidence = High`
 - `Evidence Completeness = Complete`
 
-This is not an Evidence Gap Review. Local proposal, baseline, and current-code evidence are sufficient.
+This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline evidence is sufficient for a proposal-first verdict.
 
 ## 4. Discipline Scorecard
 | Discipline | Readiness | Confidence | Evidence Completeness | Critical | High | Medium | Low |
 |---|---|---|---|---:|---:|---:|---:|
 | UI | Green | High | Complete | 0 | 0 | 0 | 0 |
 | UX | Green | High | Complete | 0 | 0 | 0 | 0 |
-| Architecture | Red | High | Complete | 0 | 2 | 1 | 0 |
+| Architecture | Amber | High | Complete | 0 | 0 | 1 | 1 |
 
 ## 5. Findings by Discipline
 
 ### 5.1 UI Findings
-- No live UI `proposal-text` finding.
+- No live UI `proposal-text` findings.
 
 ### 5.2 UX Findings
-- No live UX `proposal-text` finding.
+- No live UX `proposal-text` findings.
 
 ### 5.3 Architecture Findings
 
-#### ARCH-001 - Daemon-global Steward config and current-catalog ownership are still unspecified
-- Severity: `High`
-- Confidence: `High`
-- Evidence Completeness: `Complete`
-- Evidence IDs: `DOC-01`, `DOC-04`, `MAP-01`, `MAP-02`, `MAP-03`, `MAP-04`, `INT-01`
-- Proposal refs:
-  - `docs/proposals/049-steward-analysis-system.md:301`
-  - `docs/proposals/049-steward-analysis-system.md:303`
-  - `docs/proposals/049-steward-analysis-system.md:306`
-  - `docs/proposals/049-steward-analysis-system.md:412`
-  - `docs/proposals/049-steward-analysis-system.md:418`
-- Current repo refs:
-  - `control-plane/crates/daemon/src/main.rs:27`
-  - `control-plane/crates/daemon/src/main.rs:32`
-  - `control-plane/crates/domain/src/commands.rs:16`
-  - `control-plane/crates/domain/src/commands.rs:27`
-  - `control-plane/crates/graphql-server/src/schema.rs:99`
-  - `control-plane/crates/graphql-server/src/schema.rs:123`
-  - `control-plane/crates/mcp-server/src/tools/runs.rs:16`
-  - `control-plane/crates/mcp-server/src/tools/runs.rs:27`
-- Why it matters:
-  - The draft now correctly describes how Steward should hash the current config and current catalog, and its service signature expects both a parsed `StewardConfig` and a parsed `AgentCatalogFile`. But the current daemon still has no global owner that can supply either input. `main.rs` only reads `DATABASE_URL`, `GRAPHQL_ADDR`, and `MODE`; the current northbound start surfaces only carry per-run workflow/catalog YAML paths; and there is still no daemon-owned steward-config path or canonical current-catalog path. As written, implementers would have to invent where startup hash checks, manual `steward.run_analysis`, and optional LLM lane agent resolution get their “current” config objects from.
-- Required fix:
-  - Add an explicit daemon-owned input contract for both current Steward config and current catalog.
-  - Name the owner chain: startup config source, manual-trigger source, and the file(s) that load and pass those parsed objects into Steward.
-  - If the intent is to bind Steward to a single repo-local config path (for example `examples/steward/steward_config.yaml` + a canonical catalog path), make that explicit and define how daemon mode resolves those paths independently of per-run YAML paths.
-
-#### ARCH-002 - Deterministic JSON is still under-specified against the proposal’s own `HashMap` model
-- Severity: `High`
-- Confidence: `High`
-- Evidence Completeness: `Complete`
-- Evidence IDs: `DOC-01`, `DOC-04`, `MAP-05`, `INT-02`, `TEST-01`
-- Proposal refs:
-  - `docs/proposals/049-steward-analysis-system.md:110`
-  - `docs/proposals/049-steward-analysis-system.md:117`
-  - `docs/proposals/049-steward-analysis-system.md:123`
-  - `docs/proposals/049-steward-analysis-system.md:131`
-  - `docs/proposals/049-steward-analysis-system.md:166`
-  - `docs/proposals/049-steward-analysis-system.md:454`
-  - `docs/proposals/049-steward-analysis-system.md:496`
-- Current repo refs:
-  - `control-plane/crates/engine/src/executor.rs:824`
-- Why it matters:
-  - The draft now explicitly requires deterministic artifacts, sorted keys, and identical reruns on identical data. But its proposed Rust structs still use multiple `HashMap<String, ...>` fields for artifact-visible content (`stage_latency_medians`, `retries_per_stage_mean`, `cost_by_stage_family`, `loop_counters`, `cost_by_stage`, `cost_by_agent`) while the artifact contract names only plain `serde_json`. That is not enough to guarantee stable key order or byte-for-byte output across runs. The current control-plane artifact writer still uses `serde_json::to_string_pretty(...)`, which reinforces that no canonical sorted-key JSON writer currently exists in the daemon.
-- Required fix:
-  - Either replace all artifact-visible `HashMap` fields with deterministic containers (`BTreeMap` or explicitly sorted arrays), or add a named canonical JSON serializer/writer module to the proposal and file inventory.
-  - Tie the determinism acceptance criteria to that owner so `AC-7` does not rely on accidental map ordering.
-
-#### ARCH-003 - The stable context-dossier fallback is still missing from the proposal
+#### ARCH-001 - Proposed Steward migration collides with the current Rust migration chain
 - Severity: `Medium`
 - Confidence: `High`
 - Evidence Completeness: `Complete`
-- Evidence IDs: `DOC-01`, `DOC-03`, `MAP-06`, `INT-03`
+- Evidence IDs: `DOC-01`, `MAP-08`, `INT-04`, `REAL-04`
 - Proposal refs:
-  - `docs/proposals/049-steward-analysis-system.md:45`
-  - `docs/proposals/049-steward-analysis-system.md:294`
-  - `docs/proposals/049-steward-analysis-system.md:448`
-  - `docs/proposals/049-steward-analysis-system.md:499`
+  - `docs/proposals/049-steward-analysis-system.md:585`
 - Current repo refs:
-  - `docs/reference/forge-steward.md:35`
-  - `docs/reference/forge-steward.md:38`
-  - `Chainworks Forge/Engine/Steward/StewardAnalysisService.swift:104`
-  - `Chainworks Forge/Engine/Steward/StewardAnalysisService.swift:109`
-  - `Chainworks Forge/Engine/Steward/StewardAnalysisService.swift:275`
-  - `Chainworks Forge/Engine/Steward/StewardAnalysisService.swift:282`
+  - `control-plane/crates/db/migrations/005_validation_records.sql:1`
+  - `control-plane/crates/db/migrations/006_session_lineage.sql:1`
 - Why it matters:
-  - Stable Steward V1 does not stop at implicated-run dossiers. When no runs are implicated, it still writes dossiers for up to five observation runs and persists those observation-run links as `context`. That keeps evidence completeness intact for inconclusive and no-signal analyses, and it feeds richer inputs into the optional LLM lanes. The proposal’s pipeline, artifact list, and acceptance text still narrow dossiers to implicated runs only, so an implementer can ship a thinner evidence model while still believing they matched V1.
+  - The draft now does the important architecture work correctly, but its file inventory still instructs implementers to add `db/migrations/005_steward.sql`. In the current tree, `005` and `006` are already occupied. That makes the migration plan non-executable as written and pushes a real schema-ordering decision out of the proposal and into ad hoc implementation judgment.
 - Required fix:
-  - Amend the pipeline, dossier builder contract, artifact section, and acceptance criteria to state: build dossiers for implicated runs, or for the first five observation runs when none are implicated.
-  - Explicitly persist those no-signal observation-run links with role `context`.
+  - Rename the Steward migration in the proposal to the next free slot in the current chain, or state explicitly that implementation must use the next available migration number at landing time without renumbering existing migrations.
+  - Update every place that names the migration so the file inventory, implementation plan, and proof expectations stay aligned.
+- Acceptance criteria:
+  - The proposal no longer names an already-occupied migration slot.
+  - The migration strategy explicitly preserves the existing `001` through `006` sequence.
+
+#### ARCH-002 - Threshold container typing is still internally inconsistent
+- Severity: `Low`
+- Confidence: `High`
+- Evidence Completeness: `Complete`
+- Evidence IDs: `DOC-01`, `INT-05`, `REAL-05`
+- Proposal refs:
+  - `docs/proposals/049-steward-analysis-system.md:281`
+  - `docs/proposals/049-steward-analysis-system.md:435`
+- Why it matters:
+  - The current draft correctly moved `StewardConfig.thresholds` to `BTreeMap` as part of the deterministic contract, but `AnomalyDetector.detect(...)` still takes `&HashMap<String, ThresholdEntry>`. That does not reopen the old determinism blocker, but it leaves the proposal internally inconsistent and invites unnecessary conversion glue or a partial retreat from the new type contract during implementation.
+- Required fix:
+  - Align the `detect(...)` signature and any remaining snippets with the same thresholds container type used by `StewardConfig`.
+  - If thresholds are intentionally allowed to stay unordered internally because they are not artifact-visible, state that explicitly instead of mixing both contracts.
 
 ## 6. Cross-Discipline Conflicts and Decisions
-- Conflict:
-  - the proposal claims full stable Swift V1 parity, but it still leaves the daemon-global config/catalog owner chain undefined
-  - decision needed: choose the canonical daemon source for current `steward_config.yaml` and current `AgentCatalogFile`
-- Conflict:
-  - the proposal promises deterministic sorted-key JSON while modeling artifact-visible collections as `HashMap`
-  - decision needed: deterministic container types vs. canonical serializer module
+- No live cross-discipline conflict remains. The residual work is architecture-only cleanup before `Green`.
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P1 | Add an explicit daemon-owned source-of-truth contract for current Steward config and current catalog, including startup and manual-trigger resolution | Architecture | proposal author | Before next review | current daemon startup and northbound config surfaces | proposal no longer requires implementers to invent how `StewardConfig` / `AgentCatalogFile` are sourced | `ARCH-001` |
-| P1 | Make the deterministic JSON contract executable by naming deterministic containers or a canonical JSON writer | Architecture | proposal author | Before next review | artifact schema section, file inventory, acceptance | `AC-7` no longer depends on accidental `HashMap` ordering | `ARCH-002` |
-| P2 | Restore the no-signal context-dossier fallback to the pipeline, artifacts, and acceptance text | Architecture | proposal author | Before next review | stable Swift `StewardAnalysisService` behavior | proposal explicitly preserves context dossiers and `context` run links | `ARCH-003` |
+| P1 | Fix the Steward migration naming so it targets the next free DB slot instead of `005` | Architecture | proposal author | Before next review | current `db/migrations` baseline | proposal no longer collides with the live migration chain | `ARCH-001` |
+| P2 | Normalize thresholds container typing across the proposal text | Architecture | proposal author | Before next review | current deterministic JSON contract wording | proposal no longer mixes `BTreeMap` and `HashMap` for the same thresholds owner boundary | `ARCH-002` |
 
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Config / catalog owner chain | whether the daemon has an explicit source for current Steward config and current catalog | proposal names startup/manual-trigger input owners and owning files | no silent repo-root / cwd assumption | next proposal review | hold if `§4e` / `§6b` still rely on unspecified config objects |
-| Artifact determinism | whether identical data produces identical Steward JSON artifacts | deterministic map/container choice or canonical writer is named | no plain `HashMap` + plain `serde_json` ambiguity | next proposal review | hold if sorted-key determinism is still only aspirational |
-| Evidence completeness parity | whether no-signal analyses still emit useful dossiers and `context` links | pipeline and AC explicitly mention the first-five observation-run fallback | no regression to implicated-only dossiers | next proposal review | hold if proposal still narrows dossiers to implicated-only |
+| migration sequencing | whether the proposal is executable against the live DB baseline | the file inventory names a free migration slot | no renumbering of existing migrations | next proposal review | hold if the draft still names `005_steward.sql` |
+| threshold contract consistency | whether the tightened determinism contract stays internally coherent | all threshold-carrying snippets use one container type | no silent `HashMap` reintroduction through helper signatures | next proposal review | hold if `StewardConfig` and `AnomalyDetector` still disagree on the thresholds type |
+| implementation handoff stability | whether the now-correct owner chains remain intact | run-owner bridge, daemon current-input source, and canonical writer all stay unchanged in the text | no reintroduction of stale blockers already closed in this draft | implementation audit | hold only on implementation drift, not on already-fixed proposal sections |
 
 ## 9. Evidence Gaps and Open Questions
 
 ### Evidence Gaps
-- GAP-01: No blocking evidence gap remains. Local proposal, baseline, and current-code evidence are sufficient.
+- GAP-01: No blocking evidence gap remains. Local proposal/docs/code/baseline evidence is sufficient.
 
 ### Open Questions
-- QUESTION-01: Should the daemon own Steward config/current-catalog paths through startup env/config, or through a more explicit persisted workspace/repo binding?
-- QUESTION-02: Does the author want deterministic JSON by container choice (`BTreeMap` / sorted vectors) or by a reusable canonical writer utility?
+- QUESTION-01: Should the draft name `007_steward.sql` explicitly for the current tree, or should it state "next available migration number at landing time" to stay safe against parallel schema work?
+- QUESTION-02: Does the author want thresholds to stay `BTreeMap` end-to-end, or to remain unordered internally with determinism enforced only at artifact-writing boundaries?
 
 ## 10. Evidence Gap Review Fallback
 

@@ -3,11 +3,10 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::info;
 
-use domain::ids::AgentExecutionId;
-
 use crate::adapters::AcpAdapter;
-use crate::transport::{run_acp_session, AcpSessionConfig};
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::session::{AcpSession, AcpSessionHandle};
+use crate::transport::AcpSessionConfig;
+use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_GEMINI_ACP_BINARY";
 
@@ -53,7 +52,7 @@ impl AcpAdapter for GeminiCliAdapter {
         "gemini"
     }
 
-    async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
         if self.binary_path.is_empty() {
             bail!(
                 "GeminiCliAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -70,10 +69,8 @@ impl AcpAdapter for GeminiCliAdapter {
             "Spawning Gemini ACP subprocess"
         );
 
-        let agent_execution_id = AgentExecutionId::new();
-
         // Gemini CLI requires --acp to enable ACP server mode.
-        let mut child = Command::new(&self.binary_path)
+        let child = Command::new(&self.binary_path)
             .arg("--acp")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -95,13 +92,8 @@ impl AcpAdapter for GeminiCliAdapter {
             extra: None,
             config_options: Vec::new(),
         };
-        let (status, artifact_paths) = run_acp_session(&mut child, &req, &config).await?;
+        let session = AcpSession::start(child, req, &config).await?;
 
-        Ok(ExecutionResult {
-            agent_execution_id,
-            status,
-            artifact_paths,
-            cost_cents: None,
-        })
+        Ok(AcpSessionHandle::new(session))
     }
 }

@@ -1,37 +1,101 @@
 use anyhow::Result;
-use async_trait::async_trait;
-use tokio::sync::oneshot;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
+use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{ExecutionRequest, ExecutionResult};
+use domain::ids::AgentExecutionId;
 
-/// Trait representing a live ACP session for a single agent execution.
-#[async_trait]
-pub trait AcpSession: Send + Sync {
-    /// Run the session to completion, returning the execution result.
-    async fn run(&self, req: ExecutionRequest) -> Result<ExecutionResult>;
-
-    /// Request cancellation of the session.
-    async fn cancel(&self) -> Result<()>;
+/// Transport-backed ACP session that can accept multiple prompt turns before
+/// being closed.
+pub struct AcpSession {
+    transport: AcpTransportSession,
+    cleanup_path: Option<PathBuf>,
 }
 
-/// Handle to an in-progress ACP session.
-/// Holds a cancellation sender and can be used to await the result.
+impl AcpSession {
+    /// Start a new transport-backed ACP session from a spawned subprocess.
+    pub async fn start(
+        child: tokio::process::Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+    ) -> Result<Self> {
+        Self::start_with_cleanup(child, req, config, None).await
+    }
+
+    /// Start a new transport-backed session and remove `cleanup_path` when the
+    /// session is eventually closed.
+    pub async fn start_with_cleanup(
+        child: tokio::process::Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+        cleanup_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let transport = AcpTransportSession::start(child, req, config).await?;
+        Ok(Self {
+            transport,
+            cleanup_path,
+        })
+    }
+
+    /// Send a prompt through the live ACP session and return the prompt
+    /// result. The transport stays open for later reuse.
+    pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
+        let (status, artifact_paths, discovered_artifacts, usage) = self.transport.prompt(req).await?;
+        Ok(ExecutionResult {
+            agent_execution_id: AgentExecutionId::new(),
+            status,
+            artifact_paths,
+            discovered_artifacts,
+            cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
+            usage,
+            provider_session_id: Some(self.transport.session_id().to_string()),
+            reused_existing_session: false,
+            session_generation_id: None,
+        })
+    }
+
+    /// Close the live ACP session and wait for the subprocess to exit.
+    pub async fn close(&mut self) -> Result<()> {
+        self.transport.close().await?;
+        if let Some(path) = self.cleanup_path.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(())
+    }
+}
+
+/// Cloneable owned handle to a live ACP session.
+///
+/// The runtime manager stores these handles by generation id so later turns
+/// can reuse the same transport/session pair via `session/prompt`.
+#[derive(Clone)]
 pub struct AcpSessionHandle {
-    cancel_tx: Option<oneshot::Sender<()>>,
+    inner: Arc<Mutex<AcpSession>>,
 }
 
 impl AcpSessionHandle {
-    pub fn new(cancel_tx: oneshot::Sender<()>) -> Self {
+    pub fn new(session: AcpSession) -> Self {
         Self {
-            cancel_tx: Some(cancel_tx),
+            inner: Arc::new(Mutex::new(session)),
         }
     }
 
-    /// Signal the session to cancel.
-    pub fn request_cancel(&mut self) -> Result<()> {
-        if let Some(tx) = self.cancel_tx.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
+    /// Send a prompt through the live session.
+    pub async fn prompt(&self, req: &ExecutionRequest) -> Result<ExecutionResult> {
+        let mut session = self.inner.lock().await;
+        session.prompt(req).await
+    }
+
+    /// Close the live session.
+    pub async fn close(&self) -> Result<()> {
+        let mut session = self.inner.lock().await;
+        session.close().await
+    }
+
+    pub async fn provider_session_id(&self) -> String {
+        let session = self.inner.lock().await;
+        session.transport.session_id().to_string()
     }
 }

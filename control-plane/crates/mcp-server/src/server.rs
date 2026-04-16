@@ -470,6 +470,7 @@ mod tests {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
@@ -526,6 +527,15 @@ mod tests {
                 started_at: Utc::now(),
                 completed_at: Some(Utc::now()),
                 status: domain::agent::AgentStatus::Failed,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: Some("reused".into()),
+                session_reset_reason: Some("operator_reset".into()),
             },
         )
         .await
@@ -705,6 +715,14 @@ mod tests {
         assert_eq!(
             validation_failure["validation_failure_record"]["contractMetadata"][0]["contractID"],
             serde_json::json!("report_v1")
+        );
+        assert_eq!(
+            validation_failure["validation_failure_record"]["sessionReuseDisposition"],
+            serde_json::json!("reused")
+        );
+        assert_eq!(
+            validation_failure["validation_failure_record"]["sessionResetReason"],
+            serde_json::json!("operator_reset")
         );
     }
 }

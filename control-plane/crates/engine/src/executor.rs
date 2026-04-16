@@ -15,7 +15,7 @@ use crate::release::{
     receipt::DeliveryReceiptBuilder,
 };
 use db::work_item::{WorkItem, WorkItemKind};
-use db::repos::{agent_executions, artifacts, ideas, projections, stages, validation};
+use db::repos::{agent_executions, artifacts, ideas, projections, sessions, stages, validation};
 use domain::artifact::ArtifactFormat;
 use domain::agent::AgentStatus;
 use domain::ids::RunId;
@@ -29,6 +29,11 @@ use crate::contracts::{
 use crate::event_bus::EventSender;
 use crate::orchestrator::Orchestrator;
 use crate::recovery::RecoveryService;
+use crate::session::fingerprint::{
+    binding_fingerprint, invocation_owner_key, BindingFingerprintInput,
+    InvocationOwnerKeyInput,
+};
+use crate::session::policy::{ensure_policy, SessionPolicyDecision, SessionPolicyInput};
 use crate::work_queue::WorkQueue;
 
 pub struct BackgroundExecutor {
@@ -37,6 +42,76 @@ pub struct BackgroundExecutor {
     orchestrator: Arc<Orchestrator>,
     acp: Arc<AcpRuntimeManager>,
     events: EventSender,
+}
+
+fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
+    let path_obj = std::path::Path::new(path);
+    if let Some(parent) = path_obj.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path_obj, content)?;
+    Ok(())
+}
+
+fn materialize_declared_outputs_from_discovered_artifacts(
+    declared_outputs: &[DeclaredOutput],
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+) -> Result<()> {
+    let artifact_map: std::collections::HashMap<&str, &acp::DiscoveredArtifact> =
+        discovered_artifacts
+            .iter()
+            .map(|artifact| (artifact.name.as_str(), artifact))
+            .collect();
+
+    for declared in declared_outputs {
+        if let Some(artifact) = artifact_map.get(declared.output_name.as_str()) {
+            write_discovered_output(&declared.target_path, &artifact.content)?;
+        }
+
+        if let (Some(companion_name), Some(companion_path)) = (
+            declared.companion_output_name.as_deref(),
+            declared.companion_path.as_deref(),
+        ) {
+            if let Some(artifact) = artifact_map.get(companion_name) {
+                write_discovered_output(companion_path, &artifact.content)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn declared_machine_artifact_name<'a>(declared: &'a DeclaredOutput) -> &'a str {
+    declared
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.normalized_artifact_name.as_deref())
+        .unwrap_or(declared.output_name.as_str())
+}
+
+fn infer_artifact_format_from_content(content: &[u8]) -> (ArtifactFormat, &'static str) {
+    if serde_json::from_slice::<serde_json::Value>(content).is_ok() {
+        (ArtifactFormat::Json, "json")
+    } else if std::str::from_utf8(content).is_ok() {
+        (ArtifactFormat::Report, "txt")
+    } else {
+        (ArtifactFormat::Json, "bin")
+    }
+}
+
+fn sanitize_artifact_name_for_path(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "artifact".to_string()
+    } else {
+        sanitized
+    }
 }
 
 impl BackgroundExecutor {
@@ -190,20 +265,6 @@ impl BackgroundExecutor {
                     })?
                     .to_string();
 
-                let now = chrono::Utc::now();
-                let agent_exec_id = domain::ids::AgentExecutionId::new();
-                let agent_exec = domain::agent::AgentExecution {
-                    id: agent_exec_id,
-                    stage_execution_id,
-                    agent_id: agent_id.clone(),
-                    provider: provider.clone(),
-                    model: None,
-                    status: domain::agent::AgentStatus::Running,
-                    started_at: now,
-                    completed_at: None,
-                };
-                agent_executions::insert(&self.pool, &agent_exec).await?;
-
                 // Build the ACP request from the run record (workspace_root lives there).
                 let run = db::repos::runs::find_by_id(&self.pool, run_id)
                     .await?
@@ -217,10 +278,36 @@ impl BackgroundExecutor {
 
                 let model = payload["model"].as_str().map(String::from);
                 let effort = payload["effort"].as_str().map(String::from);
+                let task_name = payload["task_name"]
+                    .as_str()
+                    .unwrap_or(&stage_id)
+                    .to_string();
+                let task_inputs: Vec<String> =
+                    serde_json::from_value(payload["task_inputs"].clone()).unwrap_or_default();
+                let task_outputs: Vec<String> =
+                    serde_json::from_value(payload["task_outputs"].clone()).unwrap_or_default();
+                let backend_profile_id = payload["backend_profile_id"].as_str().map(String::from);
+                let permission_profile = payload["permission_profile"].as_str().map(String::from);
+                let skill_ref = payload["skill_ref"].as_str().map(String::from);
+                let skill_role = payload["skill_role"].as_str().map(String::from);
+                let skill_snapshot_hash =
+                    payload["skill_snapshot_hash"].as_str().map(String::from);
+                let requested_mcp_server_ids: Vec<String> =
+                    serde_json::from_value(payload["requested_mcp_server_ids"].clone())
+                        .unwrap_or_default();
+                let output_contract = payload["output_contract"].as_str().map(String::from);
+                let max_turns = payload["max_turns"].as_i64();
+                let temperature = payload["temperature"].as_f64();
                 let worktree_write_enabled = payload["worktree_write_enabled"]
                     .as_bool()
                     .unwrap_or(false);
                 let worktree_strategy = payload["worktree_strategy"]
+                    .as_str()
+                    .map(String::from);
+                let session_reuse_scope = payload["session_reuse_scope"]
+                    .as_str()
+                    .map(String::from);
+                let session_family_id = payload["session_family_id"]
                     .as_str()
                     .map(String::from);
                 let declared_outputs: Vec<DeclaredOutput> = serde_json::from_value(
@@ -234,6 +321,176 @@ impl BackgroundExecutor {
                             .chain(declared.companion_path.clone().into_iter())
                     })
                     .collect();
+
+                let effective_working_directory = if worktree_write_enabled
+                    || matches!(
+                        worktree_strategy.as_deref(),
+                        Some("dedicated") | Some("shared_implementation_worktree")
+                    ) {
+                    run.worktree_root
+                        .clone()
+                        .unwrap_or_else(|| run.workspace_root.clone())
+                } else {
+                    run.workspace_root.clone()
+                };
+                let workspace_mode = if worktree_write_enabled {
+                    "write_enabled".to_string()
+                } else {
+                    "read_only".to_string()
+                };
+                let resolved_model = model.clone().unwrap_or_else(|| "default".into());
+                let now = chrono::Utc::now();
+                let agent_exec_id = domain::ids::AgentExecutionId::new();
+                let owner_execution_lineage_id = stage_execution_id.to_string();
+                let policy_input = SessionPolicyInput {
+                    run_id: run_id.to_string(),
+                    agent_id: agent_id.clone(),
+                    provider: provider.clone(),
+                    model: resolved_model.clone(),
+                    working_directory: effective_working_directory.clone(),
+                    workspace_mode: workspace_mode.clone(),
+                    session_reuse_scope: session_reuse_scope.clone(),
+                    session_family_id: session_family_id.clone(),
+                    invocation_owner_key: {
+                        let run_id_str = run_id.to_string();
+                        invocation_owner_key(&InvocationOwnerKeyInput {
+                            run_id: &run_id_str,
+                            agent_id: &agent_id,
+                            stage_lineage_id: &stage_id,
+                            task_name: &task_name,
+                            owner_execution_lineage_id: &owner_execution_lineage_id,
+                        })
+                    },
+                    binding_fingerprint: binding_fingerprint(&BindingFingerprintInput {
+                        agent_id: &agent_id,
+                        provider: &provider,
+                        model: model.as_deref(),
+                        effort: effort.as_deref(),
+                        prompt: &prompt,
+                        working_directory: &effective_working_directory,
+                        workspace_mode: &workspace_mode,
+                        worktree_write_enabled,
+                        worktree_strategy: worktree_strategy.as_deref(),
+                        inputs: &task_inputs,
+                        outputs: &task_outputs,
+                        backend_profile: backend_profile_id.as_deref(),
+                        permission_profile: permission_profile.as_deref(),
+                        mcp_servers: &requested_mcp_server_ids,
+                        skill_snapshot_hash: skill_snapshot_hash.as_deref(),
+                        skill_ref: skill_ref.as_deref(),
+                        skill_role: skill_role.as_deref(),
+                        output_contract: output_contract.as_deref(),
+                        max_turns,
+                        temperature,
+                    }),
+                };
+
+                let mut policy_decision: Option<SessionPolicyDecision> = if session_reuse_scope.is_some() {
+                    Some(ensure_policy(&self.pool, policy_input.clone()).await?)
+                } else {
+                    None
+                };
+                if let Some(decision) = policy_decision.as_ref() {
+                    if decision.should_reuse_live_session
+                        && !self
+                            .acp
+                            .has_live_session(
+                                &decision.generation.id,
+                                decision.generation.provider_session_id.as_deref(),
+                            )
+                            .await
+                    {
+                        sessions::end_generation(
+                            &self.pool,
+                            &decision.generation.id,
+                            domain::session::SessionGenerationStatus::Invalidated,
+                            "transport_missing_live_handle",
+                            now,
+                        )
+                        .await?;
+                        sessions::insert_event(
+                            &self.pool,
+                            &domain::session::SessionEvent {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                lineage_id: decision.lineage.id.clone(),
+                                generation_id: decision.generation.id.clone(),
+                                event_type: domain::session::SessionEventType::Invalidated,
+                                recorded_at: now,
+                                details_json: Some(
+                                    serde_json::json!({ "reason": "transport_missing_live_handle" })
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .await?;
+                        policy_decision = Some(ensure_policy(&self.pool, policy_input).await?);
+                    }
+                }
+                if let Some(decision) = policy_decision.as_ref() {
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        lineage_id = %decision.lineage.id,
+                        generation_id = %decision.generation.id,
+                        disposition = ?decision.disposition,
+                        reuse_live_session = decision.should_reuse_live_session,
+                        "Session policy evaluated"
+                    );
+                }
+                if let Some(decision) = policy_decision.as_ref() {
+                    self.persist_session_checkpoint_artifact_if_needed(
+                        &run,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        &prompt,
+                        now,
+                        decision,
+                    )
+                    .await?;
+                }
+
+                let agent_exec = domain::agent::AgentExecution {
+                    id: agent_exec_id,
+                    stage_execution_id,
+                    agent_id: agent_id.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    status: domain::agent::AgentStatus::Running,
+                    started_at: now,
+                    completed_at: None,
+                    owner_execution_lineage_id: Some(owner_execution_lineage_id),
+                    session_lineage_id: policy_decision
+                        .as_ref()
+                        .map(|decision| decision.lineage.id.clone()),
+                    session_generation_id: policy_decision
+                        .as_ref()
+                        .map(|decision| decision.generation.id.clone()),
+                    rehydrated_from_checkpoint_artifact_id: policy_decision.as_ref().and_then(
+                        |decision| {
+                            decision
+                                .generation
+                                .rehydrated_from_checkpoint_artifact_id
+                                .clone()
+                        },
+                    ),
+                    invocation_owner_key: policy_decision
+                        .as_ref()
+                        .map(|decision| decision.generation.invocation_owner_key.clone()),
+                    session_reuse_scope: session_reuse_scope.clone(),
+                    session_family_id: session_family_id.clone(),
+                    session_reuse_disposition: policy_decision.as_ref().and_then(|decision| {
+                        serde_json::to_value(&decision.disposition)
+                            .ok()
+                            .and_then(|value| value.as_str().map(String::from))
+                    }),
+                    session_reset_reason: policy_decision
+                        .as_ref()
+                        .and_then(|decision| decision.session_reset_reason.clone()),
+                };
+                agent_executions::insert(&self.pool, &agent_exec).await?;
 
                 if self.is_release_agent(&agent_id) {
                     // Native release path: bypass ACP entirely and execute the
@@ -256,6 +513,8 @@ impl BackgroundExecutor {
                         .await;
                 }
 
+                let estimated_prompt_tokens =
+                    std::cmp::max(1_i64, (prompt.chars().count() as i64) / 4);
                 let req = acp::ExecutionRequest {
                     run_id,
                     stage_id: stage_id.clone(),
@@ -269,6 +528,17 @@ impl BackgroundExecutor {
                     worktree_write_enabled,
                     worktree_strategy,
                     expected_output_paths,
+                    keep_session_alive: policy_decision.is_some(),
+                    reuse_existing_session: policy_decision
+                        .as_ref()
+                        .map(|decision| decision.should_reuse_live_session)
+                        .unwrap_or(false),
+                    session_generation_id: policy_decision
+                        .as_ref()
+                        .map(|decision| decision.generation.id.clone()),
+                    provider_session_id: policy_decision
+                        .as_ref()
+                        .and_then(|decision| decision.generation.provider_session_id.clone()),
                 };
                 // Runtime event: session starting
                 let _ = self.events.send(domain::events::DomainEvent::RuntimeStatusChanged {
@@ -280,6 +550,52 @@ impl BackgroundExecutor {
                 });
 
                 let result = self.acp.execute(req).await?;
+
+                if !declared_outputs.is_empty() {
+                    materialize_declared_outputs_from_discovered_artifacts(
+                        &declared_outputs,
+                        &result.discovered_artifacts,
+                    )?;
+                }
+
+                if let (Some(decision), Some(provider_session_id)) =
+                    (policy_decision.as_ref(), result.provider_session_id.as_deref())
+                {
+                    let actual_input_tokens = result
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.input_tokens)
+                        .unwrap_or(estimated_prompt_tokens);
+                    sessions::update_generation_usage(
+                        &self.pool,
+                        &decision.generation.id,
+                        provider_session_id,
+                        decision.generation.turn_count + 1,
+                        actual_input_tokens,
+                        result.cost_cents.unwrap_or(0),
+                        actual_input_tokens,
+                        result
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.cached_input_tokens),
+                        result
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.output_tokens),
+                        result
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.model_context_window),
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                    sessions::set_active_generation(
+                        &self.pool,
+                        &decision.lineage.id,
+                        Some(&decision.generation.id),
+                    )
+                    .await?;
+                }
 
                 // Runtime event: session finished (completed or failed)
                 let event_kind = match result.status {
@@ -309,6 +625,20 @@ impl BackgroundExecutor {
                         &mut persisted_paths,
                     )
                     .await?;
+
+                let undeclared_artifacts = self
+                    .persist_undeclared_envelope_artifacts(
+                        &run,
+                        &declared_outputs,
+                        &result.discovered_artifacts,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        completed_at,
+                    )
+                    .await?;
+                persisted_artifacts.extend(undeclared_artifacts);
 
                 for path in &result.artifact_paths {
                     if persisted_paths.contains(path) {
@@ -862,7 +1192,7 @@ impl BackgroundExecutor {
                     run_id,
                     stage_id,
                     agent_id,
-                    declared.output_name.as_str(),
+                    declared_machine_artifact_name(declared),
                     declared
                         .schema
                         .as_ref()
@@ -906,6 +1236,84 @@ impl BackgroundExecutor {
                 }
             }
         }
+        Ok(artifacts_out)
+    }
+
+    async fn persist_undeclared_envelope_artifacts(
+        &self,
+        run: &domain::run::Run,
+        declared_outputs: &[DeclaredOutput],
+        discovered_artifacts: &[acp::DiscoveredArtifact],
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<domain::artifact::Artifact>> {
+        let declared_names: std::collections::HashSet<&str> = declared_outputs
+            .iter()
+            .flat_map(|declared| {
+                std::iter::once(declared.output_name.as_str())
+                    .chain(declared.companion_output_name.as_deref().into_iter())
+            })
+            .collect();
+        let mut artifacts_out = Vec::new();
+
+        for discovered in discovered_artifacts {
+            if discovered.source_path.is_some() || declared_names.contains(discovered.name.as_str()) {
+                continue;
+            }
+
+            let (format, extension) = infer_artifact_format_from_content(&discovered.content);
+            let file_stem = sanitize_artifact_name_for_path(&discovered.name);
+            let artifact_id = domain::ids::ArtifactId::new();
+            let path = std::path::Path::new(&run.artifact_root)
+                .join("undeclared_envelope_outputs")
+                .join(stage_id)
+                .join(format!("{}-{}.{}", file_stem, artifact_id, extension));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    anyhow::anyhow!(
+                        "create undeclared envelope artifact dir {}: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+            std::fs::write(&path, &discovered.content).map_err(|e| {
+                anyhow::anyhow!(
+                    "write undeclared envelope artifact {}: {}",
+                    path.display(),
+                    e
+                )
+            })?;
+
+            let artifact = domain::artifact::Artifact {
+                id: artifact_id,
+                run_id: run.id,
+                stage_id: stage_id.to_string(),
+                agent_id: agent_id.to_string(),
+                name: discovered.name.clone(),
+                contract_id: format!("{}.output", provider),
+                format,
+                file_path: path.to_string_lossy().into_owned(),
+                checksum_sha256: None,
+                size_bytes: Some(path.metadata().map(|meta| meta.len() as i64).unwrap_or(0)),
+                provider: provider.to_string(),
+                model: model.clone(),
+                created_at,
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+            };
+            artifacts::insert(&self.pool, &artifact).await?;
+            let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
+            artifacts_out.push(artifact);
+        }
+
         Ok(artifacts_out)
     }
 
@@ -996,6 +1404,89 @@ impl BackgroundExecutor {
             artifact_id: artifact.id,
         });
         Ok(Some(artifact))
+    }
+
+    async fn persist_session_checkpoint_artifact_if_needed(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+        decision: &SessionPolicyDecision,
+    ) -> Result<()> {
+        let Some(checkpoint_id_raw) = decision
+            .generation
+            .rehydrated_from_checkpoint_artifact_id
+            .as_deref()
+        else {
+            return Ok(());
+        };
+        let checkpoint_id: domain::ids::ArtifactId = checkpoint_id_raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parse checkpoint artifact id: {}", e))?;
+        if artifacts::find_by_id(&self.pool, checkpoint_id).await?.is_some() {
+            return Ok(());
+        }
+
+        let path = std::path::Path::new(&run.artifact_root)
+            .join("session_checkpoints")
+            .join(stage_id)
+            .join(format!("{checkpoint_id}.json"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "create session checkpoint dir {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let disposition = serde_json::to_value(&decision.disposition)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string));
+        let payload = serde_json::json!({
+            "kind": "session_checkpoint",
+            "session_lineage_id": decision.lineage.id,
+            "session_generation_id": decision.generation.id,
+            "session_reuse_disposition": disposition,
+            "prompt": prompt,
+            "runtime_provider": provider,
+            "runtime_model": model,
+            "created_at": created_at.to_rfc3339(),
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)?;
+        std::fs::write(&path, &bytes).map_err(|e| {
+            anyhow::anyhow!("write session checkpoint artifact {}: {}", path.display(), e)
+        })?;
+
+        let artifact = domain::artifact::Artifact {
+            id: checkpoint_id,
+            run_id: run.id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: "session_checkpoint".into(),
+            contract_id: "session_checkpoint_v1".into(),
+            format: domain::artifact::ArtifactFormat::Json,
+            file_path: path.to_string_lossy().into_owned(),
+            checksum_sha256: None,
+            size_bytes: Some(bytes.len() as i64),
+            provider: provider.to_string(),
+            model,
+            created_at,
+            is_pinned: false,
+            report_kind: Some("session_checkpoint".into()),
+            report_version: Some(1),
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self.events.send(domain::events::DomainEvent::ArtifactCreated {
+            run_id: run.id,
+            artifact_id: artifact.id,
+        });
+        Ok(())
     }
 
     async fn persist_validation_failure_artifact(
@@ -1354,5 +1845,45 @@ fn normalize_artifacts(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialize_declared_outputs_writes_machine_and_companion_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let machine_path = tmp.path().join("outputs/proposal_review.json");
+        let companion_path = tmp.path().join("outputs/proposal_review.md");
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            companion_output_name: Some("proposal_review_raw".to_string()),
+            companion_path: Some(companion_path.to_string_lossy().into_owned()),
+        };
+        let discovered = vec![
+            acp::DiscoveredArtifact {
+                name: "proposal_review".to_string(),
+                content: br#"{"status":"green"}"#.to_vec(),
+                source_path: None,
+            },
+            acp::DiscoveredArtifact {
+                name: "proposal_review_raw".to_string(),
+                content: b"# Review\n".to_vec(),
+                source_path: None,
+            },
+        ];
+
+        materialize_declared_outputs_from_discovered_artifacts(&[declared], &discovered)
+            .expect("envelope-derived outputs should be materialized to canonical paths");
+
+        assert_eq!(
+            std::fs::read_to_string(machine_path).unwrap(),
+            r#"{"status":"green"}"#
+        );
+        assert_eq!(std::fs::read_to_string(companion_path).unwrap(), "# Review\n");
     }
 }

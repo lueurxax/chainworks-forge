@@ -127,6 +127,25 @@ pub async fn fail(pool: &SqlitePool, id: &str, error: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn cancel_running_by_run(pool: &SqlitePool, run_id: RunId) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let cancelled = WorkItemStatus::Cancelled.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1, completed_at = ?2
+           WHERE run_id = ?3 AND status = ?4"#,
+    )
+    .bind(cancelled)
+    .bind(now)
+    .bind(run_id.to_string())
+    .bind(running)
+    .execute(pool)
+    .await
+    .context("cancel running work items by run")?;
+    Ok(())
+}
+
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<WorkItem>> {
     let run_id_str = run_id.to_string();
     let rows = sqlx::query(

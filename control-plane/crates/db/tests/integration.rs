@@ -1,10 +1,10 @@
 use db::pool::create_pool;
 use db::repos::{agent_executions, approvals, artifacts, ideas, projections, runs, stages, validation};
 use domain::approval::{Approval, ApprovalDecision};
-use domain::artifact::{Artifact, ArtifactFormat};
 use domain::idea::{Idea, IdeaStatus};
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::artifact::{Artifact, ArtifactFormat};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::validation::{
@@ -15,6 +15,267 @@ use chrono::Utc;
 
 async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:").await.expect("in-memory pool failed")
+}
+
+#[tokio::test]
+async fn session_lineage_migration_renames_legacy_table_and_creates_canonical_tables() {
+    use sqlx::Row;
+
+    let pool = test_pool().await;
+
+    let rows = sqlx::query(
+        r#"SELECT name
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name IN ('session_lineages_legacy', 'session_lineages', 'session_generations', 'session_events')
+           ORDER BY name ASC"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let names: Vec<String> = rows.into_iter().map(|row| row.get("name")).collect();
+
+    assert_eq!(
+        names,
+        vec![
+            "session_events".to_string(),
+            "session_generations".to_string(),
+            "session_lineages".to_string(),
+            "session_lineages_legacy".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn session_generation_usage_update_persists_budget_snapshot_fields() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-session-budget".into(),
+        workflow_title: "Session Budget".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let lineage = domain::session::SessionLineage {
+        id: "lineage-budget".into(),
+        run_id: run.id.to_string(),
+        agent_id: "proposal_writer".into(),
+        lineage_id: "proposal-loop".into(),
+        session_reuse_scope: "same_agent_family_within_run".into(),
+        session_family_id: Some("proposal-loop".into()),
+        active_generation_id: Some("generation-budget".into()),
+        created_at: Utc::now(),
+        closed_at: None,
+    };
+    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+
+    let created_at = Utc::now();
+    db::repos::sessions::insert_generation(
+        &pool,
+        &domain::session::SessionGeneration {
+            id: "generation-budget".into(),
+            lineage_id: lineage.id.clone(),
+            generation: 1,
+            invocation_owner_key: "owner".into(),
+            provider_session_id: None,
+            binding_fingerprint: "fingerprint".into(),
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: "/tmp/ws".into(),
+            workspace_mode: "read_only".into(),
+            runtime_provider: "claude".into(),
+            runtime_model: "sonnet".into(),
+            status: domain::session::SessionGenerationStatus::Active,
+            turn_count: 0,
+            estimated_input_tokens: 0,
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at,
+            last_activity_at: None,
+            ended_at: None,
+            end_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let last_activity_at = Utc::now();
+    db::repos::sessions::update_generation_usage(
+        &pool,
+        "generation-budget",
+        "provider-session",
+        1,
+        12_000,
+        17,
+        12_000,
+        Some(3_000),
+        Some(1_200),
+        Some(200_000),
+        last_activity_at,
+    )
+    .await
+    .unwrap();
+
+    let generation = db::repos::sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("generation should exist");
+    assert_eq!(
+        generation.provider_session_id.as_deref(),
+        Some("provider-session")
+    );
+    assert_eq!(generation.turn_count, 1);
+    assert_eq!(generation.estimated_input_tokens, 12_000);
+    assert_eq!(generation.latest_cached_input_tokens, Some(3_000));
+    assert_eq!(generation.latest_output_tokens, Some(1_200));
+    assert_eq!(generation.latest_model_context_window, Some(200_000));
+    assert_eq!(generation.cumulative_prompt_tokens, 12_000);
+    assert_eq!(generation.cumulative_cost_cents, 17);
+    assert_eq!(generation.last_activity_at, Some(last_activity_at));
+}
+
+#[tokio::test]
+async fn agent_execution_provenance_round_trips_without_lineage_joins() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-session".into(),
+        workflow_title: "Session".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: Some("[{\"agent_execution_id\":\"ae-1\"}]".into()),
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let stage = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "proposal".into(),
+        label: "Proposal".into(),
+        status: StageStatus::Running,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        owner_agent: Some("proposal_writer".into()),
+        provider: Some("claude".into()),
+        model: None,
+        stage_type: None,
+    };
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage.id,
+        agent_id: "proposal_writer".into(),
+        provider: "claude".into(),
+        model: Some("sonnet".into()),
+        started_at: Utc::now(),
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: Some("stage-execution-lineage-1".into()),
+        session_lineage_id: Some("lineage-1".into()),
+        session_generation_id: Some("generation-2".into()),
+        rehydrated_from_checkpoint_artifact_id: Some("artifact-3".into()),
+        invocation_owner_key: Some("run:agent:stage:task:lineage".into()),
+        session_reuse_scope: Some("same_agent_family_within_run".into()),
+        session_family_id: Some("proposal_authoring_loop".into()),
+        session_reuse_disposition: Some("reused_after_resume".into()),
+        session_reset_reason: Some("operator_reset".into()),
+    };
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let found = agent_executions::find_by_stage(&pool, stage.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("agent execution");
+
+    assert_eq!(found.session_lineage_id.as_deref(), Some("lineage-1"));
+    assert_eq!(
+        found.owner_execution_lineage_id.as_deref(),
+        Some("stage-execution-lineage-1")
+    );
+    assert_eq!(found.session_generation_id.as_deref(), Some("generation-2"));
+    assert_eq!(
+        found.rehydrated_from_checkpoint_artifact_id.as_deref(),
+        Some("artifact-3")
+    );
+    assert_eq!(
+        found.invocation_owner_key.as_deref(),
+        Some("run:agent:stage:task:lineage")
+    );
+    assert_eq!(
+        found.session_reuse_scope.as_deref(),
+        Some("same_agent_family_within_run")
+    );
+    assert_eq!(
+        found.session_family_id.as_deref(),
+        Some("proposal_authoring_loop")
+    );
+    assert_eq!(
+        found.session_reuse_disposition.as_deref(),
+        Some("reused_after_resume")
+    );
+    assert_eq!(found.session_reset_reason.as_deref(), Some("operator_reset"));
 }
 
 #[tokio::test]
@@ -43,6 +304,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -98,6 +360,15 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         started_at: Utc::now(),
         completed_at: Some(Utc::now()),
         status: AgentStatus::Failed,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -108,6 +379,15 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         started_at: Utc::now(),
         completed_at: Some(Utc::now()),
         status: AgentStatus::Completed,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution).await.unwrap();
     agent_executions::insert(&pool, &retry_agent_execution).await.unwrap();
@@ -236,6 +516,7 @@ async fn test_run_insert_and_find() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -276,6 +557,7 @@ async fn test_run_status_update() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -324,6 +606,7 @@ async fn test_projection_parity_after_rebuild() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -446,6 +729,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
@@ -582,6 +866,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -745,6 +1030,7 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         completed_at: None,
         cancellation_requested_at: None,
         cancellation_settled_at: None,
+        cancellation_settlement_log: None,
         current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
@@ -766,6 +1052,78 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
     assert_eq!(row.total_stages, 0);
     assert_eq!(row.completed_stages, 0);
     assert_eq!(row.failed_stages, 0);
+}
+
+#[tokio::test]
+async fn run_projection_derives_cancellation_settlement_summary_from_canonical_log() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Cancelled,
+        workflow_id: "wf-cancel".into(),
+        workflow_title: "Cancelled".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: Some(Utc::now()),
+        cancellation_settled_at: Some(Utc::now()),
+        cancellation_settlement_log: Some(
+            serde_json::json!([
+                {
+                    "agent_execution_id": "ae-1",
+                    "agent_id": "proposal_writer",
+                    "prior_status": "running",
+                    "terminal_status": "cancelled",
+                    "session_close_attempted": true,
+                    "session_close_succeeded": true,
+                    "settled_at": "2026-04-15T10:00:00Z"
+                },
+                {
+                    "agent_execution_id": "ae-2",
+                    "agent_id": "reviewer",
+                    "prior_status": "running",
+                    "terminal_status": "cancelled",
+                    "session_close_attempted": true,
+                    "session_close_succeeded": false,
+                    "settled_at": "2026-04-15T10:00:02Z"
+                }
+            ])
+            .to_string(),
+        ),
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    projections::rebuild_all_for_run(&pool, run.id).await.unwrap();
+    let found = projections::find_run_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap()
+        .expect("run projection");
+
+    assert_eq!(
+        found.cancellation_settlement_summary.as_deref(),
+        Some("2/2 agents settled, 1 sessions closed")
+    );
 }
 
 /// R7 bar: executed approval_inbox projection-vs-canonical parity.
@@ -807,6 +1165,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,

@@ -47,4 +47,13 @@ pub struct AgentExecution {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub status: AgentStatus,
+    pub owner_execution_lineage_id: Option<String>,
+    pub session_lineage_id: Option<String>,
+    pub session_generation_id: Option<String>,
+    pub rehydrated_from_checkpoint_artifact_id: Option<String>,
+    pub invocation_owner_key: Option<String>,
+    pub session_reuse_scope: Option<String>,
+    pub session_family_id: Option<String>,
+    pub session_reuse_disposition: Option<String>,
+    pub session_reset_reason: Option<String>,
 }

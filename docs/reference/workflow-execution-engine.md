@@ -76,7 +76,7 @@ on a `Run` record and re-runs `previewCompile`. Rejects compiler version mismatc
 `RunPlanCompiler` also owns the compile-time resolution that turns catalog declarations into runtime-authoritative agent bindings:
 
 - `skill_ref` / `skill_role` -> frozen `ResolvedSkill`
-- `mcp_profile` -> frozen MCP intent on the resolved agent
+- `AgentEntry.backend_profile` / `backend_profile.mcp` -> `ResolvedAgent.backend_profile_id` plus frozen `ResolvedAgent.requested_mcp_server_ids`
 - `backend_profile` / `runtime_profile` -> transport-ready provider binding truth
 
 ### Workflow Orchestrator (`WorkflowOrchestrator.swift`)

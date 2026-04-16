@@ -29,6 +29,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/per-agent-mcp-policy-and-runtime-validation.md](reference/per-agent-mcp-policy-and-runtime-validation.md) — Stable per-agent MCP intent, runtime validation, and persisted MCP truth
 - [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — Stable ACP-only transport contract, adapter families, and persisted runtime truth
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Stable canonical outcome, recovery, and report/read-truth contract
+- [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Stable named envelope parsing, contract binding, validation modes, normalized artifact identity, and validation-failure substrate
 - [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Stable output-contract authority, failed-stage evidence, narrow recovery, and declarative contract enforcement
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Stable per-run session reuse, generation history, checkpoint refresh, and shell-owned reset contract
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Stable strategy-profile freezing, handoff compilation, lazy evidence, normalized telemetry, and shell-owned recommendation contract
@@ -80,7 +81,7 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 ## Evidence And Proof
 
 - [evidence/execution-truth-and-recovery-proof.md](evidence/execution-truth-and-recovery-proof.md) -- consolidated implementation/proof status for the execution-truth and recovery slice
-- [evidence/output-contracts-failure-evidence-and-recovery-proof.md](evidence/output-contracts-failure-evidence-and-recovery-proof.md) -- consolidated implementation/proof status for output contracts, failure evidence, and narrow recovery
+- [evidence/output-contracts-failure-evidence-and-recovery-proof.md](evidence/output-contracts-failure-evidence-and-recovery-proof.md) -- consolidated implementation/proof status for structured-output validation, output contracts, failure evidence, and narrow recovery
 - [evidence/session-lineage-reuse-and-operator-reset-proof.md](evidence/session-lineage-reuse-and-operator-reset-proof.md) -- consolidated implementation/proof status for session-lineage reuse, checkpointing, and operator reset
 - [evidence/033-remove-goose-from-canonical-transport-and-simplify-runtime-proof.md](evidence/033-remove-goose-from-canonical-transport-and-simplify-runtime-proof.md) -- proof of canonical ACP transport simplification and legacy settings compatibility
 - [evidence/035-atomic-transition-settlement-and-durable-resume-cursor-proof.md](evidence/035-atomic-transition-settlement-and-durable-resume-cursor-proof.md) -- proof of cursor-authored transition settlement and deterministic resume

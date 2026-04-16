@@ -107,6 +107,8 @@ impl MutationRoot {
         workspace_root: String,
         artifact_root: String,
         delivery_configuration_json: Option<String>,
+        workflow_yaml_path: String,
+        agent_catalog_yaml_path: String,
     ) -> Result<GqlRun> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -121,8 +123,8 @@ impl MutationRoot {
             workspace_root,
             artifact_root,
             delivery_configuration_json,
-            workflow_yaml_path: None,
-            agent_catalog_yaml_path: None,
+            workflow_yaml_path,
+            agent_catalog_yaml_path,
         });
 
         let result = cmd_handler.handle(cmd).await?;
@@ -432,6 +434,7 @@ mod tests {
             completed_at: None,
             cancellation_requested_at: None,
             cancellation_settled_at: None,
+            cancellation_settlement_log: None,
             current_state: None,
             workflow_yaml_path: None,
             agent_catalog_yaml_path: None,
@@ -444,6 +447,20 @@ mod tests {
                     .into(),
             ),
         }
+    }
+
+    fn test_workflow_yaml_path() -> String {
+        format!(
+            "{}/../../../examples/workflows/workflow.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    fn test_agent_catalog_yaml_path() -> String {
+        format!(
+            "{}/../../../examples/agents/agents.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        )
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -494,6 +511,15 @@ mod tests {
                 started_at: Utc::now(),
                 completed_at: Some(Utc::now()),
                 status: domain::agent::AgentStatus::Failed,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: Some("reused".into()),
+                session_reset_reason: Some("operator_reset".into()),
             },
         )
         .await
@@ -601,13 +627,17 @@ mod tests {
                     workflowTitle: "Start Run",
                     workspaceRoot: "/tmp/ws",
                     artifactRoot: "/tmp/art",
+                    workflowYamlPath: "WORKFLOW_YAML_PATH",
+                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
                     deliveryConfigurationJson: "{\"repo_identifier\":\"repo-1\",\"repo_root\":\"/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
                   ) {
                     id
                   }
                 }
                 "#
-                .replace("IDEA_ID", &idea_id.to_string()),
+                .replace("IDEA_ID", &idea_id.to_string())
+                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
             ))
             .await;
 
@@ -645,13 +675,17 @@ mod tests {
                     workflowTitle: "Query Run",
                     workspaceRoot: "/tmp/ws",
                     artifactRoot: "/tmp/art",
+                    workflowYamlPath: "WORKFLOW_YAML_PATH",
+                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
                     deliveryConfigurationJson: "{\"repo_identifier\":\"repo-2\",\"repo_root\":\"/repo-2\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
                   ) {
                     id
                   }
                 }
                 "#
-                .replace("IDEA_ID", &idea_id.to_string()),
+                .replace("IDEA_ID", &idea_id.to_string())
+                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
             ))
             .await;
 
@@ -684,6 +718,135 @@ mod tests {
                 "{\"repo_identifier\":\"repo-2\",\"repo_root\":\"/repo-2\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp/worktrees\",\"target_branch\":\"cw/release\"}"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn run_query_exposes_cancellation_settlement_log() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(
+            &pool,
+            &domain::run::Run {
+                cancellation_settlement_log: Some(
+                    serde_json::json!([
+                        {
+                            "agent_execution_id": "ae-1",
+                            "agent_id": "writer",
+                            "prior_status": "running",
+                            "terminal_status": "cancelled",
+                            "session_close_attempted": true,
+                            "session_close_succeeded": true,
+                            "settled_at": "2026-04-15T10:00:00Z"
+                        }
+                    ])
+                    .to_string(),
+                ),
+                ..make_run(run_id, idea_id)
+            },
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let response = schema
+            .execute(Request::new(
+                format!(
+                    r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    id
+                    cancellationSettlementLog
+                  }}
+                }}
+                "#
+                )
+            ))
+            .await;
+
+        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        let json = response.data.into_json().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(json["run"]["cancellationSettlementLog"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                {
+                    "agent_execution_id": "ae-1",
+                    "agent_id": "writer",
+                    "prior_status": "running",
+                    "terminal_status": "cancelled",
+                    "session_close_attempted": true,
+                    "session_close_succeeded": true,
+                    "settled_at": "2026-04-15T10:00:00Z"
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_query_exposes_cancellation_settlement_summary_only() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(
+            &pool,
+            &domain::run::Run {
+                status: domain::run::RunStatus::Cancelling,
+                cancellation_settlement_log: Some(
+                    serde_json::json!([
+                        {
+                            "agent_execution_id": "ae-1",
+                            "agent_id": "writer",
+                            "prior_status": "running",
+                            "terminal_status": "cancelled",
+                            "session_close_attempted": true,
+                            "session_close_succeeded": true,
+                            "settled_at": "2026-04-15T10:00:00Z"
+                        },
+                        {
+                            "agent_execution_id": "ae-2",
+                            "agent_id": "reviewer",
+                            "prior_status": "running",
+                            "terminal_status": "cancelled",
+                            "session_close_attempted": true,
+                            "session_close_succeeded": false,
+                            "settled_at": "2026-04-15T10:00:02Z"
+                        }
+                    ])
+                    .to_string(),
+                ),
+                ..make_run(run_id, idea_id)
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id).await.unwrap();
+
+        let schema = build_schema(pool.clone(), make_command_handler(pool.clone()), event_bus::new_bus(64));
+        let response = schema
+            .execute(Request::new(
+                r#"
+                query Runs {
+                  runs {
+                    id
+                    cancellationSettlementSummary
+                    cancellationSettlementLog
+                  }
+                }
+                "#
+            ))
+            .await;
+
+        assert!(response.errors.is_empty(), "query must succeed: {response:?}");
+        let json = response.data.into_json().unwrap();
+        assert_eq!(
+            json["runs"][0]["cancellationSettlementSummary"],
+            serde_json::json!("2/2 agents settled, 1 sessions closed")
+        );
+        assert!(json["runs"][0]["cancellationSettlementLog"].is_null());
     }
 
     #[tokio::test]
@@ -744,6 +907,8 @@ mod tests {
                     validationFailureRecord {{
                       failureSummary
                       failureClass
+                      sessionReuseDisposition
+                      sessionResetReason
                       outputResults {{
                         outputName
                         missingFields
@@ -771,6 +936,14 @@ mod tests {
         assert_eq!(
             validation_failure["validationFailureRecord"]["outputResults"][0]["missingFields"],
             serde_json::json!(["summary"])
+        );
+        assert_eq!(
+            validation_failure["validationFailureRecord"]["sessionReuseDisposition"],
+            serde_json::json!("reused")
+        );
+        assert_eq!(
+            validation_failure["validationFailureRecord"]["sessionResetReason"],
+            serde_json::json!("operator_reset")
         );
     }
 }

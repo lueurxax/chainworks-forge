@@ -7,61 +7,81 @@
   - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md`
   - `.review-baselines/current-system-baseline.md`
   - `docs/reference/output-contracts-failure-evidence-and-recovery.md`
+  - `docs/reference/workflow-execution-engine.md`
   - `docs/reference/acp-runtime-transport.md`
-  - `docs/reference/rust-control-plane.md`
-  - `docs/proposals/046-structured-output-envelope-and-contract-validation.md`
+  - `docs/reference/execution-truth-and-recovery.md`
+  - `docs/reference/per-agent-mcp-policy-and-runtime-validation.md`
 - Reusable baseline used:
   - `.review-baselines/current-system-baseline.md`
   - `docs/reference/output-contracts-failure-evidence-and-recovery.md`
+  - `docs/reference/workflow-execution-engine.md`
   - `docs/reference/acp-runtime-transport.md`
-  - `docs/reference/rust-control-plane.md`
+- Baseline reused:
+  - repo-level intake and current proposal/readiness framing from `.review-baselines/current-system-baseline.md`
 - Baseline refreshed:
-  - targeted reread of stable failed-stage evidence and recovery packet owners
-  - targeted reread of stable MCP registry loading and ACP session materialization
-  - targeted code refresh for current Rust start-run, ACP request/result, stage/agent rows, report resource, and northbound read seams
+  - failure-evidence ownership and artifact namespace
+  - loop iteration and retry semantics
+  - stable delivery-preflight frozen JSON contract
+  - runtime-scoped MCP resolution owner chain
 - Baseline freshness: `Partially refreshed`
 - Proposal-specific integration context: none
+- Targeted context refresh performed:
+  - Rust workflow compiler, plan, executor, orchestrator, ACP transport, and DB/domain seams
+  - Swift stable owner/read surfaces for delivery preflight, failed-stage evidence, and MCP policy resolution
 - External research used: `None`
 - Code areas inspected:
-  - `Chainworks Forge/Engine/FailedStageEvidenceBuilder.swift`
   - `Chainworks Forge/Engine/DeliveryPreflightService.swift`
-  - `Chainworks Forge/Engine/MCPPolicyRuntime.swift`
-  - `Chainworks Forge/Engine/RuntimeSessionBridge.swift`
-  - `Chainworks Forge/Engine/PreflightService.swift`
   - `Chainworks Forge/Views/DeliveryPreflightReportView.swift`
   - `Chainworks Forge/Views/IdeaListView.swift`
+  - `Chainworks Forge/Engine/FailedStageEvidenceBuilder.swift`
+  - `Chainworks Forge/Engine/EvidencePackBuilder.swift`
+  - `Chainworks Forge/Engine/MCPPolicyRuntime.swift`
+  - `Chainworks Forge/Engine/RuntimeSessionBridge.swift`
+  - `Chainworks Forge/Engine/RunPlan.swift`
+  - `Chainworks Forge/Engine/RunPlanCompiler.swift`
+  - `control-plane/crates/workflow/src/catalog.rs`
+  - `control-plane/crates/workflow/src/plan.rs`
+  - `control-plane/crates/workflow/src/compiler.rs`
+  - `control-plane/crates/engine/src/orchestrator.rs`
+  - `control-plane/crates/engine/src/command_handler.rs`
+  - `control-plane/crates/engine/src/executor.rs`
   - `control-plane/crates/acp/src/lib.rs`
   - `control-plane/crates/acp/src/transport.rs`
-  - `control-plane/crates/domain/src/agent.rs`
-  - `control-plane/crates/domain/src/run.rs`
   - `control-plane/crates/domain/src/stage.rs`
-  - `control-plane/crates/domain/src/validation.rs`
-  - `control-plane/crates/engine/src/executor.rs`
-  - `control-plane/crates/engine/src/command_handler.rs`
-  - `control-plane/crates/workflow/src/catalog.rs`
-  - `control-plane/crates/workflow/src/compiler.rs`
-  - `control-plane/crates/workflow/src/plan.rs`
+  - `control-plane/crates/domain/src/agent.rs`
   - `control-plane/crates/db/src/repos/runs.rs`
   - `control-plane/crates/db/src/repos/stages.rs`
   - `control-plane/crates/db/src/repos/agent_executions.rs`
-  - `control-plane/crates/mcp-server/src/server.rs`
   - `control-plane/crates/mcp-server/src/tools/reports.rs`
-  - `control-plane/crates/graphql-server/src/schema.rs`
-  - `control-plane/crates/graphql-server/src/types/run.rs`
-  - `control-plane/crates/graphql-server/src/types/stage.rs`
 - Current repo contradictions found:
-  - the old review basis is stale: the current draft already fixes the prior undeclared `P046` dependency gap and now explicitly locks missing/disabled backend MCP servers as fail-closed against the canonical ACP registry contract
-  - two new live proposal-first blockers remain:
-    - the MCP resolution contract still omits runtime-scoped inputs and weakens current live-registry semantics
-    - the delivery preflight result schema no longer matches the stable frozen JSON contract
+  - the previous P048 review artifacts are stale; the current draft already closes the old undeclared `P046` dependency, delivery-preflight payload-shape, and canonical MCP registry / fail-closed blockers
+  - `docs/reference/per-agent-mcp-policy-and-runtime-validation.md` is partially stale against current code: live code treats `backend_profile.mcp` as canonical MCP ownership while the doc still describes legacy `mcp_profile` ownership
+- Runtime evidence used: `None`
+- Provenance of key evidence:
+  - proposal text for claimed contract changes
+  - current Swift stable owners/readers for parity reference
+  - current Rust execution/storage seams for implementability
+  - stable reference docs for artifact and recovery rules
+- Remaining assumptions:
+  - `McpResolutionReport.profile_id` is intended to mean backend profile ID, matching Swift `MCPPolicyResolutionReport.profileID`
+  - `FailedStageEvidencePacket.failed_agent_title` is still intended as a useful operator-facing field, not dead schema baggage
+- Remaining blockers:
+  - failed-stage evidence artifact namespace / canonical path semantics
+  - missing explicit Rust owner for MCP `profile_id`
+  - missing explicit Rust owner or explicit V1 deferral for `failed_agent_title`
 
 ## 1. Executive Summary
-- Overall readiness: `Red`
+- Overall readiness: `Amber`
 - Confidence: `High`
-- Proposal completeness signal: `The stale red basis is gone; packet parity is now scoped explicitly in Rust V1 terms with nullable deferred fields, and remaining risks are MCP runtime scoping + preflight payload migration safety.`
-- Top residual implementation risks:
-  1. MCP resolution still lacks the runtime namespace / provider-binding inputs and live registry reload semantics that the stable Swift owner chain uses.
-  2. The delivery preflight payload shape diverges from the stable `DeliveryPreflightService.PreflightResult` contract that current UI and frozen run evidence already assume.
+- Proposal completeness signal: `Strong`
+- Top risks:
+  1. The proposed failed-stage evidence artifact path can collide across loop iterations and mixes export-pack naming with the repo's canonical artifact namespace model.
+  2. `McpResolutionReport.profile_id` has no named Rust owner in the proposed compiler/runtime path.
+  3. `failed_agent_title` remains in the packet contract, but the current Rust durable owner chain does not carry title today.
+- Top opportunities:
+  1. The old blocker set is genuinely closed: explicit `P046` dependency, stable delivery-preflight payload shape, and canonical MCP registry / fail-closed semantics are now present in the draft.
+  2. Failed-stage evidence is now scoped as Rust V1 with explicit nullable parity-deferred fields instead of overclaiming immediate full parity.
+  3. MCP resolution now targets the same machine-local registry contract already used by the Swift implementation.
 
 ## 2. Proposal Scope and Completeness
 - In scope:
@@ -71,148 +91,109 @@
 - Out of scope:
   - shell-owned evidence-pack export
   - release-time readiness heuristics
-  - implementation audit or gate execution
+  - implementation audit / proof execution
+- Deferred intentionally:
+  - start-time `PreflightService` MCP warning parity
+  - full V2 failed-stage packet parity for fields the proposal already marks nullable
 - Most important baseline refreshes performed:
-  - stable failed-stage packet owner chain
-  - stable delivery-preflight persisted shape
-  - stable runtime-scoped MCP resolution and registry loading path
-  - current Rust ACP / DB / GraphQL / MCP read surfaces
+  - loop iteration and retry namespace semantics
+  - stable delivery-preflight frozen payload contract
+  - stable MCP `profileID` ownership chain
+  - current Rust owner gaps for title / backend-profile propagation
 - Most important contradictions with current repo:
-  - the earlier dependency / fail-policy / registry-path blockers are now closed in the draft
-  - the MCP section still leaves out runtime-scoped inputs and live registry timing
-  - the delivery preflight section still changes the stable persisted result schema
-
-## 3. Proposal Readiness Verdict
-- `Readiness = Red`
-- `Confidence = High`
-- `Evidence Completeness = Complete`
-
-This is **not** an Evidence Gap Review. Local proposal/docs/code/baseline evidence is sufficient for a proposal-first verdict.
+  - stale review artifacts still describe blockers that the current proposal text has already fixed
+  - the MCP ownership reference doc is behind current code and should not be treated as authoritative over the working tree
+- Most important missing or partial states:
+  - disjoint failed-stage evidence artifact identity across iteration and retry
+  - explicit owner for backend profile ID in MCP report persistence
+  - explicit owner or explicit nullability rule for failed agent title
 
 ## 4. Discipline Scorecard
 | Discipline | Readiness | Confidence | Evidence Completeness | Critical | High | Medium | Low |
 |---|---|---|---|---:|---:|---:|---:|
 | UI | Green | High | Complete | 0 | 0 | 0 | 0 |
 | UX | Green | High | Complete | 0 | 0 | 0 | 0 |
-| Architecture | Red | High | Complete | 0 | 1 | 1 | 0 |
+| Architecture | Amber | High | Complete | 0 | 1 | 2 | 0 |
 
 ## 5. Findings by Discipline
 
 ### 5.1 UI Findings
-- No live UI `proposal-text` finding.
+- No live UI `proposal-text` findings.
 
 ### 5.2 UX Findings
-- No live UX `proposal-text` finding.
+- No live UX `proposal-text` findings.
 
 ### 5.3 Architecture Findings
+- Finding ID: `ARCH-001`
+  Severity: `High`
+  Evidence IDs: `DOC-01`, `DOC-04`, `MAP-01`, `MAP-02`, `INT-01`, `REAL-03`
+  Why it matters:
+  The proposal says failed-stage evidence should be written to the canonical artifact path as `failure-evidence/evidence-{stage_id}-attempt{n}.json`. That path omits loop iteration or stage-execution identity. Current workflow execution reuses the same `stage_id` across loop iterations, creates a fresh iteration with `attempt_number = 1`, and only increments `attempt_number` on same-stage retry. The stable artifact model uses `{artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}` precisely to keep retries and loop iterations disjoint. Swift's flat `failure-evidence/evidence-<stageID>-attempt<n>.json` naming exists today only inside the export pack builder, not as canonical runtime artifact storage. Porting that flat export name into runtime artifact persistence risks overwrite and mixes two different namespace models.
+  Recommended fix:
+  Use a canonical identity that cannot collide, such as `stage_execution_id`, or include `{stage_id}.{iteration}` in the persisted artifact name/path. Better yet, persist the report artifact through the normal artifact row path and let export builders flatten later if they want a human bundle.
+  Acceptance criteria:
+  - the same logical stage failing at `iteration=1, attempt=1` and `iteration=2, attempt=1` produces two distinct failed-stage evidence artifacts
+  - both artifacts remain discoverable via persisted artifact rows and `reports.get`
+  - proposal text no longer labels a flat export-style path as the canonical artifact path
+  Confidence: `High`
 
-#### ARCH-001 - Failed-stage evidence packet is now explicitly scoped to Rust V1 with deferred parity fields
-- Severity: `Info`
-- Confidence: `High`
-- Evidence Completeness: `Complete`
-- Evidence IDs: `DOC-01`, `DOC-03`, `DOC-06`, `MAP-01`, `MAP-02`, `MAP-03`, `INT-01`
-- Proposal refs:
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:68`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:98`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:99`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:100`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:365`
-- Current repo refs:
-  - `control-plane/crates/acp/src/lib.rs:13`
-  - `control-plane/crates/domain/src/agent.rs:40`
-  - `control-plane/crates/domain/src/stage.rs:83`
-  - `control-plane/crates/domain/src/validation.rs:50`
-  - `control-plane/crates/engine/src/executor.rs:193`
-  - `control-plane/crates/engine/src/executor.rs:259`
-  - `control-plane/crates/engine/src/executor.rs:349`
-  - `Chainworks Forge/Engine/FailedStageEvidenceBuilder.swift:12`
-- Why it matters:
-  - The draft now treats `FailedStageEvidencePacket` as a Rust V1 packet and explicitly marks parity-deferred fields (`canonical_outcome`, `transport_error_kind`, `output_presence`, `recovery_snapshot`) as optional until their Rust owners are added.
-- Required fix:
-  - If full stable parity is later required, add the explicit owner persistence and update this acceptance pack when those fields become non-null in Rust.
-  - If those owners live across `acp::ExecutionResult`, `domain::AgentExecution`, `domain::StageExecution`, validation rows, and recovery logic, the file inventory and acceptance criteria must say so directly.
+- Finding ID: `ARCH-002`
+  Severity: `Medium`
+  Evidence IDs: `DOC-01`, `MAP-03`, `MAP-04`, `MAP-07`, `INT-02`, `REAL-04`
+  Why it matters:
+  The proposal introduces `McpResolutionReport.profile_id`, but the proposed Rust changes only mention adding `requested_mcp_server_ids` and runtime binding to `ResolvedAgent`. Current Rust `ResolvedAgent` and `AgentBinding` do not carry backend profile ID, while stable Swift MCP policy resolution derives `profileID` from `ResolvedAgent.backendProfileID`. Without an explicit Rust owner, `profile_id` can only be reconstructed by re-reading catalog YAML at execution/report time, which would weaken the claimed persistence contract.
+  Recommended fix:
+  Add `backend_profile_id` to Rust `ResolvedAgent` and compiler output, then persist/report that value directly. If `profile_id` is intended to mean something else, rename it now and state the owner explicitly in the file inventory and acceptance criteria.
+  Acceptance criteria:
+  - `McpResolutionReport.profile_id` can be emitted from persisted execution truth without re-reading YAML
+  - the proposal file inventory explicitly names the owner field added to Rust `ResolvedAgent` / execution persistence
+  Confidence: `High`
 
-#### ARCH-002 - MCP resolution still omits the runtime-scoped inputs and reload timing that the stable owner chain depends on
-- Severity: `High`
-- Confidence: `High`
-- Evidence Completeness: `Complete`
-- Evidence IDs: `DOC-01`, `DOC-04`, `MAP-04`, `MAP-05`, `INT-02`
-- Proposal refs:
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:214`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:236`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:242`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:263`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:288`
-- Current repo refs:
-  - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:247`
-  - `Chainworks Forge/Engine/RuntimeSessionBridge.swift:152`
-  - `Chainworks Forge/Engine/RuntimeSessionBridge.swift:162`
-  - `Chainworks Forge/Engine/PreflightService.swift:662`
-  - `Chainworks Forge/Engine/MCPPolicyRuntime.swift:37`
- - Why it matters:
-  - The proposal correctly moved executable MCP definitions to the canonical machine-local ACP registry and correctly made missing/disabled requested servers fail-closed. But the current design still leaves out two runtime-critical details that the stable Swift owner chain already uses:
-    - `resolve_mcp_servers(requested_ids, registry)` does not take the selected runtime namespace / provider binding, even though the proposal's own rules depend on it for cases like `type == "platform"` being valid only for Codex.
-    - the proposal says the registry is loaded at daemon startup, while the stable system reads a fresh snapshot during preflight and again during ACP realization. Startup-only loading weakens current operator semantics because MCP registry edits would not be seen until daemon restart.
-- Required fix:
-  - Thread the runtime-scoped inputs into the MCP resolution and realization contract. The design needs either `ResolvedProviderBinding`, runtime namespace, or an equivalent selected-runtime input at the resolver boundary.
-  - Make registry loading semantics explicit and parity-safe: either read fresh snapshots for preflight/session creation like the current Swift owners, or explicitly document the intended runtime-staleness tradeoff and update stable-reference claims.
-  - Keep the resolver contract clear about which step performs:
-    - requested-intent validation
-    - runtime-ID mapping
-    - ACP `mcpServers` realization
-    - post-session actual/denied settlement
-
-#### ARCH-003 - Delivery preflight no longer matches the stable frozen JSON contract it claims to port
-- Severity: `Medium`
-- Confidence: `High`
-- Evidence Completeness: `Complete`
-- Evidence IDs: `DOC-01`, `MAP-06`, `MAP-07`, `INT-03`
-- Proposal refs:
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:118`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:124`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:135`
-  - `docs/proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md:164`
-- Current repo refs:
-  - `Chainworks Forge/Engine/DeliveryPreflightService.swift:9`
-  - `Chainworks Forge/Views/DeliveryPreflightReportView.swift:34`
-  - `Chainworks Forge/Views/IdeaListView.swift:1686`
-  - `Chainworks Forge/Engine/EvidencePackBuilder.swift:59`
-- Why it matters:
-  - The proposal describes `DeliveryPreflightResult.PreflightCheck` as `{ name, passed, detail }`, but the stable persisted shape is `{ id, label, passed, detail }`. Current UI and blocking-reason surfaces use `failedChecks.map(\\.id)` and render `check.label`, while evidence-pack export writes `deliveryPreflightJSON` as-is. That means the proposal is no longer a strict port of the stable preflight payload contract.
-- Required fix:
-  - Keep the current frozen result shape unless the proposal intentionally includes a cross-reader migration.
-  - If the Rust daemon wants a different internal representation, that is fine, but the persisted JSON contract should stay aligned with Swift `DeliveryPreflightService.PreflightResult` or the proposal must explicitly update every downstream reader.
+- Finding ID: `ARCH-003`
+  Severity: `Medium`
+  Evidence IDs: `DOC-01`, `MAP-03`, `MAP-04`, `MAP-08`, `INT-01`, `REAL-05`
+  Why it matters:
+  `FailedStageEvidencePacket` still contains `failed_agent_title`, and the stable Swift packet populates it from `failedAgent.agentTitle`. Current Rust `ResolvedAgent`, `AgentExecution`, and `StageExecution` do not carry title. The proposal says the packet is built immediately when a stage settles, but it does not name any Rust owner for title and does not explicitly list this field in the V1 nullable/deferred set. That leaves the operator-facing packet schema more optimistic than the actual current owner chain.
+  Recommended fix:
+  Either add title to the Rust owner chain that feeds failed-stage evidence, or state explicitly that `failed_agent_title` is nullable in Rust V1 until a later parity slice adds the owner.
+  Acceptance criteria:
+  - the proposal names a durable Rust owner for failed agent title, or
+  - the proposal explicitly marks `failed_agent_title` as optional / expected `null` in Rust V1 readers and acceptance text
+  Confidence: `High`
 
 ## 6. Cross-Discipline Conflicts and Decisions
 - Conflict:
-  - the MCP section claims Swift-parity resolution, but its resolver signature and registry load timing are weaker than the current runtime-scoped owner chain
-  - decision needed: runtime-scoped parity now, or explicit documented behavior change
-- Conflict:
-  - the delivery preflight section claims a service port but changes the persisted check schema
-  - decision needed: preserve the current JSON contract, or promote a contract migration slice
+  The proposal now correctly preserves stable delivery-preflight payload shape and canonical MCP registry semantics, but the remaining architecture gaps are namespace/ownership gaps rather than flow/UX gaps.
+  Tradeoff:
+  Pushing the proposal to `Green` now requires tightening identity and owner declarations, not reopening scope.
+  Decision:
+  Keep scope as-is and fix the remaining contract details in-text rather than splitting a follow-on proposal.
+  Owner:
+  proposal author
 
 ## 7. Prioritized Action Backlog
 | Priority | Item | Discipline | Owner | Horizon | Dependencies | Success Metric | Source Findings |
 |---|---|---|---|---|---|---|---|
-| P2 | Make MCP resolution explicitly runtime-scoped and align registry load timing with the stable owner chain | Architecture | proposal author | Before next review | current Swift MCP owner flow | resolver contract includes selected runtime inputs and load timing is unambiguous | `ARCH-002` |
-| P2 | Restore the stable delivery preflight JSON payload shape or document a reader migration | Architecture | proposal author | Before next review | current preflight UI/evidence readers | persisted delivery-preflight payload is no longer ambiguous | `ARCH-003` |
+| P0 | Replace flat failed-stage evidence artifact naming with a collision-free canonical identity | Architecture | proposal author | Before next review | current loop/retry semantics | failed-stage evidence artifacts stay unique across iteration and retry | `ARCH-001` |
+| P1 | Add explicit Rust owner for MCP `profile_id` or rename the field to match available truth | Architecture | proposal author | Before next review | compiler / resolved-agent changes | MCP resolution reports can be persisted without catalog re-read | `ARCH-002` |
+| P1 | Add explicit owner or explicit V1 deferral for `failed_agent_title` | Architecture | proposal author | Before next review | failed-stage packet contract | packet readers know whether title is durable or nullable | `ARCH-003` |
+| P3 | Refresh stale MCP ownership reference docs after implementation lands | Architecture | proposal author | Follow-on docs cleanup | final implementation truth | reference docs stop pointing to legacy `mcp_profile` as canonical | repo contradiction |
 
 ## 8. Validation and Measurement Plan
 | Area | What Will Be Measured | Leading Indicators | Guardrails | Review Checkpoint | Rollback / Hold Criteria |
 |---|---|---|---|---|---|
-| Failed-stage evidence parity | whether every promised packet field has a durable Rust owner | file inventory names all required owners | no hidden reconstruction from ad hoc scans | next proposal review | hold if packet still overclaims unavailable fields |
-| MCP resolution parity | whether requested MCP intent is validated against the selected runtime and live registry snapshot | resolver signature includes runtime-scoped input | no startup-only stale registry assumption unless explicitly accepted | next proposal review | hold if runtime namespace / reload timing stays implicit |
-| Delivery preflight parity | whether frozen preflight payload stays reader-compatible | persisted JSON matches stable field names | no silent contract drift in evidence/export path | next proposal review | hold if payload shape remains divergent |
+| Failed-stage evidence namespace | uniqueness of persisted evidence artifacts across loop iteration and retry | artifact row path or name includes stage execution identity or iteration | no overwrite when the same logical stage fails again later in the run | next proposal review | hold if the path still only uses `stage_id + attempt_number` |
+| MCP report ownership | ability to persist `profile_id` from execution truth | Rust `ResolvedAgent` carries backend profile identity | no YAML re-read in report/executor path | next proposal review | hold if `profile_id` is still implicit or ambiguous |
+| Failed-stage packet schema honesty | whether `failed_agent_title` has a durable owner or explicit nullability rule | file inventory and acceptance text mention it directly | no silent best-effort field that looks durable but is not | next proposal review | hold if the field remains unspecified |
 
 ## 9. Evidence Gaps and Open Questions
 
 ### Evidence Gaps
-- GAP-01: No blocking evidence gap remains. Local proposal/docs/code/baseline evidence is sufficient.
+- GAP-01: No blocking evidence gap remains. Local proposal/docs/code/baseline evidence is sufficient for a proposal-readiness verdict.
 
 ### Open Questions
-- QUESTION-01: Does the author want true field-for-field failed-stage packet parity, or a narrower Rust V1 packet with an explicit reader-contract delta?
-- QUESTION-02: Should daemon MCP registry reads remain live per preflight/session like Swift, or is a startup-cached registry an intentional operational tradeoff?
-- QUESTION-03: Is there any consumer that actually requires a renamed delivery-preflight check schema, or was `{ name }` just placeholder wording that should revert to `{ id, label }`?
+- QUESTION-01: Is `McpResolutionReport.profile_id` intended to be backend profile ID, runtime profile ID, or another identifier? The current Swift parity signal points to backend profile ID.
+- QUESTION-02: Does the author want `failed_agent_title` parity in Rust V1, or is `null` acceptable until a later owner slice?
 
 ## 10. Evidence Gap Review Fallback
 

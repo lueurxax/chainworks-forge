@@ -25,7 +25,7 @@ use tokio::process::Child;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
-use crate::ExecutionRequest;
+use crate::{DiscoveredArtifact, ExecutionRequest, UsageSnapshot};
 
 /// Strip ANSI escape sequences from a string for clean log output.
 fn strip_ansi(s: &str) -> String {
@@ -116,6 +116,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
+const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
+const OUTPUT_END_MARKER: &str = "<<<END_CHAINWORKS_OUTPUT>>>";
+
 // ---------------------------------------------------------------------------
 // Workspace snapshot — used for artifact discovery
 // ---------------------------------------------------------------------------
@@ -148,6 +151,135 @@ fn snapshot_workspace(root: &str) -> HashSet<String> {
     let mut files = HashSet::new();
     collect_files(Path::new(root), &mut files);
     files
+}
+
+fn extract_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_string()),
+        Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(extract_text_from_value)
+                .filter(|part| !part.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(""))
+        }
+        Value::Object(map) => {
+            for key in ["text", "content", "message", "delta", "parts"] {
+                if let Some(text) = map.get(key).and_then(extract_text_from_value) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_text_chunk(parsed: &Value) -> Option<String> {
+    let candidates = [
+        parsed.pointer("/params/update"),
+        parsed.pointer("/params"),
+        parsed.pointer("/result"),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(extract_text_from_value)
+}
+
+fn extract_int_from_value(value: &Value, keys: &[&str]) -> Option<i64> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| extract_int_from_value(item, keys)),
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(found) = map.get(*key).and_then(extract_scalar_i64) {
+                    return Some(found);
+                }
+            }
+            map.values()
+                .find_map(|nested| extract_int_from_value(nested, keys))
+        }
+        _ => None,
+    }
+}
+
+fn extract_scalar_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_usage_snapshot(parsed: &Value) -> Option<UsageSnapshot> {
+    let snapshot = UsageSnapshot {
+        cost_cents: extract_int_from_value(parsed, &["cost_cents", "costCents"]),
+        input_tokens: extract_int_from_value(parsed, &["input_tokens", "inputTokens", "token_count"]),
+        cached_input_tokens: extract_int_from_value(
+            parsed,
+            &["cached_input_tokens", "cachedInputTokens"],
+        ),
+        output_tokens: extract_int_from_value(parsed, &["output_tokens", "outputTokens"]),
+        model_context_window: extract_int_from_value(
+            parsed,
+            &["model_context_window", "modelContextWindow"],
+        ),
+    };
+
+    (snapshot.cost_cents.is_some()
+        || snapshot.input_tokens.is_some()
+        || snapshot.cached_input_tokens.is_some()
+        || snapshot.output_tokens.is_some()
+        || snapshot.model_context_window.is_some())
+    .then_some(snapshot)
+}
+
+fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSnapshot) {
+    let current = existing.get_or_insert_with(UsageSnapshot::default);
+    current.cost_cents = incoming.cost_cents.or(current.cost_cents);
+    current.input_tokens = incoming.input_tokens.or(current.input_tokens);
+    current.cached_input_tokens = incoming.cached_input_tokens.or(current.cached_input_tokens);
+    current.output_tokens = incoming.output_tokens.or(current.output_tokens);
+    current.model_context_window =
+        incoming.model_context_window.or(current.model_context_window);
+}
+
+fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
+    let mut artifacts = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = stream_text[cursor..].find(OUTPUT_START_MARKER) {
+        let start = cursor + start_rel;
+        let header_start = start + OUTPUT_START_MARKER.len();
+        let Some(header_end_rel) = stream_text[header_start..].find(">>>") else {
+            break;
+        };
+        let header_end = header_start + header_end_rel;
+        let output_name = stream_text[header_start..header_end].trim();
+        if output_name.is_empty() {
+            cursor = header_end + 3;
+            continue;
+        }
+
+        let content_start = header_end + 3;
+        let Some(end_rel) = stream_text[content_start..].find(OUTPUT_END_MARKER) else {
+            break;
+        };
+        let content_end = content_start + end_rel;
+        let content = stream_text[content_start..content_end].to_string();
+        artifacts.push(DiscoveredArtifact {
+            name: output_name.to_string(),
+            content: content.into_bytes(),
+            source_path: None,
+        });
+        cursor = content_end + OUTPUT_END_MARKER.len();
+    }
+
+    artifacts
 }
 
 // ---------------------------------------------------------------------------
@@ -287,444 +419,457 @@ fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Main entry point
+// Live transport-backed sessions
 // ---------------------------------------------------------------------------
 
-/// Execute the full ACP JSON-RPC 2.0 protocol with an already-spawned subprocess.
-///
-/// This function owns the subprocess stdio from the moment it is called.
-/// The caller provides `child` with `stdin`, `stdout`, and optionally `stderr`
-/// already piped.
-///
-/// ## Protocol flow (matches ClaudeAgentACPTransport.swift / CodexACPTransport.swift)
-///
-/// 1. **`initialize`** — establish protocol version and client identity.
-/// 2. **`session/new`** — start an agent session; receive back a `sessionId`.
-///    `config` specifies the `model`, `mode`, and optional extra fields (e.g. `_meta`).
-/// 3. **`session/prompt`** — submit the prompt and stream `session/update`
-///    notifications until the terminal response with the matching id arrives.
-///    `session/request_permission` notifications are auto-granted.
-/// 4. **`session/close`** — clean shutdown request before dropping stdin.
-/// 5. Graceful process wait (up to [`SHUTDOWN_WAIT`]), then `SIGKILL`.
-///
-/// ## Artifact discovery
-///
-/// New regular files created inside `req.workspace_root` during the session
-/// are returned as `artifact_paths` (workspace diff: post-session − pre-session).
-/// Declared `expected_output_paths` are also returned when they exist after the
-/// session, even if the agent overwrote a pre-existing canonical file.
-pub async fn run_acp_session(
-    child: &mut Child,
-    req: &ExecutionRequest,
-    config: &AcpSessionConfig<'_>,
-) -> Result<(AgentStatus, Vec<String>)> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("ACP subprocess has no stdin pipe (was it spawned with Stdio::piped()?)")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("ACP subprocess has no stdout pipe")?;
-    if let Some(stderr) = child.stderr.take() {
-        let run_id = req.run_id;
-        let stage_id = req.stage_id.clone();
-        let provider = req.provider.clone();
-        let log_path = format!("{}/.chainworks/acp-stderr.log", req.workspace_root);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            let mut log_file = match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .await
-            {
-                Ok(f) => f,
-                Err(_) => {
-                    // If we can't open the file, we still emit to logs.
-                    return;
-                }
-            };
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
-                        // Strip ANSI escape codes for clean log output.
-                        let clean = strip_ansi(trimmed);
-                        if clean.is_empty() { continue; }
-                        // Route to appropriate log level based on subprocess output.
-                        if clean.contains("ERROR") || clean.contains("Unhandled error") {
-                            error!(
-                                run_id = %run_id,
-                                stage_id = %stage_id,
-                                provider = %provider,
-                                "{clean}"
-                            );
-                        } else if clean.contains("WARN") || clean.contains("usage_limit") {
-                            warn!(
-                                run_id = %run_id,
-                                provider = %provider,
-                                "{clean}"
-                            );
-                        } else {
-                            debug!(
-                                run_id = %run_id,
-                                provider = %provider,
-                                "{clean}"
-                            );
-                        }
-                        let timestamp = chrono::Utc::now().to_rfc3339();
-                        let _ = tokio::io::AsyncWriteExt::write_all(
-                            &mut log_file,
-                            format!("[{timestamp}] [{provider}] {clean}\n").as_bytes(),
-                        )
-                        .await;
+pub struct AcpTransportSession {
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    reader: BufReader<tokio::process::ChildStdout>,
+    session_id: String,
+    snapshot_root: String,
+    baseline_files: HashSet<String>,
+    request_counter: u64,
+    closed: bool,
+}
+
+impl AcpTransportSession {
+    pub async fn start(
+        mut child: Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+    ) -> Result<Self> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("ACP subprocess has no stdin pipe (was it spawned with Stdio::piped()?)")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("ACP subprocess has no stdout pipe")?;
+        if let Some(stderr) = child.stderr.take() {
+            let run_id = req.run_id;
+            let stage_id = req.stage_id.clone();
+            let provider = req.provider.clone();
+            let log_path = format!("{}/.chainworks/acp-stderr.log", req.workspace_root);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                let mut log_file = match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(_) => {
+                        return;
                     }
-                    Err(_) => break,
+                };
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let clean = strip_ansi(trimmed);
+                            if clean.is_empty() {
+                                continue;
+                            }
+                            if clean.contains("ERROR") || clean.contains("Unhandled error") {
+                                error!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    provider = %provider,
+                                    "{clean}"
+                                );
+                            } else if clean.contains("WARN") || clean.contains("usage_limit") {
+                                warn!(run_id = %run_id, provider = %provider, "{clean}");
+                            } else {
+                                debug!(run_id = %run_id, provider = %provider, "{clean}");
+                            }
+                            let timestamp = chrono::Utc::now().to_rfc3339();
+                            let _ = tokio::io::AsyncWriteExt::write_all(
+                                &mut log_file,
+                                format!("[{timestamp}] [{provider}] {clean}\n").as_bytes(),
+                            )
+                            .await;
+                        }
+                        Err(_) => break,
+                    }
                 }
-            }
-        });
-    }
-    let mut reader = BufReader::new(stdout);
-    let mut req_counter: u64 = 0;
-
-    macro_rules! next_id {
-        () => {{
-            req_counter += 1;
-            req_counter
-        }};
-    }
-
-    // Snapshot workspace *before* the session so we can diff for new files.
-    // For write-enabled agents, snapshot the worktree instead (Proposal 007).
-    let snapshot_root = if req.worktree_write_enabled {
-        req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
-    } else {
-        &req.workspace_root
-    };
-    let pre_files = snapshot_workspace(snapshot_root);
-
-    // ── Phase 1: initialize ──────────────────────────────────────────────────
-    let init_id = next_id!();
-    send_ndjson(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": init_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": 1,
-                "clientInfo": {
-                    "name": "chainworks-control-plane",
-                    "version": "0.1.0"
-                }
-            }
-        }),
-    )
-    .await
-    .context("ACP: send initialize")?;
-
-    await_response(&mut reader, init_id, HANDSHAKE_TIMEOUT)
-        .await
-        .context("ACP: initialize handshake")?;
-
-    // ── Phase 2: session/new ─────────────────────────────────────────────────
-    let sn_id = next_id!();
-    {
-        // Build session/new params: fixed fields + adapter-specific extras.
-        // Proposal 007: agents with dedicated/shared worktree strategy use
-        // worktree_root as cwd — both write-enabled (code_writer) and
-        // read-only (commit_and_push, build_archive).
-        let uses_worktree_cwd = req.worktree_write_enabled
-            || matches!(
-                req.worktree_strategy.as_deref(),
-                Some("dedicated") | Some("shared_implementation_worktree")
-            );
-        let effective_cwd = if uses_worktree_cwd {
-            req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
-        } else {
-            &req.workspace_root
-        };
-        let mut sn_params = serde_json::json!({
-            "mcpServers": [],
-            "cwd": effective_cwd,
-            "model": config.model,
-            "mode": config.mode,
-        });
-        // Merge optional extra fields (e.g. `_meta` for Claude, absent for Codex).
-        if let (Some(extra), Some(base_obj)) = (&config.extra, sn_params.as_object_mut()) {
-            if let Some(extra_obj) = extra.as_object() {
-                for (k, v) in extra_obj {
-                    base_obj.insert(k.clone(), v.clone());
-                }
-            }
+            });
         }
+
+        let mut reader = BufReader::new(stdout);
+        let mut req_counter: u64 = 0;
+        macro_rules! next_id {
+            () => {{
+                req_counter += 1;
+                req_counter
+            }};
+        }
+
+        let snapshot_root = if req.worktree_write_enabled {
+            req.worktree_root
+                .as_deref()
+                .unwrap_or(&req.workspace_root)
+                .to_string()
+        } else {
+            req.workspace_root.clone()
+        };
+        let baseline_files = snapshot_workspace(&snapshot_root);
+
+        let init_id = next_id!();
         send_ndjson(
             &mut stdin,
             &serde_json::json!({
                 "jsonrpc": "2.0",
-                "id": sn_id,
-                "method": "session/new",
-                "params": sn_params,
-            }),
-        )
-        .await
-        .context("ACP: send session/new")?;
-    }
-
-    let sn_result = await_response(&mut reader, sn_id, HANDSHAKE_TIMEOUT)
-        .await
-        .context("ACP: session/new handshake")?;
-
-    let session_id = sn_result["sessionId"]
-        .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!("ACP session/new response missing 'sessionId' field")
-        })?
-        .to_string();
-
-    // ── Phase 2b: session/set_config_option (best-effort) ────────────────────
-    // For providers that support it (Codex), apply config options like
-    // `reasoning_effort` that can't be set via the `session/new` model field.
-    for (config_id, value) in &config.config_options {
-        let sco_id = next_id!();
-        if let Err(e) = send_ndjson(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": sco_id,
-                "method": "session/set_config_option",
+                "id": init_id,
+                "method": "initialize",
                 "params": {
-                    "sessionId": session_id,
-                    "configId": config_id,
-                    "value": value,
+                    "protocolVersion": 1,
+                    "clientInfo": {
+                        "name": "chainworks-control-plane",
+                        "version": "0.1.0"
+                    }
                 }
             }),
         )
         .await
+        .context("ACP: send initialize")?;
+
+        await_response(&mut reader, init_id, HANDSHAKE_TIMEOUT)
+            .await
+            .context("ACP: initialize handshake")?;
+
+        let sn_id = next_id!();
         {
-            warn!(
-                session_id = %session_id,
-                config_id = %config_id,
-                "ACP: failed to send session/set_config_option: {e}"
-            );
-            continue;
+            let uses_worktree_cwd = req.worktree_write_enabled
+                || matches!(
+                    req.worktree_strategy.as_deref(),
+                    Some("dedicated") | Some("shared_implementation_worktree")
+                );
+            let effective_cwd = if uses_worktree_cwd {
+                req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
+            } else {
+                &req.workspace_root
+            };
+            let mut sn_params = serde_json::json!({
+                "mcpServers": [],
+                "cwd": effective_cwd,
+                "model": config.model,
+                "mode": config.mode,
+            });
+            if let (Some(extra), Some(base_obj)) = (&config.extra, sn_params.as_object_mut()) {
+                if let Some(extra_obj) = extra.as_object() {
+                    for (k, v) in extra_obj {
+                        base_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": sn_id,
+                    "method": "session/new",
+                    "params": sn_params,
+                }),
+            )
+            .await
+            .context("ACP: send session/new")?;
         }
 
-        match await_response(&mut reader, sco_id, HANDSHAKE_TIMEOUT).await {
-            Ok(_) => {
-                debug!(
-                    session_id = %session_id,
-                    config_id = %config_id,
-                    value = %value,
-                    "ACP: session/set_config_option applied"
-                );
-            }
-            Err(e) => {
-                // Providers that don't support set_config_option (Claude,
-                // Gemini) return "Method not found". Log and continue.
+        let sn_result = await_response(&mut reader, sn_id, HANDSHAKE_TIMEOUT)
+            .await
+            .context("ACP: session/new handshake")?;
+
+        let session_id = sn_result["sessionId"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("ACP session/new response missing 'sessionId' field"))?
+            .to_string();
+
+        for (config_id, value) in &config.config_options {
+            let sco_id = next_id!();
+            if let Err(e) = send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": sco_id,
+                    "method": "session/set_config_option",
+                    "params": {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": value,
+                    }
+                }),
+            )
+            .await
+            {
                 warn!(
                     session_id = %session_id,
                     config_id = %config_id,
-                    value = %value,
-                    "ACP: session/set_config_option rejected: {e}"
+                    "ACP: failed to send session/set_config_option: {e}"
                 );
+                continue;
             }
-        }
-    }
 
-    // ── Phase 3: session/prompt — streaming ──────────────────────────────────
-    let prompt_id = next_id!();
-    send_ndjson(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": prompt_id,
-            "method": "session/prompt",
-            "params": {
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": req.prompt}]
-            }
-        }),
-    )
-    .await
-    .context("ACP: send session/prompt")?;
-
-    let mut agent_failed = false;
-    let mut line = String::new();
-    let mut last_activity = Instant::now();
-
-    'streaming: loop {
-        let idle = last_activity.elapsed();
-        if idle >= IDLE_TIMEOUT {
-            bail!(
-                "ACP session idle timeout: no message for {}s (session={session_id})",
-                IDLE_TIMEOUT.as_secs()
-            );
-        }
-        let remaining = IDLE_TIMEOUT - idle;
-
-        line.clear();
-        let n = timeout(remaining, reader.read_line(&mut line))
-            .await
-            .context("ACP session idle timeout — no message received")?
-            .context("ACP prompt stream read_line error")?;
-
-        if n == 0 {
-            // Subprocess closed stdout before sending the terminal result.
-            // Some providers (e.g. Codex) may exit without a JSON-RPC terminal
-            // response. Check exit status to decide: exit 0 → success.
-            debug!(
-                session_id = %session_id,
-                "ACP: stdout EOF before terminal response — checking exit status"
-            );
-            break 'streaming;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let parsed: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        last_activity = Instant::now();
-        debug!(msg = %trimmed, "ACP ← subprocess (stream)");
-
-        // Terminal response: has an `id` that matches `prompt_id`
-        let msg_id: Option<u64> = match parsed.get("id") {
-            Some(Value::Number(n)) => n.as_u64(),
-            Some(Value::String(s)) => s.parse().ok(),
-            _ => None,
-        };
-
-        // Check method FIRST — session/request_permission is a JSON-RPC
-        // request from the subprocess (has an id) that we must respond to.
-        // It must be handled before the terminal-response id check.
-        if let Some(method) = parsed["method"].as_str() {
-            match method {
-                "session/request_permission" => {
-                    // Auto-grant permissions so the agent can proceed unblocked.
-                    if let Some(req_id) = parsed.get("id") {
-                        let params = parsed
-                            .get("params")
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        debug!(
-                            session_id = %session_id,
-                            "ACP: auto-granting permission request id={req_id}"
-                        );
-                        if let Some(grant) = build_permission_grant(req_id, &params) {
-                            if let Err(e) = send_ndjson(&mut stdin, &grant).await {
-                                warn!(
-                                    session_id = %session_id,
-                                    "ACP: failed to send permission grant: {e}"
-                                );
-                            }
-                        }
-                    }
-                    continue;
+            match await_response(&mut reader, sco_id, HANDSHAKE_TIMEOUT).await {
+                Ok(_) => {
+                    debug!(
+                        session_id = %session_id,
+                        config_id = %config_id,
+                        value = %value,
+                        "ACP: session/set_config_option applied"
+                    );
                 }
-                "session/update" => {
-                    debug!(session_id = %session_id, "ACP: session/update notification");
-                    continue;
-                }
-                _ => {
-                    debug!(method = method, session_id = %session_id, "ACP: notification");
-                    continue;
-                }
-            }
-        }
-
-        // Terminal response: has an `id` that matches `prompt_id`
-        if let Some(id) = msg_id {
-            if id == prompt_id {
-                if parsed.get("error").is_some() {
-                    let err_msg = parsed["error"]["message"]
-                        .as_str()
-                        .unwrap_or("ACP error");
+                Err(e) => {
                     warn!(
                         session_id = %session_id,
-                        "ACP session/prompt returned error: {err_msg}"
+                        config_id = %config_id,
+                        value = %value,
+                        "ACP: session/set_config_option rejected: {e}"
                     );
-                    agent_failed = true;
                 }
-                break 'streaming;
             }
-            // Response for a different id — skip
-            continue;
         }
+
+        Ok(Self {
+            child,
+            stdin,
+            reader,
+            session_id,
+            snapshot_root,
+            baseline_files,
+            request_counter: req_counter,
+            closed: false,
+        })
     }
 
-    // ── Phase 4: session/close ───────────────────────────────────────────────
-    let close_id = next_id!();
-    // Best-effort: some providers (e.g. early Gemini versions) don't support
-    // session/close, so we silently ignore errors here.
-    let _ = send_ndjson(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": close_id,
-            "method": "session/close",
-            "params": {"sessionId": session_id}
-        }),
-    )
-    .await;
-
-    // Dropping stdin sends EOF — signals the subprocess to exit cleanly.
-    drop(stdin);
-
-    // Wait up to SHUTDOWN_WAIT for a graceful exit, then force-kill.
-    let exit_success = match timeout(SHUTDOWN_WAIT, child.wait()).await {
-        Ok(Ok(status)) => {
-            debug!(
-                exit_status = ?status,
-                session_id = %session_id,
-                "ACP subprocess exited"
-            );
-            status.success()
-        }
-        _ => {
-            debug!(
-                session_id = %session_id,
-                "ACP subprocess did not exit within {}s — force-killing",
-                SHUTDOWN_WAIT.as_secs()
-            );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            false
-        }
-    };
-
-    // If agent explicitly failed (error response), report failure.
-    // If stdout EOF without terminal response but exit 0 → treat as success
-    // (some providers like Codex may exit cleanly without JSON-RPC end_turn).
-    if agent_failed {
-        return Ok((AgentStatus::Failed, vec![]));
-    }
-    if !exit_success && !agent_failed {
-        warn!(session_id = %session_id, "ACP subprocess exited with non-zero status");
-        return Ok((AgentStatus::Failed, vec![]));
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
-    // ── Artifact discovery: workspace filesystem diff ────────────────────────
-    let post_files = snapshot_workspace(snapshot_root);
-    let mut new_files: Vec<String> = post_files
-        .difference(&pre_files)
-        .cloned()
-        .collect();
-    for path in &req.expected_output_paths {
-        if std::path::Path::new(path).is_file() && !new_files.iter().any(|p| p == path) {
-            new_files.push(path.clone());
-        }
-    }
-    new_files.sort(); // deterministic ordering
+    pub async fn prompt(
+        &mut self,
+        req: &ExecutionRequest,
+    ) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>, Option<UsageSnapshot>)> {
+        self.request_counter += 1;
+        let prompt_id = self.request_counter;
+        send_ndjson(
+            &mut self.stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": prompt_id,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": self.session_id,
+                    "prompt": [{"type": "text", "text": req.prompt}]
+                }
+            }),
+        )
+        .await
+        .context("ACP: send session/prompt")?;
 
-    Ok((AgentStatus::Completed, new_files))
+        let mut line = String::new();
+        let mut last_activity = Instant::now();
+        let mut streamed_text = String::new();
+        let mut latest_usage_snapshot = None;
+
+        'streaming: loop {
+            let idle = last_activity.elapsed();
+            if idle >= IDLE_TIMEOUT {
+                bail!(
+                    "ACP session idle timeout: no message for {}s (session={})",
+                    IDLE_TIMEOUT.as_secs(),
+                    self.session_id
+                );
+            }
+            let remaining = IDLE_TIMEOUT - idle;
+
+            line.clear();
+            let n = timeout(remaining, self.reader.read_line(&mut line))
+                .await
+                .context("ACP session idle timeout — no message received")?
+                .context("ACP prompt stream read_line error")?;
+
+            if n == 0 {
+                bail!(
+                    "ACP stdout closed before terminal response (session={})",
+                    self.session_id
+                );
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let parsed: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            last_activity = Instant::now();
+            debug!(msg = %trimmed, "ACP ← subprocess (stream)");
+            if let Some(snapshot) = extract_usage_snapshot(&parsed) {
+                merge_usage_snapshot(&mut latest_usage_snapshot, snapshot);
+            }
+
+            let msg_id: Option<u64> = match parsed.get("id") {
+                Some(Value::Number(n)) => n.as_u64(),
+                Some(Value::String(s)) => s.parse().ok(),
+                _ => None,
+            };
+
+            if let Some(method) = parsed["method"].as_str() {
+                match method {
+                    "session/request_permission" => {
+                        if let Some(req_id) = parsed.get("id") {
+                            let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+                            debug!(
+                                session_id = %self.session_id,
+                                "ACP: auto-granting permission request id={req_id}"
+                            );
+                            if let Some(grant) = build_permission_grant(req_id, &params) {
+                                if let Err(e) = send_ndjson(&mut self.stdin, &grant).await {
+                                    warn!(
+                                        session_id = %self.session_id,
+                                        "ACP: failed to send permission grant: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    "session/update" => {
+                        debug!(session_id = %self.session_id, "ACP: session/update notification");
+                        if let Some(chunk) = extract_text_chunk(&parsed) {
+                            streamed_text.push_str(&strip_ansi(&chunk));
+                        }
+                        continue;
+                    }
+                    _ => {
+                        debug!(method = method, session_id = %self.session_id, "ACP: notification");
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(id) = msg_id {
+                if id == prompt_id {
+                    if parsed.get("error").is_some() {
+                        let err_msg = parsed["error"]["message"].as_str().unwrap_or("ACP error");
+                        warn!(
+                            session_id = %self.session_id,
+                            "ACP session/prompt returned error: {err_msg}"
+                        );
+                        return Ok((AgentStatus::Failed, vec![], vec![], latest_usage_snapshot));
+                    }
+                    if let Some(chunk) = extract_text_chunk(&parsed) {
+                        streamed_text.push_str(&strip_ansi(&chunk));
+                    }
+                    break 'streaming;
+                }
+                continue;
+            }
+        }
+
+        let post_files = snapshot_workspace(&self.snapshot_root);
+        let mut new_files: Vec<String> = post_files
+            .difference(&self.baseline_files)
+            .cloned()
+            .collect();
+        for path in &req.expected_output_paths {
+            if std::path::Path::new(path).is_file() && !new_files.iter().any(|p| p == path) {
+                new_files.push(path.clone());
+            }
+        }
+        new_files.sort();
+        self.baseline_files = post_files;
+
+        let mut discovered_artifacts = extract_output_envelopes(&streamed_text);
+        for path in &new_files {
+            let path_obj = Path::new(path);
+            let name = path_obj
+                .file_stem()
+                .or_else(|| path_obj.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("artifact")
+                .to_string();
+            if discovered_artifacts.iter().any(|artifact| artifact.name == name) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read(path_obj) {
+                discovered_artifacts.push(DiscoveredArtifact {
+                    name,
+                    content,
+                    source_path: Some(path.clone()),
+                });
+            }
+        }
+
+        Ok((AgentStatus::Completed, new_files, discovered_artifacts, latest_usage_snapshot))
+    }
+
+    pub async fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+
+        self.request_counter += 1;
+        let close_id = self.request_counter;
+        let _ = send_ndjson(
+            &mut self.stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": close_id,
+                "method": "session/close",
+                "params": {"sessionId": self.session_id}
+            }),
+        )
+        .await;
+
+        let _ = AsyncWriteExt::shutdown(&mut self.stdin).await;
+
+        let exit_success = match timeout(SHUTDOWN_WAIT, self.child.wait()).await {
+            Ok(Ok(status)) => {
+                debug!(exit_status = ?status, session_id = %self.session_id, "ACP subprocess exited");
+                status.success()
+            }
+            _ => {
+                debug!(
+                    session_id = %self.session_id,
+                    "ACP subprocess did not exit within {}s — force-killing",
+                    SHUTDOWN_WAIT.as_secs()
+                );
+                let _ = self.child.kill().await;
+                let _ = self.child.wait().await;
+                false
+            }
+        };
+
+        self.closed = true;
+        if !exit_success {
+            warn!(session_id = %self.session_id, "ACP subprocess exited with non-zero status");
+        }
+        Ok(())
+    }
+}
+
+/// Execute the full ACP JSON-RPC 2.0 protocol with an already-spawned subprocess.
+///
+/// This remains the one-shot convenience wrapper used by existing adapters.
+pub async fn run_acp_session(
+    child: Child,
+    req: &ExecutionRequest,
+    config: &AcpSessionConfig<'_>,
+) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>)> {
+    let mut session = AcpTransportSession::start(child, req, config).await?;
+    let (status, paths, artifacts, _usage) = session.prompt(req).await?;
+    let _ = session.close().await;
+    Ok((status, paths, artifacts))
 }

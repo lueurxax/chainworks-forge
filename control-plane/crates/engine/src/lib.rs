@@ -1,3 +1,4 @@
+pub mod cancellation;
 pub mod command_handler;
 pub mod contracts;
 pub mod domain_engine;
@@ -6,5 +7,6 @@ pub mod executor;
 pub mod orchestrator;
 pub mod release;
 pub mod recovery;
+pub mod session;
 pub mod work_queue;
 pub mod worktree;

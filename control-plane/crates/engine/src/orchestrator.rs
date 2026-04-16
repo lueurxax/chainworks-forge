@@ -438,6 +438,66 @@ impl Orchestrator {
                         .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
                         .await;
                 }
+                StageStatus::Pending => {
+                    // P044 §3g: A retried manual_gate stage was inserted as
+                    // Pending by RetryStage. We must restore it to
+                    // WaitingApproval with a fresh Approval record on the
+                    // same stage execution instead of falling through to
+                    // Case 2, which would fork lineage by creating another
+                    // stage via create_stage_for_state.
+                    if state.is_manual_gate {
+                        info!(
+                            run_id = %run_id,
+                            state = %current_state_id,
+                            stage_execution_id = %stage.id,
+                            attempt = stage.attempt_number,
+                            "Retried manual gate — restoring to WaitingApproval with fresh approval"
+                        );
+                        stages::update_status(&self.pool, stage.id, StageStatus::WaitingApproval)
+                            .await?;
+
+                        let approval = Approval {
+                            id: ApprovalId::new(),
+                            run_id,
+                            stage_id: current_state_id.clone(),
+                            decision: ApprovalDecision::Requested,
+                            requested_at: Utc::now(),
+                            decided_at: None,
+                            comment: None,
+                            expires_at: None,
+                        };
+                        approvals::insert(&self.pool, &approval).await?;
+
+                        let _ = self.events.send(DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id: stage.id,
+                            status: StageStatus::WaitingApproval,
+                        });
+                        let _ = self.events.send(DomainEvent::ApprovalRequested {
+                            run_id,
+                            approval_id: approval.id,
+                            stage_id: current_state_id.clone(),
+                        });
+
+                        if run.status != RunStatus::WaitingApproval {
+                            runs::update_status(
+                                &self.pool,
+                                run_id,
+                                RunStatus::WaitingApproval,
+                            )
+                            .await?;
+                            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                run_id,
+                                status: RunStatus::WaitingApproval,
+                            });
+                        }
+                        return Ok(());
+                    }
+                    // Non-manual-gate Pending stages are left to fall
+                    // through to Case 2 (preserves existing retry
+                    // semantics for compute states, which are not in
+                    // P044's scope).
+                }
                 _ => {}
             }
             } // end if !stage_is_stale
@@ -727,15 +787,29 @@ impl Orchestrator {
                     "run_id": run_id.to_string(),
                     "stage_id": stage.stage_id,
                     "stage_execution_id": stage.id.to_string(),
+                    "task_name": task.task_name,
+                    "task_inputs": task.inputs,
+                    "task_outputs": task.outputs,
                     "agent_id": task.agent.agent_id,
+                    "backend_profile_id": task.agent.backend_profile_id,
                     "provider": task.agent.provider,
                     "model": task.agent.model,
                     "effort": task.agent.effort,
+                    "max_turns": task.agent.max_turns,
+                    "temperature": task.agent.temperature,
+                    "permission_profile": task.agent.permission_profile,
+                    "skill_ref": task.agent.skill_ref,
+                    "skill_role": task.agent.skill_role,
+                    "skill_snapshot_hash": task.agent.skill_snapshot_hash,
+                    "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
+                    "output_contract": task.agent.output_contract,
                     "prompt": prompt,
                     "task_index": task_index,
                     "total_tasks": total_tasks,
                     "worktree_write_enabled": task.agent.worktree_write_enabled,
                     "worktree_strategy": task.agent.worktree_strategy,
+                    "session_reuse_scope": task.agent.session_reuse_scope,
+                    "session_family_id": task.agent.session_family_id,
                     "declared_outputs": declared_outputs,
                 }),
             )
@@ -760,15 +834,29 @@ impl Orchestrator {
                     "run_id": run_id.to_string(),
                     "stage_id": stage.stage_id,
                     "stage_execution_id": stage.id.to_string(),
+                    "task_name": stage.stage_id,
+                    "task_inputs": Vec::<String>::new(),
+                    "task_outputs": Vec::<String>::new(),
                     "agent_id": agent.agent_id,
+                    "backend_profile_id": agent.backend_profile_id,
                     "provider": agent.provider,
                     "model": agent.model,
                     "effort": agent.effort,
+                    "max_turns": agent.max_turns,
+                    "temperature": agent.temperature,
+                    "permission_profile": agent.permission_profile,
+                    "skill_ref": agent.skill_ref,
+                    "skill_role": agent.skill_role,
+                    "skill_snapshot_hash": agent.skill_snapshot_hash,
+                    "requested_mcp_server_ids": agent.requested_mcp_server_ids,
+                    "output_contract": agent.output_contract,
                     "prompt": prompt,
                     "task_index": task_index,
                     "total_tasks": total_tasks,
                     "worktree_write_enabled": agent.worktree_write_enabled,
                     "worktree_strategy": agent.worktree_strategy,
+                    "session_reuse_scope": agent.session_reuse_scope,
+                    "session_family_id": agent.session_family_id,
                     "declared_outputs": Vec::<crate::contracts::DeclaredOutput>::new(),
                 }),
             )
@@ -1400,8 +1488,13 @@ fn build_declared_outputs(
     task.outputs
         .iter()
         .map(|output_name| {
-            let target_path = resolved_artifact_path_for_task(output_name, plan, run, task);
             let schema = task.output_schemas.get(output_name).cloned();
+            let machine_artifact_name = schema
+                .as_ref()
+                .and_then(|schema| schema.normalized_artifact_name.as_deref())
+                .unwrap_or(output_name.as_str());
+            let target_path =
+                resolved_artifact_path_for_task(machine_artifact_name, plan, run, task);
             let companion_output_name = schema
                 .as_ref()
                 .filter(|schema| {
