@@ -25,7 +25,10 @@ use tokio::process::Child;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
-use crate::{DiscoveredArtifact, ExecutionRequest, McpActualObservation, UsageSnapshot};
+use crate::{
+    AcpMcpServerPayload, DiscoveredArtifact, ExecutionRequest, McpActualObservation,
+    ResolvedMcpServerTransport, UsageSnapshot,
+};
 
 /// Strip ANSI escape sequences from a string for clean log output.
 fn strip_ansi(s: &str) -> String {
@@ -125,7 +128,7 @@ pub fn build_session_new_params(
         &req.workspace_root
     };
     let mut sn_params = serde_json::json!({
-        "mcpServers": serde_json::to_value(&req.mcp_servers)
+        "mcpServers": mcp_servers_wire_value(&req.mcp_servers)
             .context("ACP: serialize resolved MCP server payloads")?,
         "cwd": effective_cwd,
         "model": config.model,
@@ -139,6 +142,40 @@ pub fn build_session_new_params(
         }
     }
     Ok(sn_params)
+}
+
+fn mcp_servers_wire_value(servers: &[AcpMcpServerPayload]) -> Result<Value> {
+    let mut wire_servers = Vec::with_capacity(servers.len());
+    for server in servers {
+        match &server.transport {
+            ResolvedMcpServerTransport::Stdio { command, args, env } => {
+                let env_vars: Vec<Value> = env
+                    .iter()
+                    .map(|(name, value)| {
+                        serde_json::json!({
+                            "name": name,
+                            "value": value,
+                        })
+                    })
+                    .collect();
+                wire_servers.push(serde_json::json!({
+                    "name": server.id,
+                    "command": command,
+                    "args": args,
+                    "env": env_vars,
+                }));
+            }
+            ResolvedMcpServerTransport::Platform { provider } => {
+                bail!(
+                    "ACP: MCP extension '{}' resolved to platform provider '{}' but ACP session/new requires concrete server transport",
+                    server.extension_id,
+                    provider
+                );
+            }
+        }
+    }
+
+    Ok(Value::Array(wire_servers))
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);

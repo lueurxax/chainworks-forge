@@ -481,12 +481,14 @@ async fn mcp_servers_session_new_serialization_tests() {
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
     let server = &captured["mcpServers"][0];
-    assert_eq!(server["id"], "fs-runtime");
-    assert_eq!(server["extensionId"], "filesystem");
-    assert_eq!(server["transport"]["type"], "stdio");
-    assert_eq!(server["transport"]["command"], "mcp-filesystem");
-    assert_eq!(server["transport"]["args"][0], "--root");
-    assert_eq!(server["transport"]["env"]["MCP_TOKEN"], "secret");
+    assert_eq!(server["name"], "fs-runtime");
+    assert_eq!(server["command"], "mcp-filesystem");
+    assert_eq!(server["args"][0], "--root");
+    assert_eq!(server["env"][0]["name"], "MCP_TOKEN");
+    assert_eq!(server["env"][0]["value"], "secret");
+    assert!(server.get("id").is_none());
+    assert!(server.get("extensionId").is_none());
+    assert!(server.get("transport").is_none());
 }
 
 /// ClaudeAgentAdapter returns AgentStatus::Failed when the ACP session returns
