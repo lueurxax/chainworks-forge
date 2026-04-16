@@ -40,8 +40,7 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
                 .to_string();
 
-            let caller =
-                CallerContext::mcp(&principal.id, &principal.class.to_string(), "stages.retry");
+            let caller = CallerContext::mcp(&principal.id, &principal.class, "stages.retry");
             let cmd = Command::RetryStage(RetryStageCmd { run_id, stage_id });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({

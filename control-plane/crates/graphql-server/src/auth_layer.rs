@@ -6,9 +6,17 @@ use axum::{
 };
 
 /// Axum middleware that extracts and validates a Bearer token.
-/// On success, inserts `auth::Principal` into request extensions.
+/// On success, inserts `auth::Principal` into request extensions so that
+/// `async_graphql::Context::data::<auth::Principal>()` can retrieve it.
 /// On failure, returns HTTP 401 with a GraphQL-shaped error body.
-pub async fn require_auth(mut request: Request, next: Next) -> Response {
+///
+/// The `PrincipalTable` is passed as a parameter (not from request extensions)
+/// to avoid relying on extension injection from an outer layer.
+pub async fn require_auth(
+    mut request: Request,
+    next: Next,
+    principal_table: auth::PrincipalTable,
+) -> Response {
     // Playground exemption: allow unauthenticated GET (playground HTML)
     // when CHAINWORKS_PLAYGROUND_AUTH=skip.
     let is_playground_get = request.method() == axum::http::Method::GET;
@@ -21,8 +29,6 @@ pub async fn require_auth(mut request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
 
-    let table = request.extensions().get::<auth::PrincipalTable>().cloned();
-
     let auth_header = request
         .headers()
         .get("authorization")
@@ -31,19 +37,13 @@ pub async fn require_auth(mut request: Request, next: Next) -> Response {
 
     match auth_header {
         Some(header_value) => match auth::extract_bearer_token(&header_value) {
-            Ok(token) => {
-                if let Some(ref table) = table {
-                    match auth::resolve_bearer(token, table) {
-                        Ok(principal) => {
-                            request.extensions_mut().insert(principal);
-                            next.run(request).await
-                        }
-                        Err(_) => unauthorized_response(),
-                    }
-                } else {
-                    unauthorized_response()
+            Ok(token) => match auth::resolve_bearer(token, &principal_table) {
+                Ok(principal) => {
+                    request.extensions_mut().insert(principal);
+                    next.run(request).await
                 }
-            }
+                Err(_) => unauthorized_response(),
+            },
             Err(_) => unauthorized_response(),
         },
         None => unauthorized_response(),

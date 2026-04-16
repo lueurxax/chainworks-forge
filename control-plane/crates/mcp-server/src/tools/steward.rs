@@ -56,7 +56,7 @@ pub async fn execute(
     match tool_name {
         "steward.run_analysis" => {
             let reason = params["reason"].as_str().unwrap_or("manual").to_string();
-            let caller = CallerContext::mcp(&principal.id, &principal.class.to_string(), tool_name);
+            let caller = CallerContext::mcp(&principal.id, &principal.class, tool_name);
             let commanded = cmd_handler
                 .handle(
                     Command::RunStewardAnalysis(RunStewardAnalysisCmd {

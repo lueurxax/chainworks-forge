@@ -83,25 +83,33 @@ impl std::fmt::Display for CallerSurface {
 pub struct CallerContext {
     pub surface: CallerSurface,
     pub principal_id: String,
-    pub principal_class: String,
+    pub principal_class: auth::PrincipalClass,
     pub caller_tool: String,
 }
 
 impl CallerContext {
-    pub fn mcp(principal_id: &str, principal_class: &str, tool_name: &str) -> Self {
+    pub fn mcp(
+        principal_id: &str,
+        principal_class: &auth::PrincipalClass,
+        tool_name: &str,
+    ) -> Self {
         CallerContext {
             surface: CallerSurface::Mcp,
             principal_id: principal_id.to_string(),
-            principal_class: principal_class.to_string(),
+            principal_class: principal_class.clone(),
             caller_tool: tool_name.to_string(),
         }
     }
 
-    pub fn graphql(principal_id: &str, principal_class: &str, mutation_name: &str) -> Self {
+    pub fn graphql(
+        principal_id: &str,
+        principal_class: &auth::PrincipalClass,
+        mutation_name: &str,
+    ) -> Self {
         CallerContext {
             surface: CallerSurface::Graphql,
             principal_id: principal_id.to_string(),
-            principal_class: principal_class.to_string(),
+            principal_class: principal_class.clone(),
             caller_tool: mutation_name.to_string(),
         }
     }
@@ -114,7 +122,7 @@ impl CallerContext {
         CallerContext {
             surface: CallerSurface::Mcp,
             principal_id: "test-operator".to_string(),
-            principal_class: "operator".to_string(),
+            principal_class: auth::PrincipalClass::Operator,
             caller_tool: "test".to_string(),
         }
     }

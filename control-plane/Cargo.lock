@@ -441,6 +441,7 @@ dependencies = [
  "auth",
  "chrono",
  "db",
+ "dirs",
  "domain",
  "engine",
  "graphql-server",
@@ -639,6 +640,7 @@ dependencies = [
 name = "domain"
 version = "0.1.0"
 dependencies = [
+ "auth",
  "chrono",
  "serde",
  "serde_json",

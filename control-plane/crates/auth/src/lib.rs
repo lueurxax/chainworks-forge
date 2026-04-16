@@ -112,6 +112,12 @@ impl PrincipalTable {
             std::fs::write(path, &json).map_err(|e| {
                 AuthError::TableLoadFailed(format!("write {}: {e}", path.display()))
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(path, perms).ok();
+            }
             tracing::info!(
                 path = %path.display(),
                 token = %token,
@@ -188,6 +194,9 @@ fn allowed_tools_for_class(class: &PrincipalClass) -> &'static [&'static str] {
             "approvals.resolve",
             "stages.retry",
             "reports.get",
+            "steward.run_analysis",
+            "steward.list_analyses",
+            "steward.get_analysis",
         ],
         PrincipalClass::Agent => &[
             "ideas.create",
@@ -196,6 +205,8 @@ fn allowed_tools_for_class(class: &PrincipalClass) -> &'static [&'static str] {
             "runs.list",
             "runs.get",
             "reports.get",
+            "steward.list_analyses",
+            "steward.get_analysis",
         ],
         PrincipalClass::Observer => &[
             "ideas.list",
@@ -203,6 +214,8 @@ fn allowed_tools_for_class(class: &PrincipalClass) -> &'static [&'static str] {
             "runs.get",
             "approvals.list",
             "reports.get",
+            "steward.list_analyses",
+            "steward.get_analysis",
         ],
     }
 }
@@ -217,6 +230,7 @@ fn allowed_resource_templates(class: &PrincipalClass) -> &'static [&'static str]
             "idea://",
             "artifact://",
             "report://",
+            "steward-analysis://",
             "chainworks://runs",
             "chainworks://ideas",
             "chainworks://approvals/inbox",
@@ -228,6 +242,7 @@ fn allowed_resource_templates(class: &PrincipalClass) -> &'static [&'static str]
             "idea://",
             "artifact://",
             "report://",
+            "steward-analysis://",
             "chainworks://runs",
             "chainworks://ideas",
         ],
@@ -235,6 +250,7 @@ fn allowed_resource_templates(class: &PrincipalClass) -> &'static [&'static str]
             "run://",
             "idea://",
             "report://",
+            "steward-analysis://",
             "chainworks://runs",
             "chainworks://ideas",
             "chainworks://approvals/inbox",
@@ -370,5 +386,46 @@ mod tests {
         assert_eq!(extract_bearer_token("Bearer abc123").unwrap(), "abc123");
         assert!(extract_bearer_token("Basic abc123").is_err());
         assert!(extract_bearer_token("Bearer ").is_err());
+    }
+
+    #[test]
+    fn operator_has_steward_tools() {
+        let p = Principal {
+            id: "op".into(),
+            class: PrincipalClass::Operator,
+        };
+        assert!(is_tool_allowed(&p, "steward.run_analysis"));
+        assert!(is_tool_allowed(&p, "steward.list_analyses"));
+        assert!(is_tool_allowed(&p, "steward.get_analysis"));
+    }
+
+    #[test]
+    fn observer_has_read_only_steward_tools() {
+        let p = Principal {
+            id: "ob".into(),
+            class: PrincipalClass::Observer,
+        };
+        assert!(!is_tool_allowed(&p, "steward.run_analysis"));
+        assert!(is_tool_allowed(&p, "steward.list_analyses"));
+        assert!(is_tool_allowed(&p, "steward.get_analysis"));
+    }
+
+    #[test]
+    fn steward_analysis_resource_allowed_for_all_classes() {
+        let op = Principal {
+            id: "op".into(),
+            class: PrincipalClass::Operator,
+        };
+        let ag = Principal {
+            id: "ag".into(),
+            class: PrincipalClass::Agent,
+        };
+        let ob = Principal {
+            id: "ob".into(),
+            class: PrincipalClass::Observer,
+        };
+        assert!(is_resource_allowed(&op, "steward-analysis://some-id"));
+        assert!(is_resource_allowed(&ag, "steward-analysis://some-id"));
+        assert!(is_resource_allowed(&ob, "steward-analysis://some-id"));
     }
 }

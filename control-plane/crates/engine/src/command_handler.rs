@@ -98,7 +98,9 @@ impl CommandHandler {
             Command::RunStewardAnalysis(_) => None,
         };
         let now = Utc::now();
-        let _ = command_journal::record(
+        let principal_class_str = caller.principal_class.to_string();
+        // INSERT is mandatory — fail closed (P029 §P2-005)
+        command_journal::record(
             &self.pool,
             &journal_id,
             cmd_type,
@@ -107,28 +109,35 @@ impl CommandHandler {
             now,
             Some(&caller.surface.to_string()),
             Some(&caller.principal_id),
-            Some(&caller.principal_class),
+            Some(&principal_class_str),
             Some(&caller.caller_tool),
         )
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
 
         let result = self.execute_command(cmd).await;
 
-        // Close the journal entry based on outcome.
+        // Completion/failure are best-effort — log errors but don't fail the command
         let completed_at = Utc::now();
         match &result {
             Ok(_) => {
-                let _ =
-                    command_journal::complete_entry(&self.pool, &journal_id, completed_at).await;
+                if let Err(e) =
+                    command_journal::complete_entry(&self.pool, &journal_id, completed_at).await
+                {
+                    tracing::error!(journal_id = %journal_id, error = %e, "Failed to close journal entry");
+                }
             }
             Err(e) => {
-                let _ = command_journal::fail_entry(
+                if let Err(e2) = command_journal::fail_entry(
                     &self.pool,
                     &journal_id,
                     completed_at,
                     &e.to_string(),
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(journal_id = %journal_id, error = %e2, "Failed to record journal failure");
+                }
             }
         }
 

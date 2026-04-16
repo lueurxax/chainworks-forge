@@ -11,6 +11,9 @@ pub mod stage;
 pub mod steward;
 pub mod validation;
 
+// P029: Re-export PrincipalClass from auth as the canonical domain type.
+pub use auth::PrincipalClass;
+
 #[cfg(test)]
 mod tests {
     use super::run::RunStatus;

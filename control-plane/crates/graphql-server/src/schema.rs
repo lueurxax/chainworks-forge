@@ -297,20 +297,15 @@ impl MutationRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal =
-            ctx.data::<auth::Principal>()
-                .cloned()
-                .unwrap_or_else(|_| auth::Principal {
-                    id: "anonymous".into(),
-                    class: auth::PrincipalClass::Operator,
-                });
+        let principal = ctx.data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
 
         if !auth::is_tool_allowed(&principal, "runs.start") {
             return Err(Error::new("forbidden"));
         }
 
-        let caller =
-            CallerContext::graphql(&principal.id, &principal.class.to_string(), "startRun");
+        let caller = CallerContext::graphql(&principal.id, &principal.class, "startRun");
 
         let iid: IdeaId = idea_id
             .parse()
@@ -359,20 +354,16 @@ impl MutationRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal =
-            ctx.data::<auth::Principal>()
-                .cloned()
-                .unwrap_or_else(|_| auth::Principal {
-                    id: "anonymous".into(),
-                    class: auth::PrincipalClass::Operator,
-                });
+        let principal = ctx.data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
 
         if !auth::is_tool_allowed(&principal, "approvals.resolve") {
             return Err(Error::new("forbidden"));
         }
 
         let caller =
-            CallerContext::graphql(&principal.id, &principal.class.to_string(), "approveStage");
+            CallerContext::graphql(&principal.id, &principal.class, "approveStage");
 
         let rid: RunId = run_id
             .parse()
@@ -411,20 +402,16 @@ impl MutationRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal =
-            ctx.data::<auth::Principal>()
-                .cloned()
-                .unwrap_or_else(|_| auth::Principal {
-                    id: "anonymous".into(),
-                    class: auth::PrincipalClass::Operator,
-                });
+        let principal = ctx.data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
 
         if !auth::is_tool_allowed(&principal, "approvals.resolve") {
             return Err(Error::new("forbidden"));
         }
 
         let caller =
-            CallerContext::graphql(&principal.id, &principal.class.to_string(), "rejectStage");
+            CallerContext::graphql(&principal.id, &principal.class, "rejectStage");
 
         let rid: RunId = run_id
             .parse()
@@ -461,20 +448,16 @@ impl MutationRoot {
     ) -> Result<RetryStagePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal =
-            ctx.data::<auth::Principal>()
-                .cloned()
-                .unwrap_or_else(|_| auth::Principal {
-                    id: "anonymous".into(),
-                    class: auth::PrincipalClass::Operator,
-                });
+        let principal = ctx.data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
 
         if !auth::is_tool_allowed(&principal, "stages.retry") {
             return Err(Error::new("forbidden"));
         }
 
         let caller =
-            CallerContext::graphql(&principal.id, &principal.class.to_string(), "retryStage");
+            CallerContext::graphql(&principal.id, &principal.class, "retryStage");
 
         let rid: RunId = run_id
             .parse()
@@ -495,20 +478,16 @@ impl MutationRoot {
     async fn cancel_run(&self, ctx: &Context<'_>, run_id: ID) -> Result<CancelRunPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal =
-            ctx.data::<auth::Principal>()
-                .cloned()
-                .unwrap_or_else(|_| auth::Principal {
-                    id: "anonymous".into(),
-                    class: auth::PrincipalClass::Operator,
-                });
+        let principal = ctx.data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
 
         if !auth::is_tool_allowed(&principal, "runs.cancel") {
             return Err(Error::new("forbidden"));
         }
 
         let caller =
-            CallerContext::graphql(&principal.id, &principal.class.to_string(), "cancelRun");
+            CallerContext::graphql(&principal.id, &principal.class, "cancelRun");
 
         let rid: RunId = run_id
             .parse()
@@ -698,6 +677,13 @@ mod tests {
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
     use std::sync::Arc;
+
+    fn test_principal() -> auth::Principal {
+        auth::Principal {
+            id: "test-operator".into(),
+            class: auth::PrincipalClass::Operator,
+        }
+    }
 
     fn make_idea(id: IdeaId) -> Idea {
         Idea {
@@ -952,6 +938,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(
@@ -979,7 +966,7 @@ mod tests {
                     "DELIVERY_CONFIG",
                     &serde_json::to_string(&delivery_json).unwrap(),
                 ),
-            ))
+            ).data(test_principal()))
             .await;
 
         assert!(
@@ -1006,6 +993,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(
@@ -1036,7 +1024,7 @@ mod tests {
                 .replace("IDEA_ID", &idea_id.to_string())
                 .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
                 .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
-            ))
+            ).data(test_principal()))
             .await;
 
         assert!(
@@ -1079,6 +1067,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let start = schema
             .execute(Request::new(
@@ -1106,7 +1095,7 @@ mod tests {
                     "DELIVERY_CONFIG",
                     &serde_json::to_string(&delivery_json).unwrap(),
                 ),
-            ))
+            ).data(test_principal()))
             .await;
 
         assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
@@ -1161,6 +1150,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let start = schema
             .execute(Request::new(
@@ -1188,7 +1178,7 @@ mod tests {
                     "DELIVERY_CONFIG",
                     &serde_json::to_string(&delivery_json).unwrap(),
                 ),
-            ))
+            ).data(test_principal()))
             .await;
 
         assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
@@ -1237,6 +1227,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(format!(
@@ -1318,6 +1309,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(format!(
@@ -1402,6 +1394,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(
@@ -1478,6 +1471,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(format!(
@@ -1608,6 +1602,7 @@ mod tests {
             pool.clone(),
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
         );
         let response = schema
             .execute(Request::new(

@@ -103,8 +103,7 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
 
-            let caller =
-                CallerContext::mcp(&principal.id, &principal.class.to_string(), "runs.start");
+            let caller = CallerContext::mcp(&principal.id, &principal.class, "runs.start");
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
                 workflow_id,
@@ -162,8 +161,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            let caller =
-                CallerContext::mcp(&principal.id, &principal.class.to_string(), "runs.cancel");
+            let caller = CallerContext::mcp(&principal.id, &principal.class, "runs.cancel");
             let cmd = Command::CancelRun(CancelRunCmd { run_id });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({

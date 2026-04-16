@@ -106,8 +106,16 @@ async fn main() -> Result<()> {
     );
 
     // 11. Load principal table (auto-bootstraps if missing)
-    let principals_path = std::path::Path::new("principals.json");
-    let principal_table = auth::PrincipalTable::load_or_bootstrap(principals_path)?;
+    let principals_path = std::env::var("CHAINWORKS_AUTH_PRINCIPALS_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".chainworks")
+                .join("auth")
+                .join("principals.json")
+        });
+    let principal_table = auth::PrincipalTable::load_or_bootstrap(&principals_path)?;
     info!("Principal table loaded from {}", principals_path.display());
 
     // 12. Mode dispatch
@@ -126,7 +134,7 @@ async fn main() -> Result<()> {
             let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new(
                 pool.clone(),
                 cmd_handler.clone(),
-                principal_table,
+                principal_table.clone(),
             ));
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
@@ -135,8 +143,14 @@ async fn main() -> Result<()> {
                 pool.clone(),
                 cmd_handler.clone(),
                 events.clone(),
+                principal_table.clone(),
             );
-            graphql_server::server::start_with_extra_routes(schema, &graphql_addr, mcp_routes)
+            graphql_server::server::start_with_extra_routes(
+                schema,
+                &graphql_addr,
+                mcp_routes,
+                principal_table,
+            )
                 .await?;
         }
     }
