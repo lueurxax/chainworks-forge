@@ -1,6 +1,6 @@
 # Idea Lifecycle
 
-Stable reference for the implemented idea-lifecycle baseline that was previously carried by Proposal 010's archive slice.
+Stable reference for the idea-lifecycle baseline.
 
 ## Purpose
 

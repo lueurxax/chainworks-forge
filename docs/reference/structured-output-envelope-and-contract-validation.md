@@ -1,10 +1,6 @@
 # Structured Output Envelopes and Contract Validation
 
-Stable reference for the implemented Rust control-plane slice that parses named ACP output envelopes, binds discovered outputs to compiled contract metadata, validates structured payloads, and persists durable validation-failure evidence.
-
-This document supersedes the implementation content that was previously tracked by Proposal 046.
-
-For current implementation and proof status, use [../evidence/output-contracts-failure-evidence-and-recovery-proof.md](../evidence/output-contracts-failure-evidence-and-recovery-proof.md).
+Stable reference for the Rust control-plane slice that parses named ACP output envelopes, binds discovered outputs to compiled contract metadata, validates structured payloads, and persists durable validation-failure evidence.
 
 ## Purpose
 

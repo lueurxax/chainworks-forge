@@ -1,6 +1,6 @@
 # Provider Binding Truth
 
-Stable reference for frozen provider/model truth, provenance, and cross-family warning behavior that were previously tracked by Proposal 011.
+Stable reference for frozen provider/model truth, provenance, and cross-family warning behavior.
 
 ## Purpose
 

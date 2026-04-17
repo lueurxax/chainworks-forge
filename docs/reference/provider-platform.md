@@ -1,6 +1,6 @@
 # Provider Platform
 
-Stable reference for the multi-provider, settings, diagnostics, and pilot-readiness baseline that was previously tracked as Proposal 006.
+Stable reference for the multi-provider, settings, diagnostics, and pilot-readiness baseline.
 
 ## Purpose
 

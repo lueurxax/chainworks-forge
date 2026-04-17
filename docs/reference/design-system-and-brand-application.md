@@ -1,6 +1,6 @@
 # Design System and Brand Application
 
-Stable reference for the implemented design-system adoption and brand-application slice that was previously tracked by Proposal 014.
+Stable reference for the design-system adoption and brand-application slice.
 
 ## Purpose
 
@@ -13,8 +13,6 @@ This document is the stable contract for:
 - bounded brand-asset integration,
 - surface adoption across shell, run, setup, and recovery views,
 - and the rule that brand language must stay subordinate to runtime/status truth.
-
-For implementation/proof status, use [../evidence/design-system-and-brand-application-proof.md](../evidence/design-system-and-brand-application-proof.md).
 
 ## Scope
 
@@ -141,9 +139,7 @@ This slice is proved by a mix of local and approved-host evidence:
 2. preview-backed owner renders for the migrated surfaces,
 3. green approved-host `proposal-014` gate.
 
-The gate name keeps the old proposal label for reproducibility, but the slice itself is now stable implemented documentation rather than an active proposal.
-
-For the consolidated evidence story, use [../evidence/design-system-and-brand-application-proof.md](../evidence/design-system-and-brand-application-proof.md).
+The gate name keeps its original label for reproducibility.
 
 ## Adjacent References
 

@@ -1,6 +1,6 @@
 # Execution Truth and Recovery
 
-Stable reference for the implemented execution-truth, settlement, and recovery slice that was previously tracked by Proposal 016.
+Stable reference for the execution-truth, settlement, and recovery contract.
 
 ## Purpose
 
@@ -13,8 +13,6 @@ This document is the stable contract for:
 - approval restoration and resume behavior,
 - frozen-vs-runtime binding truth in reports,
 - and recovery/report readers that must prefer persisted truth over heuristic reconstruction.
-
-For implementation/proof status, use [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md).
 
 ## Scope
 
@@ -152,6 +150,24 @@ It may narrow the operator action after a watchdog failure or exhausted retry, b
 
 ## Resume and Approval Restore
 
+### Atomic transition settlement and cursor authority
+
+Transition completion and cursor update are one settlement unit in the execution-persistence flow. Recovery never infers continuation from partial stage snapshots alone.
+
+The run-level transition cursor is the authoritative continuation signal:
+
+- `currentStageID` resolution is cursor-first — if cursor metadata is present, projection and UI-facing stage state follow it; `stageExecutions` order is a compatibility fallback only.
+- Interrupted transition paths keep intermediate marker state so the system can surface exact interruption and continue deterministically.
+- Workflow-map projection and report/recovery builders derive continuation from cursor data before stage aggregate views.
+
+Invariants:
+
+1. no UI-facing stage claims resumable state without matching cursor continuity,
+2. repeated projection/recovery cycles converge to the same cursor-derived stage,
+3. resumed runs never lose transition intent when partial transition state is present.
+
+Implementation owners: `Run` cursor metadata and derived-stage helpers, `WorkflowMapProjectionService`, `RunReportBuilder`, `RecoveryCoordinator`.
+
 ### Resume is fail-closed
 
 `ResumeManager` does not blindly restart work.
@@ -220,9 +236,7 @@ High-signal proof owners include:
 - `OrchestratorTests` for persistence of canonical outcome, provider/model truth, and validation-after-output settlement,
 - `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 - `RecoveryCoordinatorTests` for narrow recovery action ownership,
-- `Proposal013Tests` for failed-stage evidence and report/recovery fallback behavior.
-
-For the consolidated proof story, use [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md).
+- failed-stage evidence and report/recovery fallback suites.
 
 ## Adjacent References
 

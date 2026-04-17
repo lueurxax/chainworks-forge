@@ -4,8 +4,6 @@ Implementation-oriented reference docs for Chainworks Forge.
 
 If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md), then read the relevant subsystem documents below.
 
-Historical reference material that is no longer part of the canonical runtime architecture lives under [../archive/reference/README.md](../archive/reference/README.md).
-
 ## Foundation Layer
 
 - [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking
@@ -16,50 +14,45 @@ Historical reference material that is no longer part of the canonical runtime ar
 
 - [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, and report/recovery read precedence
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
-- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families, and persisted runtime truth
-- [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](030-acp-second-wave-runtime-profiles-codex-auggie-junie.md) — Second-wave ACP profile governance
-- [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](033-remove-goose-from-canonical-transport-and-simplify-runtime.md) — ACP canonical transport simplification and settings compatibility path
-- [035-atomic-transition-settlement-and-durable-resume-cursor.md](035-atomic-transition-settlement-and-durable-resume-cursor.md) — Atomic transition settlement and durable resume cursor
-- [044-post-approval-task-execution-and-release-gate-completion.md](044-post-approval-task-execution-and-release-gate-completion.md) — Post-approval task execution, N-phase sequential ordering, end-state task execution, and retry-with-reapproval
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, stage-owned recovery evidence, approval restore, runtime binding truth, and report/recovery read precedence
+- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), and persisted runtime truth
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, and durable validation-failure substrate
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, aggregate summary hardening, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
-- [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage within one run, immutable generation history, budget-driven compaction, checkpoint rehydration, and shell-owned per-agent reset
-- [047-session-reuse-and-cancellation-settlement.md](047-session-reuse-and-cancellation-settlement.md) — Rust control-plane session lineage persistence, invocation owner keys, binding fingerprints, generation-scoped context budget, two-phase cancellation settlement, and northbound reader split
+- [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) -- Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration
 
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
-- [operator-experience.md](operator-experience.md) — Stable operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
+- [operator-experience.md](operator-experience.md) — Operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
-- [artifact-content-rendering.md](artifact-content-rendering.md) — Stable unified rendering contract for read-only markdown and JSON artifacts
-- [provider-platform.md](provider-platform.md) — Stable provider/settings baseline: registry, adapters, settings, preflight, receipts, first-run and pilot surfaces
-- [design-system-and-brand-application.md](design-system-and-brand-application.md) — Stable Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
-- [ui-quality-and-polish.md](ui-quality-and-polish.md) — Stable UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
-- [run-control.md](run-control.md) — Stop vs archive boundary, cancellation settlement, operator-visible cancelling/cancelled truth
+- [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
+- [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, first-run and pilot surfaces
+- [design-system-and-brand-application.md](design-system-and-brand-application.md) — Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
+- [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
+- [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
+- [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, and `delivery_receipt` settlement
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling
 - [idea-lifecycle.md](idea-lifecycle.md) — Active vs archived idea contract, archive/restore eligibility, cross-surface truth
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
 - [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, evidence export
-- [045-deterministic-release-operations.md](045-deterministic-release-operations.md) — Deterministic Rust-native git/publish execution, canonical release artifacts, and `delivery_receipt` settlement
-- [mvp-sign-off.md](mvp-sign-off.md) — benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
-- [current-system-baseline.md](current-system-baseline.md) — current-head subsystem map and reusable baseline for review and planning work
+- [mvp-sign-off.md](mvp-sign-off.md) — Benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
+- [current-system-baseline.md](current-system-baseline.md) — Current-head subsystem map and reusable baseline for review and planning work
 
 ## Test Strategy
 
 - [test-suite-architecture.md](test-suite-architecture.md) — Swift Testing unit-suite structure, conventions, mock lanes, tags, plans, residual gaps
 - [test-gates.md](test-gates.md) — Layered local and CI execution gates, gate ownership, crash-aware runner behavior
-- [agent-ui-test-execution.md](agent-ui-test-execution.md) — how agents should run preview review, focused XCUITest, and app-launched UI proof flows
+- [agent-ui-test-execution.md](agent-ui-test-execution.md) — How agents should run preview review, focused XCUITest, and app-launched UI proof flows
 
 ## System Health
 

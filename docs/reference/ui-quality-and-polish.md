@@ -1,6 +1,6 @@
 # UI Quality and Visual Polish
 
-Stable reference for the implemented UI quality, readability, accessibility, and bounded design-system hardening slice that was previously tracked by Proposal 012.
+Stable reference for the UI quality, readability, accessibility, and bounded design-system hardening slice.
 
 ## Purpose
 
@@ -201,5 +201,4 @@ Use:
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) for the implemented brand/token adoption layer,
 - [provider-platform.md](provider-platform.md) for provider/settings/readiness semantics,
 - [live-workflow-map.md](live-workflow-map.md) for topology truth in run detail,
-- [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) for brand-system authority,
-- [../evidence/ui-quality-and-polish-proof.md](../evidence/ui-quality-and-polish-proof.md) for current implementation/proof status.
+- [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) for brand-system authority.

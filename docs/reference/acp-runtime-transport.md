@@ -98,8 +98,11 @@ Current repo-backed runtime profiles are:
 |---|---|---|---|---|
 | `claude_agent_acp` | `claude_agent_acp` | `operator_grade` | `acp_stdio` | `acp_native` |
 | `gemini_cli_acp` | `gemini_cli_acp` | `control_capable` | `acp_stdio` | `acp_native` |
+| `codex_acp` | `codex_acp` | `operator_grade` | `acp_stdio` | `acp_native` |
+| `auggie_cli_acp` | `auggie_cli_acp` | `control_capable` | `acp_stdio` | `acp_native` |
+| `junie_cli_acp` | `junie_cli_acp` | `control_capable` | `acp_stdio` | `acp_native` |
 
-The catalog now ships ACP runtime profiles for all supported families.
+`RuntimeProfile.requires` is a normative capability map — it gates launch, startup preflight, and MCP-policy reconciliation. Profiles that are known but missing required capabilities block run execution via the deterministic readiness contract. Disabled, configured, and unavailable states remain distinct in operator-facing surfaces (not collapsed into a single message path).
 
 ## Backend-profile ownership
 

@@ -1,6 +1,6 @@
 # Operator Experience
 
-Stable reference for the operator-facing baseline that was previously tracked as `P005-OPS`.
+Stable reference for the operator-facing baseline.
 
 ## Purpose
 
@@ -147,7 +147,7 @@ Out of scope here:
 - git/release/publish recovery,
 - repo-backed side-effect re-entry.
 
-Those remain Proposal 007 territory.
+Those remain in the repo-backed delivery slice. See [full-mvp-delivery.md](full-mvp-delivery.md).
 
 ## Workflow map in run detail
 
@@ -241,4 +241,4 @@ Later proposals and features may build on this operator spine, but should not re
 - recovery stays policy-bounded,
 - comparison stays deterministic.
 
-Repo-backed delivery work in Proposal 007 extends this operator shell rather than replacing it.
+The repo-backed delivery slice ([full-mvp-delivery.md](full-mvp-delivery.md)) extends this operator shell rather than replacing it.

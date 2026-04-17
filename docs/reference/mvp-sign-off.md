@@ -1,6 +1,6 @@
 # MVP Sign-Off
 
-Stable reference for the implemented MVP hardening and sign-off layer that was previously tracked by Proposal 008.
+Stable reference for the MVP hardening and sign-off layer.
 
 ## Purpose
 
@@ -168,7 +168,6 @@ The sign-off layer is only considered credible when the current head can show:
 - a replayable sign-off decision snapshot derived from persisted benchmark records.
 
 This reference defines the contract.
-The current proof state lives in [../evidence/mvp-sign-off-proof.md](../evidence/mvp-sign-off-proof.md).
 
 ## Adjacent references
 
@@ -177,6 +176,4 @@ Use:
 - [full-mvp-delivery.md](full-mvp-delivery.md) for the repo-backed execution and release slice,
 - [operator-experience.md](operator-experience.md) for shell-owned recovery/report behavior,
 - [provider-platform.md](provider-platform.md) for diagnostics and provider boundary surfaces,
-- [run-control.md](run-control.md) for stop/cancel truth,
-- [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md) for delivery-slice proof status,
-- [../evidence/mvp-sign-off-proof.md](../evidence/mvp-sign-off-proof.md) for current sign-off proof status.
+- [run-control.md](run-control.md) for stop/cancel truth.

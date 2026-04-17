@@ -1,6 +1,6 @@
 # Project Workspace Contract
 
-Stable reference for idea-owned working-directory truth and frozen run workspace ownership that were previously tracked by Proposal 011.
+Stable reference for idea-owned working-directory truth and frozen run workspace ownership.
 
 ## Purpose
 

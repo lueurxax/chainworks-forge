@@ -1,6 +1,6 @@
 # Context Strategy and Experiment Framework
 
-Stable reference for the implemented context-strategy, experiment, lazy-evidence, and strategy-recommendation slice that was previously tracked by Proposal 019.
+Stable reference for the context-strategy, experiment, lazy-evidence, and strategy-recommendation slice.
 
 ## Purpose
 
@@ -14,8 +14,6 @@ This document is the stable contract for:
 - model-tier escalation for retryable non-contract failures,
 - normalized strategy telemetry and scoring,
 - and shell-owned badges, recommendation output, and operator overrides.
-
-For implementation and proof status, use [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md).
 
 ## Scope
 
@@ -169,8 +167,6 @@ The strongest current proof owners for this slice are:
 - `RuntimeAgentExecutorTests`
 - `OrchestratorTests`
 - `scripts/test-gate.sh proposal-019`
-
-For the consolidated proof story, use [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md).
 
 ## Adjacent References
 

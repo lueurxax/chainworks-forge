@@ -1,6 +1,6 @@
 # Full MVP Delivery
 
-Stable reference for the implemented repo-backed delivery slice that was previously carried by Proposal 007.
+Stable reference for the repo-backed delivery slice.
 
 ## Purpose
 
@@ -27,7 +27,7 @@ Those remain owned by:
 - [operator-experience.md](operator-experience.md) for the operator shell, reports, recovery, and comparison,
 - [provider-platform.md](provider-platform.md) for provider settings, diagnostics, and frozen provider truth,
 - [project-workspace-contract.md](project-workspace-contract.md) for idea-owned workspace and frozen run root rules,
-- [045-deterministic-release-operations.md](045-deterministic-release-operations.md) for deterministic native release execution and release receipt semantics,
+- [release-gate.md](release-gate.md) for deterministic native release execution and release receipt semantics,
 - [live-workflow-map.md](live-workflow-map.md) for run-detail topology rendering.
 
 ## Core rules
@@ -194,7 +194,7 @@ After approval, `ReleaseOpsCoordinator` drives:
 2. archive/build/upload through `ConnectPublishService`.
 
 Agents may recommend release, but they do not improvise git/archive/upload mechanics.
-The detailed release contract now lives in [045-deterministic-release-operations.md](045-deterministic-release-operations.md).
+The detailed release contract now lives in [release-gate.md](release-gate.md).
 
 ### Partial failure semantics
 
@@ -262,8 +262,6 @@ The slice is only fully credible when both of these exist:
 1. one happy-path repo-backed run,
 2. one non-happy-path repo-backed run with preserved recovery context.
 
-Current proof status lives in [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md).
-
 ## Non-goals
 
 This slice does not add:
@@ -275,8 +273,3 @@ This slice does not add:
 - background/cloud execution,
 - production-by-default release targets,
 - multi-user delivery coordination.
-
-## Historical note
-
-This contract was previously carried by Proposal 007 and its review/audit artifacts.
-The proposal has been superseded by this reference and by [../evidence/full-mvp-delivery-proof.md](../evidence/full-mvp-delivery-proof.md).

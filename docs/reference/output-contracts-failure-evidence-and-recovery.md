@@ -1,6 +1,6 @@
 # Output Contracts, Failure Evidence, and Narrow Recovery
 
-Stable reference for the implemented output-contract, failure-evidence, retry-lineage, typed validation-failure reader, and bounded proposal-resilience slice consolidated from the old Proposal 013 slice and the later Rust control-plane work that was previously tracked by Proposal 046.
+Stable reference for the output-contract, failure-evidence, retry-lineage, typed validation-failure reader, and bounded proposal-resilience slice.
 
 ## Purpose
 
@@ -11,8 +11,6 @@ The runtime must be able to say, with persisted evidence rather than inference:
 - what canonical evidence survives when validation fails after generation,
 - which same-run retry path remains valid before clone-run,
 - and which declarative contract controls are enforced versus rejected.
-
-For implementation and proof status, use [../evidence/output-contracts-failure-evidence-and-recovery-proof.md](../evidence/output-contracts-failure-evidence-and-recovery-proof.md).
 
 ## Scope
 

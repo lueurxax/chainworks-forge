@@ -574,8 +574,9 @@ MCP northbound auth, capability filtering, and audit journaling gate.
 Scope:
 
 - Typed capability/resource IDs are owned in `domain` and carried on `auth::Principal`
-- `auth::filter_tools`, `auth::filter_resources`, and `auth::match_resource_uri` consume typed IDs/templates rather than string-only tool specs
-- MCP tool registration crosses the northbound boundary through `CapabilityToolId` converters
+- `auth::filter_tools` and `auth::filter_resources` consume typed IDs and use exhaustive class-policy matches rather than string-only tool specs
+- MCP tool registration crosses the northbound boundary through exhaustive `CapabilityToolId` converters
+- MCP resource rendering/parsing uses exhaustive `ResourceTemplateId` matches without wildcard fallbacks
 - MCP HTTP rejects missing and unknown bearer tokens
 - MCP stdio rejects pre-initialize non-`initialize` frames, missing `principal_token`, and unknown `principal_token`
 - MCP resource URI parsing is owned at the `mcp-server` boundary before auth checks typed `ResourceTemplateId`
@@ -656,6 +657,37 @@ Important:
 - `proposal-049` is the canonical proof path for [steward-analysis-system.md](steward-analysis-system.md)
 - the runner also accepts the `p048` and `p049` aliases
 - `cargo test --workspace` is not a substitute for these gates because each gate documents its subsystem-owned proof inventory
+
+### `proposal-050|p050`
+
+Per-run workspace isolation gate for the Rust control-plane.
+
+Scope:
+
+- per-run `chainworks_meta_root` derivation at run creation
+- `resolve_path_template` uses run meta-root override, does not consult process env for `CHAINWORKS_META_ROOT`
+- `exists()` and `artifact.field` transition checks resolve against per-run meta root; post-P050 runs do NOT fall back to shared `artifact_root`
+- `normalize_path_for_worktree` exempts meta-root paths from worktree rewrite
+- `normalize_artifacts` source-side isolation: post-P050 runs search only `artifact_root/{run_id}`
+- ACP adapter env handoff: all five adapters inject `CHAINWORKS_META_ROOT`
+- GraphQL and MCP read-only meta-root readback
+- legacy NULL-meta-root backward compatibility
+
+Host policy:
+
+- local Rust toolchain required; no UI host or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-050
+```
+
+Important:
+
+- `proposal-050` is the canonical proof path for [per-run-workspace-isolation.md](per-run-workspace-isolation.md)
+- the runner also accepts the `p050` alias
+- this gate runs `cargo test --workspace` from `control-plane/`
 
 ### `full`
 
