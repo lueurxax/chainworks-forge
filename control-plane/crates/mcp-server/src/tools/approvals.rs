@@ -66,8 +66,7 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
             let comment = params["comment"].as_str().map(|s| s.to_string());
 
-            let caller =
-                CallerContext::mcp(&principal.id, &principal.class, "approvals.resolve");
+            let caller = CallerContext::mcp(&principal.id, &principal.class, "approvals.resolve");
             let cmd = match decision {
                 "granted" => Command::ApproveStage(ApproveStageCmd {
                     run_id,

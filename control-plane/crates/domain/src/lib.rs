@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod approval;
 pub mod artifact;
+pub mod capabilities;
 pub mod commands;
 pub mod events;
 pub mod idea;
@@ -11,8 +12,9 @@ pub mod stage;
 pub mod steward;
 pub mod validation;
 
-// P029: Re-export PrincipalClass from auth as the canonical domain type.
-pub use auth::PrincipalClass;
+// P029: PrincipalClass is canonically defined in domain::commands.
+pub use capabilities::{CapabilityToolId, ResourceTemplateId};
+pub use commands::PrincipalClass;
 
 #[cfg(test)]
 mod tests {

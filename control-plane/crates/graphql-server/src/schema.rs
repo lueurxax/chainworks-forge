@@ -200,6 +200,30 @@ impl QueryRoot {
 
 pub struct MutationRoot;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationName {
+    StartRun,
+    ApproveStage,
+    RejectStage,
+    RetryStage,
+    CancelRun,
+}
+
+pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
+    match mutation {
+        MutationName::StartRun => domain::CapabilityToolId::RunsStart,
+        MutationName::ApproveStage | MutationName::RejectStage => {
+            domain::CapabilityToolId::ApprovalsResolve
+        }
+        MutationName::RetryStage => domain::CapabilityToolId::StagesRetry,
+        MutationName::CancelRun => domain::CapabilityToolId::RunsCancel,
+    }
+}
+
+fn mutation_allowed(principal: &auth::Principal, mutation: MutationName) -> bool {
+    auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1
+}
+
 #[derive(SimpleObject)]
 pub struct GqlDeliveryPreflight {
     pub passed: bool,
@@ -297,11 +321,12 @@ impl MutationRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal = ctx.data::<auth::Principal>()
+        let principal = ctx
+            .data::<auth::Principal>()
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !auth::is_tool_allowed(&principal, "runs.start") {
+        if !mutation_allowed(&principal, MutationName::StartRun) {
             return Err(Error::new("forbidden"));
         }
 
@@ -354,16 +379,16 @@ impl MutationRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal = ctx.data::<auth::Principal>()
+        let principal = ctx
+            .data::<auth::Principal>()
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !auth::is_tool_allowed(&principal, "approvals.resolve") {
+        if !mutation_allowed(&principal, MutationName::ApproveStage) {
             return Err(Error::new("forbidden"));
         }
 
-        let caller =
-            CallerContext::graphql(&principal.id, &principal.class, "approveStage");
+        let caller = CallerContext::graphql(&principal.id, &principal.class, "approveStage");
 
         let rid: RunId = run_id
             .parse()
@@ -402,16 +427,16 @@ impl MutationRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal = ctx.data::<auth::Principal>()
+        let principal = ctx
+            .data::<auth::Principal>()
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !auth::is_tool_allowed(&principal, "approvals.resolve") {
+        if !mutation_allowed(&principal, MutationName::RejectStage) {
             return Err(Error::new("forbidden"));
         }
 
-        let caller =
-            CallerContext::graphql(&principal.id, &principal.class, "rejectStage");
+        let caller = CallerContext::graphql(&principal.id, &principal.class, "rejectStage");
 
         let rid: RunId = run_id
             .parse()
@@ -448,16 +473,16 @@ impl MutationRoot {
     ) -> Result<RetryStagePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal = ctx.data::<auth::Principal>()
+        let principal = ctx
+            .data::<auth::Principal>()
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !auth::is_tool_allowed(&principal, "stages.retry") {
+        if !mutation_allowed(&principal, MutationName::RetryStage) {
             return Err(Error::new("forbidden"));
         }
 
-        let caller =
-            CallerContext::graphql(&principal.id, &principal.class, "retryStage");
+        let caller = CallerContext::graphql(&principal.id, &principal.class, "retryStage");
 
         let rid: RunId = run_id
             .parse()
@@ -478,16 +503,16 @@ impl MutationRoot {
     async fn cancel_run(&self, ctx: &Context<'_>, run_id: ID) -> Result<CancelRunPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
-        let principal = ctx.data::<auth::Principal>()
+        let principal = ctx
+            .data::<auth::Principal>()
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !auth::is_tool_allowed(&principal, "runs.cancel") {
+        if !mutation_allowed(&principal, MutationName::CancelRun) {
             return Err(Error::new("forbidden"));
         }
 
-        let caller =
-            CallerContext::graphql(&principal.id, &principal.class, "cancelRun");
+        let caller = CallerContext::graphql(&principal.id, &principal.class, "cancelRun");
 
         let rid: RunId = run_id
             .parse()
@@ -510,13 +535,18 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         run_id: Option<ID>,
-    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRun>>> + '_ {
-        let pool = ctx.data::<SqlitePool>().unwrap().clone();
-        let events = ctx.data::<EventSender>().unwrap().clone();
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRun>>>> {
+        // P029 §4.1.c: principal is injected by on_connection_init during WS handshake.
+        let _principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
 
         let rx = events.subscribe();
-        BroadcastStream::new(rx).filter_map(move |msg| {
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
             let pool = pool.clone();
             let fut = async move {
                 let event = msg.ok()?;
@@ -535,21 +565,25 @@ impl SubscriptionRoot {
                 }
             };
             fut
-        })
+        }))
     }
 
     async fn stage_status_changed(
         &self,
         ctx: &Context<'_>,
         run_id: ID,
-    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>> + '_
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>>>
     {
-        let pool = ctx.data::<SqlitePool>().unwrap().clone();
-        let events = ctx.data::<EventSender>().unwrap().clone();
+        let _principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: RunId = run_id.parse().unwrap_or_else(|_| RunId::new());
 
         let rx = events.subscribe();
-        BroadcastStream::new(rx).filter_map(move |msg| {
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
             let pool = pool.clone();
             let fut = async move {
                 let event = msg.ok()?;
@@ -571,18 +605,22 @@ impl SubscriptionRoot {
                 }
             };
             fut
-        })
+        }))
     }
 
     async fn approval_requested(
         &self,
         ctx: &Context<'_>,
-    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>> + '_ {
-        let pool = ctx.data::<SqlitePool>().unwrap().clone();
-        let events = ctx.data::<EventSender>().unwrap().clone();
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
+        let _principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let events = ctx.data::<EventSender>()?.clone();
 
         let rx = events.subscribe();
-        BroadcastStream::new(rx).filter_map(move |msg| {
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
             let pool = pool.clone();
             let fut = async move {
                 let event = msg.ok()?;
@@ -595,7 +633,7 @@ impl SubscriptionRoot {
                 }
             };
             fut
-        })
+        }))
     }
 
     /// Live stream of ACP runtime/session lifecycle events.
@@ -605,12 +643,17 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         run_id: Option<ID>,
-    ) -> impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>> + '_ {
-        let events = ctx.data::<EventSender>().unwrap().clone();
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>>>
+    {
+        let _principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+
+        let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
 
         let rx = events.subscribe();
-        BroadcastStream::new(rx).filter_map(move |msg| {
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
             let fut = async move {
                 let event = msg.ok()?;
                 match event {
@@ -639,7 +682,7 @@ impl SubscriptionRoot {
                 }
             };
             fut
-        })
+        }))
     }
 }
 
@@ -678,11 +721,32 @@ mod tests {
     use engine::work_queue::WorkQueue;
     use std::sync::Arc;
 
+    #[test]
+    fn mutation_name_converter_covers_command_mutations() {
+        assert_eq!(
+            capability_id_for(MutationName::StartRun),
+            domain::CapabilityToolId::RunsStart
+        );
+        assert_eq!(
+            capability_id_for(MutationName::ApproveStage),
+            domain::CapabilityToolId::ApprovalsResolve
+        );
+        assert_eq!(
+            capability_id_for(MutationName::RejectStage),
+            domain::CapabilityToolId::ApprovalsResolve
+        );
+        assert_eq!(
+            capability_id_for(MutationName::RetryStage),
+            domain::CapabilityToolId::StagesRetry
+        );
+        assert_eq!(
+            capability_id_for(MutationName::CancelRun),
+            domain::CapabilityToolId::RunsCancel
+        );
+    }
+
     fn test_principal() -> auth::Principal {
-        auth::Principal {
-            id: "test-operator".into(),
-            class: auth::PrincipalClass::Operator,
-        }
+        auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
     fn make_idea(id: IdeaId) -> Idea {
@@ -1153,8 +1217,9 @@ mod tests {
             auth::PrincipalTable::test_fixture(),
         );
         let start = schema
-            .execute(Request::new(
-                r#"
+            .execute(
+                Request::new(
+                    r#"
                 mutation StartRun {
                   startRun(
                     ideaId: "IDEA_ID",
@@ -1171,14 +1236,16 @@ mod tests {
                   }
                 }
                 "#
-                .replace("IDEA_ID", &idea_id.to_string())
-                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
-                .replace(
-                    "DELIVERY_CONFIG",
-                    &serde_json::to_string(&delivery_json).unwrap(),
-                ),
-            ).data(test_principal()))
+                    .replace("IDEA_ID", &idea_id.to_string())
+                    .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                    .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
+                    .replace(
+                        "DELIVERY_CONFIG",
+                        &serde_json::to_string(&delivery_json).unwrap(),
+                    ),
+                )
+                .data(test_principal()),
+            )
             .await;
 
         assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");

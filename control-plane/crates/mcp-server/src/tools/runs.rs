@@ -265,10 +265,7 @@ mod tests {
     }
 
     fn test_principal() -> auth::Principal {
-        auth::Principal {
-            id: "test-operator".into(),
-            class: auth::PrincipalClass::Operator,
-        }
+        auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
     #[tokio::test]

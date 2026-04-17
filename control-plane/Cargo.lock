@@ -213,6 +213,7 @@ name = "auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "domain",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -640,7 +641,6 @@ dependencies = [
 name = "domain"
 version = "0.1.0"
 dependencies = [
- "auth",
  "chrono",
  "serde",
  "serde_json",
@@ -947,6 +947,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "uuid",
 ]

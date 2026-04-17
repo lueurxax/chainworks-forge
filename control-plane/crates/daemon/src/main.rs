@@ -106,15 +106,7 @@ async fn main() -> Result<()> {
     );
 
     // 11. Load principal table (auto-bootstraps if missing)
-    let principals_path = std::env::var("CHAINWORKS_AUTH_PRINCIPALS_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".chainworks")
-                .join("auth")
-                .join("principals.json")
-        });
+    let principals_path = principals_path_from_env()?;
     let principal_table = auth::PrincipalTable::load_or_bootstrap(&principals_path)?;
     info!("Principal table loaded from {}", principals_path.display());
 
@@ -151,9 +143,39 @@ async fn main() -> Result<()> {
                 mcp_routes,
                 principal_table,
             )
-                .await?;
+            .await?;
         }
     }
 
     Ok(())
+}
+
+fn principals_path_from_env() -> Result<std::path::PathBuf> {
+    match std::env::var("CHAINWORKS_AUTH_PRINCIPALS_PATH") {
+        Ok(value) if value.trim().is_empty() => {
+            anyhow::bail!("CHAINWORKS_AUTH_PRINCIPALS_PATH must not be empty")
+        }
+        Ok(value) => Ok(std::path::PathBuf::from(value)),
+        Err(_) => Ok(dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".chainworks")
+            .join("auth")
+            .join("principals.json")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_principals_path_rejects_empty_env() {
+        std::env::set_var("CHAINWORKS_AUTH_PRINCIPALS_PATH", "");
+        let result = super::principals_path_from_env();
+        std::env::remove_var("CHAINWORKS_AUTH_PRINCIPALS_PATH");
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+    }
 }

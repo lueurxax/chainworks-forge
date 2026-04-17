@@ -8,13 +8,15 @@ use tracing::{error, info};
 use db::repos::{agent_executions, projections, runs, stages};
 use engine::command_handler::CommandHandler;
 
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpTool};
+use crate::protocol::JsonRpcRequest;
+use crate::protocol::JsonRpcResponse;
+use crate::protocol::McpTool;
 use crate::tools;
+use domain::ResourceTemplateId;
 
 pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
-    tool_specs: Vec<McpTool>,
     pub principal_table: auth::PrincipalTable,
 }
 
@@ -24,18 +26,9 @@ impl McpServer {
         cmd_handler: Arc<CommandHandler>,
         principal_table: auth::PrincipalTable,
     ) -> Self {
-        let mut specs = Vec::new();
-        specs.extend(tools::ideas::tool_specs());
-        specs.extend(tools::runs::tool_specs());
-        specs.extend(tools::approvals::tool_specs());
-        specs.extend(tools::stages::tool_specs());
-        specs.extend(tools::reports::tool_specs());
-        specs.extend(tools::steward::tool_specs());
-
         Self {
             pool,
             cmd_handler,
-            tool_specs: specs,
             principal_table,
         }
     }
@@ -116,7 +109,7 @@ impl McpServer {
                             let resp = JsonRpcResponse::error(
                                 request.id.clone(),
                                 -32000,
-                                "unauthorized".to_string(),
+                                "unauthorized: unknown token".to_string(),
                             );
                             if let Ok(json) = serde_json::to_string(&resp) {
                                 let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
@@ -128,7 +121,7 @@ impl McpServer {
                         let resp = JsonRpcResponse::error(
                             request.id.clone(),
                             -32000,
-                            "unauthorized: missing principal_token in clientInfo".to_string(),
+                            "unauthorized: principal_token required on initialize".to_string(),
                         );
                         if let Ok(json) = serde_json::to_string(&resp) {
                             let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
@@ -145,13 +138,13 @@ impl McpServer {
                 None => {
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
-                        -32000,
-                        "unauthorized: session not initialized".to_string(),
+                        -32002,
+                        "server not initialized".to_string(),
                     );
                     if let Ok(json) = serde_json::to_string(&resp) {
                         let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
                     }
-                    continue;
+                    break;
                 }
             };
 
@@ -193,9 +186,8 @@ impl McpServer {
 
             "tools/list" => {
                 let tools_json: Vec<serde_json::Value> = self
-                    .tool_specs
-                    .iter()
-                    .filter(|t| auth::is_tool_allowed(principal, &t.name))
+                    .visible_tool_specs(principal)
+                    .into_iter()
                     .map(|t| {
                         serde_json::json!({
                             "name": t.name,
@@ -217,7 +209,15 @@ impl McpServer {
                     }
                 };
 
-                if !auth::is_tool_allowed(principal, &tool_name) {
+                let Some(tool_id) = tools::capability_id_for(&tool_name) else {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        format!("Method not found: {tool_name}"),
+                    );
+                };
+
+                if !principal.tool_capabilities.contains(&tool_id) {
                     return JsonRpcResponse::error(
                         id,
                         -32601,
@@ -246,77 +246,11 @@ impl McpServer {
                 // Primary scheme matches the proposal contract:
                 //   run://{id}  idea://{id}  artifact://{id}  report://{run_id}
                 // The chainworks:// family is also kept for backward compatibility.
-                let all_resources = vec![
-                    // ── Proposal-spec URI family (P027 §8.1) ──────────────
-                    serde_json::json!({
-                        "uri": "run://{run_id}",
-                        "name": "Run",
-                        "description": "Full canonical state for a single workflow run",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "idea://{idea_id}",
-                        "name": "Idea",
-                        "description": "A single idea and its metadata",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "artifact://{artifact_id}",
-                        "name": "Artifact",
-                        "description": "A single artifact produced by an agent stage",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "report://{run_id}",
-                        "name": "Run Report",
-                        "description": "Execution report for a run: completed stages, artifacts, and decoded validation-failure payloads",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "steward-analysis://{analysis_id}",
-                        "name": "Steward Analysis",
-                        "description": "Persisted Steward analysis, run links, and recommendations",
-                        "mimeType": "application/json"
-                    }),
-                    // ── chainworks:// family (collection surfaces) ─────────
-                    serde_json::json!({
-                        "uri": "chainworks://runs",
-                        "name": "Active Runs",
-                        "description": "All workflow runs tracked by the daemon (projection-backed)",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "chainworks://ideas",
-                        "name": "Ideas",
-                        "description": "Idea backlog items",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "chainworks://approvals/inbox",
-                        "name": "Approval Inbox",
-                        "description": "Pending stage approvals from the approval_inbox projection",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "chainworks://runs/{run_id}/stages",
-                        "name": "Stage Executions",
-                        "description": "Stage list for a run (stage_summaries projection)",
-                        "mimeType": "application/json"
-                    }),
-                    serde_json::json!({
-                        "uri": "chainworks://runs/{run_id}/artifacts",
-                        "name": "Artifacts",
-                        "description": "Artifact list for a run (artifact_index projection)",
-                        "mimeType": "application/json"
-                    }),
-                ];
-
-                let filtered: Vec<_> = all_resources
-                    .into_iter()
-                    .filter(|r| {
-                        auth::is_resource_allowed(principal, r["uri"].as_str().unwrap_or(""))
-                    })
-                    .collect();
+                let filtered: Vec<_> =
+                    auth::filter_resources(principal, &auth::all_resource_templates())
+                        .into_iter()
+                        .map(resource_template_value)
+                        .collect();
 
                 JsonRpcResponse::success(id, serde_json::json!({ "resources": filtered }))
             }
@@ -338,7 +272,8 @@ impl McpServer {
                         )
                     }
                 };
-                if !auth::is_resource_allowed(principal, &uri) {
+                if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
+                {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
                 }
                 self.handle_resource_read(id, &uri).await
@@ -356,6 +291,14 @@ impl McpServer {
                 JsonRpcResponse::error(id, -32601, format!("Method not found: {method}"))
             }
         }
+    }
+
+    fn visible_tool_specs(&self, principal: &auth::Principal) -> Vec<McpTool> {
+        let ids = tools::all_capability_tool_ids();
+        auth::filter_tools(principal, &ids)
+            .into_iter()
+            .map(tools::mcp_tool_for)
+            .collect()
     }
 
     async fn handle_resource_read(
@@ -380,7 +323,6 @@ impl McpServer {
     }
 
     async fn read_resource(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
-        // ── Proposal-spec URI scheme (P027 §8.1) ─────────────────────────────
         if let Some(run_id) = uri.strip_prefix("run://") {
             return self.read_canonical_run_resource(run_id).await;
         }
@@ -425,7 +367,6 @@ impl McpServer {
         }
 
         if let Some(run_id) = uri.strip_prefix("report://") {
-            // Run report: projection summary + completed stages + their artifacts.
             let run_proj = projections::find_run_projection(&self.pool, run_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
@@ -471,7 +412,6 @@ impl McpServer {
             }));
         }
 
-        // ── chainworks:// collection surfaces ────────────────────────────────
         if uri == "chainworks://runs" {
             let rows = projections::list_active_projection(&self.pool).await?;
             return Ok(serde_json::to_value(rows)?);
@@ -575,6 +515,147 @@ impl McpServer {
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
+    }
+}
+
+fn resource_template_id_for_uri(uri: &str) -> Option<ResourceTemplateId> {
+    auth::all_resource_templates()
+        .into_iter()
+        .find(|id| uri_matches_template(uri, resource_template_uri(*id)))
+}
+
+fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
+    match id {
+        ResourceTemplateId::RunEntity => "run://{run_id}",
+        ResourceTemplateId::IdeaEntity => "idea://{idea_id}",
+        ResourceTemplateId::ArtifactEntity => "artifact://{artifact_id}",
+        ResourceTemplateId::ReportEntity => "report://{run_id}",
+        ResourceTemplateId::StewardAnalysisEntity => "steward-analysis://{analysis_id}",
+        ResourceTemplateId::ChainworksRuns => "chainworks://runs",
+        ResourceTemplateId::ChainworksIdeas => "chainworks://ideas",
+        ResourceTemplateId::ChainworksApprovalsInbox => "chainworks://approvals/inbox",
+        ResourceTemplateId::ChainworksRunStages => "chainworks://runs/{run_id}/stages",
+        ResourceTemplateId::ChainworksRunArtifacts => "chainworks://runs/{run_id}/artifacts",
+        _ => "unsupported://resource-template",
+    }
+}
+
+fn uri_matches_template(uri: &str, template: &str) -> bool {
+    if let Some(prefix) = template.strip_suffix("{run_id}") {
+        return uri.starts_with(prefix) && uri.len() > prefix.len();
+    }
+    if let Some(prefix) = template.strip_suffix("{idea_id}") {
+        return uri.starts_with(prefix) && uri.len() > prefix.len();
+    }
+    if let Some(prefix) = template.strip_suffix("{artifact_id}") {
+        return uri.starts_with(prefix) && uri.len() > prefix.len();
+    }
+    if let Some(prefix) = template.strip_suffix("{analysis_id}") {
+        return uri.starts_with(prefix) && uri.len() > prefix.len();
+    }
+    if template.ends_with("://") {
+        return uri.starts_with(template);
+    }
+    if uri == template {
+        return true;
+    }
+    let t_parts: Vec<&str> = template.split('/').collect();
+    let u_parts: Vec<&str> = uri.split('/').collect();
+    if t_parts.len() != u_parts.len() {
+        return false;
+    }
+    t_parts
+        .iter()
+        .zip(u_parts.iter())
+        .all(|(t, u)| t.starts_with('{') && t.ends_with('}') || t == u)
+}
+
+fn resource_template_value(id: ResourceTemplateId) -> serde_json::Value {
+    match id {
+        ResourceTemplateId::RunEntity => serde_json::json!({
+            "uri": "run://{run_id}",
+            "name": "Run",
+            "description": "Full canonical state for a single workflow run",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::IdeaEntity => serde_json::json!({
+            "uri": "idea://{idea_id}",
+            "name": "Idea",
+            "description": "A single idea and its metadata",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ArtifactEntity => serde_json::json!({
+            "uri": "artifact://{artifact_id}",
+            "name": "Artifact",
+            "description": "A single artifact produced by an agent stage",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ReportEntity => serde_json::json!({
+            "uri": "report://{run_id}",
+            "name": "Run Report",
+            "description": "Execution report for a run: completed stages, artifacts, and decoded validation-failure payloads",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::StewardAnalysisEntity => serde_json::json!({
+            "uri": "steward-analysis://{analysis_id}",
+            "name": "Steward Analysis",
+            "description": "Persisted Steward analysis, run links, and recommendations",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ChainworksRuns => serde_json::json!({
+            "uri": "chainworks://runs",
+            "name": "Active Runs",
+            "description": "All workflow runs tracked by the daemon (projection-backed)",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ChainworksIdeas => serde_json::json!({
+            "uri": "chainworks://ideas",
+            "name": "Ideas",
+            "description": "Idea backlog items",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ChainworksApprovalsInbox => serde_json::json!({
+            "uri": "chainworks://approvals/inbox",
+            "name": "Approval Inbox",
+            "description": "Pending stage approvals from the approval_inbox projection",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ChainworksRunStages => serde_json::json!({
+            "uri": "chainworks://runs/{run_id}/stages",
+            "name": "Stage Executions",
+            "description": "Stage list for a run (stage_summaries projection)",
+            "mimeType": "application/json"
+        }),
+        ResourceTemplateId::ChainworksRunArtifacts => serde_json::json!({
+            "uri": "chainworks://runs/{run_id}/artifacts",
+            "name": "Artifacts",
+            "description": "Artifact list for a run (artifact_index projection)",
+            "mimeType": "application/json"
+        }),
+        _ => serde_json::json!({
+            "uri": resource_template_uri(id),
+            "name": "Unsupported resource template",
+            "description": "Unsupported resource template",
+            "mimeType": "application/json"
+        }),
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_resource_uri_parser_maps_templates_at_server_boundary() {
+        assert_eq!(
+            resource_template_id_for_uri("run://run-1"),
+            Some(ResourceTemplateId::RunEntity)
+        );
+        assert_eq!(
+            resource_template_id_for_uri("chainworks://runs/run-1/artifacts"),
+            Some(ResourceTemplateId::ChainworksRunArtifacts)
+        );
+        assert_eq!(resource_template_id_for_uri("workflow://wf-1"), None);
     }
 }
 

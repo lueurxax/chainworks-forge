@@ -1,4 +1,4 @@
-# Proposal 027: Go + Temporal Control Plane Extraction
+# Proposal 1000: Go + Temporal Control Plane Extraction
 
 | Field | Value |
 |---|---|

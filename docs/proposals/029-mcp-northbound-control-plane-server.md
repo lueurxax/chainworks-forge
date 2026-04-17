@@ -44,7 +44,7 @@ The items in this section are already implemented and must not be treated as P02
 | `approvals` | `list`, `resolve` | `mcp-server/src/tools/approvals.rs` |
 | `stages` | `retry` | `mcp-server/src/tools/stages.rs` |
 | `reports` | `get` | `mcp-server/src/tools/reports.rs` |
-| `steward` | `run_analysis`, `list_analyses`, `get_analysis` | `mcp-server/src/tools/steward.rs` (added by Proposal 049) |
+| `steward` | `run_analysis`, `list_analyses`, `get_analysis` | `mcp-server/src/tools/steward.rs`; runtime contract documented in [steward-analysis-system.md](../reference/steward-analysis-system.md) |
 
 **Command vs. direct tools.** Not all tools converge on `engine::command_handler::CommandHandler`. The tool set divides into two categories:
 
@@ -61,7 +61,7 @@ Entity URIs (verified at `mcp-server/src/server.rs`):
 - `idea://{id}`
 - `artifact://{id}`
 - `report://{id}`
-- `steward-analysis://{analysis_id}` — registered at [`mcp-server/src/server.rs:276`](../../control-plane/crates/mcp-server/src/server.rs) by Proposal 049; read path at [`server.rs:460`](../../control-plane/crates/mcp-server/src/server.rs) loads from the `steward` repo (`find_analysis`, `list_run_links`, `list_recommendations`).
+- `steward-analysis://{analysis_id}` — registered at [`mcp-server/src/server.rs:276`](../../control-plane/crates/mcp-server/src/server.rs); read path at [`server.rs:460`](../../control-plane/crates/mcp-server/src/server.rs) loads from the `steward` repo (`find_analysis`, `list_run_links`, `list_recommendations`). The stable Steward readback contract is documented in [steward-analysis-system.md](../reference/steward-analysis-system.md).
 
 Collection URIs (verified at `mcp-server/src/server.rs:178-202`, all registered in the `chainworks://` family):
 
@@ -321,7 +321,7 @@ GraphQL today is mounted with bare `GraphQL::new(schema.clone())` at [`server.rs
 
   1. **Credential source:** the `connection_init` message must include `{ "Authorization": "Bearer <token>" }` in its payload. This is the **only** credential source for WebSocket subscriptions — HTTP upgrade headers are not inspected for auth on the `/graphql/ws` route.
   2. **Verification timing:** `on_connection_init` fires after the WebSocket opens and before any subscription resolvers run. `auth_layer.rs::resolve_bearer` is called on the extracted token. On success, the resolved `Principal` is injected into the subscription's `async_graphql::Data`.
-  3. **Error / close behavior:** if `connection_init` is absent, has no `Authorization` field, or the token is unresolvable, the handler returns a `connection_error` with `{ "message": "unauthorized" }`. The server then sends a WebSocket close frame with status 4401 (application-defined). No subscription resolver fires.
+  3. **Error / close behavior:** if `connection_init` is absent, has no `Authorization` field, or the token is unresolvable, the handler returns `async_graphql::Error("unauthorized")`. With the active `async-graphql` WebSocket implementation this maps to a `graphql-ws` close frame with status 1002 and reason `unauthorized`; the legacy `graphql-transport-ws` path emits a `connection_error` carrying the same message. No subscription resolver fires. A custom 4401 close code is deliberately not implemented in P029 because `async_graphql::http::WebSocket::on_connection_init` does not expose close-code selection.
   4. **Per-subscription capability:** if the resolved principal's class does not permit a subscription's data (e.g. `observer` cannot subscribe to mutation-level events), the resolver returns an `async_graphql` error stream. Declaring the per-subscription capability table is owned by the "northbound capability policy hardening" future proposal (§3.4). First wave in P029: all authenticated principals can subscribe to all subscriptions.
 
   **Tests (added to §9 inventory):**

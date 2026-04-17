@@ -69,7 +69,8 @@ pub async fn execute(
             match commanded.result {
                 CommandResult::StewardAnalysisQueued => Ok(serde_json::json!({
                     "queued": true,
-                    "kind": "steward_analysis"
+                    "kind": "steward_analysis",
+                    "journal_id": commanded.journal_id,
                 })),
                 _ => Err(anyhow::anyhow!("Unexpected command result")),
             }
@@ -145,10 +146,7 @@ mod tests {
     }
 
     fn test_principal() -> auth::Principal {
-        auth::Principal {
-            id: "test-operator".into(),
-            class: auth::PrincipalClass::Operator,
-        }
+        auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
     #[tokio::test]

@@ -2,6 +2,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{IdeaId, RunId};
 
+// ── P029: Canonical PrincipalClass definition (owned by domain) ────────
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalClass {
+    Operator,
+    Agent,
+    Observer,
+}
+
+impl std::fmt::Display for PrincipalClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrincipalClass::Operator => write!(f, "operator"),
+            PrincipalClass::Agent => write!(f, "agent"),
+            PrincipalClass::Observer => write!(f, "observer"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     StartRun(StartRunCmd),
@@ -83,16 +103,12 @@ impl std::fmt::Display for CallerSurface {
 pub struct CallerContext {
     pub surface: CallerSurface,
     pub principal_id: String,
-    pub principal_class: auth::PrincipalClass,
+    pub principal_class: PrincipalClass,
     pub caller_tool: String,
 }
 
 impl CallerContext {
-    pub fn mcp(
-        principal_id: &str,
-        principal_class: &auth::PrincipalClass,
-        tool_name: &str,
-    ) -> Self {
+    pub fn mcp(principal_id: &str, principal_class: &PrincipalClass, tool_name: &str) -> Self {
         CallerContext {
             surface: CallerSurface::Mcp,
             principal_id: principal_id.to_string(),
@@ -103,7 +119,7 @@ impl CallerContext {
 
     pub fn graphql(
         principal_id: &str,
-        principal_class: &auth::PrincipalClass,
+        principal_class: &PrincipalClass,
         mutation_name: &str,
     ) -> Self {
         CallerContext {
@@ -122,7 +138,7 @@ impl CallerContext {
         CallerContext {
             surface: CallerSurface::Mcp,
             principal_id: "test-operator".to_string(),
-            principal_class: auth::PrincipalClass::Operator,
+            principal_class: PrincipalClass::Operator,
             caller_tool: "test".to_string(),
         }
     }

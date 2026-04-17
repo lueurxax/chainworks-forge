@@ -573,6 +573,15 @@ MCP northbound auth, capability filtering, and audit journaling gate.
 
 Scope:
 
+- Typed capability/resource IDs are owned in `domain` and carried on `auth::Principal`
+- `auth::filter_tools`, `auth::filter_resources`, and `auth::match_resource_uri` consume typed IDs/templates rather than string-only tool specs
+- MCP tool registration crosses the northbound boundary through `CapabilityToolId` converters
+- MCP HTTP rejects missing and unknown bearer tokens
+- MCP stdio rejects pre-initialize non-`initialize` frames, missing `principal_token`, and unknown `principal_token`
+- MCP resource URI parsing is owned at the `mcp-server` boundary before auth checks typed `ResourceTemplateId`
+- GraphQL mutations cross the northbound boundary through a `MutationName -> CapabilityToolId` converter
+- GraphQL HTTP route tests prove the auth middleware principal reaches `async_graphql::Context`
+- GraphQL WebSocket `connection_init` tests prove missing/unknown token rejection and valid-token data injection
 - Bearer auth on MCP HTTP, MCP stdio (initialize), and GraphQL
 - Per-principal tool/resource capability filtering (operator/agent/observer classes)
 - command_journal caller tracking (caller_surface, caller_principal_id, caller_principal_class, caller_tool)
@@ -588,7 +597,7 @@ Command:
 
 ### `proposal-048|p048`
 
-Evidence packs, delivery preflight, and MCP resolution gate.
+Failed-stage evidence, delivery preflight, and MCP resolution gate for the Rust control-plane slice.
 
 Scope:
 
@@ -608,7 +617,7 @@ Scope:
 Use when:
 
 - changing delivery preflight, failed-stage evidence, MCP resolution, ACP MCP payloads, GraphQL blocked-start shape, or MCP report/resource readback
-- reproving the proposal-048 control-plane slice before implementation audit
+- reproving the implemented failed-stage evidence, delivery-preflight, and MCP-resolution control-plane slice
 
 Host policy:
 
@@ -643,10 +652,10 @@ Command:
 
 Important:
 
-- this gate is the canonical proof path for [048-evidence-packs-delivery-preflight-and-mcp-resolution.md](../proposals/048-evidence-packs-delivery-preflight-and-mcp-resolution.md)
-- the runner also accepts the `p048` alias for parity with other proposal gates
-- the runner also accepts the `p049` alias
-- `cargo test --workspace` is not a substitute for this gate because the gate documents the proposal-owned proof inventory
+- `proposal-048` is the canonical proof path for [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md)
+- `proposal-049` is the canonical proof path for [steward-analysis-system.md](steward-analysis-system.md)
+- the runner also accepts the `p048` and `p049` aliases
+- `cargo test --workspace` is not a substitute for these gates because each gate documents its subsystem-owned proof inventory
 
 ### `full`
 

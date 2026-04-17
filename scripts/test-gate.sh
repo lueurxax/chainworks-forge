@@ -1446,6 +1446,26 @@ case "$GATE" in
     log "Proposal 029-MCP control-plane gate: auth + capability + audit"
     (
       cd "$ROOT_DIR/control-plane"
+      cargo test -p auth principal_carries_typed_capability_sets -- --nocapture &&
+      cargo test -p auth typed_filters_and_resource_match_share_principal_sets -- --nocapture &&
+      cargo test -p mcp-server test_mcp_http_rejects_missing_authorization_header -- --nocapture &&
+      cargo test -p mcp-server test_mcp_http_rejects_unknown_bearer_token -- --nocapture &&
+      cargo test -p mcp-server mcp_tool_converter_covers_registered_tools -- --nocapture &&
+      cargo test -p mcp-server test_mcp_resource_uri_parser_maps_templates_at_server_boundary -- --nocapture &&
+      cargo test -p graphql-server mutation_name_converter_covers_command_mutations -- --nocapture &&
+      cargo test -p graphql-server test_graphql_rejects_missing_authorization_header -- --nocapture &&
+      cargo test -p graphql-server test_graphql_rejects_unknown_bearer_token -- --nocapture &&
+      cargo test -p graphql-server test_graphql_mutation_reads_principal_from_context -- --nocapture &&
+      cargo test -p graphql-server test_graphql_observer_class_cannot_invoke_start_run -- --nocapture &&
+      cargo test -p graphql-server test_graphql_ws_rejects_missing_connection_init_auth -- --nocapture &&
+      cargo test -p graphql-server test_graphql_ws_rejects_unknown_connection_init_token -- --nocapture &&
+      cargo test -p graphql-server test_graphql_ws_accepts_valid_connection_init_token -- --nocapture &&
+      cargo test -p daemon test_mcp_stdio_rejects_first_frame_other_than_initialize -- --nocapture &&
+      cargo test -p daemon test_mcp_stdio_rejects_initialize_without_principal_token -- --nocapture &&
+      cargo test -p daemon test_mcp_stdio_rejects_initialize_with_unknown_principal_token -- --nocapture &&
+      cargo test -p daemon test_mcp_stdio_binds_principal_for_session_lifetime -- --nocapture &&
+      cargo test -p daemon test_mcp_stdio_rejects_reinitialize_mid_session -- --nocapture &&
+      cargo test -p daemon test_principals_path_rejects_empty_env -- --nocapture &&
       cargo test --workspace 2>&1
     )
     log "Proposal 029-MCP control-plane gate passed"

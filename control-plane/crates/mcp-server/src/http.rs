@@ -138,3 +138,66 @@ fn json_response(
         .body(Body::from(json))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use db::pool::create_pool;
+    use engine::command_handler::CommandHandler;
+    use engine::event_bus;
+    use engine::work_queue::WorkQueue;
+
+    #[tokio::test]
+    async fn test_mcp_http_rejects_missing_authorization_header() {
+        let mcp = test_server().await;
+        let response = handle_mcp_post(
+            State(mcp),
+            HeaderMap::new(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["error"]["code"], -32000);
+        assert_eq!(json["error"]["message"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_http_rejects_unknown_bearer_token() {
+        let mcp = test_server().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer bad-token".parse().unwrap());
+        let response = handle_mcp_post(
+            State(mcp),
+            headers,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["error"]["code"], -32000);
+        assert_eq!(json["error"]["message"], "unauthorized");
+    }
+
+    async fn test_server() -> Arc<McpServer> {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let events = event_bus::new_bus(64);
+        let work_queue = WorkQueue::new(pool.clone());
+        let command_handler = Arc::new(CommandHandler::new(pool.clone(), events, work_queue));
+        Arc::new(McpServer::new(
+            pool,
+            command_handler,
+            auth::PrincipalTable::test_fixture(),
+        ))
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}

@@ -18,6 +18,7 @@ Historical reference material that is no longer part of the canonical runtime ar
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
+- [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
 - [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families, and persisted runtime truth
 - [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](030-acp-second-wave-runtime-profiles-codex-auggie-junie.md) — Second-wave ACP profile governance
 - [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](033-remove-goose-from-canonical-transport-and-simplify-runtime.md) — ACP canonical transport simplification and settings compatibility path
@@ -63,6 +64,7 @@ Historical reference material that is no longer part of the canonical runtime ar
 ## System Health
 
 - [forge-steward.md](forge-steward.md) — Forge Steward V1 (Observer): deterministic metrics, anomaly detection, cohorting, dossier building, trigger mechanisms
+- [steward-analysis-system.md](steward-analysis-system.md) — Rust Steward implementation: frozen cohort owners, deterministic analysis, active-catalog IO, triggers, persistence, and northbound readback
 
 ## Risk Analysis
 

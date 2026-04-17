@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
+
+// P029: PrincipalClass is canonically defined in domain::commands.
+// Re-export here so downstream crates that use auth::PrincipalClass keep working.
+pub use domain::{CapabilityToolId, PrincipalClass, ResourceTemplateId};
 
 // ── Principal types ─────────────────────────────────────────────────────
 
@@ -7,22 +12,21 @@ use std::path::Path;
 pub struct Principal {
     pub id: String,
     pub class: PrincipalClass,
+    #[serde(default)]
+    pub tool_capabilities: BTreeSet<CapabilityToolId>,
+    #[serde(default)]
+    pub resource_capabilities: BTreeSet<ResourceTemplateId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum PrincipalClass {
-    Operator,
-    Agent,
-    Observer,
-}
-
-impl std::fmt::Display for PrincipalClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PrincipalClass::Operator => write!(f, "operator"),
-            PrincipalClass::Agent => write!(f, "agent"),
-            PrincipalClass::Observer => write!(f, "observer"),
+impl Principal {
+    pub fn new(id: impl Into<String>, class: PrincipalClass) -> Self {
+        let tool_capabilities = default_tool_capabilities(&class);
+        let resource_capabilities = default_resource_capabilities(&class);
+        Self {
+            id: id.into(),
+            class,
+            tool_capabilities,
+            resource_capabilities,
         }
     }
 }
@@ -109,14 +113,28 @@ impl PrincipalTable {
             }
             let json = serde_json::to_string_pretty(&file)
                 .map_err(|e| AuthError::TableLoadFailed(format!("serialize: {e}")))?;
-            std::fs::write(path, &json).map_err(|e| {
-                AuthError::TableLoadFailed(format!("write {}: {e}", path.display()))
-            })?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                std::fs::set_permissions(path, perms).ok();
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|e| {
+                        AuthError::TableLoadFailed(format!("create {}: {e}", path.display()))
+                    })?;
+                file.write_all(json.as_bytes()).map_err(|e| {
+                    AuthError::TableLoadFailed(format!("write {}: {e}", path.display()))
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(path, &json).map_err(|e| {
+                    AuthError::TableLoadFailed(format!("write {}: {e}", path.display()))
+                })?;
             }
             tracing::info!(
                 path = %path.display(),
@@ -137,10 +155,7 @@ pub fn resolve_bearer(token: &str, table: &PrincipalTable) -> Result<Principal, 
         .entries
         .iter()
         .find(|e| e.token == token)
-        .map(|e| Principal {
-            id: e.id.clone(),
-            class: e.class.clone(),
-        })
+        .map(|e| Principal::new(e.id.clone(), e.class.clone()))
         .ok_or(AuthError::UnknownToken)
 }
 
@@ -161,182 +176,209 @@ pub fn extract_bearer_token(header_value: &str) -> Result<&str, AuthError> {
 
 // ── Capability filtering ────────────────────────────────────────────────
 
-/// Tool spec for capability filtering. Just needs a name.
-pub struct ToolSpec {
-    pub name: String,
+pub fn filter_tools(principal: &Principal, ids: &[CapabilityToolId]) -> Vec<CapabilityToolId> {
+    ids.iter()
+        .copied()
+        .filter(|id| principal.tool_capabilities.contains(id))
+        .collect()
 }
 
-/// Filter tools based on principal class.
-pub fn filter_tools(principal: &Principal, specs: &[ToolSpec]) -> Vec<String> {
-    let allowed = allowed_tools_for_class(&principal.class);
-    specs
-        .iter()
-        .filter(|s| allowed.contains(&s.name.as_str()))
-        .map(|s| s.name.clone())
+pub fn filter_resources(
+    principal: &Principal,
+    ids: &[ResourceTemplateId],
+) -> Vec<ResourceTemplateId> {
+    ids.iter()
+        .copied()
+        .filter(|id| principal.resource_capabilities.contains(id))
         .collect()
 }
 
 /// Check if a specific tool is allowed for a principal.
 pub fn is_tool_allowed(principal: &Principal, tool_name: &str) -> bool {
-    allowed_tools_for_class(&principal.class).contains(&tool_name)
+    let Some(id) = capability_tool_id_for_name(tool_name) else {
+        return false;
+    };
+    principal.tool_capabilities.contains(&id)
 }
 
-fn allowed_tools_for_class(class: &PrincipalClass) -> &'static [&'static str] {
+fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolId> {
     match class {
-        PrincipalClass::Operator => &[
-            "ideas.create",
-            "ideas.list",
-            "runs.start",
-            "runs.list",
-            "runs.get",
-            "runs.cancel",
-            "approvals.list",
-            "approvals.resolve",
-            "stages.retry",
-            "reports.get",
-            "steward.run_analysis",
-            "steward.list_analyses",
-            "steward.get_analysis",
-        ],
-        PrincipalClass::Agent => &[
-            "ideas.create",
-            "ideas.list",
-            "runs.start",
-            "runs.list",
-            "runs.get",
-            "reports.get",
-            "steward.list_analyses",
-            "steward.get_analysis",
-        ],
-        PrincipalClass::Observer => &[
-            "ideas.list",
-            "runs.list",
-            "runs.get",
-            "approvals.list",
-            "reports.get",
-            "steward.list_analyses",
-            "steward.get_analysis",
-        ],
+        PrincipalClass::Operator => [
+            CapabilityToolId::IdeasCreate,
+            CapabilityToolId::IdeasList,
+            CapabilityToolId::RunsStart,
+            CapabilityToolId::RunsList,
+            CapabilityToolId::RunsGet,
+            CapabilityToolId::RunsCancel,
+            CapabilityToolId::ApprovalsList,
+            CapabilityToolId::ApprovalsResolve,
+            CapabilityToolId::StagesRetry,
+            CapabilityToolId::ReportsGet,
+            CapabilityToolId::StewardRunAnalysis,
+            CapabilityToolId::StewardListAnalyses,
+            CapabilityToolId::StewardGetAnalysis,
+        ]
+        .into_iter()
+        .collect(),
+        PrincipalClass::Agent => [
+            CapabilityToolId::IdeasCreate,
+            CapabilityToolId::IdeasList,
+            CapabilityToolId::RunsStart,
+            CapabilityToolId::RunsList,
+            CapabilityToolId::RunsGet,
+            CapabilityToolId::ReportsGet,
+        ]
+        .into_iter()
+        .collect(),
+        PrincipalClass::Observer => [
+            CapabilityToolId::IdeasList,
+            CapabilityToolId::RunsList,
+            CapabilityToolId::RunsGet,
+            CapabilityToolId::ApprovalsList,
+            CapabilityToolId::ReportsGet,
+            CapabilityToolId::StewardListAnalyses,
+            CapabilityToolId::StewardGetAnalysis,
+        ]
+        .into_iter()
+        .collect(),
     }
 }
 
 // ── Resource capability filtering ───────────────────────────────────────
 
-/// Resource URI templates that each class is allowed to access.
-fn allowed_resource_templates(class: &PrincipalClass) -> &'static [&'static str] {
+fn default_resource_capabilities(class: &PrincipalClass) -> BTreeSet<ResourceTemplateId> {
     match class {
-        PrincipalClass::Operator => &[
-            "run://",
-            "idea://",
-            "artifact://",
-            "report://",
-            "steward-analysis://",
-            "chainworks://runs",
-            "chainworks://ideas",
-            "chainworks://approvals/inbox",
-            "chainworks://runs/{run_id}/stages",
-            "chainworks://runs/{run_id}/artifacts",
-        ],
-        PrincipalClass::Agent => &[
-            "run://",
-            "idea://",
-            "artifact://",
-            "report://",
-            "steward-analysis://",
-            "chainworks://runs",
-            "chainworks://ideas",
-        ],
-        PrincipalClass::Observer => &[
-            "run://",
-            "idea://",
-            "report://",
-            "steward-analysis://",
-            "chainworks://runs",
-            "chainworks://ideas",
-            "chainworks://approvals/inbox",
-        ],
+        PrincipalClass::Operator => all_resource_templates().into_iter().collect(),
+        PrincipalClass::Agent => [
+            ResourceTemplateId::RunEntity,
+            ResourceTemplateId::IdeaEntity,
+            ResourceTemplateId::ArtifactEntity,
+            ResourceTemplateId::ReportEntity,
+            ResourceTemplateId::ChainworksRuns,
+            ResourceTemplateId::ChainworksIdeas,
+        ]
+        .into_iter()
+        .collect(),
+        PrincipalClass::Observer => all_resource_templates().into_iter().collect(),
     }
 }
 
-/// Check if a concrete resource URI matches the principal's allowed templates.
-/// Template matching: a concrete URI like "chainworks://runs/abc/artifacts"
-/// matches template "chainworks://runs/{run_id}/artifacts".
-pub fn is_resource_allowed(principal: &Principal, uri: &str) -> bool {
-    let templates = allowed_resource_templates(&principal.class);
-    for template in templates {
-        if uri_matches_template(uri, template) {
-            return true;
-        }
-    }
-    false
+pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
+    [
+        ResourceTemplateId::RunEntity,
+        ResourceTemplateId::IdeaEntity,
+        ResourceTemplateId::ArtifactEntity,
+        ResourceTemplateId::ReportEntity,
+        ResourceTemplateId::StewardAnalysisEntity,
+        ResourceTemplateId::ChainworksRuns,
+        ResourceTemplateId::ChainworksIdeas,
+        ResourceTemplateId::ChainworksApprovalsInbox,
+        ResourceTemplateId::ChainworksRunStages,
+        ResourceTemplateId::ChainworksRunArtifacts,
+    ]
 }
 
-fn uri_matches_template(uri: &str, template: &str) -> bool {
-    // Entity URIs: "run://abc-123" matches "run://"
-    if template.ends_with("://") {
-        return uri.starts_with(template);
+pub fn is_resource_allowed(principal: &Principal, id: ResourceTemplateId) -> bool {
+    principal.resource_capabilities.contains(&id)
+}
+
+pub fn match_resource_uri<F>(
+    principal: &Principal,
+    uri: &str,
+    classify_uri: F,
+) -> Option<ResourceTemplateId>
+where
+    F: FnOnce(&str) -> Option<ResourceTemplateId>,
+{
+    let id = classify_uri(uri)?;
+    principal.resource_capabilities.contains(&id).then_some(id)
+}
+
+fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
+    match name {
+        "ideas.create" => Some(CapabilityToolId::IdeasCreate),
+        "ideas.list" => Some(CapabilityToolId::IdeasList),
+        "runs.start" => Some(CapabilityToolId::RunsStart),
+        "runs.list" => Some(CapabilityToolId::RunsList),
+        "runs.get" => Some(CapabilityToolId::RunsGet),
+        "runs.cancel" => Some(CapabilityToolId::RunsCancel),
+        "approvals.list" => Some(CapabilityToolId::ApprovalsList),
+        "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
+        "stages.retry" => Some(CapabilityToolId::StagesRetry),
+        "reports.get" => Some(CapabilityToolId::ReportsGet),
+        "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
+        "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
+        "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
+        _ => None,
     }
-    // Exact match for simple collection URIs
-    if uri == template {
-        return true;
-    }
-    // Template with {param} placeholders — split and match segments
-    let t_parts: Vec<&str> = template.split('/').collect();
-    let u_parts: Vec<&str> = uri.split('/').collect();
-    if t_parts.len() != u_parts.len() {
-        return false;
-    }
-    t_parts
-        .iter()
-        .zip(u_parts.iter())
-        .all(|(t, u)| t.starts_with('{') && t.ends_with('}') || t == u)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::{CapabilityToolId, ResourceTemplateId};
 
     #[test]
-    fn entity_uri_matching() {
-        assert!(uri_matches_template("run://abc-123", "run://"));
-        assert!(uri_matches_template("idea://xyz", "idea://"));
-        assert!(!uri_matches_template("run://abc", "idea://"));
+    fn principal_carries_typed_capability_sets() {
+        let p = Principal::new("op", PrincipalClass::Operator);
+
+        assert!(p.tool_capabilities.contains(&CapabilityToolId::RunsStart));
+        assert!(p
+            .tool_capabilities
+            .contains(&CapabilityToolId::StewardRunAnalysis));
+        assert!(p
+            .resource_capabilities
+            .contains(&ResourceTemplateId::StewardAnalysisEntity));
     }
 
     #[test]
-    fn collection_uri_matching() {
-        assert!(uri_matches_template(
-            "chainworks://runs",
-            "chainworks://runs"
-        ));
-        assert!(!uri_matches_template(
-            "chainworks://runs",
-            "chainworks://ideas"
-        ));
+    fn typed_filters_and_resource_match_share_principal_sets() {
+        let observer = Principal::new("ob", PrincipalClass::Observer);
+        let filtered = filter_tools(
+            &observer,
+            &[
+                CapabilityToolId::RunsGet,
+                CapabilityToolId::RunsStart,
+                CapabilityToolId::StewardGetAnalysis,
+            ],
+        );
+
+        assert_eq!(
+            filtered,
+            vec![
+                CapabilityToolId::RunsGet,
+                CapabilityToolId::StewardGetAnalysis
+            ]
+        );
+        assert_eq!(
+            match_resource_uri(
+                &observer,
+                "server-owned-artifacts-uri",
+                test_resource_id_for_uri
+            ),
+            Some(ResourceTemplateId::ChainworksRunArtifacts)
+        );
+        assert_eq!(
+            match_resource_uri(
+                &Principal::new("ag", PrincipalClass::Agent),
+                "server-owned-steward-uri",
+                test_resource_id_for_uri
+            ),
+            None
+        );
     }
 
-    #[test]
-    fn template_param_matching() {
-        assert!(uri_matches_template(
-            "chainworks://runs/abc-123/artifacts",
-            "chainworks://runs/{run_id}/artifacts"
-        ));
-        assert!(uri_matches_template(
-            "chainworks://runs/abc-123/stages",
-            "chainworks://runs/{run_id}/stages"
-        ));
-        assert!(!uri_matches_template(
-            "chainworks://runs/abc-123/artifacts",
-            "chainworks://runs/{run_id}/stages"
-        ));
+    fn test_resource_id_for_uri(uri: &str) -> Option<ResourceTemplateId> {
+        match uri {
+            "server-owned-artifacts-uri" => Some(ResourceTemplateId::ChainworksRunArtifacts),
+            "server-owned-steward-uri" => Some(ResourceTemplateId::StewardAnalysisEntity),
+            _ => None,
+        }
     }
 
     #[test]
     fn operator_has_all_tools() {
-        let p = Principal {
-            id: "op".into(),
-            class: PrincipalClass::Operator,
-        };
+        let p = Principal::new("op", PrincipalClass::Operator);
         assert!(is_tool_allowed(&p, "runs.start"));
         assert!(is_tool_allowed(&p, "approvals.resolve"));
         assert!(is_tool_allowed(&p, "stages.retry"));
@@ -344,10 +386,7 @@ mod tests {
 
     #[test]
     fn agent_cannot_approve() {
-        let p = Principal {
-            id: "ag".into(),
-            class: PrincipalClass::Agent,
-        };
+        let p = Principal::new("ag", PrincipalClass::Agent);
         assert!(is_tool_allowed(&p, "runs.start"));
         assert!(!is_tool_allowed(&p, "approvals.resolve"));
         assert!(!is_tool_allowed(&p, "stages.retry"));
@@ -356,10 +395,7 @@ mod tests {
 
     #[test]
     fn observer_read_only() {
-        let p = Principal {
-            id: "ob".into(),
-            class: PrincipalClass::Observer,
-        };
+        let p = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_tool_allowed(&p, "runs.list"));
         assert!(is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
@@ -390,10 +426,7 @@ mod tests {
 
     #[test]
     fn operator_has_steward_tools() {
-        let p = Principal {
-            id: "op".into(),
-            class: PrincipalClass::Operator,
-        };
+        let p = Principal::new("op", PrincipalClass::Operator);
         assert!(is_tool_allowed(&p, "steward.run_analysis"));
         assert!(is_tool_allowed(&p, "steward.list_analyses"));
         assert!(is_tool_allowed(&p, "steward.get_analysis"));
@@ -401,31 +434,66 @@ mod tests {
 
     #[test]
     fn observer_has_read_only_steward_tools() {
-        let p = Principal {
-            id: "ob".into(),
-            class: PrincipalClass::Observer,
-        };
+        let p = Principal::new("ob", PrincipalClass::Observer);
         assert!(!is_tool_allowed(&p, "steward.run_analysis"));
         assert!(is_tool_allowed(&p, "steward.list_analyses"));
         assert!(is_tool_allowed(&p, "steward.get_analysis"));
     }
 
     #[test]
-    fn steward_analysis_resource_allowed_for_all_classes() {
-        let op = Principal {
-            id: "op".into(),
-            class: PrincipalClass::Operator,
-        };
-        let ag = Principal {
-            id: "ag".into(),
-            class: PrincipalClass::Agent,
-        };
-        let ob = Principal {
-            id: "ob".into(),
-            class: PrincipalClass::Observer,
-        };
-        assert!(is_resource_allowed(&op, "steward-analysis://some-id"));
-        assert!(is_resource_allowed(&ag, "steward-analysis://some-id"));
-        assert!(is_resource_allowed(&ob, "steward-analysis://some-id"));
+    fn steward_analysis_resource_policy() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(is_resource_allowed(
+            &op,
+            ResourceTemplateId::StewardAnalysisEntity
+        ));
+        assert!(!is_resource_allowed(
+            &ag,
+            ResourceTemplateId::StewardAnalysisEntity
+        ));
+        assert!(is_resource_allowed(
+            &ob,
+            ResourceTemplateId::StewardAnalysisEntity
+        ));
+    }
+
+    #[test]
+    fn agent_has_no_steward_tools() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        assert!(!is_tool_allowed(&ag, "steward.run_analysis"));
+        assert!(!is_tool_allowed(&ag, "steward.list_analyses"));
+        assert!(!is_tool_allowed(&ag, "steward.get_analysis"));
+    }
+
+    #[test]
+    fn observer_has_all_read_resources() {
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(is_resource_allowed(&ob, ResourceTemplateId::RunEntity));
+        assert!(is_resource_allowed(&ob, ResourceTemplateId::IdeaEntity));
+        assert!(is_resource_allowed(&ob, ResourceTemplateId::ArtifactEntity));
+        assert!(is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
+        assert!(is_resource_allowed(
+            &ob,
+            ResourceTemplateId::StewardAnalysisEntity
+        ));
+        assert!(is_resource_allowed(&ob, ResourceTemplateId::ChainworksRuns));
+        assert!(is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ChainworksIdeas
+        ));
+        assert!(is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ChainworksApprovalsInbox
+        ));
+        assert!(is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ChainworksRunStages
+        ));
+        assert!(is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ChainworksRunArtifacts
+        ));
     }
 }
