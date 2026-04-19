@@ -806,7 +806,7 @@ Add focused tests for:
 - research-gate preflight rejects missing or placeholder HTTP streaming feasibility artifact
 - MCP resolver refuses broker mode for providers not proven compatible by the research verdict
 - **provider capability preflight**: when `ProviderCapabilityCache` records `mcpCapabilities.http = false` for a runtime profile, `resolve_mcp_servers` returns a blocking issue before any lease is reserved; no HTTP endpoint is bound, no token is minted, no `session/new` is sent; `actual_mcp_observation_json` records `provider_http_mcp_unsupported`
-- capability probe caches `AgentCapabilities` per (adapter_family, binary_fingerprint) and invalidates on binary upgrade
+- capability probe caches `AgentCapabilities` per full `ProbeKey` (adapter family, runtime profile id, binary fingerprint, launch args fingerprint, capability-relevant launch env fingerprint, adapter settings fingerprint) and invalidates on any component change — not only binary upgrade
 - two concurrent Xcode lease requests serialize through the per-PID initialize Mutex and both complete a `tools/list` round-trip without interference
 - parallel `tools/call` requests on sibling leases do not serialize (lock is released after initialize)
 - each lease spawns its own `mcpbridge` subprocess; no backend sharing across leases
