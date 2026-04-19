@@ -218,7 +218,7 @@ struct ProbeKey {
 }
 ```
 
-`launch_env_fingerprint` covers an explicit allowlist of capability-relevant env vars (e.g., `CODEX_HOME`, `GEMINI_API_KEY` presence flag, `CLAUDE_AGENT_*` feature flags, `ACP_EXPERIMENTAL_*`) — never values for secrets, only a redacted/boolean fingerprint. `adapter_settings_fingerprint` covers the `AcpSessionConfig` knobs that alter provider behavior (mode, config options, structured-output intent). Any change in any of these forces a fresh probe.
+`launch_env_fingerprint` covers the `capability_env` subset of env vars (`PATH` excluding shim-dir prefix, `HOME`, `TMPDIR`, `DEVELOPER_DIR`, `CODEX_HOME`, `GEMINI_API_KEY` presence flag, `CLAUDE_AGENT_*` feature flags, `ACP_EXPERIMENTAL_*`) — never secret values, only redacted/boolean fingerprints. It does **not** include `credential_env` (shim token, shim socket, shim-dir `PATH` prefix), so rotating the shim token between reuses does not invalidate the capability cache. `adapter_settings_fingerprint` covers the `AcpSessionConfig` knobs that alter provider behavior (mode, config options, structured-output intent). Any change in any fingerprinted input forces a fresh probe.
 
 ```rust
 impl ProviderCapabilityProbe {
@@ -238,19 +238,56 @@ No public API in this module accepts a bare `ProbeKey` to spawn a process — ke
 
 **Preflight timing.** During `ExecutionRequest` construction, the caller first assembles a `ProviderLaunchSpec` (the exact launch shape a real `session/new` would use — binary path, argv, env, adapter settings, mode, config options), then asks `AcpRuntimeManager::ensure_provider_capabilities(&launch_spec)` for capabilities. The manager computes `ProbeKey::from(&launch_spec)` internally and returns the cached or freshly probed `AgentCapabilities`. This runs **before** `engine::mcp::resolve_mcp_servers` is called.
 
+**Capability env vs credential env.** Shim credentials (`$CHAINWORKS_XCODE_SHIM_TOKEN`, `$XCODE_SHIM_DISPATCH_SOCKET`, shim-dir `PATH` prefix) are minted **per provider session**. A capability probe runs before any provider session exists and before any lease is minted — if the probe were required to carry real shim credentials, we'd have to mint a token for a probe that might be rejected before ever reaching `session/new`, or generate inert placeholders that make the probe diverge from the real session. Both paths break either the lifecycle fail-closed rule or the byte-identical ProbeKey guarantee.
+
+P051 splits the launch env into two disjoint subsets:
+
+- **Capability env** (`capability_env`): env vars that could change provider-advertised capabilities — `PATH` (excluding shim-dir prefix), `HOME`, `TMPDIR`, `DEVELOPER_DIR`, `CODEX_HOME`, `ACP_EXPERIMENTAL_*`, and any other capability-gating variables declared in the adapter's allowlist. This subset is byte-identical between probe and real session, and it is the **only** env contribution to `ProbeKey`.
+- **Credential env** (`credential_env`): session-scoped credentials that do not influence provider capability advertisement — `CHAINWORKS_XCODE_SHIM_TOKEN`, `XCODE_SHIM_DISPATCH_SOCKET`, and the shim-dir `PATH` prefix. Present only in the real session's env; absent from the probe's env. Not fingerprinted in `ProbeKey`.
+
+The probe's actual subprocess env is exactly `capability_env`. The real session's subprocess env is `capability_env ⊕ credential_env` (merged with credential env taking precedence on key collision — only `PATH` would collide, where the shim-dir prefix is prepended).
+
 ```rust
 pub struct ProviderLaunchSpec {
     pub adapter_family: AdapterFamily,
     pub runtime_profile_id: RuntimeProfileId,
     pub binary_path: PathBuf,
     pub launch_args: Vec<String>,
-    pub launch_env: BTreeMap<String, String>,   // full env the real session will use
-    pub adapter_settings: AcpSessionConfig,     // mode, extra, config_options
+    pub capability_env: BTreeMap<String, String>,  // byte-identical across probe + session; feeds ProbeKey
+    pub credential_env: BTreeMap<String, String>,  // real-session only; NOT in ProbeKey; empty for probe
+    pub adapter_settings: AcpSessionConfig,        // mode, extra, config_options
 }
 
 impl ProviderLaunchSpec {
-    pub fn probe_key(&self) -> ProbeKey { /* derive fingerprints */ }
+    /// ProbeKey derives fingerprints from capability_env ONLY. credential_env is
+    /// intentionally excluded so shim token rotation across reuses does not
+    /// invalidate the capability cache.
+    pub fn probe_key(&self) -> ProbeKey { /* derive from capability_env + args + settings */ }
+
+    /// The env used to launch the capability-probe subprocess.
+    pub fn probe_env(&self) -> &BTreeMap<String, String> { &self.capability_env }
+
+    /// The env used to launch the real session subprocess.
+    pub fn session_env(&self) -> BTreeMap<String, String> {
+        // Merge credential_env over capability_env; PATH is the only known colliding key.
+        let mut merged = self.capability_env.clone();
+        for (k, v) in &self.credential_env {
+            match k.as_str() {
+                "PATH" => {
+                    // Prepend credential PATH (shim dir) onto capability PATH.
+                    if let Some(cap_path) = merged.get(k) {
+                        merged.insert(k.clone(), format!("{}:{}", v, cap_path));
+                    } else {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+                _ => { merged.insert(k.clone(), v.clone()); }
+            }
+        }
+        merged
+    }
 }
+```
 
 impl AcpRuntimeManager {
     pub async fn ensure_provider_capabilities(
@@ -326,7 +363,8 @@ let handle = adapter
 |---|---|---|
 | `launch_spec.binary_path` | same | same |
 | `launch_spec.launch_args` | same | same |
-| `launch_spec.launch_env` | same (including shim env) | same |
+| `launch_spec.capability_env` | same (no shim credentials) | same |
+| `launch_spec.credential_env` | empty `{}` | populated (`CHAINWORKS_XCODE_SHIM_TOKEN`, `XCODE_SHIM_DISPATCH_SOCKET`, shim-dir `PATH` prefix) — not fingerprinted |
 | `launch_spec.adapter_settings` | same | same |
 | `session_new_spec.mcpServers` | always `[]` | resolved list (may include broker HTTP entries) |
 | `session_new_spec.cwd` | frozen workspace root | frozen workspace root |
@@ -672,14 +710,23 @@ Tokens are **session-lifetime, not single-use**. Three distinct TTL concerns are
 | Concern | Field | Behavior |
 |---|---|---|
 | First-connect wait | `first_connect_deadline` | How long the broker waits for the provider to make its initial HTTP MCP connection after the `session/new` payload was delivered. Default 60 s. Exceeding this moves the lease to `orphaned` and releases it. |
-| Bound stream identity | `bound_stream_id` (set on first connect) | Once the provider's first HTTP stream is accepted, the broker records its connection id and considers the lease "bound to this stream." Subsequent requests on the **same** stream reuse the bearer without re-validation cost. |
-| Session lifetime | `expires_at` (= provider session's max lifetime, typically 24 h) | The bearer remains valid for the entire provider session, supporting reconnect on transport hiccup (e.g., the MCP `client.post` HTTP keep-alive dies). A reconnect presents the same bearer, which is **not** invalidated by the disconnect — only by provider-session close, `expires_at` passing, or explicit operator reset. |
+| MCP session binding | `bound_mcp_session_id` (set on first `initialize` response) | After the provider's first `initialize` succeeds, the broker records the `Mcp-Session-Id` header value returned to the provider and considers the lease bound to that MCP session. Subsequent requests must present both the bearer and the same `Mcp-Session-Id`. |
+| Single active stream | `active_stream_count` (integer, guarded by Mutex) | The broker allows **at most one active HTTP stream** on the lease at any time. A second concurrent HTTP connection presenting the same bearer is rejected (`xcode_mcp_concurrent_stream_rejected`) as long as `active_stream_count > 0`. On stream drop (connection close, FIN, timeout), the count is decremented and a reconnect becomes eligible. |
+| Session lifetime | `expires_at` (= provider session's max lifetime, typically 24 h) | The bearer remains valid for the entire provider session, supporting reconnect on transport hiccup. |
 
-**Reconnect / replay semantics:**
+**Why no peer-pid / peer-uid check on the HTTP bearer path.** Loopback TCP does not expose `LOCAL_PEERPID` (macOS) or `SO_PEERCRED` (Linux) — those APIs require Unix-domain sockets. All three provider adapters require HTTP streaming MCP via loopback TCP (per the feasibility research), and switching to UDS would break provider compatibility. Peer-credential derivation is therefore only available on the **Unix-domain shim dispatch socket** (§5.1.1), not on the HTTP broker path. The HTTP path relies on a different identity model:
 
-- If the bound stream drops and the provider reconnects with the same bearer within `expires_at`, the broker accepts the reconnect, issues a fresh `bound_stream_id`, and continues serving the same backend `mcpbridge` subprocess. This is the ordinary MCP Streamable HTTP reconnect case.
-- If a replay attacker presents the same bearer from a different process (different peer credentials, or a different `Mcp-Session-Id` on the MCP layer), the broker accepts the request only if (a) the peer is still the same provider subprocess pid as the original lease, or (b) this is a reconnect from a provider process that inherited the subprocess slot (rare, mostly theoretical). Cross-session-id reuse on the MCP protocol layer is rejected by MCP's own session-id handling.
-- The token is not single-use. Calling it "single-use" in any §9 or later wording is an error — replace with "session-lifetime, bound to the first accepted stream".
+1. **Bearer + MCP session-id binding.** Each request must present the lease's bearer in `Authorization: Bearer <token>` **and** the matching `Mcp-Session-Id` header that was issued at first `initialize`. A replayed bearer without the session-id (or with a forged/different session-id) is rejected by the broker or by MCP's own session-id validation — MCP Streamable HTTP session-ids are unique per `initialize` and the server enforces uniqueness.
+2. **Single-active-stream invariant.** At most one HTTP stream holds the lease at a time. A replay attempting to open a parallel stream with the same bearer is rejected. This collapses the concurrent-replay attack surface: an attacker who somehow observed the bearer (e.g., by also observing `credential_env` as a shell-capable agent) cannot open a second stream while the provider holds its own.
+3. **Lease expiry.** Bearer becomes invalid after `expires_at` or on provider-session close, whichever comes first.
+
+**Reconnect semantics (TCP-compatible):**
+
+- If the provider's HTTP stream drops and no other stream is active, `active_stream_count` falls to 0 and the broker accepts a reconnect that presents the same bearer **and** the same `Mcp-Session-Id`. A new stream is opened, `active_stream_count` becomes 1 again, the backend `mcpbridge` subprocess continues serving.
+- A reconnect that presents the same bearer but a **different** `Mcp-Session-Id` is rejected with `xcode_mcp_session_id_mismatch`. This blocks a replay attacker who learned the bearer but not the original session-id, and it blocks a fresh client accidentally presenting a stale bearer.
+- A reconnect after `expires_at` is rejected with `xcode_mcp_lease_token_expired` regardless of session-id.
+
+**Token is not single-use.** Any §9 wording still claiming single-use tokens is an error — the correct model is "session-lifetime bearer bound to a unique MCP session-id, limited to one active stream at a time."
 
 **Reserved lease expiration** (first-connect failure): if the provider does not send `session/new` + connect within `first_connect_deadline`, the lease moves to `orphaned` and the broker closes any already-spawned `mcpbridge` subprocess.
 
@@ -759,7 +806,7 @@ Equality is evaluated on the MCP server inventory that was delivered to `session
 
 - same set of MCP server names (requested set matches),
 - for each name, same transport variant (stdio vs http/sse),
-- for HTTP entries, same broker lease identity (the live session's lease is still `active` and the new request would have been resolved to the same lease).
+- for HTTP entries, same **requested broker contract** — the stable inputs that would resolve to a lease: broker-mode boolean, workspace root, `requires_xcode_host_execution` flag, resolved tool allowlist hash, permission profile id, Xcode PID at resolution time. The **random lease token and lease-id are not part of this comparison** — those are runtime state minted after the reuse decision, not inputs to it.
 
 This last condition is the Xcode-specific piece: a live provider session that holds an `active` broker lease for Xcode MCP is reuse-compatible. Because leases are provider-session-owned (§5.3), an alive provider session always has its lease alive — a "released lease while provider alive" only happens on reuse-incompatible supersession (where the lease is released *because* the session is being superseded) or on explicit operator reset. If the provider session itself has closed, there is nothing to reuse and the question is moot — P047 treats that as a fresh start anyway.
 
@@ -768,7 +815,12 @@ This last condition is the Xcode-specific piece: a live provider session that ho
 - **Reuse-compatible**: the existing provider session is reused; `session/prompt` is sent; the existing lease count continues; no new `mcpbridge` subprocess is spawned for this request.
 - **Reuse-incompatible** (requested Xcode MCP set differs from the live session's accepted set, or the prior lease is no longer `active`): P047 disposition is forced to `FreshSessionRequired`. A fresh provider session is started, a fresh broker lease is acquired, and a fresh `mcpbridge` subprocess is spawned.
 
-The binding-fingerprint check already in P047 (session-lineage-reuse-and-operator-reset.md) includes MCP server inventory — implementation should extend the fingerprint input to also hash the broker lease identity for HTTP MCP entries so this compatibility check is enforced at the same layer as other binding drifts.
+**Fingerprint layer vs live-session layer.** P047 binding fingerprints are built at prompt construction, write-once, and must only depend on stable requested-contract inputs — hashing a random per-session lease id is not executable because the lease does not yet exist when the fingerprint is computed. P051 therefore splits compatibility into two layers:
+
+1. **Binding fingerprint layer (persisted, P047 write-once)** — hashes the *requested broker contract* for HTTP MCP entries: `{ broker_mode: bool, workspace_root, requires_xcode_host_execution, resolved_tool_allowlist_hash, permission_profile_id, xcode_pid_at_resolution }`. Any change in these forces `FreshSessionRequired` at the fingerprint-comparison layer.
+2. **Live-session compatibility check (runtime, new for P051)** — run *after* the fingerprint check passes, verifies that the live provider session still holds an `active` broker lease with matching frozen fields. If the fingerprint matches but the lease is gone/expired/invalidated (e.g., mid-run broker degradation previously released it), the runtime check demotes the P047 disposition to `FreshSessionRequired` and a fresh session + fresh lease + fresh token are minted.
+
+This gives the reuse decision two independent gates: persisted-contract hash (fast, pre-lease) and runtime liveness (post-fingerprint, no hashing of volatile ids). Neither gate hashes the lease token.
 
 **Cancellation and cleanup under reuse.** When an ACP provider session is closed (normal close, cancel, crash, timeout, operator reset) its associated broker lease is released — regardless of whether the session was originally fresh or reused, regardless of how many successful executions ran on it. A reused provider session inherits lease ownership from whichever execution first opened the session; subsequent executions borrow the lease without changing its ownership, and none of them release it individually.
 
@@ -793,7 +845,7 @@ The envelope shape is append-only-per-execution:
   "mcp_broker_observations": [          // one entry per brokered Xcode MCP lease
     {
       "source": "xcode_mcp_broker",
-      "backend_start_disposition": "spawned|restarted_after_pid_change",
+      "backend_start_disposition": "spawned|restarted_after_pid_change|reused_existing_provider_session_lease",
       "pool_id": "...",
       "lease_id": "...",
       "xcode_pid": "77907",
@@ -809,7 +861,10 @@ The envelope shape is append-only-per-execution:
       "backend_initialize_wait_ms": 420,
       "backend_startup_latency_ms": 23031,
       "http_session_startup_latency_ms": 42,
-      "backend_failure_class": null      // null | "per_lease_backend" | "pool_pid_drift" | "broker_infrastructure" | "host_env_unavailable"
+      "backend_failure_class": null,     // null | "per_lease_backend" | "pool_pid_drift" | "broker_infrastructure" | "host_env_unavailable"
+      // Fields populated only when backend_start_disposition == "reused_existing_provider_session_lease":
+      "originating_execution_id": null,  // AgentExecutionId that first opened this lease (when reused)
+      "prompt_cycle_index": 0            // 0 for the originating execution, 1+ for reused-in prompt cycles
     }
   ],
   "xcode_shim_events": [                // one entry per shim invocation (reject or pass-through-logged)
@@ -852,6 +907,19 @@ The envelope shape is append-only-per-execution:
 - An execution with Xcode MCP and no direct commands: `mcp_broker_observations: [...]`, `xcode_shim_events: []`.
 - A mixed execution records both.
 - Each array entry is immutable once written; updates to lease state (e.g., `backend_failure_class` after a later crash) append a new entry with the same `lease_id` and a `status_update` field rather than mutating the original.
+
+**Reuse observation entries.** When a later `AgentExecution` on the same lineage reuses a provider session and its existing Xcode broker lease, the executor appends an entry to the later execution's `mcp_broker_observations[]` with:
+
+- `backend_start_disposition: "reused_existing_provider_session_lease"`,
+- `lease_id`: same as the originating execution's entry,
+- `backend_process_id`: same `mcpbridge` pid (not restarted),
+- `originating_execution_id`: the `AgentExecutionId` that first opened the lease,
+- `prompt_cycle_index`: incremented from 0 (originating execution records 0; first reuse records 1),
+- `backend_initialize_wait_ms: 0` (no initialize serialization — no new `session/new`),
+- `backend_startup_latency_ms: 0` (no new bridge spawn),
+- `backend_failure_class: null` unless the reuse itself failed.
+
+Every execution therefore has an independent observation entry, so reports, comparison, and readback surfaces can attribute Xcode MCP use to each execution without relying on lineage joins. The acceptance criterion "runtime observations distinguish backend start from backend reuse" is executable on every reused execution, not only the first.
 
 **Northbound projection.** GraphQL `AgentExecution` type exposes `actualXcodeRuntimeObservation` as a structured typed field (arrays of typed records, not opaque JSON strings). MCP `reports.get` returns the same envelope at `execution.xcode_runtime_observation`. Reports and comparison readers must handle the three arrays as independent evidence streams.
 
@@ -908,7 +976,7 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
 
 - `control-plane/crates/acp/src/provider_probe.rs` (new)
   - `ProviderCapabilityProbe::probe(&ProviderLaunchSpec) -> AgentCapabilities` — one-shot `initialize` subprocess launched from the spec's concrete `binary_path`/`launch_args`/`launch_env`/`adapter_settings` (minus `mcpServers`), records returned capabilities, closes immediately. `ProbeKey` is computed via `launch_spec.probe_key()` only for cache lookup and audit.
-  - `ProbeKey` composed of `(adapter_family, runtime_profile_id, binary_fingerprint, launch_args_fingerprint, launch_env_fingerprint, adapter_settings_fingerprint)`.
+  - `ProbeKey` composed of `(adapter_family, runtime_profile_id, binary_fingerprint, launch_args_fingerprint, capability_env_fingerprint, adapter_settings_fingerprint)`. `credential_env` is intentionally excluded so rotating session credentials does not invalidate the probe cache.
   - Binary fingerprinting: path + mtime + size. No signature verification in P051.
   - Env fingerprint allowlist restricted to capability-gating env vars (never raw secret values; boolean/redacted fingerprint only).
 
@@ -938,7 +1006,10 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
     Mount path for provider-facing streams: `POST /xcode-mcp/{lease_id}` (MCP Streamable HTTP over the per-lease path). Authorization: `Authorization: Bearer <lease_token>` header, validated by middleware before any MCP frame is parsed.
   - **Shared state.** `XcodeMcpBrokerState` is an `Arc` shared between (a) the router (reads lease state, dispatches MCP frames to backend `mcpbridge` via in-process channels), (b) `AcpRuntimeManager` (writes lease state, spawns backends). The shared state lives in the daemon process for its entire lifetime; dropped on SIGTERM.
   - **Bind order.** The daemon binds the axum listener first via `packaging::bind_with_fallback()`, then starts `AcpRuntimeManager` — but `AcpRuntimeManager` is **not allowed** to mint a lease URL or token until the daemon's listener is accepting connections. A readiness gate (`broker_state.set_router_ready()` called once the daemon's `axum::serve` future is spawned) blocks `ensure_provider_capabilities` and `resolve_mcp_servers` from producing HTTP MCP entries until the route is live.
-  - **Unhealthy broker.** If the broker router fails to mount (state construction error, port bind already taken), the daemon fails to start. If the broker declares itself unhealthy mid-run (e.g., `broker_state.healthy()` returns false after an infrastructure failure per §8.2), every new `resolve_mcp_servers` call returns `McpResolutionError::BrokerUnhealthy` and acts like the provider-HTTP-MCP-unsupported fail-closed path — no new lease is minted, HTTP endpoint is not emitted into `session/new`. Existing streams drain normally.
+  - **Broker health states.** The broker distinguishes two mid-run unhealthy states with different recovery contracts:
+    - **Degraded** (`broker_state.health() == Degraded`): a non-infrastructure subsystem is unhealthy but the HTTP listener and Unix socket are still live — e.g., capability cache is temporarily unavailable, catalog lint subsystem is stalled, or a transient non-fatal broker internal error. `resolve_mcp_servers` returns `McpResolutionError::BrokerDegraded`; no new lease is minted. **Existing streams continue serving** — bearer validation, `Mcp-Session-Id` binding, and per-lease `mcpbridge` subprocesses are unaffected. Auto-recovers to `Healthy` when the degraded condition clears. This is the "degraded no-new-lease" mode.
+    - **Failed infrastructure** (`broker_state.health() == Failed`): the HTTP listener died, the Unix dispatch socket died, or the broker internal token/lease store is corrupted beyond repair — i.e., existing streams cannot be served correctly. Treated as the `backend_failure_class = "broker_infrastructure"` path from §8.2: all active leases terminally close, `mcpbridge` subprocesses are reaped, `resolve_mcp_servers` returns `McpResolutionError::BrokerFailed` and the daemon flags itself unhealthy. Does not auto-recover mid-run — operator restart is required.
+  - **Startup-time broker failure.** If the broker router fails to mount at daemon start (state construction error, port bind already taken), the daemon fails to start — there is no "start-degraded" mode.
 
 - `control-plane/crates/acp/src/xcode_host_dispatch.rs` (new)
   - Unix-domain socket listener for `ShimDispatchRequest`. Owns the `XcodeShimDispatchLease` state map. Exposes a similar readiness gate — shim dispatch tokens are not minted until the socket is listening.
@@ -1209,7 +1280,7 @@ Required safeguards:
 - Pool keys include permission profile or a policy fingerprint.
 - Tool list responses are filtered per lease, not globally trusted from the backend.
 - HTTP clients cannot request arbitrary pool ids without a broker-issued lease token.
-- Lease tokens are random (≥ 32 bytes, constant-time compared), **session-lifetime** (not single-use), bound to the first accepted HTTP stream's connection id, and valid for reconnects from the same provider subprocess until the provider session closes or `expires_at` passes.
+- Lease tokens are random (≥ 32 bytes, constant-time compared), **session-lifetime** (not single-use), bound to a unique `Mcp-Session-Id` at first `initialize`, and limited to a single active HTTP stream at a time. Reconnects must present both the bearer and the matching session-id. Peer-credential derivation is not available on the loopback TCP path; cross-session replay is blocked by the `Mcp-Session-Id` binding and the single-active-stream invariant rather than by peer pid/uid checks. The Unix-domain shim dispatch socket (a separate authority, see §5.1.1) does use peer credentials.
 - Broker HTTP listener binds to loopback or a daemon-owned local transport proven compatible by research.
 - Lease tokens are delivered only to the intended provider process and are redacted from logs.
 - Logs must include ids and counts, not raw MCP request payloads by default.
@@ -1255,7 +1326,7 @@ Add focused tests for:
 - non-simulator passes through: `xcodebuild -destination 'platform=macOS'` argv is unchanged; `simulator_selection.mode = "no_simulator"`
 - **direct Xcode command guard**: fake-home agent with `requires_xcode_host_execution: false` invoking `xcodebuild` or `xcrun simctl` via shell receives an explicit shim rejection (exit 127 with structured stderr) rather than a CoreSimulator failure deep in the call stack; `actual_xcode_runtime_observation_json.xcode_shim_events[]` appends the rejection
 - agent with `requires_xcode_host_execution: true` has its direct Xcode command routed through the broker host executor under host-user environment; both `xcode_shim_events[]` (policy_decision: routed) and `xcode_host_executor_events[]` (argv, cwd, simulator UUID, env allowlist, exit) are appended
-- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` disables the shim (diagnostic mode); startup warning logged
+- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes the `xcodebuild`, `simctl`, and `xcrun`-non-`mcpbridge` shims transparent passthroughs; `mcpbridge` and `xcrun mcpbridge` remain rejected (see "mcpbridge hard-fail is absolute"); startup WARN logged
 
 ### Integration tests
 
@@ -1264,6 +1335,7 @@ Add ACP fixture tests for:
 - two parallel `ExecutionRequest`s with Xcode MCP each get their own fixture backend; their initialize phases serialize through the broker's per-PID Mutex but complete successfully, and parallel `tools/call` is not serialized
 - provider-side `mcpServers` contains an HTTP streaming Xcode MCP endpoint, not direct `xcrun mcpbridge`, when broker mode is enabled
 - `actual_xcode_runtime_observation_json.mcp_broker_observations[]` records `backend_start_disposition = "spawned"` for each lease and `backend_initialize_wait_ms` for the serialization latency on late-starters
+- reuse observation: a second `AgentExecution` that reuses an existing provider session's Xcode lease appends an `mcp_broker_observations[]` entry with `backend_start_disposition = "reused_existing_provider_session_lease"`, identical `lease_id` and `backend_process_id` to the originating execution, `originating_execution_id` pointing back, and `prompt_cycle_index >= 1`
 - brokered Xcode execution records `xcode_home_disposition = "host_user_home"` and does not expose the real home to the provider environment
 - explicit simulator UUID selection is recorded in broker observation data
 - cancellation of one execution releases only its lease
@@ -1283,12 +1355,13 @@ Add ACP fixture tests for:
 - reuse-compatible fixture: successful execution on a session with Xcode MCP; a second execution on same lineage with same MCP set reuses the session, its lease, and its `mcpbridge` subprocess. `session/prompt` is sent. Asserts: bridge subprocess PID equals the first execution's, HTTP endpoint/token unchanged, `mcp_broker_observations[]` does not append a new spawn entry
 - lease-lifetime fixture: successful execution does **not** release the lease. After execution returns success, assert the lease is still `active`, bridge subprocess is alive, HTTP endpoint still responds to a probe
 - reuse-incompatible fixture (MCP set differs): live session opened without Xcode MCP, new request adds Xcode MCP → supersession forced; old lease (if any) released, fresh provider session + fresh lease + fresh bridge
-- reuse-incompatible fixture (permission fingerprint differs): same MCP server name but different broker lease identity → supersession forced
+- reuse-incompatible fixture (permission fingerprint differs): same MCP server name but different resolved tool allowlist hash / permission profile id → fingerprint differs → supersession forced at the fingerprint layer, before any lease is consulted
 - supersession cleanup fixture: when supersession releases the old lease, the old `mcpbridge` subprocess is closed (SIGTERM 3s → SIGKILL) before the new lease acquires its bridge
 - provider-session-close fixture: normal `session/close` or stdin EOF from provider releases the lease and closes the bridge
 - cancellation fixture: run cancel releases the lease and closes the bridge regardless of execution success status
 - operator-reset fixture: operator-triggered session reset releases the lease and closes the bridge
-- binding fingerprint change includes broker lease identity for HTTP MCP entries — fixture asserts the fingerprint differs when lease identity differs even if server name matches
+- binding fingerprint hashes the **requested broker contract** (broker_mode, workspace_root, requires_xcode_host_execution, resolved_tool_allowlist_hash, permission_profile_id, xcode_pid_at_resolution) — fixture asserts fingerprint differs when any of these differ and matches when all are equal; random lease tokens/ids are **not** in the input set
+- live-session liveness check (new): fingerprint matches but the prior lease has been released/expired → runtime demotes disposition to `FreshSessionRequired`; fixture forces a mid-run degradation that releases the lease while provider session stays alive, then triggers a new execution on the lineage and asserts fresh lease is minted
 
 **Observation envelope parity**
 
@@ -1316,7 +1389,7 @@ Add ACP fixture tests for:
 
 ### Gate
 
-`./scripts/test-gate.sh proposal-051` should run from `control-plane/`:
+`./scripts/test-gate.sh proposal-051` should run from the repository root (`scripts/test-gate.sh` is at repo root, not under `control-plane/`). The gate internally `cd`s into `control-plane/` for `cargo` invocations:
 
 ```bash
 cargo test -p engine p051_http_streaming_research_gate -- --nocapture
@@ -1338,17 +1411,21 @@ The exact test names may differ, but the gate must prove:
 **Lease token lifecycle (P2 new)**
 
 - first-connect deadline fixture: provider never connects within `first_connect_deadline` → lease moves to `orphaned`, any already-spawned `mcpbridge` is closed, observation records the expiry
-- stream-bound identity fixture: provider connects, broker records `bound_stream_id`; a second concurrent HTTP connection presenting the same bearer is accepted only if it is a reconnect from the same peer-pid (first stream had dropped), rejected otherwise
-- reconnect-after-hiccup fixture: drop the bound HTTP stream mid-session; provider reconnects within `expires_at` with the same bearer from the same peer-pid; accepted with fresh `bound_stream_id`; backend `mcpbridge` subprocess continues serving without restart
-- reconnect-after-expiry fixture: force `expires_at` to pass; reconnect attempt is rejected with `xcode_lease_token_expired`
-- reconnect-from-different-peer fixture: simulate a reconnect attempt from a different peer pid/uid; rejected with `xcode_shim_peer_uid_mismatch` (or `xcode_mcp_peer_mismatch` for the MCP bearer path)
+- MCP session-id binding: provider connects, completes `initialize`, receives an `Mcp-Session-Id`; broker records `bound_mcp_session_id`. A second request with the same bearer but missing or different session-id is rejected with `xcode_mcp_session_id_mismatch`
+- single-active-stream invariant: while a stream holds the lease (`active_stream_count > 0`), a second concurrent HTTP connection with the same bearer is rejected with `xcode_mcp_concurrent_stream_rejected`
+- reconnect-after-hiccup fixture: drop the active HTTP stream; wait for `active_stream_count` to reach 0; reconnect with the same bearer **and** the same `Mcp-Session-Id`; accepted; backend `mcpbridge` subprocess continues serving without restart
+- reconnect-with-wrong-session-id: reconnect presents valid bearer but a fresh/forged `Mcp-Session-Id` → rejected
+- reconnect-after-expiry fixture: force `expires_at` to pass; reconnect is rejected with `xcode_mcp_lease_token_expired` regardless of session-id
 - token is **not** single-use: fixture sends multiple MCP requests on the same stream with the same bearer; all accepted; token is not invalidated by the first use
+- loopback TCP cannot assert peer-pid: fixture does **not** attempt peer-credential derivation on the HTTP bearer path; peer-cred fixtures exist only for the Unix-domain shim dispatch socket (§5.1.1)
 
 **Daemon integration (P1 new)**
 
 - broker router mounts at `POST /xcode-mcp/{lease_id}` on the daemon's loopback listener; fixture sends an MCP frame to the path with a valid `Authorization: Bearer <lease_token>` header and asserts the frame reaches the backend
 - bind-order readiness: fixture asserts `ensure_provider_capabilities` / `resolve_mcp_servers` do not emit an HTTP MCP entry before `broker_state.set_router_ready()` is called (router ready-gate blocks lease minting)
-- broker unhealthy (fixture flips `broker_state.healthy()` to false): new `resolve_mcp_servers` calls return `McpResolutionError::BrokerUnhealthy`; no new lease/HTTP entry minted; existing streams drain normally
+- broker degraded (fixture sets `broker_state.health() = Degraded`): new `resolve_mcp_servers` calls return `McpResolutionError::BrokerDegraded`; no new lease/HTTP entry minted; existing streams continue serving successfully
+- broker failed infrastructure (fixture sets `health() = Failed`, e.g., forces HTTP listener drop): all active leases receive terminal errors with `backend_failure_class = "broker_infrastructure"`; `mcpbridge` subprocesses are reaped; new `resolve_mcp_servers` returns `McpResolutionError::BrokerFailed`; daemon health flipped to unhealthy
+- auto-recovery: Degraded → Healthy is automatic when the degraded condition clears; Failed does not auto-recover (fixture asserts restart required)
 - daemon start failure when broker router cannot mount (fixture forces state construction error): daemon exits non-zero; no partial startup
 - shim Unix socket readiness: `XcodeShimDispatchLease` tokens are not minted until the dispatch socket is listening
 
