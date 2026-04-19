@@ -279,7 +279,7 @@ Nothing in the current codebase is a structural blocker. The wire emitter + tran
 | `pwd.pw_dir` differs from GUI user in headless daemon launch | Daemon config override for operator home; warn if mismatch; never auto-derive to `/var/empty` or similar | LOW |
 | Operator runs daemon as root or a service account | Reject at startup with clear error; daemon must run as the GUI user's UID for CoreSimulator access | MEDIUM |
 | UDS HTTP listener — if a provider later requires it | Current evidence: no provider requires UDS. Loopback + bearer is the universal path. Revisit only if added provider mandates UDS. | LOW |
-| Host executor (§3, §5.1.1) becomes a general "run with real HOME" API | Enforce allowlist of commands (`xcodebuild`, `xcrun simctl`, `xcrun mcpbridge`) in host executor; reject everything else | MEDIUM |
+| Host executor (§3, §5.1.1) becomes a general "run with real HOME" API | Enforce allowlist of commands (`xcodebuild`, `simctl`) in host executor; `mcpbridge` is **not** in the host-executor allowlist — it is broker-only (the broker spawns `xcrun mcpbridge` internally as backend per HTTP client session, never routed by the host executor); reject everything else | MEDIUM |
 
 ---
 

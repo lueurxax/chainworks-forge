@@ -113,7 +113,7 @@ The research verdict is one of:
 - `Proceed with scoped provider set`: only a named subset supports it; the proposal must be revised to limit scope before implementation.
 - `Do not implement P051 as written`: HTTP streaming is not currently viable; the proposal must be revised or replaced before any implementation starts.
 
-The P051 proof gate includes a static check that this research artifact exists and contains a non-placeholder verdict before implementation PR sign-off.
+The P051 proof gate includes a **static consistency check** that this research artifact exists, contains a non-placeholder verdict, **and does not contradict the current proposal text**. Specifically the check scans the artifact for known stale-guidance patterns (e.g., "`mcpbridge` in host-executor allowlist", "direct `xcrun mcpbridge` diagnostic fallback", "shared backend across leases") and fails if any are present. When the proposal revises a contract, the artifact must be updated in the same PR; the gate rejects sign-off otherwise. This prevents an allowed-verdict artifact from silently carrying obsolete guidance that implementers might follow in preference to the proposal body. The list of stale patterns the gate rejects is maintained alongside the gate script and updated whenever the proposal's contracts change.
 
 ---
 
@@ -232,7 +232,7 @@ impl ProviderCapabilityProbe {
 }
 ```
 
-The probe launches the provider binary **from `launch_spec` using its concrete `binary_path`, `launch_args`, `launch_env`, and `adapter_settings`** — the exact shape a real `session/new` would use, minus the actual `mcpServers` list (probe sends `mcpServers: []`). It sends `initialize` with minimal client capabilities, records the returned `AgentCapabilities`, and immediately closes via `session/close` or stdin EOF.
+The probe launches the provider binary **from `launch_spec` using its concrete `binary_path`, `launch_args`, `capability_env`, and `adapter_settings`**. ACP `initialize` already returns `AgentCapabilities.mcpCapabilities.http` in its response, so the probe **does not send `session/new`** — it sends `initialize` only, reads the returned `AgentCapabilities`, and closes via stdin EOF (no session was ever created; there is no session id to close). No `session/new` payload is constructed for the probe, which aligns with the §8.1 fail-closed guarantee: "no per-lease state allocated, no `session/new` payload constructed" applies to **all** provider interactions — probe included.
 
 `AcpRuntimeManager::ensure_provider_capabilities(&launch_spec)` computes `launch_spec.probe_key()` for cache lookup, and on miss calls `ProviderCapabilityProbe::probe(launch_spec)` to launch the probe. The manager then caches `AgentCapabilities` by `ProbeKey`. One probe per unique `ProbeKey` per daemon process lifetime; result cached in-memory.
 
@@ -376,7 +376,7 @@ let handle = adapter
 | `session_new_spec.mode` | same as real | same |
 | `session_new_spec.model`, `_meta`, config | same | same |
 
-The probe's one-shot `session/new` sends `mcpServers: []` — it is **only** measuring provider capability. The real session later sends the resolved list. The launch spec's **capability slice** (binary, argv, `capability_env`, adapter_settings) is byte-identical between probe and session; `credential_env` is intentionally different (empty vs populated). The `session_new_spec` differs only in the `mcpServers` field.
+The probe sends **only `initialize`** — no `session/new` — and exits on stdin EOF after reading `AgentCapabilities`. The real session later sends `initialize` followed by `session/new` with the resolved `mcpServers` list. The launch spec's **capability slice** (binary, argv, `capability_env`, adapter_settings) is byte-identical between probe and session; `credential_env` is intentionally different (empty vs populated). The `session_new_spec` is used by the real session only — the probe never constructs one.
 
 **Shared config builder.** A single `launch_spec_builder` module (`control-plane/crates/acp/src/launch_spec.rs`) holds the common derivation logic shared across adapters: resolving binary path from runtime profile, composing env from the adapter-specific baseline plus shim injection plus P050 meta-root plus host isolation, deriving adapter_settings from `AcpSessionConfig`. Each adapter's `prepare_launch_spec` calls into this shared builder and adds its adapter-specific overrides (Codex fake-home, Claude mode flags, Gemini `--acp` flag) on top.
 
@@ -474,36 +474,51 @@ This cleanly resolves the previous contradiction: pure Xcode MCP can reuse its b
 
 `prepare_launch_spec` reads `XcodeShimInjectionSignal` from `ExecutionRequest.resolved_agent` but **does not mint any credentials** at this phase — `credential_env` is returned empty. Credentials are attached in a second explicit phase (`attach_session_credentials`) only after capability preflight and MCP resolution both succeed, and only when `XcodeShimInjectionSignal: true`.
 
-**Two-phase credential attachment.** `prepare_launch_spec` runs before capability preflight, so it cannot mint a shim token or dispatch lease — if it did, an HTTP-incompatible provider would leak per-session state before the fail-closed path runs. The executor calls:
+**Seven-phase executor flow.** `prepare_launch_spec` runs before capability preflight, so it cannot mint credentials — if it did, an HTTP-incompatible provider would leak per-session state before the fail-closed path runs. Broker lease reservation must happen in an explicit phase so `resolve_mcp_servers` does not hide global broker mutation. The executor calls:
 
 ```rust
-// Phase 1: pre-preflight. credential_env is empty.
-let launch_spec = adapter.prepare_launch_spec(&request, /* shim signal only */)?;
+// Phase 1: pre-preflight. credential_env is empty. No MCP state yet.
+let mut launch_spec = adapter.prepare_launch_spec(&request)?;
 let cap_slice_before = launch_spec.capability_slice();
 
-// Phase 2: preflight.
+// Phase 2: capability preflight.
 let caps = runtime.ensure_provider_capabilities(&launch_spec).await?;
-// If this fails (e.g., provider_http_mcp_unsupported): NO token minted, NO lease,
-// launch_spec is discarded. Fail-closed path returns.
+// On failure (e.g., provider_http_mcp_unsupported): no broker state, no shim
+// state, launch_spec discarded. Fail-closed path returns.
 
-// Phase 3: MCP resolution.
-let servers = resolve_mcp_servers(&request.mcp, &caps)?;
+// Phase 3: MCP resolution — pure function over request + caps. Produces
+// ResolvedMcpServer entries with placeholder URL/token for HTTP broker entries.
+// No broker state allocated yet.
+let mut servers = resolve_mcp_servers(&request.mcp, &caps)?;
+
+// Phase 4: broker lease reservation — the single code path that reserves Xcode
+// broker leases (URL + bearer + pool entry + backend mcpbridge placeholder) and
+// fills in the HTTP entries in `servers`. AcpRuntimeManager owns broker state.
+// Returns a LeaseReservationGuard that rolls back all reservations if any later
+// phase returns Err (Drop releases minted state).
+let broker_guard = runtime.attach_broker_leases(&mut servers, &request).await?;
+
+// Phase 5: session/new payload construction from fully-populated servers.
 let session_new_spec = adapter.prepare_session_new_spec(&request, &servers)?;
 
-// Phase 4: credential attachment — mints token + XcodeShimDispatchLease ONLY if
-// all prior phases succeeded AND XcodeShimInjectionSignal is true.
+// Phase 6: shim credential attachment — mints XcodeShimDispatchLease +
+// writes shim env into credential_env. Runs only when XcodeShimInjectionSignal.
 runtime.attach_session_credentials(&mut launch_spec, &request).await?;
 
-// Phase 5: debug-assert the capability slice is unchanged after attach.
+// Phase 7: launch real session. Commit broker_guard on success.
 debug_assert_eq!(cap_slice_before, launch_spec.capability_slice());
-
-// Phase 6: launch real session.
 let handle = adapter.open_session_with_specs(&launch_spec, &session_new_spec).await?;
+broker_guard.commit(); // broker leases are now owned by the live session
 ```
 
-`attach_session_credentials` is the sole code path that mints `XcodeShimDispatchLease` and writes to `launch_spec.credential_env`. It only runs if capability preflight succeeded, MCP resolution succeeded, and the shim signal is set. Failure before this phase → no shim state allocated, per the fail-closed contract.
+**Ownership of broker state.** `AcpRuntimeManager::attach_broker_leases` is the **sole** code path that reserves `XcodeMcpBridgePool` entries and mints per-lease bearer tokens. It accepts `&mut [ResolvedMcpServer]`, finds HTTP-transport entries needing a broker URL, reserves a lease for each, and writes the final URL and bearer into the entry. The returned `LeaseReservationGuard`:
 
-The debug-assert after Phase 4 verifies that `attach_session_credentials` only mutates `credential_env`, never the capability slice — i.e., the capability-slice equality (§5.1.2 invariant) is preserved across credential attachment.
+- On `commit()` (success path after provider session opens): ownership of the reserved leases transfers to the live session; broker state is now canonically associated with the session id.
+- On `Drop` without `commit()` (any phase 5-7 error, or `?` propagation from the executor before commit): all reserved leases are released, backend `mcpbridge` subprocesses are reaped, pool entries are removed. No leaked broker state after a mid-flow failure.
+
+`resolve_mcp_servers` does **not** mutate broker state — it is a pure function that produces placeholder HTTP entries. Broker mutation is concentrated in `attach_broker_leases` with explicit rollback. The resolver signature therefore does not need a runtime handle; the allocator handle is used in the separate phase-4 call.
+
+**What "no per-lease state" means under fail-closed (§8.1 contract):** if capability preflight or MCP resolution fails, **`attach_broker_leases` is never called** — no broker pool entry, no bearer token, no backend `mcpbridge` spawn. If capability and resolution succeed but a later phase (5, 6, 7) fails, the `LeaseReservationGuard` drops and rolls back the broker state that phase 4 reserved. Either way, no leaked state survives a failing request. The debug-assert after phase 6 verifies that `attach_session_credentials` only mutates `credential_env`, never the capability slice.
 
 An agent that uses direct `xcodebuild` but has no Xcode MCP server still receives the shim, the token, and the socket — trigger (2) fires at catalog compilation time (direct-shell lexeme detected). An agent that **only** requests Xcode MCP (no direct-shell Xcode commands, no `requires_xcode_host_execution`) gets `XcodeBrokerRequired: true` but `XcodeShimInjectionSignal: false` — the broker lease and `session/new.mcpServers` HTTP entry are minted after capability preflight succeeds, but no PATH shim is injected. The agent has no way to shell out to Xcode tools anyway, so the shim would be useless overhead; crucially, this keeps pure Xcode MCP eligible for session reuse per §5.6. Agents with zero Xcode signals get no shim; their provider subprocess keeps its unmodified `PATH`.
 
@@ -568,11 +583,17 @@ Pass-through always uses `execve("/usr/bin/xcrun", argv, envp)` to avoid shim re
 
 **Absolute-path containment (catalog lint).** PATH shims cannot intercept direct absolute-path invocations like `/usr/bin/xcrun simctl list` or `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild build`. P051 closes this with a **catalog lint step**, not a runtime interceptor, because libc `execve`-level audit requires `DYLD_INSERT_LIBRARIES` (SIP-protected for Apple-signed binaries) or kernel extensions (deprecated). The lint runs at run-start during workflow compilation.
 
-**Lint blast radius — structured executable fields only.** The hard-fail lint scans only **structured executable fields** that the compiler knows will be passed to `execve`:
+**Lint blast radius — every direct-command declaration field (aligned with shim-signal scope).** The hard-fail lint scans **the same set of fields that can set `XcodeShimInjectionSignal`** — any divergence would let an agent escape the hard-fail lint while still triggering shim injection (or vice versa). Both scans cover:
 
-- every agent's resolved `run` block command path and argv,
-- every agent's resolved `run` block env values (specifically `DEVELOPER_DIR=…` paired with Xcode tools),
-- required-tool declarations, if the catalog schema models them separately.
+- `run` block command path and argv,
+- `run` block env values (specifically `DEVELOPER_DIR=…` paired with Xcode tools),
+- `shell_allowlist` entries (current catalog shape),
+- `allowed_commands` entries,
+- `tools.shell.commands` entries,
+- adapter-specific shell-capability fields defined by the catalog schema,
+- required-tool declarations if the catalog schema models them separately.
+
+For each field, the matcher rejects absolute paths matching the patterns listed below. An absolute `/usr/bin/xcrun mcpbridge` in `shell_allowlist` fails run-start with `xcode_absolute_path_forbidden` the same way as the same path in a `run` block.
 
 For each structured field, absolute paths matching the patterns below **fail run-start** with `xcode_absolute_path_forbidden`:
 
@@ -852,7 +873,7 @@ The allowlist is small by design: the host executor is the trust crossing point,
 **Streaming contract.** Host executor streams stdout/stderr back to the shim over the same Unix socket as framed chunks (`{stream: "stdout"|"stderr", bytes: <base64>}`) so the agent sees command output interleaved as normal shell would. Exit code delivered as `{exit: <i32>}` terminator. The shim then exits with the same code.
 
 - Diagnostic escape hatch: daemon config `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` (not per-agent — global, for local debugging of `xcodebuild`/`simctl` wrapper edge cases) makes the `xcodebuild`, `simctl`, and `xcrun` (non-mcpbridge branches) shims transparent passthroughs to the real binaries. Logged at WARN level on daemon start if set. Not valid in production deployments.
-- **Diagnostic does NOT bypass the `mcpbridge` guard.** `mcpbridge`, `xcrun mcpbridge`, and option-prefixed variants remain rejected even with `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`. The broker's MCP policy boundary — bearer tokens, tool-allowlist filtering, request-id rewriting, per-lease observations — is absolute. Engineers debugging Xcode MCP issues can run `xcrun mcpbridge` directly from their own shell outside any ACP agent; there is no scenario where an agent shell should need raw stdio MCP access. If a future operator-approved privileged diagnostic exception is ever required for mcpbridge, it must be a separate flag (not the direct-diagnostic flag), must be authenticated per-use (not a set-and-forget env var), must record an audit event per invocation, and must not be settable by provider-authored shell commands.
+- **Diagnostic does NOT bypass the `mcpbridge` guard (within the enforced boundary).** `mcpbridge`, `xcrun mcpbridge`, and option-prefixed variants in **PATH-based invocations and catalog-declared structured fields** remain rejected even with `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`. The broker's MCP policy boundary — bearer tokens, tool-allowlist filtering, request-id rewriting, per-lease observations — is absolute **for the enforced boundary**. It is **not** absolute for LLM-improvised absolute paths at prompt time (`/usr/bin/xcrun mcpbridge` synthesized in a prompt-response shell string): those bypass PATH-shim and catalog-lint by design, receive a runtime warning via the `XcodeResidualPathObserver` (§5.1.1 mitigation (b)), but are **not** blocked. A future proposal can add libc audit or sandbox-exec profiles to close this residual. Engineers debugging Xcode MCP issues can run `xcrun mcpbridge` directly from their own shell outside any ACP agent; there is no scenario where an agent shell should need raw stdio MCP access. If a future operator-approved privileged diagnostic exception is ever required for mcpbridge, it must be a separate flag (not the direct-diagnostic flag), must be authenticated per-use (not a set-and-forget env var), must record an audit event per invocation, and must not be settable by provider-authored shell commands.
 
 **Allowlist scope.** The broker host executor accepts only **`xcodebuild`** and **`simctl`** (whether invoked directly or via `xcrun <subcommand>`). Any other `xcrun`-routed tool (`dtrace`, `xcode-select`, `notarytool`, etc.) is not shimmed and continues to run under the ACP provider's isolated environment — those do not depend on per-user CoreSimulator state.
 
@@ -1209,13 +1230,14 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Own `XcodeMcpBridgePool`.
   - Own `ProviderCapabilityCache: HashMap<ProbeKey, AgentCapabilities>` (see §5.1.2 for full `ProbeKey` shape).
   - Expose `ensure_provider_capabilities(&ProviderLaunchSpec) -> AgentCapabilities` as preflight called before `engine::mcp::resolve_mcp_servers`. The `ProviderLaunchSpec` is the single source of launch truth; implementation must assert the **capability slice** (binary, argv, capability_env, adapter_settings) is unchanged between the probe call and the later `open_session_with_specs` call. `credential_env` is intentionally empty at preflight and populated only after by `attach_session_credentials`.
-  - Expose `attach_session_credentials(&mut ProviderLaunchSpec, &ExecutionRequest)` as the **sole** code path that mints shim tokens, creates `XcodeShimDispatchLease`, and writes to `credential_env`. Runs only after capability preflight and MCP resolution both succeed. Never called when `provider_http_mcp_unsupported` or any prior fail-closed path fires — guarantees §8.1 "no per-lease state allocated" contract.
+  - Expose `attach_broker_leases(&mut [ResolvedMcpServer], &ExecutionRequest) -> LeaseReservationGuard` as the **sole** code path that reserves `XcodeMcpBridgePool` entries, mints per-lease HTTP bearer tokens, and writes final URLs/tokens into the HTTP `ResolvedMcpServer` entries. Runs after capability preflight and MCP resolution both succeed. Returned guard commits on live-session open or drops-with-rollback on any later-phase failure.
+  - Expose `attach_session_credentials(&mut ProviderLaunchSpec, &ExecutionRequest)` as the **sole** code path that mints shim tokens, creates `XcodeShimDispatchLease`, and writes to `credential_env`. Runs only after capability preflight, MCP resolution, and broker lease reservation all succeed. Never called when `provider_http_mcp_unsupported` or any prior fail-closed path fires — guarantees §8.1 "no per-lease state allocated" contract.
   - Acquire leases before `adapter.open_session`.
   - Release leases on normal close, provider error, timeout, cancellation, and drop paths.
   - Refuse broker mode unless the P051 HTTP streaming feasibility research verdict allows the current provider set.
 
 - `control-plane/crates/acp/src/provider_probe.rs` (new)
-  - `ProviderCapabilityProbe::probe(&ProviderLaunchSpec) -> AgentCapabilities` — one-shot `initialize` subprocess launched from the spec's concrete `binary_path`/`launch_args`/`launch_env`/`adapter_settings` (minus `mcpServers`), records returned capabilities, closes immediately. `ProbeKey` is computed via `launch_spec.probe_key()` only for cache lookup and audit.
+  - `ProviderCapabilityProbe::probe(&ProviderLaunchSpec) -> AgentCapabilities` — one-shot `initialize`-only subprocess (no `session/new` ever sent) launched from the spec's concrete `binary_path`/`launch_args`/`capability_env`/`adapter_settings`, records `AgentCapabilities` from the `initialize` response, closes on stdin EOF. `ProbeKey` is computed via `launch_spec.probe_key()` only for cache lookup and audit.
   - `ProbeKey` composed of `(adapter_family, runtime_profile_id, binary_fingerprint, launch_args_fingerprint, capability_env_fingerprint, adapter_settings_fingerprint)`. `credential_env` is intentionally excluded so rotating session credentials does not invalidate the probe cache.
   - Binary fingerprinting: path + mtime + size. No signature verification in P051.
   - Env fingerprint allowlist restricted to capability-gating env vars (never raw secret values; boolean/redacted fingerprint only).
@@ -1278,11 +1300,11 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation with `{tool, via_xcrun: bool, argv, cwd, policy_reason}`.
   - Route path: stream stdout/stderr/exit from broker's host executor via framed chunks over the same Unix socket; emit `xcode_shim_routed` observation with argv, cwd, selected simulator UUID, exit status.
   - Pass-through path (`xcrun` only, non-Xcode subcommands): silent `execve`, no observation.
-  - Diagnostic bypass: `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes `xcodebuild`, `simctl`, and `xcrun` (non-mcpbridge branches) transparent passthroughs, with WARN log at daemon start and per-invocation WARN log per shim. The `mcpbridge` shim (and `xcrun mcpbridge` variants) remains **rejected in diagnostic mode**. Policy boundary is absolute.
+  - Diagnostic bypass: `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes `xcodebuild`, `simctl`, and `xcrun` (non-mcpbridge branches) transparent passthroughs, with WARN log at daemon start and per-invocation WARN log per shim. The `mcpbridge` shim (and `xcrun mcpbridge` variants) remains **rejected in diagnostic mode** for PATH-based and catalog-declared invocations — policy boundary is absolute within the enforced scope (see §5.1.1 "Scope of guarantee" for the out-of-scope residual).
 
 - `control-plane/crates/workflow/src/catalog_lint.rs` (new)
   - Run at run-start during workflow compilation.
-  - **Hard-fail scope (run-blocking)**: scan only structured executable fields — every agent's resolved `run` block command path and argv, env values, and required-tool declarations — for Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`) and `DEVELOPER_DIR=...xcodebuild`/`simctl` env assignments. Fail run-start with `xcode_absolute_path_forbidden` unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`.
+  - **Hard-fail scope (run-blocking)**: scan **every direct-command declaration field** — `run` block command path/argv/env, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields, and required-tool declarations — for Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`) and `DEVELOPER_DIR=...xcodebuild`/`simctl` env assignments. The scan set is **identical** to the `XcodeShimInjectionSignal` trigger scan set — divergence would let an agent escape one while triggering the other. Fail run-start with `xcode_absolute_path_forbidden` unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` (which skips only `xcodebuild`/`simctl` paths; `mcpbridge` always hard-fails).
   - **`mcpbridge` hard-fail is absolute**: structured fields whose path or `xcrun` subcommand resolves to `mcpbridge` fail run-start regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`. Diagnostic mode's bypass covers `xcodebuild`/`simctl` only; `mcpbridge` has no diagnostic exception anywhere in P051.
   - **Soft-warn scope (advisory, not blocking)**: scan prompt/system-instruction/description free-form text for the same patterns. Emit warnings into `ResolvedAgent.prompt_lint_warnings: Vec<PromptLintWarning>` — a compile-time carrier that travels with the resolved agent through the executor. The executor reads the carrier when creating each `AgentExecution` row and appends entries to `actual_xcode_runtime_observation_json.xcode_shim_events` in the same transaction as the row insert, ensuring durable attribution. Does **not** block run-start. Exists so P051 documentation, review prompts, and evidence quotes are not false-positives.
   - Produce **two independent compile-time booleans** on `ResolvedAgent`, available pre-resolution: `XcodeBrokerRequired` (triggered by requested Xcode MCP server in catalog entry) and `XcodeShimInjectionSignal` (triggered by (a) `requires_xcode_host_execution: true` or (b) any bare Xcode-tool lexeme in any direct-command declaration field — `run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). Pure Xcode MCP agents get `XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`. `prepare_launch_spec` reads `XcodeShimInjectionSignal` only; **`credential_env` remains empty at this phase** and is populated exclusively by `attach_session_credentials` after capability preflight and MCP resolution both succeed.
@@ -1304,7 +1326,7 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Shim env injection: driven exclusively by `XcodeShimInjectionSignal: true` (which is set only by direct-shell triggers — `requires_xcode_host_execution: true` or bare Xcode-tool lexeme in any direct-command field; **not** by `XcodeBrokerRequired`). When the signal is set, the shared builder prepends `$XCODE_SHIM_DIR` to `PATH` and injects `CHAINWORKS_XCODE_SHIM_TOKEN` and `XCODE_SHIM_DISPATCH_SOCKET` into `credential_env` via `attach_session_credentials` (after successful capability preflight + MCP resolution — never earlier). Adapters do not add shim env independently.
   - Pure Xcode MCP agents (`XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`) keep their normal `PATH` — they get the HTTP MCP entry in `session_new_spec` without PATH shim env, preserving session reuse per §5.6.
   - Agents with zero Xcode signals keep their normal `PATH`.
-  - Each adapter gets two focused tests: (1) a fixture provider asserts env/argv match the launch spec field-by-field via `/proc/<pid>/environ` or an argv-echo fixture; (2) the probe's `session/new` payload has `mcpServers: []` while the real session's `session/new` payload has the resolved HTTP MCP entries — inspected via an ACP wire-capture fixture.
+  - Each adapter gets two focused tests: (1) a fixture provider asserts env/argv match the launch spec field-by-field via `/proc/<pid>/environ` or an argv-echo fixture; (2) the probe sends `initialize` **only** (no `session/new`) while the real session sends both `initialize` and `session/new` with resolved HTTP MCP entries — inspected via an ACP wire-capture fixture that records every JSON-RPC frame the provider sees.
 
 ### Engine crate
 
@@ -1580,7 +1602,7 @@ Add focused tests for:
 - broker cached state (consent awareness, tools/list snapshot per PID) is dropped after grace period
 - backend restart after Xcode PID change invalidates cached tool list
 - request routing returns responses to the correct HTTP client session
-- explicit direct-mode diagnostic config bypasses broker only when configured
+- diagnostic config (`CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`) makes `xcodebuild`/`simctl`/`xcrun`-non-`mcpbridge` shims transparent passthroughs for **direct-command shell invocations only**; brokered Xcode MCP and `mcpbridge` shim behavior are unaffected — MCP traffic always flows through the broker, `mcpbridge` remains rejected in structured fields. Fixture asserts: under diagnostic mode, (a) an agent with Xcode MCP still receives the HTTP broker endpoint in `session_new_spec` (no direct `xcrun mcpbridge` transport is substituted), (b) structured `mcpbridge` invocations still hard-fail, (c) only `xcodebuild`/`simctl` PATH-shim entries pass through.
 - host-env builder uses operator home and host temp paths for Xcode subprocesses
 - ACP provider environment remains fake-home-backed while broker-owned Xcode environment is host-home-backed
 - ambiguous simulator name/OS requests are rejected or resolved to a configured UUID with recorded evidence
@@ -1708,6 +1730,9 @@ The exact test names may differ, but the gate must prove:
 
 - HTTP-incompatible provider (fixture with `mcpCapabilities.http = false`) fails closed with `provider_http_mcp_unsupported` **before** any per-lease state is allocated — no `lease_id` minted, no bearer token generated, no `XcodeMcpBridgePool` entry created, no `mcpbridge` backend spawned, no `XcodeShimDispatchLease` recorded, no `session/new` payload constructed, `credential_env` is still empty on the discarded `launch_spec`. Fixture asserts `attach_session_credentials` was never called on this path. The daemon's shared loopback listener remains bound (it's a daemon-lifetime resource) — the test asserts no per-lease resources, not that the listener comes down.
 - capability-slice invariance across credential attach: fixture captures `cap_slice_before = launch_spec.capability_slice()`, runs the happy path through `attach_session_credentials`, asserts `cap_slice_before == launch_spec.capability_slice()` afterwards. Only `credential_env` changed.
+- **broker lease reservation ownership**: fixture asserts `resolve_mcp_servers` produces HTTP entries with placeholder URL/token; `attach_broker_leases` is the sole call that writes real URL/token into those entries; `prepare_session_new_spec` consumes the fully-populated entries; broker state is observable only after phase 4.
+- **broker lease rollback on mid-flow failure**: fixture forces phase 5 (`prepare_session_new_spec`) to return `AdapterError` after `attach_broker_leases` succeeds. Asserts the `LeaseReservationGuard` drops without commit, broker `XcodeMcpBridgePool` has no entries for this request, no backend `mcpbridge` subprocess exists, no bearer token is reachable. Same fixture covers phase 6 failure (`attach_session_credentials`) and phase 7 failure (`open_session_with_specs`).
+- **broker lease rollback on fail-closed before phase 4**: fixture forces capability preflight to return `provider_http_mcp_unsupported`. Asserts `attach_broker_leases` was never called, no broker state exists, guard was never constructed (cannot "roll back" what was never minted). This is the base case for the fail-closed contract.
 - capability probe cache hit for a previously-seen full `ProbeKey` (same adapter/profile/binary/args/env/settings) skips the probe subprocess
 - binary fingerprint change (path, mtime, or size) invalidates the cached entry and triggers a fresh probe
 - runtime profile change forces a fresh probe even when the binary is unchanged — fixture: two profiles on the same Codex binary with different `mode` or `config_options` produce independent cache entries
@@ -1760,6 +1785,10 @@ Absolute-path catalog lint — structured fields (hard-fail):
 - catalog with a `run` block command starting with `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` fails run-start with `xcode_absolute_path_forbidden`; run is not created
 - catalog with an env assignment `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` alongside a direct `xcodebuild` invocation fails the lint
 - catalog with bare `xcodebuild` (no absolute path) passes the lint and proceeds to shim-based enforcement
+- **catalog with absolute `/usr/bin/xcrun mcpbridge` in `shell_allowlist` fails run-start** with `xcode_absolute_path_forbidden` — fixture uses the current catalog shape that puts Xcode tools in `shell_allowlist` rather than `run` blocks. Mirrors the shim-signal scan scope.
+- catalog with absolute `/usr/bin/xcodebuild` in `allowed_commands` fails run-start
+- catalog with absolute Xcode path in `tools.shell.commands` fails run-start
+- **lint scope parity fixture**: for every field name in the `XcodeShimInjectionSignal` trigger list, an absolute-path entry fails the hard-fail lint. Guarantees the two scans stay in sync across schema evolution.
 
 Absolute-path catalog lint — prompt text (soft-warn):
 
