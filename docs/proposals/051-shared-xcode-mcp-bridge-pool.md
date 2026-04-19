@@ -439,13 +439,38 @@ ACP provider subprocesses continue to run with isolated per-session home state. 
 
 The reliability goal of P051 is not achieved if the same Xcode-dependent agents still invoke `xcodebuild`, `xcrun simctl`, or `xcrun mcpbridge` directly through their shell tool from a fake-home context — the CoreSimulator / `simdiskimaged` failure mode returns. P051 therefore defines a minimum, enforceable guard rather than leaving direct commands as "diagnostic-only":
 
-**Injection condition — evaluated pre-resolution.** The shim is injected when an agent has **any modeled Xcode-dependent capability**. Because `prepare_launch_spec` runs **before** `resolve_mcp_servers`, all three injection triggers must be decidable from pre-resolution inputs — the agent catalog entry as written, plus static catalog metadata. MCP resolution output is not consulted at this stage:
+**Injection condition — shell-shim is orthogonal to Xcode MCP.** The PATH shim guards **direct shell invocations** of Xcode tools. Pure Xcode MCP agents (catalog requests the `xcode` MCP server but the agent never shells out to `xcodebuild`/`simctl`/`mcpbridge`/`xcrun`) do **not** need the shim — they call MCP tools over the broker's HTTP endpoint and never spawn an Xcode subprocess themselves. Injecting the shim for pure-MCP agents would add no safety and would needlessly forbid session reuse.
 
-1. any **requested** MCP entry in the catalog entry with server id `xcode` or `adapter_family: xcode_*`. The compiled `ResolvedAgent` exposes the requested MCP inventory (catalog author's declared intent) independent of whether resolution later succeeds. This is a static catalog property, not a runtime one.
-2. any declared `requires_xcode_host_execution: true` (catalog field, per §7 catalog chain).
-3. any **modeled direct-command declaration** in the agent catalog entry that matches a known Xcode-tool lexeme (`xcodebuild`, `simctl`, `mcpbridge`, `xcrun`, or any absolute path beginning with `/Applications/Xcode.app/Contents/Developer/`). The lint scans **every** field in the catalog entry where direct shell commands can be declared: `run` blocks, `shell_allowlist` entries (current catalog shape), `allowed_commands`, `tools.shell.commands`, and any adapter-specific shell-capability field defined by the catalog schema. A bare `xcodebuild` (or equivalent) in any of these fields triggers injection. Detection is performed by the catalog lint pass, which runs **at run-start compilation**, also before `resolve_mcp_servers` — its output is a static `XcodeShimInjectionSignal` attached to the `ResolvedAgent`.
+P051 therefore separates two orthogonal signals:
 
-The `XcodeShimInjectionSignal` is a compile-time boolean available on `ResolvedAgent` before any resolution runs. `prepare_launch_spec` reads it from `ExecutionRequest.resolved_agent.xcode_shim_injection_signal` but **does not mint any credentials** at this phase — `credential_env` is returned empty. Credentials are attached in a second explicit phase (`attach_session_credentials`) only after capability preflight and MCP resolution both succeed.
+- **`XcodeBrokerRequired: bool`** — the agent requested Xcode MCP in its catalog entry. This drives broker lease minting and `session/new.mcpServers` HTTP entry construction, but does **not** trigger shim injection. Fully compatible with session reuse per §5.6.
+- **`XcodeShimInjectionSignal: bool`** — the agent can invoke Xcode shell commands directly. This drives PATH-shim injection and `XcodeShimDispatchLease` minting, and forbids session reuse per §5.3.
+
+Both signals are compile-time booleans attached to `ResolvedAgent` and available pre-resolution. `prepare_launch_spec` reads **`XcodeShimInjectionSignal`** only — it does not depend on `XcodeBrokerRequired` (the broker entry is added later via `session_new_spec`, after capability preflight passes).
+
+**`XcodeShimInjectionSignal` triggers (shell-shim only):**
+
+1. any declared `requires_xcode_host_execution: true` (catalog field, per §7 catalog chain).
+2. any **modeled direct-command declaration** in the agent catalog entry that matches a known Xcode-tool lexeme (`xcodebuild`, `simctl`, `mcpbridge`, `xcrun`, or any absolute path beginning with `/Applications/Xcode.app/Contents/Developer/`). The lint scans **every** field in the catalog entry where direct shell commands can be declared: `run` blocks, `shell_allowlist` entries (current catalog shape), `allowed_commands`, `tools.shell.commands`, and any adapter-specific shell-capability field defined by the catalog schema.
+
+**`XcodeBrokerRequired` triggers:**
+
+1. any **requested** MCP entry in the catalog entry with server id `xcode` or `adapter_family: xcode_*`. The compiled `ResolvedAgent` exposes the requested MCP inventory independent of whether resolution later succeeds.
+
+Detection for both signals is performed by the catalog lint pass, which runs **at run-start compilation**, before `resolve_mcp_servers`. Both signals are static properties of `ResolvedAgent`, not runtime state.
+
+**Four combinations:**
+
+| Agent pattern | `XcodeBrokerRequired` | `XcodeShimInjectionSignal` | Shim injected | Session reuse allowed |
+|---|---|---|---|---|
+| Pure Xcode MCP (no direct shell Xcode) | true | false | no | yes (per §5.6) |
+| Direct `xcodebuild` in shell allowlist, no MCP | false | true | yes | no (per §5.3) |
+| Both Xcode MCP AND direct shell Xcode | true | true | yes | no |
+| Neither | false | false | no | yes (non-Xcode agent; P051 not relevant) |
+
+This cleanly resolves the previous contradiction: pure Xcode MCP can reuse its brokered session and backend bridge across executions (§5.6 gate fixtures apply); shell-shim-enabled agents force fresh sessions to preserve observation truth (§5.3 rule). The two cases never collide because `XcodeBrokerRequired` alone does not trigger the shim.
+
+`prepare_launch_spec` reads `XcodeShimInjectionSignal` from `ExecutionRequest.resolved_agent` but **does not mint any credentials** at this phase — `credential_env` is returned empty. Credentials are attached in a second explicit phase (`attach_session_credentials`) only after capability preflight and MCP resolution both succeed, and only when `XcodeShimInjectionSignal: true`.
 
 **Two-phase credential attachment.** `prepare_launch_spec` runs before capability preflight, so it cannot mint a shim token or dispatch lease — if it did, an HTTP-incompatible provider would leak per-session state before the fail-closed path runs. The executor calls:
 
@@ -495,19 +520,42 @@ The shim directory contains executables named `xcodebuild`, `simctl`, `mcpbridge
 3. connects to the broker's local Unix-domain dispatch socket (`$XCODE_SHIM_DISPATCH_SOCKET`),
 4. dispatches to one of three paths based on agent policy (below).
 
-**`xcrun` shim — option-aware subcommand parsing.** `xcrun` accepts several leading options before the subcommand, e.g. `xcrun --sdk iphonesimulator simctl list` or `xcrun --toolchain swift-latest mcpbridge`. Naive `argv[1]` inspection would miss these and pass-through dangerous invocations. The shim implements a proper option parser with the known `xcrun` flag set from `xcrun --help`:
+**`xcrun` shim — mode-aware argv parser.** `xcrun` has three distinct **modes** that change whether the named tool is actually executed. Treating every flag as generic option-with-arg/without-arg (the previous spec) misclassifies mode flags and can consume a tool name as a flag argument (e.g., `xcrun -r mcpbridge` under that model would swallow `mcpbridge` as an arg to `-r`, missing the reject). The shim parser must be mode-aware.
 
-- option-with-arg flags consume the next token: `--sdk <name>`, `--toolchain <name>`, `--log <path>`, `-r <path>`, `--run <path>`.
-- option-without-arg flags: `--find`, `-f`, `--help`, `-h`, `--version`, `--verbose`, `--no-cache`, `--kill-cache`, `--show-sdk-path`, `--show-sdk-version`, `--show-sdk-platform-path`, `--show-sdk-platform-version`, `--show-sdk-build-version`.
-- Unknown flag: fail closed (reject with `xcrun_unknown_option`) rather than silently pass through. The flag set is updated when Apple ships new `xcrun` options; until then, unknown is treated as adversarial.
+Mode flags from `xcrun --help` (macOS 26.3):
 
-After skipping options, the first non-option token is treated as the subcommand. The intercepted set is **`xcodebuild`, `simctl`, and `mcpbridge`** — matching the host-executor allowlist plus the mcpbridge unconditional reject. For each:
+- **Run mode** (default; tool **is executed**): `-r <tool>`, `--run <tool>`, or bare `xcrun <tool>` with no mode flag. In all three forms the named tool is executed via `execve`. For P051 policy: inspect the resolved tool name, apply reject/route/passthrough.
+- **Find mode** (tool **is NOT executed** — `xcrun` prints the resolved path and exits): `-f <tool>`, `--find <tool>`. Agent learns the absolute path but no execution happens. Safe to pass through — the absolute path is catalog-lint-bounded elsewhere and cannot be directly invoked without hitting the PATH-shim boundary again.
+- **Show modes** (no tool arg): `--show-sdk-path`, `--show-sdk-version`, `--show-sdk-platform-path`, `--show-sdk-platform-version`, `--show-sdk-build-version`. No execution. Pass through silently.
 
-- `xcodebuild` — apply reject/route/diagnostic policy identical to bare `xcodebuild`.
-- `simctl` — apply reject/route/diagnostic policy identical to bare `simctl`.
-- `mcpbridge` — unconditional reject (even with `requires_xcode_host_execution: true`), identical to bare `mcpbridge`.
+Additional option flags that modify run/find mode without changing it: `--sdk <name>`, `--toolchain <name>`, `-l <path>` / `--log <path>` (logging), `--verbose`, `--no-cache`, `--kill-cache`, `--help`/`-h`, `--version`.
 
-Any other subcommand (`dtrace`, `xar`, `notarytool`, `swiftc`, `xcode-select`, `clang`, etc.) does `execve("/usr/bin/xcrun", argv, envp)` pass-through, preserving the provider's isolated environment. Pass-through is silent (no observation). Absolute path `/usr/bin/xcrun` avoids shim recursion via `PATH`.
+**Parser algorithm:**
+
+```text
+mode := Run  // default
+tool := None
+for each argv token (starting from argv[1]):
+  if token is "-r" or "--run":     mode := Run;  expect tool next
+  elif token is "-f" or "--find":  mode := Find; expect tool next
+  elif token starts with "--show-sdk-":  mode := Show; break
+  elif token is --sdk|--toolchain|-l|--log:  consume next token as option-arg
+  elif token is --verbose|--no-cache|--kill-cache|--help|-h|--version:  continue
+  elif token starts with "-" or "--" (unknown flag):  reject xcrun_unknown_option
+  else:
+    tool := token
+    break  // remaining tokens are args to the tool
+
+dispatch according to mode:
+  Show → pass-through (no tool to inspect)
+  Find → pass-through (no execution)
+  Run + tool is None → pass-through (malformed; let xcrun error)
+  Run + tool ∈ {xcodebuild, simctl} → apply reject/route/diagnostic policy
+  Run + tool == mcpbridge → unconditional reject
+  Run + other tool → pass-through (dtrace, xar, notarytool, swiftc, etc.)
+```
+
+Pass-through always uses `execve("/usr/bin/xcrun", argv, envp)` to avoid shim recursion via `PATH`. Pass-through is silent (no observation).
 
 **Absolute-path containment (catalog lint).** PATH shims cannot intercept direct absolute-path invocations like `/usr/bin/xcrun simctl list` or `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild build`. P051 closes this with a **catalog lint step**, not a runtime interceptor, because libc `execve`-level audit requires `DYLD_INSERT_LIBRARIES` (SIP-protected for Apple-signed binaries) or kernel extensions (deprecated). The lint runs at run-start during workflow compilation.
 
@@ -528,7 +576,12 @@ Catalog authors must instead use bare tool names (which the shim can intercept) 
 
 **Prompt/system-instruction text — warning only.** Prompt text, system instructions, agent descriptions, and any other free-form narrative fields **do not hard-fail the lint**. P051 documentation itself, internal audit notes, and normal review prompts legitimately quote `/Applications/Xcode…`, `/usr/bin/xcrun`, and `DEVELOPER_DIR=…` as inert evidence. Scanning these would block runs whose context merely discusses the forbidden commands, not runs that execute them.
 
-Instead, prompt-text matches are emitted as a **warning** (`xcode_absolute_path_in_prompt`) captured into the agent's `actual_xcode_runtime_observation_json` as an advisory event. Operators see this warning in reports and may choose to sanitize the prompt; it does not block the run.
+Instead, prompt-text matches are emitted as a **warning** (`xcode_absolute_path_in_prompt`). Because the catalog lint runs at workflow compilation / run-start (before the executor creates the `AgentExecution` row via its claim path), warnings cannot be written directly to `actual_xcode_runtime_observation_json` — the target row does not exist yet. P051 uses a **two-step carrier**:
+
+1. **Compile-time.** `catalog_lint.rs` produces a `PromptLintWarnings: Vec<PromptLintWarning>` per agent, attached to `ResolvedAgent` alongside `XcodeBrokerRequired` and `XcodeShimInjectionSignal`. Each warning records the match pattern, the source field path (`agent.prompt`, `agent.system_instruction`, `agent.description`, etc.), and a short excerpt for operator review.
+2. **Execution-time.** When the executor creates the `AgentExecution` row for that agent, it reads `ResolvedAgent.prompt_lint_warnings` and appends each entry to `actual_xcode_runtime_observation_json.xcode_shim_events` as a `{tool: null, policy_decision: "prompt_warning", policy_reason: "xcode_absolute_path_in_prompt", source_field, excerpt}` entry. The append is part of the same transaction that writes the `AgentExecution` row, so warnings either both land or neither does — no partial handoff.
+
+This ensures warnings are durable, attributed to the correct `AgentExecution`, and never lost between compilation and execution. Operators see them in reports and may choose to sanitize the prompt; they do not block the run.
 
 **Rationale for the split.** Hard-fail on executable fields, soft-warn on narrative. Executable fields are unambiguous: if they are present, the agent *will* attempt to run that command. Narrative fields are ambiguous: quoting a path in a review prompt is benign, but an LLM later synthesizing a shell command from that text is a residual risk handled by the other mitigations below.
 
@@ -594,7 +647,7 @@ Transitions:
 - **Shim dispatch is only valid during an active prompt.** If `current_execution_id.is_some()`, dispatch is attributed to that execution with `dispatch_prompt_epoch: current_prompt_epoch` recorded. This is the in-prompt case.
 - **Shim dispatch during an idle window** (`current_execution_id.is_none()`, i.e., between prompts): rejected with `xcode_shim_no_active_prompt`. The rejection event lands in the lease's `originating_execution_id`'s orphan bucket. This catches delayed subprocesses from a prior prompt that fire after the prompt ends but before the next one starts.
 
-**No cross-prompt attribution — shim-enabled executions do not reuse provider sessions.** A cross-prompt attribution gap would violate P051's per-execution observation truth. Rather than document it as an accepted limitation, P051 eliminates it structurally: **when an execution's `XcodeShimInjectionSignal` is true, the run cannot reuse an existing provider session.**
+**No cross-prompt attribution — shell-shim-enabled executions do not reuse provider sessions.** A cross-prompt attribution gap would violate P051's per-execution observation truth. Rather than document it as an accepted limitation, P051 eliminates it structurally: **when an execution's `XcodeShimInjectionSignal` is true, the run cannot reuse an existing provider session.** Note this applies only to the shell-shim signal (direct `xcodebuild`/`simctl` via shell). Pure Xcode MCP agents (`XcodeBrokerRequired: true`, `XcodeShimInjectionSignal: false`) have full session reuse as specified in §5.6 — the broker serves them via HTTP MCP, they never shell out, and attribution ambiguity cannot arise.
 
 Reuse-compat check (§5.6) now has an additional rule stacked on top of the existing MCP/policy/workspace matches:
 
@@ -937,7 +990,7 @@ P051 composes with ACP session reuse (P047) but introduces a **reusable-session 
 
 1. the P047 `SessionReuseDisposition` policy returns `Reused` or `ReusedAfterResume` as before, **and**
 2. the **MCP server set accepted at the live session's `session/new`** equals the MCP server set that the new execution's `resolve_mcp_servers` output requires, **and**
-3. **neither the new execution nor the live session has `XcodeShimInjectionSignal: true`** (shim-enabled executions never reuse — see §5.3 "No cross-prompt attribution" rule and preserve per-execution observation truth by construction).
+3. **neither the new execution nor the live session has `XcodeShimInjectionSignal: true`** (shell-shim-enabled executions never reuse — see §5.3 "No cross-prompt attribution" rule and preserve per-execution observation truth by construction). Pure Xcode MCP agents (`XcodeBrokerRequired: true`, `XcodeShimInjectionSignal: false`) are unaffected by this rule and retain full session reuse.
 
 Equality is evaluated on the MCP server inventory that was delivered to `session/new` (server name, transport type, endpoint identity for HTTP, command/args/env for stdio). Because Xcode MCP in broker mode resolves to an HTTP endpoint with a **per-lease bearer token and lease-bound URL**, two different Xcode-MCP requests never compare equal — even for the same agent — once the prior lease has been released. The reused-session MCP set equality therefore means:
 
@@ -1171,7 +1224,7 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Four shim executables under a daemon-managed `$XCODE_SHIM_DIR`:
     - `xcodebuild`, `simctl` — apply reject/route policy based on agent's `requires_xcode_host_execution` flag.
     - `mcpbridge` — **always rejects** direct invocation, regardless of `requires_xcode_host_execution`.
-    - `xcrun` — **option-aware argv parser** covering the known `xcrun` flag set (with-arg: `--sdk`, `--toolchain`, `--log`, `-r`, `--run`; without-arg: `-f`, `--find`, `--help`, `-h`, `--version`, `--verbose`, `--no-cache`, `--kill-cache`, `--show-sdk-*`). Skips options to find first non-option subcommand; intercepts `xcodebuild`/`simctl`/`mcpbridge` and applies the corresponding policy; otherwise `execve("/usr/bin/xcrun", argv, envp)` as pass-through. Unknown option fails closed with `xcrun_unknown_option`.
+    - `xcrun` — **mode-aware argv parser** distinguishing Run mode (`-r`/`--run` or default — tool executes), Find mode (`-f`/`--find` — tool path printed, not executed, pass-through), Show mode (`--show-sdk-*` — no tool, pass-through). Option-with-arg flags (`--sdk`, `--toolchain`, `-l`/`--log`) consume next token but do not change mode. After mode + tool extraction: Run + `xcodebuild`/`simctl` → reject/route/diagnostic; Run + `mcpbridge` → unconditional reject; Run + other tool / Find / Show → pass-through via `execve("/usr/bin/xcrun", ...)`. Unknown flag fails closed with `xcrun_unknown_option`.
   - Each shim: read argv + `$HOME` + `$CHAINWORKS_XCODE_SHIM_TOKEN` + `getcwd()` + capability-relevant env subset, connect to `$XCODE_SHIM_DISPATCH_SOCKET`, dispatch via `ShimDispatchRequest` DTO.
   - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation with `{tool, via_xcrun: bool, argv, cwd, policy_reason}`.
   - Route path: stream stdout/stderr/exit from broker's host executor via framed chunks over the same Unix socket; emit `xcode_shim_routed` observation with argv, cwd, selected simulator UUID, exit status.
@@ -1182,8 +1235,8 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Run at run-start during workflow compilation.
   - **Hard-fail scope (run-blocking)**: scan only structured executable fields — every agent's resolved `run` block command path and argv, env values, and required-tool declarations — for Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`) and `DEVELOPER_DIR=...xcodebuild`/`simctl` env assignments. Fail run-start with `xcode_absolute_path_forbidden` unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`.
   - **`mcpbridge` hard-fail is absolute**: structured fields whose path or `xcrun` subcommand resolves to `mcpbridge` fail run-start regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`. Diagnostic mode's bypass covers `xcodebuild`/`simctl` only; `mcpbridge` has no diagnostic exception anywhere in P051.
-  - **Soft-warn scope (advisory, not blocking)**: scan prompt/system-instruction and description free-form text for the same patterns. Emit `xcode_absolute_path_in_prompt` advisory events appended to `actual_xcode_runtime_observation_json` as warnings; does **not** block run-start. This exists so P051 documentation, review prompts, and evidence quotes are not false-positives.
-  - Produce the agent-level `XcodeShimInjectionSignal: bool` at compilation time, attached to `ResolvedAgent` and available pre-resolution. Triggered by: (1) requested Xcode MCP server in catalog entry, (2) `requires_xcode_host_execution: true`, (3) any bare Xcode-tool lexeme in **any** direct-command declaration field — `run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, and any adapter-specific shell-capability field defined by the catalog schema. Existing catalog shape places Xcode tools in `shell_allowlist` rather than `run` blocks, so the lint must cover both. `prepare_launch_spec` reads the signal and populates `credential_env` before `resolve_mcp_servers` runs.
+  - **Soft-warn scope (advisory, not blocking)**: scan prompt/system-instruction/description free-form text for the same patterns. Emit warnings into `ResolvedAgent.prompt_lint_warnings: Vec<PromptLintWarning>` — a compile-time carrier that travels with the resolved agent through the executor. The executor reads the carrier when creating each `AgentExecution` row and appends entries to `actual_xcode_runtime_observation_json.xcode_shim_events` in the same transaction as the row insert, ensuring durable attribution. Does **not** block run-start. Exists so P051 documentation, review prompts, and evidence quotes are not false-positives.
+  - Produce **two independent compile-time booleans** on `ResolvedAgent`, available pre-resolution: `XcodeBrokerRequired` (triggered by requested Xcode MCP server in catalog entry) and `XcodeShimInjectionSignal` (triggered by (a) `requires_xcode_host_execution: true` or (b) any bare Xcode-tool lexeme in any direct-command declaration field — `run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). Pure Xcode MCP agents get `XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`. `prepare_launch_spec` reads `XcodeShimInjectionSignal` only; **`credential_env` remains empty at this phase** and is populated exclusively by `attach_session_credentials` after capability preflight and MCP resolution both succeed.
 
 - `control-plane/crates/acp/src/launch_spec.rs` (new)
   - Shared `ProviderLaunchSpec` builder used by every adapter's `prepare_launch_spec`.
@@ -1515,7 +1568,10 @@ Add ACP fixture tests for:
 - direct-Xcode-only execution: `XcodeShimDispatchToken` minted at provider-launch time; broker authorizes shim dispatch by token→lease lookup and appends events to the correct `AgentExecution`
 - **reused session event ownership**: a single provider session runs two successful executions (E1 then E2) that both invoke `xcodebuild` via shell. Fixture asserts the broker updated `current_execution_id` and incremented `current_prompt_epoch` before E2's `session/prompt`, so E1's shim event lands in E1's `actual_xcode_runtime_observation_json.xcode_shim_events` and E2's lands in E2's — **no cross-execution contamination**. Same token value is reused across both; only the broker's internal pointers move.
 - **idle-window dispatch rejection**: E1 spawns a background `xcodebuild &`; E1 prompt completes (broker sets `current_execution_id = None`); **before E2 starts**, the backgrounded `xcodebuild` reaches the shim socket. Fixture asserts the late dispatch is rejected with `xcode_shim_no_active_prompt`, the rejection lands in the lease's `originating_execution_id` orphan bucket with `is_orphan: true`, `dispatch_arrived_epoch`, `session_current_epoch_at_dispatch`, and no attribution to any live execution.
-- **shim-enabled reuse is forbidden**: agent with `XcodeShimInjectionSignal: true` runs E1 → provider session 1 closed → E2 on same lineage → forced fresh provider session 2 with fresh shim lease. Fixture asserts P047 disposition is forced to `FreshSessionRequired` for shim-enabled agents even when MCP/policy/workspace inputs match. A second fixture covers the inverse: agent **without** shim signal (pure Xcode MCP, no direct xcodebuild) reuses normally per §5.6 rule 1-2. By construction, cross-prompt dispatch gap cannot occur because no shim-enabled session ever serves more than one execution.
+- **shell-shim-enabled reuse is forbidden**: agent with `XcodeShimInjectionSignal: true` (direct `xcodebuild` in shell_allowlist, or `requires_xcode_host_execution: true`) runs E1 → provider session 1 closed → E2 on same lineage → forced fresh provider session 2 with fresh shim lease. Fixture asserts P047 disposition is forced to `FreshSessionRequired` for shim-enabled agents even when MCP/policy/workspace inputs match.
+- **pure Xcode MCP reuses normally**: agent with `XcodeBrokerRequired: true` and `XcodeShimInjectionSignal: false` (only requests Xcode MCP, no shell Xcode commands, no `requires_xcode_host_execution`) runs E1 successfully → E2 on same lineage reuses the provider session, its broker lease, and its backend `mcpbridge` subprocess per §5.6. Same bridge PID, same HTTP endpoint, no new spawn. Fixture asserts reuse works.
+- **both signals true — no reuse**: agent with Xcode MCP AND direct `xcodebuild` → both signals set → shim injected → reuse forbidden per §5.3. Fixture asserts the shim-enabled reuse-forbidden rule wins over the MCP-reuse-allowed rule.
+- **signal split verification**: catalog lint fixture asserts the two signals are produced independently — an agent with only `xcode` MCP entry gets `XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`; an agent with only `shell_allowlist: [xcodebuild]` gets the inverse.
 - **reuse-incompatible on shim authority**: second execution on same lineage has a different `workspace_root` → supersession forced. Old session + old token retired; fresh session + fresh token minted with E2's workspace_root. Fixture asserts E1's shim lease is `released` before E2's is minted.
 - **reuse-incompatible on policy change**: second execution has `requires_xcode_host_execution: true` while the live session was opened with `false` → supersession forced
 - forged token: shim dispatch with a token not in broker's state map is rejected with `xcode_shim_invalid_token`; no event is appended to any execution
@@ -1606,8 +1662,13 @@ Shim enforcement (PATH-based invocations):
 - fake-home agent invoking `xcrun simctl list` receives exit 127; `xcode_shim_rejected` with `{tool: "simctl", via_xcrun: true}`
 - fake-home agent invoking `xcrun --sdk iphonesimulator simctl list` (option-prefixed form) is correctly parsed by the option-aware `xcrun` shim and receives exit 127; `xcode_shim_rejected` with `{tool: "simctl", via_xcrun: true}`
 - fake-home agent invoking `xcrun mcpbridge` receives exit 127 regardless of `requires_xcode_host_execution` value; `xcode_shim_rejected` with `{tool: "mcpbridge", via_xcrun: true, policy_reason: "mcpbridge_broker_only"}`
-- fake-home agent invoking `xcrun dtrace` (non-Xcode subcommand, no options) passes through transparently; no observation emitted
-- fake-home agent invoking `xcrun --toolchain swift-latest swiftc …` (option-prefixed non-Xcode) passes through transparently after option parse
+- fake-home agent invoking **`xcrun -r mcpbridge`** (Run mode with short `-r`) resolves tool to `mcpbridge` and is rejected with `xcode_shim_rejected`; fixture explicitly proves the mode-aware parser does not consume `mcpbridge` as an argument to `-r`
+- fake-home agent invoking **`xcrun --run mcpbridge`** (Run mode with long form) same result
+- fake-home agent invoking **`xcrun --find xcodebuild`** (Find mode — no execution) passes through transparently; fixture asserts no `xcode_shim_rejected`/`xcode_shim_routed` event is emitted because `xcodebuild` is not actually executed, only its path is printed
+- fake-home agent invoking **`xcrun --find mcpbridge`** similarly passes through (no execution); the printed path is still subject to the absolute-path catalog-lint boundary elsewhere
+- fake-home agent invoking **`xcrun --show-sdk-path`** (Show mode, no tool) passes through silently
+- fake-home agent invoking `xcrun dtrace` (Run mode, non-Xcode tool) passes through transparently; no observation emitted
+- fake-home agent invoking `xcrun --toolchain swift-latest swiftc …` (Run mode with non-mode option-with-arg) passes through transparently after option parse
 - fake-home agent invoking `xcrun --bogus-unknown-flag simctl list` receives exit 127 (unknown flag fail-closed); `xcode_shim_rejected` with `policy_reason: "xcrun_unknown_option"`
 
 Absolute-path catalog lint — structured fields (hard-fail):
@@ -1618,7 +1679,8 @@ Absolute-path catalog lint — structured fields (hard-fail):
 
 Absolute-path catalog lint — prompt text (soft-warn):
 
-- catalog with a prompt that quotes `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` as inert documentation (e.g., a review agent's instructions describing what is blocked) **passes** run-start; fixture asserts run is created and an `xcode_absolute_path_in_prompt` warning is appended to the agent's `actual_xcode_runtime_observation_json`
+- catalog with a prompt that quotes `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` as inert documentation (e.g., a review agent's instructions describing what is blocked) **passes** run-start; fixture asserts (a) run is created, (b) `ResolvedAgent.prompt_lint_warnings` contains the entry at compile time, (c) when the executor creates the `AgentExecution` row, the warning is appended to `actual_xcode_runtime_observation_json.xcode_shim_events` in the same transaction, (d) the entry carries `source_field` and `excerpt` for operator review
+- warning carrier durability: fixture simulates an executor crash between compile and claim — on recovery, the next executor replay reads the same `ResolvedAgent` (which is frozen run truth) and still writes the warning to the new `AgentExecution` row. Warnings are never dropped between compilation and execution.
 - fixture using this P051 proposal text itself as the prompt body compiles cleanly — no false-positive on documentation that quotes the forbidden paths
 - a prompt that contains **both** a quoted path AND a structured `run` block command with the same absolute path: run-start fails on the structured field; the prompt warning is still recorded
 
