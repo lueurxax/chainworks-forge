@@ -205,13 +205,26 @@ The pool key still groups leases by policy fingerprint for permission filtering,
 
 ACP HTTP MCP must not be sent to a provider that has not advertised `mcpCapabilities.http == true` in its `initialize` response. The P051 wire emitter must gate HTTP MCP on a checked capability, and that check must happen **before** engine MCP resolution returns a transport — otherwise `resolve_mcp_servers` could mint an HTTP `ResolvedMcpServerTransport` for a stdio-only provider, a lease would be reserved, and failure would surface late inside `session/new`.
 
-**Capability owner.** `AcpRuntimeManager` owns a `ProviderCapabilityCache: HashMap<(AdapterFamily, BinaryFingerprint), AgentCapabilities>` populated by a one-shot capability-probe subprocess:
+**Capability owner.** `AcpRuntimeManager` owns a `ProviderCapabilityCache: HashMap<ProbeKey, AgentCapabilities>`. The probe key captures **every input that could change what the provider advertises** — not just binary identity, because the same binary can report different capabilities under different launch configurations:
 
-```text
-ProviderCapabilityProbe::probe(adapter_family, binary_path, binary_mtime) -> AgentCapabilities
+```rust
+struct ProbeKey {
+    adapter_family: AdapterFamily,
+    runtime_profile_id: RuntimeProfileId,
+    binary_fingerprint: BinaryFingerprint,   // path + mtime + size
+    launch_args_fingerprint: sha256,          // sorted argv the probe will use
+    launch_env_fingerprint: sha256,           // sorted capability-relevant env
+    adapter_settings_fingerprint: sha256,     // AcpSessionConfig.extra / mode / config_options
+}
 ```
 
-The probe launches the provider binary, sends `initialize` with minimal client capabilities, records the returned `AgentCapabilities` (including `mcpCapabilities.{http,sse}`), and immediately closes via `session/close` or stdin EOF. One probe per (adapter_family, binary_fingerprint) per daemon process lifetime; result cached in-memory.
+`launch_env_fingerprint` covers an explicit allowlist of capability-relevant env vars (e.g., `CODEX_HOME`, `GEMINI_API_KEY` presence flag, `CLAUDE_AGENT_*` feature flags, `ACP_EXPERIMENTAL_*`) — never values for secrets, only a redacted/boolean fingerprint. `adapter_settings_fingerprint` covers the `AcpSessionConfig` knobs that alter provider behavior (mode, config options, structured-output intent). Any change in any of these forces a fresh probe.
+
+```text
+ProviderCapabilityProbe::probe(ProbeKey) -> AgentCapabilities
+```
+
+The probe launches the provider binary **with the exact args and env that a real session/new would use** (minus the actual `mcpServers` list — probe sends an empty `mcpServers: []`), sends `initialize` with minimal client capabilities, records the returned `AgentCapabilities`, and immediately closes via `session/close` or stdin EOF. One probe per unique `ProbeKey` per daemon process lifetime; result cached in-memory.
 
 **Preflight timing.** `AcpRuntimeManager::ensure_provider_capabilities(runtime_profile_id)` runs as a preflight step during `ExecutionRequest` construction, **before** `engine::mcp::resolve_mcp_servers` is called. The resolved capabilities are threaded into MCP resolution as a function argument:
 
@@ -229,7 +242,15 @@ fn resolve_mcp_servers(
 - `AgentExecution.actual_mcp_observation_json` records `provider_http_mcp_unsupported` with the adapter family and binary fingerprint,
 - the stage settles as `failed_before_output`.
 
-**Cache invalidation.** The cache entry is keyed on binary fingerprint (path + mtime + file size). A provider upgrade invalidates the entry automatically; the next request for that provider triggers a fresh probe.
+**Cache invalidation.** The cache entry is keyed on the full `ProbeKey` tuple. Any of these invalidates a lookup:
+
+- provider upgrade (binary path, mtime, or size changes),
+- runtime profile change (e.g., switching from `codex-reasoning-high` to `codex-reasoning-medium` where effort-dependent capabilities might differ),
+- launch args change (e.g., Gemini switching between `--acp` and `--experimental-acp`, which happen to be synonyms today but could diverge),
+- launch env change (a capability-gating env var was added/removed/toggled),
+- adapter-settings change (e.g., Codex `mode: full-access` vs `mode: bypassPermissions` affecting advertised tool sets).
+
+A lookup miss triggers a fresh probe, records the fresh result, and proceeds. The cache never returns cross-profile results.
 
 ### 5.1.1 Host-user Xcode execution boundary
 
@@ -249,7 +270,15 @@ ACP provider subprocesses continue to run with isolated per-session home state. 
 
 The reliability goal of P051 is not achieved if the same Xcode-dependent agents still invoke `xcodebuild`, `xcrun simctl`, or `xcrun mcpbridge` directly through their shell tool from a fake-home context — the CoreSimulator / `simdiskimaged` failure mode returns. P051 therefore defines a minimum, enforceable guard rather than leaving direct commands as "diagnostic-only":
 
-**Guard mechanism — PATH shim.** When an ACP provider subprocess is launched for an agent that has any Xcode MCP entry in its resolved catalog, the broker prepends a daemon-managed shim directory to the provider's `PATH`:
+**Injection condition.** The shim is injected when an agent has **any modeled Xcode-dependent capability**. Three triggers, any of which activates injection:
+
+1. any resolved MCP entry with `adapter_family: xcode_*` or server id `xcode`,
+2. any declared `requires_xcode_host_execution: true`,
+3. any entry in the agent's allowed `run` commands that matches a known Xcode-tool lexeme (`xcodebuild`, `simctl`, `mcpbridge`, `xcrun`, or any absolute path beginning with `/Applications/Xcode.app/Contents/Developer/`). Detection is performed by a catalog lint pass at run-start.
+
+An agent that uses direct `xcodebuild` but has no Xcode MCP server still receives the shim, the token, and the socket. Agents with zero Xcode signals get no shim — the provider subprocess keeps its normal `PATH` unchanged.
+
+**Guard mechanism — PATH shim + absolute-path catalog lint.** For agents meeting any injection trigger, the broker prepends a daemon-managed shim directory to the provider's `PATH`:
 
 ```text
 $XCODE_SHIM_DIR:$ORIGINAL_PATH
@@ -262,12 +291,31 @@ The shim directory contains executables named `xcodebuild`, `simctl`, `mcpbridge
 3. connects to the broker's local Unix-domain dispatch socket (`$XCODE_SHIM_DISPATCH_SOCKET`),
 4. dispatches to one of three paths based on agent policy (below).
 
-**`xcrun` shim — narrow interception.** `xcrun` is a multi-tool dispatcher used by many non-Xcode flows (e.g., `xcrun dtrace`, `xcrun xar`, `xcrun notarytool`, `xcrun xcode-select`), so the shim must not globally intercept it. The shim inspects `argv[1]` and:
+**`xcrun` shim — option-aware subcommand parsing.** `xcrun` accepts several leading options before the subcommand, e.g. `xcrun --sdk iphonesimulator simctl list` or `xcrun --toolchain swift-latest mcpbridge`. Naive `argv[1]` inspection would miss these and pass-through dangerous invocations. The shim implements a proper option parser with the known `xcrun` flag set from `xcrun --help`:
 
-- if `argv[1]` is `simctl` or `mcpbridge` — apply the reject/route/diagnostic policy as if the tool were invoked directly,
-- if `argv[1]` is anything else — `execve("/usr/bin/xcrun", argv, envp)` with full pass-through, preserving the provider's isolated environment. The shim does not observe or log pass-through invocations.
+- option-with-arg flags consume the next token: `--sdk <name>`, `--toolchain <name>`, `--log <path>`, `-r <path>`, `--run <path>`.
+- option-without-arg flags: `--find`, `-f`, `--help`, `-h`, `--version`, `--verbose`, `--no-cache`, `--kill-cache`, `--show-sdk-path`, `--show-sdk-version`, `--show-sdk-platform-path`, `--show-sdk-platform-version`, `--show-sdk-build-version`.
+- Unknown flag: fail closed (reject with `xcrun_unknown_option`) rather than silently pass through. The flag set is updated when Apple ships new `xcrun` options; until then, unknown is treated as adversarial.
 
-The shim pass-through uses the absolute path `/usr/bin/xcrun` (not `$ORIGINAL_PATH`) to avoid a shim-recursion loop where `PATH` resolution returns the shim again.
+After skipping options, the first non-option token is treated as the subcommand. If that token is `simctl` or `mcpbridge`, apply the reject/route/diagnostic policy. Otherwise `execve("/usr/bin/xcrun", argv, envp)` passes through, preserving the provider's isolated environment. Pass-through is silent (no observation). Absolute path `/usr/bin/xcrun` avoids shim recursion via `PATH`.
+
+**Absolute-path containment (catalog lint).** PATH shims cannot intercept direct absolute-path invocations like `/usr/bin/xcrun simctl list` or `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild build`. P051 closes this with a **catalog lint step**, not a runtime interceptor, because libc `execve`-level audit requires `DYLD_INSERT_LIBRARIES` (SIP-protected for Apple-signed binaries) or kernel extensions (deprecated). The lint runs at run-start during workflow compilation:
+
+- scan every agent's resolved `run` block (commands, args, env values) plus prompt/system-instruction text for absolute paths matching:
+  - `/usr/bin/xcrun`, `/usr/bin/xcodebuild`
+  - `/Applications/Xcode.app/Contents/Developer/`
+  - `/Applications/Xcode*.app/Contents/Developer/`
+  - any `DEVELOPER_DIR=…xcodebuild`, `DEVELOPER_DIR=…simctl` assignments
+- **fail run-start** with `xcode_absolute_path_forbidden` for matches, requiring the catalog author to use bare tool names (which the shim can intercept) or explicit `requires_xcode_host_execution: true` with opt-in routing.
+- Diagnostic mode (`CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`) skips the lint with a WARN log.
+
+**Scope of guarantee.** The containment model is:
+
+- **PATH-based invocations** of `xcodebuild`, `simctl`, `mcpbridge`, and `xcrun <subcommand>`: enforced by shim at runtime.
+- **Absolute-path invocations**: enforced by catalog lint at run-start; not enforced at runtime.
+- **Agent prompt-time improvisation** (an LLM synthesizing an absolute path mid-run): not blocked by P051. This is a residual risk. Mitigations: (a) prompt templates for Xcode-dependent agents include explicit "use bare `xcodebuild`, never absolute paths" instruction, (b) agent-shell output observation flags commands starting with `/Applications/Xcode.app/` or `DEVELOPER_DIR=` to a warning stream for operator review post-run, (c) a follow-up proposal can add libc audit or sandbox-exec profiles if the residual risk becomes a real failure mode in dogfood.
+
+P051 does not claim the residual risk is zero. It claims the enforceable boundary covers PATH-based commands and catalog-declared absolute paths, which is the common case observed today.
 
 **Agent policy outcomes.** The agent catalog gains one optional field:
 
@@ -285,7 +333,45 @@ agents:
   ```
   exit code 127. `actual_mcp_observation_json` records `xcode_shim_rejected` with the command and argv.
 
-- `requires_xcode_host_execution: true`: shim **routes** the invocation through the broker's host executor over the Unix dispatch socket. The broker runs the actual `/Applications/Xcode.app/Contents/Developer/usr/bin/<tool>` under full host-user environment (HOME/TMPDIR/DEVELOPER_DIR/USER/LOGNAME), streams stdout/stderr/exit back to the shim, and records `xcode_shim_routed` with the selected simulator UUID when applicable.
+- `requires_xcode_host_execution: true`: shim **routes** the invocation through the broker's host executor over the Unix dispatch socket. The broker runs the actual `/Applications/Xcode.app/Contents/Developer/usr/bin/<tool>` under full host-user environment, streams stdout/stderr/exit back to the shim, and records `xcode_shim_routed` with the selected simulator UUID when applicable.
+
+**Dispatch DTO.** The shim sends a structured request over the Unix socket (not just argv):
+
+```rust
+struct ShimDispatchRequest {
+    token: String,              // CHAINWORKS_XCODE_SHIM_TOKEN (matches broker lease)
+    tool: ShimTool,             // Xcodebuild | Simctl | Mcpbridge | XcrunPassthrough
+    argv: Vec<String>,          // as received by the shim, minus argv[0]
+    cwd: PathBuf,               // shim captures getcwd() at invocation time
+    provider_env_snapshot: BTreeMap<String, String>, // safe subset (below)
+    provider_pid: u32,          // for audit correlation
+    invocation_ts: SystemTime,
+}
+```
+
+**cwd handoff.** The shim records `getcwd()` and sends it to the broker. The host executor `chdir`s to this cwd before `execve`ing the real tool — unless the cwd is outside the agent's frozen workspace root (in which case the host executor rejects with `cwd_outside_workspace`). Without cwd propagation, `xcodebuild` run from the agent's working directory (`.chainworks/worktrees/<id>`) would execute in whatever arbitrary directory the broker happened to be running in, breaking workspace-relative invocations.
+
+**Env propagation (allowlist, not pass-through).** The host executor **does not inherit** the provider's env. It constructs the Xcode subprocess env from scratch and selectively merges a narrow allowlist from `provider_env_snapshot`:
+
+| Env var | Policy |
+|---|---|
+| `HOME` | **Overridden** to operator home by host executor. Provider's fake `$HOME` is ignored. |
+| `TMPDIR` | **Overridden** to operator `DARWIN_USER_TEMP_DIR`. Provider's fake `$TMPDIR` is ignored. |
+| `USER`, `LOGNAME` | **Overridden** to operator account name. |
+| `DEVELOPER_DIR` | **Overridden** to `xcode-select -p` value resolved at daemon start. Provider's value is ignored unless the agent declares `xcode_developer_dir_override` (future extension). |
+| `PATH` | **Overridden** to a minimal Xcode-appropriate `PATH`: `/usr/bin:/bin:/usr/sbin:/sbin:<DEVELOPER_DIR>/usr/bin`. Provider's shim-prefixed `PATH` is stripped to avoid shim recursion in the subprocess. |
+| `CODEX_HOME` | **Unset**. Codex fake-home must not leak into Xcode. |
+| `XDG_CACHE_HOME` | **Unset**. Not used by Xcode. |
+| `CHAINWORKS_*` | **Unset**. No control-plane internal env leaks to Xcode subprocess. |
+| `SCHEME`, `CONFIGURATION`, `DESTINATION` | **Propagated** from provider snapshot if present (build-input env). |
+| `CODE_SIGN_STYLE`, `DEVELOPMENT_TEAM` | **Propagated** if present (signing env). |
+| Other env vars | **Dropped by default.** Add to allowlist in host executor config if a legitimate build flow needs them. |
+
+The allowlist is small by design: the host executor is the trust crossing point, so anything not explicitly on the list is untrusted. Agents that need custom env should declare it in the agent catalog `env` block — that declaration is then carried into the snapshot allowlist.
+
+**Workspace root + simulator UUID.** The broker resolves the selected simulator UUID (from `xcrun simctl list --json` at daemon start + per-request resolution if needed) and includes it in `xcode_shim_routed` observation. The broker verifies the agent's frozen workspace root matches a known Xcode project/workspace location before running `xcodebuild`; mismatch → reject with `workspace_mismatch`.
+
+**Streaming contract.** Host executor streams stdout/stderr back to the shim over the same Unix socket as framed chunks (`{stream: "stdout"|"stderr", bytes: <base64>}`) so the agent sees command output interleaved as normal shell would. Exit code delivered as `{exit: <i32>}` terminator. The shim then exits with the same code.
 
 - Diagnostic escape hatch: daemon config `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` (not per-agent — global, for local debugging) makes all shims transparent passthroughs to the real binaries. Logged at WARN level on daemon start if set. Not valid in production deployments.
 
@@ -470,8 +556,10 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Refuse broker mode unless the P051 HTTP streaming feasibility research verdict allows the current provider set.
 
 - `control-plane/crates/acp/src/provider_probe.rs` (new)
-  - `ProviderCapabilityProbe::probe(adapter_family, binary_path, binary_mtime) -> AgentCapabilities` — one-shot `initialize` subprocess, records returned capabilities, closes immediately.
+  - `ProviderCapabilityProbe::probe(ProbeKey) -> AgentCapabilities` — one-shot `initialize` subprocess with the **exact args + env + adapter settings** that a real session would use (minus `mcpServers`), records returned capabilities, closes immediately.
+  - `ProbeKey` composed of `(adapter_family, runtime_profile_id, binary_fingerprint, launch_args_fingerprint, launch_env_fingerprint, adapter_settings_fingerprint)`.
   - Binary fingerprinting: path + mtime + size. No signature verification in P051.
+  - Env fingerprint allowlist restricted to capability-gating env vars (never raw secret values; boolean/redacted fingerprint only).
 
 - `control-plane/crates/acp/src/lib.rs`
   - Add request/result fields only if required for pool observations.
@@ -503,16 +591,23 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
 - `control-plane/crates/acp/src/xcode_shim/` (new crate or module + thin binaries)
   - Four shim executables under a daemon-managed `$XCODE_SHIM_DIR`:
     - `xcodebuild`, `simctl` — apply reject/route policy based on agent's `requires_xcode_host_execution` flag.
-    - `mcpbridge` — **always rejects** direct invocation (no route path), regardless of `requires_xcode_host_execution`.
-    - `xcrun` — inspects `argv[1]`; if `simctl` or `mcpbridge`, applies the same policy as the corresponding direct-command shim; otherwise `execve("/usr/bin/xcrun", argv, envp)` as pass-through.
-  - Each shim: read argv + `$HOME` + `$CHAINWORKS_XCODE_SHIM_TOKEN`, connect to `$XCODE_SHIM_DISPATCH_SOCKET`, dispatch according to shim type and agent policy.
-  - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation with `{tool, via_xcrun: bool, argv, policy_reason}`.
-  - Route path: stream stdout/stderr/exit from broker's host executor; emit `xcode_shim_routed` observation.
+    - `mcpbridge` — **always rejects** direct invocation, regardless of `requires_xcode_host_execution`.
+    - `xcrun` — **option-aware argv parser** covering the known `xcrun` flag set (with-arg: `--sdk`, `--toolchain`, `--log`, `-r`, `--run`; without-arg: `-f`, `--find`, `--help`, `-h`, `--version`, `--verbose`, `--no-cache`, `--kill-cache`, `--show-sdk-*`). Skips options to find first non-option subcommand; if `simctl`/`mcpbridge`, applies corresponding policy; otherwise `execve("/usr/bin/xcrun", argv, envp)` as pass-through. Unknown option fails closed with `xcrun_unknown_option`.
+  - Each shim: read argv + `$HOME` + `$CHAINWORKS_XCODE_SHIM_TOKEN` + `getcwd()` + capability-relevant env subset, connect to `$XCODE_SHIM_DISPATCH_SOCKET`, dispatch via `ShimDispatchRequest` DTO.
+  - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation with `{tool, via_xcrun: bool, argv, cwd, policy_reason}`.
+  - Route path: stream stdout/stderr/exit from broker's host executor via framed chunks over the same Unix socket; emit `xcode_shim_routed` observation with argv, cwd, selected simulator UUID, exit status.
   - Pass-through path (`xcrun` only, non-Xcode subcommands): silent `execve`, no observation.
   - Diagnostic bypass: `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes the shim a transparent passthrough — including `mcpbridge` — with WARN log at daemon start and per-invocation WARN log per shim.
 
+- `control-plane/crates/workflow/src/catalog_lint.rs` (new)
+  - Run at run-start during workflow compilation.
+  - Scan every agent's resolved `run` block (commands, args, env values) plus prompt/system-instruction text for Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`) and `DEVELOPER_DIR=...` assignments paired with Xcode tools.
+  - Fail run-start with `xcode_absolute_path_forbidden` on match unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`.
+  - Produce the agent-level shim-injection signal based on: (1) Xcode MCP server present, (2) `requires_xcode_host_execution: true`, (3) any bare Xcode-tool lexeme in `run` block.
+
 - `control-plane/crates/acp/src/adapters/{codex,claude,gemini,auggie,junie}.rs`
-  - For agents with Xcode MCP entries: prepend `$XCODE_SHIM_DIR` to the subprocess `PATH`; inject `CHAINWORKS_XCODE_SHIM_TOKEN` and `XCODE_SHIM_DISPATCH_SOCKET`.
+  - For agents that meet **any** of the three injection triggers (Xcode MCP entry, `requires_xcode_host_execution: true`, or any Xcode-tool lexeme detected by catalog lint): prepend `$XCODE_SHIM_DIR` to the subprocess `PATH`; inject `CHAINWORKS_XCODE_SHIM_TOKEN` and `XCODE_SHIM_DISPATCH_SOCKET`.
+  - Agents with zero Xcode signals keep their normal `PATH` (no shim overhead).
 
 ### Engine crate
 
@@ -725,11 +820,14 @@ The exact test names may differ, but the gate must prove:
 - HTTP streaming endpoint shape is used for brokered Xcode MCP
 - policy-separated leases get independent broker state (no cross-lease policy leakage)
 
-**Capability preflight (P1 new)**
+**Capability preflight**
 
 - HTTP-incompatible provider (fixture with `mcpCapabilities.http = false`) fails closed with `provider_http_mcp_unsupported` **before** any lease is reserved, before the HTTP listener is bound, and before `session/new` is sent
-- capability probe cache hit for a previously-seen `(adapter_family, binary_fingerprint)` skips the probe subprocess
+- capability probe cache hit for a previously-seen full `ProbeKey` (same adapter/profile/binary/args/env/settings) skips the probe subprocess
 - binary fingerprint change (path, mtime, or size) invalidates the cached entry and triggers a fresh probe
+- runtime profile change forces a fresh probe even when the binary is unchanged — fixture: two profiles on the same Codex binary with different `mode` or `config_options` produce independent cache entries
+- launch-env fingerprint change forces a fresh probe — fixture: toggling an `ACP_EXPERIMENTAL_*` env var between probes yields two distinct cache entries
+- launch-args fingerprint change forces a fresh probe — fixture: Gemini switching between `--acp` and `--experimental-acp` produces two distinct cache entries
 
 **Per-lease vs pool-wide failure isolation (P1 new)**
 
@@ -738,15 +836,41 @@ The exact test names may differ, but the gate must prove:
 - host-env unavailable (fixture with unreadable operator home) fails closed with `backend_failure_class = "host_env_unavailable"`
 - broker HTTP infrastructure failure (fixture listener killed) marks broker unhealthy with `backend_failure_class = "broker_infrastructure"`
 
-**Direct Xcode command guard (P1 new)**
+**Direct Xcode command guard**
 
-- fake-home agent with `requires_xcode_host_execution: false` invoking `xcodebuild -project …` via shell receives exit 127 with structured stderr; `xcode_shim_rejected` observation recorded with `{tool: "xcodebuild", via_xcrun: false}`
-- fake-home agent invoking `xcrun simctl list` receives exit 127 (shim intercepts xcrun subcommand); `xcode_shim_rejected` observation with `{tool: "simctl", via_xcrun: true}`
-- fake-home agent invoking `xcrun mcpbridge` receives exit 127 regardless of `requires_xcode_host_execution` value; `xcode_shim_rejected` observation with `{tool: "mcpbridge", via_xcrun: true, policy_reason: "mcpbridge_broker_only"}`
-- fake-home agent invoking `xcrun dtrace` (non-Xcode subcommand) passes through transparently; no observation emitted
-- agent with `requires_xcode_host_execution: true` invoking `xcodebuild build -scheme Foo` has its command routed through the broker host executor; `xcode_shim_routed` observation records argv, selected simulator UUID (when applicable), exit status, and host-env disposition
-- `mcpbridge` is **not** routable via the host executor even with `requires_xcode_host_execution: true` — fixture confirms rejection is unconditional
-- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes all shims transparent (including `mcpbridge`) and emits WARN-level structured log at daemon start and per invocation
+Shim injection:
+
+- agent with only Xcode MCP entries (no direct `xcodebuild` in `run` block) gets the shim injected
+- agent with only direct `xcodebuild` commands (no Xcode MCP entry) gets the shim injected via the catalog-lint injection trigger
+- agent with `requires_xcode_host_execution: true` but no other Xcode signal gets the shim injected
+- agent with zero Xcode signals gets no shim; its `PATH` remains unchanged
+
+Shim enforcement (PATH-based invocations):
+
+- fake-home agent with `requires_xcode_host_execution: false` invoking `xcodebuild -project …` via shell receives exit 127; `xcode_shim_rejected` observation with `{tool: "xcodebuild", via_xcrun: false}`
+- fake-home agent invoking `xcrun simctl list` receives exit 127; `xcode_shim_rejected` with `{tool: "simctl", via_xcrun: true}`
+- fake-home agent invoking `xcrun --sdk iphonesimulator simctl list` (option-prefixed form) is correctly parsed by the option-aware `xcrun` shim and receives exit 127; `xcode_shim_rejected` with `{tool: "simctl", via_xcrun: true}`
+- fake-home agent invoking `xcrun mcpbridge` receives exit 127 regardless of `requires_xcode_host_execution` value; `xcode_shim_rejected` with `{tool: "mcpbridge", via_xcrun: true, policy_reason: "mcpbridge_broker_only"}`
+- fake-home agent invoking `xcrun dtrace` (non-Xcode subcommand, no options) passes through transparently; no observation emitted
+- fake-home agent invoking `xcrun --toolchain swift-latest swiftc …` (option-prefixed non-Xcode) passes through transparently after option parse
+- fake-home agent invoking `xcrun --bogus-unknown-flag simctl list` receives exit 127 (unknown flag fail-closed); `xcode_shim_rejected` with `policy_reason: "xcrun_unknown_option"`
+
+Absolute-path catalog lint:
+
+- catalog with a `run` block command starting with `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` fails run-start with `xcode_absolute_path_forbidden`; run is not created
+- catalog with an env assignment `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` alongside a direct `xcodebuild` invocation fails the lint
+- catalog with bare `xcodebuild` (no absolute path) passes the lint and proceeds to shim-based enforcement
+
+Host executor routing:
+
+- agent with `requires_xcode_host_execution: true` invoking `xcodebuild build -scheme Foo` is routed; `xcode_shim_routed` observation records argv, selected simulator UUID, exit status, host-env disposition, **and `cwd`**
+- routed `xcodebuild` executes with `chdir` to the agent's cwd; fixture confirms build artifact landing in the correct workspace-relative path
+- routed command with cwd outside frozen workspace root is rejected with `cwd_outside_workspace`
+- routed command's subprocess env contains host-user `HOME`/`TMPDIR`/`DEVELOPER_DIR` (via fixture inspection of `/usr/bin/env` output), **not** the provider's fake-home values
+- provider env like `CODEX_HOME`, `XDG_CACHE_HOME`, `CHAINWORKS_*` is absent from routed subprocess env
+- build-input env (`SCHEME`, `CONFIGURATION`, `DESTINATION`) present in provider snapshot is propagated to routed subprocess
+- `mcpbridge` is not routable via the host executor even with `requires_xcode_host_execution: true` — fixture confirms rejection is unconditional
+- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes all shims transparent (including `mcpbridge` and catalog lint skipped) with WARN log at daemon start and per invocation
 
 **Catalog migration**
 
