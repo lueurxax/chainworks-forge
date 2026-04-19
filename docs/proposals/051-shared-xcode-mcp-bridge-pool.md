@@ -373,11 +373,33 @@ agents:
 
 - `requires_xcode_host_execution: true`: shim **routes** the invocation through the broker's host executor over the Unix dispatch socket. The broker runs the actual `/Applications/Xcode.app/Contents/Developer/usr/bin/<tool>` under full host-user environment, streams stdout/stderr/exit back to the shim, appends `policy_decision: "routed"` to `xcode_shim_events`, and appends a matching entry to `actual_xcode_runtime_observation_json.xcode_host_executor_events` with argv, cwd, selected simulator UUID, host-env disposition, env allowlist applied, and exit status.
 
+**Dispatch authority is separate from MCP lease authority.** Shim authentication cannot reuse the broker HTTP MCP bearer token, because:
+
+1. direct-Xcode-only agents have no MCP lease, no HTTP endpoint, and no MCP bearer token — but they still need a dispatch token to reach the broker,
+2. mixing the two authorities would let an MCP lease token be used to request host-executor routing, and vice versa; orthogonal authorities are safer.
+
+P051 introduces a separate **`XcodeShimDispatchToken`** minted by the broker per `AgentExecution` at provider-launch time, whenever the shim is injected (§5.1.1 injection condition — any of the three triggers). It is distinct from any MCP bearer token.
+
+```rust
+struct XcodeShimDispatchLease {
+    token: String,                     // 32+ random bytes, constant-time compared by broker
+    agent_execution_id: AgentExecutionId,
+    workspace_root: PathBuf,           // frozen agent worktree root; enforces cwd boundary
+    requires_host_execution: bool,     // agent's requires_xcode_host_execution flag
+    issued_at: SystemTime,
+    expires_at: SystemTime,            // max = provider session lifetime; typically 24h
+}
+```
+
+Broker-owned state: `HashMap<String /* token */, XcodeShimDispatchLease>`. Minted in memory only; not persisted. Lifetime matches the provider session — released on provider-session close alongside the MCP lease (if any). Tokens are never shared across executions or sessions.
+
+The shim receives the token via `$CHAINWORKS_XCODE_SHIM_TOKEN` in its environment (alongside `$XCODE_SHIM_DISPATCH_SOCKET`). The provider subprocess sees both env vars; they cannot be read by the ACP agent's prompt (env vars are set by the adapter at subprocess spawn, not exposed via ACP `session/*` messages). An agent cannot mint, forge, or guess a token.
+
 **Dispatch DTO.** The shim sends a structured request over the Unix socket (not just argv):
 
 ```rust
 struct ShimDispatchRequest {
-    token: String,              // CHAINWORKS_XCODE_SHIM_TOKEN (matches broker lease)
+    token: String,              // $CHAINWORKS_XCODE_SHIM_TOKEN (XcodeShimDispatchLease.token)
     tool: ShimTool,             // Xcodebuild | Simctl | Mcpbridge | XcrunPassthrough
     argv: Vec<String>,          // as received by the shim, minus argv[0]
     cwd: PathBuf,               // shim captures getcwd() at invocation time
@@ -386,6 +408,20 @@ struct ShimDispatchRequest {
     invocation_ts: SystemTime,
 }
 ```
+
+**Broker authorization pipeline on receiving `ShimDispatchRequest`:**
+
+1. look up `XcodeShimDispatchLease` by `token`; reject with `xcode_shim_invalid_token` on miss or on constant-time mismatch; reject with `xcode_shim_token_expired` on `SystemTime::now() > expires_at`.
+2. resolve `agent_execution_id` from the lease; the broker uses this to append events to the correct `actual_xcode_runtime_observation_json`.
+3. apply `requires_host_execution` policy from the lease (source of truth — not re-read from the agent catalog, to prevent runtime catalog mutation bypassing the decision frozen at provider launch).
+4. apply `workspace_root` cwd check: reject routed `xcodebuild`/`simctl` requests whose `cwd` is outside the lease's `workspace_root`.
+5. dispatch to reject path or host-executor route; append events.
+
+**MCP bearer token vs shim dispatch token — non-overlap:**
+
+- An MCP lease's HTTP bearer token authorizes HTTP MCP traffic to the broker's `/xcode-mcp/<lease_id>` endpoint. It cannot be used against the shim dispatch socket.
+- An `XcodeShimDispatchLease.token` authorizes shim dispatch requests on the Unix-domain socket. It cannot be used as an HTTP bearer header.
+- Different tokens, different sockets, different state maps. The broker rejects cross-use by construction (different code paths, different validators).
 
 **cwd handoff.** The shim records `getcwd()` and sends it to the broker. The host executor `chdir`s to this cwd before `execve`ing the real tool — unless the cwd is outside the agent's frozen workspace root (in which case the host executor rejects with `cwd_outside_workspace`). Without cwd propagation, `xcodebuild` run from the agent's working directory (`.chainworks/worktrees/<id>`) would execute in whatever arbitrary directory the broker happened to be running in, breaking workspace-relative invocations.
 
@@ -454,15 +490,27 @@ The broker must:
 
 An ACP execution that requests Xcode MCP obtains a lease before `session/new`.
 
+**Ownership model: provider-session-owned leases.** MCP servers are immutable in a provider session — they are established during `session/new` and cannot be replaced while the session is alive. A lease's lifetime therefore must equal the lifetime of the provider session's MCP binding, not the execution that happened to trigger its creation. An Xcode MCP lease is owned by the ACP provider session that received the `session/new` payload referencing it, and survives across multiple `session/prompt` cycles on that session.
+
 Lease states:
 
-- `reserved`: an HTTP streaming endpoint and lease token are created but the provider has not connected yet.
-- `active`: provider has initialized over HTTP streaming and is attached to the broker session.
-- `closing`: ACP execution is ending and HTTP stream shutdown has started.
-- `released`: HTTP client session is gone and the lease no longer counts toward backend liveness.
+- `reserved`: an HTTP streaming endpoint and lease token are created but the provider has not sent `session/new` yet.
+- `active`: provider received `session/new` with the lease's HTTP MCP entry, initialized over HTTP streaming, and is attached to the broker session.
+- `closing`: ACP provider session is ending (normal close / cancel / timeout / crash / session reset / reuse-incompatible supersession) and HTTP stream shutdown has started.
+- `released`: HTTP client session is gone and the backend `mcpbridge` subprocess has exited.
 - `orphaned`: provider process died or the daemon lost the HTTP stream before normal release.
 
-Backend liveness (per lease, since each lease owns its own `mcpbridge`):
+**Release triggers.** A lease transitions from `active` to `closing` only on provider-session-scoped events, not on single-execution success:
+
+- provider session closes normally (ACP `session/close` or stdin EOF),
+- execution is cancelled (cancels the provider session, which in turn releases the lease),
+- provider subprocess exits unexpectedly (crash, kill, timeout),
+- operator-triggered session reset (see [session-lineage-reuse-and-operator-reset.md](../reference/session-lineage-reuse-and-operator-reset.md)),
+- reuse-incompatible supersession: a new execution on the same lineage fails the reuse-compat check (§5.6); the existing provider session is superseded by a fresh session, and the old lease is released as part of that supersession.
+
+Successful completion of an individual execution does **not** release the lease — a subsequent prompt cycle on the same provider session continues to use the same lease and the same backend `mcpbridge` subprocess. This is what makes Xcode MCP session reuse (§5.6) executable.
+
+**Backend liveness (per lease, since each lease owns its own `mcpbridge`):**
 
 - Each lease's backend `mcpbridge` subprocess is alive while the lease is `reserved`, `active`, or `closing`.
 - When the lease transitions to `released`, its backend bridge is closed (stdin close → graceful exit, kill after timeout).
@@ -471,12 +519,12 @@ Backend liveness (per lease, since each lease owns its own `mcpbridge`):
 
 There is no long-lived shared backend process to keep warm across unrelated leases.
 
-HTTP endpoint lifecycle:
+**HTTP endpoint lifecycle:**
 
 - The endpoint must bind only to loopback or a daemon-owned Unix-domain HTTP listener if supported by the provider.
 - Each lease uses a random bearer token or equivalent one-time auth secret.
-- Tokens are scoped to one agent execution and one pool key.
-- Reserved leases expire if the provider does not connect within the startup timeout.
+- Tokens are scoped to one provider session and one pool key; they survive across prompt cycles but are invalidated on provider-session close.
+- Reserved leases expire if the provider does not send `session/new` within the startup timeout.
 
 ### 5.4 Xcode PID drift
 
@@ -530,7 +578,7 @@ Equality is evaluated on the MCP server inventory that was delivered to `session
 - for each name, same transport variant (stdio vs http/sse),
 - for HTTP entries, same broker lease identity (the live session's lease is still `active` and the new request would have been resolved to the same lease).
 
-This last condition is the Xcode-specific piece: a live session that already holds a valid broker lease for Xcode MCP is reuse-compatible; a live session whose prior lease has been released (grace expired, ACP session close, cancellation) is **not** reuse-compatible for a new Xcode-MCP request.
+This last condition is the Xcode-specific piece: a live provider session that holds an `active` broker lease for Xcode MCP is reuse-compatible. Because leases are provider-session-owned (§5.3), an alive provider session always has its lease alive — a "released lease while provider alive" only happens on reuse-incompatible supersession (where the lease is released *because* the session is being superseded) or on explicit operator reset. If the provider session itself has closed, there is nothing to reuse and the question is moot — P047 treats that as a fresh start anyway.
 
 **Outcomes.**
 
@@ -539,15 +587,16 @@ This last condition is the Xcode-specific piece: a live session that already hol
 
 The binding-fingerprint check already in P047 (session-lineage-reuse-and-operator-reset.md) includes MCP server inventory — implementation should extend the fingerprint input to also hash the broker lease identity for HTTP MCP entries so this compatibility check is enforced at the same layer as other binding drifts.
 
-**Cancellation and cleanup under reuse.** When an ACP session is closed (normal close, cancel, crash, timeout) its associated broker leases are released regardless of whether the session was originally fresh or reused. A reused session does not "inherit" lease ownership from a prior execution — each execution that runs on the session acquires its own lease accounting, and the last execution's release triggers lease close.
+**Cancellation and cleanup under reuse.** When an ACP provider session is closed (normal close, cancel, crash, timeout, operator reset) its associated broker lease is released — regardless of whether the session was originally fresh or reused, regardless of how many successful executions ran on it. A reused provider session inherits lease ownership from whichever execution first opened the session; subsequent executions borrow the lease without changing its ownership, and none of them release it individually.
 
 **Timeline examples.**
 
 - First prompt in two parallel ACP sessions: each gets its own HTTP streaming lease and its own backend `mcpbridge` subprocess. The broker-held Mutex serializes the brief initialize window per Xcode PID; after that both bridges serve `tools/*` concurrently. Both leases share the same broker-owned host-user Xcode environment and the same already-consented Xcode process (so no duplicate modals).
-- Retry/resume of the same agent while its ACP session is live **and** the prior lease is still `active` with the same requested MCP set: reuse-compatible. Session reuse avoids both `session/new` and a new HTTP MCP client session — the existing lease and bridge subprocess continue.
-- Retry/resume of the same agent while its ACP session is live **but** the prior lease has been released (e.g., after a previous prompt cycle closed it): reuse-incompatible for Xcode MCP. Provider session forced fresh before the next `session/prompt`.
-- Retry/resume of an agent that now requires Xcode MCP when the live session was opened **without** Xcode MCP: reuse-incompatible. Fresh provider session forced.
-- Retry/resume after ACP session died but broker grace period is still active: provider starts a new ACP session and a new lease; the bridge subprocess for the dead lease is closed during grace-period sweep. Grace period exists to suppress Xcode spin-up cost, not to share backend state across leases.
+- Successful first execution followed by a reused prompt on the same provider session with same MCP set: reuse-compatible. The provider session stays alive, its lease stays `active`, the `mcpbridge` subprocess continues running, and `session/prompt` is sent. No new bridge spawn.
+- Retry/resume after the provider session closed (lease released with the session): not reuse — this is a fresh start. New provider session + new lease + new bridge.
+- New execution on the same lineage that now requires Xcode MCP when the live session was opened **without** Xcode MCP: reuse-incompatible. The live session is superseded with a fresh session; the old lease (if any) is released as part of supersession.
+- New execution on the same lineage whose requested MCP set differs from the live session's accepted set (e.g., Xcode MCP now with different permission fingerprint): reuse-incompatible. Live session superseded, old lease released, fresh session + fresh lease.
+- Retry/resume after ACP session died but broker grace period is still active: provider starts a new ACP session and a new lease; the bridge subprocess for the dead lease is already closed. Grace period exists to suppress Xcode spin-up cost via cached metadata, not to share backend state across leases.
 - Retry/resume after grace expiry: new backend bridge start is allowed and recorded.
 
 ### 5.7 Observability
@@ -697,10 +746,12 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Redact host paths and tokens from logs where appropriate.
 
 - `control-plane/crates/acp/src/xcode_host_executor.rs` (new)
+  - Own `XcodeShimDispatchLease` state map (`HashMap<token, lease>`), mint tokens at provider-launch time for any shim-injected execution (whether or not the execution has an Xcode MCP lease), release on provider-session close.
   - Execute approved Xcode-bound commands (`xcodebuild`, `simctl`) under the host-user environment contract.
   - Allowlist-bound: rejects any binary not in `{xcodebuild, simctl}`. `mcpbridge` is explicitly **not** in the host-executor allowlist — see §5.1.1 direct-command guard rationale.
+  - Authorize `ShimDispatchRequest` via constant-time token comparison; enforce `workspace_root` cwd check; apply frozen `requires_host_execution` flag from the lease (not re-read from catalog).
   - Prefer simulator UUIDs and reject ambiguous simulator destinations.
-  - Record observation data for command, selected simulator id, host-env disposition, exit status.
+  - Append observation events to the correct `AgentExecution.actual_xcode_runtime_observation_json` via repository `append_xcode_runtime_observation`.
   - Expose a Unix-domain dispatch socket consumed by the shim binaries (below).
 
 - `control-plane/crates/acp/src/xcode_shim/` (new crate or module + thin binaries)
@@ -752,21 +803,79 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
 
 ### Domain / DB
 
-No durable schema is required for P051.
+P051 adds exactly one durable column — the runtime-observation envelope defined in §5.7. Runtime state (broker pool, leases, bridges, Mutexes, caches, dispatch tokens) remains in-memory and is not persisted.
 
-Rationale:
+**Migration** (next sequential migration number in `control-plane/crates/db/migrations/`):
 
-- The broker is a runtime resource, not run truth.
-- `AgentExecution.actual_mcp_observation_json` already carries generic MCP evidence; P051 adds the sibling `actual_xcode_runtime_observation_json` field, which is also persisted on `AgentExecution` but is not durable schema (JSON blob column).
-- Active leases do not survive daemon restart. On restart, session generations without live handles are already invalidated and new leases are acquired.
+```sql
+ALTER TABLE agent_executions
+  ADD COLUMN actual_xcode_runtime_observation_json TEXT;
+-- nullable, no default; legacy rows read back as NULL.
+```
 
-If implementation discovers that operator debugging needs persisted bridge history beyond agent execution observations, add a follow-up proposal for durable runtime telemetry rows instead of expanding P051.
+**Domain model** (`control-plane/crates/domain/src/agent.rs`):
+
+```rust
+pub struct AgentExecution {
+    // ...existing fields...
+    pub actual_xcode_runtime_observation_json: Option<String>,
+}
+
+// Typed envelope for serialize/deserialize:
+pub struct XcodeRuntimeObservation {
+    pub mcp_broker_observations: Vec<McpBrokerObservation>,
+    pub xcode_shim_events: Vec<XcodeShimEvent>,
+    pub xcode_host_executor_events: Vec<XcodeHostExecutorEvent>,
+}
+```
+
+**Repository append semantics** (`control-plane/crates/db/src/repos/agent_executions.rs`):
+
+Implement `append_xcode_runtime_observation(execution_id, update: XcodeRuntimeObservationUpdate)` where:
+
+- the update is one of: push `McpBrokerObservation`, push `XcodeShimEvent`, push `XcodeHostExecutorEvent`, or patch an existing `mcp_broker_observations[]` entry identified by `lease_id` (for post-hoc `backend_failure_class` updates after a later crash). The patch path writes a new entry with a `status_update` discriminator rather than mutating the existing one — see §5.7 immutability rule.
+- the write path is read-modify-write within a transaction to preserve atomicity across concurrent appends (fan-out leases, simultaneous shim invocations from parallel tool calls). SQLite WAL handles the concurrent-reader side.
+- serialization failure (e.g., corrupt prior JSON) is logged at ERROR and the update is dropped — the execution does not fail because of observation-write failure, to match the precedent set by `actual_mcp_observation_json`.
+
+**Legacy / null semantics:**
+
+- Rows created before the migration: `actual_xcode_runtime_observation_json = NULL`. GraphQL exposes this as `null` (not as an empty envelope) so clients can distinguish "not instrumented" from "instrumented but no events".
+- Rows created after the migration on executions that never touch Xcode MCP or shim: `actual_xcode_runtime_observation_json = NULL`. Same GraphQL behavior.
+- Rows with any event: `actual_xcode_runtime_observation_json` contains the envelope with the relevant array populated and the other two as `[]`.
+
+**Rationale for in-memory runtime state (unchanged from prior revision):**
+
+- The broker itself is a runtime resource, not run truth.
+- Active leases, bridge subprocesses, Mutexes, `tools/list` caches, and dispatch tokens do not survive daemon restart. On restart, session generations without live handles are already invalidated by existing P047 recovery and new leases are acquired.
+
+If implementation discovers that operator debugging needs persisted bridge history beyond agent-execution observations, add a follow-up proposal for durable runtime telemetry rows instead of expanding P051.
 
 ### MCP server / GraphQL
 
-No new mutating MCP or GraphQL tools are required.
+**GraphQL schema addition** (`control-plane/crates/graphql-server/src/types/agent_execution.rs`):
 
-Optional debug readback may be added behind existing debug surfaces only if the repo already has an internal runtime-status path. It must be read-only and must not expose a way to force-close shared bridges in P051.
+```graphql
+type AgentExecution {
+  # ...existing fields...
+  actualXcodeRuntimeObservation: XcodeRuntimeObservation
+}
+
+type XcodeRuntimeObservation {
+  mcpBrokerObservations: [McpBrokerObservation!]!
+  xcodeShimEvents: [XcodeShimEvent!]!
+  xcodeHostExecutorEvents: [XcodeHostExecutorEvent!]!
+}
+
+type McpBrokerObservation { ... }   # typed fields from §5.7
+type XcodeShimEvent { ... }
+type XcodeHostExecutorEvent { ... }
+```
+
+Resolver reads `actual_xcode_runtime_observation_json`, deserializes, and exposes typed arrays. `null` column yields GraphQL `null` for the top-level field (not empty arrays) so downstream readers can distinguish "not instrumented".
+
+**MCP `reports.get`** projects the same envelope at `execution.xcode_runtime_observation` with identical shape.
+
+No new **mutating** MCP or GraphQL tools are introduced. Optional debug readback may be added behind existing debug surfaces only if the repo already has an internal runtime-status path. It must be read-only and must not expose a way to force-close shared bridges in P051.
 
 ### Catalog / profiles
 
@@ -924,17 +1033,33 @@ Add ACP fixture tests for:
 
 **Session reuse compatibility**
 
-- reuse-compatible fixture: live session with accepted Xcode MCP set == new request's resolved Xcode MCP set and prior lease is still `active` → session is reused, `session/prompt` is sent, no new `mcpbridge` spawn, lease count continues
-- reuse-incompatible fixture (prior lease released): live session existed but prior Xcode lease was released → P047 disposition forced to `FreshSessionRequired`, fresh provider session + fresh lease + fresh bridge
-- reuse-incompatible fixture (MCP set differs): live session opened without Xcode MCP, new request adds Xcode MCP → fresh provider session forced before `session/prompt`
+- reuse-compatible fixture: successful execution on a session with Xcode MCP; a second execution on same lineage with same MCP set reuses the session, its lease, and its `mcpbridge` subprocess. `session/prompt` is sent. Asserts: bridge subprocess PID equals the first execution's, HTTP endpoint/token unchanged, `mcp_broker_observations[]` does not append a new spawn entry
+- lease-lifetime fixture: successful execution does **not** release the lease. After execution returns success, assert the lease is still `active`, bridge subprocess is alive, HTTP endpoint still responds to a probe
+- reuse-incompatible fixture (MCP set differs): live session opened without Xcode MCP, new request adds Xcode MCP → supersession forced; old lease (if any) released, fresh provider session + fresh lease + fresh bridge
+- reuse-incompatible fixture (permission fingerprint differs): same MCP server name but different broker lease identity → supersession forced
+- supersession cleanup fixture: when supersession releases the old lease, the old `mcpbridge` subprocess is closed (SIGTERM 3s → SIGKILL) before the new lease acquires its bridge
+- provider-session-close fixture: normal `session/close` or stdin EOF from provider releases the lease and closes the bridge
+- cancellation fixture: run cancel releases the lease and closes the bridge regardless of execution success status
+- operator-reset fixture: operator-triggered session reset releases the lease and closes the bridge
 - binding fingerprint change includes broker lease identity for HTTP MCP entries — fixture asserts the fingerprint differs when lease identity differs even if server name matches
 
 **Observation envelope parity**
 
-- direct-Xcode-only execution (no MCP server request at all) persists `actual_xcode_runtime_observation_json.xcode_shim_events[]` with rejection evidence; `mcp_broker_observations` is empty `[]`
-- mixed execution (brokered Xcode MCP + direct `xcodebuild` with `requires_xcode_host_execution: true`) preserves both `mcp_broker_observations[]` and `xcode_host_executor_events[]` — neither array overwrites the other
+- direct-Xcode-only execution (no MCP server request at all) receives a valid `XcodeShimDispatchToken`, persists `actual_xcode_runtime_observation_json.xcode_shim_events[]` with rejection evidence; `mcp_broker_observations` is empty `[]`; execution's durable row has non-null envelope
+- mixed execution (brokered Xcode MCP + direct `xcodebuild` with `requires_xcode_host_execution: true`) preserves both `mcp_broker_observations[]` and `xcode_host_executor_events[]` — neither array overwrites the other; MCP bearer token and shim dispatch token are distinct
 - GraphQL `AgentExecution.actualXcodeRuntimeObservation` exposes the three arrays as typed fields; MCP `reports.get` returns the same envelope at `execution.xcode_runtime_observation`
 - repeated shim invocations (three direct `xcodebuild` calls in one execution) produce three entries in `xcode_shim_events`, not one merged entry
+- legacy row (pre-migration): `actualXcodeRuntimeObservation` resolves to GraphQL `null`, not an empty envelope
+- post-migration execution that never touches Xcode: column remains `NULL`, GraphQL resolves to `null`
+
+**Shim dispatch token authority**
+
+- direct-Xcode-only execution: `XcodeShimDispatchToken` minted at provider-launch time; broker authorizes shim dispatch by token→lease lookup and appends events to the correct `AgentExecution`
+- forged token: shim dispatch with a token not in broker's state map is rejected with `xcode_shim_invalid_token`; no event is appended to any execution
+- expired token: shim dispatch with a token past `expires_at` is rejected with `xcode_shim_token_expired`
+- cross-authority attempt: using an MCP bearer token as `$CHAINWORKS_XCODE_SHIM_TOKEN` (or vice versa) fails — different sockets, different validators, never cross-accepted
+- token is not observable in agent ACP messages — fixture spawns an agent and inspects ACP stdin/stdout transcript to assert the token does not leak
+- cwd boundary: routed `xcodebuild` with `cwd` outside the lease's `workspace_root` is rejected
 
 ### Gate
 
@@ -1033,12 +1158,14 @@ Implementation is complete when:
 - Absolute-path catalog lint rejects run-start with `xcode_absolute_path_forbidden` when any agent's `run` block or prompt text contains Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`, or `DEVELOPER_DIR=...` paired with Xcode tools), unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` is set.
 - Default shim policy rejects direct `xcodebuild`/`simctl` invocations with exit 127 and `xcode_shim_rejected` observation; `requires_xcode_host_execution: true` opt-in routes through the broker host executor with full `ShimDispatchRequest` DTO (cwd, env allowlist, provider snapshot).
 - Direct `mcpbridge` (bare or via `xcrun mcpbridge`, option-prefixed or not) is **always rejected** by the shim regardless of `requires_xcode_host_execution` **and regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`**; `mcpbridge` is not routable via the host executor; the broker is the only code path that spawns `xcrun mcpbridge`.
+- **Shim dispatch token authority is separate from MCP lease authority.** `XcodeShimDispatchToken` is minted per `AgentExecution` at provider-launch time for any shim-injected execution (including direct-Xcode-only agents with no MCP lease). Tokens are constant-time validated, have explicit expiry, enforce a `workspace_root` cwd boundary, and cannot be cross-used with MCP HTTP bearer tokens.
+- **Durable schema.** `agent_executions.actual_xcode_runtime_observation_json` column exists (migration added), legacy rows read back as GraphQL `null`, and the repository supports append-only semantics across the three arrays. GraphQL and MCP expose typed envelope.
 - Broker-owned Xcode subprocesses run with host-user `HOME`/`TMPDIR`; ACP providers continue to run with isolated fake-home state.
 - The implementation does not grant the entire ACP provider process the real user home as the normal Xcode fix.
 - Xcode destination handling prefers explicit simulator UUIDs and fails clearly on ambiguous name/OS requests.
 - Direct multi-client sharing of raw `xcrun mcpbridge` stdio is not used.
 - Provider-facing stdio proxying is not implemented as P051's architecture.
-- Broker leases are released on success, failure, cancellation, timeout, and provider process death.
+- Broker leases are **provider-session-owned**. A lease is released on provider-session close, cancellation, timeout, provider process death, operator session reset, or reuse-incompatible supersession — **not** on individual execution success. A reused provider session retains its lease and backend `mcpbridge` subprocess across prompt cycles.
 - Runtime observations distinguish backend start from backend reuse.
 - Permission-separated agents get distinct broker state keyed by permission fingerprint; no policy leakage across leases.
 - Existing session reuse behavior still works.
