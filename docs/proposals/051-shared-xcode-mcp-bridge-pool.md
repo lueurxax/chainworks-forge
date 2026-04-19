@@ -503,9 +503,9 @@ let handle = adapter.open_session_with_specs(&launch_spec, &session_new_spec).aw
 
 The debug-assert after Phase 4 verifies that `attach_session_credentials` only mutates `credential_env`, never the capability slice — i.e., the capability-slice equality (§5.1.2 invariant) is preserved across credential attachment.
 
-An agent that uses direct `xcodebuild` but has no Xcode MCP server still receives the shim, the token, and the socket — the third trigger fires at catalog compilation time. An agent that only requests Xcode MCP (no direct commands, no `requires_xcode_host_execution`) also receives the shim via the first trigger — the catalog *requests* Xcode MCP regardless of whether later resolution succeeds or fails. Agents with zero Xcode signals get no shim; their provider subprocess keeps its unmodified `PATH`.
+An agent that uses direct `xcodebuild` but has no Xcode MCP server still receives the shim, the token, and the socket — trigger (2) fires at catalog compilation time (direct-shell lexeme detected). An agent that **only** requests Xcode MCP (no direct-shell Xcode commands, no `requires_xcode_host_execution`) gets `XcodeBrokerRequired: true` but `XcodeShimInjectionSignal: false` — the broker lease and `session/new.mcpServers` HTTP entry are minted after capability preflight succeeds, but no PATH shim is injected. The agent has no way to shell out to Xcode tools anyway, so the shim would be useless overhead; crucially, this keeps pure Xcode MCP eligible for session reuse per §5.6. Agents with zero Xcode signals get no shim; their provider subprocess keeps its unmodified `PATH`.
 
-If resolution **later** fails (e.g., `provider_http_mcp_unsupported`), the shim env is already in the `credential_env`, but the provider session never starts, so the shim dispatch socket is never used. This is intentional — the shim injection decision is frozen at catalog compilation, and a later resolution failure simply aborts the run with per §5.1.2 before the provider launches.
+If capability preflight or MCP resolution **later** fails (e.g., `provider_http_mcp_unsupported`), the run is aborted per §5.1.2 before `attach_session_credentials` is ever called. `credential_env` remains empty on the discarded `launch_spec`, no `XcodeShimDispatchLease` is created, no shim token is minted, no Unix socket binding is allocated. The fail-closed contract is absolute — shim state allocation happens only on the success path, after both capability preflight and MCP resolution pass.
 
 **Guard mechanism — PATH shim + absolute-path catalog lint.** For agents meeting any injection trigger, the broker prepends a daemon-managed shim directory to the provider's `PATH`:
 
@@ -528,27 +528,34 @@ Mode flags from `xcrun --help` (macOS 26.3):
 - **Find mode** (tool **is NOT executed** — `xcrun` prints the resolved path and exits): `-f <tool>`, `--find <tool>`. Agent learns the absolute path but no execution happens. Safe to pass through — the absolute path is catalog-lint-bounded elsewhere and cannot be directly invoked without hitting the PATH-shim boundary again.
 - **Show modes** (no tool arg): `--show-sdk-path`, `--show-sdk-version`, `--show-sdk-platform-path`, `--show-sdk-platform-version`, `--show-sdk-build-version`. No execution. Pass through silently.
 
-Additional option flags that modify run/find mode without changing it: `--sdk <name>`, `--toolchain <name>`, `-l <path>` / `--log <path>` (logging), `--verbose`, `--no-cache`, `--kill-cache`, `--help`/`-h`, `--version`.
+Flag classification (from local `xcrun --help`):
+
+- **Option-with-arg** (consume next token): `--sdk <name>`, `--toolchain <name>`.
+- **No-arg flags** (do not consume next token): `-l` / `--log` (enables logging — **no-arg**, not option-with-arg), `--verbose`, `--no-cache`, `--kill-cache`, `--help` / `-h`, `--version`. Treating `-l`/`--log` as option-with-arg was a bug in an earlier revision — under that model, `xcrun -l mcpbridge` could consume `mcpbridge` as the log argument and pass through unchecked. They are mode modifiers, not options that take a path.
 
 **Parser algorithm:**
 
 ```text
 mode := Run  // default
 tool := None
-for each argv token (starting from argv[1]):
-  if token is "-r" or "--run":     mode := Run;  expect tool next
-  elif token is "-f" or "--find":  mode := Find; expect tool next
-  elif token starts with "--show-sdk-":  mode := Show; break
-  elif token is --sdk|--toolchain|-l|--log:  consume next token as option-arg
-  elif token is --verbose|--no-cache|--kill-cache|--help|-h|--version:  continue
-  elif token starts with "-" or "--" (unknown flag):  reject xcrun_unknown_option
-  else:
-    tool := token
-    break  // remaining tokens are args to the tool
+i := 1
+while i < argv.len():
+  token := argv[i]
+  match token:
+    "-r" | "--run":           mode := Run;  i += 1; tool := argv.get(i); break // tool follows
+    "-f" | "--find":          mode := Find; i += 1; tool := argv.get(i); break
+    t if t.starts_with("--show-sdk-"):  mode := Show; break // no tool
+    "--sdk" | "--toolchain":  i += 2 // consume flag + its arg
+    "-l" | "--log" |
+    "--verbose" | "--no-cache" | "--kill-cache" |
+    "--help" | "-h" | "--version":
+                              i += 1 // no-arg flag
+    t if t.starts_with("-"):  return reject("xcrun_unknown_option")
+    _:                        tool := Some(token); break // positional tool
 
 dispatch according to mode:
   Show → pass-through (no tool to inspect)
-  Find → pass-through (no execution)
+  Find → pass-through (no execution; path just printed)
   Run + tool is None → pass-through (malformed; let xcrun error)
   Run + tool ∈ {xcodebuild, simctl} → apply reject/route/diagnostic policy
   Run + tool == mcpbridge → unconditional reject
@@ -1664,6 +1671,9 @@ Shim enforcement (PATH-based invocations):
 - fake-home agent invoking `xcrun mcpbridge` receives exit 127 regardless of `requires_xcode_host_execution` value; `xcode_shim_rejected` with `{tool: "mcpbridge", via_xcrun: true, policy_reason: "mcpbridge_broker_only"}`
 - fake-home agent invoking **`xcrun -r mcpbridge`** (Run mode with short `-r`) resolves tool to `mcpbridge` and is rejected with `xcode_shim_rejected`; fixture explicitly proves the mode-aware parser does not consume `mcpbridge` as an argument to `-r`
 - fake-home agent invoking **`xcrun --run mcpbridge`** (Run mode with long form) same result
+- fake-home agent invoking **`xcrun -l mcpbridge`** (no-arg `-l` flag followed by positional tool) resolves tool to `mcpbridge` and is rejected; fixture proves `-l` is no-arg and does not consume `mcpbridge`
+- fake-home agent invoking **`xcrun --log mcpbridge`** same result
+- fake-home agent invoking **`xcrun --log --verbose mcpbridge`** (two no-arg flags + positional tool) resolves tool to `mcpbridge` and is rejected
 - fake-home agent invoking **`xcrun --find xcodebuild`** (Find mode — no execution) passes through transparently; fixture asserts no `xcode_shim_rejected`/`xcode_shim_routed` event is emitted because `xcodebuild` is not actually executed, only its path is printed
 - fake-home agent invoking **`xcrun --find mcpbridge`** similarly passes through (no execution); the printed path is still subject to the absolute-path catalog-lint boundary elsewhere
 - fake-home agent invoking **`xcrun --show-sdk-path`** (Show mode, no tool) passes through silently
@@ -1719,7 +1729,7 @@ Implementation is complete when:
 - Parallel ACP sessions that request Xcode MCP each get their own lease and backend `mcpbridge` subprocess; their initialize phases serialize per Xcode PID; their `tools/*` calls run in parallel.
 - ACP providers receive an HTTP streaming MCP endpoint for brokered Xcode access.
 - Single backend crash fails only its lease; sibling leases continue. Xcode PID drift and broker HTTP infrastructure failure terminally close all affected leases with their respective `backend_failure_class`. Host-env loss fails **new lease acquisitions** and **shim-route requests** but does not disturb already-running MCP streams.
-- PATH shim (`xcodebuild`, `simctl`, `mcpbridge`, option-aware `xcrun`) is injected into an ACP provider subprocess when the compile-time `XcodeShimInjectionSignal` is set, triggered by any of: (1) catalog requests Xcode MCP, (2) agent declares `requires_xcode_host_execution: true`, (3) catalog lint detects any bare Xcode-tool lexeme in any direct-command declaration field (`run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). Signal is decidable before MCP resolution runs. Agents with zero Xcode signals keep their unmodified `PATH`.
+- PATH shim (`xcodebuild`, `simctl`, `mcpbridge`, mode-aware `xcrun`) is injected into an ACP provider subprocess **only** when the compile-time `XcodeShimInjectionSignal` is set. Triggers are direct-shell-only: (1) agent declares `requires_xcode_host_execution: true`, (2) catalog lint detects any bare Xcode-tool lexeme in any direct-command declaration field (`run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). A **catalog request for Xcode MCP** sets the orthogonal `XcodeBrokerRequired` flag (which drives broker lease minting and `session/new.mcpServers` HTTP entry) but does **not** trigger shim injection — pure Xcode MCP agents keep their unmodified `PATH` and retain full session reuse per §5.6. Agents with zero Xcode signals also keep their unmodified `PATH`.
 - Absolute-path catalog lint hard-fails run-start with `xcode_absolute_path_forbidden` **only** when a structured executable field (`run` block command path/argv, env assignments of `DEVELOPER_DIR`) contains Xcode-tool absolute paths. Prompt/system-instruction/description text gets a soft `xcode_absolute_path_in_prompt` warning recorded in the runtime observation envelope but does not block run-start. `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` skips the lint **only for `xcodebuild`/`simctl` paths** (structured and prompt). Any structured field whose absolute path resolves to `mcpbridge` (bare, via `/usr/bin/xcrun mcpbridge`, or any option-prefixed `xcrun` variant ending in `mcpbridge`) still hard-fails even in diagnostic mode — the broker-only-mcpbridge boundary has no diagnostic override anywhere in P051.
 - Default shim policy rejects direct `xcodebuild`/`simctl` invocations with exit 127 and `xcode_shim_rejected` observation; `requires_xcode_host_execution: true` opt-in routes through the broker host executor with full `ShimDispatchRequest` DTO (cwd, env allowlist, provider snapshot).
 - Direct `mcpbridge` (bare or via `xcrun mcpbridge`, option-prefixed or not) is **always rejected within the enforced boundary** — PATH-based invocations via the shim, catalog-declared structured-field paths via the lint — regardless of `requires_xcode_host_execution` **and regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`**. `mcpbridge` is not routable via the host executor. LLM-improvised absolute `/usr/bin/xcrun mcpbridge` at prompt time is outside the enforced boundary (documented residual, §5.1.1).
