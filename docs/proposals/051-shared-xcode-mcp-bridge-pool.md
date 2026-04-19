@@ -441,14 +441,17 @@ HTTP endpoint lifecycle:
 
 ### 5.4 Xcode PID drift
 
-The pool key includes the current Xcode PID.
+The pool key includes the current Xcode PID. Xcode PID drift is a **shared-state failure**, not a per-lease event — the old Xcode process is gone or a new one has replaced it, so the XPC tool-service that every stale-pool bridge was bound to is no longer valid. The runtime cannot safely leave those leases running.
 
-If `pgrep -n -x Xcode` returns a different PID from the backend's PID target:
+If `pgrep -n -x Xcode` returns a different PID from the pool's backend-PID target:
 
-- new leases use a new pool key and start a new backend bridge
-- existing leases continue until their ACP sessions end
-- the old backend is closed when its leases drain
-- telemetry records `xcode_pid_changed`
+- every lease on the stale pool key receives a terminal MCP error with `backend_failure_class = "pool_pid_drift"`,
+- each stale lease's `mcpbridge` subprocess is closed (stdin close → SIGTERM 3s → SIGKILL 10s),
+- the stale pool key is removed from broker state along with its in-memory cache (Mutex, `tools/list` snapshot, consent-granted flag),
+- new leases use a new pool key tied to the new Xcode PID and start fresh backend bridges,
+- telemetry records `xcode_pid_changed` with `{old_pid, new_pid, closed_lease_count}`.
+
+This is the same termination contract described in §8.2 for shared-state failures — the two sections now agree.
 
 If no Xcode PID is available:
 
@@ -549,7 +552,7 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
 
 - `control-plane/crates/acp/src/manager.rs`
   - Own `XcodeMcpBridgePool`.
-  - Own `ProviderCapabilityCache: HashMap<(AdapterFamily, BinaryFingerprint), AgentCapabilities>`.
+  - Own `ProviderCapabilityCache: HashMap<ProbeKey, AgentCapabilities>` (see §5.1.2 for full `ProbeKey` shape).
   - Expose `ensure_provider_capabilities(runtime_profile_id) -> AgentCapabilities` as preflight called before `engine::mcp::resolve_mcp_servers`.
   - Acquire leases before `adapter.open_session`.
   - Release leases on normal close, provider error, timeout, cancellation, and drop paths.
@@ -885,11 +888,14 @@ No Xcode UI automation is required for this gate. Use fixture backend processes 
 Implementation is complete when:
 
 - The HTTP streaming feasibility research artifact exists, has an allowed verdict, and the implementation scope matches that verdict.
-- `ProviderCapabilityCache` is populated by a one-shot `initialize` probe per (adapter_family, binary_fingerprint); `resolve_mcp_servers` fails closed with `provider_http_mcp_unsupported` before lease/port/token allocation when HTTP MCP is unsupported.
+- `ProviderCapabilityCache` is populated by a one-shot `initialize` probe per unique `ProbeKey` (adapter family + runtime profile id + binary fingerprint + launch args/env/adapter-settings fingerprints); `resolve_mcp_servers` fails closed with `provider_http_mcp_unsupported` before lease/port/token allocation when HTTP MCP is unsupported.
 - Parallel ACP sessions that request Xcode MCP each get their own lease and backend `mcpbridge` subprocess; their initialize phases serialize per Xcode PID; their `tools/*` calls run in parallel.
 - ACP providers receive an HTTP streaming MCP endpoint for brokered Xcode access.
-- Single backend crash fails only its lease; sibling leases continue; pool-wide invalidation occurs only on Xcode PID drift, host-env loss, or broker infrastructure failure.
-- PATH shim for `xcodebuild`/`simctl`/`mcpbridge` is injected into ACP provider subprocess for agents with Xcode MCP; default policy rejects direct invocations; `requires_xcode_host_execution: true` opt-in routes through the broker host executor.
+- Single backend crash fails only its lease; sibling leases continue. Xcode PID drift terminally closes all stale-pool leases with `backend_failure_class = "pool_pid_drift"` and requires new leases on the new pool key. Host-env loss and broker infrastructure failure also produce pool-wide terminal closure with their respective `backend_failure_class` values.
+- PATH shim (`xcodebuild`, `simctl`, `mcpbridge`, option-aware `xcrun`) is injected into an ACP provider subprocess when **any** of three triggers fires: (1) resolved catalog contains an Xcode MCP entry, (2) agent declares `requires_xcode_host_execution: true`, (3) catalog lint detects any bare Xcode-tool lexeme in the agent's `run` block. Agents with zero Xcode signals keep their unmodified `PATH`.
+- Absolute-path catalog lint rejects run-start with `xcode_absolute_path_forbidden` when any agent's `run` block or prompt text contains Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`, or `DEVELOPER_DIR=...` paired with Xcode tools), unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` is set.
+- Default shim policy rejects direct `xcodebuild`/`simctl` invocations with exit 127 and `xcode_shim_rejected` observation; `requires_xcode_host_execution: true` opt-in routes through the broker host executor with full `ShimDispatchRequest` DTO (cwd, env allowlist, provider snapshot).
+- Direct `mcpbridge` (bare or via `xcrun mcpbridge`, option-prefixed or not) is **always rejected** by the shim regardless of `requires_xcode_host_execution`; `mcpbridge` is not routable via the host executor; the broker is the only code path that spawns `xcrun mcpbridge`.
 - Broker-owned Xcode subprocesses run with host-user `HOME`/`TMPDIR`; ACP providers continue to run with isolated fake-home state.
 - The implementation does not grant the entire ACP provider process the real user home as the normal Xcode fix.
 - Xcode destination handling prefers explicit simulator UUIDs and fails clearly on ambiguous name/OS requests.
@@ -908,9 +914,9 @@ Implementation is complete when:
 
 ## 12. Rollout Plan
 
-1. Produce `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md`.
-2. Include host-env feasibility in the same research artifact: real operator home, host temp resolution, Xcode/CoreSimulator command shape, and simulator UUID strategy.
-3. Revise P051 if the research verdict is anything other than `Proceed`.
+1. ✅ Produce `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md` — complete 2026-04-19.
+2. ✅ Include host-env feasibility in the same research artifact — covered.
+3. ✅ Current verdict is `Proceed with scoped architecture`; P051 has been revised accordingly (per-lease backend, initialize Mutex, shim + catalog lint, `ProbeKey` cache, host-executor DTO). No further proposal revision is gated on research.
 4. Implement broker behind default-on runtime config for Xcode only.
 5. Implement host-user Xcode environment handling inside the broker or host executor before dogfooding Xcode-dependent agents.
 6. Keep a diagnostic escape hatch to force direct `xcrun mcpbridge` for local debugging, but do not add a stdio proxy fallback.
