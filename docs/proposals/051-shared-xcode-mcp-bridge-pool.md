@@ -736,7 +736,8 @@ Shim dispatch request handling:
 - accepted MCP set at `session/new` matches the new request's resolved set (§5.6 original rule),
 - `workspace_root` of the new execution equals the lease's frozen `workspace_root`,
 - `requires_xcode_host_execution` of the new execution's agent equals the lease's frozen flag,
-- the lease itself is not expired.
+- the lease itself is not expired,
+- **neither the new execution nor the candidate live session has `XcodeShimInjectionSignal: true`**. Shell-shim-enabled executions are categorically reuse-ineligible per §5.3 — this gate short-circuits the rest of the list; even if all other fields match, a shim-signal on either side forces `FreshSessionRequired`. Pure Xcode MCP (`XcodeShimInjectionSignal: false` on both sides) proceeds through the remaining checks.
 
 Any mismatch forces reuse-incompatible supersession: old provider session closed, old shim lease released, fresh provider session + fresh token + fresh lease minted with the new execution's frozen values.
 
