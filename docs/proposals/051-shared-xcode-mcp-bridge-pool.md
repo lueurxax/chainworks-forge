@@ -602,13 +602,31 @@ Diagnostic mode logs a WARN at daemon start and an additional WARN each time the
 
 - **PATH-based invocations** of `xcodebuild`, `simctl`, `mcpbridge`, and `xcrun <subcommand>`: enforced by shim at runtime.
 - **Absolute-path invocations**: enforced by catalog lint at run-start; not enforced at runtime.
-- **Agent prompt-time improvisation** (an LLM synthesizing an absolute path mid-run): not blocked by P051. This is a residual risk. Mitigations: (a) prompt templates for Xcode-dependent agents include explicit "use bare `xcodebuild`, never absolute paths" instruction; (b) **agent-shell output observation** flags any ACP provider shell-tool command whose argv or command string matches the **residual-path warning matcher** — a warning stream emitted to `actual_xcode_runtime_observation_json.xcode_shim_events` with `policy_decision: "prompt_warning"`, `policy_reason: "xcode_residual_absolute_path"`, and the matched substring recorded for operator review. The matcher covers the full residual surface:
+- **Agent prompt-time improvisation** (an LLM synthesizing an absolute path mid-run): not blocked by P051. This is a residual risk. Mitigations: (a) prompt templates for Xcode-dependent agents include explicit "use bare `xcodebuild`, never absolute paths" instruction; (b) **ACP `session/update` shell-tool argv observer** — a runtime owner in the ACP transport layer captures every tool-call event the provider emits in `session/update` notifications, runs the **residual-path warning matcher** on each tool call's argv and command-string fields, and appends warnings to `actual_xcode_runtime_observation_json.xcode_shim_events`. The matcher covers the full residual surface:
   - `/Applications/Xcode.app/Contents/Developer/` and `/Applications/Xcode*.app/Contents/Developer/` (any Xcode binary under Developer dir),
   - `/usr/bin/xcrun` (including `/usr/bin/xcrun mcpbridge`, `/usr/bin/xcrun simctl`, `/usr/bin/xcrun xcodebuild`, and option-prefixed forms — the warning fires on any match to `/usr/bin/xcrun\b`, with a stronger-priority warning if a subsequent token parses to `mcpbridge`, `xcodebuild`, or `simctl` under the same mode-aware parse used by the `xcrun` shim),
   - `/usr/bin/xcodebuild` (direct absolute-path xcodebuild),
   - `/usr/bin/simctl` (direct absolute-path simctl),
   - `DEVELOPER_DIR=` prefixes when paired with any Xcode tool in the same shell command.
   The warning does not block execution (the residual is out of the enforced boundary) but it **is** emitted even for the highest-risk case (`/usr/bin/xcrun mcpbridge`) so operators have a trail to audit after the fact. (c) A follow-up proposal can add libc audit or sandbox-exec profiles if the residual risk becomes a real failure mode in dogfood.
+
+**ACP session/update observer contract.** The `ACP Stream Event Mapper` (existing module per `control-plane/crates/acp/src/`) gets a new sub-component `XcodeResidualPathObserver` that hooks the ACP `session/update` notification handler for every provider session. On each `session/update` with `type: "tool_use"` or the provider-specific equivalent that carries shell-tool argv, the observer:
+
+1. Extracts the argv or command-string fields the provider surfaced (schema differs per provider — see below).
+2. Runs the residual-path matcher defined above on each token / on the joined command string.
+3. On match: appends a warning entry to the current execution's `actual_xcode_runtime_observation_json.xcode_shim_events` via the same append-only repository path used by shim invocations.
+4. Never blocks or mutates the tool call — observation only.
+
+**Per-provider argv surface in `session/update`:**
+
+- **Claude Agent ACP**: surfaces tool calls including shell tool use in `session/update` notifications with `toolUseBlock.input` containing the shell command string. Observer parses the command string with a POSIX tokenizer before matching.
+- **Codex ACP**: surfaces shell tool calls in `session/update` with argv as a structured array (`input.command`). Observer matches array elements.
+- **Gemini CLI ACP**: surfaces tool-call events with `toolCall.name` and `toolCall.args`. Shell tools expose argv via `toolCall.args.command`. Observer parses the command string.
+- **Auggie / Junie ACP**: to be verified during implementation; if the provider does not emit shell argv in `session/update`, the observer records a daemon-start diagnostic `xcode_residual_observer_unavailable_for: <adapter_family>` warning and the residual is documented as unobserved for that provider family. Dogfooding must include a per-provider smoke test confirming argv visibility.
+
+**Fallback behavior.** If a provider emits shell commands in `session/update` only after execution (post-exec report), the warning fires after the fact — that is still useful for operator audit. If a provider buffers multiple shell calls into one update, the observer fires once per argv entry in the batch. If a provider does not emit shell-tool argv at all (a capability gap), the daemon logs a persistent WARN at provider-session start (`xcode_residual_observer_gap: {provider, session_id}`) and attaches a synthetic `observer_unavailable` marker to the execution's runtime observation envelope so reports show the gap explicitly rather than silently missing warnings.
+
+**Implementation inventory addition (§7).** Add `control-plane/crates/acp/src/xcode_residual_observer.rs` (new module) that owns the `XcodeResidualPathObserver` and is wired into `ACPStreamEventMapper` per-adapter. Per-adapter argv extractors live alongside the existing `AcpSessionConfig` per-adapter logic.
 
 P051 does not claim the residual risk is zero. It claims the enforceable boundary covers **PATH-based commands and catalog-declared absolute paths**, which is the common case observed today.
 
@@ -1073,20 +1091,35 @@ The envelope shape is append-only-per-execution:
       "prompt_cycle_index": 0            // 0 for the originating execution, 1+ for reused-in prompt cycles
     }
   ],
-  "xcode_shim_events": [                // one entry per shim invocation (reject or pass-through-logged)
+  "xcode_shim_events": [
+    // Discriminated union — two variants sharing the same array but distinct schemas.
+    // Consumers (GraphQL / MCP / reports) switch on "kind" to select the shape.
+
+    // Variant 1: shim invocation (PATH-shim-intercepted command; may also be emitted for diagnostic WARNs from the lint path)
     {
+      "kind": "shim_invocation",
       "ts": "2026-04-19T12:34:56.789Z",
-      "tool": "xcodebuild|simctl|mcpbridge",
+      "tool": "xcodebuild",            // xcodebuild|simctl|mcpbridge (never null for this variant)
       "via_xcrun": false,
       "argv": ["-project", "Foo.xcodeproj", "build"],
       "cwd": "/path/to/agent/worktree",
-      "policy_decision": "rejected|routed",
-      "policy_reason": "requires_xcode_host_execution_false|mcpbridge_broker_only|xcrun_unknown_option|xcode_shim_invalid_token|xcode_shim_token_expired|xcode_shim_peer_uid_mismatch|...",
-      "derived_peer_pid": 48217,        // from Unix socket peer creds, authoritative
+      "policy_decision": "rejected",    // rejected|routed
+      "policy_reason": "requires_xcode_host_execution_false",  // ...|mcpbridge_broker_only|xcrun_unknown_option|xcode_shim_invalid_token|xcode_shim_token_expired|xcode_shim_peer_uid_mismatch|...
+      "derived_peer_pid": 48217,
       "derived_peer_uid": 501,
-      "claimed_provider_pid": 48217,    // client-supplied; diagnostic only
-      "peer_pid_mismatch": false,        // true if derived != claimed
-      "exit_status": 127                // exit code delivered to the agent shell
+      "claimed_provider_pid": 48217,
+      "peer_pid_mismatch": false,
+      "exit_status": 127
+    },
+
+    // Variant 2: warning (prompt-lint or residual-path matcher; no exec intercepted, observation-only)
+    {
+      "kind": "warning",
+      "ts": "2026-04-19T12:35:10.123Z",
+      "policy_reason": "xcode_absolute_path_in_prompt", // or "xcode_residual_absolute_path"
+      "source_field": "agent.prompt",                   // or "acp_session_update_tool_use"
+      "matched_substring": "/usr/bin/xcrun mcpbridge",
+      "excerpt": "…run /usr/bin/xcrun mcpbridge to debug the service…"
     }
   ],
   "xcode_host_executor_events": [       // one entry per routed host-executor run
@@ -1365,11 +1398,39 @@ type XcodeRuntimeObservation {
 }
 
 type McpBrokerObservation { ... }   # typed fields from §5.7
-type XcodeShimEvent { ... }
+
+# Discriminated union — XcodeShimEvent is a union of two concrete types.
+# GraphQL unions require each member to be an object type; clients use __typename
+# to dispatch. The two variants correspond to §5.7 envelope's kind discriminator.
+union XcodeShimEvent = XcodeShimInvocationEvent | XcodeShimWarningEvent
+
+type XcodeShimInvocationEvent {
+  ts: DateTime!
+  tool: XcodeShimTool!                # XCODEBUILD | SIMCTL | MCPBRIDGE
+  viaXcrun: Boolean!
+  argv: [String!]!
+  cwd: String!
+  policyDecision: ShimPolicyDecision! # REJECTED | ROUTED
+  policyReason: String!
+  derivedPeerPid: Int!
+  derivedPeerUid: Int!
+  claimedProviderPid: Int!
+  peerPidMismatch: Boolean!
+  exitStatus: Int!
+}
+
+type XcodeShimWarningEvent {
+  ts: DateTime!
+  policyReason: String!               # "xcode_absolute_path_in_prompt" | "xcode_residual_absolute_path"
+  sourceField: String!                # "agent.prompt" | "acp_session_update_tool_use" | ...
+  matchedSubstring: String!
+  excerpt: String!
+}
+
 type XcodeHostExecutorEvent { ... }
 ```
 
-Resolver reads `actual_xcode_runtime_observation_json`, deserializes, and exposes typed arrays. `null` column yields GraphQL `null` for the top-level field (not empty arrays) so downstream readers can distinguish "not instrumented".
+Resolver reads `actual_xcode_runtime_observation_json`, deserializes, and exposes typed arrays. For `xcodeShimEvents`, the JSON `kind` discriminator maps to the GraphQL union member (`shim_invocation` → `XcodeShimInvocationEvent`, `warning` → `XcodeShimWarningEvent`). `null` column yields GraphQL `null` for the top-level field (not empty arrays) so downstream readers can distinguish "not instrumented".
 
 **MCP `reports.get`** projects the same envelope at `execution.xcode_runtime_observation` with identical shape.
 
@@ -1707,9 +1768,20 @@ Absolute-path catalog lint — prompt text (soft-warn):
 
 **Residual-path runtime warnings (P2 new)**
 
-- fake-home agent (pure Xcode MCP, no direct shell Xcode declared in catalog) executes a shell tool call whose argv is `["/usr/bin/xcrun", "mcpbridge"]` — LLM-improvised at prompt time. Fixture asserts: (a) the command is **not blocked** at runtime (outside enforced boundary; no PATH shim on this agent, no catalog lint coverage for prompt-time argv), (b) the `mcpbridge` subprocess starts and talks to Xcode (accepting the documented trade-off), (c) a warning is **emitted** to `actual_xcode_runtime_observation_json.xcode_shim_events` with `policy_decision: "prompt_warning"`, `policy_reason: "xcode_residual_absolute_path"`, `matched_substring: "/usr/bin/xcrun mcpbridge"`, `source_field: "agent_shell_tool_argv"` so operators can audit the event post-run.
-- similar fixtures for `/usr/bin/xcrun xcodebuild`, `/usr/bin/xcrun simctl`, `/usr/bin/xcodebuild`, `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild`, and `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild`. Each emits a warning with the matching `policy_reason`/`matched_substring`.
-- `/usr/bin/xcrun dtrace` (non-Xcode subcommand) does **not** emit a warning — matcher recognizes it's a legitimate xcrun use of a non-Xcode-tool subcommand.
+Per-provider `XcodeResidualPathObserver` fixtures — each provider's shell-tool argv surface in `session/update` must be exercised end-to-end:
+
+- **Claude Agent**: fake-home agent (pure Xcode MCP, no direct shell Xcode declared in catalog) executes a shell tool call whose argv is `["/usr/bin/xcrun", "mcpbridge"]` — LLM-improvised at prompt time. Fixture: (a) observer sees the `toolUseBlock` in `session/update`, (b) the command is **not blocked** at runtime (outside enforced boundary), (c) the `mcpbridge` subprocess starts and talks to Xcode (accepting documented trade-off), (d) a warning is **emitted** to `actual_xcode_runtime_observation_json.xcode_shim_events` with `policy_decision: "prompt_warning"`, `policy_reason: "xcode_residual_absolute_path"`, `matched_substring: "/usr/bin/xcrun mcpbridge"`, `source_field: "acp_session_update_tool_use"`.
+- **Codex**: same scenario via Codex `session/update` shell tool call (argv as structured array); fixture asserts the observer extracted argv from `input.command` and emitted the matching warning.
+- **Gemini CLI**: same scenario via Gemini `toolCall.args.command` command string; fixture asserts command-string tokenizer surfaces `/usr/bin/xcrun mcpbridge` and emits the warning.
+- similar per-provider fixtures for `/usr/bin/xcrun xcodebuild`, `/usr/bin/xcrun simctl`, `/usr/bin/xcodebuild`, `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild`, and `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild`. Each emits a warning with the matching `policy_reason`/`matched_substring`.
+- **Negative fixture**: `/usr/bin/xcrun dtrace` (non-Xcode subcommand) does **not** emit a warning — matcher recognizes it's a legitimate xcrun use of a non-Xcode-tool subcommand.
+- **Observer-gap fixture**: provider that emits `session/update` events without shell-tool argv (simulated by a fixture stripping the relevant field). Observer records `xcode_residual_observer_gap` WARN at session start and attaches `observer_unavailable: { adapter_family }` marker to the execution's envelope; fixture asserts the marker appears in `actual_xcode_runtime_observation_json` so operators see the gap explicitly.
+
+**Shim event schema discrimination (P2 new)**
+
+- GraphQL `xcodeShimEvents` returns a `[XcodeShimEvent!]` list of union members; fixture asserts a mixed execution with one rejection + one warning yields two array entries with distinct `__typename` (`XcodeShimInvocationEvent` vs `XcodeShimWarningEvent`) and that each carries the full variant-specific fields (invocation has `derivedPeerPid` etc.; warning has `matchedSubstring`/`excerpt`).
+- MCP `reports.get` returns the same discrimination via the `kind` field on JSON objects; fixture asserts kinds round-trip through serialization without field loss.
+- Storage round-trip: JSON envelope written by the repository with both variants in `xcode_shim_events[]` deserializes back to Rust `XcodeShimEvent::{Invocation, Warning}` enum without silent field drop; fixture asserts equality of serialized/deserialized values.
 - fixture using this P051 proposal text itself as the prompt body compiles cleanly — no false-positive on documentation that quotes the forbidden paths
 - a prompt that contains **both** a quoted path AND a structured `run` block command with the same absolute path: run-start fails on the structured field; the prompt warning is still recorded
 
