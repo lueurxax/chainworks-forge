@@ -348,10 +348,11 @@ The old `open_session(&ExecutionRequest)` method is retired. Callers (the execut
 
 ```rust
 let launch_spec = adapter.prepare_launch_spec(&request, shim_env.as_ref())?;
+let cap_slice_before = launch_spec.capability_slice();
 let caps = runtime.ensure_provider_capabilities(&launch_spec).await?;
 let servers = resolve_mcp_servers(&request.mcp, &caps)?;
 let session_new_spec = adapter.prepare_session_new_spec(&request, &servers)?;
-// debug_assert!(launch_spec == launch_spec_still_unchanged_here);
+debug_assert_eq!(cap_slice_before, launch_spec.capability_slice());
 let handle = adapter
     .open_session_with_specs(&launch_spec, &session_new_spec)
     .await?;
@@ -371,7 +372,7 @@ let handle = adapter
 | `session_new_spec.mode` | same as real | same |
 | `session_new_spec.model`, `_meta`, config | same | same |
 
-The probe's one-shot `session/new` sends `mcpServers: []` — it is **only** measuring provider capability. The real session later sends the resolved list. The launch spec is byte-identical; the session_new spec differs only in the `mcpServers` field.
+The probe's one-shot `session/new` sends `mcpServers: []` — it is **only** measuring provider capability. The real session later sends the resolved list. The launch spec's **capability slice** (binary, argv, `capability_env`, adapter_settings) is byte-identical between probe and session; `credential_env` is intentionally different (empty vs populated). The `session_new_spec` differs only in the `mcpServers` field.
 
 **Shared config builder.** A single `launch_spec_builder` module (`control-plane/crates/acp/src/launch_spec.rs`) holds the common derivation logic shared across adapters: resolving binary path from runtime profile, composing env from the adapter-specific baseline plus shim injection plus P050 meta-root plus host isolation, deriving adapter_settings from `AcpSessionConfig`. Each adapter's `prepare_launch_spec` calls into this shared builder and adds its adapter-specific overrides (Codex fake-home, Claude mode flags, Gemini `--acp` flag) on top.
 
@@ -440,7 +441,7 @@ The reliability goal of P051 is not achieved if the same Xcode-dependent agents 
 
 1. any **requested** MCP entry in the catalog entry with server id `xcode` or `adapter_family: xcode_*`. The compiled `ResolvedAgent` exposes the requested MCP inventory (catalog author's declared intent) independent of whether resolution later succeeds. This is a static catalog property, not a runtime one.
 2. any declared `requires_xcode_host_execution: true` (catalog field, per §7 catalog chain).
-3. any entry in the agent's allowed `run` commands that matches a known Xcode-tool lexeme (`xcodebuild`, `simctl`, `mcpbridge`, `xcrun`, or any absolute path beginning with `/Applications/Xcode.app/Contents/Developer/`). Detection is performed by the catalog lint pass, which runs **at run-start compilation**, also before `resolve_mcp_servers` — its output is a static `XcodeShimInjectionSignal` attached to the `ResolvedAgent`.
+3. any **modeled direct-command declaration** in the agent catalog entry that matches a known Xcode-tool lexeme (`xcodebuild`, `simctl`, `mcpbridge`, `xcrun`, or any absolute path beginning with `/Applications/Xcode.app/Contents/Developer/`). The lint scans **every** field in the catalog entry where direct shell commands can be declared: `run` blocks, `shell_allowlist` entries (current catalog shape), `allowed_commands`, `tools.shell.commands`, and any adapter-specific shell-capability field defined by the catalog schema. A bare `xcodebuild` (or equivalent) in any of these fields triggers injection. Detection is performed by the catalog lint pass, which runs **at run-start compilation**, also before `resolve_mcp_servers` — its output is a static `XcodeShimInjectionSignal` attached to the `ResolvedAgent`.
 
 The `XcodeShimInjectionSignal` is a compile-time boolean available on `ResolvedAgent` before any resolution runs. `prepare_launch_spec` reads it from `ExecutionRequest.resolved_agent.xcode_shim_injection_signal` and populates `credential_env` unconditionally from that signal.
 
@@ -537,16 +538,35 @@ P051 introduces a separate **`XcodeShimDispatchToken`** minted by the broker per
 
 **Token scope: provider-session, not per-execution.** A reused ACP provider session does not relaunch the provider process and therefore cannot receive a new environment variable for a later execution. Binding the token to a single `AgentExecution` would mean: (a) later executions on the same session invoke shims with a stale token whose `agent_execution_id` no longer matches the live execution, (b) frozen workspace/policy data would outlive the execution it was meant to describe. Both are wrong. The token lifetime therefore matches the provider session, not any one execution.
 
-**Current-execution mapping and prompt-epoch model.** The broker owns a per-session mutable pointer `current_execution_id` and a monotonically increasing `current_prompt_epoch: u64` (initialized to 0). Before each `session/prompt` dispatch, the broker:
+**Current-execution mapping and active-prompt-window model.** The broker owns per-session state:
 
-1. increments `current_prompt_epoch` (so every prompt cycle has a unique id),
-2. updates `current_execution_id` to the new execution's id,
-3. captures a snapshot of `(current_execution_id, current_prompt_epoch)` at the moment `session/prompt` is sent.
+- `current_execution_id: Option<AgentExecutionId>` — `Some` while a prompt is actively being served, `None` between prompts.
+- `current_prompt_epoch: u64` — monotonically incremented on each `session/prompt`.
+- `active_prompt_started_at: Option<SystemTime>` — timestamp at prompt start; `None` between prompts.
 
-Shim dispatch events carry the prompt-epoch observed at dispatch time (not the epoch when the shim was launched — the broker reads `current_prompt_epoch` at dispatch receipt). Attribution rules:
+Transitions:
 
-- **In-epoch dispatch** (dispatch arrives while `current_prompt_epoch` is still the same as when the agent's tools were spawned for this prompt — the common case): event is appended to `current_execution_id`'s observation. `prompt_epoch` recorded.
-- **Stale-epoch dispatch** (dispatch arrives from a background process the agent spawned during an earlier prompt, after `current_prompt_epoch` has advanced): rejected with `xcode_shim_stale_prompt_epoch`. Rationale: a shim dispatch whose originating prompt has already ended is unsupported in P051 — ACP agents run shell commands synchronously inside their prompt cycle, so a delayed dispatch is either a bug or out-of-scope background daemon spawn.
+1. **On `session/prompt` send**: increment `current_prompt_epoch`; set `current_execution_id = Some(new_exec)`; set `active_prompt_started_at = Some(now)`.
+2. **On `session/prompt` response or cancel**: set `current_execution_id = None`; set `active_prompt_started_at = None`. The broker considers the prompt window **closed**; `current_prompt_epoch` stays at its last value (for observation).
+
+**Active-prompt-window dispatch rule.** Because the shim is a fresh subprocess spawned by the provider on each shell invocation and reads its env at spawn (env is frozen at provider launch), the shim cannot carry its own "origin epoch" in the dispatch DTO. P051 therefore does not attempt to distinguish "which epoch the shim was spawned for" — it enforces a simpler invariant:
+
+- **Shim dispatch is only valid during an active prompt.** If `current_execution_id.is_some()`, dispatch is attributed to that execution with `dispatch_prompt_epoch: current_prompt_epoch` recorded. This is the in-prompt case.
+- **Shim dispatch during an idle window** (`current_execution_id.is_none()`, i.e., between prompts): rejected with `xcode_shim_no_active_prompt`. The rejection event lands in the lease's `originating_execution_id`'s orphan bucket. This catches delayed subprocesses from a prior prompt that fire after the prompt ends but before the next one starts.
+
+**Accepted attribution gap.** If E1 spawns `xcodebuild &`, E1 prompt completes (broker sets idle), E2 prompt starts (broker sets active again), and the backgrounded `xcodebuild` finally invokes the shim **during** E2's active window — the broker cannot distinguish it from a genuine E2 dispatch and will attribute it to E2. This is an **accepted P051 limitation**, documented explicitly:
+
+> Agents that spawn detached background subprocesses whose shim dispatches fire during a **later** prompt window on the same provider session will have those events attributed to the later execution. P051 does not claim to correctly attribute such cross-prompt delayed dispatches — the shim cannot carry its own origin epoch because the provider subprocess inherits a frozen env.
+
+The workaround for agents that genuinely need background Xcode work: declare `requires_xcode_host_execution: true` and run commands synchronously via the host executor, which does provide per-invocation identity. A future opt-in (`requires_delayed_shim_dispatch: true`) would force fresh provider sessions so cross-prompt attribution cannot occur — out of P051 scope.
+
+**Dispatch attribution summary:**
+
+| Broker state at dispatch | Behavior |
+|---|---|
+| Active prompt, same session | Attribute to `current_execution_id`; record `dispatch_prompt_epoch` |
+| Idle window (between prompts) | Reject with `xcode_shim_no_active_prompt`; record to `originating_execution_id` orphan bucket with `is_orphan: true` |
+| Provider session closed / lease released | Reject with `xcode_shim_invalid_token` (lease no longer exists) |
 
 Rejected dispatches still produce an observation event, but attributed to a synthetic per-session `orphan` bucket:
 
@@ -574,15 +594,16 @@ The broker owns a per-session mutable pointer `current_execution_id` that is upd
 
 ```rust
 struct XcodeShimDispatchLease {
-    token: String,                         // 32+ random bytes, constant-time compared by broker
-    provider_session_id: ProviderSessionId, // lifetime owner
-    current_execution_id: AgentExecutionId, // MUTABLE — updated before each session/prompt
-    current_prompt_epoch: u64,              // MUTABLE — incremented on each session/prompt; used for late-dispatch rejection
+    token: String,                              // 32+ random bytes, constant-time compared by broker
+    provider_session_id: ProviderSessionId,     // lifetime owner
+    current_execution_id: Option<AgentExecutionId>, // Some during an active prompt, None between prompts
+    current_prompt_epoch: u64,                  // monotonically incremented on each session/prompt
+    active_prompt_started_at: Option<SystemTime>, // Some during active prompt
     originating_execution_id: AgentExecutionId, // IMMUTABLE — first execution that opened the lease; owns orphan bucket
-    workspace_root: PathBuf,               // frozen agent worktree root; set at session/new
-    requires_host_execution: bool,         // frozen at session/new
+    workspace_root: PathBuf,                    // frozen agent worktree root; set at session/new
+    requires_host_execution: bool,              // frozen at session/new
     issued_at: SystemTime,
-    expires_at: SystemTime,                // max = provider session lifetime; typically 24h
+    expires_at: SystemTime,                     // max = provider session lifetime; typically 24h
 }
 ```
 
@@ -1106,7 +1127,7 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - **Hard-fail scope (run-blocking)**: scan only structured executable fields — every agent's resolved `run` block command path and argv, env values, and required-tool declarations — for Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`) and `DEVELOPER_DIR=...xcodebuild`/`simctl` env assignments. Fail run-start with `xcode_absolute_path_forbidden` unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`.
   - **`mcpbridge` hard-fail is absolute**: structured fields whose path or `xcrun` subcommand resolves to `mcpbridge` fail run-start regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`. Diagnostic mode's bypass covers `xcodebuild`/`simctl` only; `mcpbridge` has no diagnostic exception anywhere in P051.
   - **Soft-warn scope (advisory, not blocking)**: scan prompt/system-instruction and description free-form text for the same patterns. Emit `xcode_absolute_path_in_prompt` advisory events appended to `actual_xcode_runtime_observation_json` as warnings; does **not** block run-start. This exists so P051 documentation, review prompts, and evidence quotes are not false-positives.
-  - Produce the agent-level `XcodeShimInjectionSignal: bool` at compilation time, attached to `ResolvedAgent` and available pre-resolution. Triggered by: (1) requested Xcode MCP server in catalog entry, (2) `requires_xcode_host_execution: true`, (3) any bare Xcode-tool lexeme in `run` block. `prepare_launch_spec` reads this signal and populates `credential_env` before `resolve_mcp_servers` runs.
+  - Produce the agent-level `XcodeShimInjectionSignal: bool` at compilation time, attached to `ResolvedAgent` and available pre-resolution. Triggered by: (1) requested Xcode MCP server in catalog entry, (2) `requires_xcode_host_execution: true`, (3) any bare Xcode-tool lexeme in **any** direct-command declaration field — `run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, and any adapter-specific shell-capability field defined by the catalog schema. Existing catalog shape places Xcode tools in `shell_allowlist` rather than `run` blocks, so the lint must cover both. `prepare_launch_spec` reads the signal and populates `credential_env` before `resolve_mcp_servers` runs.
 
 - `control-plane/crates/acp/src/launch_spec.rs` (new)
   - Shared `ProviderLaunchSpec` builder used by every adapter's `prepare_launch_spec`.
@@ -1437,7 +1458,8 @@ Add ACP fixture tests for:
 
 - direct-Xcode-only execution: `XcodeShimDispatchToken` minted at provider-launch time; broker authorizes shim dispatch by token→lease lookup and appends events to the correct `AgentExecution`
 - **reused session event ownership**: a single provider session runs two successful executions (E1 then E2) that both invoke `xcodebuild` via shell. Fixture asserts the broker updated `current_execution_id` and incremented `current_prompt_epoch` before E2's `session/prompt`, so E1's shim event lands in E1's `actual_xcode_runtime_observation_json.xcode_shim_events` and E2's lands in E2's — **no cross-execution contamination**. Same token value is reused across both; only the broker's internal pointers move.
-- **stale-epoch dispatch rejection**: E1 spawns a background `xcodebuild` via shell (`xcodebuild … &`); E1 completes its prompt; E2 begins and `current_prompt_epoch` advances; the backgrounded `xcodebuild` finally reaches the shim dispatch socket. Fixture asserts the late dispatch is rejected with `xcode_shim_stale_prompt_epoch`, the rejection is recorded in E1's orphan bucket (via `originating_execution_id`) with `is_orphan: true` and both `dispatch_arrived_epoch` and `session_current_epoch_at_dispatch` values, and does **not** attribute to E2.
+- **idle-window dispatch rejection**: E1 spawns a background `xcodebuild &`; E1 prompt completes (broker sets `current_execution_id = None`); **before E2 starts**, the backgrounded `xcodebuild` reaches the shim socket. Fixture asserts the late dispatch is rejected with `xcode_shim_no_active_prompt`, the rejection lands in the lease's `originating_execution_id` orphan bucket with `is_orphan: true`, `dispatch_arrived_epoch`, `session_current_epoch_at_dispatch`, and no attribution to any live execution.
+- **cross-prompt attribution gap (accepted limitation)**: E1 spawns `xcodebuild &`; E1 prompt completes; E2 prompt starts (broker sets active again); the backgrounded `xcodebuild` reaches the shim during E2's active window. Fixture documents the accepted limitation: dispatch is attributed to E2 (the broker cannot distinguish it from a genuine E2 dispatch). The fixture asserts the behavior explicitly — not as correct attribution, but as the documented P051 limitation. Reports/docs must warn agent authors that cross-prompt background subprocess dispatches will mis-attribute.
 - **reuse-incompatible on shim authority**: second execution on same lineage has a different `workspace_root` → supersession forced. Old session + old token retired; fresh session + fresh token minted with E2's workspace_root. Fixture asserts E1's shim lease is `released` before E2's is minted.
 - **reuse-incompatible on policy change**: second execution has `requires_xcode_host_execution: true` while the live session was opened with `false` → supersession forced
 - forged token: shim dispatch with a token not in broker's state map is rejected with `xcode_shim_invalid_token`; no event is appended to any execution
@@ -1499,7 +1521,7 @@ The exact test names may differ, but the gate must prove:
 - runtime profile change forces a fresh probe even when the binary is unchanged — fixture: two profiles on the same Codex binary with different `mode` or `config_options` produce independent cache entries
 - launch-env fingerprint change forces a fresh probe — fixture: toggling an `ACP_EXPERIMENTAL_*` env var between probes yields two distinct cache entries
 - launch-args fingerprint change forces a fresh probe — fixture: Gemini switching between `--acp` and `--experimental-acp` produces two distinct cache entries
-- **launch-spec identity**: fixture asserts the `ProviderLaunchSpec` passed to `ensure_provider_capabilities` is byte-identical to the one later passed into the adapter's `open_session`. Debug-assert in the executor panics at test time if they diverge.
+- **capability-slice identity**: fixture asserts `launch_spec.capability_slice()` (binary, argv, `capability_env`, `adapter_settings`) is byte-identical at `ensure_provider_capabilities` call time and at `open_session_with_specs` call time. `credential_env` is **not** part of this equality — it is intentionally empty for the probe and populated for the real session. Two additional assertions cover the env split: (a) probe subprocess's actual env does not contain `CHAINWORKS_XCODE_SHIM_TOKEN` or `XCODE_SHIM_DISPATCH_SOCKET` and its `PATH` has no shim-dir prefix; (b) real session subprocess's env does contain these credentials. Debug-assert in the executor panics at test time if the capability slice diverges.
 
 **Per-lease vs pool-wide failure isolation (P1 new)**
 
@@ -1512,8 +1534,10 @@ The exact test names may differ, but the gate must prove:
 
 Shim injection:
 
-- agent with only Xcode MCP entries (no direct `xcodebuild` in `run` block) gets the shim injected
-- agent with only direct `xcodebuild` commands (no Xcode MCP entry) gets the shim injected via the catalog-lint injection trigger
+- agent with only Xcode MCP entries (no direct `xcodebuild` in any command-declaration field) gets the shim injected
+- agent with only a direct `xcodebuild` entry in **`run` block** (no Xcode MCP, no `requires_xcode_host_execution`) gets the shim injected via the catalog-lint injection trigger
+- agent with only `shell_allowlist: [xcodebuild, …]` (current catalog shape — no `run` entry, no MCP, no `requires_xcode_host_execution`) gets the shim injected via the expanded lint scope. Fixture uses a real catalog entry shape from `examples/agents/agents.yaml`.
+- agent with `allowed_commands: [xcodebuild, …]` or `tools.shell.commands: [xcodebuild, …]` similarly triggers injection
 - agent with `requires_xcode_host_execution: true` but no other Xcode signal gets the shim injected
 - agent with zero Xcode signals gets no shim; its `PATH` remains unchanged
 
@@ -1576,8 +1600,8 @@ Implementation is complete when:
 - Parallel ACP sessions that request Xcode MCP each get their own lease and backend `mcpbridge` subprocess; their initialize phases serialize per Xcode PID; their `tools/*` calls run in parallel.
 - ACP providers receive an HTTP streaming MCP endpoint for brokered Xcode access.
 - Single backend crash fails only its lease; sibling leases continue. Xcode PID drift and broker HTTP infrastructure failure terminally close all affected leases with their respective `backend_failure_class`. Host-env loss fails **new lease acquisitions** and **shim-route requests** but does not disturb already-running MCP streams.
-- PATH shim (`xcodebuild`, `simctl`, `mcpbridge`, option-aware `xcrun`) is injected into an ACP provider subprocess when the compile-time `XcodeShimInjectionSignal` is set, triggered by any of: (1) catalog requests Xcode MCP, (2) agent declares `requires_xcode_host_execution: true`, (3) catalog lint detects any bare Xcode-tool lexeme in the agent's `run` block. Signal is decidable before MCP resolution runs. Agents with zero Xcode signals keep their unmodified `PATH`.
-- Absolute-path catalog lint hard-fails run-start with `xcode_absolute_path_forbidden` **only** when a structured executable field (`run` block command path/argv, env assignments of `DEVELOPER_DIR`) contains Xcode-tool absolute paths. Prompt/system-instruction/description text gets a soft `xcode_absolute_path_in_prompt` warning recorded in the runtime observation envelope but does not block run-start. `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` skips both.
+- PATH shim (`xcodebuild`, `simctl`, `mcpbridge`, option-aware `xcrun`) is injected into an ACP provider subprocess when the compile-time `XcodeShimInjectionSignal` is set, triggered by any of: (1) catalog requests Xcode MCP, (2) agent declares `requires_xcode_host_execution: true`, (3) catalog lint detects any bare Xcode-tool lexeme in any direct-command declaration field (`run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). Signal is decidable before MCP resolution runs. Agents with zero Xcode signals keep their unmodified `PATH`.
+- Absolute-path catalog lint hard-fails run-start with `xcode_absolute_path_forbidden` **only** when a structured executable field (`run` block command path/argv, env assignments of `DEVELOPER_DIR`) contains Xcode-tool absolute paths. Prompt/system-instruction/description text gets a soft `xcode_absolute_path_in_prompt` warning recorded in the runtime observation envelope but does not block run-start. `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` skips the lint **only for `xcodebuild`/`simctl` paths** (structured and prompt). Any structured field whose absolute path resolves to `mcpbridge` (bare, via `/usr/bin/xcrun mcpbridge`, or any option-prefixed `xcrun` variant ending in `mcpbridge`) still hard-fails even in diagnostic mode — the broker-only-mcpbridge boundary has no diagnostic override anywhere in P051.
 - Default shim policy rejects direct `xcodebuild`/`simctl` invocations with exit 127 and `xcode_shim_rejected` observation; `requires_xcode_host_execution: true` opt-in routes through the broker host executor with full `ShimDispatchRequest` DTO (cwd, env allowlist, provider snapshot).
 - Direct `mcpbridge` (bare or via `xcrun mcpbridge`, option-prefixed or not) is **always rejected** by the shim regardless of `requires_xcode_host_execution` **and regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`**; `mcpbridge` is not routable via the host executor; the broker is the only code path that spawns `xcrun mcpbridge`.
 - **Shim dispatch token authority is separate from MCP lease authority and scoped to the provider session, not a single execution.** `XcodeShimDispatchToken` is minted per provider session at provider-launch time for any shim-injected execution (including direct-Xcode-only agents with no MCP lease). The broker maintains a mutable `current_execution_id` pointer updated before each `session/prompt` so shim events always append to the currently-active execution. Reuse-compat check forces supersession if `workspace_root` or `requires_xcode_host_execution` would differ between executions. Tokens are constant-time validated, have explicit expiry, enforce the frozen `workspace_root` cwd boundary, and cannot be cross-used with MCP HTTP bearer tokens. Tokens are **not** assumed secret from shell-capable agents (env delivery is readable via `env`/`printenv`); all authorization is server-side.
