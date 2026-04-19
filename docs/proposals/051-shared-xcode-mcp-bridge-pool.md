@@ -212,13 +212,15 @@ struct ProbeKey {
     adapter_family: AdapterFamily,
     runtime_profile_id: RuntimeProfileId,
     binary_fingerprint: BinaryFingerprint,   // path + mtime + size
-    launch_args_fingerprint: sha256,          // sorted argv the probe will use
+    launch_args_fingerprint: sha256,          // ORDERED argv (byte-for-byte, positional); never sorted — order is part of launch contract
     launch_env_fingerprint: sha256,           // sorted capability-relevant env
     adapter_settings_fingerprint: sha256,     // AcpSessionConfig.extra / mode / config_options
 }
 ```
 
-`launch_env_fingerprint` covers the `capability_env` subset of env vars (`PATH` excluding shim-dir prefix, `HOME`, `TMPDIR`, `DEVELOPER_DIR`, `CODEX_HOME`, `GEMINI_API_KEY` presence flag, `CLAUDE_AGENT_*` feature flags, `ACP_EXPERIMENTAL_*`) — never secret values, only redacted/boolean fingerprints. It does **not** include `credential_env` (shim token, shim socket, shim-dir `PATH` prefix), so rotating the shim token between reuses does not invalidate the capability cache. `adapter_settings_fingerprint` covers the `AcpSessionConfig` knobs that alter provider behavior (mode, config options, structured-output intent). Any change in any fingerprinted input forces a fresh probe.
+`launch_args_fingerprint` is computed over the **ordered** argv vector exactly as it will be passed to `execve` — position-preserving, never sorted. Argv order is part of the launch contract: later options can override earlier ones, option-with-arg flags consume the next token positionally, and flag interleaving changes behavior. Sorting argv before hashing would let two different launch orders share a cached `AgentCapabilities` result — e.g., `[--sdk, ios, --toolchain, swift-latest]` and `[--toolchain, swift-latest, --sdk, ios]` would hash identically after sorting even though they are potentially different launch shapes. Serialization: concatenate argv tokens with a NUL byte separator (`'\x00'`) to avoid ambiguity with tokens containing whitespace.
+
+`launch_env_fingerprint` covers the `capability_env` subset of env vars (`PATH` excluding shim-dir prefix, `HOME`, `TMPDIR`, `DEVELOPER_DIR`, `CODEX_HOME`, `GEMINI_API_KEY` presence flag, `CLAUDE_AGENT_*` feature flags, `ACP_EXPERIMENTAL_*`) — sorted before hashing (env is a map, order does not matter), never secret values, only redacted/boolean fingerprints. It does **not** include `credential_env` (shim token, shim socket, shim-dir `PATH` prefix), so rotating the shim token between reuses does not invalidate the capability cache. `adapter_settings_fingerprint` covers the `AcpSessionConfig` knobs that alter provider behavior (mode, config options, structured-output intent). Any change in any fingerprinted input forces a fresh probe.
 
 ```rust
 impl ProviderCapabilityProbe {
@@ -600,7 +602,13 @@ Diagnostic mode logs a WARN at daemon start and an additional WARN each time the
 
 - **PATH-based invocations** of `xcodebuild`, `simctl`, `mcpbridge`, and `xcrun <subcommand>`: enforced by shim at runtime.
 - **Absolute-path invocations**: enforced by catalog lint at run-start; not enforced at runtime.
-- **Agent prompt-time improvisation** (an LLM synthesizing an absolute path mid-run): not blocked by P051. This is a residual risk. Mitigations: (a) prompt templates for Xcode-dependent agents include explicit "use bare `xcodebuild`, never absolute paths" instruction, (b) agent-shell output observation flags commands starting with `/Applications/Xcode.app/` or `DEVELOPER_DIR=` to a warning stream for operator review post-run, (c) a follow-up proposal can add libc audit or sandbox-exec profiles if the residual risk becomes a real failure mode in dogfood.
+- **Agent prompt-time improvisation** (an LLM synthesizing an absolute path mid-run): not blocked by P051. This is a residual risk. Mitigations: (a) prompt templates for Xcode-dependent agents include explicit "use bare `xcodebuild`, never absolute paths" instruction; (b) **agent-shell output observation** flags any ACP provider shell-tool command whose argv or command string matches the **residual-path warning matcher** — a warning stream emitted to `actual_xcode_runtime_observation_json.xcode_shim_events` with `policy_decision: "prompt_warning"`, `policy_reason: "xcode_residual_absolute_path"`, and the matched substring recorded for operator review. The matcher covers the full residual surface:
+  - `/Applications/Xcode.app/Contents/Developer/` and `/Applications/Xcode*.app/Contents/Developer/` (any Xcode binary under Developer dir),
+  - `/usr/bin/xcrun` (including `/usr/bin/xcrun mcpbridge`, `/usr/bin/xcrun simctl`, `/usr/bin/xcrun xcodebuild`, and option-prefixed forms — the warning fires on any match to `/usr/bin/xcrun\b`, with a stronger-priority warning if a subsequent token parses to `mcpbridge`, `xcodebuild`, or `simctl` under the same mode-aware parse used by the `xcrun` shim),
+  - `/usr/bin/xcodebuild` (direct absolute-path xcodebuild),
+  - `/usr/bin/simctl` (direct absolute-path simctl),
+  - `DEVELOPER_DIR=` prefixes when paired with any Xcode tool in the same shell command.
+  The warning does not block execution (the residual is out of the enforced boundary) but it **is** emitted even for the highest-risk case (`/usr/bin/xcrun mcpbridge`) so operators have a trail to audit after the fact. (c) A follow-up proposal can add libc audit or sandbox-exec profiles if the residual risk becomes a real failure mode in dogfood.
 
 P051 does not claim the residual risk is zero. It claims the enforceable boundary covers **PATH-based commands and catalog-declared absolute paths**, which is the common case observed today.
 
@@ -1644,6 +1652,7 @@ The exact test names may differ, but the gate must prove:
 - runtime profile change forces a fresh probe even when the binary is unchanged — fixture: two profiles on the same Codex binary with different `mode` or `config_options` produce independent cache entries
 - launch-env fingerprint change forces a fresh probe — fixture: toggling an `ACP_EXPERIMENTAL_*` env var between probes yields two distinct cache entries
 - launch-args fingerprint change forces a fresh probe — fixture: Gemini switching between `--acp` and `--experimental-acp` produces two distinct cache entries
+- **argv order matters** (P1 new): fixture constructs two launch specs with the same argv multiset in different positional order (e.g., `[--sdk, ios, --toolchain, swift-latest]` vs `[--toolchain, swift-latest, --sdk, ios]`) and asserts they produce different `ProbeKey.launch_args_fingerprint` values. Cache is not shared across the two orders; each triggers a fresh probe.
 - **capability-slice identity**: fixture asserts `launch_spec.capability_slice()` (binary, argv, `capability_env`, `adapter_settings`) is byte-identical at `ensure_provider_capabilities` call time and at `open_session_with_specs` call time. `credential_env` is **not** part of this equality — it is intentionally empty for the probe and populated for the real session. Two additional assertions cover the env split: (a) probe subprocess's actual env does not contain `CHAINWORKS_XCODE_SHIM_TOKEN` or `XCODE_SHIM_DISPATCH_SOCKET` and its `PATH` has no shim-dir prefix; (b) real session subprocess's env does contain these credentials. Debug-assert in the executor panics at test time if the capability slice diverges.
 
 **Per-lease vs pool-wide failure isolation (P1 new)**
@@ -1695,6 +1704,12 @@ Absolute-path catalog lint — prompt text (soft-warn):
 
 - catalog with a prompt that quotes `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` as inert documentation (e.g., a review agent's instructions describing what is blocked) **passes** run-start; fixture asserts (a) run is created, (b) `ResolvedAgent.prompt_lint_warnings` contains the entry at compile time, (c) when the executor creates the `AgentExecution` row, the warning is appended to `actual_xcode_runtime_observation_json.xcode_shim_events` in the same transaction, (d) the entry carries `source_field` and `excerpt` for operator review
 - warning carrier durability: fixture simulates an executor crash between compile and claim — on recovery, the next executor replay reads the same `ResolvedAgent` (which is frozen run truth) and still writes the warning to the new `AgentExecution` row. Warnings are never dropped between compilation and execution.
+
+**Residual-path runtime warnings (P2 new)**
+
+- fake-home agent (pure Xcode MCP, no direct shell Xcode declared in catalog) executes a shell tool call whose argv is `["/usr/bin/xcrun", "mcpbridge"]` — LLM-improvised at prompt time. Fixture asserts: (a) the command is **not blocked** at runtime (outside enforced boundary; no PATH shim on this agent, no catalog lint coverage for prompt-time argv), (b) the `mcpbridge` subprocess starts and talks to Xcode (accepting the documented trade-off), (c) a warning is **emitted** to `actual_xcode_runtime_observation_json.xcode_shim_events` with `policy_decision: "prompt_warning"`, `policy_reason: "xcode_residual_absolute_path"`, `matched_substring: "/usr/bin/xcrun mcpbridge"`, `source_field: "agent_shell_tool_argv"` so operators can audit the event post-run.
+- similar fixtures for `/usr/bin/xcrun xcodebuild`, `/usr/bin/xcrun simctl`, `/usr/bin/xcodebuild`, `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild`, and `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild`. Each emits a warning with the matching `policy_reason`/`matched_substring`.
+- `/usr/bin/xcrun dtrace` (non-Xcode subcommand) does **not** emit a warning — matcher recognizes it's a legitimate xcrun use of a non-Xcode-tool subcommand.
 - fixture using this P051 proposal text itself as the prompt body compiles cleanly — no false-positive on documentation that quotes the forbidden paths
 - a prompt that contains **both** a quoted path AND a structured `run` block command with the same absolute path: run-start fails on the structured field; the prompt warning is still recorded
 
