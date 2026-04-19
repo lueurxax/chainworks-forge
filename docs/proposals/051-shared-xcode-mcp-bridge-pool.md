@@ -7,8 +7,8 @@
 | Author | Andrey Khasanov |
 | Depends on | [025-per-agent-mcp-policy-and-runtime-validation.md](025-per-agent-mcp-policy-and-runtime-validation.md), [026-acp-first-runtime-transport-and-goose-decoupling.md](026-acp-first-runtime-transport-and-goose-decoupling.md), [029-mcp-northbound-control-plane-server.md](029-mcp-northbound-control-plane-server.md), [037-acp-execution-supervision-and-idle-watchdog.md](037-acp-execution-supervision-and-idle-watchdog.md), [049-context-strategy-management-mcp-tools.md](049-context-strategy-management-mcp-tools.md) |
 | Priority | P1 / High |
-| Scope | Implement a Chainworks-owned HTTP streaming Xcode MCP broker that (a) serves provider-facing Xcode MCP via loopback HTTP with per-session bearer tokens, (b) spawns one `xcrun mcpbridge` backend subprocess per HTTP client session under a broker-owned **host-user environment**, (c) serializes bridge spawn + `initialize` per Xcode PID while allowing parallel `tools/*` calls, (d) centralizes simulator UUID selection and policy filtering. The broker is the Xcode host-session execution boundary so isolated ACP agents do not run Xcode tools directly from fake per-run `HOME`/`TMPDIR` environments. |
-| Goal | Eliminate CoreSimulator/`simdiskimaged` failures caused by isolated agent home directories (primary reliability goal), preserve one-modal-per-Xcode-process consent behavior across parallel reviewers, reduce MCP startup latency through pooled lifecycle, and preserve per-agent session isolation, permission policy, MCP capability reporting, and recovery semantics. |
+| Scope | Implement a Chainworks-owned HTTP streaming Xcode MCP broker that (a) serves provider-facing Xcode MCP via loopback HTTP with per-session bearer tokens, (b) spawns one `xcrun mcpbridge` backend subprocess per HTTP client session under a broker-owned **host-user environment**, (c) serializes bridge spawn + `initialize` per Xcode PID while allowing parallel `tools/*` calls, (d) centralizes simulator UUID selection and policy filtering. The broker is the Xcode host-session execution boundary **for catalog-declared and PATH-based invocations**; P051 does not claim to block LLM-improvised absolute-path invocations at runtime (see §5.1.1 "Scope of guarantee"). |
+| Goal | Eliminate CoreSimulator/`simdiskimaged` failures caused by isolated agent home directories **for catalog-declared and PATH-based Xcode commands** (primary reliability goal — this is the observed operational failure mode), preserve one-modal-per-Xcode-process consent behavior across parallel reviewers, reduce MCP startup latency through pooled lifecycle, and preserve per-agent session isolation, permission policy, MCP capability reporting, and recovery semantics. Prompt-time LLM-improvised absolute-path invocations remain a documented residual with runtime warnings (§5.1.1 mitigation b); closing that residual requires a future libc-audit / sandbox-exec proposal. |
 | Research artifact | [051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md](051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md) — verdict **Proceed with scoped architecture**, Phase 0 probes complete. |
 
 **Gate naming note:** this proposal owns the new canonical gate alias `proposal-051|p051`. It must be added to `scripts/test-gate.sh` and `docs/reference/test-gates.md`; it must not reuse the existing P044, P045, P049, or P050 gates.
@@ -113,7 +113,19 @@ The research verdict is one of:
 - `Proceed with scoped provider set`: only a named subset supports it; the proposal must be revised to limit scope before implementation.
 - `Do not implement P051 as written`: HTTP streaming is not currently viable; the proposal must be revised or replaced before any implementation starts.
 
-The P051 proof gate includes a **static consistency check** that this research artifact exists, contains a non-placeholder verdict, **and does not contradict the current proposal text**. Specifically the check scans the artifact for known stale-guidance patterns (e.g., "`mcpbridge` in host-executor allowlist", "direct `xcrun mcpbridge` diagnostic fallback", "shared backend across leases") and fails if any are present. When the proposal revises a contract, the artifact must be updated in the same PR; the gate rejects sign-off otherwise. This prevents an allowed-verdict artifact from silently carrying obsolete guidance that implementers might follow in preference to the proposal body. The list of stale patterns the gate rejects is maintained alongside the gate script and updated whenever the proposal's contracts change.
+The P051 proof gate includes a **static consistency check** that this research artifact exists, contains a non-placeholder verdict, **and does not contradict the current proposal text**. The check scans the artifact for known stale-guidance patterns and fails sign-off if any are present. The matcher set is maintained alongside the gate script and updated whenever the proposal's contracts change. Current stale-pattern set (not exhaustive — new items added as contracts evolve):
+
+- `mcpbridge` listed in the host-executor allowlist,
+- direct `xcrun mcpbridge` diagnostic fallback or "retained behind a diagnostic flag",
+- "shared backend across leases" or "one backend bridge per pool key shared across multiple leases",
+- direct-command guarding described as "optional", "diagnostic-only", or "follow-up proposal scope" (per P051 current text, direct-command shim + catalog lint are required, not optional),
+- "xcode MCP entry triggers shim injection" (pure Xcode MCP must not be shimmed per the XcodeBrokerRequired vs XcodeShimInjectionSignal split),
+- "probe sends session/new" or "probe sends mcpServers: []" (the probe sends initialize only),
+- "byte-identical ProviderLaunchSpec between probe and session" without the capability-slice qualifier (credential_env intentionally differs),
+- "-l/--log consumes argument" (it is a no-arg mode modifier per xcrun --help),
+- "argv sorted before hashing" for ProbeKey (argv is ordered, positional).
+
+When the proposal revises a contract, the artifact must be updated in the same PR; the gate rejects sign-off otherwise. This prevents an allowed-verdict artifact from silently carrying obsolete guidance that implementers might follow in preference to the proposal body.
 
 ---
 
@@ -327,8 +339,9 @@ pub trait AcpAdapter: Send + Sync {
 
     /// Build the session/new protocol payload from resolved MCP servers + request.
     /// This is how resolved Xcode broker HTTP entries (URL + bearer) reach the
-    /// real session. The probe never calls this — capability probing sends an
-    /// empty mcpServers list directly.
+    /// real session. The probe never calls this — capability probing sends
+    /// initialize ONLY, reads AgentCapabilities from the initialize response,
+    /// and closes on stdin EOF. No session/new is constructed by the probe at all.
     fn prepare_session_new_spec(
         &self,
         request: &ExecutionRequest,
@@ -542,7 +555,7 @@ The shim directory contains executables named `xcodebuild`, `simctl`, `mcpbridge
 Mode flags from `xcrun --help` (macOS 26.3):
 
 - **Run mode** (default; tool **is executed**): `-r <tool>`, `--run <tool>`, or bare `xcrun <tool>` with no mode flag. In all three forms the named tool is executed via `execve`. For P051 policy: inspect the resolved tool name, apply reject/route/passthrough.
-- **Find mode** (tool **is NOT executed** — `xcrun` prints the resolved path and exits): `-f <tool>`, `--find <tool>`. Agent learns the absolute path but no execution happens. Safe to pass through — the absolute path is catalog-lint-bounded elsewhere and cannot be directly invoked without hitting the PATH-shim boundary again.
+- **Find mode** (tool **is NOT executed** — `xcrun` prints the resolved path and exits): `-f <tool>`, `--find <tool>`. Previously passed through because no execution happens, but the printed absolute path can then be reused by the same shell-capable agent as `/usr/bin/xcrun mcpbridge` (or direct `/Applications/Xcode.app/.../mcpbridge` invocation) — a find-then-exec chain that bypasses the PATH shim. P051 therefore **rejects Find mode for the three guarded tools** (`mcpbridge`, `xcodebuild`, `simctl`); the shim exits 127 with `policy_reason: "xcrun_find_of_guarded_tool_rejected"`, `tool: <resolved>`, `via_xcrun: true`, and no absolute path is leaked to stdout. `xcrun --find` for any other tool (`dtrace`, `swiftc`, `xar`, etc.) still passes through — those tools are not P051's concern. Agents that need the absolute path of `xcodebuild` or `simctl` for a legitimate use case must declare `requires_xcode_host_execution: true` and invoke the tool via the shim route; agents never need the absolute path of `mcpbridge` because `mcpbridge` is broker-only.
 - **Show modes** (no tool arg): `--show-sdk-path`, `--show-sdk-version`, `--show-sdk-platform-path`, `--show-sdk-platform-version`, `--show-sdk-build-version`. No execution. Pass through silently.
 
 Flag classification (from local `xcrun --help`):
@@ -572,7 +585,8 @@ while i < argv.len():
 
 dispatch according to mode:
   Show → pass-through (no tool to inspect)
-  Find → pass-through (no execution; path just printed)
+  Find + tool ∈ {xcodebuild, simctl, mcpbridge} → reject (xcrun_find_of_guarded_tool_rejected)
+  Find + other tool → pass-through (no execution; path just printed for non-guarded tools)
   Run + tool is None → pass-through (malformed; let xcrun error)
   Run + tool ∈ {xcodebuild, simctl} → apply reject/route/diagnostic policy
   Run + tool == mcpbridge → unconditional reject
@@ -1589,7 +1603,8 @@ Add focused tests for:
 
 - research-gate preflight rejects missing or placeholder HTTP streaming feasibility artifact
 - MCP resolver refuses broker mode for providers not proven compatible by the research verdict
-- **provider capability preflight**: when `ProviderCapabilityCache` records `mcpCapabilities.http = false` for a runtime profile, `resolve_mcp_servers` returns a blocking issue before any per-lease state is allocated — no `lease_id` minted, no per-lease bearer token generated, no broker pool entry created, no backend `mcpbridge` spawned, no `XcodeShimDispatchLease` recorded, no `session/new` payload constructed, no HTTP MCP server entry emitted into any provider spec. The daemon's shared loopback listener and `/xcode-mcp` route remain bound — those are daemon-lifetime resources covered by the separate daemon-start invariant (see §7 daemon integration), not per-request resources. `actual_mcp_observation_json` records `provider_http_mcp_unsupported`.
+- **provider capability preflight**: when `ProviderCapabilityCache` records `mcpCapabilities.http = false` for a runtime profile, `resolve_mcp_servers` returns a blocking issue before any per-lease state is allocated — no `lease_id` minted, no per-lease bearer token generated, no broker pool entry created, no backend `mcpbridge` spawned, no `XcodeShimDispatchLease` recorded, no `session/new` payload constructed (neither by the probe — the probe never sends `session/new` at all — nor by the would-be real session), no HTTP MCP server entry emitted into any provider spec. The daemon's shared loopback listener and `/xcode-mcp` route remain bound — those are daemon-lifetime resources covered by the separate daemon-start invariant (see §7 daemon integration), not per-request resources. `actual_mcp_observation_json` records `provider_http_mcp_unsupported`.
+- **probe wire capture**: fixture records every JSON-RPC frame the provider subprocess sees during capability probing and asserts the frame sequence is exactly `{initialize-request, initialize-response, <stdin EOF>}`. Specifically asserts: no `session/new` frame appears in probe traffic, no `mcpServers` field reaches the provider, no `session/prompt`, no `session/close`.
 - capability probe caches `AgentCapabilities` per full `ProbeKey` (adapter family, runtime profile id, binary fingerprint, launch args fingerprint, capability-relevant launch env fingerprint, adapter settings fingerprint) and invalidates on any component change — not only binary upgrade
 - two concurrent Xcode lease requests serialize through the per-PID initialize Mutex and both complete a `tools/list` round-trip without interference
 - parallel `tools/call` requests on sibling leases do not serialize (lock is released after initialize)
@@ -1773,8 +1788,10 @@ Shim enforcement (PATH-based invocations):
 - fake-home agent invoking **`xcrun -l mcpbridge`** (no-arg `-l` flag followed by positional tool) resolves tool to `mcpbridge` and is rejected; fixture proves `-l` is no-arg and does not consume `mcpbridge`
 - fake-home agent invoking **`xcrun --log mcpbridge`** same result
 - fake-home agent invoking **`xcrun --log --verbose mcpbridge`** (two no-arg flags + positional tool) resolves tool to `mcpbridge` and is rejected
-- fake-home agent invoking **`xcrun --find xcodebuild`** (Find mode — no execution) passes through transparently; fixture asserts no `xcode_shim_rejected`/`xcode_shim_routed` event is emitted because `xcodebuild` is not actually executed, only its path is printed
-- fake-home agent invoking **`xcrun --find mcpbridge`** similarly passes through (no execution); the printed path is still subject to the absolute-path catalog-lint boundary elsewhere
+- fake-home agent invoking **`xcrun --find xcodebuild`** (Find mode + guarded tool) is **rejected** with exit 127; `xcode_shim_rejected` with `{tool: "xcodebuild", via_xcrun: true, policy_reason: "xcrun_find_of_guarded_tool_rejected"}`. Fixture asserts no absolute path is printed to stdout — the find-to-exec chain is broken at the find step.
+- fake-home agent invoking **`xcrun --find mcpbridge`** similarly rejected with `tool: "mcpbridge"`
+- fake-home agent invoking **`xcrun -f simctl`** (short form) similarly rejected with `tool: "simctl"`
+- fake-home agent invoking **`xcrun --find dtrace`** (Find mode + non-guarded tool) passes through transparently; dtrace's path is printed. Non-Xcode tools are not P051's concern.
 - fake-home agent invoking **`xcrun --show-sdk-path`** (Show mode, no tool) passes through silently
 - fake-home agent invoking `xcrun dtrace` (Run mode, non-Xcode tool) passes through transparently; no observation emitted
 - fake-home agent invoking `xcrun --toolchain swift-latest swiftc …` (Run mode with non-mode option-with-arg) passes through transparently after option parse

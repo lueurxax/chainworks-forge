@@ -222,7 +222,7 @@ Confidence: **HIGH** on HOME/TMPDIR/DEVELOPER_DIR; **MEDIUM** on USER/LOGNAME ne
 
 **Guarded via broker-owned host executor (recommended for P051 implementation phase):**
 
-- `xcodebuild` — only if invoked by broker-owned flows (release preflight, build verification helpers). Direct agent-issued `xcodebuild` in fake-home ACP context remains the known failure mode; P051 should add a focused guard that intercepts `xcodebuild` in agent shell and either routes through the host executor or rejects with a clear "use brokered-build-tool" error. The proposal explicitly leaves this as optional for P051 scope (§3.5) — we recommend at minimum a diagnostic log when direct `xcodebuild` is detected, then plan a follow-up proposal for full guarding.
+- `xcodebuild` — the current P051 proposal **requires** (not optional) the direct-command shim + catalog lint for PATH-based and catalog-declared `xcodebuild` invocations. Default shim policy is reject; `requires_xcode_host_execution: true` opt-in routes through the broker host executor. The earlier "optional for P051 scope" wording in this artifact is retired — direct-command guarding is part of P051's enforced boundary.
 - `xcrun simctl` — same category as `xcodebuild`; CoreSimulator state lives under real user HOME. The broker's simulator-UUID resolver should be the only normal path to `simctl`.
 
 **Diagnostic-only (not in P051 scope):**
@@ -306,7 +306,7 @@ Nothing in the current codebase is a structural blocker. The wire emitter + tran
    - Observation payload (`actual_mcp_observation_json` broker fields).
    - Fixture-based Rust tests for lease release on all failure paths.
 5. **Phase 4 — Guard + gate**:
-   - Diagnostic log for direct agent-issued `xcodebuild` in fake-home context (not full guard — that's a follow-up).
+   - PATH shim + catalog lint for direct agent-issued `xcodebuild`/`simctl`/`mcpbridge`/`xcrun` — full guard, not diagnostic-only. `requires_xcode_host_execution: true` opt-in routes `xcodebuild`/`simctl` through the broker host executor; `mcpbridge` is broker-only.
    - `proposal-051|p051` gate in `scripts/test-gate.sh` and `docs/reference/test-gates.md`.
    - Static preflight check that this research artifact exists and has an allowed verdict.
 6. **Phase 5 — Dogfood + demote diagnostic direct-mode**.
