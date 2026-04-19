@@ -43,14 +43,17 @@ P051 therefore must not be treated as only a modal-deduplication optimization. I
 
 ## 2. Product Questions This Proposal Must Answer
 
-1. Can a parallel stage with two Xcode-capable ACP sessions start with only one real `xcrun mcpbridge` connection to Xcode?
-2. Can each ACP provider consume Xcode MCP through HTTP streaming without knowing that Chainworks is brokering the backend bridge?
-3. Can the broker preserve per-agent read/write policy and MCP capability reporting?
-4. Can one stuck or cancelled ACP session release its lease without killing sibling sessions that still use the shared bridge?
-5. Can the system fail closed when the broker cannot start or when Xcode PID changes?
-6. Can operators and tests prove the number of real Xcode bridge starts and modal-prone handshakes is reduced?
-7. Can Xcode and CoreSimulator commands run from a stable host-user environment without giving the whole ACP agent access to the real user `HOME`?
-8. Can the runtime prevent direct Xcode execution from isolated fake-home ACP sessions except through an explicit diagnostic escape hatch?
+Success is framed around four properties, not bridge-count reduction (Phase 0 confirmed each lease gets its own `mcpbridge` subprocess; P051 no longer claims "one bridge for N clients").
+
+1. **Single host-session consent boundary.** Can a parallel stage with two Xcode-capable ACP sessions complete with at most one Xcode consent modal per Xcode process, regardless of how many `mcpbridge` subprocesses the broker spawns?
+2. **Transport abstraction.** Can each ACP provider consume Xcode MCP through HTTP streaming without knowing that Chainworks is spawning backend `mcpbridge` subprocesses under a host-user environment?
+3. **Modal-prone initialize serialization.** Can the broker serialize the per-Xcode-PID initialize phase so concurrent lease requests never race at Xcode's XPC tool-service setup, while keeping `tools/*` calls parallel?
+4. **Per-lease backend isolation.** Can one stuck, crashed, or cancelled lease release cleanly — closing only its own backend `mcpbridge` subprocess — without affecting sibling leases on the same Xcode PID?
+5. **Policy and capability preservation.** Can the broker preserve per-agent read/write policy, MCP tool-allowlist filtering, and capability reporting when brokering MCP traffic?
+6. **Fail-closed behavior.** Can the system fail closed before lease/port/token allocation when the provider does not advertise `mcpCapabilities.http`, and when the broker cannot start, host-env is unavailable, or Xcode PID drifts?
+7. **Host-session execution boundary.** Can Xcode and CoreSimulator commands run from a stable host-user environment without giving the whole ACP agent process access to the real user `HOME`?
+8. **Direct-command containment.** Can the runtime prevent direct Xcode execution (`xcodebuild`, `simctl`, `mcpbridge`, via-`xcrun` variants) from isolated fake-home ACP sessions via an enforceable shim, with an opt-in host-executor route for the narrow set of commands that legitimately need it (excluding `mcpbridge`, which is broker-only), and an explicit diagnostic escape hatch?
+9. **Observable evidence.** Can operators and tests prove the above via structured runtime observations (`backend_start_disposition`, `backend_initialize_wait_ms`, `xcode_home_disposition`, `xcode_shim_rejected`/`xcode_shim_routed`, `backend_failure_class`, selected simulator UUID) rather than inferring from log patterns?
 
 ---
 
@@ -252,14 +255,19 @@ The reliability goal of P051 is not achieved if the same Xcode-dependent agents 
 $XCODE_SHIM_DIR:$ORIGINAL_PATH
 ```
 
-The shim directory contains executables named `xcodebuild`, `simctl`, and `mcpbridge` that intercept shell invocations. Each shim is a small Rust binary that:
+The shim directory contains executables named `xcodebuild`, `simctl`, `mcpbridge`, **and `xcrun`** that intercept shell invocations. Each shim is a small Rust binary that:
 
 1. reads the invocation arguments and the current process's effective home (from `$HOME`),
 2. reads a daemon-issued dispatch token from the environment (`CHAINWORKS_XCODE_SHIM_TOKEN`),
 3. connects to the broker's local Unix-domain dispatch socket (`$XCODE_SHIM_DISPATCH_SOCKET`),
 4. dispatches to one of three paths based on agent policy (below).
 
-The shim does **not** wrap `xcrun` directly — `xcrun` is a multi-tool dispatcher used by many non-Xcode flows (e.g., `xcrun dtrace`, `xcrun xar`). Only the specific Xcode binaries it would resolve are shimmed.
+**`xcrun` shim — narrow interception.** `xcrun` is a multi-tool dispatcher used by many non-Xcode flows (e.g., `xcrun dtrace`, `xcrun xar`, `xcrun notarytool`, `xcrun xcode-select`), so the shim must not globally intercept it. The shim inspects `argv[1]` and:
+
+- if `argv[1]` is `simctl` or `mcpbridge` — apply the reject/route/diagnostic policy as if the tool were invoked directly,
+- if `argv[1]` is anything else — `execve("/usr/bin/xcrun", argv, envp)` with full pass-through, preserving the provider's isolated environment. The shim does not observe or log pass-through invocations.
+
+The shim pass-through uses the absolute path `/usr/bin/xcrun` (not `$ORIGINAL_PATH`) to avoid a shim-recursion loop where `PATH` resolution returns the shim again.
 
 **Agent policy outcomes.** The agent catalog gains one optional field:
 
@@ -281,7 +289,11 @@ agents:
 
 - Diagnostic escape hatch: daemon config `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` (not per-agent — global, for local debugging) makes all shims transparent passthroughs to the real binaries. Logged at WARN level on daemon start if set. Not valid in production deployments.
 
-**Allowlist scope.** The host executor accepts only the three allowlisted binaries (`xcodebuild`, `simctl`, `mcpbridge`). Any other `xcrun`-routed tool (`dtrace`, `xcode-select`, `notarytool`, etc.) is not shimmed and continues to run under the ACP provider's isolated environment — those do not depend on per-user CoreSimulator state. This keeps the guard narrowly scoped: P051 is not a general "run with real HOME" API.
+**Allowlist scope.** The broker host executor accepts only **`xcodebuild`** and **`simctl`** (whether invoked directly or via `xcrun <subcommand>`). Any other `xcrun`-routed tool (`dtrace`, `xcode-select`, `notarytool`, etc.) is not shimmed and continues to run under the ACP provider's isolated environment — those do not depend on per-user CoreSimulator state.
+
+**`mcpbridge` is never routed through the host executor.** Direct `mcpbridge` or `xcrun mcpbridge` invocations from an ACP provider subprocess are **always rejected by the shim**, regardless of `requires_xcode_host_execution`. Allowing raw `mcpbridge` execution under the operator home would hand the agent a stdio MCP bridge that bypasses the broker's bearer-token lease, per-lease policy filtering, tool-allowlist enforcement, request-id rewriting, and observability. Agents that need Xcode MCP access use the brokered HTTP streaming endpoint delivered through `session/new.mcpServers[]`. The only code path that spawns `xcrun mcpbridge` is the broker itself, internally, one subprocess per lease, never exposed to agent shells.
+
+This keeps the guard narrowly scoped: P051 is not a general "run with real HOME" API, and the host executor is not a back door around the broker's policy boundary.
 
 **Catalog migration.** `examples/agents/agents.yaml` entries that currently include direct `xcodebuild` commands must be updated in the P051 implementation PR:
 
@@ -482,18 +494,22 @@ For an operator running Xcode-dependent verification from an isolated ACP agent:
   - Redact host paths and tokens from logs where appropriate.
 
 - `control-plane/crates/acp/src/xcode_host_executor.rs` (new)
-  - Execute approved Xcode-bound commands (`xcodebuild`, `simctl`, `mcpbridge`) under the host-user environment contract.
-  - Allowlist-bound: rejects any binary not in `{xcodebuild, simctl, mcpbridge}`.
+  - Execute approved Xcode-bound commands (`xcodebuild`, `simctl`) under the host-user environment contract.
+  - Allowlist-bound: rejects any binary not in `{xcodebuild, simctl}`. `mcpbridge` is explicitly **not** in the host-executor allowlist — see §5.1.1 direct-command guard rationale.
   - Prefer simulator UUIDs and reject ambiguous simulator destinations.
   - Record observation data for command, selected simulator id, host-env disposition, exit status.
   - Expose a Unix-domain dispatch socket consumed by the shim binaries (below).
 
 - `control-plane/crates/acp/src/xcode_shim/` (new crate or module + thin binaries)
-  - Three shim executables: `xcodebuild`, `simctl`, `mcpbridge` under a daemon-managed `$XCODE_SHIM_DIR`.
-  - Each shim: read argv + `$HOME` + `$CHAINWORKS_XCODE_SHIM_TOKEN`, connect to `$XCODE_SHIM_DISPATCH_SOCKET`, dispatch reject-or-route based on agent's `requires_xcode_host_execution` flag.
-  - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation.
+  - Four shim executables under a daemon-managed `$XCODE_SHIM_DIR`:
+    - `xcodebuild`, `simctl` — apply reject/route policy based on agent's `requires_xcode_host_execution` flag.
+    - `mcpbridge` — **always rejects** direct invocation (no route path), regardless of `requires_xcode_host_execution`.
+    - `xcrun` — inspects `argv[1]`; if `simctl` or `mcpbridge`, applies the same policy as the corresponding direct-command shim; otherwise `execve("/usr/bin/xcrun", argv, envp)` as pass-through.
+  - Each shim: read argv + `$HOME` + `$CHAINWORKS_XCODE_SHIM_TOKEN`, connect to `$XCODE_SHIM_DISPATCH_SOCKET`, dispatch according to shim type and agent policy.
+  - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation with `{tool, via_xcrun: bool, argv, policy_reason}`.
   - Route path: stream stdout/stderr/exit from broker's host executor; emit `xcode_shim_routed` observation.
-  - Diagnostic bypass: `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes the shim a transparent passthrough (logged WARN at daemon start).
+  - Pass-through path (`xcrun` only, non-Xcode subcommands): silent `execve`, no observation.
+  - Diagnostic bypass: `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes the shim a transparent passthrough — including `mcpbridge` — with WARN log at daemon start and per-invocation WARN log per shim.
 
 - `control-plane/crates/acp/src/adapters/{codex,claude,gemini,auggie,junie}.rs`
   - For agents with Xcode MCP entries: prepend `$XCODE_SHIM_DIR` to the subprocess `PATH`; inject `CHAINWORKS_XCODE_SHIM_TOKEN` and `XCODE_SHIM_DISPATCH_SOCKET`.
@@ -702,14 +718,39 @@ cargo test -p engine broker_observation -- --nocapture
 
 The exact test names may differ, but the gate must prove:
 
+**Core broker behavior**
+
 - two parallel Xcode ACP sessions each spawn their own `mcpbridge` subprocess, both under host-user environment, both complete full MCP round-trip
 - initialize phases serialize per Xcode PID (late-starter's `backend_initialize_wait_ms` > 0)
 - HTTP streaming endpoint shape is used for brokered Xcode MCP
 - policy-separated leases get independent broker state (no cross-lease policy leakage)
-- lease cleanup on failure/cancellation closes only its own bridge subprocess
-- runtime observation includes `backend_start_disposition`, `backend_initialize_wait_ms`, and host-user Xcode environment disposition
-- runtime observation includes selected simulator UUID when applicable
-- fake-home provider isolation remains active for Xcode-capable ACP sessions
+
+**Capability preflight (P1 new)**
+
+- HTTP-incompatible provider (fixture with `mcpCapabilities.http = false`) fails closed with `provider_http_mcp_unsupported` **before** any lease is reserved, before the HTTP listener is bound, and before `session/new` is sent
+- capability probe cache hit for a previously-seen `(adapter_family, binary_fingerprint)` skips the probe subprocess
+- binary fingerprint change (path, mtime, or size) invalidates the cached entry and triggers a fresh probe
+
+**Per-lease vs pool-wide failure isolation (P1 new)**
+
+- one backend `mcpbridge` crash fails only its lease; a sibling lease on the same Xcode PID continues serving `tools/*` calls and completes successfully
+- Xcode PID drift (simulated by changing `pgrep` output) invalidates the pool, all stale-PID leases receive terminal errors, and new leases use a new pool key; `backend_failure_class = "pool_pid_drift"` recorded
+- host-env unavailable (fixture with unreadable operator home) fails closed with `backend_failure_class = "host_env_unavailable"`
+- broker HTTP infrastructure failure (fixture listener killed) marks broker unhealthy with `backend_failure_class = "broker_infrastructure"`
+
+**Direct Xcode command guard (P1 new)**
+
+- fake-home agent with `requires_xcode_host_execution: false` invoking `xcodebuild -project …` via shell receives exit 127 with structured stderr; `xcode_shim_rejected` observation recorded with `{tool: "xcodebuild", via_xcrun: false}`
+- fake-home agent invoking `xcrun simctl list` receives exit 127 (shim intercepts xcrun subcommand); `xcode_shim_rejected` observation with `{tool: "simctl", via_xcrun: true}`
+- fake-home agent invoking `xcrun mcpbridge` receives exit 127 regardless of `requires_xcode_host_execution` value; `xcode_shim_rejected` observation with `{tool: "mcpbridge", via_xcrun: true, policy_reason: "mcpbridge_broker_only"}`
+- fake-home agent invoking `xcrun dtrace` (non-Xcode subcommand) passes through transparently; no observation emitted
+- agent with `requires_xcode_host_execution: true` invoking `xcodebuild build -scheme Foo` has its command routed through the broker host executor; `xcode_shim_routed` observation records argv, selected simulator UUID (when applicable), exit status, and host-env disposition
+- `mcpbridge` is **not** routable via the host executor even with `requires_xcode_host_execution: true` — fixture confirms rejection is unconditional
+- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes all shims transparent (including `mcpbridge`) and emits WARN-level structured log at daemon start and per invocation
+
+**Catalog migration**
+
+- agent catalog entries with direct `xcodebuild` commands declare explicit `requires_xcode_host_execution` value (either `true` or `false`); missing declaration blocks the lint step
 
 No Xcode UI automation is required for this gate. Use fixture backend processes for deterministic proof.
 
