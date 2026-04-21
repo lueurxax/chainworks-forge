@@ -94,6 +94,10 @@ pub(crate) async fn execution_mcp_truth_json(
                     "denied_mcp_extensions_json": execution.denied_mcp_extensions_json,
                     "mcp_blocking_issues_json": execution.mcp_blocking_issues_json,
                     "actual_mcp_observation_json": execution.actual_mcp_observation_json,
+                    "xcode_runtime_observation": execution
+                        .actual_xcode_runtime_observation_json
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()),
                     "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
                 })
             })
@@ -296,6 +300,9 @@ mod tests {
         ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
     };
+    use domain::xcode_runtime::{
+        XcodeRuntimeObservationUpdate, XcodeShimEvent, XcodeShimWarningEvent,
+    };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
 
@@ -463,6 +470,7 @@ mod tests {
                 actual_mcp_observation_json: Some(
                     r#"{"source":"provider_session_new_response"}"#.into(),
                 ),
+                actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
             },
         )
@@ -666,7 +674,23 @@ mod tests {
         runs::insert(&pool, &make_run(run_id, idea_id))
             .await
             .unwrap();
-        seed_validation_attempt(&pool, run_id).await;
+        let (_stage_execution_id, agent_execution_id) =
+            seed_validation_attempt(&pool, run_id).await;
+        db::repos::agent_executions::append_xcode_runtime_observation(
+            &pool,
+            agent_execution_id,
+            XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
+                XcodeShimWarningEvent {
+                    ts: Utc::now(),
+                    policy_reason: "xcode_absolute_path_in_prompt".into(),
+                    source_field: "agent.prompt".into(),
+                    matched_substring: "/usr/bin/xcrun mcpbridge".into(),
+                    excerpt: "run /usr/bin/xcrun mcpbridge".into(),
+                },
+            )),
+        )
+        .await
+        .unwrap();
 
         let handler = make_command_handler(pool.clone());
         let result = execute(
@@ -696,6 +720,10 @@ mod tests {
         assert_eq!(
             execution["actual_mcp_runtime_ids_json"],
             serde_json::json!(r#"["fs-runtime"]"#)
+        );
+        assert_eq!(
+            execution["xcode_runtime_observation"]["xcode_shim_events"][0]["policy_reason"],
+            serde_json::json!("xcode_absolute_path_in_prompt")
         );
     }
 

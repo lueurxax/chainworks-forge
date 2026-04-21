@@ -1,11 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::info;
 
-use crate::adapters::AcpAdapter;
-use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::AcpSessionConfig;
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_GEMINI_ACP_BINARY";
@@ -51,7 +48,11 @@ impl AcpAdapter for GeminiCliAdapter {
         "gemini"
     }
 
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
         if self.binary_path.is_empty() {
             bail!(
                 "GeminiCliAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -68,29 +69,15 @@ impl AcpAdapter for GeminiCliAdapter {
             "Spawning Gemini ACP subprocess"
         );
 
-        // Gemini CLI requires --acp to enable ACP server mode.
-        let child = Command::new(&self.binary_path)
-            .arg("--acp")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn Gemini ACP subprocess: {} --acp", self.binary_path))?;
+        Ok(AcpLaunchSpec::new(&self.binary_path).with_arg("--acp"))
+    }
 
+    fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
         // Gemini uses bypassPermissions mode; no _meta block needed.
         // Pass the model from YAML backend_profile; Gemini CLI accepts
         // its own catalog (e.g. gemini-2.5-pro, gemini-3-pro) and falls
         // back to auto-selection if unrecognized.
         let model_str = req.model.as_deref().unwrap_or("default").to_string();
-        let config = AcpSessionConfig {
-            model: &model_str,
-            mode: "bypassPermissions",
-            extra: None,
-            config_options: Vec::new(),
-        };
-        let session = AcpSession::start(child, req, &config).await?;
-
-        Ok(AcpSessionHandle::new(session))
+        Ok(AcpSessionNewSpec::new(model_str, "bypassPermissions"))
     }
 }

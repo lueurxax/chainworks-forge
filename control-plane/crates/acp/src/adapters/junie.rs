@@ -1,11 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::info;
 
-use crate::adapters::AcpAdapter;
-use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::AcpSessionConfig;
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_JUNIE_ACP_BINARY";
@@ -47,7 +44,11 @@ impl AcpAdapter for JunieAdapter {
         "junie"
     }
 
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
         if self.binary_path.is_empty() {
             bail!(
                 "JunieAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -64,22 +65,14 @@ impl AcpAdapter for JunieAdapter {
             "Spawning Junie ACP subprocess"
         );
 
-        let child = Command::new(&self.binary_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn Junie ACP subprocess: {}", self.binary_path))?;
+        Ok(AcpLaunchSpec::new(&self.binary_path))
+    }
 
-        let config = AcpSessionConfig {
-            model: "default",
-            mode: "bypassPermissions",
-            extra: None,
-            config_options: Vec::new(),
-        };
-        let session = AcpSession::start(child, req, &config).await?;
+    fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
+        Ok(AcpSessionNewSpec::new("default", "bypassPermissions"))
+    }
 
-        Ok(AcpSessionHandle::new(session))
+    fn supports_http_mcp_capability_probe(&self) -> bool {
+        false
     }
 }

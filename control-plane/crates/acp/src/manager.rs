@@ -1,23 +1,84 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use domain::xcode_runtime::{
+    McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate,
+};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::adapters::auggie::AuggieAdapter;
 use crate::adapters::claude::ClaudeAgentAdapter;
 use crate::adapters::codex::CodexAdapter;
 use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
-use crate::adapters::AcpAdapter;
+use crate::adapters::{AcpAdapter, LaunchResourceGuard, ProviderCapabilityCache};
 use crate::session::AcpSessionHandle;
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::{
+    ExecutionRequest, ExecutionResult, NoopXcodeRuntimeObservationSink, XcodeRuntimeObservationSink,
+};
+
+#[derive(Debug)]
+pub struct BrokeredXcodeLeaseAttachment {
+    pub request: ExecutionRequest,
+    pub lease_ids: Vec<String>,
+}
+
+impl BrokeredXcodeLeaseAttachment {
+    pub fn new(request: ExecutionRequest) -> Self {
+        Self {
+            request,
+            lease_ids: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait XcodeBrokerLeaseAttacher: Send + Sync {
+    async fn attach_brokered_xcode_leases(
+        &self,
+        req: &ExecutionRequest,
+    ) -> Result<BrokeredXcodeLeaseAttachment>;
+
+    async fn release_brokered_xcode_leases(&self, _lease_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub struct NoopXcodeBrokerLeaseAttacher;
+
+#[async_trait::async_trait]
+impl XcodeBrokerLeaseAttacher for NoopXcodeBrokerLeaseAttacher {
+    async fn attach_brokered_xcode_leases(
+        &self,
+        req: &ExecutionRequest,
+    ) -> Result<BrokeredXcodeLeaseAttachment> {
+        if let Some(intent) = req.brokered_xcode_intents().into_iter().next() {
+            bail!(
+                "ACP: brokered Xcode MCP intent '{}' must be converted to an HTTP lease before session/new",
+                intent.runtime_id
+            );
+        }
+        Ok(BrokeredXcodeLeaseAttachment::new(req.clone()))
+    }
+}
+
+#[derive(Clone)]
+struct BrokeredXcodeLeaseCleanup {
+    attacher: Arc<dyn XcodeBrokerLeaseAttacher>,
+    lease_ids: Vec<String>,
+}
 
 /// Manages ACP provider adapters and owns any live reusable sessions.
 pub struct AcpRuntimeManager {
     adapters: HashMap<String, Arc<dyn AcpAdapter>>,
     live_sessions: Mutex<HashMap<String, AcpSessionHandle>>,
+    live_xcode_leases: Mutex<HashMap<String, BrokeredXcodeLeaseCleanup>>,
+    provider_capability_cache: ProviderCapabilityCache,
+    xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
+    xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
 }
 
 impl AcpRuntimeManager {
@@ -47,12 +108,32 @@ impl AcpRuntimeManager {
         Self {
             adapters,
             live_sessions: Mutex::new(HashMap::new()),
+            live_xcode_leases: Mutex::new(HashMap::new()),
+            provider_capability_cache: ProviderCapabilityCache::default(),
+            xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
+            xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
         }
     }
 
     /// Retrieve a shared reference to the adapter for the given provider name.
     pub fn get_adapter(&self, provider: &str) -> Option<Arc<dyn AcpAdapter>> {
         self.adapters.get(provider).cloned()
+    }
+
+    pub fn set_xcode_runtime_observation_sink(&self, sink: Arc<dyn XcodeRuntimeObservationSink>) {
+        let mut guard = self
+            .xcode_runtime_observation_sink
+            .write()
+            .expect("xcode runtime observation sink lock poisoned");
+        *guard = sink;
+    }
+
+    pub fn set_xcode_broker_lease_attacher(&self, attacher: Arc<dyn XcodeBrokerLeaseAttacher>) {
+        let mut guard = self
+            .xcode_broker_lease_attacher
+            .write()
+            .expect("xcode broker lease attacher lock poisoned");
+        *guard = attacher;
     }
 
     async fn adapter_for(&self, provider: &str) -> Result<Arc<dyn AcpAdapter>> {
@@ -104,8 +185,19 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: starting session"
         );
 
-        let session = adapter.open_session(&req).await?;
-        let mut result = session.prompt(&req).await?;
+        let opened = self.open_ordered_session(adapter, &req).await?;
+        let session = opened.session;
+        let session_req = opened.session_req;
+        let lease_cleanup = opened.lease_cleanup;
+
+        let mut result = match session.prompt(&session_req).await {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = session.close().await;
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(err);
+            }
+        };
         if req.keep_session_alive {
             let generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!("keep_session_alive requested without session_generation_id")
@@ -114,15 +206,103 @@ impl AcpRuntimeManager {
                 .lock()
                 .await
                 .insert(generation_id.clone(), session);
+            if let Some(cleanup) = lease_cleanup {
+                self.live_xcode_leases
+                    .lock()
+                    .await
+                    .insert(generation_id.clone(), cleanup);
+            }
             result.session_generation_id = Some(generation_id);
             result.reused_existing_session = false;
             return Ok(result);
         }
 
-        session.close().await?;
+        let close_result = session.close().await;
+        self.release_xcode_leases(lease_cleanup).await;
+        close_result?;
         result.session_generation_id = None;
         result.reused_existing_session = false;
         Ok(result)
+    }
+
+    async fn open_ordered_session(
+        &self,
+        adapter: Arc<dyn AcpAdapter>,
+        req: &ExecutionRequest,
+    ) -> Result<OpenedAcpSession> {
+        let mut resources = LaunchResourceGuard::default();
+        let mut launch_spec = adapter.prepare_launch_spec(req, &mut resources)?;
+        let runtime_profile_id = req
+            .brokered_xcode_intents()
+            .into_iter()
+            .find_map(|intent| intent.runtime_profile_id.as_deref());
+        launch_spec.record_capability_fingerprint(runtime_profile_id, None);
+
+        adapter
+            .ensure_brokered_xcode_http_capability(
+                req,
+                &launch_spec,
+                &self.provider_capability_cache,
+            )
+            .await?;
+
+        let attacher = self
+            .xcode_broker_lease_attacher
+            .read()
+            .expect("xcode broker lease attacher lock poisoned")
+            .clone();
+        let attachment = attacher.attach_brokered_xcode_leases(req).await?;
+        let lease_cleanup = (!attachment.lease_ids.is_empty()).then(|| BrokeredXcodeLeaseCleanup {
+            attacher: attacher.clone(),
+            lease_ids: attachment.lease_ids.clone(),
+        });
+        let session_req = attachment.request;
+
+        if let Err(err) = adapter.reject_unconverted_broker_intents(&session_req) {
+            self.release_xcode_leases(lease_cleanup).await;
+            return Err(err);
+        }
+
+        let session_new_spec = match adapter.prepare_session_new_spec(&session_req) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(err);
+            }
+        };
+        launch_spec.cleanup_paths.extend(resources.commit());
+        let session = match adapter
+            .open_session_with_specs(&session_req, launch_spec, session_new_spec)
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(err);
+            }
+        };
+        Ok(OpenedAcpSession {
+            session,
+            session_req,
+            lease_cleanup,
+        })
+    }
+
+    async fn release_xcode_leases(&self, cleanup: Option<BrokeredXcodeLeaseCleanup>) {
+        let Some(cleanup) = cleanup else {
+            return;
+        };
+        if let Err(err) = cleanup
+            .attacher
+            .release_brokered_xcode_leases(&cleanup.lease_ids)
+            .await
+        {
+            warn!(
+                error = %err,
+                lease_count = cleanup.lease_ids.len(),
+                "Failed to release brokered Xcode MCP leases"
+            );
+        }
     }
 
     /// Prompt an existing live ACP session by generation id.
@@ -169,21 +349,89 @@ impl AcpRuntimeManager {
                     "No live ACP session registered for generation id '{session_generation_id}'"
                 )
             })?;
-        session.close().await
+        let lease_cleanup = self
+            .live_xcode_leases
+            .lock()
+            .await
+            .remove(session_generation_id);
+        let close_result = session.close().await;
+        self.release_xcode_leases(lease_cleanup).await;
+        close_result
     }
 
     /// Route an execution request to the matching adapter or live session.
     pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
-        if req.reuse_existing_session {
+        let result = if req.reuse_existing_session {
             let session_generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!(
                     "reuse_existing_session was requested but no session_generation_id was provided"
                 )
             })?;
-            return self.prompt_session(&session_generation_id, req).await;
+            self.prompt_session(&session_generation_id, req.clone())
+                .await
+        } else {
+            self.start_session(req.clone()).await
+        };
+
+        if let Err(error) = &result {
+            self.record_xcode_broker_failure_observation(&req, error)
+                .await;
         }
 
-        self.start_session(req).await
+        result
+    }
+
+    async fn record_xcode_broker_failure_observation(
+        &self,
+        req: &ExecutionRequest,
+        error: &anyhow::Error,
+    ) {
+        let Some(agent_execution_id) = req.agent_execution_id else {
+            return;
+        };
+        let Some(intent) = req.brokered_xcode_intents().into_iter().next() else {
+            return;
+        };
+
+        let update = XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+            source: "xcode_mcp_broker".to_string(),
+            backend_start_disposition: "failed_closed_before_session_new".to_string(),
+            pool_id: None,
+            lease_id: None,
+            xcode_pid: None,
+            backend_process_id: None,
+            http_endpoint: None,
+            xcode_home_disposition: None,
+            xcode_tmpdir_disposition: None,
+            simulator_selection: None,
+            sibling_leases_at_spawn: None,
+            backend_initialize_wait_ms: None,
+            backend_startup_latency_ms: None,
+            http_session_startup_latency_ms: None,
+            backend_failure_class: Some(xcode_failure_class_from_error(error)),
+            originating_execution_id: Some(agent_execution_id.to_string()),
+            prompt_cycle_index: None,
+            status_update: Some(format!(
+                "Brokered Xcode MCP intent '{}' failed before session/new: {}",
+                intent.runtime_id, error
+            )),
+        });
+
+        let sink = self
+            .xcode_runtime_observation_sink
+            .read()
+            .expect("xcode runtime observation sink lock poisoned")
+            .clone();
+        if let Err(sink_error) = sink
+            .append_xcode_runtime_observation(agent_execution_id, update)
+            .await
+        {
+            warn!(
+                agent_execution_id = %agent_execution_id,
+                error = %sink_error,
+                "Failed to persist Xcode runtime observation"
+            );
+        }
     }
 
     /// Register an additional adapter (useful for testing or future dynamic registration).
@@ -202,7 +450,46 @@ impl AcpRuntimeManager {
         Self {
             adapters,
             live_sessions: Mutex::new(HashMap::new()),
+            live_xcode_leases: Mutex::new(HashMap::new()),
+            provider_capability_cache: ProviderCapabilityCache::default(),
+            xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
+            xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
         }
+    }
+}
+
+struct OpenedAcpSession {
+    session: AcpSessionHandle,
+    session_req: ExecutionRequest,
+    lease_cleanup: Option<BrokeredXcodeLeaseCleanup>,
+}
+
+fn xcode_failure_class_from_error(error: &anyhow::Error) -> XcodeRuntimeFailureClass {
+    let message = error.to_string();
+    if message.contains("provider_http_mcp_unsupported") {
+        XcodeRuntimeFailureClass::ProviderHttpMcpUnsupported
+    } else if message.contains("xcode_mcp_registry_stale_stdio") {
+        XcodeRuntimeFailureClass::XcodeMcpRegistryStaleStdio
+    } else if message.contains("xcode_mcp_registry_ambiguous") {
+        XcodeRuntimeFailureClass::XcodeMcpRegistryAmbiguous
+    } else if message.contains("xcode_mcp_capacity_exhausted") {
+        XcodeRuntimeFailureClass::XcodeMcpCapacityExhausted
+    } else if message.contains("xcode_mcp_initialize_timeout") {
+        XcodeRuntimeFailureClass::XcodeMcpInitializeTimeout
+    } else if message.contains("xcode_mcp_action_required") {
+        XcodeRuntimeFailureClass::XcodeMcpActionRequired
+    } else if message.contains("xcode_mcp_first_connect_timeout") {
+        XcodeRuntimeFailureClass::XcodeMcpFirstConnectTimeout
+    } else if message.contains("pool_pid_drift") {
+        XcodeRuntimeFailureClass::PoolPidDrift
+    } else if message.contains("xcode_target_not_found") {
+        XcodeRuntimeFailureClass::XcodeTargetNotFound
+    } else if message.contains("xcode_target_ambiguous") {
+        XcodeRuntimeFailureClass::XcodeTargetAmbiguous
+    } else if message.contains("host_env_unavailable") {
+        XcodeRuntimeFailureClass::HostEnvUnavailable
+    } else {
+        XcodeRuntimeFailureClass::BrokerInfrastructure
     }
 }
 

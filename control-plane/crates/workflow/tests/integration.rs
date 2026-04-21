@@ -35,6 +35,19 @@ fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::pl
     compiler::compile(&wf_path, &cat_path).expect("should compile plan")
 }
 
+fn compile_error_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> String {
+    let workflow_yaml = if workflow_yaml.trim_start().starts_with("workflow:") {
+        workflow_yaml.to_string()
+    } else {
+        format!("workflow:\n  id: contract-fixture\n  family: contract_fixture\n{workflow_yaml}")
+    };
+    let wf_path = write_temp_fixture("workflow.yaml", &workflow_yaml);
+    let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
+    compiler::compile(&wf_path, &cat_path)
+        .expect_err("plan should fail direct-command lint")
+        .to_string()
+}
+
 #[test]
 fn test_parse_full_mvp_live_workflow() {
     let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
@@ -177,6 +190,92 @@ fn test_compile_full_mvp_live_plan() {
 
     // Verify variables were loaded
     assert!(plan.variables.contains_key("proposal_score_target"));
+}
+
+#[test]
+fn p051_catalog_lint_sets_xcode_signals_from_mcp_and_declared_commands() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    run:
+      sequence:
+        - agent: builder
+          task: build
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+    mcp:
+      - xcode
+permission_profiles:
+  CODE:
+    shell:
+      allow:
+        - xcodebuild -project "Chainworks Forge.xcodeproj" build
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    permission_profile: CODE
+    required_tools:
+      - simctl list devices
+    prompt: "Build through the declared commands."
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_broker_required,
+        "requesting the xcode MCP server must require brokered MCP"
+    );
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "declared xcodebuild/simctl commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "declared Xcode shell commands must be marked for host execution"
+    );
+}
+
+#[test]
+fn p051_catalog_lint_rejects_structured_absolute_xcode_paths() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    required_tools:
+      - /usr/bin/xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+    );
+
+    assert!(
+        error.contains("P051 direct-command catalog lint failed"),
+        "compile should fail through the P051 scanner: {error}"
+    );
+    assert!(
+        error.contains("p051_absolute_xcode_tool_path"),
+        "absolute xcodebuild path should be rejected: {error}"
+    );
 }
 
 #[test]

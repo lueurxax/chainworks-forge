@@ -1,10 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::info;
 
-use crate::adapters::AcpAdapter;
-use crate::session::{AcpSession, AcpSessionHandle};
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
 use crate::transport::AcpSessionConfig;
 use crate::ExecutionRequest;
 
@@ -54,7 +52,11 @@ impl AcpAdapter for ClaudeAgentAdapter {
         "claude"
     }
 
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
         if self.binary_path.is_empty() {
             bail!(
                 "ClaudeAgentAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -71,15 +73,10 @@ impl AcpAdapter for ClaudeAgentAdapter {
             "Spawning Claude ACP subprocess"
         );
 
-        // Claude Agent ACP is invoked with no extra arguments.
-        let child = Command::new(&self.binary_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn Claude ACP subprocess: {}", self.binary_path))?;
+        Ok(AcpLaunchSpec::new(&self.binary_path))
+    }
 
+    fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
         let default_config = AcpSessionConfig::default();
         let model_str = req
             .model
@@ -90,7 +87,6 @@ impl AcpAdapter for ClaudeAgentAdapter {
             model: &model_str,
             ..default_config
         };
-        let session = AcpSession::start(child, req, &config).await?;
-        Ok(AcpSessionHandle::new(session))
+        Ok(AcpSessionNewSpec::from_config(config))
     }
 }

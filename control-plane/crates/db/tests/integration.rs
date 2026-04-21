@@ -18,11 +18,121 @@ use domain::validation::{
     ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
     ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
 };
+use domain::xcode_runtime::{
+    McpBrokerObservation, XcodeHostExecutorEvent, XcodeRuntimeFailureClass,
+    XcodeRuntimeObservation, XcodeRuntimeObservationUpdate, XcodeShimEvent, XcodeShimWarningEvent,
+    XCODE_RUNTIME_OBSERVATION_MAX_BYTES, XCODE_RUNTIME_OBSERVATION_MAX_EVENTS,
+};
 
 async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
         .await
         .expect("in-memory pool failed")
+}
+
+async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecutionId {
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-p051".into(),
+        workflow_title: "P051".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+    };
+    runs::insert(pool, &run).await.unwrap();
+
+    let stage = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "stage-p051".into(),
+        label: "Stage P051".into(),
+        status: StageStatus::Running,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        owner_agent: Some("xcode_agent".into()),
+        provider: Some("codex".into()),
+        model: None,
+        stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
+    };
+    stages::insert(pool, &stage).await.unwrap();
+
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage.id,
+        agent_id: "xcode_agent".into(),
+        provider: "codex".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+    };
+    agent_executions::insert(pool, &execution).await.unwrap();
+
+    execution.id
 }
 
 #[tokio::test]
@@ -509,6 +619,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
@@ -653,6 +764,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         actual_mcp_observation_json: Some(
             r#"{"source":"not_started_blocked_before_session_new"}"#.into(),
         ),
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: Some(42),
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
@@ -702,6 +814,331 @@ async fn proposal_048_persistence_fields_round_trip() {
         found_execution.mcp_session_startup_latency_ms,
         execution.mcp_session_startup_latency_ms
     );
+}
+
+#[tokio::test]
+async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-p051".into(),
+        workflow_title: "P051".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let stage = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "stage-p051".into(),
+        label: "Stage P051".into(),
+        status: StageStatus::Running,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        owner_agent: Some("xcode_agent".into()),
+        provider: Some("codex".into()),
+        model: None,
+        stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
+    };
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage.id,
+        agent_id: "xcode_agent".into(),
+        provider: "codex".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+    };
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+            source: "xcode_mcp_broker".into(),
+            backend_start_disposition: "spawned".into(),
+            pool_id: Some("pool-1".into()),
+            lease_id: Some("lease-1".into()),
+            xcode_pid: Some("77907".into()),
+            backend_process_id: Some(24837),
+            http_endpoint: Some("127.0.0.1:<redacted>".into()),
+            xcode_home_disposition: Some("host_user_home".into()),
+            xcode_tmpdir_disposition: Some("host_user_temp".into()),
+            simulator_selection: None,
+            sibling_leases_at_spawn: Some(1),
+            backend_initialize_wait_ms: Some(420),
+            backend_startup_latency_ms: Some(23031),
+            http_session_startup_latency_ms: Some(42),
+            backend_failure_class: None,
+            originating_execution_id: None,
+            prompt_cycle_index: Some(0),
+            status_update: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
+            XcodeShimWarningEvent {
+                ts: Utc::now(),
+                policy_reason: "xcode_absolute_path_in_prompt".into(),
+                source_field: "agent.prompt".into(),
+                matched_substring: "/usr/bin/xcrun mcpbridge".into(),
+                excerpt: "run /usr/bin/xcrun mcpbridge".into(),
+            },
+        )),
+    )
+    .await
+    .unwrap();
+
+    let found = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let observation: XcodeRuntimeObservation = serde_json::from_str(
+        found
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(observation.version, 1);
+    assert_eq!(observation.mcp_broker_observations.len(), 1);
+    assert_eq!(observation.xcode_shim_events.len(), 1);
+    assert_eq!(
+        observation.mcp_broker_observations[0].lease_id.as_deref(),
+        Some("lease-1")
+    );
+
+    sqlx::query(
+        "UPDATE agent_executions SET actual_xcode_runtime_observation_json = ? WHERE id = ?",
+    )
+    .bind("{not-json")
+    .bind(execution.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::XcodeHostExecutorEvent(XcodeHostExecutorEvent {
+            ts: Utc::now(),
+            tool: "xcodebuild".into(),
+            argv: vec!["build".into()],
+            cwd: "/tmp/ws".into(),
+            host_env_disposition: "host_user_home".into(),
+            env_allowlist_applied: vec!["HOME".into(), "TMPDIR".into()],
+            env_dropped_from_provider: vec!["CODEX_HOME".into()],
+            selected_simulator_id: None,
+            exit_status: 0,
+            duration_ms: 17,
+        }),
+    )
+    .await
+    .unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::McpBrokerStatusUpdate(
+            domain::xcode_runtime::McpBrokerStatusUpdate {
+                lease_id: "lease-1".into(),
+                backend_failure_class: XcodeRuntimeFailureClass::PoolPidDrift,
+                status_update: "backend_failed_after_spawn".into(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+
+    let recovered = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let recovered_observation: XcodeRuntimeObservation = serde_json::from_str(
+        recovered
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered_observation.xcode_host_executor_events.len(), 1);
+    assert_eq!(recovered_observation.mcp_broker_observations.len(), 1);
+    assert_eq!(
+        recovered_observation.mcp_broker_observations[0]
+            .status_update
+            .as_deref(),
+        Some("backend_failed_after_spawn")
+    );
+    assert_eq!(recovered_observation.storage.corrupt_json_recovery_count, 1);
+    assert_eq!(
+        recovered_observation.storage.corrupt_json_quarantined_bytes,
+        "{not-json".len()
+    );
+}
+
+#[tokio::test]
+async fn proposal_051_xcode_runtime_observation_append_enforces_event_and_byte_bounds() {
+    let pool = test_pool().await;
+    let execution_id = insert_p051_test_agent_execution(&pool).await;
+
+    for idx in 0..(XCODE_RUNTIME_OBSERVATION_MAX_EVENTS + 2) {
+        agent_executions::append_xcode_runtime_observation(
+            &pool,
+            execution_id,
+            XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+                source: "xcode_mcp_broker".into(),
+                backend_start_disposition: "spawned".into(),
+                pool_id: Some("pool-1".into()),
+                lease_id: Some(format!("lease-{idx}")),
+                xcode_pid: Some("77907".into()),
+                backend_process_id: Some(24837),
+                http_endpoint: Some("127.0.0.1:<redacted>".into()),
+                xcode_home_disposition: Some("host_user_home".into()),
+                xcode_tmpdir_disposition: Some("host_user_temp".into()),
+                simulator_selection: None,
+                sibling_leases_at_spawn: Some(1),
+                backend_initialize_wait_ms: Some(420),
+                backend_startup_latency_ms: Some(23031),
+                http_session_startup_latency_ms: Some(42),
+                backend_failure_class: None,
+                originating_execution_id: None,
+                prompt_cycle_index: Some(idx as i64),
+                status_update: None,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let found = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let observation: XcodeRuntimeObservation = serde_json::from_str(
+        found
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        observation.total_event_count(),
+        XCODE_RUNTIME_OBSERVATION_MAX_EVENTS
+    );
+    assert!(observation.storage.truncated);
+    assert_eq!(observation.storage.total_events_dropped, 2);
+    assert_eq!(observation.storage.mcp_broker_observations_dropped, 2);
+    assert_eq!(
+        observation.mcp_broker_observations[0].lease_id.as_deref(),
+        Some("lease-2")
+    );
+
+    let oversized_execution_id = insert_p051_test_agent_execution(&pool).await;
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        oversized_execution_id,
+        XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
+            XcodeShimWarningEvent {
+                ts: Utc::now(),
+                policy_reason: "xcode_absolute_path_in_prompt".into(),
+                source_field: "agent.prompt".into(),
+                matched_substring: "/usr/bin/xcrun mcpbridge".into(),
+                excerpt: "x".repeat(XCODE_RUNTIME_OBSERVATION_MAX_BYTES + 1),
+            },
+        )),
+    )
+    .await
+    .unwrap();
+
+    let oversized_found = agent_executions::find_by_id(&pool, oversized_execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let oversized_json = oversized_found
+        .actual_xcode_runtime_observation_json
+        .as_deref()
+        .unwrap();
+    let oversized_observation: XcodeRuntimeObservation =
+        serde_json::from_str(oversized_json).unwrap();
+    assert!(oversized_json.len() <= XCODE_RUNTIME_OBSERVATION_MAX_BYTES);
+    assert!(oversized_observation.storage.truncated);
+    assert_eq!(oversized_observation.total_event_count(), 0);
+    assert_eq!(oversized_observation.storage.total_events_dropped, 1);
+    assert_eq!(oversized_observation.storage.xcode_shim_events_dropped, 1);
 }
 
 #[tokio::test]
@@ -824,6 +1261,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     let retry_agent_execution = AgentExecution {
@@ -853,6 +1291,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)

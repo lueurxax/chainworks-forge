@@ -11,7 +11,7 @@ use domain::ids::AgentExecutionId;
 /// being closed.
 pub struct AcpSession {
     transport: AcpTransportSession,
-    cleanup_path: Option<PathBuf>,
+    cleanup_paths: Vec<PathBuf>,
 }
 
 impl AcpSession {
@@ -32,10 +32,28 @@ impl AcpSession {
         config: &AcpSessionConfig<'_>,
         cleanup_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let transport = AcpTransportSession::start(child, req, config).await?;
+        Self::start_with_cleanup_paths(child, req, config, cleanup_path.into_iter().collect()).await
+    }
+
+    /// Start a new transport-backed session and remove every cleanup path when
+    /// the session is eventually closed. If transport startup fails, the paths
+    /// are removed before returning the error.
+    pub async fn start_with_cleanup_paths(
+        child: tokio::process::Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+        cleanup_paths: Vec<PathBuf>,
+    ) -> Result<Self> {
+        let transport = match AcpTransportSession::start(child, req, config).await {
+            Ok(transport) => transport,
+            Err(err) => {
+                cleanup_paths.iter().for_each(cleanup_path);
+                return Err(err);
+            }
+        };
         Ok(Self {
             transport,
-            cleanup_path,
+            cleanup_paths,
         })
     }
 
@@ -54,7 +72,7 @@ impl AcpSession {
             .map(|observation| observation.actual_runtime_ids.clone())
             .unwrap_or_default();
         Ok(ExecutionResult {
-            agent_execution_id: AgentExecutionId::new(),
+            agent_execution_id: req.agent_execution_id.unwrap_or_else(AgentExecutionId::new),
             status,
             artifact_paths,
             discovered_artifacts,
@@ -73,11 +91,15 @@ impl AcpSession {
     /// Close the live ACP session and wait for the subprocess to exit.
     pub async fn close(&mut self) -> Result<()> {
         self.transport.close().await?;
-        if let Some(path) = self.cleanup_path.take() {
-            let _ = std::fs::remove_dir_all(path);
+        for path in self.cleanup_paths.drain(..) {
+            cleanup_path(&path);
         }
         Ok(())
     }
+}
+
+fn cleanup_path(path: &PathBuf) {
+    let _ = std::fs::remove_dir_all(path);
 }
 
 /// Cloneable owned handle to a live ACP session.

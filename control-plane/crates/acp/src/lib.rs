@@ -2,18 +2,37 @@ pub mod adapters;
 pub mod manager;
 pub mod session;
 pub mod transport;
+pub mod xcode_broker;
+pub mod xcode_target;
 
-pub use manager::AcpRuntimeManager;
+pub use manager::{AcpRuntimeManager, BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
 pub use session::{AcpSession, AcpSessionHandle};
+pub use xcode_broker::{
+    BrokerMcpPolicy, BrokerMcpPolicyDecision, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
+    XcodeBrokerHttpRouteState, XcodeMcpBackend, XcodeMcpBackendRequestContext, XcodeMcpBridgePool,
+    XcodeMcpBridgePoolConfig, XcodeMcpLeaseState, XcodeMcpProcessBackend,
+    XcodeMcpProcessBackendConfig,
+};
+pub use xcode_target::{
+    probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,
+    LocalXcodeHostProbeConfig, XcodeProcessCandidate, XcodeTargetResolver,
+    XcodeTargetSelectionConfidence, XcodeTargetSelectionInput, XcodeTargetSnapshot,
+};
 
 use std::collections::BTreeMap;
 
+use anyhow::Result;
 use domain::agent::AgentStatus;
 use domain::ids::{AgentExecutionId, RunId};
+use domain::xcode_runtime::XcodeRuntimeObservationUpdate;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionRequest {
+    /// Engine-persisted execution id, when this request is owned by a durable
+    /// agent_executions row. ACP uses this only for runtime observation sinks.
+    #[serde(default)]
+    pub agent_execution_id: Option<AgentExecutionId>,
     pub run_id: RunId,
     pub stage_id: String,
     pub agent_id: String,
@@ -58,6 +77,44 @@ pub struct ExecutionRequest {
     /// into provider-local runtime ids before ACP startup.
     #[serde(default)]
     pub mcp_servers: Vec<AcpMcpServerPayload>,
+}
+
+impl ExecutionRequest {
+    pub fn brokered_xcode_intents(&self) -> Vec<&BrokeredXcodeMcpIntent> {
+        self.mcp_servers
+            .iter()
+            .filter_map(|server| match &server.transport {
+                ResolvedMcpServerTransport::XcodeBrokerIntent { intent }
+                    if intent.provider_http_required =>
+                {
+                    Some(intent)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+pub trait XcodeRuntimeObservationSink: Send + Sync {
+    async fn append_xcode_runtime_observation(
+        &self,
+        agent_execution_id: AgentExecutionId,
+        update: XcodeRuntimeObservationUpdate,
+    ) -> Result<()>;
+}
+
+pub struct NoopXcodeRuntimeObservationSink;
+
+#[async_trait::async_trait]
+impl XcodeRuntimeObservationSink for NoopXcodeRuntimeObservationSink {
+    async fn append_xcode_runtime_observation(
+        &self,
+        _agent_execution_id: AgentExecutionId,
+        _update: XcodeRuntimeObservationUpdate,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,6 +171,32 @@ pub enum ResolvedMcpServerTransport {
     Platform {
         provider: String,
     },
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    XcodeBrokerIntent {
+        intent: BrokeredXcodeMcpIntent,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BrokeredXcodeMcpIntent {
+    pub extension_id: String,
+    pub runtime_id: String,
+    pub server_id: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub xcode_pid_selector: Option<String>,
+    #[serde(default)]
+    pub runtime_profile_id: Option<String>,
+    #[serde(default)]
+    pub permission_profile_id: Option<String>,
+    #[serde(default)]
+    pub resolved_tool_allowlist_hash: Option<String>,
+    pub provider_http_required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

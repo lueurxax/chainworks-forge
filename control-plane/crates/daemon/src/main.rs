@@ -1,16 +1,36 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use sqlx::SqlitePool;
 use tracing::info;
 
 use acp::AcpRuntimeManager;
 use db::pool::create_pool;
+use db::repos::agent_executions;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::new_bus;
 use engine::executor::BackgroundExecutor;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+
+mod xcode_broker_http;
+
+struct DbXcodeRuntimeObservationSink {
+    pool: SqlitePool,
+}
+
+#[async_trait::async_trait]
+impl acp::XcodeRuntimeObservationSink for DbXcodeRuntimeObservationSink {
+    async fn append_xcode_runtime_observation(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        update: domain::xcode_runtime::XcodeRuntimeObservationUpdate,
+    ) -> Result<()> {
+        agent_executions::append_xcode_runtime_observation(&self.pool, agent_execution_id, update)
+            .await
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,6 +87,20 @@ async fn main() -> Result<()> {
 
     // 6. Create AcpRuntimeManager
     let acp = Arc::new(AcpRuntimeManager::new());
+    let xcode_broker_config = xcode_broker_config_from_env(&graphql_addr);
+    let xcode_broker_pool = Arc::new(acp::XcodeMcpBridgePool::new_with_sink_and_backend(
+        xcode_broker_config.clone(),
+        Arc::new(DbXcodeRuntimeObservationSink { pool: pool.clone() }),
+        Arc::new(acp::XcodeMcpProcessBackend::new(
+            xcode_process_backend_config_from_env(),
+        )),
+    ));
+    acp.set_xcode_broker_lease_attacher(xcode_broker_pool.clone());
+    info!(
+        base_url = %xcode_broker_config.base_url,
+        disabled = xcode_broker_config.broker_disabled,
+        "Xcode MCP broker configured"
+    );
 
     // 7. Create CommandHandler
     let cmd_handler = Arc::new(CommandHandler::new_with_acp(
@@ -129,7 +163,9 @@ async fn main() -> Result<()> {
                 principal_table.clone(),
             ));
             let mcp_routes = mcp_server::http::routes(mcp);
+            let xcode_broker_routes = xcode_broker_http::routes(xcode_broker_pool);
             info!("MCP HTTP transport mounted at /mcp");
+            info!("Xcode MCP broker mounted at /xcode-mcp/{{lease_id}}");
 
             let schema = graphql_server::schema::build_schema(
                 pool.clone(),
@@ -140,7 +176,7 @@ async fn main() -> Result<()> {
             graphql_server::server::start_with_extra_routes(
                 schema,
                 &graphql_addr,
-                mcp_routes,
+                mcp_routes.merge(xcode_broker_routes),
                 principal_table,
             )
             .await?;
@@ -164,6 +200,77 @@ fn principals_path_from_env() -> Result<std::path::PathBuf> {
     }
 }
 
+fn xcode_broker_config_from_env(graphql_addr: &str) -> acp::XcodeMcpBridgePoolConfig {
+    let mut config = acp::XcodeMcpBridgePoolConfig::default();
+    config.base_url = std::env::var("CHAINWORKS_XCODE_BROKER_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| xcode_broker_base_url_from_graphql_addr(graphql_addr));
+    config.broker_disabled = env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED");
+    config.use_local_host_probe = true;
+    config
+}
+
+fn xcode_process_backend_config_from_env() -> acp::XcodeMcpProcessBackendConfig {
+    let mut config = acp::XcodeMcpProcessBackendConfig::default();
+    if let Ok(command) = std::env::var("CHAINWORKS_XCODE_MCPBRIDGE_COMMAND") {
+        if !command.trim().is_empty() {
+            config.command = command;
+        }
+    }
+    if let Ok(args) = std::env::var("CHAINWORKS_XCODE_MCPBRIDGE_ARGS") {
+        let parsed = args
+            .split_whitespace()
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() {
+            config.args = parsed;
+        }
+    }
+    config
+}
+
+fn xcode_broker_base_url_from_graphql_addr(graphql_addr: &str) -> String {
+    let trimmed = graphql_addr.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return format!("{}/xcode-mcp", trimmed.trim_end_matches('/'));
+    }
+
+    let (host, port) = split_host_port(trimmed).unwrap_or(("127.0.0.1", "4000"));
+    let connect_host = match host {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        value => value.trim_matches(&['[', ']'][..]),
+    };
+    let host_for_url = if connect_host.contains(':') {
+        format!("[{connect_host}]")
+    } else {
+        connect_host.to_string()
+    };
+    format!("http://{host_for_url}:{port}/xcode-mcp")
+}
+
+fn split_host_port(value: &str) -> Option<(&str, &str)> {
+    if let Some(stripped) = value.strip_prefix('[') {
+        if let Some((host, port)) = stripped.split_once("]:") {
+            return Some((host, port));
+        }
+    }
+    value.rsplit_once(':')
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -177,5 +284,21 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must not be empty"));
+    }
+
+    #[test]
+    fn xcode_broker_base_url_rewrites_wildcard_listener_to_loopback() {
+        assert_eq!(
+            super::xcode_broker_base_url_from_graphql_addr("0.0.0.0:4000"),
+            "http://127.0.0.1:4000/xcode-mcp"
+        );
+        assert_eq!(
+            super::xcode_broker_base_url_from_graphql_addr("[::]:5000"),
+            "http://127.0.0.1:5000/xcode-mcp"
+        );
+        assert_eq!(
+            super::xcode_broker_base_url_from_graphql_addr("127.0.0.1:4100"),
+            "http://127.0.0.1:4100/xcode-mcp"
+        );
     }
 }

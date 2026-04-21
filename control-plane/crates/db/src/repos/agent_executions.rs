@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
+use domain::xcode_runtime::{XcodeRuntimeObservation, XcodeRuntimeObservationUpdate};
 
 const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
                 owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
@@ -12,6 +13,7 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 backend_profile_id, requested_mcp_extensions_json, predicted_mcp_extensions_json,
                 predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
                 denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
+                actual_xcode_runtime_observation_json,
                 mcp_session_startup_latency_ms"#;
 
 pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
@@ -24,8 +26,9 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
           backend_profile_id, requested_mcp_extensions_json, predicted_mcp_extensions_json,
           predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
           denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
+          actual_xcode_runtime_observation_json,
           mcp_session_startup_latency_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
     .bind(exec.stage_execution_id.to_string())
@@ -53,6 +56,7 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
     .bind(&exec.denied_mcp_extensions_json)
     .bind(&exec.mcp_blocking_issues_json)
     .bind(&exec.actual_mcp_observation_json)
+    .bind(&exec.actual_xcode_runtime_observation_json)
     .bind(exec.mcp_session_startup_latency_ms)
     .execute(pool)
     .await?;
@@ -140,6 +144,86 @@ pub async fn update_mcp_actual(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn append_xcode_runtime_observation(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    update: XcodeRuntimeObservationUpdate,
+) -> Result<()> {
+    for attempt in 0..3 {
+        let mut tx = pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT actual_xcode_runtime_observation_json FROM agent_executions WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(anyhow!("Agent execution not found: {id}"));
+        };
+
+        let current_json: Option<String> = row.get("actual_xcode_runtime_observation_json");
+        let mut observation = current_json
+            .as_deref()
+            .map(|json| {
+                serde_json::from_str::<XcodeRuntimeObservation>(json).unwrap_or_else(|error| {
+                    tracing::error!(
+                        agent_execution_id = %id,
+                        error = %error,
+                        "Recovering corrupt Xcode runtime observation JSON"
+                    );
+                    let mut observation = XcodeRuntimeObservation::default();
+                    observation.record_corrupt_json_recovery(json.len());
+                    observation
+                })
+            })
+            .unwrap_or_default();
+
+        observation.apply_update(update.clone());
+        observation.apply_default_storage_bounds()?;
+        let next_json = serde_json::to_string(&observation)?;
+
+        let result = if let Some(current_json) = current_json.as_deref() {
+            sqlx::query(
+                "UPDATE agent_executions
+                 SET actual_xcode_runtime_observation_json = ?
+                 WHERE id = ? AND actual_xcode_runtime_observation_json = ?",
+            )
+            .bind(&next_json)
+            .bind(id.to_string())
+            .bind(current_json)
+            .execute(&mut *tx)
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE agent_executions
+                 SET actual_xcode_runtime_observation_json = ?
+                 WHERE id = ? AND actual_xcode_runtime_observation_json IS NULL",
+            )
+            .bind(&next_json)
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?
+        };
+
+        if result.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        tx.rollback().await?;
+        tracing::warn!(
+            agent_execution_id = %id,
+            attempt = attempt + 1,
+            "Retrying contended Xcode runtime observation append"
+        );
+    }
+
+    Err(anyhow!(
+        "Failed to append Xcode runtime observation after optimistic retries: {id}"
+    ))
 }
 
 pub async fn find_by_stage(
@@ -235,6 +319,7 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         denied_mcp_extensions_json: row.get("denied_mcp_extensions_json"),
         mcp_blocking_issues_json: row.get("mcp_blocking_issues_json"),
         actual_mcp_observation_json: row.get("actual_mcp_observation_json"),
+        actual_xcode_runtime_observation_json: row.get("actual_xcode_runtime_observation_json"),
         mcp_session_startup_latency_ms: row.get("mcp_session_startup_latency_ms"),
     })
 }

@@ -37,6 +37,22 @@ use crate::session::fingerprint::{
 use crate::session::policy::{ensure_policy, SessionPolicyDecision, SessionPolicyInput};
 use crate::work_queue::WorkQueue;
 
+struct DbXcodeRuntimeObservationSink {
+    pool: SqlitePool,
+}
+
+#[async_trait::async_trait]
+impl acp::XcodeRuntimeObservationSink for DbXcodeRuntimeObservationSink {
+    async fn append_xcode_runtime_observation(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        update: domain::xcode_runtime::XcodeRuntimeObservationUpdate,
+    ) -> Result<()> {
+        agent_executions::append_xcode_runtime_observation(&self.pool, agent_execution_id, update)
+            .await
+    }
+}
+
 pub struct BackgroundExecutor {
     pool: SqlitePool,
     work_queue: WorkQueue,
@@ -107,6 +123,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
         let result = self
             .acp
             .execute(acp::ExecutionRequest {
+                agent_execution_id: None,
                 run_id: RunId::new(),
                 stage_id: format!("steward_{}", agent.id),
                 agent_id: agent.id.clone(),
@@ -317,6 +334,9 @@ impl BackgroundExecutor {
         acp: Arc<AcpRuntimeManager>,
         events: EventSender,
     ) -> Self {
+        acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
+            pool: pool.clone(),
+        }));
         Self {
             pool,
             work_queue,
@@ -335,6 +355,9 @@ impl BackgroundExecutor {
         events: EventSender,
         steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
     ) -> Self {
+        acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
+            pool: pool.clone(),
+        }));
         Self {
             pool,
             work_queue,
@@ -512,7 +535,7 @@ impl BackgroundExecutor {
                 let requested_mcp_server_ids: Vec<String> =
                     serde_json::from_value(payload["requested_mcp_server_ids"].clone())
                         .unwrap_or_default();
-                let mcp_resolution = crate::mcp::resolve_mcp_servers(
+                let mut mcp_resolution = crate::mcp::resolve_mcp_servers(
                     &requested_mcp_server_ids,
                     backend_profile_id.as_deref(),
                     &provider,
@@ -535,6 +558,15 @@ impl BackgroundExecutor {
                 let worktree_strategy = payload["worktree_strategy"].as_str().map(String::from);
                 let session_reuse_scope = payload["session_reuse_scope"].as_str().map(String::from);
                 let session_family_id = payload["session_family_id"].as_str().map(String::from);
+                let xcode_broker_required = payload["xcode_broker_required"]
+                    .as_bool()
+                    .unwrap_or_else(|| requested_mcp_server_ids.iter().any(|id| id == "xcode"));
+                let xcode_shim_injection_signal = payload["xcode_shim_injection_signal"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let requires_xcode_host_execution = payload["requires_xcode_host_execution"]
+                    .as_bool()
+                    .unwrap_or(false);
                 let declared_outputs: Vec<DeclaredOutput> =
                     serde_json::from_value(payload["declared_outputs"].clone()).unwrap_or_default();
                 let expected_output_paths: Vec<String> = declared_outputs
@@ -561,6 +593,13 @@ impl BackgroundExecutor {
                 } else {
                     "read_only".to_string()
                 };
+                crate::mcp::attach_xcode_broker_execution_context(
+                    &mut mcp_resolution.payloads,
+                    &run.workspace_root,
+                    permission_profile.as_deref(),
+                );
+                let xcode_broker_contract_hash =
+                    crate::mcp::xcode_broker_contract_hash(&mcp_resolution.payloads);
                 let resolved_model = model.clone().unwrap_or_else(|| "default".into());
                 let now = chrono::Utc::now();
                 let agent_exec_id = domain::ids::AgentExecutionId::new();
@@ -599,6 +638,10 @@ impl BackgroundExecutor {
                         backend_profile: backend_profile_id.as_deref(),
                         permission_profile: permission_profile.as_deref(),
                         mcp_servers: &requested_mcp_server_ids,
+                        xcode_broker_contract_hash: xcode_broker_contract_hash.as_deref(),
+                        xcode_broker_required,
+                        xcode_shim_injection_signal,
+                        requires_xcode_host_execution,
                         skill_snapshot_hash: skill_snapshot_hash.as_deref(),
                         skill_ref: skill_ref.as_deref(),
                         skill_role: skill_role.as_deref(),
@@ -722,6 +765,7 @@ impl BackgroundExecutor {
                     denied_mcp_extensions_json: Some(denied_mcp_extensions_json.clone()),
                     mcp_blocking_issues_json: Some(mcp_blocking_issues_json.clone()),
                     actual_mcp_observation_json: None,
+                    actual_xcode_runtime_observation_json: None,
                     mcp_session_startup_latency_ms: None,
                 };
                 agent_executions::insert(&self.pool, &agent_exec).await?;
@@ -857,6 +901,7 @@ impl BackgroundExecutor {
                 let estimated_prompt_tokens =
                     std::cmp::max(1_i64, (prompt.chars().count() as i64) / 4);
                 let req = acp::ExecutionRequest {
+                    agent_execution_id: Some(agent_exec_id),
                     run_id,
                     stage_id: stage_id.clone(),
                     agent_id: agent_id.clone(),

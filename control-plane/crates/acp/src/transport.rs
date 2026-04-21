@@ -160,6 +160,7 @@ fn mcp_servers_wire_value(servers: &[AcpMcpServerPayload]) -> Result<Value> {
                     .collect();
                 wire_servers.push(serde_json::json!({
                     "name": server.id,
+                    "type": "stdio",
                     "command": command,
                     "args": args,
                     "env": env_vars,
@@ -170,6 +171,29 @@ fn mcp_servers_wire_value(servers: &[AcpMcpServerPayload]) -> Result<Value> {
                     "ACP: MCP extension '{}' resolved to platform provider '{}' but ACP session/new requires concrete server transport",
                     server.extension_id,
                     provider
+                );
+            }
+            ResolvedMcpServerTransport::Http { url, headers } => {
+                let header_values: Vec<Value> = headers
+                    .iter()
+                    .map(|(name, value)| {
+                        serde_json::json!({
+                            "name": name,
+                            "value": value,
+                        })
+                    })
+                    .collect();
+                wire_servers.push(serde_json::json!({
+                    "name": server.id,
+                    "type": "http",
+                    "url": url,
+                    "headers": header_values,
+                }));
+            }
+            ResolvedMcpServerTransport::XcodeBrokerIntent { intent } => {
+                bail!(
+                    "ACP: brokered Xcode MCP intent '{}' must be converted to an HTTP lease before session/new",
+                    intent.runtime_id
                 );
             }
         }
@@ -448,7 +472,7 @@ fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
 // ndjson write
 // ---------------------------------------------------------------------------
 
-async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Value) -> Result<()> {
+pub(crate) async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Value) -> Result<()> {
     let mut line = serde_json::to_string(msg).context("serialize ACP JSON-RPC message")?;
     line.push('\n');
     stdin
@@ -464,7 +488,7 @@ async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Value) -> Res
 // Notifications (no `id` field) are silently skipped.
 // ---------------------------------------------------------------------------
 
-async fn await_response(
+pub(crate) async fn await_response(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     expected_id: u64,
     time_limit: Duration,
@@ -531,6 +555,56 @@ async fn await_response(
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default())));
     }
+}
+
+/// Run only the ACP initialize handshake against a freshly spawned provider.
+///
+/// P051 uses this before constructing brokered HTTP MCP `session/new` payloads
+/// so stdio-only providers fail closed without receiving HTTP MCP entries.
+pub(crate) async fn probe_initialize(mut child: Child) -> Result<Value> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("ACP capability probe subprocess has no stdin pipe")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("ACP capability probe subprocess has no stdout pipe")?;
+    let mut reader = BufReader::new(stdout);
+
+    send_ndjson(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientInfo": {
+                    "name": "chainworks-control-plane",
+                    "version": "0.1.0"
+                }
+            }
+        }),
+    )
+    .await
+    .context("ACP: send capability probe initialize")?;
+
+    let result = await_response(&mut reader, 1, HANDSHAKE_TIMEOUT)
+        .await
+        .context("ACP: capability probe initialize handshake")?;
+
+    let _ = AsyncWriteExt::shutdown(&mut stdin).await;
+    drop(stdin);
+    match timeout(SHUTDOWN_WAIT, child.wait()).await {
+        Ok(Ok(_)) => {}
+        _ => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
