@@ -1,0 +1,34 @@
+version: 1
+schema: proposal-lifecycle-review.router
+
+defaults:
+  proposal_review_skill: proposal-review-router
+  implementation_audit_skill: proposal-implementation-audit
+  reviewer_selection_artifact: "<proposal>.review/reviewer-selection.yaml"
+  preserve_reviewer_id_continuity: true
+  proposal_review_target_reviewers: 3
+  proposal_review_hard_cap: 5
+  implementation_audit_reuse_prior_selection: true
+  implementation_audit_max_delta_reviewers: 2
+
+dispatch:
+  proposal_review_keywords:
+    - proposal review
+    - proposal-readiness
+    - research pack
+    - evidence pack
+    - reviewer routing
+    - final review
+  implementation_audit_keywords:
+    - implementation audit
+    - conformance
+    - REQ-
+    - current implementation
+    - PR diff
+    - ready to ship
+    - audit report
+
+artifacts:
+  proposal_review_directory: "<proposal>.review"
+  reviewer_selection_template: "shared/reviewer-selection-state-template.yaml"
+  implementation_audit_report_pattern: "<proposal-stem>_IMPLEMENTATION_AUDIT_R<N>.md"

@@ -91,6 +91,8 @@ import SwiftData
     // Serialized TransitionCursor — the single canonical continuation truth for resume,
     // recovery, and report surfaces. Nil for pre-P032 runs (fallback to heuristic path).
     var transitionCursorJSON: Data?
+    // Proposal 054: Canonical implementation_self_assessment_summary projection.
+    var implementationSelfAssessmentSummaryJSON: Data?
 
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?

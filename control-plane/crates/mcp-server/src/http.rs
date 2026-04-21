@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -17,6 +17,7 @@ use axum::Router;
 use tracing::info;
 
 use crate::protocol::JsonRpcRequest;
+use crate::request_context;
 use crate::server::McpServer;
 
 /// Build the axum router for MCP HTTP transport.
@@ -36,8 +37,20 @@ pub fn routes(mcp: Arc<McpServer>) -> Router {
 async fn handle_mcp_post(
     State(mcp): State<Arc<McpServer>>,
     headers: HeaderMap,
+    // P042 §9.3: the axum request-id middleware attaches the id (either
+    // the client-supplied safe value or a freshly minted UUID) to the
+    // request Extensions. Reading it via `Option<Extension<RequestId>>`
+    // picks up BOTH the client-supplied and the middleware-generated
+    // IDs; reading the raw `x-request-id` inbound header would miss the
+    // generated case because the middleware puts the ID on the
+    // response, not the inbound request. MCP stdio never enters this
+    // handler, so the extension is absent and the task-local resolves
+    // to `None`.
+    request_id: Option<Extension<graphql_server::request_id::RequestId>>,
     body: String,
 ) -> Response {
+    let inbound_request_id = request_id.map(|Extension(r)| r.0);
+
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return (StatusCode::BAD_REQUEST, "Empty body").into_response();
@@ -55,7 +68,8 @@ async fn handle_mcp_post(
                             None,
                             -32000,
                             "unauthorized".to_string(),
-                        );
+                        )
+                        .with_error_request_id(inbound_request_id.as_deref());
                         return json_response(StatusCode::OK, &resp, None);
                     }
                 },
@@ -64,7 +78,8 @@ async fn handle_mcp_post(
                         None,
                         -32000,
                         "unauthorized".to_string(),
-                    );
+                    )
+                    .with_error_request_id(inbound_request_id.as_deref());
                     return json_response(StatusCode::OK, &resp, None);
                 }
             },
@@ -73,7 +88,8 @@ async fn handle_mcp_post(
                     None,
                     -32000,
                     "unauthorized".to_string(),
-                );
+                )
+                .with_error_request_id(inbound_request_id.as_deref());
                 return json_response(StatusCode::OK, &resp, None);
             }
         }
@@ -84,7 +100,8 @@ async fn handle_mcp_post(
         Ok(r) => r,
         Err(e) => {
             let resp =
-                crate::protocol::JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
+                crate::protocol::JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"))
+                    .with_error_request_id(inbound_request_id.as_deref());
             return json_response(StatusCode::OK, &resp, None);
         }
     };
@@ -93,14 +110,29 @@ async fn handle_mcp_post(
     let is_notification =
         request.id.is_none() || matches!(&request.id, Some(serde_json::Value::Null));
 
-    // For notifications (no id), return 202 Accepted
+    // For notifications (no id), return 202 Accepted. The request-id
+    // scope is still set so the downstream command journal INSERT can
+    // carry the correlation id.
     if is_notification {
-        let _ = mcp.handle_request(request, &principal).await;
+        let _ = request_context::scope_request_id(inbound_request_id.clone(), async {
+            mcp.handle_request(request, &principal).await
+        })
+        .await;
         return StatusCode::ACCEPTED.into_response();
     }
 
-    // Process the request
-    let response = mcp.handle_request(request, &principal).await;
+    // Process the request inside the request-id scope so tool handlers
+    // pick the id up via `request_context::mcp_caller`.
+    //
+    // `rid_for_errors` keeps a copy of the id around so we can stamp
+    // the final JSON-RPC response with it AFTER the scope finishes
+    // (scope_request_id consumes the Option by move).
+    let rid_for_errors = inbound_request_id.clone();
+    let response = request_context::scope_request_id(inbound_request_id, async {
+        mcp.handle_request(request, &principal).await
+    })
+    .await
+    .with_error_request_id(rid_for_errors.as_deref());
 
     // On initialize, generate a session ID
     let session_id = if is_initialize {
@@ -154,6 +186,7 @@ mod tests {
         let response = handle_mcp_post(
             State(mcp),
             HeaderMap::new(),
+            None,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         )
         .await;
@@ -172,6 +205,7 @@ mod tests {
         let response = handle_mcp_post(
             State(mcp),
             headers,
+            None,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         )
         .await;
@@ -180,6 +214,55 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(json["error"]["code"], -32000);
         assert_eq!(json["error"]["message"], "unauthorized");
+    }
+
+    /// R12 API-001 / AC-15: every error response MUST include the
+    /// ambient request id in `error.data.request_id` so an operator
+    /// pasting a failed MCP response can grep logs and
+    /// `command_journal` for the same id.
+    #[tokio::test]
+    async fn test_mcp_http_error_includes_request_id_in_error_data() {
+        let mcp = test_server().await;
+        let response = handle_mcp_post(
+            State(mcp),
+            HeaderMap::new(),
+            Some(Extension(graphql_server::request_id::RequestId(
+                "rid-mcp-xyz".to_string(),
+            ))),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["error"]["code"], -32000, "unauthorized envelope");
+        assert_eq!(
+            json["error"]["data"]["request_id"], "rid-mcp-xyz",
+            "error.data.request_id must carry the inbound correlation id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_http_parse_error_includes_request_id() {
+        let mcp = test_server().await;
+        let mut headers = HeaderMap::new();
+        // `PrincipalTable::test_fixture()` uses a stable `"test-token"`
+        // string so integration callers don't have to scrape the
+        // bootstrapped uuid. Re-using the literal here keeps this test
+        // readable and avoids adding a new introspection API just for
+        // error-envelope verification.
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+        let response = handle_mcp_post(
+            State(mcp),
+            headers,
+            Some(Extension(graphql_server::request_id::RequestId(
+                "rid-parse-1".to_string(),
+            ))),
+            "not-json".to_string(),
+        )
+        .await;
+        let json = response_json(response).await;
+        assert_eq!(json["error"]["code"], -32700);
+        assert_eq!(json["error"]["data"]["request_id"], "rid-parse-1");
     }
 
     async fn test_server() -> Arc<McpServer> {

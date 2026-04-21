@@ -30,6 +30,11 @@ pub struct RunProjectionRow {
     pub completed_stages: i64,
     pub failed_stages: i64,
     pub pending_approvals: i64,
+    /// P050: Per-run meta root (read-only, nullable for legacy runs).
+    pub chainworks_meta_root: Option<String>,
+    pub projection_present: bool,
+    pub projection_updated_at: Option<String>,
+    pub projection_lag: bool,
 }
 
 /// A stage row produced by joining `stage_executions` with `stage_summaries`.
@@ -49,6 +54,9 @@ pub struct StageSummaryRow {
     pub has_artifacts: bool,
     pub has_pending_approval: bool,
     pub has_validation_failure: bool,
+    pub projection_present: bool,
+    pub projection_updated_at: Option<String>,
+    pub projection_lag: bool,
 }
 
 /// List active runs via the projection layer.
@@ -66,7 +74,11 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
-                  COALESCE(rs.pending_approvals, 0) AS pending_approvals
+                  COALESCE(rs.pending_approvals, 0) AS pending_approvals,
+                  r.chainworks_meta_root,
+                  CASE WHEN rs.run_id IS NULL THEN 0 ELSE 1 END AS projection_present,
+                  rs.updated_at AS projection_updated_at,
+                  CASE WHEN rs.run_id IS NULL OR rs.status != r.status THEN 1 ELSE 0 END AS projection_lag
            FROM runs r
            LEFT JOIN run_summaries rs ON rs.run_id = r.id
            WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
@@ -94,6 +106,10 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
                 completed_stages: r.get("completed_stages"),
                 failed_stages: r.get("failed_stages"),
                 pending_approvals: r.get("pending_approvals"),
+                chainworks_meta_root: r.get("chainworks_meta_root"),
+                projection_present: r.get::<i64, _>("projection_present") != 0,
+                projection_updated_at: r.get("projection_updated_at"),
+                projection_lag: r.get::<i64, _>("projection_lag") != 0,
             })
         })
         .collect()
@@ -113,7 +129,11 @@ pub async fn list_by_idea_projection(
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
-                  COALESCE(rs.pending_approvals, 0) AS pending_approvals
+                  COALESCE(rs.pending_approvals, 0) AS pending_approvals,
+                  r.chainworks_meta_root,
+                  CASE WHEN rs.run_id IS NULL THEN 0 ELSE 1 END AS projection_present,
+                  rs.updated_at AS projection_updated_at,
+                  CASE WHEN rs.run_id IS NULL OR rs.status != r.status THEN 1 ELSE 0 END AS projection_lag
            FROM runs r
            LEFT JOIN run_summaries rs ON rs.run_id = r.id
            WHERE r.idea_id = ?
@@ -142,6 +162,10 @@ pub async fn list_by_idea_projection(
                 completed_stages: r.get("completed_stages"),
                 failed_stages: r.get("failed_stages"),
                 pending_approvals: r.get("pending_approvals"),
+                chainworks_meta_root: r.get("chainworks_meta_root"),
+                projection_present: r.get::<i64, _>("projection_present") != 0,
+                projection_updated_at: r.get("projection_updated_at"),
+                projection_lag: r.get::<i64, _>("projection_lag") != 0,
             })
         })
         .collect()
@@ -162,7 +186,10 @@ pub async fn list_stages_projection(
                   COALESCE(ss.attempt_number, se.attempt_number) AS attempt_number,
                   COALESCE(ss.has_artifacts, 0) AS has_artifacts,
                   COALESCE(ss.has_pending_approval, 0) AS has_pending_approval,
-                  COALESCE(ss.has_validation_failure, 0) AS has_validation_failure
+                  COALESCE(ss.has_validation_failure, 0) AS has_validation_failure,
+                  CASE WHEN ss.stage_execution_id IS NULL THEN 0 ELSE 1 END AS projection_present,
+                  ss.updated_at AS projection_updated_at,
+                  CASE WHEN ss.stage_execution_id IS NULL OR ss.status != se.status OR ss.attempt_number != se.attempt_number THEN 1 ELSE 0 END AS projection_lag
            FROM stage_executions se
            LEFT JOIN stage_summaries ss ON ss.stage_execution_id = se.id
            WHERE se.run_id = ?
@@ -188,6 +215,9 @@ pub async fn list_stages_projection(
                 has_artifacts: r.get::<i64, _>("has_artifacts") != 0,
                 has_pending_approval: r.get::<i64, _>("has_pending_approval") != 0,
                 has_validation_failure: r.get::<i64, _>("has_validation_failure") != 0,
+                projection_present: r.get::<i64, _>("projection_present") != 0,
+                projection_updated_at: r.get("projection_updated_at"),
+                projection_lag: r.get::<i64, _>("projection_lag") != 0,
             })
         })
         .collect()
@@ -211,7 +241,11 @@ pub async fn find_run_projection(
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
-                  COALESCE(rs.pending_approvals, 0) AS pending_approvals
+                  COALESCE(rs.pending_approvals, 0) AS pending_approvals,
+                  r.chainworks_meta_root,
+                  CASE WHEN rs.run_id IS NULL THEN 0 ELSE 1 END AS projection_present,
+                  rs.updated_at AS projection_updated_at,
+                  CASE WHEN rs.run_id IS NULL OR rs.status != r.status THEN 1 ELSE 0 END AS projection_lag
            FROM runs r
            LEFT JOIN run_summaries rs ON rs.run_id = r.id
            WHERE r.id = ?"#,
@@ -238,6 +272,10 @@ pub async fn find_run_projection(
             completed_stages: r.get("completed_stages"),
             failed_stages: r.get("failed_stages"),
             pending_approvals: r.get("pending_approvals"),
+            chainworks_meta_root: r.get("chainworks_meta_root"),
+            projection_present: r.get::<i64, _>("projection_present") != 0,
+            projection_updated_at: r.get("projection_updated_at"),
+            projection_lag: r.get::<i64, _>("projection_lag") != 0,
         })
     })
     .transpose()
@@ -449,9 +487,14 @@ pub async fn list_artifacts_projection(
         r#"SELECT ai.artifact_id AS id, ai.run_id, ai.stage_id, a.agent_id, ai.name,
                   a.contract_id, ai.format, ai.file_path, a.checksum_sha256, a.size_bytes,
                   a.provider, a.model, ai.created_at, ai.is_pinned, ai.report_kind,
-                  a.report_version
+                  a.report_version, g.generation_id AS artifact_generation_id,
+                  g.source_agent_execution_id, g.source_stage_execution_id,
+                  g.source_session_generation_id, g.source_work_item_id,
+                  g.supersedes_generation_id AS supersedes_artifact_generation_id,
+                  g.output_settlement, g.source_generation_verified
            FROM artifact_index ai
            JOIN artifacts a ON a.id = ai.artifact_id
+           LEFT JOIN artifact_contract_generations g ON g.artifact_id = ai.artifact_id
            WHERE ai.run_id = ?
            ORDER BY ai.created_at ASC"#,
     )
@@ -478,6 +521,16 @@ pub async fn list_artifacts_projection(
                 is_pinned: r.get::<i64, _>("is_pinned") != 0,
                 report_kind: r.get("report_kind"),
                 report_version: r.get("report_version"),
+                artifact_generation_id: r.get("artifact_generation_id"),
+                source_agent_execution_id: r.get("source_agent_execution_id"),
+                source_stage_execution_id: r.get("source_stage_execution_id"),
+                source_session_generation_id: r.get("source_session_generation_id"),
+                source_work_item_id: r.get("source_work_item_id"),
+                supersedes_artifact_generation_id: r.get("supersedes_artifact_generation_id"),
+                output_settlement: r.get("output_settlement"),
+                source_generation_verified: r
+                    .get::<Option<i64>, _>("source_generation_verified")
+                    .map(|value| value != 0),
             })
         })
         .collect()
@@ -515,6 +568,14 @@ pub struct ArtifactIndexRow {
     pub is_pinned: bool,
     pub report_kind: Option<String>,
     pub report_version: Option<i64>,
+    pub artifact_generation_id: Option<String>,
+    pub source_agent_execution_id: Option<String>,
+    pub source_stage_execution_id: Option<String>,
+    pub source_session_generation_id: Option<String>,
+    pub source_work_item_id: Option<String>,
+    pub supersedes_artifact_generation_id: Option<String>,
+    pub output_settlement: Option<String>,
+    pub source_generation_verified: Option<bool>,
 }
 
 /// Full projection rebuild for a run (all tables).

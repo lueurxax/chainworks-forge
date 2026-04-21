@@ -1,0 +1,26 @@
+version: 1
+schema: proposal-implementation-audit.reviewer-plugin
+
+reviewers:
+  - id: custom_domain_reviewer
+    display_name: Custom Domain Implementation Reviewer
+    mode: domain-only
+    stacks: []
+    surfaces: []
+    risks: []
+    finding_prefixes:
+      - DOMAIN
+      - READY
+    strong_proposal_keywords: []
+    strong_changed_files: []
+    implementation_checks:
+      - Verify the implementation satisfies proposal commitments for the repo-specific domain.
+      - Separate objective `REQ-*` status from domain risk findings.
+    usually_pair_with: []
+    rubric: .codex/implementation-reviewers/custom-domain-rubric.md
+    preferred_agent_names:
+      - custom_domain_reviewer
+
+notes:
+  - Prefer reusing built-in reviewer ids for lifecycle continuity.
+  - Add implementation-only reviewers only for repo-specific risks not covered by the built-in registry.

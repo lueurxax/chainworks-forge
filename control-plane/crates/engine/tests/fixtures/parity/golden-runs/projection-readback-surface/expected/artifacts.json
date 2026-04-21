@@ -1,0 +1,1 @@
+{"artifacts":[{"name":"artifact_index_source","contract_id":"artifact.index","stage_id":"readback_source","format":"json","report_kind":null},{"name":"graphql_mcp_readback","contract_id":"readback.parity","stage_id":"readback_report","format":"json","report_kind":"parity_summary"}]}

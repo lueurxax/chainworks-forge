@@ -1,0 +1,161 @@
+version: 1
+schema: proposal-review-router.repo-routing-config
+
+routing:
+  target_reviewer_count: 3
+  hard_cap: 5
+  product_opt_in: true
+  prefer_repo_local_agents: true
+  baseline_policy: affected-slices-only
+  proposal_dirs:
+    - docs/proposals
+    - docs/research
+    - docs/ps
+  baseline_paths:
+    current_system: .review-baselines/current-system-baseline.md
+    reference_index: docs/reference/current-system-baseline.md
+  proposal_artifact_convention:
+    review_dir_suffix: .review
+    integration_context: integration-context.md
+    evidence_pack: evidence-pack.md
+    research_pack: research-pack.md
+
+stack_aliases:
+  macos:
+    - Chainworks Forge.xcodeproj
+    - Chainworks Forge/**
+    - Chainworks ForgeTests/**
+    - Chainworks ForgeUITests/**
+  apple-client:
+    - Chainworks Forge/**
+    - examples/workflows/**
+    - examples/agents/**
+  rust-backend:
+    - control-plane/Cargo.toml
+    - control-plane/crates/**
+  go-backend:
+    - go.mod
+    - cmd/**
+    - internal/**
+    - pkg/**
+    - docs/proposals/1000-go-*.md
+  shared-api:
+    - control-plane/crates/graphql-server/**
+    - control-plane/crates/mcp-server/**
+    - control-plane/crates/acp/**
+    - examples/mcp/**
+    - examples/workflows/**
+    - examples/agents/**
+    - "**/*.proto"
+    - "**/*graphql*"
+    - openapi.yaml
+    - openapi.yml
+
+path_overrides:
+  - pattern: "Chainworks Forge/Views/**"
+    add_stack_tags: [macos, apple-client]
+    add_surface_tags: [ui, ux, navigation]
+    prefer_reviewers: [macos_ui_reviewer, apple_ux_reviewer]
+  - pattern: "Chainworks Forge/Engine/**"
+    add_stack_tags: [macos, apple-client]
+    add_surface_tags: [architecture, state-management, concurrency, background-work]
+    prefer_reviewers: [apple_arch_reviewer, chainworks_execution_truth_reviewer]
+  - pattern: "Chainworks Forge/Providers/**"
+    add_stack_tags: [macos, apple-client]
+    add_surface_tags: [architecture, auth, security-boundary, api-contract]
+    prefer_reviewers: [apple_arch_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+  - pattern: "Chainworks Forge/Models/**"
+    add_stack_tags: [macos, apple-client]
+    add_surface_tags: [persistence, state-management]
+    prefer_reviewers: [apple_arch_reviewer, chainworks_execution_truth_reviewer]
+  - pattern: "control-plane/crates/engine/**"
+    add_stack_tags: [rust-backend]
+    add_surface_tags: [architecture, background-work, concurrency, persistence]
+    add_risk_tags: [idempotency, availability-sensitive]
+    prefer_reviewers: [rust_arch_reviewer, rust_reliability_reviewer, chainworks_execution_truth_reviewer]
+  - pattern: "control-plane/crates/db/migrations/**"
+    add_stack_tags: [rust-backend]
+    add_surface_tags: [persistence, migration, rollout]
+    add_risk_tags: [data-loss, backward-compatibility]
+    prefer_reviewers: [rust_arch_reviewer, observability_rollout_reviewer]
+  - pattern: "control-plane/crates/graphql-server/**"
+    add_stack_tags: [rust-backend, shared-api]
+    add_surface_tags: [api-contract, auth]
+    add_risk_tags: [backward-compatibility, security-sensitive]
+    prefer_reviewers: [rust_arch_reviewer, api_contract_reviewer, rust_security_reviewer]
+  - pattern: "control-plane/crates/mcp-server/**"
+    add_stack_tags: [rust-backend, shared-api]
+    add_surface_tags: [api-contract, auth]
+    add_risk_tags: [backward-compatibility, security-sensitive]
+    prefer_reviewers: [rust_arch_reviewer, api_contract_reviewer, rust_security_reviewer]
+  - pattern: "control-plane/crates/acp/**"
+    add_stack_tags: [rust-backend, shared-api]
+    add_surface_tags: [api-contract, background-work, security-boundary]
+    add_risk_tags: [availability-sensitive, security-sensitive]
+    prefer_reviewers: [rust_arch_reviewer, rust_reliability_reviewer, api_contract_reviewer]
+  - pattern: "examples/workflows/**"
+    add_stack_tags: [macos, rust-backend, shared-api, cross-stack]
+    add_surface_tags: [api-contract, state-management]
+    add_risk_tags: [backward-compatibility, multi-service-coordination]
+    prefer_reviewers: [api_contract_reviewer, chainworks_execution_truth_reviewer]
+  - pattern: "examples/agents/**"
+    add_stack_tags: [macos, rust-backend, shared-api, cross-stack]
+    add_surface_tags: [api-contract, auth, security-boundary]
+    prefer_reviewers: [api_contract_reviewer, rust_security_reviewer]
+  - pattern: "scripts/test-gate.sh"
+    add_surface_tags: [rollout, telemetry]
+    add_risk_tags: [operability-sensitive]
+    prefer_reviewers: [observability_rollout_reviewer]
+  - pattern: "docs/reference/test-gates.md"
+    add_surface_tags: [rollout, telemetry]
+    add_risk_tags: [operability-sensitive]
+    prefer_reviewers: [observability_rollout_reviewer]
+  - pattern: "docs/proposals/1000-go-*.md"
+    add_stack_tags: [go-backend, microservice, shared-api, cross-stack]
+    add_surface_tags: [architecture, api-contract, background-work, rollout]
+    add_risk_tags: [multi-service-coordination, availability-sensitive, backward-compatibility]
+    prefer_reviewers: [go_service_arch_reviewer, go_reliability_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+
+reviewer_overrides:
+  force_include: []
+  force_exclude: []
+  suppress_by_default:
+    - ios_ui_reviewer
+    - product_reviewer
+  prefer_when_evidenced:
+    macos_ui_reviewer:
+      evidence_required: "macOS UI/view/window/menu/toolbar/sidebar proposal or `Chainworks Forge/Views/**` code path."
+    apple_arch_reviewer:
+      evidence_required: "Swift client state, navigation, lifecycle, provider, persistence, or workflow ownership changes."
+    chainworks_execution_truth_reviewer:
+      evidence_required: "Run/stage/agent/approval/artifact/recovery truth changes crossing Swift, Rust, YAML, reports, or projections."
+    rust_reliability_reviewer:
+      evidence_required: "Work queue, executor, retry, resume, cancellation, recovery, idempotency, or async lifecycle changes."
+    api_contract_reviewer:
+      evidence_required: "GraphQL, MCP, ACP JSON-RPC, workflow YAML, agent catalog, report payload, protobuf/OpenAPI, or generated client contract changes."
+    observability_rollout_reviewer:
+      evidence_required: "Migration, test-gate, rollout, rollback, telemetry, release receipt, or support/debuggability changes."
+    go_service_arch_reviewer:
+      evidence_required: "Go/Temporal service proposal or actual Go module evidence."
+
+agent_name_overrides:
+  macos_ui_reviewer: [macos_ui_reviewer, ui_reviewer]
+  apple_ux_reviewer: [apple_ux_reviewer, ux_reviewer]
+  apple_arch_reviewer: [apple_arch_reviewer, arch_reviewer]
+  rust_arch_reviewer: [rust_arch_reviewer]
+  rust_reliability_reviewer: [rust_reliability_reviewer]
+  rust_security_reviewer: [rust_security_reviewer]
+  go_service_arch_reviewer: [go_service_arch_reviewer]
+  go_reliability_reviewer: [go_reliability_reviewer]
+  api_contract_reviewer: [api_contract_reviewer]
+  observability_rollout_reviewer: [observability_rollout_reviewer]
+  chainworks_execution_truth_reviewer: [chainworks_execution_truth_reviewer]
+
+custom_reviewers:
+  - chainworks_execution_truth_reviewer
+
+notes:
+  - "This repo is a macOS SwiftUI operator app plus Rust control-plane parity workspace; current Go support is proposal-level unless `go.mod` appears."
+  - "Use built-in reviewers first; the custom Chainworks reviewer exists only for durable run/stage/agent/approval/artifact truth semantics."
+  - "Do not select product_reviewer unless explicitly requested or metrics/decision checkpoints are central."
+  - "Do not select ios_ui_reviewer without explicit iOS target evidence."

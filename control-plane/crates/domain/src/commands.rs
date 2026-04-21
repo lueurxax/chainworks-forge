@@ -31,6 +31,7 @@ pub enum Command {
     CancelRun(CancelRunCmd),
     ResetSession(ResetSessionCmd),
     RunStewardAnalysis(RunStewardAnalysisCmd),
+    OverrideArtifactContract(OverrideArtifactContractCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,11 +69,25 @@ pub struct RejectStageCmd {
 pub struct RetryStageCmd {
     pub run_id: RunId,
     pub stage_id: String,
+    #[serde(default)]
+    pub consume_quota_budget_now: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CancelRunCmd {
     pub run_id: RunId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OverrideArtifactContractCmd {
+    pub run_id: RunId,
+    pub contract_id: String,
+    pub override_type: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub reason: String,
+    pub source_artifacts: Vec<String>,
+    pub expires_at_stage: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,6 +120,14 @@ pub struct CallerContext {
     pub principal_id: String,
     pub principal_class: PrincipalClass,
     pub caller_tool: String,
+    /// Inbound HTTP `X-Request-ID` (P042 §9.3). Populated by the axum
+    /// middleware on GraphQL/MCP HTTP paths; left `None` for MCP stdio
+    /// and for call sites that bypass the middleware (tests). The
+    /// daemon persists it in `command_journal.request_id` so an
+    /// operator can join HTTP access logs, daemon logs, and the audit
+    /// trail on one id.
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 impl CallerContext {
@@ -114,6 +137,7 @@ impl CallerContext {
             principal_id: principal_id.to_string(),
             principal_class: principal_class.clone(),
             caller_tool: tool_name.to_string(),
+            request_id: None,
         }
     }
 
@@ -127,7 +151,16 @@ impl CallerContext {
             principal_id: principal_id.to_string(),
             principal_class: principal_class.clone(),
             caller_tool: mutation_name.to_string(),
+            request_id: None,
         }
+    }
+
+    /// Attach a P042 §9.3 correlation id — typically the value of the
+    /// inbound `X-Request-ID` header (or a freshly minted one if the
+    /// client didn't send one). Returns `self` for builder-style chaining.
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
     }
 
     /// Test/fixture stand-in. Tags rows as caller_surface='mcp' with a
@@ -140,6 +173,7 @@ impl CallerContext {
             principal_id: "test-operator".to_string(),
             principal_class: PrincipalClass::Operator,
             caller_tool: "test".to_string(),
+            request_id: None,
         }
     }
 }

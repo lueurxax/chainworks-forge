@@ -126,10 +126,12 @@ pub fn resolve_mcp_servers(
             .as_deref()
             .filter(|command| !command.is_empty())
         {
+            let mut env = entry.env.clone();
+            inject_xcode_mcpbridge_pid_env(&mut env, command, &entry.args, current_xcode_pid);
             ResolvedMcpServerTransport::Stdio {
                 command: command.to_string(),
                 args: entry.args.clone(),
-                env: entry.env.clone(),
+                env,
             }
         } else if let Some(platform_provider) = entry
             .provider
@@ -186,6 +188,47 @@ pub fn resolve_mcp_servers(
             blocking_issues,
         },
         payloads,
+    }
+}
+
+fn inject_xcode_mcpbridge_pid_env<F>(
+    env: &mut BTreeMap<String, String>,
+    command: &str,
+    args: &[String],
+    current_xcode_pid: F,
+) where
+    F: FnOnce() -> Option<String>,
+{
+    if env.contains_key("MCP_XCODE_PID") {
+        return;
+    }
+    if command != "xcrun" || args.first().map(String::as_str) != Some("mcpbridge") {
+        return;
+    }
+    if let Some(pid) = current_xcode_pid().filter(|pid| !pid.is_empty()) {
+        env.insert("MCP_XCODE_PID".to_string(), pid);
+    }
+}
+
+fn current_xcode_pid() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("pgrep")
+            .args(["-n", "-x", "Xcode"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(|pid| pid.trim().to_string())
+            .filter(|pid| !pid.is_empty())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -267,5 +310,28 @@ mcp:
         let entry = servers.get("filesystem").unwrap();
         assert_eq!(entry.runtime_id.as_deref(), Some("fs-runtime"));
         assert_eq!(entry.command.as_deref(), Some("mcp-filesystem"));
+    }
+
+    #[test]
+    fn injects_xcode_pid_for_mcpbridge_stdio_entries() {
+        let mut env = BTreeMap::new();
+        inject_xcode_mcpbridge_pid_env(&mut env, "xcrun", &["mcpbridge".to_string()], || {
+            Some("77907".to_string())
+        });
+
+        assert_eq!(env.get("MCP_XCODE_PID").map(String::as_str), Some("77907"));
+    }
+
+    #[test]
+    fn does_not_override_explicit_xcode_pid_for_mcpbridge_stdio_entries() {
+        let mut env: BTreeMap<String, String> =
+            [("MCP_XCODE_PID".to_string(), "12345".to_string())]
+                .into_iter()
+                .collect();
+        inject_xcode_mcpbridge_pid_env(&mut env, "xcrun", &["mcpbridge".to_string()], || {
+            Some("77907".to_string())
+        });
+
+        assert_eq!(env.get("MCP_XCODE_PID").map(String::as_str), Some("12345"));
     }
 }

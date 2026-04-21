@@ -7,6 +7,7 @@ import Foundation
 ///   - `always` (when: 'true')
 ///   - `artifactExists` (when: exists('name'))
 ///   - `approvalGranted` (when: approval.granted == true)
+///   - `approvalRejected` (when: approval.rejected == true)
 ///   - `expression`: artifact.field {==,!=,<,<=,>,>=} value/vars.X, `and`, `or`
 ///   - vars.* substituted at RUNTIME from RunPlan.variables
 struct TransitionEvaluator {
@@ -17,6 +18,8 @@ struct TransitionEvaluator {
         let producedArtifactNames: Set<String>
         /// Whether approval has been granted for the current stage.
         let approvalGranted: Bool
+        /// Whether approval has been rejected for the current stage.
+        let approvalRejected: Bool
         /// Runtime variables (from RunPlan.variables, may be mutated by loop counters).
         let variables: [String: AnyCodableValue]
         /// Artifact metadata for field-level expression checks.
@@ -39,6 +42,9 @@ struct TransitionEvaluator {
 
         case .approvalGranted:
             return context.approvalGranted
+
+        case .approvalRejected:
+            return context.approvalRejected
 
         case .expression(let expr):
             return evaluateExpression(expr, context: context)
@@ -68,6 +74,7 @@ struct TransitionEvaluator {
     ///   - `expr or expr`
     ///   - `exists('name')`
     ///   - `approval.granted == true`
+    ///   - `approval.rejected == true`
     ///   - `true` / `'true'`
     private static func evaluateExpression(
         _ expr: String,
@@ -100,9 +107,12 @@ struct TransitionEvaluator {
             return context.producedArtifactNames.contains(inner)
         }
 
-        // Handle approval.granted == true
+        // Handle approval.granted == true / approval.rejected == true
         if trimmed == "approval.granted == true" {
             return context.approvalGranted
+        }
+        if trimmed == "approval.rejected == true" {
+            return context.approvalRejected
         }
 
         // Handle comparison expressions: lhs op rhs
@@ -231,7 +241,14 @@ struct TransitionEvaluator {
             if parts.count == 2 {
                 let artifactName = parts[0]
                 let fieldName = parts[1]
-                return context.artifactFields[artifactName]?[fieldName] ?? .null
+                if let value = context.artifactFields[artifactName]?[fieldName] {
+                    return value
+                }
+                if artifactName == "implementation_self_assessment_v2",
+                   let value = context.artifactFields["implementation_self_assessment"]?[fieldName] {
+                    return value
+                }
+                return .null
             }
         }
 

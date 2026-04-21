@@ -1,0 +1,28 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "projection-readback-surface",
+  "title": "Projection Readback Surface",
+  "initial_state": "readback_source",
+  "states": [
+    {
+      "stage_id": "readback_source",
+      "label": "Readback Source",
+      "owner": "fixture_agent",
+      "outputs": [
+        "artifact_index_source"
+      ],
+      "next_stage": "readback_report",
+      "terminal": false
+    },
+    {
+      "stage_id": "readback_report",
+      "label": "Readback Report",
+      "owner": "fixture_agent",
+      "outputs": [
+        "graphql_mcp_readback"
+      ],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

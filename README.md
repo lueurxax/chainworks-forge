@@ -93,7 +93,9 @@ The repository is past the scaffold stage. The implemented system now includes:
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
+- local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
+- implementation completeness and handoff contract with structured status and verification truth
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
@@ -129,6 +131,10 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - ACP-oriented runtime dispatch and provider bindings
   - Goose compatibility diagnostics and remediation
   - frozen provider/model provenance truth
+- local daemon lifecycle slice:
+  - typed health/readiness and `daemonStatus` readback
+  - packaged app/helper supervision with PID lock and crash budget
+  - SQLite migration preflight, failed-serve status, diagnostics export, and packaged daemon proof lanes
 - repo-backed delivery slice:
   - worktree provisioning
   - delivery configuration freezing
@@ -215,6 +221,7 @@ Most common gates:
 
 - `./scripts/test-gate.sh build` — compile-only sanity check
 - `./scripts/test-gate.sh fast` — default inner-loop runtime/unit gate
+- Focused implementation completeness and handoff proof gate — see `docs/reference/test-gates.md`
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"` — remote-only UI smoke gate
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-022"` — remote-only Proposal 022 proof gate
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"` — remote-only full sign-off gate

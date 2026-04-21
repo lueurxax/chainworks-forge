@@ -1,0 +1,71 @@
+version: 1
+schema: proposal-review-router.reviewer-plugin
+
+reviewers:
+  - id: chainworks_execution_truth_reviewer
+    family: repo-local
+    display_name: Chainworks Execution Truth Reviewer
+    mode: architecture-only
+    stacks: [macos, apple-client, rust-backend, shared-api, cross-stack]
+    surfaces: [architecture, state-management, persistence, api-contract, background-work]
+    risks: [data-loss, idempotency, availability-sensitive, multi-service-coordination, operability-sensitive]
+    mandatory_when:
+      any:
+        - run lifecycle
+        - stage execution
+        - agent execution
+        - approval truth
+        - artifact truth
+        - recovery truth
+        - projection truth
+        - workflow snapshot
+        - MCP truth
+        - ACP runtime truth
+    strong_proposal_keywords:
+      - Run
+      - StageExecution
+      - AgentExecution
+      - Approval
+      - artifact truth
+      - recovery snapshot
+      - execution truth
+      - workflow snapshot
+      - command journal
+      - projection
+      - resume
+      - retry
+      - MCP truth
+      - ACP
+      - receipt
+      - release gate
+    strong_repo_files:
+      - "Chainworks Forge/Engine/**"
+      - "Chainworks Forge/Models/**"
+      - "control-plane/crates/domain/**"
+      - "control-plane/crates/engine/**"
+      - "control-plane/crates/db/**"
+      - "control-plane/crates/graphql-server/**"
+      - "control-plane/crates/mcp-server/**"
+      - "examples/workflows/**"
+      - "examples/agents/**"
+      - "docs/reference/execution-truth-and-recovery.md"
+      - "docs/reference/runtime-contract.md"
+      - "docs/reference/domain-model.md"
+    strong_repo_symbols:
+      - RunPlanSnapshot
+      - WorkflowOrchestrator
+      - RecoveryCoordinator
+      - ResumeManager
+      - RunRepository
+      - CommandHandler
+      - command_journal
+      - StageExecution
+      - AgentExecution
+      - Approval
+      - projections
+      - WorkQueue
+    close_alternatives: [apple_arch_reviewer, rust_arch_reviewer, rust_reliability_reviewer, api_contract_reviewer]
+    usually_pair_with: [rust_reliability_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+    rubric: .codex/agents/chainworks_execution_truth_reviewer.md
+    preferred_agent_names: [chainworks_execution_truth_reviewer, execution_truth_reviewer]
+    notes: "Use only when proposal changes durable Chainworks execution semantics, not for generic app or service architecture."

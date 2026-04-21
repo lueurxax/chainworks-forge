@@ -1,0 +1,280 @@
+version: 2
+schema: proposal-review-router.reviewer-registry
+
+defaults:
+  target_reviewer_count: 3
+  minimum_reviewer_count: 1
+  hard_cap: 5
+  product_opt_in: true
+  score_weights:
+    explicit_user_request: 5
+    stack_match: 4
+    surface_match: 3
+    risk_match: 3
+    repo_signal_match: 2
+    cross_stack_dependency: 2
+    baseline_gap_match: 1
+    overlap_penalty: -3
+
+reviewers:
+  - id: ios_ui_reviewer
+    family: apple
+    display_name: iOS UI Reviewer
+    mode: ui-only
+    stacks: [ios, apple-client]
+    surfaces: [ui, navigation, accessibility]
+    risks: [platform-mismatch, user-trust]
+    mandatory_when:
+      all: [ios, ui]
+    strong_proposal_keywords: [SwiftUI, UIKit, iPhone, iPad, NavigationStack, TabView, sheet, fullScreenCover, dynamic type, VoiceOver, deep link]
+    strong_repo_files: ["*.xcodeproj", "*.xcworkspace", "Package.swift", "**/*.swift", "**/*.storyboard", "**/*.xib"]
+    strong_repo_symbols: [SwiftUI, UIKit, UIViewController, UIHostingController, NavigationStack, @Environment, accessibilityLabel]
+    close_alternatives: [macos_ui_reviewer, apple_ux_reviewer, apple_arch_reviewer]
+    usually_pair_with: [apple_arch_reviewer, apple_ux_reviewer]
+    rubric: references/rubrics/ios-ui-rubric.md
+    preferred_agent_names: [ios_ui_reviewer, ios-ui-reviewer, ui_reviewer]
+
+  - id: macos_ui_reviewer
+    family: apple
+    display_name: macOS UI Reviewer
+    mode: ui-only
+    stacks: [macos, apple-client]
+    surfaces: [ui, navigation, accessibility]
+    risks: [platform-mismatch, user-trust]
+    mandatory_when:
+      all: [macos, ui]
+    strong_proposal_keywords: [AppKit, macOS, SwiftUI, NSWindow, toolbar, sidebar, inspector, settings window, menu, Commands, keyboard shortcut, NavigationSplitView]
+    strong_repo_files: ["*.xcodeproj", "*.xcworkspace", "Package.swift", "**/*.swift", "**/*.xib", "**/*.storyboard"]
+    strong_repo_symbols: [AppKit, NSViewController, NSWindow, NSToolbar, NavigationSplitView, Commands, FocusState]
+    close_alternatives: [ios_ui_reviewer, apple_ux_reviewer, apple_arch_reviewer]
+    usually_pair_with: [apple_arch_reviewer, apple_ux_reviewer]
+    rubric: references/rubrics/macos-ui-rubric.md
+    preferred_agent_names: [macos_ui_reviewer, macos-ui-reviewer, ui_reviewer]
+
+  - id: apple_ux_reviewer
+    family: apple
+    display_name: Apple UX Reviewer
+    mode: ux-only
+    stacks: [ios, macos, apple-client]
+    surfaces: [ux, accessibility, navigation]
+    risks: [user-trust, data-loss, privacy-sensitive]
+    mandatory_when:
+      any: [ux]
+    strong_proposal_keywords: [onboarding, empty state, error recovery, confirmation, destructive, permission, privacy, trust, accessibility, VoiceOver, decision, user journey]
+    strong_repo_files: ["**/*.swift", "**/*.strings", "**/*.stringsdict"]
+    strong_repo_symbols: [Alert, confirmationDialog, accessibilityLabel, accessibilityHint, LocalizedStringKey]
+    close_alternatives: [ios_ui_reviewer, macos_ui_reviewer, product_reviewer]
+    usually_pair_with: [ios_ui_reviewer, macos_ui_reviewer, apple_arch_reviewer]
+    rubric: references/rubrics/apple-ux-rubric.md
+    preferred_agent_names: [apple_ux_reviewer, apple-ux-reviewer, ux_reviewer]
+
+  - id: apple_arch_reviewer
+    family: apple
+    display_name: Apple Architecture Reviewer
+    mode: architecture-only
+    stacks: [ios, macos, apple-client]
+    surfaces: [architecture, state-management, navigation, concurrency, persistence, feature-flag]
+    risks: [data-loss, availability-sensitive, platform-mismatch]
+    mandatory_when:
+      any: [state-management, concurrency, persistence]
+      stack_any: [ios, macos, apple-client]
+    strong_proposal_keywords: [coordinator, router, Observable, Observation, ObservableObject, @MainActor, actor, Task, cancellation, persistence, SwiftData, CoreData, deep link, state restoration]
+    strong_repo_files: ["Package.swift", "*.xcodeproj", "**/*.swift"]
+    strong_repo_symbols: [@MainActor, actor, Task, ObservableObject, SwiftData, CoreData, URLSession, AppStorage, SceneStorage]
+    close_alternatives: [ios_ui_reviewer, macos_ui_reviewer, api_contract_reviewer]
+    usually_pair_with: [ios_ui_reviewer, macos_ui_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/apple-architecture-rubric.md
+    preferred_agent_names: [apple_arch_reviewer, apple-arch-reviewer, arch_reviewer]
+
+  - id: rust_arch_reviewer
+    family: rust
+    display_name: Rust Architecture Reviewer
+    mode: architecture-only
+    stacks: [rust-backend]
+    surfaces: [architecture, concurrency, persistence, api-contract, migration]
+    risks: [availability-sensitive, backward-compatibility]
+    mandatory_when:
+      any: [rust-backend]
+    strong_proposal_keywords: [Rust, Cargo, crate, trait, tokio, axum, tonic, sqlx, serde, migration, workspace, command handler, repository]
+    strong_repo_files: ["Cargo.toml", "Cargo.lock", "**/*.rs", "migrations/*.sql"]
+    strong_repo_symbols: [tokio, axum, tonic, sqlx, serde, tracing, anyhow, thiserror]
+    close_alternatives: [rust_reliability_reviewer, api_contract_reviewer]
+    usually_pair_with: [rust_reliability_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/rust-architecture-rubric.md
+    preferred_agent_names: [rust_arch_reviewer, rust-arch-reviewer, arch_reviewer]
+
+  - id: rust_reliability_reviewer
+    family: rust
+    display_name: Rust Reliability Reviewer
+    mode: reliability-only
+    stacks: [rust-backend]
+    surfaces: [background-work, concurrency, persistence]
+    risks: [idempotency, availability-sensitive, operability-sensitive, data-loss]
+    mandatory_when:
+      stack_any: [rust-backend]
+      any: [background-work, idempotency, availability-sensitive]
+    strong_proposal_keywords: [retry, idempotency, timeout, deadline, cancellation, backpressure, queue, worker, replay, shutdown, recovery, resume, duplicate]
+    strong_repo_files: ["Cargo.toml", "**/*.rs"]
+    strong_repo_symbols: [tokio::select!, tokio::spawn, timeout, retry, mpsc, broadcast, oneshot, WorkQueue, claim_next]
+    close_alternatives: [rust_arch_reviewer, observability_rollout_reviewer]
+    usually_pair_with: [rust_arch_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/rust-reliability-rubric.md
+    preferred_agent_names: [rust_reliability_reviewer, rust-reliability-reviewer, reliability_reviewer]
+
+  - id: rust_performance_reviewer
+    family: rust
+    display_name: Rust Performance Reviewer
+    mode: performance-only
+    stacks: [rust-backend]
+    surfaces: [performance-hot-path, concurrency]
+    risks: [latency-sensitive, availability-sensitive]
+    mandatory_when:
+      stack_any: [rust-backend]
+      any: [performance-hot-path, latency-sensitive]
+    strong_proposal_keywords: [hot path, latency, throughput, streaming, allocation, lock contention, batching, serialization, cache, benchmark]
+    strong_repo_files: ["Cargo.toml", "**/*.rs"]
+    strong_repo_symbols: [Bytes, futures, serde_json, prost, DashMap, parking_lot, Arc, Mutex, RwLock]
+    close_alternatives: [rust_arch_reviewer, rust_reliability_reviewer]
+    usually_pair_with: [rust_arch_reviewer]
+    rubric: references/rubrics/rust-performance-rubric.md
+    preferred_agent_names: [rust_performance_reviewer, rust-performance-reviewer, performance_reviewer]
+
+  - id: rust_security_reviewer
+    family: rust
+    display_name: Rust Security Reviewer
+    mode: security-only
+    stacks: [rust-backend]
+    surfaces: [auth, security-boundary]
+    risks: [security-sensitive, privacy-sensitive]
+    mandatory_when:
+      stack_any: [rust-backend]
+      any: [auth, security-sensitive, security-boundary]
+    strong_proposal_keywords: [auth, token, secret, unsafe, FFI, deserialization, PII, permission, public endpoint, rate limit, validation, mTLS]
+    strong_repo_files: ["Cargo.toml", "**/*.rs", "**/auth*/**"]
+    strong_repo_symbols: [unsafe, Authorization, JWT, token, secret, serde_json::from_str, tower_http, CORS]
+    close_alternatives: [api_contract_reviewer, rust_arch_reviewer]
+    usually_pair_with: [rust_arch_reviewer, api_contract_reviewer]
+    rubric: references/rubrics/rust-security-rubric.md
+    preferred_agent_names: [rust_security_reviewer, rust-security-reviewer, security_reviewer]
+
+  - id: go_service_arch_reviewer
+    family: go
+    display_name: Go Service Architecture Reviewer
+    mode: architecture-only
+    stacks: [go-backend, microservice]
+    surfaces: [architecture, api-contract, persistence, migration]
+    risks: [backward-compatibility, availability-sensitive]
+    mandatory_when:
+      any: [go-backend, microservice]
+    strong_proposal_keywords: [Go, golang, go.mod, handler, service, repository, grpc, protobuf, sqlc, ent, interface, middleware, microservice]
+    strong_repo_files: ["go.mod", "go.sum", "cmd/**", "internal/**", "pkg/**", "**/*.go", "**/*.proto", "openapi.*"]
+    strong_repo_symbols: [context.Context, http.Handler, grpc, chi, gin, sqlc, ent, errgroup]
+    close_alternatives: [go_reliability_reviewer, api_contract_reviewer]
+    usually_pair_with: [go_reliability_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/go-service-architecture-rubric.md
+    preferred_agent_names: [go_service_arch_reviewer, go-service-arch-reviewer, go_arch_reviewer]
+
+  - id: go_reliability_reviewer
+    family: go
+    display_name: Go Reliability Reviewer
+    mode: reliability-only
+    stacks: [go-backend, microservice]
+    surfaces: [background-work, concurrency]
+    risks: [idempotency, availability-sensitive, operability-sensitive, data-loss]
+    mandatory_when:
+      stack_any: [go-backend, microservice]
+      any: [background-work, idempotency, availability-sensitive]
+    strong_proposal_keywords: [context, deadline, timeout, retry, idempotency, goroutine, errgroup, worker, queue, backpressure, graceful shutdown, duplicate]
+    strong_repo_files: ["go.mod", "**/*.go"]
+    strong_repo_symbols: [context.Context, context.WithTimeout, errgroup, goroutine, channel, select, signal.NotifyContext]
+    close_alternatives: [go_service_arch_reviewer, observability_rollout_reviewer]
+    usually_pair_with: [go_service_arch_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/go-reliability-rubric.md
+    preferred_agent_names: [go_reliability_reviewer, go-reliability-reviewer, reliability_reviewer]
+
+  - id: go_performance_reviewer
+    family: go
+    display_name: Go Performance Reviewer
+    mode: performance-only
+    stacks: [go-backend, microservice]
+    surfaces: [performance-hot-path]
+    risks: [latency-sensitive, availability-sensitive]
+    mandatory_when:
+      stack_any: [go-backend, microservice]
+      any: [performance-hot-path, latency-sensitive]
+    strong_proposal_keywords: [hot path, latency, throughput, allocation, GC, pooling, batching, serialization, pprof, benchmark, cache]
+    strong_repo_files: ["go.mod", "**/*.go"]
+    strong_repo_symbols: [sync.Pool, pprof, benchmark, json.Marshal, proto.Marshal, mutex, RWMutex]
+    close_alternatives: [go_service_arch_reviewer, go_reliability_reviewer]
+    usually_pair_with: [go_service_arch_reviewer]
+    rubric: references/rubrics/go-performance-rubric.md
+    preferred_agent_names: [go_performance_reviewer, go-performance-reviewer, performance_reviewer]
+
+  - id: go_security_reviewer
+    family: go
+    display_name: Go Security Reviewer
+    mode: security-only
+    stacks: [go-backend, microservice]
+    surfaces: [auth, security-boundary]
+    risks: [security-sensitive, privacy-sensitive]
+    mandatory_when:
+      stack_any: [go-backend, microservice]
+      any: [auth, security-sensitive, security-boundary]
+    strong_proposal_keywords: [auth, token, secret, public endpoint, validation, SSRF, webhook, permission, RBAC, PII, rate limit, CORS]
+    strong_repo_files: ["go.mod", "**/*.go", "**/auth*/**"]
+    strong_repo_symbols: [Authorization, jwt, oauth, bcrypt, crypto, net/http, url.Parse, httputil]
+    close_alternatives: [api_contract_reviewer, go_service_arch_reviewer]
+    usually_pair_with: [go_service_arch_reviewer, api_contract_reviewer]
+    rubric: references/rubrics/go-security-rubric.md
+    preferred_agent_names: [go_security_reviewer, go-security-reviewer, security_reviewer]
+
+  - id: api_contract_reviewer
+    family: cross-cutting
+    display_name: API Contract Reviewer
+    mode: api-contract-only
+    stacks: [shared-api, cross-stack, ios, macos, rust-backend, go-backend, microservice]
+    surfaces: [api-contract, migration, persistence]
+    risks: [backward-compatibility, multi-service-coordination, data-loss]
+    mandatory_when:
+      any: [api-contract, shared-api, backward-compatibility]
+    strong_proposal_keywords: [API, contract, protobuf, OpenAPI, GraphQL, schema, DTO, event, webhook, version, compatibility, migration, request, response]
+    strong_repo_files: ["**/*.proto", "openapi.yaml", "openapi.yml", "schema.graphql", "**/schema/**", "**/*dto*", "**/*contract*"]
+    strong_repo_symbols: [GraphQL, protobuf, OpenAPI, serde, json, marshal, unmarshal]
+    close_alternatives: [observability_rollout_reviewer, rust_security_reviewer, go_security_reviewer]
+    usually_pair_with: [observability_rollout_reviewer]
+    rubric: references/rubrics/api-contract-rubric.md
+    preferred_agent_names: [api_contract_reviewer, api-contract-reviewer, contract_reviewer]
+
+  - id: observability_rollout_reviewer
+    family: cross-cutting
+    display_name: Observability and Rollout Reviewer
+    mode: observability-rollout-only
+    stacks: [ios, macos, apple-client, rust-backend, go-backend, microservice, cross-stack]
+    surfaces: [telemetry, feature-flag, rollout, rollback, migration]
+    risks: [operability-sensitive, availability-sensitive, multi-service-coordination, data-loss]
+    mandatory_when:
+      any: [telemetry, feature-flag, rollout, rollback, migration, operability-sensitive]
+    strong_proposal_keywords: [rollout, rollback, migration, feature flag, dark launch, telemetry, metric, tracing, alert, dashboard, SLO, canary, staged rollout]
+    strong_repo_files: ["**/*metrics*", "**/*telemetry*", "**/*observability*", "**/*migration*", "**/*feature*flag*", "**/*.sql"]
+    strong_repo_symbols: [tracing, metrics, os.Logger, Logger, Prometheus, OpenTelemetry, StatsD, featureFlag]
+    close_alternatives: [api_contract_reviewer, product_reviewer]
+    usually_pair_with: [api_contract_reviewer]
+    rubric: references/rubrics/observability-rollout-rubric.md
+    preferred_agent_names: [observability_rollout_reviewer, observability-rollout-reviewer, rollout_reviewer]
+
+  - id: product_reviewer
+    family: cross-cutting
+    display_name: Product Reviewer
+    mode: product-only
+    stacks: [ios, macos, apple-client, rust-backend, go-backend, microservice, cross-stack]
+    surfaces: [ux, rollout]
+    risks: [user-trust, operability-sensitive]
+    mandatory_when:
+      explicit_only: true
+    strong_proposal_keywords: [KPI, metric, adoption, experiment, A/B, launch criteria, target user, prioritization, scope, decision checkpoint, success metric]
+    strong_repo_files: ["**/*analytics*", "**/*metrics*", "**/*experiment*", "**/*rollout*"]
+    strong_repo_symbols: [analytics, experiment, metric, event]
+    close_alternatives: [apple_ux_reviewer, observability_rollout_reviewer]
+    usually_pair_with: [observability_rollout_reviewer]
+    rubric: references/rubrics/product-review-rubric.md
+    preferred_agent_names: [product_reviewer, product-reviewer, pm_reviewer]

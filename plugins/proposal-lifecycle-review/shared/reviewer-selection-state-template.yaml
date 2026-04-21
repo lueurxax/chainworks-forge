@@ -1,0 +1,47 @@
+version: 1
+schema: proposal-lifecycle-review.reviewer-selection
+
+proposal:
+  path: docs/proposals/example.md
+  title: ""
+  state: Active
+  reviewed_at: ""
+  source_skill: proposal-review-router
+  source_plugin: proposal-lifecycle-review
+
+fingerprint:
+  stack_tags: []
+  surface_tags: []
+  risk_tags: []
+  evidence_ids: []
+
+selected_reviewers:
+  - id: rust_arch_reviewer
+    source: built-in
+    reason: ""
+    evidence_ids: []
+    rubric: skills/proposal-review-router/references/rubrics/rust-architecture-rubric.md
+
+rejected_close_alternatives:
+  - id: rust_performance_reviewer
+    reason: ""
+    evidence_ids: []
+
+required_changes_before_implementation: []
+
+research:
+  conclusions: []
+  sources: []
+  freshness_risks: []
+
+product_metrics:
+  leading_metric: null
+  guardrail_metric: null
+  decision_checkpoint: null
+
+implementation_audit_reuse:
+  default_mode: reuse-proposal-review-selection
+  allow_reroute: true
+  allow_delta_reviewers: true
+  max_delta_reviewers: 2
+  notes: []

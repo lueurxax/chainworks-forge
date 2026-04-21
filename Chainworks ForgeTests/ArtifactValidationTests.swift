@@ -236,6 +236,7 @@ struct ArtifactValidationTests {
         let ctx = TransitionEvaluator.EvaluationContext(
             producedArtifactNames: [],
             approvalGranted: false,
+            approvalRejected: false,
             variables: [:],
             artifactFields: [:]
         )
@@ -256,6 +257,7 @@ struct ArtifactValidationTests {
         let ctx = TransitionEvaluator.EvaluationContext(
             producedArtifactNames: [],
             approvalGranted: false,
+            approvalRejected: false,
             variables: [:],
             artifactFields: [:]
         )

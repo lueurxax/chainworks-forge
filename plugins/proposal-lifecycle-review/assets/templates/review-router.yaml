@@ -1,0 +1,26 @@
+version: 1
+schema: proposal-review-router.repo-routing
+
+reviewer_registry:
+  built_in: skills/proposal-review-router/assets/reviewer-registry.yaml
+  repo_local_glob: .codex/reviewers/*.yaml
+
+defaults:
+  target_reviewer_count: 3
+  hard_cap: 5
+  product_review_default: opt-in
+  local_first_research: true
+
+route_overrides:
+  # Example:
+  # - when:
+  #     stack_tags: [rust-backend]
+  #     risk_tags: [idempotency]
+  #   prefer_reviewers:
+  #     - rust_reliability_reviewer
+  #   reason: "Repo queues require reliability review for idempotency changes."
+  []
+
+repo_local_agents:
+  prefer_exact_reviewer_id: true
+  preferred_agent_directory: .codex/agents

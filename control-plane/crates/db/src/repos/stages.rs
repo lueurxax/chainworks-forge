@@ -1,11 +1,18 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::ids::{RunId, StageExecutionId};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 
 pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_tx(&mut tx, stage).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, stage: &StageExecution) -> Result<()> {
     let id = stage.id.to_string();
     let run_id = stage.run_id.to_string();
     let status = stage.status.to_string();
@@ -41,7 +48,7 @@ pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
     .bind(&stage.evidence_packet_json)
     .bind(&stage.recovery_snapshot_json)
     .bind(&stage.retry_reason)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert stage execution")?;
     Ok(())
@@ -100,6 +107,18 @@ pub async fn settle(
     kind: StageSettlementKind,
     at: DateTime<Utc>,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    settle_tx(&mut tx, id, kind, at).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn settle_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: StageExecutionId,
+    kind: StageSettlementKind,
+    at: DateTime<Utc>,
+) -> Result<()> {
     let id_str = id.to_string();
     let kind_str = kind.to_string();
     let at_str = at.to_rfc3339();
@@ -116,7 +135,7 @@ pub async fn settle(
     .bind(kind_str)
     .bind(at_str)
     .bind(id_str)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("settle stage execution")?;
     Ok(())

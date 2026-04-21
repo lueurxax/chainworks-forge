@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::SqlitePool;
+use serde::{Deserialize, Serialize};
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use db::repos::sessions;
 use domain::session::{
@@ -24,7 +25,7 @@ pub struct SessionPolicyInput {
     pub binding_fingerprint: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionPolicyDecision {
     pub lineage: SessionLineage,
     pub generation: SessionGeneration,
@@ -95,7 +96,7 @@ pub async fn ensure_policy(
                     lineage,
                     input,
                     SessionReuseDisposition::FreshSessionRequired,
-                    None,
+                    Some("policy_forbid".to_string()),
                     None,
                 )
                 .await;
@@ -114,7 +115,7 @@ pub async fn ensure_policy(
                     lineage,
                     input,
                     SessionReuseDisposition::FreshSessionRequired,
-                    None,
+                    Some("provider_mismatch".to_string()),
                     None,
                 )
                 .await;
@@ -135,7 +136,7 @@ pub async fn ensure_policy(
                     lineage,
                     input,
                     SessionReuseDisposition::FreshSessionRequired,
-                    None,
+                    Some("policy_forbid".to_string()),
                     None,
                 )
                 .await;
@@ -260,6 +261,233 @@ pub async fn ensure_policy(
     .await
 }
 
+pub async fn ensure_policy_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: SessionPolicyInput,
+) -> Result<SessionPolicyDecision> {
+    let lineage_key = input
+        .session_family_id
+        .clone()
+        .unwrap_or_else(|| input.agent_id.clone());
+
+    let lineage =
+        match sessions::find_lineage_by_run_and_key_tx(tx, &input.run_id, &lineage_key).await? {
+            Some(existing) => existing,
+            None => {
+                let lineage = SessionLineage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    run_id: input.run_id.clone(),
+                    agent_id: input.agent_id.clone(),
+                    lineage_id: lineage_key.clone(),
+                    session_reuse_scope: input
+                        .session_reuse_scope
+                        .clone()
+                        .unwrap_or_else(|| "none".into()),
+                    session_family_id: input.session_family_id.clone(),
+                    active_generation_id: None,
+                    created_at: Utc::now(),
+                    closed_at: None,
+                };
+                sessions::insert_lineage_tx(tx, &lineage).await?;
+                lineage
+            }
+        };
+
+    let active = sessions::find_active_generation_tx(tx, &lineage.id).await?;
+    let generations = sessions::list_generations_for_lineage_tx(tx, &lineage.id).await?;
+    if lineage.active_generation_id.is_some() && active.is_none() {
+        return create_generation_tx(
+            tx,
+            lineage,
+            input,
+            SessionReuseDisposition::UnverifiableSessionHistory,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    if let Some(active_generation) = active {
+        if active_generation.status == SessionGenerationStatus::Active {
+            let scope = lineage.session_reuse_scope.as_str();
+            if scope == "none" {
+                invalidate_generation_tx(
+                    tx,
+                    &lineage,
+                    &active_generation,
+                    "scope_none_requires_fresh_session",
+                )
+                .await?;
+                return create_generation_tx(
+                    tx,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshSessionRequired,
+                    Some("policy_forbid".to_string()),
+                    None,
+                )
+                .await;
+            }
+
+            if active_generation.binding_fingerprint != input.binding_fingerprint {
+                invalidate_generation_tx(
+                    tx,
+                    &lineage,
+                    &active_generation,
+                    "binding_fingerprint_changed",
+                )
+                .await?;
+                return create_generation_tx(
+                    tx,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshSessionRequired,
+                    Some("provider_mismatch".to_string()),
+                    None,
+                )
+                .await;
+            }
+
+            if scope == "same_invocation_owner"
+                && active_generation.invocation_owner_key != input.invocation_owner_key
+            {
+                invalidate_generation_tx(
+                    tx,
+                    &lineage,
+                    &active_generation,
+                    "invocation_owner_changed",
+                )
+                .await?;
+                return create_generation_tx(
+                    tx,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshSessionRequired,
+                    Some("policy_forbid".to_string()),
+                    None,
+                )
+                .await;
+            }
+
+            match budget::evaluate(
+                &budget_signals_from_generation_tx(tx, &active_generation).await,
+                &budget::BudgetConfig::default(),
+            ) {
+                BudgetDecision::ContinueReuse => {
+                    sessions::insert_event_tx(
+                        tx,
+                        &SessionEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            lineage_id: lineage.id.clone(),
+                            generation_id: active_generation.id.clone(),
+                            event_type: SessionEventType::Reused,
+                            recorded_at: Utc::now(),
+                            details_json: None,
+                        },
+                    )
+                    .await?;
+                    return Ok(SessionPolicyDecision {
+                        lineage,
+                        generation: active_generation,
+                        disposition: SessionReuseDisposition::Reused,
+                        should_reuse_live_session: true,
+                        session_reset_reason: None,
+                    });
+                }
+                BudgetDecision::Compact { reason } => {
+                    let checkpoint_artifact_id = domain::ids::ArtifactId::new().to_string();
+                    let end_reason =
+                        format!("budget_compaction_checkpoint:{checkpoint_artifact_id}");
+                    sessions::end_generation_tx(
+                        tx,
+                        &active_generation.id,
+                        SessionGenerationStatus::Closed,
+                        &end_reason,
+                        Utc::now(),
+                    )
+                    .await?;
+                    sessions::insert_event_tx(
+                        tx,
+                        &SessionEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            lineage_id: lineage.id.clone(),
+                            generation_id: active_generation.id.clone(),
+                            event_type: SessionEventType::Compacted,
+                            recorded_at: Utc::now(),
+                            details_json: Some(
+                                serde_json::json!({
+                                    "reason": reason,
+                                    "checkpoint_artifact_id": checkpoint_artifact_id,
+                                })
+                                .to_string(),
+                            ),
+                        },
+                    )
+                    .await?;
+                    return create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::ReusedAfterResume,
+                        None,
+                        Some(checkpoint_artifact_id),
+                    )
+                    .await;
+                }
+                BudgetDecision::Invalidate { reason } => {
+                    sessions::end_generation_tx(
+                        tx,
+                        &active_generation.id,
+                        SessionGenerationStatus::Invalidated,
+                        &reason,
+                        Utc::now(),
+                    )
+                    .await?;
+                    sessions::insert_event_tx(
+                        tx,
+                        &SessionEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            lineage_id: lineage.id.clone(),
+                            generation_id: active_generation.id.clone(),
+                            event_type: SessionEventType::BudgetExceeded,
+                            recorded_at: Utc::now(),
+                            details_json: Some(serde_json::json!({ "reason": reason }).to_string()),
+                        },
+                    )
+                    .await?;
+                    return create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterBudget,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let (disposition, checkpoint_artifact_id) = generations
+        .last()
+        .map(map_last_generation_state)
+        .unwrap_or((SessionReuseDisposition::Fresh, None));
+    let reset_reason = matches!(disposition, SessionReuseDisposition::FreshAfterReset)
+        .then(|| generations.last().and_then(extract_reset_reason))
+        .flatten();
+
+    create_generation_tx(
+        tx,
+        lineage,
+        input,
+        disposition,
+        reset_reason,
+        checkpoint_artifact_id,
+    )
+    .await
+}
+
 async fn budget_signals_from_generation(
     pool: &SqlitePool,
     generation: &SessionGeneration,
@@ -284,6 +512,50 @@ async fn budget_signals_from_generation(
     });
     let compaction_churn_count =
         sessions::count_generation_events(pool, &generation.id, SessionEventType::Compacted)
+            .await
+            .unwrap_or(0);
+    budget::BudgetSignals {
+        turn_count: generation.turn_count,
+        estimated_input_tokens: generation.estimated_input_tokens,
+        cumulative_prompt_tokens: generation.cumulative_prompt_tokens,
+        cumulative_cost_cents: generation.cumulative_cost_cents,
+        idle_age_seconds: (Utc::now()
+            - generation.last_activity_at.unwrap_or(generation.created_at))
+        .num_seconds() as f64,
+        transcript_growth_ratio,
+        cached_token_share,
+        normalized_savings_versus_fresh,
+        effective_prompt_size_fraction: generation.latest_model_context_window.and_then(|window| {
+            (window > 0).then_some(generation.estimated_input_tokens as f64 / window as f64)
+        }),
+        compaction_churn_count,
+    }
+}
+
+async fn budget_signals_from_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation: &SessionGeneration,
+) -> budget::BudgetSignals {
+    let fresh_baseline_estimate = std::cmp::max(
+        1_i64,
+        generation.cumulative_prompt_tokens / std::cmp::max(1_i64, generation.turn_count),
+    );
+    let transcript_growth_ratio =
+        Some(generation.estimated_input_tokens as f64 / fresh_baseline_estimate as f64);
+    let cached_token_share = generation
+        .latest_cached_input_tokens
+        .and_then(|cached_tokens| {
+            (generation.estimated_input_tokens > 0)
+                .then_some(cached_tokens as f64 / generation.estimated_input_tokens as f64)
+        });
+    let normalized_savings_versus_fresh = cached_token_share.map(|cache_share| {
+        let fresh_cost_cents = fresh_baseline_estimate as f64 / 1000.0;
+        let reuse_cost_cents =
+            generation.estimated_input_tokens as f64 / 1000.0 * (1.0 - cache_share * 0.5);
+        fresh_cost_cents - reuse_cost_cents
+    });
+    let compaction_churn_count =
+        sessions::count_generation_events_tx(tx, &generation.id, SessionEventType::Compacted)
             .await
             .unwrap_or(0);
     budget::BudgetSignals {
@@ -383,6 +655,35 @@ async fn invalidate_generation(
     Ok(())
 }
 
+async fn invalidate_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage: &SessionLineage,
+    generation: &SessionGeneration,
+    reason: &str,
+) -> Result<()> {
+    sessions::end_generation_tx(
+        tx,
+        &generation.id,
+        SessionGenerationStatus::Invalidated,
+        reason,
+        Utc::now(),
+    )
+    .await?;
+    sessions::insert_event_tx(
+        tx,
+        &SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            lineage_id: lineage.id.clone(),
+            generation_id: generation.id.clone(),
+            event_type: SessionEventType::Invalidated,
+            recorded_at: Utc::now(),
+            details_json: Some(serde_json::json!({ "reason": reason }).to_string()),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn create_generation(
     pool: &SqlitePool,
     lineage: SessionLineage,
@@ -421,6 +722,64 @@ async fn create_generation(
     sessions::set_active_generation(pool, &lineage.id, Some(&generation.id)).await?;
     sessions::insert_event(
         pool,
+        &SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            lineage_id: lineage.id.clone(),
+            generation_id: generation.id.clone(),
+            event_type: SessionEventType::Created,
+            recorded_at: Utc::now(),
+            details_json: None,
+        },
+    )
+    .await?;
+
+    Ok(SessionPolicyDecision {
+        lineage,
+        generation,
+        disposition,
+        should_reuse_live_session: false,
+        session_reset_reason,
+    })
+}
+
+async fn create_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage: SessionLineage,
+    input: SessionPolicyInput,
+    disposition: SessionReuseDisposition,
+    session_reset_reason: Option<String>,
+    rehydrated_from_checkpoint_artifact_id: Option<String>,
+) -> Result<SessionPolicyDecision> {
+    let generation_number = sessions::next_generation_number_tx(tx, &lineage.id).await?;
+    let generation = SessionGeneration {
+        id: uuid::Uuid::new_v4().to_string(),
+        lineage_id: lineage.id.clone(),
+        generation: generation_number,
+        invocation_owner_key: input.invocation_owner_key,
+        provider_session_id: None,
+        binding_fingerprint: input.binding_fingerprint,
+        rehydrated_from_checkpoint_artifact_id,
+        working_directory: input.working_directory,
+        workspace_mode: input.workspace_mode,
+        runtime_provider: input.provider,
+        runtime_model: input.model,
+        status: SessionGenerationStatus::Active,
+        turn_count: 0,
+        estimated_input_tokens: 0,
+        latest_cached_input_tokens: None,
+        latest_output_tokens: None,
+        latest_model_context_window: None,
+        cumulative_prompt_tokens: 0,
+        cumulative_cost_cents: 0,
+        created_at: Utc::now(),
+        last_activity_at: None,
+        ended_at: None,
+        end_reason: None,
+    };
+    sessions::insert_generation_tx(tx, &generation).await?;
+    sessions::set_active_generation_tx(tx, &lineage.id, Some(&generation.id)).await?;
+    sessions::insert_event_tx(
+        tx,
         &SessionEvent {
             id: uuid::Uuid::new_v4().to_string(),
             lineage_id: lineage.id.clone(),
@@ -514,6 +873,7 @@ mod tests {
                 catalog_snapshot_json: None,
                 drift_detected_at: None,
                 drift_details_json: None,
+                chainworks_meta_root: None,
             },
         )
         .await

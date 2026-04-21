@@ -3,23 +3,27 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_executions, approvals, command_journal, ideas, projections, runs, sessions, stages,
-    work_items,
+    agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
+    ideas, projections, runs, sessions, stages, work_items,
 };
-use db::work_item::WorkItemKind;
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
+use domain::PrincipalClass;
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
-use crate::preflight::{run_delivery_preflight, DeliveryPreflightResult};
+use crate::preflight::{
+    missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
+};
 use crate::work_queue::WorkQueue;
 
 pub struct CommandHandler {
@@ -38,6 +42,7 @@ pub enum CommandResult {
     RunCancelled { run_id: RunId },
     SessionReset { run_id: RunId, stage_id: String },
     StewardAnalysisQueued,
+    ArtifactContractOverrideCreated { override_id: String },
 }
 
 pub struct StartRunBlockedByDeliveryPreflight {
@@ -51,9 +56,25 @@ pub struct Commanded {
     pub journal_id: String,
 }
 
+fn plan_requires_delivery_configuration(plan: &workflow::plan::RunPlan) -> bool {
+    plan.states.values().any(|state| {
+        state
+            .tasks
+            .iter()
+            .chain(state.post_approval_tasks.iter())
+            .any(|task| is_release_agent(&task.agent.agent_id))
+    })
+}
+
+fn is_release_agent(agent_id: &str) -> bool {
+    matches!(
+        agent_id,
+        "commit_and_push_to_github" | "build_archive_and_push_connect"
+    )
+}
+
 impl CommandHandler {
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
-        let work_queue = work_queue.with_event_sender(events.clone());
         Self {
             pool,
             events,
@@ -68,7 +89,6 @@ impl CommandHandler {
         work_queue: WorkQueue,
         acp: Arc<AcpRuntimeManager>,
     ) -> Self {
-        let work_queue = work_queue.with_event_sender(events.clone());
         Self {
             pool,
             events,
@@ -78,6 +98,12 @@ impl CommandHandler {
     }
 
     pub async fn handle(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
+        if matches!(&cmd, Command::OverrideArtifactContract(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: OverrideArtifactContract requires operator principal");
+        }
+
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal_id = uuid::Uuid::new_v4().to_string();
         let cmd_type = match &cmd {
@@ -88,6 +114,7 @@ impl CommandHandler {
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
+            Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
         };
         let raw = serde_json::to_string(&cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(&cmd, &raw);
@@ -99,6 +126,7 @@ impl CommandHandler {
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
+            Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
         };
         let now = Utc::now();
         let principal_class_str = caller.principal_class.to_string();
@@ -114,11 +142,12 @@ impl CommandHandler {
             Some(&caller.principal_id),
             Some(&principal_class_str),
             Some(&caller.caller_tool),
+            caller.request_id.as_deref(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
 
-        let result = self.execute_command(cmd).await;
+        let result = self.execute_command(cmd, &journal_id).await;
 
         // Completion/failure are best-effort — log errors but don't fail the command
         let completed_at = Utc::now();
@@ -150,7 +179,7 @@ impl CommandHandler {
         })
     }
 
-    async fn execute_command(&self, cmd: Command) -> Result<CommandResult> {
+    async fn execute_command(&self, cmd: Command, journal_id: &str) -> Result<CommandResult> {
         match cmd {
             Command::StartRun(c) => {
                 let now = Utc::now();
@@ -172,6 +201,12 @@ impl CommandHandler {
                             ));
                         }
                         Some(serde_json::to_string(&preflight)?)
+                    } else if plan_requires_delivery_configuration(&plan) {
+                        return Ok(CommandResult::StartRunBlockedByDeliveryPreflight(
+                            StartRunBlockedByDeliveryPreflight {
+                                delivery_preflight: missing_delivery_configuration_preflight(),
+                            },
+                        ));
                     } else {
                         None
                     };
@@ -220,6 +255,9 @@ impl CommandHandler {
                     catalog_snapshot_json: Some(plan.catalog_snapshot_json.clone()),
                     drift_detected_at: None,
                     drift_details_json: None,
+                    // P050: Per-run workspace isolation. All YAML artifact paths
+                    // resolve through this meta root instead of shared .chainworks/.
+                    chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
                 };
                 runs::insert(&self.pool, &run).await?;
                 // Activate the idea when its first run starts.
@@ -243,6 +281,26 @@ impl CommandHandler {
                     )
                     .await?;
                 Ok(CommandResult::RunStarted { run_id })
+            }
+
+            Command::OverrideArtifactContract(c) => {
+                let override_id = db::repos::artifact_contracts::create_override_and_rebuild(
+                    &self.pool,
+                    domain::artifact_contracts::ArtifactContractOverrideInput {
+                        run_id: c.run_id,
+                        contract_id: c.contract_id,
+                        override_type: c.override_type,
+                        from_status: c.from_status,
+                        to_status: c.to_status,
+                        reason: c.reason,
+                        owner: "operator".to_string(),
+                        source_artifacts: c.source_artifacts,
+                        expires_at_stage: c.expires_at_stage,
+                        journal_id: journal_id.to_string(),
+                    },
+                )
+                .await?;
+                Ok(CommandResult::ArtifactContractOverrideCreated { override_id })
             }
 
             Command::ApproveStage(c) => {
@@ -359,24 +417,50 @@ impl CommandHandler {
                 )
                 .await?;
 
-                // Update stage to Blocked
+                let mut should_enqueue_advance = false;
+
+                // Workflow manual gates use rejection as transition evidence so
+                // the state machine can route normal loopbacks such as state_6 -> state_5.
+                // Non-manual stages retain the existing rejection-as-blocked behavior.
                 let run_stages = stages::list_by_run(&self.pool, c.run_id).await?;
                 if let Some(stage) = run_stages
                     .iter()
                     .find(|s| s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval)
                 {
-                    stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
-                    let _ = self.events.send(DomainEvent::StageStatusChanged {
-                        run_id: c.run_id,
-                        stage_execution_id: stage.id,
-                        status: StageStatus::Blocked,
-                    });
+                    if stage.stage_type.as_deref() == Some("manual_gate") {
+                        stages::settle(&self.pool, stage.id, StageSettlementKind::Completed, now)
+                            .await?;
+                        should_enqueue_advance = true;
+                        let _ = self.events.send(DomainEvent::StageStatusChanged {
+                            run_id: c.run_id,
+                            stage_execution_id: stage.id,
+                            status: StageStatus::Completed,
+                        });
+                    } else {
+                        stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+                        let _ = self.events.send(DomainEvent::StageStatusChanged {
+                            run_id: c.run_id,
+                            stage_execution_id: stage.id,
+                            status: StageStatus::Blocked,
+                        });
+                    }
                 }
 
                 let _ = self.events.send(DomainEvent::ApprovalResolved {
                     approval_id: approval.id,
                     decision: ApprovalDecision::Rejected,
                 });
+
+                if should_enqueue_advance {
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(c.run_id),
+                            None,
+                            serde_json::json!({ "run_id": c.run_id.to_string() }),
+                        )
+                        .await?;
+                }
 
                 // Refresh projections so reads reflect the rejection.
                 projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
@@ -388,24 +472,44 @@ impl CommandHandler {
 
             Command::RetryStage(c) => {
                 let run_stages = stages::list_by_run(&self.pool, c.run_id).await?;
-                let old_stage = run_stages
+                let matching_stages = run_stages
                     .iter()
-                    .find(|s| s.stage_id == c.stage_id)
+                    .filter(|s| s.stage_id == c.stage_id)
+                    .collect::<Vec<_>>();
+                let old_stage = matching_stages
+                    .iter()
+                    .copied()
+                    .max_by_key(|s| s.started_at)
                     .ok_or_else(|| anyhow!("Stage {} not found", c.stage_id))?;
+                let completed_current_stage_on_blocked_run =
+                    if old_stage.status == StageStatus::Completed {
+                        let run = runs::find_by_id(&self.pool, c.run_id)
+                            .await?
+                            .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                        run.status == RunStatus::Blocked
+                            && (run.current_state.as_deref() == Some(c.stage_id.as_str())
+                                || old_stage.stage_id == c.stage_id)
+                    } else {
+                        false
+                    };
+
+                if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
+                    && !completed_current_stage_on_blocked_run
+                {
+                    return Err(anyhow!(
+                        "Stage {} latest attempt is {} and cannot be retried yet",
+                        c.stage_id,
+                        old_stage.status
+                    ));
+                }
+                let next_attempt_number = matching_stages
+                    .iter()
+                    .map(|s| s.attempt_number)
+                    .max()
+                    .unwrap_or(old_stage.attempt_number)
+                    + 1;
 
                 let now = Utc::now();
-                // Mark old stage as skipped
-                stages::settle(&self.pool, old_stage.id, StageSettlementKind::Skipped, now).await?;
-                agent_executions::cancel_running_by_stage(&self.pool, old_stage.id, now).await?;
-                work_items::cancel_running_invoke_agent_by_stage(
-                    &self.pool,
-                    c.run_id,
-                    &old_stage.stage_id,
-                    old_stage.id,
-                )
-                .await?;
-
-                // Create new stage execution with attempt+1
                 let new_stage = StageExecution {
                     id: domain::ids::StageExecutionId::new(),
                     run_id: c.run_id,
@@ -413,7 +517,7 @@ impl CommandHandler {
                     label: old_stage.label.clone(),
                     status: StageStatus::Pending,
                     iteration: old_stage.iteration,
-                    attempt_number: old_stage.attempt_number + 1,
+                    attempt_number: next_attempt_number,
                     settlement_kind: None,
                     started_at: now,
                     completed_at: None,
@@ -426,16 +530,57 @@ impl CommandHandler {
                     recovery_snapshot_json: None,
                     retry_reason: Some("operator_retry".into()),
                 };
-                stages::insert(&self.pool, &new_stage).await?;
-
-                self.work_queue
-                    .enqueue(
-                        WorkItemKind::AdvanceRun,
-                        Some(c.run_id),
-                        Some(c.stage_id.clone()),
-                        serde_json::json!({ "run_id": c.run_id.to_string(), "stage_id": c.stage_id }),
-                    )
-                    .await?;
+                let retry_advance_work_item_id = new_stage.id.to_string();
+                let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
+                let retry_tx_started = Instant::now();
+                let mut retry_tx =
+                    db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
+                apply_quota_retry_budget_for_stage_tx(
+                    &mut retry_tx,
+                    c.run_id,
+                    old_stage.id,
+                    c.consume_quota_budget_now,
+                    journal_id,
+                )
+                .await?;
+                stages::settle_tx(
+                    &mut retry_tx,
+                    old_stage.id,
+                    StageSettlementKind::Skipped,
+                    now,
+                )
+                .await?;
+                stages::insert_tx(&mut retry_tx, &new_stage).await?;
+                artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
+                    &mut retry_tx,
+                    c.run_id,
+                    &old_stage.id.to_string(),
+                    &retry_invoke_work_item_id,
+                    journal_id,
+                )
+                .await?;
+                work_items::enqueue_tx(
+                    &mut retry_tx,
+                    &WorkItem {
+                        id: retry_advance_work_item_id,
+                        kind: WorkItemKind::AdvanceRun,
+                        payload_json: serde_json::json!({
+                            "run_id": c.run_id.to_string(),
+                            "stage_id": c.stage_id.clone()
+                        })
+                        .to_string(),
+                        status: WorkItemStatus::Pending,
+                        run_id: Some(c.run_id),
+                        stage_id: Some(c.stage_id.clone()),
+                        created_at: now,
+                        scheduled_at: now,
+                        attempt_count: 0,
+                        last_error: None,
+                    },
+                )
+                .await?;
+                retry_tx.commit().await?;
+                db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
 
                 // Refresh projections so reads reflect the retry.
                 projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
@@ -457,7 +602,6 @@ impl CommandHandler {
 
                 let now = Utc::now();
                 cancellation::begin_settlement(&self.pool, c.run_id, now).await?;
-                self.work_queue.refresh_scheduler_projection().await?;
 
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
@@ -620,4 +764,38 @@ impl CommandHandler {
             }
         }
     }
+}
+
+async fn apply_quota_retry_budget_for_stage_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    consume_quota_budget_now: bool,
+    journal_id: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let ledgers =
+        agent_retry_budget_ledger::list_quota_for_stage_tx(tx, run_id, stage_execution_id).await?;
+    for ledger in ledgers {
+        if ledger.normal_budget_consumed {
+            continue;
+        }
+        match ledger.retry_after {
+            Some(retry_after) if retry_after > now => {
+                if !consume_quota_budget_now {
+                    return Err(anyhow!(
+                        "quota retry_after has not elapsed for stage {}; retry after {} or set consume_quota_budget_now=true",
+                        stage_execution_id,
+                        retry_after.to_rfc3339()
+                    ));
+                }
+                agent_retry_budget_ledger::consume_early_quota_retry_tx(tx, &ledger.id, journal_id)
+                    .await?;
+            }
+            _ => {
+                agent_retry_budget_ledger::mark_quota_reset_elapsed_tx(tx, &ledger.id).await?;
+            }
+        }
+    }
+    Ok(())
 }

@@ -1,12 +1,22 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::session::{
     SessionEvent, SessionEventType, SessionGeneration, SessionGenerationStatus, SessionLineage,
 };
 
 pub async fn insert_lineage(pool: &SqlitePool, lineage: &SessionLineage) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_lineage_tx(&mut tx, lineage).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_lineage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage: &SessionLineage,
+) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO session_lineages
            (id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id, active_generation_id, created_at, closed_at)
@@ -21,13 +31,23 @@ pub async fn insert_lineage(pool: &SqlitePool, lineage: &SessionLineage) -> Resu
     .bind(&lineage.active_generation_id)
     .bind(lineage.created_at.to_rfc3339())
     .bind(lineage.closed_at.map(|v| v.to_rfc3339()))
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert session_lineage")?;
     Ok(())
 }
 
 pub async fn insert_generation(pool: &SqlitePool, generation: &SessionGeneration) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_generation_tx(&mut tx, generation).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation: &SessionGeneration,
+) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO session_generations
            (id, lineage_id, generation, invocation_owner_key, provider_session_id, binding_fingerprint,
@@ -60,13 +80,20 @@ pub async fn insert_generation(pool: &SqlitePool, generation: &SessionGeneration
     .bind(generation.last_activity_at.map(|v| v.to_rfc3339()))
     .bind(generation.ended_at.map(|v| v.to_rfc3339()))
     .bind(&generation.end_reason)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert session_generation")?;
     Ok(())
 }
 
 pub async fn insert_event(pool: &SqlitePool, event: &SessionEvent) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_event_tx(&mut tx, event).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_event_tx(tx: &mut Transaction<'_, Sqlite>, event: &SessionEvent) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO session_events
            (id, lineage_id, generation_id, event_type, recorded_at, details_json)
@@ -78,7 +105,7 @@ pub async fn insert_event(pool: &SqlitePool, event: &SessionEvent) -> Result<()>
     .bind(session_event_type_to_str(&event.event_type))
     .bind(event.recorded_at.to_rfc3339())
     .bind(&event.details_json)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert session_event")?;
     Ok(())
@@ -107,6 +134,29 @@ pub async fn list_generations_for_lineage(
     rows.into_iter().map(parse_generation_row).collect()
 }
 
+pub async fn list_generations_for_lineage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage_id: &str,
+) -> Result<Vec<SessionGeneration>> {
+    let rows = sqlx::query(
+        r#"SELECT id, lineage_id, generation, invocation_owner_key, provider_session_id,
+                  binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+                  workspace_mode, runtime_provider, runtime_model, status, turn_count,
+                  estimated_input_tokens, latest_cached_input_tokens, latest_output_tokens,
+                  latest_model_context_window, cumulative_prompt_tokens, cumulative_cost_cents,
+                  created_at, last_activity_at, ended_at, end_reason
+           FROM session_generations
+           WHERE lineage_id = ?1
+           ORDER BY generation ASC"#,
+    )
+    .bind(lineage_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("list session_generations for lineage")?;
+
+    rows.into_iter().map(parse_generation_row).collect()
+}
+
 pub async fn find_lineage_by_run_and_key(
     pool: &SqlitePool,
     run_id: &str,
@@ -123,6 +173,62 @@ pub async fn find_lineage_by_run_and_key(
     .fetch_optional(pool)
     .await
     .context("find session_lineage by run and key")?;
+
+    row.map(parse_lineage_row).transpose()
+}
+
+pub async fn find_lineage_by_id(
+    pool: &SqlitePool,
+    lineage_row_id: &str,
+) -> Result<Option<SessionLineage>> {
+    let row = sqlx::query(
+        r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                  active_generation_id, created_at, closed_at
+           FROM session_lineages
+           WHERE id = ?1"#,
+    )
+    .bind(lineage_row_id)
+    .fetch_optional(pool)
+    .await
+    .context("find session_lineage by id")?;
+
+    row.map(parse_lineage_row).transpose()
+}
+
+pub async fn find_lineage_by_run_and_key_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    lineage_key: &str,
+) -> Result<Option<SessionLineage>> {
+    let row = sqlx::query(
+        r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                  active_generation_id, created_at, closed_at
+           FROM session_lineages
+           WHERE run_id = ?1 AND lineage_id = ?2"#,
+    )
+    .bind(run_id)
+    .bind(lineage_key)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find session_lineage by run and key")?;
+
+    row.map(parse_lineage_row).transpose()
+}
+
+pub async fn find_lineage_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage_row_id: &str,
+) -> Result<Option<SessionLineage>> {
+    let row = sqlx::query(
+        r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                  active_generation_id, created_at, closed_at
+           FROM session_lineages
+           WHERE id = ?1"#,
+    )
+    .bind(lineage_row_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find session_lineage by id")?;
 
     row.map(parse_lineage_row).transpose()
 }
@@ -150,6 +256,73 @@ pub async fn find_active_generation(
     row.map(parse_generation_row).transpose()
 }
 
+pub async fn find_generation_by_id(
+    pool: &SqlitePool,
+    generation_id: &str,
+) -> Result<Option<SessionGeneration>> {
+    let row = sqlx::query(
+        r#"SELECT id, lineage_id, generation, invocation_owner_key, provider_session_id,
+                  binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+                  workspace_mode, runtime_provider, runtime_model, status, turn_count,
+                  estimated_input_tokens, latest_cached_input_tokens, latest_output_tokens,
+                  latest_model_context_window, cumulative_prompt_tokens, cumulative_cost_cents,
+                  created_at, last_activity_at, ended_at, end_reason
+           FROM session_generations
+           WHERE id = ?1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await
+    .context("find session_generation by id")?;
+
+    row.map(parse_generation_row).transpose()
+}
+
+pub async fn find_active_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage_id: &str,
+) -> Result<Option<SessionGeneration>> {
+    let row = sqlx::query(
+        r#"SELECT g.id, g.lineage_id, g.generation, g.invocation_owner_key, g.provider_session_id,
+                  g.binding_fingerprint, g.rehydrated_from_checkpoint_artifact_id, g.working_directory,
+                  g.workspace_mode, g.runtime_provider, g.runtime_model, g.status, g.turn_count,
+                  g.estimated_input_tokens, g.latest_cached_input_tokens, g.latest_output_tokens,
+                  g.latest_model_context_window, g.cumulative_prompt_tokens, g.cumulative_cost_cents,
+                  g.created_at, g.last_activity_at, g.ended_at, g.end_reason
+           FROM session_generations g
+           INNER JOIN session_lineages l ON l.active_generation_id = g.id
+           WHERE l.id = ?1"#,
+    )
+    .bind(lineage_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find active session_generation")?;
+
+    row.map(parse_generation_row).transpose()
+}
+
+pub async fn find_generation_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation_id: &str,
+) -> Result<Option<SessionGeneration>> {
+    let row = sqlx::query(
+        r#"SELECT id, lineage_id, generation, invocation_owner_key, provider_session_id,
+                  binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+                  workspace_mode, runtime_provider, runtime_model, status, turn_count,
+                  estimated_input_tokens, latest_cached_input_tokens, latest_output_tokens,
+                  latest_model_context_window, cumulative_prompt_tokens, cumulative_cost_cents,
+                  created_at, last_activity_at, ended_at, end_reason
+           FROM session_generations
+           WHERE id = ?1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find session_generation by id")?;
+
+    row.map(parse_generation_row).transpose()
+}
+
 pub async fn next_generation_number(pool: &SqlitePool, lineage_id: &str) -> Result<i64> {
     let row = sqlx::query(
         r#"SELECT COALESCE(MAX(generation), 0) + 1 AS next_generation
@@ -163,15 +336,42 @@ pub async fn next_generation_number(pool: &SqlitePool, lineage_id: &str) -> Resu
     Ok(row.get("next_generation"))
 }
 
+pub async fn next_generation_number_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage_id: &str,
+) -> Result<i64> {
+    let row = sqlx::query(
+        r#"SELECT COALESCE(MAX(generation), 0) + 1 AS next_generation
+           FROM session_generations
+           WHERE lineage_id = ?1"#,
+    )
+    .bind(lineage_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("compute next session generation number")?;
+    Ok(row.get("next_generation"))
+}
+
 pub async fn set_active_generation(
     pool: &SqlitePool,
+    lineage_id: &str,
+    generation_id: Option<&str>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    set_active_generation_tx(&mut tx, lineage_id, generation_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn set_active_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     lineage_id: &str,
     generation_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(r#"UPDATE session_lineages SET active_generation_id = ?1 WHERE id = ?2"#)
         .bind(generation_id)
         .bind(lineage_id)
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .context("set active generation on lineage")?;
     Ok(())
@@ -179,6 +379,19 @@ pub async fn set_active_generation(
 
 pub async fn end_generation(
     pool: &SqlitePool,
+    generation_id: &str,
+    status: SessionGenerationStatus,
+    end_reason: &str,
+    ended_at: DateTime<Utc>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    end_generation_tx(&mut tx, generation_id, status, end_reason, ended_at).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn end_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     generation_id: &str,
     status: SessionGenerationStatus,
     end_reason: &str,
@@ -193,7 +406,7 @@ pub async fn end_generation(
     .bind(end_reason)
     .bind(ended_at.to_rfc3339())
     .bind(generation_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("end session generation")?;
     Ok(())
@@ -255,6 +468,25 @@ pub async fn count_generation_events(
     .bind(generation_id)
     .bind(session_event_type_to_str(&event_type))
     .fetch_one(pool)
+    .await
+    .context("count session generation events")?;
+    Ok(row.get("event_count"))
+}
+
+pub async fn count_generation_events_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation_id: &str,
+    event_type: SessionEventType,
+) -> Result<i64> {
+    let row = sqlx::query(
+        r#"SELECT COUNT(*) AS event_count
+           FROM session_events
+           WHERE generation_id = ?1
+             AND event_type = ?2"#,
+    )
+    .bind(generation_id)
+    .bind(session_event_type_to_str(&event_type))
+    .fetch_one(&mut **tx)
     .await
     .context("count session generation events")?;
     Ok(row.get("event_count"))
@@ -334,7 +566,7 @@ fn parse_dt(raw: &str) -> Result<DateTime<Utc>> {
         .with_timezone(&Utc))
 }
 
-fn session_generation_status_to_str(status: &SessionGenerationStatus) -> &'static str {
+pub fn session_generation_status_to_str(status: &SessionGenerationStatus) -> &'static str {
     match status {
         SessionGenerationStatus::Active => "active",
         SessionGenerationStatus::Invalidated => "invalidated",

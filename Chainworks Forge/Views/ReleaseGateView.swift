@@ -54,6 +54,20 @@ struct ReleaseGateView: View {
         artifact(named: "approved_proposal") != nil ? .openProposal : .rejectRelease
     }
 
+    private var implementationSelfAssessmentSummary: ImplementationSelfAssessmentDisplaySummary? {
+        ImplementationSelfAssessmentDisplayAdapter.summary(from: run, artifacts: allArtifacts)
+    }
+
+    private var releaseEvidenceBlocked: Bool {
+        implementationSelfAssessmentSummary?.status == "blocked"
+            || implementationSelfAssessmentSummary?.verificationGreen == false
+    }
+
+    private var implementationSelfAssessmentArtifact: Artifact? {
+        artifact(named: "implementation_self_assessment_v2")
+            ?? artifact(named: "implementation_self_assessment")
+    }
+
     private var focusProofLabel: String {
         "Focused: \(focusedTarget?.label ?? initialFocusTarget.label)"
     }
@@ -124,6 +138,7 @@ struct ReleaseGateView: View {
                 .tint(DesignTokens.Action.caution)
                 // Proposal 012 (L-09): Keyboard shortcut for approve
                 .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(releaseEvidenceBlocked)
                 .accessibilityIdentifier("release-gate-approve-button")
                 .accessibilitySortPriority(1)
                 .focusable(focusProofEnabled)
@@ -205,7 +220,7 @@ struct ReleaseGateView: View {
                 reviewRow("Security Report", artifactName: "security_report", in: allArtifacts)
                 reviewRow("Pre-Push Review", artifactName: "prepush_review_report", in: allArtifacts)
                 reviewRow("Docs Report", artifactName: "docs_report", in: allArtifacts)
-                reviewRow("Tests Result", artifactName: "tests_result", in: allArtifacts)
+                testsResultReviewRow(in: allArtifacts)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -241,6 +256,25 @@ struct ReleaseGateView: View {
                     .font(DesignTokens.Typography.supporting)
                     .foregroundStyle(DesignTokens.Status.neutral)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func testsResultReviewRow(in artifacts: [Artifact]) -> some View {
+        if let summary = implementationSelfAssessmentSummary {
+            HStack {
+                Image(systemName: summary.verificationGreen == true ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .foregroundStyle(summary.verificationGreen == true ? DesignTokens.Status.success : DesignTokens.Status.warning)
+                Text("Tests Result")
+                Spacer()
+                StatusCapsule(
+                    text: summary.verificationLabel,
+                    color: summary.verificationGreen == true ? DesignTokens.Status.success : DesignTokens.Status.warning,
+                    size: .small
+                )
+            }
+        } else {
+            reviewRow("Tests Result", artifactName: "tests_result", in: artifacts)
         }
     }
 
@@ -299,6 +333,41 @@ struct ReleaseGateView: View {
                     .font(.headline)
 
                 let artifacts = allArtifacts
+
+                if releaseEvidenceBlocked {
+                    LabeledContent("Verification Hold") {
+                        StatusCapsule(
+                            text: "Release Evidence Blocked",
+                            color: DesignTokens.Status.warning,
+                            size: .small
+                        )
+                    }
+                }
+
+                if releaseEvidenceBlocked,
+                   let summary = implementationSelfAssessmentSummary,
+                   !summary.handoffTasks.isEmpty {
+                    let blockingReviewCount = summary.handoffTasks.filter(\.blocking).count
+                    LabeledContent("Pending Handoff Tasks") {
+                        StatusCapsule(
+                            text: blockingReviewCount > 0
+                                ? "\(summary.handoffTasks.count) total · \(blockingReviewCount) blocking review"
+                                : "\(summary.handoffTasks.count) total",
+                            color: blockingReviewCount > 0 ? DesignTokens.Status.warning : DesignTokens.Status.info,
+                            size: .small
+                        )
+                    }
+                    if let selfAssessmentArtifact = implementationSelfAssessmentArtifact {
+                        Button {
+                            openArtifact(selfAssessmentArtifact)
+                        } label: {
+                            Label("Open Implementation Self-Assessment", systemImage: "arrow.up.right.square")
+                                .font(.callout)
+                        }
+                        .buttonStyle(.link)
+                        .accessibilityIdentifier("release-gate-open-implementation-self-assessment")
+                    }
+                }
 
                 // Diff stat
                 if let changedFiles = artifacts.first(where: { $0.name == "changed_files_manifest" }) {

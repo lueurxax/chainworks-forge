@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::adapters::auggie::AuggieAdapter;
 use crate::adapters::claude::ClaudeAgentAdapter;
@@ -12,7 +12,7 @@ use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::AcpAdapter;
 use crate::session::AcpSessionHandle;
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::{AcpCloseDiagnostic, ExecutionRequest, ExecutionResult};
 
 /// Manages ACP provider adapters and owns any live reusable sessions.
 pub struct AcpRuntimeManager {
@@ -63,16 +63,23 @@ impl AcpRuntimeManager {
     }
 
     async fn live_session(&self, generation_id: &str) -> Result<AcpSessionHandle> {
-        self.live_sessions
-            .lock()
-            .await
-            .get(generation_id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No live ACP session registered for generation id '{generation_id}'"
-                )
-            })
+        let session = {
+            let sessions = self.live_sessions.lock().await;
+            sessions.get(generation_id).cloned()
+        };
+        let Some(session) = session else {
+            return Err(anyhow::anyhow!(
+                "No live ACP session registered for generation id '{generation_id}'"
+            ));
+        };
+        if session.is_alive().await {
+            return Ok(session);
+        }
+
+        self.live_sessions.lock().await.remove(generation_id);
+        Err(anyhow::anyhow!(
+            "No live ACP session registered for generation id '{generation_id}'"
+        ))
     }
 
     pub async fn has_live_session(
@@ -87,10 +94,19 @@ impl AcpRuntimeManager {
         let Some(session) = session else {
             return false;
         };
-        match provider_session_id {
+        let provider_matches = match provider_session_id {
             Some(expected) => session.provider_session_id().await == expected,
             None => true,
+        };
+        if !provider_matches {
+            return false;
         }
+
+        let alive = session.is_alive().await;
+        if !alive {
+            self.live_sessions.lock().await.remove(generation_id);
+        }
+        alive
     }
 
     /// Start a fresh ACP session and keep it alive if requested.
@@ -104,23 +120,33 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: starting session"
         );
 
-        let session = adapter.open_session(&req).await?;
-        let mut result = session.prompt(&req).await?;
-        if req.keep_session_alive {
-            let generation_id = req.session_generation_id.clone().ok_or_else(|| {
-                anyhow::anyhow!("keep_session_alive requested without session_generation_id")
-            })?;
-            self.live_sessions
-                .lock()
-                .await
-                .insert(generation_id.clone(), session);
-            result.session_generation_id = Some(generation_id);
-            result.reused_existing_session = false;
-            return Ok(result);
+        if !req.keep_session_alive {
+            return adapter.execute(req).await;
         }
 
-        session.close().await?;
-        result.session_generation_id = None;
+        let session = adapter.open_session(&req).await?;
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(prompt_error) => {
+                if let Err(close_error) = session.close().await {
+                    warn!(
+                        provider = %provider,
+                        run_id = %req.run_id,
+                        stage_id = %req.stage_id,
+                        "ACP keep-alive session close after prompt error failed: {close_error}"
+                    );
+                }
+                return Err(prompt_error);
+            }
+        };
+        let generation_id = req.session_generation_id.clone().ok_or_else(|| {
+            anyhow::anyhow!("keep_session_alive requested without session_generation_id")
+        })?;
+        self.live_sessions
+            .lock()
+            .await
+            .insert(generation_id.clone(), session);
+        result.session_generation_id = Some(generation_id);
         result.reused_existing_session = false;
         Ok(result)
     }
@@ -151,14 +177,37 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: reusing live session"
         );
 
-        let mut result = session.prompt(&req).await?;
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(prompt_error) => {
+                let removed_session = self
+                    .live_sessions
+                    .lock()
+                    .await
+                    .remove(session_generation_id);
+                let session_to_close = removed_session.unwrap_or_else(|| session.clone());
+                if let Err(close_error) = session_to_close.close().await {
+                    warn!(
+                        provider = %req.provider,
+                        run_id = %req.run_id,
+                        stage_id = %req.stage_id,
+                        session_generation_id = %session_generation_id,
+                        "ACP reused session close after prompt error failed: {close_error}"
+                    );
+                }
+                return Err(prompt_error);
+            }
+        };
         result.session_generation_id = Some(session_generation_id.to_string());
         result.reused_existing_session = true;
         Ok(result)
     }
 
     /// Close and remove a live ACP session.
-    pub async fn close_session(&self, session_generation_id: &str) -> Result<()> {
+    pub async fn close_session(
+        &self,
+        session_generation_id: &str,
+    ) -> Result<Option<AcpCloseDiagnostic>> {
         let session = self
             .live_sessions
             .lock()

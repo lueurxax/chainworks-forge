@@ -1,5 +1,6 @@
-import SwiftUI
+import AppKit
 import SwiftData
+import SwiftUI
 import UniformTypeIdentifiers
 
 struct IdeaListView: View {
@@ -63,7 +64,9 @@ struct IdeaListView: View {
                         StyledEmptyState(
                             title: archivedIdeas.isEmpty ? "No ideas yet" : "No active ideas",
                             systemImage: "lightbulb",
-                            description: archivedIdeas.isEmpty ? "Create your first idea to get started." : "Open the archive lane to restore an idea or create a new one.",
+                            description: archivedIdeas.isEmpty
+                                ? "Create your first idea to get started."
+                                : "Open the archive lane to restore an idea or create a new one.",
                             actionTitle: "New Idea"
                         ) {
                             presentNewIdeaSheet()
@@ -139,7 +142,8 @@ struct IdeaListView: View {
                 StyledEmptyState(
                     title: "Select an Idea",
                     systemImage: "lightbulb",
-                    description: "Choose an idea from the list or create a new one to configure its project directory and start a run."
+                    description:
+                        "Choose an idea from the list or create a new one to configure its project directory and start a run."
                 )
             }
         }
@@ -168,9 +172,13 @@ struct IdeaListView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Ideas")
                         .font(.title3.weight(.semibold))
-                    Text(metrics.attentionCount > 0 ? "\(metrics.attentionCount) need attention" : "Operator workspace")
-                        .font(.caption)
-                        .foregroundStyle(metrics.attentionCount > 0 ? DesignTokens.Status.warning : .secondary)
+                    Text(
+                        metrics.attentionCount > 0
+                            ? "\(metrics.attentionCount) need attention" : "Operator workspace"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(
+                        metrics.attentionCount > 0 ? DesignTokens.Status.warning : .secondary)
                 }
                 Spacer()
                 if metrics.attentionCount > 0 {
@@ -218,8 +226,11 @@ struct IdeaListView: View {
 
             HStack(spacing: 8) {
                 if executionService.hasActiveRuns {
-                    Label("\(executionService.activeOrchestrators.count) run\(executionService.activeOrchestrators.count == 1 ? "" : "s") active", systemImage: "play.circle.fill")
-                        .foregroundStyle(DesignTokens.Status.success)
+                    Label(
+                        "\(executionService.activeOrchestrators.count) run\(executionService.activeOrchestrators.count == 1 ? "" : "s") active",
+                        systemImage: "play.circle.fill"
+                    )
+                    .foregroundStyle(DesignTokens.Status.success)
                 }
                 switch executionService.liveRuntimeReadiness {
                 case .ready(_, let source):
@@ -274,7 +285,9 @@ struct IdeaListView: View {
     }
 
     /// Pill-shaped chip for the summary strip.
-    private func summaryChip(label: String, icon: String, color: Color, accessibilityIdentifier: String) -> some View {
+    private func summaryChip(
+        label: String, icon: String, color: Color, accessibilityIdentifier: String
+    ) -> some View {
         StatusCapsule(
             text: label,
             color: color,
@@ -292,11 +305,15 @@ struct IdeaListView: View {
         archivedLabel: String?
     ) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            summaryChipAccessibilityMirror(identifier: "ideas-summary-chip-total", label: totalLabel)
-            summaryChipAccessibilityMirror(identifier: "ideas-summary-chip-drafts", label: draftLabel)
-            summaryChipAccessibilityMirror(identifier: "ideas-summary-chip-active", label: activeLabel)
+            summaryChipAccessibilityMirror(
+                identifier: "ideas-summary-chip-total", label: totalLabel)
+            summaryChipAccessibilityMirror(
+                identifier: "ideas-summary-chip-drafts", label: draftLabel)
+            summaryChipAccessibilityMirror(
+                identifier: "ideas-summary-chip-active", label: activeLabel)
             if let archivedLabel {
-                summaryChipAccessibilityMirror(identifier: "ideas-summary-chip-archived", label: archivedLabel)
+                summaryChipAccessibilityMirror(
+                    identifier: "ideas-summary-chip-archived", label: archivedLabel)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -336,7 +353,8 @@ struct IdeaListView: View {
         if uiTestAccessibilitySettings.reduceTransparency {
             activeModes.append("reduce transparency")
         }
-        return activeModes.isEmpty ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
+        return activeModes.isEmpty
+            ? "standard accessibility display settings" : activeModes.joined(separator: ", ")
     }
 
     private func summaryStripAccessibilityLabel(metrics: IdeaSummaryMetrics) -> String {
@@ -344,7 +362,7 @@ struct IdeaListView: View {
             "\(metrics.totalCount) ideas",
             "\(metrics.draftCount) drafts",
             "\(metrics.activeCount) active",
-            "Archive"
+            "Archive",
         ]
         parts.append(summaryChipAccessibilityModes)
         return parts.joined(separator: ", ")
@@ -376,7 +394,8 @@ struct IdeaListView: View {
         do {
             try modelContext.save()
         } catch {
-            ForgeLogger.ui.error("Failed to save new idea '\(idea.title)': \(error.localizedDescription)")
+            ForgeLogger.ui.error(
+                "Failed to save new idea '\(idea.title)': \(error.localizedDescription)")
             return
         }
         selectedIdeaID = idea.id
@@ -391,11 +410,13 @@ struct IdeaListView: View {
     private func prefillNewIdeaDraftFromUITestEnvironmentIfNeeded() {
         let environment = ProcessInfo.processInfo.environment
         if let title = environment["CHAINWORKS_UI_TEST_NEW_IDEA_TITLE"],
-           newIdeaDraft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            newIdeaDraft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             newIdeaDraft.title = title
         }
         if let body = environment["CHAINWORKS_UI_TEST_NEW_IDEA_BODY"],
-           newIdeaDraft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            newIdeaDraft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             newIdeaDraft.body = body
         }
     }
@@ -445,12 +466,12 @@ struct IdeaListView: View {
 
     private func browseAttachment() {
         #if os(macOS)
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            newIdeaDraft.attachmentPath = url.path
-        }
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            if panel.runModal() == .OK, let url = panel.url {
+                newIdeaDraft.attachmentPath = url.path
+            }
         #endif
     }
 
@@ -539,7 +560,8 @@ private struct IdeaSidebarRow: View {
                 if let attentionLabel {
                     sidebarMetaTag(attentionLabel, icon: attentionIcon, color: attentionColor)
                 } else if hasActiveRun {
-                    sidebarMetaTag("Run active", icon: "play.circle.fill", color: DesignTokens.Status.running)
+                    sidebarMetaTag(
+                        "Run active", icon: "play.circle.fill", color: DesignTokens.Status.running)
                 }
 
                 if idea.attachmentPath?.isEmpty == false {
@@ -810,10 +832,12 @@ struct NewIdeaSheetView: View {
             Text("New Idea")
                 .font(DesignTokens.Typography.screenTitle)
 
-            Text("Capture the idea first. Project directory and run configuration come after the idea exists.")
-                .font(DesignTokens.Typography.supporting)
-                .foregroundStyle(ForgeColor.Text.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                "Capture the idea first. Project directory and run configuration come after the idea exists."
+            )
+            .font(DesignTokens.Typography.supporting)
+            .foregroundStyle(ForgeColor.Text.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, DesignTokens.Spacing.large)
@@ -825,11 +849,13 @@ struct NewIdeaSheetView: View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
             panelHeader(
                 title: "Details",
-                subtitle: "Give the idea a clear name and enough context to make the first run legible."
+                subtitle:
+                    "Give the idea a clear name and enough context to make the first run legible."
             )
 
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
-                fieldLabel("Title", hint: "Short, action-oriented, and easy to scan in the sidebar.")
+                fieldLabel(
+                    "Title", hint: "Short, action-oriented, and easy to scan in the sidebar.")
 
                 TextField("Example: Harden provider bootstrap flow", text: $draft.title)
                     .textFieldStyle(.roundedBorder)
@@ -837,7 +863,10 @@ struct NewIdeaSheetView: View {
                     .accessibilityIdentifier("new-idea-title-field")
                     .onPasteCommand(of: [UTType.plainText]) { providers in
                         guard let provider = providers.first else { return }
-                        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                        provider.loadItem(
+                            forTypeIdentifier: UTType.plainText.identifier, options: nil
+                        ) {
+                            item, _ in
                             let resolvedText: String?
                             switch item {
                             case let data as Data:
@@ -858,23 +887,33 @@ struct NewIdeaSheetView: View {
             }
 
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
-                fieldLabel("Body", hint: "What problem are you trying to solve, and what does a good result look like?")
+                fieldLabel(
+                    "Body",
+                    hint:
+                        "What problem are you trying to solve, and what does a good result look like?"
+                )
 
                 ZStack(alignment: .topLeading) {
-                    RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.card, style: .continuous)
-                        .fill(ForgeColor.Surface.appBackground)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.card, style: .continuous)
-                                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+                    RoundedRectangle(
+                        cornerRadius: DesignTokens.CornerRadius.card, style: .continuous
+                    )
+                    .fill(ForgeColor.Surface.appBackground)
+                    .overlay(
+                        RoundedRectangle(
+                            cornerRadius: DesignTokens.CornerRadius.card, style: .continuous
                         )
+                        .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+                    )
 
                     if draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("Describe the idea, the user or operator pain, and any constraints that matter.")
-                            .font(DesignTokens.Typography.supporting)
-                            .foregroundStyle(ForgeColor.Text.tertiary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 12)
-                            .allowsHitTesting(false)
+                        Text(
+                            "Describe the idea, the user or operator pain, and any constraints that matter."
+                        )
+                        .font(DesignTokens.Typography.supporting)
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .allowsHitTesting(false)
                     }
 
                     TextEditor(text: $draft.body)
@@ -895,7 +934,8 @@ struct NewIdeaSheetView: View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {
             panelHeader(
                 title: "Attachment",
-                subtitle: "Optional reference material. The path is stored with the idea and validated later."
+                subtitle:
+                    "Optional reference material. The path is stored with the idea and validated later."
             )
 
             HStack(alignment: .center, spacing: DesignTokens.Spacing.small) {
@@ -958,12 +998,14 @@ struct NewIdeaSheetView: View {
     @MainActor
     private func prefillFromUITestEnvironmentIfNeeded() {
         guard let title = environment["CHAINWORKS_UI_TEST_NEW_IDEA_TITLE"],
-              draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
             return
         }
         draft.title = title
         if let body = environment["CHAINWORKS_UI_TEST_NEW_IDEA_BODY"],
-           draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             draft.body = body
         }
     }
@@ -1008,7 +1050,8 @@ struct IdeaDetailView: View {
         case .completed:
             return "Latest run completed. Start another run or archive the idea."
         case .failed:
-            return "Latest run failed. Review artifacts, then start another run or archive the idea."
+            return
+                "Latest run failed. Review artifacts, then start another run or archive the idea."
         default:
             return nil
         }
@@ -1044,7 +1087,11 @@ struct IdeaDetailView: View {
                                             ? DesignTokens.Status.success.opacity(0.15)
                                             : DesignTokens.Status.error.opacity(0.15)
                                     )
-                                    .foregroundStyle(validation.status == .referenceOnly ? DesignTokens.Status.success : DesignTokens.Status.error)
+                                    .foregroundStyle(
+                                        validation.status == .referenceOnly
+                                            ? DesignTokens.Status.success
+                                            : DesignTokens.Status.error
+                                    )
                                     .clipShape(Capsule())
                             }
                             if let reason = validation.rejectionReason {
@@ -1069,7 +1116,10 @@ struct IdeaDetailView: View {
                             Button("Save Path") {
                                 saveWorkspaceRoot()
                             }
-                            .disabled(editingWorkspacePath.trimmingCharacters(in: .whitespaces) == (idea.workspaceRootPath ?? ""))
+                            .disabled(
+                                editingWorkspacePath.trimmingCharacters(in: .whitespaces)
+                                    == (idea.workspaceRootPath ?? "")
+                            )
                             .accessibilityIdentifier("idea-workspace-root-save")
                             Button("Browse...") {
                                 browseWorkspaceRoot()
@@ -1080,24 +1130,32 @@ struct IdeaDetailView: View {
                         if let path = idea.workspaceRootPath, !path.isEmpty {
                             let isValid = isValidDirectory(path)
                             Label(
-                                isValid ? "Valid directory" : "Directory not found or not accessible",
+                                isValid
+                                    ? "Valid directory" : "Directory not found or not accessible",
                                 systemImage: isValid ? "checkmark.circle.fill" : "xmark.circle.fill"
                             )
                             .font(.caption)
-                            .foregroundStyle(isValid ? DesignTokens.Status.success : DesignTokens.Status.error)
+                            .foregroundStyle(
+                                isValid ? DesignTokens.Status.success : DesignTokens.Status.error
+                            )
                             .accessibilityIdentifier("idea-workspace-root-status")
                         } else {
-                            Text("Set a project directory for workflows that require project access.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "Set a project directory for workflows that require project access."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         }
                     }
 
                     Section("Archive") {
                         if idea.isArchived {
-                            Label("Archived ideas stay visible here and in the archive lane until restored.", systemImage: "archivebox.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Label(
+                                "Archived ideas stay visible here and in the archive lane until restored.",
+                                systemImage: "archivebox.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             Button {
                                 restoreIdea()
                             } label: {
@@ -1122,9 +1180,11 @@ struct IdeaDetailView: View {
                                     .foregroundStyle(.secondary)
                                     .accessibilityIdentifier("archive-idea-reason")
                             } else {
-                                Text("Archive the idea when it is draft or its latest run is terminal.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                Text(
+                                    "Archive the idea when it is draft or its latest run is terminal."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                             }
                         }
                         if let archiveMessage {
@@ -1160,8 +1220,10 @@ struct IdeaDetailView: View {
                                 showStopConfirmation = true
                             } label: {
                                 Label(
-                                    runToStop.cancellationRequestedAt != nil ? "Cancelling\u{2026}" : "Stop Run",
-                                    systemImage: runToStop.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
+                                    runToStop.cancellationRequestedAt != nil
+                                        ? "Cancelling\u{2026}" : "Stop Run",
+                                    systemImage: runToStop.cancellationRequestedAt != nil
+                                        ? "hourglass" : "stop.fill"
                                 )
                             }
                             .disabled(runToStop.cancellationRequestedAt != nil)
@@ -1174,9 +1236,11 @@ struct IdeaDetailView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             } else {
-                                Text("Stop the active run. All run history and artifacts remain intact.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                Text(
+                                    "Stop the active run. All run history and artifacts remain intact."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                             }
                         }
                         .alert("Stop Run?", isPresented: $showStopConfirmation) {
@@ -1185,9 +1249,11 @@ struct IdeaDetailView: View {
                                     await executionService.cancelRun(runID: runToStop.id)
                                 }
                             }
-                            Button("Keep Running", role: .cancel) { }
+                            Button("Keep Running", role: .cancel) {}
                         } message: {
-                            Text("This will stop all active agents for \"\(idea.title)\". Run history and artifacts remain visible as terminal history.")
+                            Text(
+                                "This will stop all active agents for \"\(idea.title)\". Run history and artifacts remain visible as terminal history."
+                            )
                         }
                     }
 
@@ -1208,7 +1274,8 @@ struct IdeaDetailView: View {
                                             HStack(spacing: 8) {
                                                 Text(run.presentationStatusLabel)
                                                     .font(.caption)
-                                                    .foregroundStyle(self.statusColor(run.presentationStatus))
+                                                    .foregroundStyle(
+                                                        self.statusColor(run.presentationStatus))
                                                 Text(run.startedAt, format: .dateTime)
                                                     .font(.caption2)
                                                     .foregroundStyle(.tertiary)
@@ -1255,8 +1322,11 @@ struct IdeaDetailView: View {
                         try modelContext.save()
                         archiveMessage = nil
                     } catch {
-                        ForgeLogger.ui.error("Failed to persist idea status before starting run \(prepared.run.id): \(error.localizedDescription)")
-                        archiveMessage = "Run will start, but idea status could not be saved: \(error.localizedDescription)"
+                        ForgeLogger.ui.error(
+                            "Failed to persist idea status before starting run \(prepared.run.id): \(error.localizedDescription)"
+                        )
+                        archiveMessage =
+                            "Run will start, but idea status could not be saved: \(error.localizedDescription)"
                     }
                     executionService.startRun(
                         run: prepared.run,
@@ -1292,35 +1362,39 @@ struct IdeaDetailView: View {
 
     private func browseWorkspaceRoot() {
         #if os(macOS)
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Select Project Directory"
-        if panel.runModal() == .OK, let url = panel.url {
-            editingWorkspacePath = url.path
-        }
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.prompt = "Select Project Directory"
+            if panel.runModal() == .OK, let url = panel.url {
+                editingWorkspacePath = url.path
+            }
         #endif
     }
 
     private func saveWorkspaceRoot() {
         let trimmed = editingWorkspacePath.trimmingCharacters(in: .whitespaces)
-        let bookmarkSaved = SecurityScopedAccess.remember(path: trimmed.isEmpty ? nil : trimmed, kind: .workspaceRoot)
+        let bookmarkSaved = SecurityScopedAccess.remember(
+            path: trimmed.isEmpty ? nil : trimmed, kind: .workspaceRoot)
         idea.workspaceRootPath = trimmed.isEmpty ? nil : trimmed
         do {
             try modelContext.save()
-            archiveMessage = bookmarkSaved
+            archiveMessage =
+                bookmarkSaved
                 ? "Saved project directory."
                 : "Saved project directory, but access could not be bookmarked for future launches."
         } catch {
-            ForgeLogger.ui.error("Failed to save workspace root for idea \(idea.id): \(error.localizedDescription)")
+            ForgeLogger.ui.error(
+                "Failed to save workspace root for idea \(idea.id): \(error.localizedDescription)")
             archiveMessage = "Failed to save project directory: \(error.localizedDescription)"
         }
     }
 
     private func isValidDirectory(_ path: String) -> Bool {
         var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
     }
 
     private func runStatusIcon(_ status: RunStatus) -> some View {
@@ -1360,1065 +1434,1118 @@ struct IdeaDetailView: View {
 // WorkflowArtifactInspectorView -> ArtifactInspectorView.swift
 
 #if true
-struct PreparedRunStart {
-    let run: Run
-    let plan: RunPlan
-    let workspace: RunWorkspace
-}
-
-struct WorkflowStartRunSheet: View {
-    @Environment(\.modelContext) private var modelContext
-    @Environment(\.dismiss) private var dismiss
-    @Environment(ExecutionService.self) private var executionService
-    @Environment(AppConfigurationStore.self) private var appConfigurationStore
-    @Environment(ProviderSettingsStore.self) private var providerSettingsStore
-    @Environment(ProviderRegistry.self) private var providerRegistry
-
-    let idea: Idea
-    var onRunPrepared: ((PreparedRunStart) -> Void)? = nil
-
-    @State private var compileState: CompileState = .idle
-    @State private var compiledPlan: RunPlan?
-    @State private var workflowURLs: [WorkflowPreset: URL] = [:]
-    @State private var catalogURL: URL?
-    @State private var isStarting = false
-    @State private var selectedMode: RunStartExecutionMode = .simulated
-    @State private var selectedWorkflow: WorkflowPreset = .canonicalRelease
-    @State private var startOptions: RunStartOptions = .empty
-    @State private var selectedContextStrategyProfileID = "current_mixed_baseline"
-    @State private var preflightReport: PreflightReport?
-    @State private var showPreflightSheet = false
-    @State private var allowWarnStart = false
-    @State private var showAdvancedOverrides = false
-
-    // MARK: Delivery Configuration (Proposal 007 §10.1)
-    @State private var deliveryRepoRoot = ""
-    @State private var deliveryBaseBranch = "main"
-    @State private var deliveryTargetBranch = ""
-    @State private var deliveryWorktreeBasePath = ""
-    @State private var deliveryReleaseTargetID = "sandbox_local"
-    @State private var deliveryReleaseMode: ReleaseMode = .sandbox
-    @State private var deliveryPreflightResult: DeliveryPreflightService.PreflightResult?
-    @State private var showDeliveryPreflightSheet = false
-
-    private enum CompileState: Equatable {
-        case idle
-        case compiling
-        case success(stateCount: Int, agentCount: Int)
-        case error(String)
+    struct PreparedRunStart {
+        let run: Run
+        let plan: RunPlan
+        let workspace: RunWorkspace
     }
 
-    private enum WorkflowPreset: String, CaseIterable, Identifiable {
-        case canonicalRelease
-        case proposalLoopLive
-        case fullMVPLive
+    struct WorkflowStartRunSheet: View {
+        @Environment(\.modelContext) private var modelContext
+        @Environment(\.dismiss) private var dismiss
+        @Environment(ExecutionService.self) private var executionService
+        @Environment(AppConfigurationStore.self) private var appConfigurationStore
+        @Environment(ProviderSettingsStore.self) private var providerSettingsStore
+        @Environment(ProviderRegistry.self) private var providerRegistry
 
-        var id: String { rawValue }
+        let idea: Idea
+        var onRunPrepared: ((PreparedRunStart) -> Void)? = nil
 
-        var mode: RunStartExecutionMode {
-            switch self {
-            case .canonicalRelease: return .simulated
-            case .proposalLoopLive: return .live
-            case .fullMVPLive: return .live
+        @State private var compileState: CompileState = .idle
+        @State private var compiledPlan: RunPlan?
+        @State private var workflowURLs: [WorkflowPreset: URL] = [:]
+        @State private var catalogURL: URL?
+        @State private var isStarting = false
+        @State private var selectedMode: RunStartExecutionMode = .simulated
+        @State private var selectedWorkflow: WorkflowPreset = .canonicalRelease
+        @State private var startOptions: RunStartOptions = .empty
+        @State private var selectedContextStrategyProfileID = "current_mixed_baseline"
+        @State private var preflightReport: PreflightReport?
+        @State private var showPreflightSheet = false
+        @State private var allowWarnStart = false
+        @State private var showAdvancedOverrides = false
+
+        // MARK: Delivery Configuration (Proposal 007 §10.1)
+        @State private var deliveryRepoRoot = ""
+        @State private var deliveryBaseBranch = "main"
+        @State private var deliveryTargetBranch = ""
+        @State private var deliveryWorktreeBasePath = ""
+        @State private var deliveryReleaseTargetID = "sandbox_local"
+        @State private var deliveryReleaseMode: ReleaseMode = .sandbox
+        @State private var deliveryPreflightResult: DeliveryPreflightService.PreflightResult?
+        @State private var showDeliveryPreflightSheet = false
+
+        private enum CompileState: Equatable {
+            case idle
+            case compiling
+            case success(stateCount: Int, agentCount: Int)
+            case error(String)
+        }
+
+        private enum WorkflowPreset: String, CaseIterable, Identifiable {
+            case canonicalRelease
+            case proposalLoopLive
+            case fullMVPLive
+
+            var id: String { rawValue }
+
+            var mode: RunStartExecutionMode {
+                switch self {
+                case .canonicalRelease: return .simulated
+                case .proposalLoopLive: return .live
+                case .fullMVPLive: return .live
+                }
+            }
+
+            var title: String {
+                switch self {
+                case .canonicalRelease: return "Canonical Workflow"
+                case .proposalLoopLive: return "Proposal Loop (Live)"
+                case .fullMVPLive: return "Full MVP (Live)"
+                }
+            }
+
+            var relativePath: String {
+                switch self {
+                case .canonicalRelease:
+                    return "examples/workflows/workflow.yaml"
+                case .proposalLoopLive:
+                    return "examples/workflows/proposal-loop-live.yaml"
+                case .fullMVPLive:
+                    return "examples/workflows/full-mvp-live.yaml"
+                }
+            }
+
+            var bundleResourceName: String? {
+                switch self {
+                case .canonicalRelease:
+                    return "workflow"
+                case .proposalLoopLive:
+                    return "proposal-loop-live"
+                case .fullMVPLive:
+                    return "full-mvp-live"
+                }
             }
         }
 
-        var title: String {
-            switch self {
-            case .canonicalRelease: return "Canonical Workflow"
-            case .proposalLoopLive: return "Proposal Loop (Live)"
-            case .fullMVPLive: return "Full MVP (Live)"
+        private var availableWorkflows: [WorkflowPreset] {
+            WorkflowPreset.allCases.filter { $0.mode == selectedMode }
+        }
+
+        @ViewBuilder
+        private var workflowSelectionControl: some View {
+            if availableWorkflows.count <= 1 {
+                LabeledContent("Workflow", value: workflowSelection.wrappedValue.title)
+                    .accessibilityIdentifier("workflow-preset-single")
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Workflow")
+                        .font(.subheadline.weight(.medium))
+                    ForEach(availableWorkflows) { workflow in
+                        Button {
+                            workflowSelection.wrappedValue = workflow
+                        } label: {
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(workflow.title)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                    Text(workflow.relativePath)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Image(
+                                    systemName: workflowSelection.wrappedValue == workflow
+                                        ? "checkmark.circle.fill" : "circle"
+                                )
+                                .foregroundStyle(
+                                    workflowSelection.wrappedValue == workflow
+                                        ? DesignTokens.Action.primary : DesignTokens.Status.neutral)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(
+                                        workflowSelection.wrappedValue == workflow
+                                            ? DesignTokens.Action.primary.opacity(0.12)
+                                            : DesignTokens.Status.neutral.opacity(0.08))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(workflow.title)
+                        .accessibilityValue(
+                            workflowSelection.wrappedValue == workflow ? "selected" : "not selected"
+                        )
+                        .accessibilityIdentifier("workflow-preset-button-\(workflow.id)")
+                    }
+                }
+                .accessibilityIdentifier("workflow-preset-list")
+                .accessibilityValue(workflowSelection.wrappedValue.id)
             }
         }
 
-        var relativePath: String {
-            switch self {
-            case .canonicalRelease:
-                return "examples/workflows/workflow.yaml"
-            case .proposalLoopLive:
-                return "examples/workflows/proposal-loop-live.yaml"
-            case .fullMVPLive:
-                return "examples/workflows/full-mvp-live.yaml"
-            }
+        private var selectedWorkflowURL: URL? {
+            workflowURLs[selectedWorkflow]
         }
 
-        var bundleResourceName: String? {
-            switch self {
-            case .canonicalRelease:
-                return "workflow"
-            case .proposalLoopLive:
-                return "proposal-loop-live"
-            case .fullMVPLive:
-                return "full-mvp-live"
-            }
+        private var availableContextStrategyProfileIDs: [String] {
+            let config = executionService.stewardConfig ?? .defaultConfig
+            let keys = config.contextStrategyProfiles.keys.sorted()
+            return keys.isEmpty ? ["current_mixed_baseline"] : keys
         }
-    }
 
-    private var availableWorkflows: [WorkflowPreset] {
-        WorkflowPreset.allCases.filter { $0.mode == selectedMode }
-    }
+        private var workflowSelection: Binding<WorkflowPreset> {
+            Binding(
+                get: {
+                    if availableWorkflows.contains(selectedWorkflow) {
+                        return selectedWorkflow
+                    }
+                    return availableWorkflows.first ?? .canonicalRelease
+                },
+                set: { newValue in
+                    selectedWorkflow = newValue
+                }
+            )
+        }
 
-    @ViewBuilder
-    private var workflowSelectionControl: some View {
-        if availableWorkflows.count <= 1 {
-            LabeledContent("Workflow", value: workflowSelection.wrappedValue.title)
-                .accessibilityIdentifier("workflow-preset-single")
-        } else {
+        private var liveRuntimeReady: Bool {
+            if case .ready = executionService.liveRuntimeReadiness {
+                return true
+            }
+            return false
+        }
+
+        private var liveRuntimeRecoveryCopy: (reason: String, recovery: String)? {
+            if case .unavailable(let reason, let recovery) = executionService.liveRuntimeReadiness {
+                return (reason, recovery)
+            }
+            return nil
+        }
+
+        @ViewBuilder
+        private var executionModeSelectionControl: some View {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Workflow")
+                Text("Execution Mode")
                     .font(.subheadline.weight(.medium))
-                ForEach(availableWorkflows) { workflow in
+                ForEach(availableModes) { mode in
+                    let presentation = RunStartModePresentationPolicy.presentation(for: mode)
                     Button {
-                        workflowSelection.wrappedValue = workflow
+                        selectedMode = mode
                     } label: {
                         HStack(spacing: 10) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(workflow.title)
-                                    .font(.subheadline.weight(.medium))
-                                    .foregroundStyle(.primary)
-                                Text(workflow.relativePath)
+                                HStack(spacing: 8) {
+                                    Text(mode.title)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                    if let badge = presentation.badge {
+                                        Text(badge)
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(
+                                                mode == .live
+                                                    ? DesignTokens.Action.primary : .secondary
+                                            )
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(
+                                                Capsule(style: .continuous)
+                                                    .fill(
+                                                        mode == .live
+                                                            ? DesignTokens.Action.primary.opacity(
+                                                                0.12)
+                                                            : DesignTokens.Status.neutral.opacity(
+                                                                0.10))
+                                            )
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(presentation.subtitle)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
                             }
                             Spacer()
-                            Image(systemName: workflowSelection.wrappedValue == workflow ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(workflowSelection.wrappedValue == workflow ? DesignTokens.Action.primary : DesignTokens.Status.neutral)
+                            Image(
+                                systemName: selectedMode == mode
+                                    ? "checkmark.circle.fill" : "circle"
+                            )
+                            .foregroundStyle(
+                                selectedMode == mode
+                                    ? DesignTokens.Action.primary : DesignTokens.Status.neutral)
                         }
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(workflowSelection.wrappedValue == workflow ? DesignTokens.Action.primary.opacity(0.12) : DesignTokens.Status.neutral.opacity(0.08))
+                                .fill(
+                                    selectedMode == mode
+                                        ? DesignTokens.Action.primary.opacity(0.12)
+                                        : DesignTokens.Status.neutral.opacity(0.08))
                         )
                     }
                     .buttonStyle(.plain)
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(workflow.title)
-                    .accessibilityValue(workflowSelection.wrappedValue == workflow ? "selected" : "not selected")
-                    .accessibilityIdentifier("workflow-preset-button-\(workflow.id)")
+                    .accessibilityLabel(mode.title)
+                    .accessibilityValue(selectedMode == mode ? "selected" : "not selected")
+                    .accessibilityIdentifier("execution-mode-\(mode.id)-button")
                 }
             }
-            .accessibilityIdentifier("workflow-preset-list")
-            .accessibilityValue(workflowSelection.wrappedValue.id)
+            .accessibilityIdentifier("execution-mode-list")
         }
-    }
 
-    private var selectedWorkflowURL: URL? {
-        workflowURLs[selectedWorkflow]
-    }
+        private var availableModes: [RunStartExecutionMode] {
+            RunStartModePresentationPolicy.orderedModes(
+                supportsLiveExecution: executionService.supportsLiveExecution)
+        }
 
-    private var availableContextStrategyProfileIDs: [String] {
-        let config = executionService.stewardConfig ?? .defaultConfig
-        let keys = config.contextStrategyProfiles.keys.sorted()
-        return keys.isEmpty ? ["current_mixed_baseline"] : keys
-    }
+        private var liveModeConfigured: Bool {
+            liveRuntimeReady
+        }
 
-    private var workflowSelection: Binding<WorkflowPreset> {
-        Binding(
-            get: {
-                if availableWorkflows.contains(selectedWorkflow) {
-                    return selectedWorkflow
-                }
-                return availableWorkflows.first ?? .canonicalRelease
-            },
-            set: { newValue in
-                selectedWorkflow = newValue
+        private var shouldDefaultToDeliveryFlow: Bool {
+            liveRuntimeReady
+                && !(idea.workspaceRootPath?.trimmingCharacters(in: .whitespaces).isEmpty ?? true)
+        }
+
+        private var liveModeRequiresConfiguration: Bool {
+            selectedMode == .live && !liveModeConfigured
+        }
+
+        private var preflightBlocksStart: Bool {
+            preflightReport?.status == .fail
+        }
+
+        private var requiresCleanPreflight: Bool {
+            providerSettingsStore.settings.runStartRequiresCleanPreflight
+        }
+
+        private var warnRequiresConfirmation: Bool {
+            preflightReport?.status == .warn && !requiresCleanPreflight
+        }
+
+        private var normalizedWorkspaceRoot: String? {
+            idea.workspaceRootPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        }
+
+        private var effectiveDeliveryRepoRoot: String? {
+            ProjectRootPolicy.effectiveProjectRoot(
+                workspaceRootPath: normalizedWorkspaceRoot,
+                deliveryRepoRootPath: deliveryRepoRoot
+            )
+        }
+
+        private var effectiveProjectRoot: String? {
+            ProjectRootPolicy.effectiveProjectRoot(
+                workspaceRootPath: normalizedWorkspaceRoot,
+                deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
+            )
+        }
+
+        private var effectiveDeliveryWorktreeBasePath: String {
+            if let explicit = deliveryWorktreeBasePath.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            .nilIfEmpty {
+                return explicit
             }
-        )
-    }
-
-    private var liveRuntimeReady: Bool {
-        if case .ready = executionService.liveRuntimeReadiness {
-            return true
-        }
-        return false
-    }
-
-    private var liveRuntimeRecoveryCopy: (reason: String, recovery: String)? {
-        if case let .unavailable(reason, recovery) = executionService.liveRuntimeReadiness {
-            return (reason, recovery)
-        }
-        return nil
-    }
-
-    @ViewBuilder
-    private var executionModeSelectionControl: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Execution Mode")
-                .font(.subheadline.weight(.medium))
-            ForEach(availableModes) { mode in
-                let presentation = RunStartModePresentationPolicy.presentation(for: mode)
-                Button {
-                    selectedMode = mode
-                } label: {
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 8) {
-                                Text(mode.title)
-                                    .font(.subheadline.weight(.medium))
-                                    .foregroundStyle(.primary)
-                                if let badge = presentation.badge {
-                                    Text(badge)
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(mode == .live ? DesignTokens.Action.primary : .secondary)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(
-                                            Capsule(style: .continuous)
-                                                .fill(mode == .live ? DesignTokens.Action.primary.opacity(0.12) : DesignTokens.Status.neutral.opacity(0.10))
-                                        )
-                                }
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            Text(presentation.subtitle)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Image(systemName: selectedMode == mode ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(selectedMode == mode ? DesignTokens.Action.primary : DesignTokens.Status.neutral)
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(selectedMode == mode ? DesignTokens.Action.primary.opacity(0.12) : DesignTokens.Status.neutral.opacity(0.08))
-                    )
-                }
-                .buttonStyle(.plain)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(mode.title)
-                .accessibilityValue(selectedMode == mode ? "selected" : "not selected")
-                .accessibilityIdentifier("execution-mode-\(mode.id)-button")
+            if let configured = appConfigurationStore.configuration.worktreeBasePath?
+                .trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).nilIfEmpty
+            {
+                return configured
             }
+            return AppConfiguration.defaultSupportRoot()
+                .appendingPathComponent("worktrees", isDirectory: true)
+                .path
         }
-        .accessibilityIdentifier("execution-mode-list")
-    }
 
-    private var availableModes: [RunStartExecutionMode] {
-        RunStartModePresentationPolicy.orderedModes(supportsLiveExecution: executionService.supportsLiveExecution)
-    }
-
-    private var liveModeConfigured: Bool {
-        liveRuntimeReady
-    }
-
-    private var shouldDefaultToDeliveryFlow: Bool {
-        liveRuntimeReady && !(idea.workspaceRootPath?.trimmingCharacters(in: .whitespaces).isEmpty ?? true)
-    }
-
-    private var liveModeRequiresConfiguration: Bool {
-        selectedMode == .live && !liveModeConfigured
-    }
-
-    private var preflightBlocksStart: Bool {
-        preflightReport?.status == .fail
-    }
-
-    private var requiresCleanPreflight: Bool {
-        providerSettingsStore.settings.runStartRequiresCleanPreflight
-    }
-
-    private var warnRequiresConfirmation: Bool {
-        preflightReport?.status == .warn && !requiresCleanPreflight
-    }
-
-    private var normalizedWorkspaceRoot: String? {
-        idea.workspaceRootPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-    }
-
-    private var effectiveDeliveryRepoRoot: String? {
-        ProjectRootPolicy.effectiveProjectRoot(
-            workspaceRootPath: normalizedWorkspaceRoot,
-            deliveryRepoRootPath: deliveryRepoRoot
-        )
-    }
-
-    private var effectiveProjectRoot: String? {
-        ProjectRootPolicy.effectiveProjectRoot(
-            workspaceRootPath: normalizedWorkspaceRoot,
-            deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
-        )
-    }
-
-    private var effectiveDeliveryWorktreeBasePath: String {
-        if let explicit = deliveryWorktreeBasePath.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-            return explicit
+        private var effectiveDeliveryTargetBranch: String {
+            deliveryTargetBranch.isEmpty
+                ? "dogfood/\(idea.title.lowercased().replacingOccurrences(of: " ", with: "-"))-\(UUID().uuidString.prefix(8))"
+                : deliveryTargetBranch
         }
-        if let configured = appConfigurationStore.configuration.worktreeBasePath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-            return configured
-        }
-        return AppConfiguration.defaultSupportRoot()
-            .appendingPathComponent("worktrees", isDirectory: true)
-            .path
-    }
 
-    private var effectiveDeliveryTargetBranch: String {
-        deliveryTargetBranch.isEmpty
-            ? "dogfood/\(idea.title.lowercased().replacingOccurrences(of: " ", with: "-"))-\(UUID().uuidString.prefix(8))"
-            : deliveryTargetBranch
-    }
-
-    private var startRunBlockingReasons: [String] {
-        var reasons: [String] = []
-        if compiledPlan == nil { reasons.append("compile_pending") }
-        if isStarting { reasons.append("starting") }
-        if compileState == .compiling { reasons.append("compiling") }
-        if liveModeRequiresConfiguration { reasons.append("live_runtime_unconfigured") }
-        if preflightBlocksStart { reasons.append("preflight_failed") }
-        if preflightReport?.status == .warn && requiresCleanPreflight { reasons.append("preflight_requires_clean") }
-        if warnRequiresConfirmation && allowWarnStart == false { reasons.append("warning_confirmation_required") }
-        if deliveryPreflightBlocksStart { reasons.append("delivery_preflight_blocked") }
-        return reasons
-    }
-
-    private var startRunButtonAccessibilityValue: String {
-        if startRunBlockingReasons.isEmpty {
-            return "enabled"
-        }
-        var components = ["blocked:\(startRunBlockingReasons.joined(separator: ","))"]
-        if let preflightReport, let firstBlockingIssue = preflightReport.blockingIssues.first {
-            components.append("preflight_issue=\(firstBlockingIssue)")
-        } else if let preflightReport, let firstWarning = preflightReport.warnings.first {
-            components.append("preflight_warning=\(firstWarning)")
-        }
-        if let deliveryPreflightResult, !deliveryPreflightResult.passed {
-            let failedIDs = deliveryPreflightResult.failedChecks.map(\.id).joined(separator: ",")
-            components.append("delivery_checks=\(failedIDs)")
-        }
-        if selectedWorkflow == .fullMVPLive {
-            components.append("delivery_repo_root=\(effectiveDeliveryRepoRoot ?? "nil")")
-        }
-        return components.joined(separator: " | ")
-    }
-
-    var body: some View {
-        launchConfigurationBody
-    }
-
-    private var launchConfigurationBody: some View {
-        VStack(spacing: 16) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 12) {
-                Image(systemName: "play.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(DesignTokens.Action.primary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Start New Run")
-                        .font(.headline)
-                    Text("Compile YAML into an immutable RunPlan snapshot, then create the run.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
+        private var startRunBlockingReasons: [String] {
+            var reasons: [String] = []
+            if compiledPlan == nil { reasons.append("compile_pending") }
+            if isStarting { reasons.append("starting") }
+            if compileState == .compiling { reasons.append("compiling") }
+            if liveModeRequiresConfiguration { reasons.append("live_runtime_unconfigured") }
+            if preflightBlocksStart { reasons.append("preflight_failed") }
+            if preflightReport?.status == .warn && requiresCleanPreflight {
+                reasons.append("preflight_requires_clean")
             }
-
-            GroupBox("Idea") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(idea.title)
-                        .font(.subheadline.bold())
-                    Text(idea.body)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(4)
-                    if let attachmentPath = idea.attachmentPath, !attachmentPath.isEmpty {
-                        Label(attachmentPath, systemImage: "paperclip")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if warnRequiresConfirmation && allowWarnStart == false {
+                reasons.append("warning_confirmation_required")
             }
+            if deliveryPreflightBlocksStart { reasons.append("delivery_preflight_blocked") }
+            return reasons
+        }
 
-                    GroupBox("Run Mode") {
-                VStack(alignment: .leading, spacing: 10) {
-                    if selectedMode == .live && !liveModeConfigured {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Label("Live runtime unavailable", systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption.weight(.semibold))
-                                .accessibilityIdentifier("live-runtime-unavailable-title")
-                            Text(liveRuntimeRecoveryCopy?.reason ?? "Live workflows require an available runtime transport.")
-                                .font(.caption2)
-                                .accessibilityIdentifier("live-runtime-unavailable-guidance")
-                            if let recovery = liveRuntimeRecoveryCopy?.recovery, !recovery.isEmpty {
-                                Text(recovery)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .accessibilityIdentifier("live-runtime-unavailable-recovery")
-                            }
-                        }
-                        .foregroundStyle(DesignTokens.Status.warning)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(DesignTokens.Status.warning.opacity(0.10))
-                        )
-                        .accessibilityElement(children: .contain)
-                        .accessibilityIdentifier("live-runtime-missing-block")
-                    }
+        private var startRunButtonAccessibilityValue: String {
+            if startRunBlockingReasons.isEmpty {
+                return "enabled"
+            }
+            var components = ["blocked:\(startRunBlockingReasons.joined(separator: ","))"]
+            if let preflightReport, let firstBlockingIssue = preflightReport.blockingIssues.first {
+                components.append("preflight_issue=\(firstBlockingIssue)")
+            } else if let preflightReport, let firstWarning = preflightReport.warnings.first {
+                components.append("preflight_warning=\(firstWarning)")
+            }
+            if let deliveryPreflightResult, !deliveryPreflightResult.passed {
+                let failedIDs = deliveryPreflightResult.failedChecks.map(\.id).joined(
+                    separator: ",")
+                components.append("delivery_checks=\(failedIDs)")
+            }
+            if selectedWorkflow == .fullMVPLive {
+                components.append("delivery_repo_root=\(effectiveDeliveryRepoRoot ?? "nil")")
+            }
+            return components.joined(separator: " | ")
+        }
 
-                    executionModeSelectionControl
+        var body: some View {
+            launchConfigurationBody
+        }
 
-                    workflowSelectionControl
-
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Picker("Context Strategy", selection: $selectedContextStrategyProfileID) {
-                                ForEach(availableContextStrategyProfileIDs, id: \.self) { profileID in
-                                    Text(profileID).tag(profileID)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .accessibilityIdentifier("context-strategy-picker")
-
-                            Text("The selected strategy is frozen into the run snapshot and reused for resume, frozen clone, and comparison.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Context Strategy")
-                                .font(.subheadline.bold())
-                            Text("Choose the strategy profile for this run.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    if selectedMode == .live && !liveModeConfigured {
-                        Text("Advanced setup: `CHAINWORKS_FIXTURE_MODE=proposal_loop_success`, then relaunch the app.")
-                            .font(.caption)
-                            .foregroundStyle(DesignTokens.Status.warning)
-                            .accessibilityIdentifier("live-runtime-unavailable-advanced")
-                    } else if selectedMode == .live {
-                        if let liveRuntimeConfiguration = executionService.liveRuntimeConfiguration {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Label(
-                                    "Live runtime: \(liveRuntimeConfiguration.summary)",
-                                    systemImage: "bolt.horizontal.circle"
+        private var launchConfigurationBody: some View {
+            VStack(spacing: 16) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "play.circle.fill")
+                                .font(.title2)
+                                .foregroundStyle(DesignTokens.Action.primary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Start New Run")
+                                    .font(.headline)
+                                Text(
+                                    "Compile YAML into an immutable RunPlan snapshot, then create the run."
                                 )
-                                Label("Source: \(liveRuntimeConfiguration.sourceDescription)", systemImage: "server.rack")
-                                Label("Safety: read-only workspace, no git/release side effects", systemImage: "lock.shield")
-                                if let compiledPlan {
-                                    let liveAgents = compiledPlan.agentBindings.values
-                                        .sorted { $0.title < $1.title }
-                                        .map { "\($0.title) (\($0.id))" }
-                                    Label("Resolved live agents: \(liveAgents.count)", systemImage: "person.3.sequence")
-                                    Text(liveAgents.joined(separator: ", "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+
+                        GroupBox("Idea") {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(idea.title)
+                                    .font(.subheadline.bold())
+                                Text(idea.body)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(4)
+                                if let attachmentPath = idea.attachmentPath, !attachmentPath.isEmpty
+                                {
+                                    Label(attachmentPath, systemImage: "paperclip")
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                 }
                             }
-                            .font(.caption)
-                            .foregroundStyle(DesignTokens.Status.success)
-                            .accessibilityIdentifier("live-runtime-config-block")
-                        }
-                    } else {
-                        Label("Simulated mode is a local diagnostic path and does not use live runtime execution.", systemImage: "checkmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            if let compiledPlan, selectedMode == .live {
-                GroupBox {
-                    DisclosureGroup(isExpanded: $showAdvancedOverrides) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Optional per-profile provider/model/effort overrides for debugging or targeted experiments.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            RunStartOverridesView(
-                                plan: compiledPlan,
-                                providerRegistry: providerRegistry,
-                                startOptions: $startOptions
-                            )
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .padding(.top, 6)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Advanced Provider Overrides")
-                                .font(.subheadline.bold())
-                            Text("Usually leave this collapsed and use the catalog defaults.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .accessibilityIdentifier("advanced-provider-overrides")
-                }
-            }
 
-            // MARK: - Delivery Configuration (Proposal 007 §10.1)
-            if selectedWorkflow == .fullMVPLive {
-                GroupBox("Delivery Configuration") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("Repo-backed delivery settings for the Full MVP Live workflow.", systemImage: "shippingbox.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        GroupBox("Run Mode") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                if selectedMode == .live && !liveModeConfigured {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Label(
+                                            "Live runtime unavailable",
+                                            systemImage: "exclamationmark.triangle.fill"
+                                        )
+                                        .font(.caption.weight(.semibold))
+                                        .accessibilityIdentifier("live-runtime-unavailable-title")
+                                        Text(
+                                            liveRuntimeRecoveryCopy?.reason
+                                                ?? "Live workflows require an available runtime transport."
+                                        )
+                                        .font(.caption2)
+                                        .accessibilityIdentifier(
+                                            "live-runtime-unavailable-guidance")
+                                        if let recovery = liveRuntimeRecoveryCopy?.recovery,
+                                            !recovery.isEmpty
+                                        {
+                                            Text(recovery)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .accessibilityIdentifier(
+                                                    "live-runtime-unavailable-recovery")
+                                        }
+                                    }
+                                    .foregroundStyle(DesignTokens.Status.warning)
+                                    .padding(10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .fill(DesignTokens.Status.warning.opacity(0.10))
+                                    )
+                                    .accessibilityElement(children: .contain)
+                                    .accessibilityIdentifier("live-runtime-missing-block")
+                                }
 
-                        LabeledContent("Repository Root") {
-                            TextField("Path to repo", text: $deliveryRepoRoot)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption)
-                                .accessibilityIdentifier("delivery-repo-root")
-                        }
-                        .font(.caption)
+                                executionModeSelectionControl
 
-                        HStack(spacing: 12) {
-                            LabeledContent("Base Branch") {
-                                TextField("main", text: $deliveryBaseBranch)
-                                    .textFieldStyle(.roundedBorder)
+                                workflowSelectionControl
+
+                                GroupBox {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Picker(
+                                            "Context Strategy",
+                                            selection: $selectedContextStrategyProfileID
+                                        ) {
+                                            ForEach(availableContextStrategyProfileIDs, id: \.self)
+                                            { profileID in
+                                                Text(profileID).tag(profileID)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .accessibilityIdentifier("context-strategy-picker")
+
+                                        Text(
+                                            "The selected strategy is frozen into the run snapshot and reused for resume, frozen clone, and comparison."
+                                        )
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Context Strategy")
+                                            .font(.subheadline.bold())
+                                        Text("Choose the strategy profile for this run.")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                if selectedMode == .live && !liveModeConfigured {
+                                    Text(
+                                        "Advanced setup: `CHAINWORKS_FIXTURE_MODE=proposal_loop_success`, then relaunch the app."
+                                    )
                                     .font(.caption)
-                                    .frame(maxWidth: 140)
-                                    .accessibilityIdentifier("delivery-base-branch")
-                            }
-                            .font(.caption)
-
-                            LabeledContent("Target Branch") {
-                                TextField("dogfood/full-mvp", text: $deliveryTargetBranch)
-                                    .textFieldStyle(.roundedBorder)
+                                    .foregroundStyle(DesignTokens.Status.warning)
+                                    .accessibilityIdentifier("live-runtime-unavailable-advanced")
+                                } else if selectedMode == .live {
+                                    if let liveRuntimeConfiguration = executionService
+                                        .liveRuntimeConfiguration
+                                    {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Label(
+                                                "Live runtime: \(liveRuntimeConfiguration.summary)",
+                                                systemImage: "bolt.horizontal.circle"
+                                            )
+                                            Label(
+                                                "Source: \(liveRuntimeConfiguration.sourceDescription)",
+                                                systemImage: "server.rack")
+                                            Label(
+                                                "Safety: read-only workspace, no git/release side effects",
+                                                systemImage: "lock.shield")
+                                            if let compiledPlan {
+                                                let liveAgents = compiledPlan.agentBindings.values
+                                                    .sorted { $0.title < $1.title }
+                                                    .map { "\($0.title) (\($0.id))" }
+                                                Label(
+                                                    "Resolved live agents: \(liveAgents.count)",
+                                                    systemImage: "person.3.sequence")
+                                                Text(liveAgents.joined(separator: ", "))
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.tertiary)
+                                            }
+                                        }
+                                        .font(.caption)
+                                        .foregroundStyle(DesignTokens.Status.success)
+                                        .accessibilityIdentifier("live-runtime-config-block")
+                                    }
+                                } else {
+                                    Label(
+                                        "Simulated mode is a local diagnostic path and does not use live runtime execution.",
+                                        systemImage: "checkmark.circle"
+                                    )
                                     .font(.caption)
-                                    .frame(maxWidth: 180)
-                                    .accessibilityIdentifier("delivery-target-branch")
-                            }
-                            .font(.caption)
-                        }
-
-                        LabeledContent("Worktree Base Path") {
-                            TextField("Path for worktrees", text: $deliveryWorktreeBasePath)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption)
-                                .accessibilityIdentifier("delivery-worktree-base")
-                        }
-                        .font(.caption)
-
-                        HStack(spacing: 12) {
-                            LabeledContent("Release Target") {
-                                TextField("sandbox_local", text: $deliveryReleaseTargetID)
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(.caption)
-                                    .frame(maxWidth: 140)
-                                    .accessibilityIdentifier("delivery-release-target")
-                            }
-                            .font(.caption)
-
-                            Picker("Release Mode", selection: $deliveryReleaseMode) {
-                                Text("Sandbox").tag(ReleaseMode.sandbox)
-                                Text("Staging").tag(ReleaseMode.staging)
-                            }
-                            .pickerStyle(.segmented)
-                            .accessibilityIdentifier("delivery-release-mode-picker")
-                        }
-
-                        // Delivery Preflight
-                        Divider()
-                        if let deliveryPreflightResult {
-                            HStack {
-                                Label(
-                                    deliveryPreflightResult.passed ? "Delivery preflight passed" : "Delivery preflight issues found",
-                                    systemImage: deliveryPreflightResult.passed ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
-                                )
-                                .foregroundStyle(deliveryPreflightResult.passed ? .green : .orange)
-                                Spacer()
-                                Button("Review") {
-                                    showDeliveryPreflightSheet = true
+                                    .foregroundStyle(.secondary)
                                 }
                             }
-                            .font(.caption)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
 
-                            if !deliveryPreflightResult.passed {
-                                ForEach(deliveryPreflightResult.failedChecks, id: \.id) { check in
-                                    Label(check.detail ?? check.label, systemImage: "xmark.circle")
+                        if let compiledPlan, selectedMode == .live {
+                            GroupBox {
+                                DisclosureGroup(isExpanded: $showAdvancedOverrides) {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        Text(
+                                            "Optional per-profile provider/model/effort overrides for debugging or targeted experiments."
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+
+                                        RunStartOverridesView(
+                                            plan: compiledPlan,
+                                            providerRegistry: providerRegistry,
+                                            startOptions: $startOptions
+                                        )
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .padding(.top, 6)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Advanced Provider Overrides")
+                                            .font(.subheadline.bold())
+                                        Text(
+                                            "Usually leave this collapsed and use the catalog defaults."
+                                        )
                                         .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .accessibilityIdentifier("advanced-provider-overrides")
+                            }
+                        }
+
+                        // MARK: - Delivery Configuration (Proposal 007 §10.1)
+                        if selectedWorkflow == .fullMVPLive {
+                            GroupBox("Delivery Configuration") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Label(
+                                        "Repo-backed delivery settings for the Full MVP Live workflow.",
+                                        systemImage: "shippingbox.fill"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                    LabeledContent("Repository Root") {
+                                        TextField("Path to repo", text: $deliveryRepoRoot)
+                                            .textFieldStyle(.roundedBorder)
+                                            .font(.caption)
+                                            .accessibilityIdentifier("delivery-repo-root")
+                                    }
+                                    .font(.caption)
+
+                                    HStack(spacing: 12) {
+                                        LabeledContent("Base Branch") {
+                                            TextField("main", text: $deliveryBaseBranch)
+                                                .textFieldStyle(.roundedBorder)
+                                                .font(.caption)
+                                                .frame(maxWidth: 140)
+                                                .accessibilityIdentifier("delivery-base-branch")
+                                        }
+                                        .font(.caption)
+
+                                        LabeledContent("Target Branch") {
+                                            TextField(
+                                                "dogfood/full-mvp", text: $deliveryTargetBranch
+                                            )
+                                            .textFieldStyle(.roundedBorder)
+                                            .font(.caption)
+                                            .frame(maxWidth: 180)
+                                            .accessibilityIdentifier("delivery-target-branch")
+                                        }
+                                        .font(.caption)
+                                    }
+
+                                    LabeledContent("Worktree Base Path") {
+                                        TextField(
+                                            "Path for worktrees", text: $deliveryWorktreeBasePath
+                                        )
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.caption)
+                                        .accessibilityIdentifier("delivery-worktree-base")
+                                    }
+                                    .font(.caption)
+
+                                    HStack(spacing: 12) {
+                                        LabeledContent("Release Target") {
+                                            TextField(
+                                                "sandbox_local", text: $deliveryReleaseTargetID
+                                            )
+                                            .textFieldStyle(.roundedBorder)
+                                            .font(.caption)
+                                            .frame(maxWidth: 140)
+                                            .accessibilityIdentifier("delivery-release-target")
+                                        }
+                                        .font(.caption)
+
+                                        Picker("Release Mode", selection: $deliveryReleaseMode) {
+                                            Text("Sandbox").tag(ReleaseMode.sandbox)
+                                            Text("Staging").tag(ReleaseMode.staging)
+                                        }
+                                        .pickerStyle(.segmented)
+                                        .accessibilityIdentifier("delivery-release-mode-picker")
+                                    }
+
+                                    // Delivery Preflight
+                                    Divider()
+                                    if let deliveryPreflightResult {
+                                        HStack {
+                                            Label(
+                                                deliveryPreflightResult.passed
+                                                    ? "Delivery preflight passed"
+                                                    : "Delivery preflight issues found",
+                                                systemImage: deliveryPreflightResult.passed
+                                                    ? "checkmark.shield.fill"
+                                                    : "exclamationmark.shield.fill"
+                                            )
+                                            .foregroundStyle(
+                                                deliveryPreflightResult.passed ? .green : .orange)
+                                            Spacer()
+                                            Button("Review") {
+                                                showDeliveryPreflightSheet = true
+                                            }
+                                        }
+                                        .font(.caption)
+
+                                        if !deliveryPreflightResult.passed {
+                                            ForEach(deliveryPreflightResult.failedChecks, id: \.id)
+                                            { check in
+                                                Label(
+                                                    check.detail ?? check.label,
+                                                    systemImage: "xmark.circle"
+                                                )
+                                                .font(.caption2)
+                                                .foregroundStyle(DesignTokens.Status.error)
+                                            }
+                                        }
+                                    } else {
+                                        Button("Run Delivery Preflight") {
+                                            Task { await runDeliveryPreflight() }
+                                        }
+                                        .font(.caption)
+                                        .accessibilityIdentifier("delivery-preflight-button")
+                                    }
+
+                                    // Summary block
+                                    if let effectiveRepoRoot = effectiveDeliveryRepoRoot {
+                                        Divider()
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text("Workflow: Full MVP Live")
+                                            Text(
+                                                "Repo: \(URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent) → \(effectiveRepoRoot)"
+                                            )
+                                            Text(
+                                                "Branch: \(deliveryBaseBranch) → \(deliveryTargetBranch.isEmpty ? "auto" : deliveryTargetBranch)"
+                                            )
+                                            Text(
+                                                "Release target: \(deliveryReleaseMode.rawValue.capitalized) (\(deliveryReleaseTargetID))"
+                                            )
+                                            Text(
+                                                "Safety: dedicated worktree, manual release gate, deterministic services"
+                                            )
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .accessibilityIdentifier("delivery-configuration-section")
+                            .sheet(isPresented: $showDeliveryPreflightSheet) {
+                                if let deliveryPreflightResult {
+                                    NavigationStack {
+                                        DeliveryPreflightReportView(result: deliveryPreflightResult)
+                                            .toolbar {
+                                                ToolbarItem(placement: .cancellationAction) {
+                                                    Button("Done") {
+                                                        showDeliveryPreflightSheet = false
+                                                    }
+                                                }
+                                            }
+                                    }
+                                    .frame(minWidth: 480, minHeight: 360)
+                                }
+                            }
+                        }
+
+                        GroupBox("Compilation Preview") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                switch compileState {
+                                case .idle:
+                                    Text(
+                                        "Compile to validate `\(selectedWorkflow.relativePath)` and `agents.yaml` before starting."
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                case .compiling:
+                                    HStack(spacing: 8) {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("Compiling workflow...")
+                                            .font(.caption)
+                                    }
+
+                                case .success(let stateCount, let agentCount):
+                                    HStack(spacing: 12) {
+                                        Label("\(stateCount) states", systemImage: "flowchart")
+                                        Label("\(agentCount) agents", systemImage: "person.3")
+                                    }
+                                    .font(.caption)
+                                    .foregroundStyle(DesignTokens.Status.success)
+
+                                    if let compiledPlan {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text("Workflow: \(compiledPlan.workflowTitle)")
+                                            Text("Workflow ID: \(compiledPlan.workflowID)")
+                                            Text(
+                                                "Compiler version: \(compiledPlan.planCompilerVersion)"
+                                            )
+                                            Text(
+                                                "Workflow hash: \(compiledPlan.workflowSnapshotHash)"
+                                            )
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                            if selectedMode == .live {
+                                                Text("Executor: Live runtime execution")
+                                            } else {
+                                                Text("Executor: Simulated")
+                                            }
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                    }
+
+                                case .error(let message):
+                                    Label(message, systemImage: "xmark.circle.fill")
+                                        .font(.caption)
                                         .foregroundStyle(DesignTokens.Status.error)
                                 }
                             }
-                        } else {
-                            Button("Run Delivery Preflight") {
-                                Task { await runDeliveryPreflight() }
-                            }
-                            .font(.caption)
-                            .accessibilityIdentifier("delivery-preflight-button")
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
 
-                        // Summary block
-                        if let effectiveRepoRoot = effectiveDeliveryRepoRoot {
-                            Divider()
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("Workflow: Full MVP Live")
-                                Text("Repo: \(URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent) → \(effectiveRepoRoot)")
-                                Text("Branch: \(deliveryBaseBranch) → \(deliveryTargetBranch.isEmpty ? "auto" : deliveryTargetBranch)")
-                                Text("Release target: \(deliveryReleaseMode.rawValue.capitalized) (\(deliveryReleaseTargetID))")
-                                Text("Safety: dedicated worktree, manual release gate, deterministic services")
-                            }
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .accessibilityIdentifier("delivery-configuration-section")
-                .sheet(isPresented: $showDeliveryPreflightSheet) {
-                    if let deliveryPreflightResult {
-                        NavigationStack {
-                            DeliveryPreflightReportView(result: deliveryPreflightResult)
-                                .toolbar {
-                                    ToolbarItem(placement: .cancellationAction) {
-                                        Button("Done") { showDeliveryPreflightSheet = false }
+                        GroupBox("Preflight") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                if let preflightReport {
+                                    HStack {
+                                        Label(
+                                            preflightReport.status.rawValue.capitalized,
+                                            systemImage: preflightIcon(preflightReport.status)
+                                        )
+                                        .foregroundStyle(preflightColor(preflightReport.status))
+                                        Spacer()
+                                        Button("Review Report") {
+                                            showPreflightSheet = true
+                                        }
                                     }
-                                }
-                        }
-                        .frame(minWidth: 480, minHeight: 360)
-                    }
-                }
-            }
+                                    .font(.caption)
 
-            GroupBox("Compilation Preview") {
-                VStack(alignment: .leading, spacing: 8) {
-                    switch compileState {
-                    case .idle:
-                        Text("Compile to validate `\(selectedWorkflow.relativePath)` and `agents.yaml` before starting.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                                    Text(
+                                        "Configuration source: \(preflightReport.configurationSource.displayName)"
+                                    )
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
 
-                    case .compiling:
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Compiling workflow...")
-                                .font(.caption)
-                        }
+                                    if preflightReport.status == .warn && !requiresCleanPreflight {
+                                        Toggle("Allow start with warnings", isOn: $allowWarnStart)
+                                            .toggleStyle(.checkbox)
+                                            .font(.caption)
+                                            .accessibilityIdentifier(
+                                                "allow-start-with-warnings-toggle")
+                                    } else if preflightReport.status == .warn
+                                        && requiresCleanPreflight
+                                    {
+                                        Label(
+                                            "Run start is blocked until preflight is clean in current settings.",
+                                            systemImage: "lock.fill"
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(DesignTokens.Status.warning)
+                                    }
 
-                    case .success(let stateCount, let agentCount):
-                        HStack(spacing: 12) {
-                            Label("\(stateCount) states", systemImage: "flowchart")
-                            Label("\(agentCount) agents", systemImage: "person.3")
-                        }
-                        .font(.caption)
-                        .foregroundStyle(DesignTokens.Status.success)
-
-                        if let compiledPlan {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("Workflow: \(compiledPlan.workflowTitle)")
-                                Text("Workflow ID: \(compiledPlan.workflowID)")
-                                Text("Compiler version: \(compiledPlan.planCompilerVersion)")
-                                Text("Workflow hash: \(compiledPlan.workflowSnapshotHash)")
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                if selectedMode == .live {
-                                    Text("Executor: Live runtime execution")
+                                    if let firstBlockingIssue = preflightReport.blockingIssues.first
+                                    {
+                                        Text(firstBlockingIssue)
+                                            .font(.caption2)
+                                            .foregroundStyle(DesignTokens.Status.error)
+                                    } else if let firstWarning = preflightReport.warnings.first {
+                                        Text(firstWarning)
+                                            .font(.caption2)
+                                            .foregroundStyle(DesignTokens.Status.warning)
+                                    }
                                 } else {
-                                    Text("Executor: Simulated")
+                                    Text("Preflight will run after compilation.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                    }  // end ScrollView inner VStack
+                }  // end ScrollView
 
-                    case .error(let message):
-                        Label(message, systemImage: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(DesignTokens.Status.error)
+                Divider()
+
+                HStack {
+                    Button("Cancel", role: .cancel) {
+                        dismiss()
                     }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
+                    .keyboardShortcut(.cancelAction)
 
-            GroupBox("Preflight") {
-                VStack(alignment: .leading, spacing: 8) {
-                    if let preflightReport {
-                        HStack {
-                            Label(preflightReport.status.rawValue.capitalized, systemImage: preflightIcon(preflightReport.status))
-                                .foregroundStyle(preflightColor(preflightReport.status))
-                            Spacer()
-                            Button("Review Report") {
-                                showPreflightSheet = true
-                            }
-                        }
-                        .font(.caption)
+                    Spacer()
 
-                        Text("Configuration source: \(preflightReport.configurationSource.displayName)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-
-                        if preflightReport.status == .warn && !requiresCleanPreflight {
-                            Toggle("Allow start with warnings", isOn: $allowWarnStart)
-                                .toggleStyle(.checkbox)
-                                .font(.caption)
-                                .accessibilityIdentifier("allow-start-with-warnings-toggle")
-                        } else if preflightReport.status == .warn && requiresCleanPreflight {
-                            Label("Run start is blocked until preflight is clean in current settings.", systemImage: "lock.fill")
-                                .font(.caption)
-                                .foregroundStyle(DesignTokens.Status.warning)
-                        }
-
-                        if let firstBlockingIssue = preflightReport.blockingIssues.first {
-                            Text(firstBlockingIssue)
-                                .font(.caption2)
-                                .foregroundStyle(DesignTokens.Status.error)
-                        } else if let firstWarning = preflightReport.warnings.first {
-                            Text(firstWarning)
-                                .font(.caption2)
-                                .foregroundStyle(DesignTokens.Status.warning)
-                        }
-                    } else {
-                        Text("Preflight will run after compilation.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    Button("Compile") {
+                        compile()
                     }
+                    .disabled(compileState == .compiling)
+                    .accessibilityIdentifier("workflow-compile-button")
+
+                    Button("Start Run") {
+                        startRun()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!startRunBlockingReasons.isEmpty)
+                    .accessibilityIdentifier("workflow-start-run-confirm-button")
+                    .accessibilityValue(startRunButtonAccessibilityValue)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
-                } // end ScrollView inner VStack
-            } // end ScrollView
-
-            Divider()
-
-            HStack {
-                Button("Cancel", role: .cancel) {
-                    dismiss()
+            .padding(20)
+            .frame(minWidth: 520, minHeight: 480)
+            .task {
+                resolveURLs()
+                selectedMode = RunStartModePresentationPolicy.defaultMode(
+                    supportsLiveExecution: executionService.supportsLiveExecution,
+                    shouldDefaultToDeliveryFlow: shouldDefaultToDeliveryFlow,
+                    currentSelection: selectedMode
+                )
+                if shouldDefaultToDeliveryFlow {
+                    selectedWorkflow = .fullMVPLive
+                } else {
+                    selectedWorkflow = availableWorkflows.first ?? .canonicalRelease
                 }
-                .keyboardShortcut(.cancelAction)
-
-                Spacer()
-
-                Button("Compile") {
-                    compile()
+                if deliveryRepoRoot.isEmpty, let workspaceRoot = normalizedWorkspaceRoot {
+                    deliveryRepoRoot = workspaceRoot
                 }
-                .disabled(compileState == .compiling)
-                .accessibilityIdentifier("workflow-compile-button")
-
-                Button("Start Run") {
-                    startRun()
+                if deliveryWorktreeBasePath.isEmpty {
+                    deliveryWorktreeBasePath = effectiveDeliveryWorktreeBasePath
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(!startRunBlockingReasons.isEmpty)
-                .accessibilityIdentifier("workflow-start-run-confirm-button")
-                .accessibilityValue(startRunButtonAccessibilityValue)
+                compile()
             }
-        }
-        .padding(20)
-        .frame(minWidth: 520, minHeight: 480)
-        .task {
-            resolveURLs()
-            selectedMode = RunStartModePresentationPolicy.defaultMode(
-                supportsLiveExecution: executionService.supportsLiveExecution,
-                shouldDefaultToDeliveryFlow: shouldDefaultToDeliveryFlow,
-                currentSelection: selectedMode
-            )
-            if shouldDefaultToDeliveryFlow {
-                selectedWorkflow = .fullMVPLive
-            } else {
-                selectedWorkflow = availableWorkflows.first ?? .canonicalRelease
+            .onChange(of: selectedMode) { _, newMode in
+                if let firstWorkflow = WorkflowPreset.allCases.first(where: { $0.mode == newMode })
+                {
+                    selectedWorkflow = firstWorkflow
+                }
+                compile()
             }
-            if deliveryRepoRoot.isEmpty, let workspaceRoot = normalizedWorkspaceRoot {
-                deliveryRepoRoot = workspaceRoot
+            .onChange(of: selectedWorkflow) { _, _ in
+                compile()
             }
-            if deliveryWorktreeBasePath.isEmpty {
-                deliveryWorktreeBasePath = effectiveDeliveryWorktreeBasePath
+            .onChange(of: startOptions) { _, _ in
+                Task { await refreshPreflight() }
             }
-            compile()
-        }
-        .onChange(of: selectedMode) { _, newMode in
-            if let firstWorkflow = WorkflowPreset.allCases.first(where: { $0.mode == newMode }) {
-                selectedWorkflow = firstWorkflow
-            }
-            compile()
-        }
-        .onChange(of: selectedWorkflow) { _, _ in
-            compile()
-        }
-        .onChange(of: startOptions) { _, _ in
-            Task { await refreshPreflight() }
-        }
-        .sheet(isPresented: $showPreflightSheet) {
-            if let preflightReport {
-                NavigationStack {
-                    PreflightReportView(report: preflightReport)
-                        .toolbar {
-                            ToolbarItem(placement: .cancellationAction) {
-                                Button("Done") { showPreflightSheet = false }
+            .sheet(isPresented: $showPreflightSheet) {
+                if let preflightReport {
+                    NavigationStack {
+                        PreflightReportView(report: preflightReport)
+                            .toolbar {
+                                ToolbarItem(placement: .cancellationAction) {
+                                    Button("Done") { showPreflightSheet = false }
+                                }
                             }
+                    }
+                    .frame(minWidth: 520, minHeight: 420)
+                }
+            }
+        }
+
+        private func resolveURLs() {
+            let configuredWorkflowRepositoryRoot = repositoryRoot(
+                derivedFromWorkflowPath: appConfigurationStore.configuration.workflowSourcePath)
+            workflowURLs = Dictionary(
+                uniqueKeysWithValues: WorkflowPreset.allCases.compactMap { preset in
+                    let bundleURL = preset.bundleResourceName.flatMap {
+                        Bundle.main.url(forResource: $0, withExtension: "yaml")
+                    }
+                    let configuredWorkflowURL: URL? = {
+                        switch preset {
+                        case .canonicalRelease:
+                            return URL(
+                                fileURLWithPath: appConfigurationStore.configuration
+                                    .workflowSourcePath)
+                        case .proposalLoopLive:
+                            return configuredWorkflowRepositoryRoot?.appendingPathComponent(
+                                preset.relativePath)
+                        case .fullMVPLive:
+                            return configuredWorkflowRepositoryRoot?.appendingPathComponent(
+                                preset.relativePath)
                         }
-                }
-                .frame(minWidth: 520, minHeight: 420)
-            }
+                    }()
+                    guard
+                        let url = AppConfiguration.preferredExampleURL(
+                            configuredURL: configuredWorkflowURL,
+                            repoRelativePath: preset.relativePath,
+                            bundledURL: bundleURL
+                        ) ?? resolveExistingFile(at: [configuredWorkflowURL, bundleURL])
+                    else {
+                        return nil
+                    }
+                    return (preset, url)
+                })
+
+            catalogURL =
+                AppConfiguration.preferredExampleURL(
+                    configuredURL: URL(
+                        fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
+                    repoRelativePath: "examples/agents/agents.yaml",
+                    bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml")
+                )
+                ?? resolveExistingFile(at: [
+                    URL(
+                        fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
+                    Bundle.main.url(forResource: "agents", withExtension: "yaml"),
+                ])
         }
-    }
 
-    private func resolveURLs() {
-        let configuredWorkflowRepositoryRoot = repositoryRoot(derivedFromWorkflowPath: appConfigurationStore.configuration.workflowSourcePath)
-        workflowURLs = Dictionary(uniqueKeysWithValues: WorkflowPreset.allCases.compactMap { preset in
-            let bundleURL = preset.bundleResourceName.flatMap { Bundle.main.url(forResource: $0, withExtension: "yaml") }
-            let configuredWorkflowURL: URL? = {
-                switch preset {
-                case .canonicalRelease:
-                    return URL(fileURLWithPath: appConfigurationStore.configuration.workflowSourcePath)
-                case .proposalLoopLive:
-                    return configuredWorkflowRepositoryRoot?.appendingPathComponent(preset.relativePath)
-                case .fullMVPLive:
-                    return configuredWorkflowRepositoryRoot?.appendingPathComponent(preset.relativePath)
-                }
-            }()
-            guard let url = AppConfiguration.preferredExampleURL(
-                configuredURL: configuredWorkflowURL,
-                repoRelativePath: preset.relativePath,
-                bundledURL: bundleURL
-            ) ?? resolveExistingFile(at: [configuredWorkflowURL, bundleURL]) else {
-                return nil
+        private func resolveExistingFile(at candidates: [URL?]) -> URL? {
+            for case let url? in candidates
+            where FileManager.default.isReadableFile(atPath: url.path) {
+                return url
             }
-            return (preset, url)
-        })
-
-        catalogURL = AppConfiguration.preferredExampleURL(
-            configuredURL: URL(fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
-            repoRelativePath: "examples/agents/agents.yaml",
-            bundledURL: Bundle.main.url(forResource: "agents", withExtension: "yaml")
-        ) ?? resolveExistingFile(at: [
-            URL(fileURLWithPath: appConfigurationStore.configuration.agentCatalogSourcePath),
-            Bundle.main.url(forResource: "agents", withExtension: "yaml")
-        ])
-    }
-
-    private func resolveExistingFile(at candidates: [URL?]) -> URL? {
-        for case let url? in candidates where FileManager.default.isReadableFile(atPath: url.path) {
-            return url
-        }
-        return nil
-    }
-
-    private func repositoryRoot(derivedFromWorkflowPath path: String) -> URL? {
-        let workflowURL = URL(fileURLWithPath: path)
-        let components = Array(workflowURL.pathComponents.suffix(3))
-        guard components.count == 3,
-              components[0] == "examples",
-              components[1] == "workflows" else {
             return nil
         }
-        return workflowURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-    }
 
-    private func compile() {
-        guard let workflowURL = selectedWorkflowURL, let catalogURL else {
-            compileState = .error("Unable to locate workflow or agent catalog")
-            compiledPlan = nil
-            preflightReport = nil
+        private func repositoryRoot(derivedFromWorkflowPath path: String) -> URL? {
+            let workflowURL = URL(fileURLWithPath: path)
+            let components = Array(workflowURL.pathComponents.suffix(3))
+            guard components.count == 3,
+                components[0] == "examples",
+                components[1] == "workflows"
+            else {
+                return nil
+            }
             return
+                workflowURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
         }
 
-        compileState = .compiling
-
-        do {
-            let compiler = RunPlanCompiler(modelContext: modelContext)
-            let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
-            let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
-            let plan = try compiler.previewCompile(
-                workflow: workflow,
-                catalog: catalog,
-                catalogSourcePath: catalogURL.path
-            )
-
-            compiledPlan = plan
-            compileState = .success(stateCount: plan.states.count, agentCount: plan.agentBindings.count)
-            Task { await refreshPreflight() }
-        } catch {
-            compiledPlan = nil
-            compileState = .error(error.localizedDescription)
-            preflightReport = nil
-        }
-    }
-
-    private func startRun() {
-        guard let compiledPlan,
-              let workflowURL = selectedWorkflowURL,
-              let catalogURL,
-              !preflightBlocksStart,
-              !(preflightReport?.status == .warn && requiresCleanPreflight),
-              !warnRequiresConfirmation || allowWarnStart,
-              !deliveryPreflightBlocksStart else { return }
-
-        // Proposal 011 (REQ-005, REQ-007): Fail-closed workspace check — no ambient cwd fallback.
-        if compiledPlan.requiresProjectAccess {
-            do {
-                _ = try ProjectRootPolicy.requireAccessibleProjectRoot(
-                    workspaceRootPath: normalizedWorkspaceRoot,
-                    deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
-                )
-            } catch {
-                compileState = .error(error.localizedDescription)
+        private func compile() {
+            guard let workflowURL = selectedWorkflowURL, let catalogURL else {
+                compileState = .error("Unable to locate workflow or agent catalog")
+                compiledPlan = nil
+                preflightReport = nil
                 return
             }
-        }
 
-        isStarting = true
+            compileState = .compiling
 
-        do {
-            let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
-            let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
-            let providerBindings = try resolver.resolveBindings(plan: compiledPlan, startOptions: startOptions, runtimeProfiles: catalog.runtimeProfiles)
-            let adjustedPlan = RunStartOverrideResolver.applying(bindings: providerBindings, to: compiledPlan)
-            let startSnapshot = try buildRunStartSnapshot(
-                resolver: resolver,
-                catalog: catalog,
-                adjustedPlan: adjustedPlan,
-                providerBindings: providerBindings
-            )
-            let compiler = RunPlanCompiler(modelContext: modelContext)
-            let (run, workspace) = try compiler.createRun(
-                for: idea,
-                plan: adjustedPlan,
-                workflowSourcePath: workflowURL.path,
-                catalogSourcePath: catalogURL.path,
-                startSnapshot: startSnapshot
-            )
+            do {
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+                let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+                let plan = try compiler.previewCompile(
+                    workflow: workflow,
+                    catalog: catalog,
+                    catalogSourcePath: catalogURL.path
+                )
 
-            let preparedRun = PreparedRunStart(run: run, plan: adjustedPlan, workspace: workspace)
-            onRunPrepared?(preparedRun)
-            dismiss()
-        } catch {
-            compileState = .error("Failed to start run: \(error.localizedDescription)")
-            isStarting = false
-        }
-    }
-
-    private func refreshPreflight() async {
-        guard let workflowURL = selectedWorkflowURL,
-              let catalogURL else {
-            preflightReport = nil
-            return
-        }
-        let preflight = PreflightService(
-            appConfigurationStore: appConfigurationStore,
-            providerRegistry: providerRegistry
-        )
-        preflightReport = await preflight.runReport(
-            workflowURL: workflowURL,
-            catalogURL: catalogURL,
-            plan: compiledPlan,
-            startOptions: startOptions,
-            requiresRuntimeMCPValidation: selectedMode == .live,
-            idea: idea,
-            effectiveProjectRootPath: effectiveProjectRoot
-        )
-        if preflightReport?.status != .warn {
-            allowWarnStart = false
-        }
-    }
-
-    // MARK: - Delivery Preflight (Proposal 007 §9.6)
-
-    private func runDeliveryPreflight() async {
-        let effectiveRepoRoot = effectiveDeliveryRepoRoot ?? "(no project directory set)"
-
-        let draft = DeliveryConfiguration(
-            profileID: nil,
-            profileLabel: nil,
-            sampleProfileID: nil,
-            repoIdentifier: URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent,
-            repoRoot: effectiveRepoRoot,
-            baseBranch: deliveryBaseBranch,
-            worktreeBasePath: effectiveDeliveryWorktreeBasePath,
-            targetBranch: effectiveDeliveryTargetBranch,
-            releaseTargetID: deliveryReleaseTargetID,
-            releaseTargetLabel: deliveryReleaseMode == .sandbox ? "Sandbox" : "Staging",
-            releaseMode: deliveryReleaseMode
-        )
-
-        let service = DeliveryPreflightService()
-        deliveryPreflightResult = await service.validate(draft)
-    }
-
-    private var deliveryPreflightBlocksStart: Bool {
-        guard selectedWorkflow == .fullMVPLive else { return false }
-        // Block start if delivery preflight hasn't been run or has failed
-        guard let result = deliveryPreflightResult else { return true }
-        return !result.passed
-    }
-
-    private func encodeProviderBindings(_ bindings: [String: ResolvedProviderBinding]) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(bindings)
-    }
-
-    private func encodeProvenances(_ provenances: [String: FrozenBindingProvenance]) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(provenances)
-    }
-
-    private func encodeStartOptions(_ options: RunStartOptions) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(options)
-    }
-
-    private func encodeResolvedSkills(_ skills: [String: ResolvedSkill]) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(skills)
-    }
-
-    private func encodeSkillHashes(_ hashes: [String: String]) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(hashes)
-    }
-
-    private func encodeMCPPolicies(_ policies: [String: MCPPolicyResolutionReport]) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(policies)
-    }
-
-    private func buildRunStartSnapshot(
-        resolver: BackendProfileResolverV2,
-        catalog: AgentCatalog,
-        adjustedPlan: RunPlan,
-        providerBindings: [String: ResolvedProviderBinding]
-    ) throws -> RunStartSnapshot {
-        let provenances = resolver.resolveProvenances(plan: adjustedPlan, startOptions: startOptions)
-        let resolvedSkills: [String: ResolvedSkill] = adjustedPlan.agentBindings.values.reduce(into: [:]) { partialResult, agent in
-            guard let skill = agent.resolvedSkill else { return }
-            partialResult[agent.skillRef] = skill
-        }
-        let skillContentHashes = resolvedSkills.mapValues { $0.contentHash }
-        let skillInjectedContentHashes = resolvedSkills.mapValues { $0.injectedContentHash }
-        let runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
-        let resolvedMCPPolicies: [String: MCPPolicyResolutionReport] = adjustedPlan.agentBindings.reduce(into: [:]) { partialResult, entry in
-            partialResult[entry.key] = MCPPolicyResolver().resolve(
-                agent: entry.value,
-                catalog: catalog,
-                providerBinding: providerBindings[entry.key],
-                runtimeRegistry: runtimeRegistry
-            )
-        }
-        let strategySelection = StrategyExperimentCoordinator(config: executionService.stewardConfig)
-            .resolveSelection(
-                selectedProfileID: selectedContextStrategyProfileID,
-                cohortID: nil
-            )
-
-        let deliveryConfig: DeliveryConfiguration?
-        let deliveryPreflightJSON: Data?
-        if selectedWorkflow == .fullMVPLive {
-            guard let effectiveRepoRoot = effectiveDeliveryRepoRoot else {
-                throw WorkflowStartSnapshotError.missingDeliveryProjectDirectory
+                compiledPlan = plan
+                compileState = .success(
+                    stateCount: plan.states.count, agentCount: plan.agentBindings.count)
+                Task { await refreshPreflight() }
+            } catch {
+                compiledPlan = nil
+                compileState = .error(error.localizedDescription)
+                preflightReport = nil
             }
-            deliveryConfig = DeliveryConfiguration(
-                profileID: "chainworks_forge_self",
-                profileLabel: "Chainworks Forge (Self)",
-                sampleProfileID: "chainworks_forge_self",
+        }
+
+        private func startRun() {
+            guard let compiledPlan,
+                let workflowURL = selectedWorkflowURL,
+                let catalogURL,
+                !preflightBlocksStart,
+                !(preflightReport?.status == .warn && requiresCleanPreflight),
+                !warnRequiresConfirmation || allowWarnStart,
+                !deliveryPreflightBlocksStart
+            else { return }
+
+            // Proposal 011 (REQ-005, REQ-007): Fail-closed workspace check — no ambient cwd fallback.
+            if compiledPlan.requiresProjectAccess {
+                do {
+                    _ = try ProjectRootPolicy.requireAccessibleProjectRoot(
+                        workspaceRootPath: normalizedWorkspaceRoot,
+                        deliveryRepoRootPath: selectedWorkflow == .fullMVPLive
+                            ? deliveryRepoRoot : nil
+                    )
+                } catch {
+                    compileState = .error(error.localizedDescription)
+                    return
+                }
+            }
+
+            isStarting = true
+
+            do {
+                let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+                let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
+                let providerBindings = try resolver.resolveBindings(
+                    plan: compiledPlan, startOptions: startOptions,
+                    runtimeProfiles: catalog.runtimeProfiles)
+                let adjustedPlan = RunStartOverrideResolver.applying(
+                    bindings: providerBindings, to: compiledPlan)
+                let startSnapshot = try buildRunStartSnapshot(
+                    resolver: resolver,
+                    catalog: catalog,
+                    adjustedPlan: adjustedPlan,
+                    providerBindings: providerBindings
+                )
+                let compiler = RunPlanCompiler(modelContext: modelContext)
+                let (run, workspace) = try compiler.createRun(
+                    for: idea,
+                    plan: adjustedPlan,
+                    workflowSourcePath: workflowURL.path,
+                    catalogSourcePath: catalogURL.path,
+                    startSnapshot: startSnapshot
+                )
+
+                let preparedRun = PreparedRunStart(
+                    run: run, plan: adjustedPlan, workspace: workspace)
+                onRunPrepared?(preparedRun)
+                dismiss()
+            } catch {
+                compileState = .error("Failed to start run: \(error.localizedDescription)")
+                isStarting = false
+            }
+        }
+
+        private func refreshPreflight() async {
+            guard let workflowURL = selectedWorkflowURL,
+                let catalogURL
+            else {
+                preflightReport = nil
+                return
+            }
+            let preflight = PreflightService(
+                appConfigurationStore: appConfigurationStore,
+                providerRegistry: providerRegistry
+            )
+            preflightReport = await preflight.runReport(
+                workflowURL: workflowURL,
+                catalogURL: catalogURL,
+                plan: compiledPlan,
+                startOptions: startOptions,
+                requiresRuntimeMCPValidation: selectedMode == .live,
+                idea: idea,
+                effectiveProjectRootPath: effectiveProjectRoot
+            )
+            if preflightReport?.status != .warn {
+                allowWarnStart = false
+            }
+        }
+
+        // MARK: - Delivery Preflight (Proposal 007 §9.6)
+
+        private func runDeliveryPreflight() async {
+            let effectiveRepoRoot = effectiveDeliveryRepoRoot ?? "(no project directory set)"
+
+            let draft = DeliveryConfiguration(
+                profileID: nil,
+                profileLabel: nil,
+                sampleProfileID: nil,
                 repoIdentifier: URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent,
                 repoRoot: effectiveRepoRoot,
                 baseBranch: deliveryBaseBranch,
@@ -2428,545 +2555,1378 @@ struct WorkflowStartRunSheet: View {
                 releaseTargetLabel: deliveryReleaseMode == .sandbox ? "Sandbox" : "Staging",
                 releaseMode: deliveryReleaseMode
             )
-            deliveryPreflightJSON = deliveryPreflightResult.flatMap { try? JSONEncoder().encode($0) }
-        } else {
-            deliveryConfig = nil
-            deliveryPreflightJSON = nil
+
+            let service = DeliveryPreflightService()
+            deliveryPreflightResult = await service.validate(draft)
         }
 
-        let frozenProjectRoot = ProjectRootPolicy.effectiveProjectRoot(
-            workspaceRootPath: normalizedWorkspaceRoot,
-            deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
-        )
+        private var deliveryPreflightBlocksStart: Bool {
+            guard selectedWorkflow == .fullMVPLive else { return false }
+            // Block start if delivery preflight hasn't been run or has failed
+            guard let result = deliveryPreflightResult else { return true }
+            return !result.passed
+        }
 
-        return RunStartSnapshot(
-            providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
-            bindingProvenanceJSON: encodeProvenances(provenances),
-            resolvedSkillsJSON: encodeResolvedSkills(resolvedSkills),
-            skillContentHashesJSON: encodeSkillHashes(skillContentHashes),
-            skillInjectedContentHashesJSON: encodeSkillHashes(skillInjectedContentHashes),
-            resolvedMCPPoliciesJSON: encodeMCPPolicies(resolvedMCPPolicies),
-            startOptionsJSON: encodeStartOptions(startOptions),
-            frozenWorkspaceRootPath: adjustedPlan.requiresProjectAccess
-                ? try ProjectRootPolicy.requireProjectRoot(
-                    workspaceRootPath: frozenProjectRoot,
-                    deliveryRepoRootPath: nil
+        private func encodeProviderBindings(_ bindings: [String: ResolvedProviderBinding]) -> Data?
+        {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(bindings)
+        }
+
+        private func encodeProvenances(_ provenances: [String: FrozenBindingProvenance]) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(provenances)
+        }
+
+        private func encodeStartOptions(_ options: RunStartOptions) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(options)
+        }
+
+        private func encodeResolvedSkills(_ skills: [String: ResolvedSkill]) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(skills)
+        }
+
+        private func encodeSkillHashes(_ hashes: [String: String]) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(hashes)
+        }
+
+        private func encodeMCPPolicies(_ policies: [String: MCPPolicyResolutionReport]) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(policies)
+        }
+
+        private func buildRunStartSnapshot(
+            resolver: BackendProfileResolverV2,
+            catalog: AgentCatalog,
+            adjustedPlan: RunPlan,
+            providerBindings: [String: ResolvedProviderBinding]
+        ) throws -> RunStartSnapshot {
+            let provenances = resolver.resolveProvenances(
+                plan: adjustedPlan, startOptions: startOptions)
+            let resolvedSkills: [String: ResolvedSkill] = adjustedPlan.agentBindings.values.reduce(
+                into: [:]) { partialResult, agent in
+                    guard let skill = agent.resolvedSkill else { return }
+                    partialResult[agent.skillRef] = skill
+                }
+            let skillContentHashes = resolvedSkills.mapValues { $0.contentHash }
+            let skillInjectedContentHashes = resolvedSkills.mapValues { $0.injectedContentHash }
+            let runtimeRegistry = try? CodexExtensionRegistryReader().snapshot()
+            let resolvedMCPPolicies: [String: MCPPolicyResolutionReport] = adjustedPlan
+                .agentBindings
+                .reduce(into: [:]) { partialResult, entry in
+                    partialResult[entry.key] = MCPPolicyResolver().resolve(
+                        agent: entry.value,
+                        catalog: catalog,
+                        providerBinding: providerBindings[entry.key],
+                        runtimeRegistry: runtimeRegistry
+                    )
+                }
+            let strategySelection = StrategyExperimentCoordinator(
+                config: executionService.stewardConfig
+            )
+            .resolveSelection(
+                selectedProfileID: selectedContextStrategyProfileID,
+                cohortID: nil
+            )
+
+            let deliveryConfig: DeliveryConfiguration?
+            let deliveryPreflightJSON: Data?
+            if selectedWorkflow == .fullMVPLive {
+                guard let effectiveRepoRoot = effectiveDeliveryRepoRoot else {
+                    throw WorkflowStartSnapshotError.missingDeliveryProjectDirectory
+                }
+                deliveryConfig = DeliveryConfiguration(
+                    profileID: "chainworks_forge_self",
+                    profileLabel: "Chainworks Forge (Self)",
+                    sampleProfileID: "chainworks_forge_self",
+                    repoIdentifier: URL(fileURLWithPath: effectiveRepoRoot).lastPathComponent,
+                    repoRoot: effectiveRepoRoot,
+                    baseBranch: deliveryBaseBranch,
+                    worktreeBasePath: effectiveDeliveryWorktreeBasePath,
+                    targetBranch: effectiveDeliveryTargetBranch,
+                    releaseTargetID: deliveryReleaseTargetID,
+                    releaseTargetLabel: deliveryReleaseMode == .sandbox ? "Sandbox" : "Staging",
+                    releaseMode: deliveryReleaseMode
                 )
-                : frozenProjectRoot,
-            deliveryConfiguration: deliveryConfig,
-            deliveryPreflightJSON: deliveryPreflightJSON,
-            contextStrategyProfileID: strategySelection.profileID,
-            strategyAssignmentMode: strategySelection.assignmentMode,
-            strategyRecommendationState: strategySelection.recommendationState,
-            contextStrategySnapshotJSON: try JSONEncoder().encode(strategySelection.profile)
-        )
-    }
-
-    private func preflightIcon(_ status: PreflightStatus) -> String {
-        switch status {
-        case .pass:
-            return "checkmark.circle.fill"
-        case .warn:
-            return "exclamationmark.triangle.fill"
-        case .fail:
-            return "xmark.circle.fill"
-        }
-    }
-
-    private func preflightColor(_ status: PreflightStatus) -> Color {
-        switch status {
-        case .pass:
-            return DesignTokens.Status.success
-        case .warn:
-            return DesignTokens.Status.warning
-        case .fail:
-            return DesignTokens.Status.error
-        }
-    }
-}
-
-// MARK: - WorkflowRunProgressView
-
-struct WorkflowRunProgressView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Environment(ExecutionService.self) private var executionService
-    @Query private var summaryArtifacts: [Artifact]
-
-    let run: Run
-    private let forcedInitialPane: IdeaRunPane?
-
-    @State private var selectedPane: IdeaRunPane = .summary
-    @State private var selectedArtifact: Artifact?
-    @State private var approvalComment = ""
-    @State private var showStopConfirmation = false
-    @State private var showTimelineInspector = false
-
-    init(run: Run, initialPane: IdeaRunPane? = nil) {
-        self.run = run
-        self.forcedInitialPane = initialPane
-        _selectedPane = State(initialValue: initialPane ?? .summary)
-        let runID = run.id
-        _summaryArtifacts = Query(
-            filter: #Predicate<Artifact> { artifact in
-                artifact.runID == runID
-                    && (artifact.reportKind == nil || artifact.reportKind != "immutable_history")
-            },
-            sort: [SortDescriptor(\Artifact.createdAt, order: .reverse)]
-        )
-    }
-
-    private var sortedStages: [RunStageSnapshot] {
-        RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
-    }
-
-    private var artifactHierarchy: RunArtifactHierarchy {
-        RunArtifactHierarchyBuilder().build(for: run)
-    }
-
-    private var latestArtifacts: [Artifact] {
-        artifactSnapshot.latestArtifacts
-    }
-
-    private var activeAgents: [RunStageAgentSnapshot] {
-        sortedStages.flatMap(\.agentExecutions).filter { $0.status == .running }
-    }
-
-    private var orchestrator: WorkflowOrchestrator? {
-        executionService.peekOrchestrator(for: run.id)
-    }
-
-    private var liveTimeline: [LiveExecutionTimelineEntry] {
-        orchestrator?.liveTimeline.reversed() ?? []
-    }
-
-    private var workflowMapProjectionService: WorkflowMapProjectionService {
-        WorkflowMapProjectionService(
-            modelContext: modelContext,
-            executionService: executionService
-        )
-    }
-
-    private var workflowMapProjection: WorkflowMapProjection? {
-        workflowMapProjectionService.projection(for: run)
-    }
-
-    private var currentStageSummary: WorkflowMapCurrentStageSummary? {
-        workflowMapProjectionService.currentStageSummary(for: run)
-    }
-
-    private var pendingApprovalRequest: ApprovalRequest? {
-        executionService.pendingApprovals.values.first { $0.runID == run.id }
-    }
-
-    private var effectiveRunStatus: RunStatus {
-        workflowMapProjectionService.runStatus(for: run)
-    }
-
-    private var effectiveRunStatusLabel: String {
-        effectiveRunStatus.rawValue.replacingOccurrences(of: "_", with: " ")
-    }
-
-    private var effectiveCurrentStageLabel: String {
-        currentStageSummary?.label ?? run.cursorDerivedStageLabel
-    }
-
-    private var approvalContextArtifacts: [Artifact] {
-        artifactSnapshot.approvalContextArtifacts
-    }
-
-    private var pendingApprovalTitle: String {
-        pendingApprovalRequest.map { "Run is waiting at \($0.stageLabel)." } ?? "No active approval gate."
-    }
-
-    private var proposalLoopFeedbackSummary: ProposalLoopFeedbackSummary? {
-        ProposalLoopFeedbackParser.parseSummary(from: approvalContextArtifacts)
-    }
-
-    private var latestDebugArtifacts: [Artifact] {
-        artifactSnapshot.latestDebugArtifacts
-    }
-
-    private var artifactSnapshot: WorkflowRunArtifactSnapshot {
-        WorkflowRunArtifactSnapshot(artifacts: summaryArtifacts)
-    }
-
-    private var preferredPane: IdeaRunPane {
-        defaultIdeaRunPane(for: effectiveRunStatus)
-    }
-
-    private var latestPersistedCheckpointText: String? {
-        let latestApproval = PersistedRunGraph.approvals(for: run).max {
-            ($0.decidedAt ?? $0.requestedAt) < ($1.decidedAt ?? $1.requestedAt)
-        }
-        let latestStage = sortedStages.max {
-            ($0.completedAt ?? $0.startedAt) < ($1.completedAt ?? $1.startedAt)
-        }
-
-        let approvalTimestamp = latestApproval.map { $0.decidedAt ?? $0.requestedAt }
-        let stageTimestamp = latestStage.map { $0.completedAt ?? $0.startedAt }
-
-        if let latestApproval, let approvalTimestamp,
-           stageTimestamp == nil || approvalTimestamp >= stageTimestamp! {
-            let decisionLabel = latestApproval.decision.rawValue.replacingOccurrences(of: "_", with: " ")
-            return "Persisted approval \(decisionLabel) for \(latestApproval.stageID)"
-        }
-
-        if let latestStage {
-            let statusLabel = latestStage.status.rawValue.replacingOccurrences(of: "_", with: " ")
-            return "Persisted stage \(statusLabel) in \(latestStage.stageID)"
-        }
-
-        return nil
-    }
-
-    private var latestPersistedSessionID: String? {
-        sortedStages
-            .flatMap(\.agentExecutions)
-            .sorted { lhs, rhs in
-                let leftTimestamp = lhs.completedAt ?? lhs.startedAt
-                let rightTimestamp = rhs.completedAt ?? rhs.startedAt
-                if leftTimestamp == rightTimestamp {
-                    return lhs.id.uuidString > rhs.id.uuidString
+                deliveryPreflightJSON = deliveryPreflightResult.flatMap {
+                    try? JSONEncoder().encode($0)
                 }
-                return leftTimestamp > rightTimestamp
+            } else {
+                deliveryConfig = nil
+                deliveryPreflightJSON = nil
             }
-            .first { snapshot in
-                guard let sessionID = snapshot.runtimeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                    return false
+
+            let frozenProjectRoot = ProjectRootPolicy.effectiveProjectRoot(
+                workspaceRootPath: normalizedWorkspaceRoot,
+                deliveryRepoRootPath: selectedWorkflow == .fullMVPLive ? deliveryRepoRoot : nil
+            )
+
+            return RunStartSnapshot(
+                providerBindingSnapshotJSON: encodeProviderBindings(providerBindings),
+                bindingProvenanceJSON: encodeProvenances(provenances),
+                resolvedSkillsJSON: encodeResolvedSkills(resolvedSkills),
+                skillContentHashesJSON: encodeSkillHashes(skillContentHashes),
+                skillInjectedContentHashesJSON: encodeSkillHashes(skillInjectedContentHashes),
+                resolvedMCPPoliciesJSON: encodeMCPPolicies(resolvedMCPPolicies),
+                startOptionsJSON: encodeStartOptions(startOptions),
+                frozenWorkspaceRootPath: adjustedPlan.requiresProjectAccess
+                    ? try ProjectRootPolicy.requireProjectRoot(
+                        workspaceRootPath: frozenProjectRoot,
+                        deliveryRepoRootPath: nil
+                    )
+                    : frozenProjectRoot,
+                deliveryConfiguration: deliveryConfig,
+                deliveryPreflightJSON: deliveryPreflightJSON,
+                contextStrategyProfileID: strategySelection.profileID,
+                strategyAssignmentMode: strategySelection.assignmentMode,
+                strategyRecommendationState: strategySelection.recommendationState,
+                contextStrategySnapshotJSON: try JSONEncoder().encode(strategySelection.profile)
+            )
+        }
+
+        private func preflightIcon(_ status: PreflightStatus) -> String {
+            switch status {
+            case .pass:
+                return "checkmark.circle.fill"
+            case .warn:
+                return "exclamationmark.triangle.fill"
+            case .fail:
+                return "xmark.circle.fill"
+            }
+        }
+
+        private func preflightColor(_ status: PreflightStatus) -> Color {
+            switch status {
+            case .pass:
+                return DesignTokens.Status.success
+            case .warn:
+                return DesignTokens.Status.warning
+            case .fail:
+                return DesignTokens.Status.error
+            }
+        }
+    }
+
+    struct ImplementationSelfAssessmentDisplaySummary {
+        struct Task: Identifiable {
+            let id = UUID()
+            let summary: String
+            let owner: String
+            let blocking: Bool
+            let evidence: String
+            let targetStage: String?
+            let ownerClass: String?
+            let sourcePointer: String?
+        }
+
+        struct TargetStageSummary: Identifiable {
+            let id = UUID()
+            let targetStage: String
+            let count: Int
+            let blockingReviewCount: Int
+        }
+
+        struct ValidationIssue: Identifiable {
+            let id = UUID()
+            let code: String
+            let message: String
+            let pointer: String
+
+            var displayText: String {
+                let prefix = code.isEmpty ? "validation" : code
+                let suffix = pointer.isEmpty ? "" : " (\(pointer))"
+                return "\(prefix): \(message)\(suffix)"
+            }
+        }
+
+        let status: String
+        let implementationComplete: Bool?
+        let verificationGreen: Bool?
+        let remainingCodeTasks: [Task]
+        let handoffTasks: [Task]
+        let knownRisks: [String]
+        let testsRun: [String]
+        let docsImpacted: [String]
+        let ownerClassCounts: [String: Int]
+        let targetStageSummaries: [TargetStageSummary]
+        let validationErrors: [ValidationIssue]
+        let warnings: [ValidationIssue]
+        let sourceArtifactName: String
+        let rawJSON: String
+
+        var statusLabel: String {
+            status.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+
+        var verificationLabel: String {
+            switch verificationGreen {
+            case .some(true): return "Green"
+            case .some(false): return "Blocked"
+            case .none: return "Unknown"
+            }
+        }
+
+        var evidenceText: String {
+            let taskEvidence = (remainingCodeTasks + handoffTasks)
+                .map { "\($0.summary): \($0.evidence)" }
+            let validationEvidence =
+                validationErrors.map(\.displayText) + warnings.map(\.displayText)
+            return (taskEvidence + knownRisks + testsRun + validationEvidence).joined(
+                separator: "\n")
+        }
+    }
+
+    enum ImplementationSelfAssessmentDisplayAdapter {
+        static func summary(
+            from run: Run,
+            artifacts: [Artifact]
+        ) -> ImplementationSelfAssessmentDisplaySummary? {
+            if let data = run.implementationSelfAssessmentSummaryJSON,
+                let canonicalData =
+                    ImplementationSelfAssessmentSummaryProjection.canonicalSummaryData(
+                        from: data,
+                        artifactName: nil
+                    ),
+                let rawJSON = String(data: canonicalData, encoding: .utf8)
+            {
+                return summary(
+                    from: canonicalData,
+                    rawJSON: rawJSON,
+                    sourceArtifactName: "run.implementation_self_assessment_summary"
+                )
+            }
+
+            return summary(from: artifacts)
+        }
+
+        static func summary(from artifacts: [Artifact])
+            -> ImplementationSelfAssessmentDisplaySummary?
+        {
+            if let summary = embeddedCanonicalSummary(from: artifacts) {
+                return summary
+            }
+
+            guard
+                let artifact = artifacts.last(where: {
+                    $0.name == "implementation_self_assessment"
+                        || $0.name == "implementation_self_assessment_v2"
+                        || $0.contractID == "implementation_self_assessment_v2"
+                }),
+                let data = try? Data(contentsOf: URL(fileURLWithPath: artifact.filePath)),
+                let summaryData =
+                    ImplementationSelfAssessmentSummaryProjection.canonicalSummaryData(
+                        from: data,
+                        artifactName: artifact.name
+                    ),
+                let rawJSON = String(data: summaryData, encoding: .utf8)
+            else {
+                return nil
+            }
+
+            return summary(from: summaryData, rawJSON: rawJSON, sourceArtifactName: artifact.name)
+        }
+
+        private static func embeddedCanonicalSummary(
+            from artifacts: [Artifact]
+        ) -> ImplementationSelfAssessmentDisplaySummary? {
+            guard
+                let artifact = artifacts.last(where: { $0.name == "implementation_review_summary" }
+                ),
+                let data = try? Data(contentsOf: URL(fileURLWithPath: artifact.filePath)),
+                let summaryData =
+                    ImplementationSelfAssessmentSummaryProjection.canonicalSummaryData(
+                        from: data,
+                        artifactName: artifact.name
+                    ),
+                let rawJSON = String(data: summaryData, encoding: .utf8)
+            else {
+                return nil
+            }
+
+            return summary(
+                from: summaryData,
+                rawJSON: rawJSON,
+                sourceArtifactName:
+                    "implementation_review_summary.implementation_self_assessment_summary"
+            )
+        }
+
+        private static func summary(
+            from data: Data,
+            rawJSON: String,
+            sourceArtifactName: String
+        ) -> ImplementationSelfAssessmentDisplaySummary {
+            guard let decoded = try? JSONDecoder().decode(RawSelfAssessment.self, from: data) else {
+                return ImplementationSelfAssessmentDisplaySummary(
+                    status: "invalid",
+                    implementationComplete: nil,
+                    verificationGreen: nil,
+                    remainingCodeTasks: [],
+                    handoffTasks: [],
+                    knownRisks: [
+                        "Artifact could not be decoded as implementation_self_assessment_v2."
+                    ],
+                    testsRun: [],
+                    docsImpacted: [],
+                    ownerClassCounts: [:],
+                    targetStageSummaries: [],
+                    validationErrors: [
+                        ImplementationSelfAssessmentDisplaySummary.ValidationIssue(
+                            code: "decode_failed",
+                            message:
+                                "Artifact could not be decoded as implementation_self_assessment_v2.",
+                            pointer: "$"
+                        )
+                    ],
+                    warnings: [],
+                    sourceArtifactName: sourceArtifactName,
+                    rawJSON: rawJSON
+                )
+            }
+
+            let status = decoded.status.map(isKnownStatus) == true ? decoded.status! : "invalid"
+            let validationErrors =
+                decoded.validationErrors.map {
+                    ImplementationSelfAssessmentDisplaySummary.ValidationIssue(
+                        code: $0.code,
+                        message: $0.message,
+                        pointer: $0.pointer
+                    )
                 }
-                return !sessionID.isEmpty
-            }?
-            .runtimeSessionID
-    }
 
-    private var effectiveLatestSessionID: String? {
-        latestLiveSessionID ?? latestPersistedSessionID
-    }
-
-    private var nextActionText: String {
-        switch effectiveRunStatus {
-        case .waitingApproval:
-            return "Approve or reject the current proposal."
-        case .blocked:
-            return run.driftDetails ?? "Inspect the blocked stage and decide whether to resume."
-        case .failed:
-            return "Inspect receipts and artifacts, then retry or adjust the workflow."
-        case .completed:
-            return "Review the completed feature report and generated artifacts."
-        case .running, .pending, .ready:
-            return "Watch live progress and inspect artifacts as they arrive."
-        case .cancelled:
-            return "Run was cancelled. Return to the idea to start another run or archive it."
-        case .cancelling:
-            return "Cancellation in progress. Waiting for agents to settle."
+            return ImplementationSelfAssessmentDisplaySummary(
+                status: status,
+                implementationComplete: decoded.implementationComplete,
+                verificationGreen: decoded.verificationGreen,
+                remainingCodeTasks: decoded.remainingCodeTasks.map {
+                    ImplementationSelfAssessmentDisplaySummary.Task(
+                        summary: $0.summary,
+                        owner: $0.owner,
+                        blocking: $0.blocking,
+                        evidence: $0.evidence,
+                        targetStage: nil,
+                        ownerClass: nil,
+                        sourcePointer: $0.sourcePointer
+                    )
+                },
+                handoffTasks: decoded.handoffTasks.map {
+                    ImplementationSelfAssessmentDisplaySummary.Task(
+                        summary: $0.summary,
+                        owner: ownerClassLabel(for: $0.ownerClass),
+                        blocking: $0.blockingReview,
+                        evidence: $0.evidence,
+                        targetStage: $0.targetStage,
+                        ownerClass: $0.ownerClass,
+                        sourcePointer: $0.sourcePointer
+                    )
+                },
+                knownRisks: decoded.knownRisks,
+                testsRun: decoded.testsRun,
+                docsImpacted: decoded.docsImpacted,
+                ownerClassCounts: decoded.ownerClassCounts,
+                targetStageSummaries: decoded.targetStageSummaries.map {
+                    ImplementationSelfAssessmentDisplaySummary.TargetStageSummary(
+                        targetStage: $0.targetStage,
+                        count: $0.count,
+                        blockingReviewCount: $0.blockingReviewCount
+                    )
+                },
+                validationErrors: validationErrors,
+                warnings: decoded.warnings.map {
+                    ImplementationSelfAssessmentDisplaySummary.ValidationIssue(
+                        code: $0.code,
+                        message: $0.message,
+                        pointer: $0.pointer
+                    )
+                },
+                sourceArtifactName: sourceArtifactName,
+                rawJSON: rawJSON
+            )
         }
-    }
 
-    private func statusColor(_ status: RunStatus) -> Color {
-        switch status {
-        case .pending, .ready:
-            return DesignTokens.Status.neutral
-        case .running:
-            return DesignTokens.Status.running
-        case .waitingApproval, .cancelling, .blocked:
-            return DesignTokens.Status.warning
-        case .completed:
-            return DesignTokens.Status.success
-        case .failed:
-            return DesignTokens.Status.error
-        case .cancelled:
-            return DesignTokens.Status.cancelled
+        private nonisolated static func isKnownStatus(_ status: String) -> Bool {
+            ["invalid", "needs_code_fixes", "blocked", "handoff_required", "complete", "unknown"]
+                .contains(status)
         }
-    }
 
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                header
-                segmentedSwitcher
-                paneBody
+        nonisolated static func ownerClassLabel(for ownerClass: String) -> String {
+            switch ownerClass {
+            case "docs":
+                return "Docs"
+            case "manual_evidence":
+                return "Manual Evidence"
+            case "release":
+                return "Release"
+            case "ops":
+                return "Ops"
+            case "product":
+                return "Product"
+            case "human_operator":
+                return "Human Operator"
+            case "unknown":
+                return "Human Triage"
+            default:
+                return ownerClass.replacingOccurrences(of: "_", with: " ").capitalized
             }
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .accessibilityIdentifier("run-progress-view")
-        .sheet(item: $selectedArtifact) { artifact in
-            NavigationStack {
-                ArtifactInspectorView(artifact: artifact, run: run)
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Done") { selectedArtifact = nil }
-                        }
+
+        private struct RawSelfAssessment: Decodable {
+            var status: String?
+            var implementationComplete: Bool?
+            var verificationGreen: Bool?
+            var remainingCodeTasks: [RawCodeTask]
+            var handoffTasks: [RawHandoffTask]
+            var knownRisks: [String]
+            var testsRun: [String]
+            var docsImpacted: [String]
+            var ownerClassCounts: [String: Int]
+            var targetStageSummaries: [RawTargetStageSummary]
+            var validationErrors: [RawValidationIssue]
+            var warnings: [RawValidationIssue]
+
+            enum CodingKeys: String, CodingKey {
+                case status
+                case implementationComplete = "implementation_complete"
+                case verificationGreen = "verification_green"
+                case remainingCodeTasks = "remaining_code_tasks"
+                case handoffTasks = "handoff_tasks"
+                case knownRisks = "known_risks"
+                case testsRun = "tests_run"
+                case docsImpacted = "docs_impacted"
+                case ownerClassCounts = "owner_class_counts"
+                case targetStageSummaries = "target_stage_summaries"
+                case validationErrors = "validation_errors"
+                case warnings
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                status = try container.decodeIfPresent(String.self, forKey: .status)
+                implementationComplete = try container.decodeIfPresent(
+                    Bool.self, forKey: .implementationComplete)
+                verificationGreen = try container.decodeIfPresent(
+                    Bool.self, forKey: .verificationGreen)
+                remainingCodeTasks =
+                    try container.decodeIfPresent([RawCodeTask].self, forKey: .remainingCodeTasks)
+                    ?? []
+                handoffTasks =
+                    try container.decodeIfPresent([RawHandoffTask].self, forKey: .handoffTasks)
+                    ?? []
+                knownRisks = try container.decodeIfPresent([String].self, forKey: .knownRisks) ?? []
+                testsRun = try container.decodeIfPresent([String].self, forKey: .testsRun) ?? []
+                docsImpacted =
+                    try container.decodeIfPresent([String].self, forKey: .docsImpacted) ?? []
+                ownerClassCounts =
+                    try container.decodeIfPresent([String: Int].self, forKey: .ownerClassCounts)
+                    ?? [:]
+                targetStageSummaries =
+                    try container.decodeIfPresent(
+                        [RawTargetStageSummary].self, forKey: .targetStageSummaries)
+                    ?? []
+                validationErrors =
+                    try container.decodeIfPresent(
+                        [RawValidationIssue].self, forKey: .validationErrors) ?? []
+                warnings =
+                    try container.decodeIfPresent([RawValidationIssue].self, forKey: .warnings)
+                    ?? []
+            }
+        }
+
+        private struct RawCodeTask: Decodable {
+            let summary: String
+            let owner: String
+            let blocking: Bool
+            let evidence: String
+            let sourcePointer: String?
+
+            enum CodingKeys: String, CodingKey {
+                case summary
+                case owner
+                case blocking
+                case evidence
+                case sourcePointer = "source_pointer"
+            }
+        }
+
+        private struct RawHandoffTask: Decodable {
+            let summary: String
+            let ownerClass: String
+            let targetStage: String
+            let blockingReview: Bool
+            let evidence: String
+            let sourcePointer: String?
+
+            enum CodingKeys: String, CodingKey {
+                case summary
+                case ownerClass = "owner_class"
+                case targetStage = "target_stage"
+                case blockingReview = "blocking_review"
+                case evidence
+                case sourcePointer = "source_pointer"
+            }
+        }
+
+        private struct RawTargetStageSummary: Decodable {
+            let targetStage: String
+            let count: Int
+            let blockingReviewCount: Int
+
+            enum CodingKeys: String, CodingKey {
+                case targetStage = "target_stage"
+                case count
+                case blockingReviewCount = "blocking_review_count"
+            }
+        }
+
+        private struct RawValidationIssue: Decodable {
+            let code: String
+            let message: String
+            let pointer: String
+        }
+    }
+
+    struct ImplementationSelfAssessmentPanel: View {
+        let summary: ImplementationSelfAssessmentDisplaySummary
+        @State private var showHandoffOnly = false
+        @State private var copiedPayload: CopiedPayload?
+
+        private enum CopiedPayload: Equatable {
+            case evidence
+            case rawJSON
+        }
+
+        private var totalDetailRows: Int {
+            summary.remainingCodeTasks.count
+                + summary.handoffTasks.count
+                + summary.knownRisks.count
+                + summary.testsRun.count
+                + summary.docsImpacted.count
+                + summary.validationErrors.count
+                + summary.warnings.count
+                + summary.ownerClassCounts.count
+                + summary.targetStageSummaries.count
+        }
+
+        private var showsHandoffOnlyFilter: Bool {
+            totalDetailRows > 5 && !summary.handoffTasks.isEmpty
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
+                HStack {
+                    Label("Implementation Self-Assessment", systemImage: "checklist.checked")
+                        .font(ForgeTypography.cardTitle)
+                    Spacer()
+                    StatusCapsule(
+                        text: summary.statusLabel, color: statusColor, icon: statusSymbol,
+                        size: .small)
+                }
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(minimum: 0), spacing: ForgeSpacing.medium),
+                        GridItem(.flexible(minimum: 0), spacing: ForgeSpacing.medium),
+                    ],
+                    alignment: .leading,
+                    spacing: ForgeSpacing.medium
+                ) {
+                    metric("Status", summary.statusLabel)
+                    metric("Verification", summary.verificationLabel)
+                    metric("Code Tasks", "\(summary.remainingCodeTasks.count)")
+                    metric("Handoffs", "\(summary.handoffTasks.count)")
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("implementation-self-assessment-metrics-grid")
+
+                if showsHandoffOnlyFilter {
+                    Toggle("Handoff Only", isOn: $showHandoffOnly)
+                        .toggleStyle(.checkbox)
+                }
+
+                if !showHandoffOnly {
+                    taskSection("Remaining Code Tasks", tasks: summary.remainingCodeTasks)
+                }
+
+                taskSection("Handoff Tasks", tasks: summary.handoffTasks)
+
+                if !showHandoffOnly {
+                    bulletSection(
+                        "Validation Errors", rows: summary.validationErrors.map(\.displayText))
+                    bulletSection("Warnings", rows: summary.warnings.map(\.displayText))
+                    bulletSection("Known Risks", rows: summary.knownRisks)
+                    bulletSection("Tests Run", rows: summary.testsRun)
+                    bulletSection("Docs Impacted", rows: summary.docsImpacted)
+                    bulletSection("Owner Classes", rows: ownerClassRows)
+                    bulletSection("Target Stages", rows: targetStageRows)
+                }
+
+                HStack {
+                    Button(
+                        copiedPayload == .evidence ? "Copied" : "Copy Evidence",
+                        systemImage: copiedPayload == .evidence ? "checkmark" : "doc.on.clipboard"
+                    ) {
+                        copyToPasteboard(summary.evidenceText, payload: .evidence)
                     }
+                    Button(
+                        copiedPayload == .rawJSON ? "Copied" : "Copy as JSON",
+                        systemImage: copiedPayload == .rawJSON ? "checkmark" : "curlybraces"
+                    ) {
+                        copyToPasteboard(summary.rawJSON, payload: .rawJSON)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
-            .frame(minWidth: 960, minHeight: 640)
+            .forgePanel(tint: statusColor.opacity(0.5), fill: ForgeColor.Surface.elevated)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Implementation self-assessment \(summary.statusLabel), verification \(summary.verificationLabel), \(summary.remainingCodeTasks.count) code tasks, \(summary.handoffTasks.count) handoff tasks"
+            )
+            .accessibilityIdentifier("implementation-self-assessment-panel")
         }
-        .sheet(isPresented: $showTimelineInspector) {
-            NavigationStack {
-                if let projection = workflowMapProjection {
-                    RunTimelineInspectorView(projection: projection)
+
+        private var ownerClassRows: [String] {
+            summary.ownerClassCounts
+                .sorted { $0.key < $1.key }
+                .map {
+                    "\(ImplementationSelfAssessmentDisplayAdapter.ownerClassLabel(for: $0.key)): \($0.value)"
+                }
+        }
+
+        private var targetStageRows: [String] {
+            summary.targetStageSummaries.map {
+                if $0.blockingReviewCount > 0 {
+                    return
+                        "\($0.targetStage): \($0.count) total, \($0.blockingReviewCount) blocking review"
+                }
+                return "\($0.targetStage): \($0.count) total"
+            }
+        }
+
+        private var statusColor: Color {
+            switch summary.status {
+            case "complete":
+                return DesignTokens.Status.success
+            case "needs_code_fixes", "invalid":
+                return DesignTokens.Status.error
+            case "blocked", "unknown":
+                return DesignTokens.Status.warning
+            case "handoff_required":
+                return DesignTokens.Status.info
+            default:
+                return DesignTokens.Status.warning
+            }
+        }
+
+        private var statusSymbol: String {
+            switch summary.status {
+            case "complete":
+                return "checkmark.circle.fill"
+            case "needs_code_fixes":
+                return "xmark.octagon.fill"
+            case "blocked":
+                return "exclamationmark.triangle.fill"
+            case "handoff_required":
+                return "arrow.right.circle.fill"
+            case "invalid":
+                return "exclamationmark.octagon.fill"
+            case "unknown":
+                return "questionmark.diamond.fill"
+            default:
+                return "questionmark.circle"
+            }
+        }
+
+        private func metric(_ label: String, _ value: String) -> some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                Text(label)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                Text(value)
+                    .font(ForgeTypography.cardTitle)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(ForgeSpacing.medium)
+            .background(
+                ForgeColor.Surface.muted,
+                in: RoundedRectangle(cornerRadius: ForgeRadius.card, style: .continuous))
+        }
+
+        @ViewBuilder
+        private func taskSection(
+            _ title: String,
+            tasks: [ImplementationSelfAssessmentDisplaySummary.Task]
+        ) -> some View {
+            if tasks.isEmpty {
+                nonInteractiveEmptyRow(title: title)
+            } else {
+                DisclosureGroup("\(title) (\(tasks.count))") {
+                    taskRows(tasks)
+                }
+            }
+        }
+
+        @ViewBuilder
+        private func bulletSection(_ title: String, rows: [String]) -> some View {
+            if rows.isEmpty {
+                nonInteractiveEmptyRow(title: title)
+            } else {
+                DisclosureGroup("\(title) (\(rows.count))") {
+                    bulletRows(rows)
+                }
+            }
+        }
+
+        private func nonInteractiveEmptyRow(title: String) -> some View {
+            HStack {
+                Text(title)
+                    .font(ForgeTypography.supporting.weight(.semibold))
+                Spacer()
+                Text("(None)")
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+            }
+        }
+
+        private func taskRows(
+            _ tasks: [ImplementationSelfAssessmentDisplaySummary.Task],
+        ) -> some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                ForEach(tasks) { task in
+                    VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                        HStack {
+                            Text(task.summary)
+                                .font(ForgeTypography.supporting.weight(.semibold))
+                            Spacer()
+                            StatusCapsule(
+                                text: task.blocking ? "Blocking" : "Non-blocking",
+                                color: task.blocking
+                                    ? DesignTokens.Status.warning : DesignTokens.Status.neutral,
+                                size: .small
+                            )
+                        }
+                        ownerLine(for: task)
+                        if let sourcePointer = task.sourcePointer, !sourcePointer.isEmpty {
+                            Text(sourcePointer)
+                                .font(ForgeTypography.micro)
+                                .foregroundStyle(ForgeColor.Text.tertiary)
+                        }
+                        Text(task.evidence)
+                            .font(ForgeTypography.supporting)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, ForgeSpacing.compact)
+                }
+            }
+            .padding(.top, ForgeSpacing.compact)
+        }
+
+        @ViewBuilder
+        private func ownerLine(for task: ImplementationSelfAssessmentDisplaySummary.Task)
+            -> some View
+        {
+            if let ownerClass = task.ownerClass {
+                let metadata = ownerMetadata(for: ownerClass)
+                HStack(spacing: ForgeSpacing.compact) {
+                    Image(systemName: metadata.icon)
+                        .font(ForgeTypography.micro)
+                    Text("\(metadata.label) · \(task.targetStage ?? "Unspecified stage")")
+                        .font(ForgeTypography.micro)
+                }
+                .foregroundStyle(
+                    metadata.emphasizeWarning
+                        ? DesignTokens.Status.warning : ForgeColor.Text.secondary
+                )
+                .padding(.horizontal, metadata.emphasizeWarning ? ForgeSpacing.compact : 0)
+                .padding(.vertical, metadata.emphasizeWarning ? 2 : 0)
+                .background(
+                    metadata.emphasizeWarning ? DesignTokens.Status.warning.opacity(0.15) : .clear,
+                    in: RoundedRectangle(cornerRadius: ForgeRadius.card, style: .continuous)
+                )
+            } else {
+                Text(task.owner)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+            }
+        }
+
+        private func bulletRows(_ rows: [String]) -> some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                ForEach(rows, id: \.self) { row in
+                    Label(row, systemImage: "smallcircle.filled.circle")
+                        .font(ForgeTypography.supporting)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+            }
+            .padding(.top, ForgeSpacing.compact)
+        }
+
+        private func ownerMetadata(for ownerClass: String) -> (
+            icon: String, label: String, emphasizeWarning: Bool
+        ) {
+            switch ownerClass {
+            case "docs":
+                return ("doc.text", "Docs", false)
+            case "manual_evidence":
+                return ("hand.raised", "Manual Evidence", false)
+            case "release":
+                return ("shippingbox", "Release", false)
+            case "ops":
+                return ("gearshape", "Ops", false)
+            case "product":
+                return ("lightbulb", "Product", false)
+            case "human_operator":
+                return ("person.crop.circle", "Human Operator", false)
+            case "unknown":
+                return ("questionmark.circle", "Human Triage", true)
+            default:
+                return (
+                    "questionmark.circle",
+                    ownerClass.replacingOccurrences(of: "_", with: " ").capitalized,
+                    true
+                )
+            }
+        }
+
+        private func copyToPasteboard(_ value: String, payload: CopiedPayload) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
+            copiedPayload = payload
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1.2))
+                if copiedPayload == payload {
+                    copiedPayload = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - WorkflowRunProgressView
+
+    struct WorkflowRunProgressView: View {
+        @Environment(\.modelContext) private var modelContext
+        @Environment(ExecutionService.self) private var executionService
+        @Query private var summaryArtifacts: [Artifact]
+
+        let run: Run
+        private let forcedInitialPane: IdeaRunPane?
+
+        @State private var selectedPane: IdeaRunPane = .summary
+        @State private var selectedArtifact: Artifact?
+        @State private var approvalComment = ""
+        @State private var showStopConfirmation = false
+        @State private var showTimelineInspector = false
+
+        init(run: Run, initialPane: IdeaRunPane? = nil) {
+            self.run = run
+            self.forcedInitialPane = initialPane
+            _selectedPane = State(initialValue: initialPane ?? .summary)
+            let runID = run.id
+            _summaryArtifacts = Query(
+                filter: #Predicate<Artifact> { artifact in
+                    artifact.runID == runID
+                        && (artifact.reportKind == nil
+                            || artifact.reportKind != "immutable_history")
+                },
+                sort: [SortDescriptor(\Artifact.createdAt, order: .reverse)]
+            )
+        }
+
+        private var sortedStages: [RunStageSnapshot] {
+            RunStageSnapshotLoader.load(for: run, modelContext: modelContext)
+        }
+
+        private var artifactHierarchy: RunArtifactHierarchy {
+            RunArtifactHierarchyBuilder().build(for: run)
+        }
+
+        private var latestArtifacts: [Artifact] {
+            artifactSnapshot.latestArtifacts
+        }
+
+        private var activeAgents: [RunStageAgentSnapshot] {
+            sortedStages.flatMap(\.agentExecutions).filter { $0.status == .running }
+        }
+
+        private var orchestrator: WorkflowOrchestrator? {
+            executionService.peekOrchestrator(for: run.id)
+        }
+
+        private var liveTimeline: [LiveExecutionTimelineEntry] {
+            orchestrator?.liveTimeline.reversed() ?? []
+        }
+
+        private var workflowMapProjectionService: WorkflowMapProjectionService {
+            WorkflowMapProjectionService(
+                modelContext: modelContext,
+                executionService: executionService
+            )
+        }
+
+        private var workflowMapProjection: WorkflowMapProjection? {
+            workflowMapProjectionService.projection(for: run)
+        }
+
+        private var currentStageSummary: WorkflowMapCurrentStageSummary? {
+            workflowMapProjectionService.currentStageSummary(for: run)
+        }
+
+        private var pendingApprovalRequest: ApprovalRequest? {
+            executionService.pendingApprovals.values.first { $0.runID == run.id }
+        }
+
+        private var effectiveRunStatus: RunStatus {
+            workflowMapProjectionService.runStatus(for: run)
+        }
+
+        private var effectiveRunStatusLabel: String {
+            effectiveRunStatus.rawValue.replacingOccurrences(of: "_", with: " ")
+        }
+
+        private var effectiveCurrentStageLabel: String {
+            currentStageSummary?.label ?? run.cursorDerivedStageLabel
+        }
+
+        private var approvalContextArtifacts: [Artifact] {
+            artifactSnapshot.approvalContextArtifacts
+        }
+
+        private var pendingApprovalTitle: String {
+            pendingApprovalRequest.map { "Run is waiting at \($0.stageLabel)." }
+                ?? "No active approval gate."
+        }
+
+        private var proposalLoopFeedbackSummary: ProposalLoopFeedbackSummary? {
+            ProposalLoopFeedbackParser.parseSummary(from: approvalContextArtifacts)
+        }
+
+        private var implementationSelfAssessmentSummary: ImplementationSelfAssessmentDisplaySummary?
+        {
+            ImplementationSelfAssessmentDisplayAdapter.summary(
+                from: run, artifacts: latestArtifacts)
+        }
+
+        private var latestDebugArtifacts: [Artifact] {
+            artifactSnapshot.latestDebugArtifacts
+        }
+
+        private var artifactSnapshot: WorkflowRunArtifactSnapshot {
+            WorkflowRunArtifactSnapshot(artifacts: summaryArtifacts)
+        }
+
+        private var preferredPane: IdeaRunPane {
+            defaultIdeaRunPane(for: effectiveRunStatus)
+        }
+
+        private var latestPersistedCheckpointText: String? {
+            let latestApproval = PersistedRunGraph.approvals(for: run).max {
+                ($0.decidedAt ?? $0.requestedAt) < ($1.decidedAt ?? $1.requestedAt)
+            }
+            let latestStage = sortedStages.max {
+                ($0.completedAt ?? $0.startedAt) < ($1.completedAt ?? $1.startedAt)
+            }
+
+            let approvalTimestamp = latestApproval.map { $0.decidedAt ?? $0.requestedAt }
+            let stageTimestamp = latestStage.map { $0.completedAt ?? $0.startedAt }
+
+            if let latestApproval, let approvalTimestamp,
+                stageTimestamp == nil || approvalTimestamp >= stageTimestamp!
+            {
+                let decisionLabel = latestApproval.decision.rawValue.replacingOccurrences(
+                    of: "_", with: " ")
+                return "Persisted approval \(decisionLabel) for \(latestApproval.stageID)"
+            }
+
+            if let latestStage {
+                let statusLabel = latestStage.status.rawValue.replacingOccurrences(
+                    of: "_", with: " ")
+                return "Persisted stage \(statusLabel) in \(latestStage.stageID)"
+            }
+
+            return nil
+        }
+
+        private var latestPersistedSessionID: String? {
+            sortedStages
+                .flatMap(\.agentExecutions)
+                .sorted { lhs, rhs in
+                    let leftTimestamp = lhs.completedAt ?? lhs.startedAt
+                    let rightTimestamp = rhs.completedAt ?? rhs.startedAt
+                    if leftTimestamp == rightTimestamp {
+                        return lhs.id.uuidString > rhs.id.uuidString
+                    }
+                    return leftTimestamp > rightTimestamp
+                }
+                .first { snapshot in
+                    guard
+                        let sessionID = snapshot.runtimeSessionID?.trimmingCharacters(
+                            in: .whitespacesAndNewlines)
+                    else {
+                        return false
+                    }
+                    return !sessionID.isEmpty
+                }?
+                .runtimeSessionID
+        }
+
+        private var effectiveLatestSessionID: String? {
+            latestLiveSessionID ?? latestPersistedSessionID
+        }
+
+        private var nextActionText: String {
+            switch effectiveRunStatus {
+            case .waitingApproval:
+                return "Approve or reject the current proposal."
+            case .blocked:
+                return run.driftDetails ?? "Inspect the blocked stage and decide whether to resume."
+            case .failed:
+                return "Inspect receipts and artifacts, then retry or adjust the workflow."
+            case .completed:
+                return "Review the completed feature report and generated artifacts."
+            case .running, .pending, .ready:
+                return "Watch live progress and inspect artifacts as they arrive."
+            case .cancelled:
+                return "Run was cancelled. Return to the idea to start another run or archive it."
+            case .cancelling:
+                return "Cancellation in progress. Waiting for agents to settle."
+            }
+        }
+
+        private func statusColor(_ status: RunStatus) -> Color {
+            switch status {
+            case .pending, .ready:
+                return DesignTokens.Status.neutral
+            case .running:
+                return DesignTokens.Status.running
+            case .waitingApproval, .cancelling, .blocked:
+                return DesignTokens.Status.warning
+            case .completed:
+                return DesignTokens.Status.success
+            case .failed:
+                return DesignTokens.Status.error
+            case .cancelled:
+                return DesignTokens.Status.cancelled
+            }
+        }
+
+        var body: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    header
+                    segmentedSwitcher
+                    paneBody
+                }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .accessibilityIdentifier("run-progress-view")
+            .sheet(item: $selectedArtifact) { artifact in
+                NavigationStack {
+                    ArtifactInspectorView(artifact: artifact, run: run)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { selectedArtifact = nil }
+                            }
+                        }
+                }
+                .frame(minWidth: 960, minHeight: 640)
+            }
+            .sheet(isPresented: $showTimelineInspector) {
+                NavigationStack {
+                    if let projection = workflowMapProjection {
+                        RunTimelineInspectorView(projection: projection)
+                            .toolbar {
+                                ToolbarItem(placement: .cancellationAction) {
+                                    Button("Done") { showTimelineInspector = false }
+                                }
+                            }
+                    } else {
+                        ContentUnavailableView(
+                            "Live Timeline Unavailable",
+                            systemImage: "waveform.path.ecg",
+                            description: Text(
+                                "This run snapshot could not be projected into timeline state.")
+                        )
                         .toolbar {
                             ToolbarItem(placement: .cancellationAction) {
                                 Button("Done") { showTimelineInspector = false }
                             }
                         }
-                } else {
-                    ContentUnavailableView(
-                        "Live Timeline Unavailable",
-                        systemImage: "waveform.path.ecg",
-                        description: Text("This run snapshot could not be projected into timeline state.")
-                    )
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Done") { showTimelineInspector = false }
+                    }
+                }
+                .frame(minWidth: 520, minHeight: 440)
+            }
+            .alert("Stop Run?", isPresented: $showStopConfirmation) {
+                Button("Stop", role: .destructive) {
+                    Task {
+                        await executionService.cancelRun(runID: run.id)
+                    }
+                }
+                Button("Keep Running", role: .cancel) {}
+            } message: {
+                Text(
+                    "This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history."
+                )
+            }
+            .task(id: effectiveRunStatus.rawValue) {
+                selectedPane = forcedInitialPane ?? preferredPane
+            }
+        }
+
+        private var elapsedText: String {
+            durationString(from: run.startedAt, to: run.completedAt ?? Date())
+        }
+
+        private var runStatusColor: Color {
+            switch effectiveRunStatus {
+            case .pending, .ready:
+                return DesignTokens.Status.neutral
+            case .running:
+                return DesignTokens.Status.running
+            case .waitingApproval, .blocked:
+                return DesignTokens.Status.warning
+            case .completed:
+                return DesignTokens.Status.success
+            case .failed:
+                return DesignTokens.Status.error
+            case .cancelled, .cancelling:
+                return DesignTokens.Status.neutral
+            }
+        }
+
+        private var header: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(run.workflowTitle)
+                        .font(.title2.bold())
+                    HStack(spacing: 8) {
+                        StatusCapsule(
+                            text: effectiveRunStatusLabel,
+                            color: runStatusColor,
+                            size: .regular
+                        )
+                        if let currentStageSummary {
+                            Label(currentStageSummary.label, systemImage: "square.stack.3d.up")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Label(effectiveCurrentStageLabel, systemImage: "square.stack.3d.up")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
-            }
-            .frame(minWidth: 520, minHeight: 440)
-        }
-        .alert("Stop Run?", isPresented: $showStopConfirmation) {
-            Button("Stop", role: .destructive) {
-                Task {
-                    await executionService.cancelRun(runID: run.id)
+
+                HStack(spacing: 10) {
+                    Label("Elapsed \(elapsedText)", systemImage: "clock")
+                    Label(
+                        run.totalCostCents.map { "\($0) cents" } ?? "Pending cost",
+                        systemImage: "dollarsign.circle")
+                    if let sessionID = effectiveLatestSessionID {
+                        Label(sessionID, systemImage: "lanyardcard")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                HStack(spacing: 8) {
+                    if run.canBeCancelledByOperator {
+                        Button(role: .destructive) {
+                            showStopConfirmation = true
+                        } label: {
+                            Label(
+                                run.cancellationRequestedAt != nil
+                                    ? "Cancelling\u{2026}" : "Stop Run",
+                                systemImage: run.cancellationRequestedAt != nil
+                                    ? "hourglass" : "stop.fill"
+                            )
+                        }
+                        .disabled(run.cancellationRequestedAt != nil)
+                        .accessibilityIdentifier("run-progress-stop-run-button")
+                    }
+
+                    if effectiveRunStatus == .completed || effectiveRunStatus == .blocked
+                        || effectiveRunStatus == .failed || effectiveRunStatus == .cancelled
+                    {
+                        Button("Open in Runs Home") {
+                            NotificationCenter.default.post(
+                                name: .chainworksOpenRunInRunsHome,
+                                object: nil,
+                                userInfo: ["runID": run.id.uuidString]
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("open-run-in-runs-home-button")
+                    }
+
+                    Button("Live Timeline", systemImage: "waveform.path.ecg") {
+                        showTimelineInspector = true
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
-            Button("Keep Running", role: .cancel) { }
-        } message: {
-            Text("This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history.")
         }
-        .task(id: effectiveRunStatus.rawValue) {
-            selectedPane = forcedInitialPane ?? preferredPane
+
+        private var segmentedSwitcher: some View {
+            Picker("Run Surface", selection: $selectedPane) {
+                ForEach(IdeaRunPane.allCases, id: \.self) { pane in
+                    Text(pane.rawValue.capitalized).tag(pane)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("run-progress-pane-picker")
         }
-    }
 
-    private var elapsedText: String {
-        durationString(from: run.startedAt, to: run.completedAt ?? Date())
-    }
-
-    private var runStatusColor: Color {
-        switch effectiveRunStatus {
-        case .pending, .ready:
-            return DesignTokens.Status.neutral
-        case .running:
-            return DesignTokens.Status.running
-        case .waitingApproval, .blocked:
-            return DesignTokens.Status.warning
-        case .completed:
-            return DesignTokens.Status.success
-        case .failed:
-            return DesignTokens.Status.error
-        case .cancelled, .cancelling:
-            return DesignTokens.Status.neutral
+        @ViewBuilder
+        private var paneBody: some View {
+            switch selectedPane {
+            case .summary:
+                summaryPane
+            case .progress:
+                progressPane
+            case .artifacts:
+                artifactsPane
+            }
         }
-    }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 4) {
-                    Text(run.workflowTitle)
-                        .font(.title2.bold())
-                HStack(spacing: 8) {
+        private var summaryPane: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: ForgeSpacing.section) {
+                    summaryOverviewPanel
+                    summaryMetricsGrid
+                    if pendingApprovalRequest != nil
+                        || implementationSelfAssessmentSummary != nil
+                        || !approvalContextArtifacts.isEmpty
+                        || !latestDebugArtifacts.isEmpty
+                    {
+                        summaryDecisionContextSection
+                    }
+                    if run.canBeCancelledByOperator {
+                        summaryRunControlPanel
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, ForgeSpacing.compact)
+            }
+        }
+
+        private var summaryOverviewPanel: some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.large) {
+                HStack(alignment: .top, spacing: ForgeSpacing.large) {
+                    VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                        Text("Run Overview")
+                            .font(ForgeTypography.sectionHeader)
+                        Text(effectiveCurrentStageLabel)
+                            .font(.title3.weight(.semibold))
+                        Text(nextActionText)
+                            .font(ForgeTypography.body)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: ForgeSpacing.large)
                     StatusCapsule(
                         text: effectiveRunStatusLabel,
                         color: runStatusColor,
                         size: .regular
                     )
-                    if let currentStageSummary {
-                        Label(currentStageSummary.label, systemImage: "square.stack.3d.up")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Label(effectiveCurrentStageLabel, systemImage: "square.stack.3d.up")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            HStack(spacing: 10) {
-                Label("Elapsed \(elapsedText)", systemImage: "clock")
-                Label(run.totalCostCents.map { "\($0) cents" } ?? "Pending cost", systemImage: "dollarsign.circle")
-                if let sessionID = effectiveLatestSessionID {
-                    Label(sessionID, systemImage: "lanyardcard")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            HStack(spacing: 8) {
-                if run.canBeCancelledByOperator {
-                    Button(role: .destructive) {
-                        showStopConfirmation = true
-                    } label: {
-                        Label(
-                            run.cancellationRequestedAt != nil ? "Cancelling\u{2026}" : "Stop Run",
-                            systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
-                        )
-                    }
-                    .disabled(run.cancellationRequestedAt != nil)
-                    .accessibilityIdentifier("run-progress-stop-run-button")
+                    .accessibilityIdentifier("run-status-\(effectiveRunStatus.rawValue)")
                 }
 
-                if effectiveRunStatus == .completed || effectiveRunStatus == .blocked || effectiveRunStatus == .failed || effectiveRunStatus == .cancelled {
-                    Button("Open in Runs Home") {
-                        NotificationCenter.default.post(
-                            name: .chainworksOpenRunInRunsHome,
-                            object: nil,
-                            userInfo: ["runID": run.id.uuidString]
-                        )
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("open-run-in-runs-home-button")
-                }
-
-                Button("Live Timeline", systemImage: "waveform.path.ecg") {
-                    showTimelineInspector = true
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-    }
-
-    private var segmentedSwitcher: some View {
-        Picker("Run Surface", selection: $selectedPane) {
-            ForEach(IdeaRunPane.allCases, id: \.self) { pane in
-                Text(pane.rawValue.capitalized).tag(pane)
-            }
-        }
-        .pickerStyle(.segmented)
-        .accessibilityIdentifier("run-progress-pane-picker")
-    }
-
-    @ViewBuilder
-    private var paneBody: some View {
-        switch selectedPane {
-        case .summary:
-            summaryPane
-        case .progress:
-            progressPane
-        case .artifacts:
-            artifactsPane
-        }
-    }
-
-    private var summaryPane: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: ForgeSpacing.section) {
-                summaryOverviewPanel
-                summaryMetricsGrid
-                if pendingApprovalRequest != nil || !approvalContextArtifacts.isEmpty || !latestDebugArtifacts.isEmpty {
-                    summaryDecisionContextSection
-                }
-                if run.canBeCancelledByOperator {
-                    summaryRunControlPanel
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, ForgeSpacing.compact)
-        }
-    }
-
-    private var summaryOverviewPanel: some View {
-        VStack(alignment: .leading, spacing: ForgeSpacing.large) {
-            HStack(alignment: .top, spacing: ForgeSpacing.large) {
                 VStack(alignment: .leading, spacing: ForgeSpacing.small) {
-                    Text("Run Overview")
-                        .font(ForgeTypography.sectionHeader)
-                    Text(effectiveCurrentStageLabel)
-                        .font(.title3.weight(.semibold))
-                    Text(nextActionText)
-                        .font(ForgeTypography.body)
-                        .foregroundStyle(ForgeColor.Text.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    summaryRow(label: "Workflow", value: run.workflowTitle)
+                    summaryRow(label: "Current Stage", value: effectiveCurrentStageLabel)
+                    summaryRow(label: "Latest Phase", value: effectiveCurrentStageLabel)
+                    summaryRow(label: "Latest Event", value: latestMeaningfulEventText)
                 }
-                Spacer(minLength: ForgeSpacing.large)
-                StatusCapsule(
-                    text: effectiveRunStatusLabel,
-                    color: runStatusColor,
-                    size: .regular
+            }
+            .forgePanel(
+                tint: runStatusColor.opacity(0.55),
+                fill: ForgeColor.Brand.accentMuted.opacity(0.55)
+            )
+        }
+
+        private var summaryMetricsGrid: some View {
+            LazyVGrid(
+                columns: [
+                    GridItem(.adaptive(minimum: 220, maximum: 320), spacing: ForgeSpacing.large)
+                ],
+                alignment: .leading,
+                spacing: ForgeSpacing.large
+            ) {
+                summaryMetricCard(
+                    title: "Loop Iteration",
+                    value: currentStageSummary.flatMap { summary in
+                        summary.iteration.map(String.init)
+                    } ?? "0",
+                    detail: "Current refinement/review cycle",
+                    symbol: "repeat.circle"
                 )
-                .accessibilityIdentifier("run-status-\(effectiveRunStatus.rawValue)")
-            }
-
-            VStack(alignment: .leading, spacing: ForgeSpacing.small) {
-                summaryRow(label: "Workflow", value: run.workflowTitle)
-                summaryRow(label: "Current Stage", value: effectiveCurrentStageLabel)
-                summaryRow(label: "Latest Phase", value: effectiveCurrentStageLabel)
-                summaryRow(label: "Latest Event", value: latestMeaningfulEventText)
+                summaryMetricCard(
+                    title: "Elapsed",
+                    value: elapsedText,
+                    detail: "Wall-clock run duration",
+                    symbol: "clock"
+                )
+                summaryMetricCard(
+                    title: "Spend",
+                    value: run.totalCostCents.map { "\($0) cents" } ?? "Pending",
+                    detail: "Accumulated execution cost",
+                    symbol: "dollarsign.circle"
+                )
+                summaryMetricCard(
+                    title: "Session",
+                    value: effectiveLatestSessionID ?? "No live session",
+                    detail: effectiveLatestSessionID == nil
+                        ? missingSessionDetail
+                        : latestLiveSessionID == nil
+                            ? "Most recent persisted runtime session"
+                            : "Most recent active runtime session",
+                    symbol: "lanyardcard"
+                )
             }
         }
-        .forgePanel(
-            tint: runStatusColor.opacity(0.55),
-            fill: ForgeColor.Brand.accentMuted.opacity(0.55)
-        )
-    }
 
-    private var summaryMetricsGrid: some View {
-        LazyVGrid(
-            columns: [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: ForgeSpacing.large)],
-            alignment: .leading,
-            spacing: ForgeSpacing.large
-        ) {
-            summaryMetricCard(
-                title: "Loop Iteration",
-                value: currentStageSummary.flatMap { summary in
-                    summary.iteration.map(String.init)
-                } ?? "0",
-                detail: "Current refinement/review cycle",
-                symbol: "repeat.circle"
-            )
-            summaryMetricCard(
-                title: "Elapsed",
-                value: elapsedText,
-                detail: "Wall-clock run duration",
-                symbol: "clock"
-            )
-            summaryMetricCard(
-                title: "Spend",
-                value: run.totalCostCents.map { "\($0) cents" } ?? "Pending",
-                detail: "Accumulated execution cost",
-                symbol: "dollarsign.circle"
-            )
-            summaryMetricCard(
-                title: "Session",
-                value: effectiveLatestSessionID ?? "No live session",
-                detail: effectiveLatestSessionID == nil
-                    ? missingSessionDetail
-                    : latestLiveSessionID == nil
-                        ? "Most recent persisted runtime session"
-                        : "Most recent active runtime session",
-                symbol: "lanyardcard"
-            )
-        }
-    }
-
-    @ViewBuilder
-    private var summaryDecisionContextSection: some View {
-        VStack(alignment: .leading, spacing: ForgeSpacing.large) {
-            HStack {
-                VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
-                    Text("Decision Context")
-                        .font(ForgeTypography.sectionHeader)
-                    Text(pendingApprovalTitle)
-                        .font(ForgeTypography.supporting)
-                        .foregroundStyle(ForgeColor.Text.secondary)
-                }
-                Spacer()
-            }
-
-            if let pendingApprovalRequest {
-                summaryApprovalPanel(for: pendingApprovalRequest)
-            }
-
-            if !approvalContextArtifacts.isEmpty {
-                VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
-                    if let summary = proposalLoopFeedbackSummary {
-                        proposalFeedbackPanel(summary)
+        @ViewBuilder
+        private var summaryDecisionContextSection: some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.large) {
+                HStack {
+                    VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                        Text("Decision Context")
+                            .font(ForgeTypography.sectionHeader)
+                        Text(pendingApprovalTitle)
+                            .font(ForgeTypography.supporting)
+                            .foregroundStyle(ForgeColor.Text.secondary)
                     }
+                    Spacer()
+                }
 
+                if let pendingApprovalRequest {
+                    summaryApprovalPanel(for: pendingApprovalRequest)
+                }
+
+                if let summary = proposalLoopFeedbackSummary {
+                    proposalFeedbackPanel(summary)
+                }
+
+                if let implementationSelfAssessmentSummary {
+                    ImplementationSelfAssessmentPanel(summary: implementationSelfAssessmentSummary)
+                }
+
+                if !approvalContextArtifacts.isEmpty {
                     VStack(alignment: .leading, spacing: ForgeSpacing.small) {
                         Text("Summary Documents")
                             .font(ForgeTypography.cardTitle)
@@ -2974,167 +3934,101 @@ struct WorkflowRunProgressView: View {
                             artifactButton(artifact)
                         }
                     }
+                    .forgePanel()
                 }
-                .forgePanel()
-            }
-
-            if !latestDebugArtifacts.isEmpty {
-                VStack(alignment: .leading, spacing: ForgeSpacing.small) {
-                    Text("Receipts & Traces")
-                        .font(ForgeTypography.cardTitle)
-                    ForEach(latestDebugArtifacts) { artifact in
-                        artifactButton(artifact)
-                    }
-                }
-                .forgePanel(tint: ForgeColor.Surface.border, fill: ForgeColor.Surface.muted)
-            }
-        }
-    }
-
-    private var progressPane: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            GroupBox("Progress") {
-                VStack(alignment: .leading, spacing: 8) {
-                    LabeledContent("Current Stage", value: effectiveCurrentStageLabel)
-                    LabeledContent(
-                        "Loop Iteration",
-                        value: currentStageSummary.flatMap { summary in
-                            summary.iteration.map(String.init)
-                        } ?? "0"
-                    )
-                    LabeledContent("Active Agents", value: "\(activeAgents.count)")
-                    if activeAgents.isEmpty == false {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(activeAgents) { agent in
-                                HStack {
-                                    Text(agent.agentTitle)
-                                    Spacer()
-                                    Text(agent.status.rawValue)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .font(.caption)
-                            }
+                if !latestDebugArtifacts.isEmpty {
+                    VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                        Text("Receipts & Traces")
+                            .font(ForgeTypography.cardTitle)
+                        ForEach(latestDebugArtifacts) { artifact in
+                            artifactButton(artifact)
                         }
                     }
-                    LabeledContent("Latest Event", value: latestMeaningfulEventText)
+                    .forgePanel(tint: ForgeColor.Surface.border, fill: ForgeColor.Surface.muted)
                 }
             }
+        }
 
-            GroupBox("Workflow Map") {
-                WorkflowMapView(
-                    run: run,
-                    showsSummaryStrip: false,
-                    visibleSections: [.topology, .handoffs, .agents, .telemetry],
-                    onOpenTimelineInspector: { showTimelineInspector = true }
-                )
-                .accessibilityIdentifier("workflow-map-section")
+        private var progressPane: some View {
+            VStack(alignment: .leading, spacing: 14) {
+                GroupBox("Progress") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        LabeledContent("Current Stage", value: effectiveCurrentStageLabel)
+                        LabeledContent(
+                            "Loop Iteration",
+                            value: currentStageSummary.flatMap { summary in
+                                summary.iteration.map(String.init)
+                            } ?? "0"
+                        )
+                        LabeledContent("Active Agents", value: "\(activeAgents.count)")
+                        if activeAgents.isEmpty == false {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(activeAgents) { agent in
+                                    HStack {
+                                        Text(agent.agentTitle)
+                                        Spacer()
+                                        Text(agent.status.rawValue)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .font(.caption)
+                                }
+                            }
+                        }
+                        LabeledContent("Latest Event", value: latestMeaningfulEventText)
+                    }
+                }
+
+                GroupBox("Workflow Map") {
+                    WorkflowMapView(
+                        run: run,
+                        showsSummaryStrip: false,
+                        visibleSections: [.topology, .handoffs, .agents, .telemetry],
+                        onOpenTimelineInspector: { showTimelineInspector = true }
+                    )
+                    .accessibilityIdentifier("workflow-map-section")
+                }
             }
         }
-    }
 
-    private var artifactsPane: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            GroupBox("Artifacts") {
-                RunArtifactHierarchyView(
-                    hierarchy: artifactHierarchy,
-                    onOpenArtifact: { selectedArtifact = $0 },
-                    artifactResolver: resolveArtifact(withID:)
-                )
-            }
-        }
-    }
-
-    private var summaryRunControlPanel: some View {
-        HStack(alignment: .center, spacing: ForgeSpacing.large) {
-            VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
-                Text("Run Control")
-                    .font(ForgeTypography.cardTitle)
-                Text(
-                    run.cancellationRequestedAt != nil
-                        ? "Cancellation in progress. Waiting for agents to settle."
-                        : "Stop the active run. All run history and artifacts remain intact."
-                )
-                .font(ForgeTypography.supporting)
-                .foregroundStyle(ForgeColor.Text.secondary)
-            }
-            Spacer()
-            if run.canBeCancelledByOperator {
-                Button(role: .destructive) {
-                    showStopConfirmation = true
-                } label: {
-                    Label(
-                        run.cancellationRequestedAt != nil ? "Cancelling…" : "Stop Run",
-                        systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
+        private var artifactsPane: some View {
+            VStack(alignment: .leading, spacing: 14) {
+                GroupBox("Artifacts") {
+                    RunArtifactHierarchyView(
+                        hierarchy: artifactHierarchy,
+                        onOpenArtifact: { selectedArtifact = $0 },
+                        artifactResolver: resolveArtifact(withID:)
                     )
                 }
-                .disabled(run.cancellationRequestedAt != nil)
-                .accessibilityIdentifier("run-progress-stop-run-button")
             }
         }
-        .forgePanel(
-            tint: DesignTokens.Status.warning.opacity(0.45),
-            fill: ForgeColor.Surface.elevated
-        )
-    }
 
-    @ViewBuilder
-    private func summaryApprovalPanel(for request: ApprovalRequest) -> some View {
-        if run.deliveryConfigurationJSON != nil,
-           request.approvalPolicy == "manual_release" {
-            ReleaseGateView(
-                run: run,
-                onApprove: {
-                    executionService.resolveApproval(
-                        approvalID: request.id,
-                        granted: true,
-                        comment: blankToNil(approvalComment)
-                    )
-                    approvalComment = ""
-                },
-                onReject: {
-                    executionService.resolveApproval(
-                        approvalID: request.id,
-                        granted: false,
-                        comment: blankToNil(approvalComment)
-                    )
-                    approvalComment = ""
-                }
-            )
-        } else {
-            VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
-                HStack {
-                    Text("Approval Gate")
+        private var summaryRunControlPanel: some View {
+            HStack(alignment: .center, spacing: ForgeSpacing.large) {
+                VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                    Text("Run Control")
                         .font(ForgeTypography.cardTitle)
-                    Spacer()
-                    Text(request.stageLabel)
-                        .font(ForgeTypography.micro)
-                        .foregroundStyle(ForgeColor.Text.secondary)
+                    Text(
+                        run.cancellationRequestedAt != nil
+                            ? "Cancellation in progress. Waiting for agents to settle."
+                            : "Stop the active run. All run history and artifacts remain intact."
+                    )
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.secondary)
                 }
-                summaryRow(label: "Spend to Date", value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
-                TextField("Comment", text: $approvalComment, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                HStack {
-                    Button("Reject", role: .destructive) {
-                        executionService.resolveApproval(
-                            approvalID: request.id,
-                            granted: false,
-                            comment: blankToNil(approvalComment)
+                Spacer()
+                if run.canBeCancelledByOperator {
+                    Button(role: .destructive) {
+                        showStopConfirmation = true
+                    } label: {
+                        Label(
+                            run.cancellationRequestedAt != nil ? "Cancelling…" : "Stop Run",
+                            systemImage: run.cancellationRequestedAt != nil
+                                ? "hourglass" : "stop.fill"
                         )
-                        approvalComment = ""
                     }
-                    .accessibilityIdentifier("approval-reject-button")
-                    Spacer()
-                    Button("Approve") {
-                        executionService.resolveApproval(
-                            approvalID: request.id,
-                            granted: true,
-                            comment: blankToNil(approvalComment)
-                        )
-                        approvalComment = ""
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("approval-approve-button")
+                    .disabled(run.cancellationRequestedAt != nil)
+                    .accessibilityIdentifier("run-progress-stop-run-button")
                 }
             }
             .forgePanel(
@@ -3142,446 +4036,530 @@ struct WorkflowRunProgressView: View {
                 fill: ForgeColor.Surface.elevated
             )
         }
-    }
 
-    private func proposalFeedbackPanel(_ summary: ProposalLoopFeedbackSummary) -> some View {
-        VStack(alignment: .leading, spacing: ForgeSpacing.small) {
-            Text("Proposal-Loop Feedback")
-                .font(ForgeTypography.cardTitle)
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 120), spacing: ForgeSpacing.medium)],
-                alignment: .leading,
-                spacing: ForgeSpacing.medium
-            ) {
-                feedbackMetric(title: "Backlog", value: "\(summary.backlogItemCount)")
-                feedbackMetric(title: "Unresolved", value: "\(summary.unresolvedItemCount)")
-                feedbackMetric(title: "Deferred", value: "\(summary.deferredItemCount)")
-                feedbackMetric(title: "Addressed", value: "\(summary.addressedItemCount)")
-                feedbackMetric(title: "Coverage", value: summary.coverageStatusSummary)
+        @ViewBuilder
+        private func summaryApprovalPanel(for request: ApprovalRequest) -> some View {
+            if run.deliveryConfigurationJSON != nil,
+                request.approvalPolicy == "manual_release"
+            {
+                ReleaseGateView(
+                    run: run,
+                    onApprove: {
+                        executionService.resolveApproval(
+                            approvalID: request.id,
+                            granted: true,
+                            comment: blankToNil(approvalComment)
+                        )
+                        approvalComment = ""
+                    },
+                    onReject: {
+                        executionService.resolveApproval(
+                            approvalID: request.id,
+                            granted: false,
+                            comment: blankToNil(approvalComment)
+                        )
+                        approvalComment = ""
+                    }
+                )
+            } else {
+                VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
+                    HStack {
+                        Text("Approval Gate")
+                            .font(ForgeTypography.cardTitle)
+                        Spacer()
+                        Text(request.stageLabel)
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                    }
+                    summaryRow(
+                        label: "Spend to Date",
+                        value: run.totalCostCents.map { "\($0) cents" } ?? "Pending")
+                    TextField("Comment", text: $approvalComment, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Button("Reject", role: .destructive) {
+                            executionService.resolveApproval(
+                                approvalID: request.id,
+                                granted: false,
+                                comment: blankToNil(approvalComment)
+                            )
+                            approvalComment = ""
+                        }
+                        .accessibilityIdentifier("approval-reject-button")
+                        Spacer()
+                        Button("Approve") {
+                            executionService.resolveApproval(
+                                approvalID: request.id,
+                                granted: true,
+                                comment: blankToNil(approvalComment)
+                            )
+                            approvalComment = ""
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("approval-approve-button")
+                    }
+                }
+                .forgePanel(
+                    tint: DesignTokens.Status.warning.opacity(0.45),
+                    fill: ForgeColor.Surface.elevated
+                )
             }
-            if let targeted = summary.targetedReviewerSummary {
-                Text(targeted)
+        }
+
+        private func proposalFeedbackPanel(_ summary: ProposalLoopFeedbackSummary) -> some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                Text("Proposal-Loop Feedback")
+                    .font(ForgeTypography.cardTitle)
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 120), spacing: ForgeSpacing.medium)],
+                    alignment: .leading,
+                    spacing: ForgeSpacing.medium
+                ) {
+                    feedbackMetric(title: "Backlog", value: "\(summary.backlogItemCount)")
+                    feedbackMetric(title: "Unresolved", value: "\(summary.unresolvedItemCount)")
+                    feedbackMetric(title: "Deferred", value: "\(summary.deferredItemCount)")
+                    feedbackMetric(title: "Addressed", value: "\(summary.addressedItemCount)")
+                    feedbackMetric(title: "Coverage", value: summary.coverageStatusSummary)
+                }
+                if let targeted = summary.targetedReviewerSummary {
+                    Text(targeted)
+                        .font(ForgeTypography.supporting)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+            }
+            .padding(ForgeSpacing.large)
+            .background(
+                ForgeColor.Surface.muted,
+                in: RoundedRectangle(cornerRadius: ForgeRadius.card, style: .continuous))
+        }
+
+        private func summaryMetricCard(title: String, value: String, detail: String, symbol: String)
+            -> some View
+        {
+            VStack(alignment: .leading, spacing: ForgeSpacing.small) {
+                Label(title, systemImage: symbol)
                     .font(ForgeTypography.supporting)
                     .foregroundStyle(ForgeColor.Text.secondary)
+                Text(value)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                Text(detail)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
+            .forgePanel()
         }
-        .padding(ForgeSpacing.large)
-        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: ForgeRadius.card, style: .continuous))
-    }
 
-    private func summaryMetricCard(title: String, value: String, detail: String, symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: ForgeSpacing.small) {
-            Label(title, systemImage: symbol)
-                .font(ForgeTypography.supporting)
-                .foregroundStyle(ForgeColor.Text.secondary)
-            Text(value)
-                .font(.title3.weight(.semibold))
-                .lineLimit(2)
-                .truncationMode(.middle)
-            Text(detail)
-                .font(ForgeTypography.micro)
-                .foregroundStyle(ForgeColor.Text.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
-        .forgePanel()
-    }
-
-    private func feedbackMetric(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
-            Text(title)
-                .font(ForgeTypography.micro)
-                .foregroundStyle(ForgeColor.Text.secondary)
-            Text(value)
-                .font(ForgeTypography.cardTitle)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func summaryRow(label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(ForgeTypography.micro)
-                .foregroundStyle(ForgeColor.Text.secondary)
-            Text(value)
-                .font(ForgeTypography.body)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var latestMeaningfulEventText: String {
-        latestLiveEvent?.event.detail
-            ?? latestPersistedCheckpointText
-            ?? "Waiting for the next execution event"
-    }
-
-    private var latestLiveEvent: LiveExecutionTimelineEntry? {
-        liveTimeline.first(where: { $0.event.type != .textChunk }) ?? liveTimeline.first
-    }
-
-    private var latestLiveSessionID: String? {
-        latestLiveEvent?.event.sessionID
-    }
-
-    private var missingSessionDetail: String {
-        if latestPersistedSessionID != nil {
-            return "No in-memory live stream is attached. Showing the most recent persisted runtime session."
-        }
-        switch effectiveRunStatus {
-        case .pending, .ready, .running:
-            return "Waiting for the next session to start"
-        case .waitingApproval:
-            return "No live session while the run is waiting at approval"
-        case .blocked:
-            return "No live session. Use recovery to resume from the blocked stage"
-        case .completed, .failed, .cancelled, .cancelling:
-            return "No active live session"
-        }
-    }
-
-    @ViewBuilder
-    private func artifactButton(_ artifact: Artifact) -> some View {
-        Button {
-            selectedArtifact = artifact
-        } label: {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(artifact.name)
-                        .font(.headline)
-                    Text("\(artifact.stageID) · \(artifact.agentID)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Text(artifact.format.rawValue)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+        private func feedbackMetric(title: String, value: String) -> some View {
+            VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                Text(title)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                Text(value)
+                    .font(ForgeTypography.cardTitle)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Open \(artifact.name)")
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("artifact-button-\(artifact.name)")
-    }
 
-    private func resolveArtifact(withID artifactID: UUID) -> Artifact? {
-        latestArtifacts.first { $0.id == artifactID }
-    }
-
-    private func durationString(from start: Date, to end: Date) -> String {
-        let formatter = DateComponentsFormatter()
-        let interval = max(0, end.timeIntervalSince(start))
-        formatter.allowedUnits = interval >= 3600 ? [.hour, .minute] : [.minute, .second]
-        formatter.unitsStyle = .abbreviated
-        return formatter.string(from: interval) ?? "0s"
-    }
-
-    private func stageStatusIcon(_ status: StageStatus) -> String {
-        switch status {
-        case .pending, .ready: return "clock"
-        case .running: return "bolt.circle.fill"
-        case .waitingApproval: return "checkmark.seal.fill"
-        case .blocked: return "pause.circle.fill"
-        case .completed: return "checkmark.circle.fill"
-        case .failed: return "xmark.circle.fill"
-        case .skipped: return "arrow.uturn.forward.circle"
-        }
-    }
-
-    private func stageStatusColor(_ status: StageStatus) -> Color {
-        switch status {
-        case .pending, .ready: return DesignTokens.Status.neutral
-        case .running: return DesignTokens.Status.running
-        case .waitingApproval: return DesignTokens.Status.warning
-        case .blocked: return DesignTokens.Status.warning
-        case .completed: return DesignTokens.Status.success
-        case .failed: return DesignTokens.Status.error
-        case .skipped: return DesignTokens.Status.neutral
-        }
-    }
-
-    private func blankToNil(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-struct WorkflowRunArtifactSnapshot {
-    let latestArtifacts: [Artifact]
-    let approvalContextArtifacts: [Artifact]
-    let latestDebugArtifacts: [Artifact]
-
-    init(artifacts: [Artifact]) {
-        let compactArtifacts = artifacts.filter { $0.reportKind != "immutable_history" }
-        self.latestArtifacts = Self.sortLatestArtifacts(compactArtifacts)
-        self.approvalContextArtifacts = Self.makeApprovalContextArtifacts(from: latestArtifacts)
-        self.latestDebugArtifacts = Self.makeLatestDebugArtifacts(from: latestArtifacts)
-    }
-
-    private static func sortLatestArtifacts(_ artifacts: [Artifact]) -> [Artifact] {
-        artifacts.sorted { lhs, rhs in
-            if lhs.name == "final_feature_report" { return true }
-            if rhs.name == "final_feature_report" { return false }
-            return lhs.createdAt > rhs.createdAt
-        }
-    }
-
-    private static func makeApprovalContextArtifacts(from artifacts: [Artifact]) -> [Artifact] {
-        let priority = [
-            "proposal_revision_summary",
-            "proposal_review_summary",
-            "score_lift_backlog",
-            "proposal_feedback_coverage",
-            "proposal_current",
-            "proposal_review_po",
-            "proposal_review_ux",
-            "proposal_review_ui",
-            "proposal_review_architect"
-        ]
-        let indexed = Dictionary(uniqueKeysWithValues: priority.enumerated().map { ($1, $0) })
-        var seen = Set<String>()
-
-        return artifacts
-            .filter { indexed[$0.name] != nil }
-            .filter { seen.insert($0.name).inserted }
-            .sorted { lhs, rhs in
-                (indexed[lhs.name] ?? .max) < (indexed[rhs.name] ?? .max)
+        private func summaryRow(label: String, value: String) -> some View {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                Text(value)
+                    .font(ForgeTypography.body)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+        }
+
+        private var latestMeaningfulEventText: String {
+            latestLiveEvent?.event.detail
+                ?? latestPersistedCheckpointText
+                ?? "Waiting for the next execution event"
+        }
+
+        private var latestLiveEvent: LiveExecutionTimelineEntry? {
+            liveTimeline.first(where: { $0.event.type != .textChunk }) ?? liveTimeline.first
+        }
+
+        private var latestLiveSessionID: String? {
+            latestLiveEvent?.event.sessionID
+        }
+
+        private var missingSessionDetail: String {
+            if latestPersistedSessionID != nil {
+                return
+                    "No in-memory live stream is attached. Showing the most recent persisted runtime session."
+            }
+            switch effectiveRunStatus {
+            case .pending, .ready, .running:
+                return "Waiting for the next session to start"
+            case .waitingApproval:
+                return "No live session while the run is waiting at approval"
+            case .blocked:
+                return "No live session. Use recovery to resume from the blocked stage"
+            case .completed, .failed, .cancelled, .cancelling:
+                return "No active live session"
+            }
+        }
+
+        @ViewBuilder
+        private func artifactButton(_ artifact: Artifact) -> some View {
+            Button {
+                selectedArtifact = artifact
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(artifact.name)
+                            .font(.headline)
+                        Text("\(artifact.stageID) · \(artifact.agentID)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(artifact.format.rawValue)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open \(artifact.name)")
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("artifact-button-\(artifact.name)")
+        }
+
+        private func resolveArtifact(withID artifactID: UUID) -> Artifact? {
+            latestArtifacts.first { $0.id == artifactID }
+        }
+
+        private func durationString(from start: Date, to end: Date) -> String {
+            let formatter = DateComponentsFormatter()
+            let interval = max(0, end.timeIntervalSince(start))
+            formatter.allowedUnits = interval >= 3600 ? [.hour, .minute] : [.minute, .second]
+            formatter.unitsStyle = .abbreviated
+            return formatter.string(from: interval) ?? "0s"
+        }
+
+        private func stageStatusIcon(_ status: StageStatus) -> String {
+            switch status {
+            case .pending, .ready: return "clock"
+            case .running: return "bolt.circle.fill"
+            case .waitingApproval: return "checkmark.seal.fill"
+            case .blocked: return "pause.circle.fill"
+            case .completed: return "checkmark.circle.fill"
+            case .failed: return "xmark.circle.fill"
+            case .skipped: return "arrow.uturn.forward.circle"
+            }
+        }
+
+        private func stageStatusColor(_ status: StageStatus) -> Color {
+            switch status {
+            case .pending, .ready: return DesignTokens.Status.neutral
+            case .running: return DesignTokens.Status.running
+            case .waitingApproval: return DesignTokens.Status.warning
+            case .blocked: return DesignTokens.Status.warning
+            case .completed: return DesignTokens.Status.success
+            case .failed: return DesignTokens.Status.error
+            case .skipped: return DesignTokens.Status.neutral
+            }
+        }
+
+        private func blankToNil(_ value: String?) -> String? {
+            guard let value else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
     }
 
-    private static func makeLatestDebugArtifacts(from artifacts: [Artifact]) -> [Artifact] {
-        var seen = Set<String>()
-        return artifacts
-            .filter {
-                $0.name.hasSuffix("_receipt.json")
-                    || $0.name.hasSuffix("_transcript.md")
-                    || $0.name.contains("approval_resolution_diagnostic_")
+    struct WorkflowRunArtifactSnapshot {
+        let latestArtifacts: [Artifact]
+        let approvalContextArtifacts: [Artifact]
+        let latestDebugArtifacts: [Artifact]
+
+        init(artifacts: [Artifact]) {
+            let compactArtifacts = artifacts.filter { $0.reportKind != "immutable_history" }
+            self.latestArtifacts = Self.sortLatestArtifacts(compactArtifacts)
+            self.approvalContextArtifacts = Self.makeApprovalContextArtifacts(from: latestArtifacts)
+            self.latestDebugArtifacts = Self.makeLatestDebugArtifacts(from: latestArtifacts)
+        }
+
+        private static func sortLatestArtifacts(_ artifacts: [Artifact]) -> [Artifact] {
+            artifacts.sorted { lhs, rhs in
+                if lhs.name == "final_feature_report" { return true }
+                if rhs.name == "final_feature_report" { return false }
+                return lhs.createdAt > rhs.createdAt
             }
-            .filter { seen.insert($0.name).inserted }
-            .prefix(4)
-            .map { $0 }
+        }
+
+        private static func makeApprovalContextArtifacts(from artifacts: [Artifact]) -> [Artifact] {
+            let priority = [
+                "proposal_revision_summary",
+                "proposal_review_summary",
+                "score_lift_backlog",
+                "proposal_feedback_coverage",
+                "proposal_current",
+                "proposal_review_po",
+                "proposal_review_ux",
+                "proposal_review_ui",
+                "proposal_review_architect",
+            ]
+            let indexed = Dictionary(uniqueKeysWithValues: priority.enumerated().map { ($1, $0) })
+            var seen = Set<String>()
+
+            return
+                artifacts
+                .filter { indexed[$0.name] != nil }
+                .filter { seen.insert($0.name).inserted }
+                .sorted { lhs, rhs in
+                    (indexed[lhs.name] ?? .max) < (indexed[rhs.name] ?? .max)
+                }
+        }
+
+        private static func makeLatestDebugArtifacts(from artifacts: [Artifact]) -> [Artifact] {
+            var seen = Set<String>()
+            return
+                artifacts
+                .filter {
+                    $0.name.hasSuffix("_receipt.json")
+                        || $0.name.hasSuffix("_transcript.md")
+                        || $0.name.contains("approval_resolution_diagnostic_")
+                }
+                .filter { seen.insert($0.name).inserted }
+                .prefix(4)
+                .map { $0 }
+        }
     }
-}
 
-// MARK: - WorkflowStageDetailView
+    // MARK: - WorkflowStageDetailView
 
-struct WorkflowStageDetailView: View {
-    let stageExecution: RunStageSnapshot
-    let run: Run
+    struct WorkflowStageDetailView: View {
+        let stageExecution: RunStageSnapshot
+        let run: Run
 
-    private var sortedAgentExecutions: [RunStageAgentSnapshot] { stageExecution.agentExecutions }
+        private var sortedAgentExecutions: [RunStageAgentSnapshot] {
+            stageExecution.agentExecutions
+        }
 
-    var body: some View {
-        List {
-            Section("Stage") {
-                LabeledContent("Label", value: stageExecution.label)
-                LabeledContent("Stage ID", value: stageExecution.stageID)
-                LabeledContent("Status", value: stageExecution.status.rawValue)
-                LabeledContent("Iteration", value: "\(stageExecution.iteration)")
-                LabeledContent("Attempt", value: "\(stageExecution.attemptNumber)")
-            }
+        var body: some View {
+            List {
+                Section("Stage") {
+                    LabeledContent("Label", value: stageExecution.label)
+                    LabeledContent("Stage ID", value: stageExecution.stageID)
+                    LabeledContent("Status", value: stageExecution.status.rawValue)
+                    LabeledContent("Iteration", value: "\(stageExecution.iteration)")
+                    LabeledContent("Attempt", value: "\(stageExecution.attemptNumber)")
+                }
 
-            Section("Agent Executions") {
-                if sortedAgentExecutions.isEmpty {
-                    Text("No agent executions recorded for this stage.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(sortedAgentExecutions) { execution in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text(execution.agentTitle)
-                                    .font(.headline)
-                                Spacer()
-                                Text(execution.status.rawValue)
+                Section("Agent Executions") {
+                    if sortedAgentExecutions.isEmpty {
+                        Text("No agent executions recorded for this stage.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(sortedAgentExecutions) { execution in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(execution.agentTitle)
+                                        .font(.headline)
+                                    Spacer()
+                                    Text(execution.status.rawValue)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text(execution.taskName)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                agentMetadataRow(for: execution)
+                                if let logSnippet = execution.logSnippet, !logSnippet.isEmpty {
+                                    Text(logSnippet)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
                             }
-                            Text(execution.taskName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            agentMetadataRow(for: execution)
-                            if let logSnippet = execution.logSnippet, !logSnippet.isEmpty {
-                                Text(logSnippet)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
                     }
                 }
             }
+            .frame(minWidth: 560, minHeight: 420)
+            .accessibilityIdentifier("stage-detail-view")
         }
-        .frame(minWidth: 560, minHeight: 420)
-        .accessibilityIdentifier("stage-detail-view")
-    }
 
-    /// Decode frozen provenances from the run's snapshot (Proposal 011 — REQ-009).
-    private func frozenProvenance(for agentID: String) -> FrozenBindingProvenance? {
-        guard let data = run.bindingProvenanceJSON else { return nil }
-        let decoded = try? JSONDecoder().decode([String: FrozenBindingProvenance].self, from: data)
-        return decoded?[agentID]
-    }
-
-    /// Decode frozen binding from the run's snapshot (Proposal 011 — REQ-008).
-    private func frozenBinding(for agentID: String) -> ResolvedProviderBinding? {
-        guard let data = run.providerBindingSnapshotJSON else { return nil }
-        let decoded = try? JSONDecoder().decode([String: ResolvedProviderBinding].self, from: data)
-        return decoded?[agentID]
-    }
-
-    @ViewBuilder
-    private func agentMetadataRow(for execution: RunStageAgentSnapshot) -> some View {
-        let frozen = frozenBinding(for: execution.agentID)
-        let provenance = frozenProvenance(for: execution.agentID)
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 10) {
-                Text(execution.provider)
-                // Proposal 011 (REQ-008): Prefer frozen model truth.
-                let displayModel = frozen?.model ?? execution.resolvedModel
-                if let model = displayModel, !model.isEmpty {
-                    Text(model)
-                }
-                Text(execution.effort)
-                // Proposal 011 (REQ-009): Show provenance source.
-                if let source = provenance?.source {
-                    Text("[\(source.rawValue)]")
-                        .foregroundStyle(.tertiary)
-                }
-                // Proposal 011 (REQ-010): Cross-family mismatch warning.
-                if frozen?.hasCrossFamilyMismatch == true {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(DesignTokens.Status.warning)
-                        .help("Cross-family binding: model '\(frozen?.model ?? "")' may not match provider family '\(frozen?.providerFamily ?? "")'")
-                        .accessibilityIdentifier("cross-family-warning")
-                }
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-
-            HStack(spacing: 10) {
-                Text(durationString(from: execution.startedAt, to: execution.completedAt ?? Date()))
-                if let cost = execution.costCents {
-                    Text("\(cost) cents")
-                }
-            }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
+        /// Decode frozen provenances from the run's snapshot (Proposal 011 — REQ-009).
+        private func frozenProvenance(for agentID: String) -> FrozenBindingProvenance? {
+            guard let data = run.bindingProvenanceJSON else { return nil }
+            let decoded = try? JSONDecoder().decode(
+                [String: FrozenBindingProvenance].self, from: data)
+            return decoded?[agentID]
         }
-    }
 
-    private func durationString(from start: Date, to end: Date) -> String {
-        let formatter = DateComponentsFormatter()
-        let interval = max(0, end.timeIntervalSince(start))
-        formatter.allowedUnits = interval >= 3600 ? [.hour, .minute] : [.minute, .second]
-        formatter.unitsStyle = .abbreviated
-        return formatter.string(from: interval) ?? "0s"
-    }
-}
+        /// Decode frozen binding from the run's snapshot (Proposal 011 — REQ-008).
+        private func frozenBinding(for agentID: String) -> ResolvedProviderBinding? {
+            guard let data = run.providerBindingSnapshotJSON else { return nil }
+            let decoded = try? JSONDecoder().decode(
+                [String: ResolvedProviderBinding].self, from: data)
+            return decoded?[agentID]
+        }
 
-// MARK: - Proposal 008 (REQ-009): Attachment Validation Status Icon
-
-/// Displays a color-coded icon indicating attachment validation state.
-/// `reference_only` = paperclip (secondary), `rejected` = warning triangle (red).
-struct AttachmentStatusIcon: View {
-    let path: String
-
-    private var validation: MVPBoundaryPolicy.AttachmentValidationResult {
-        MVPBoundaryPolicy.validateAttachment(path: path)
-    }
-
-    var body: some View {
-        let isValid = validation.status == .referenceOnly
-        Image(systemName: isValid ? "paperclip" : "exclamationmark.triangle")
-            .font(.caption2)
-            .foregroundStyle(isValid ? DesignTokens.Status.neutral : DesignTokens.Status.error)
-    }
-}
-
-// MARK: - WorkflowArtifactInspectorView
-
-struct WorkflowArtifactInspectorView: View {
-    @Environment(\.modelContext) private var modelContext
-
-    let run: Run
-    let artifact: Artifact
-
-    @State private var renderedContent = "Loading artifact..."
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        @ViewBuilder
+        private func agentMetadataRow(for execution: RunStageAgentSnapshot) -> some View {
+            let frozen = frozenBinding(for: execution.agentID)
+            let provenance = frozenProvenance(for: execution.agentID)
             VStack(alignment: .leading, spacing: 4) {
-                Text(artifact.name)
-                    .font(.headline)
-                    .accessibilityIdentifier("artifact-inspector-title")
-                Text("\(artifact.stageID) · \(artifact.agentID) · \(artifact.format.rawValue)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(artifact.filePath)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
+                HStack(spacing: 10) {
+                    Text(execution.provider)
+                    // Proposal 011 (REQ-008): Prefer frozen model truth.
+                    let displayModel = frozen?.model ?? execution.resolvedModel
+                    if let model = displayModel, !model.isEmpty {
+                        Text(model)
+                    }
+                    Text(execution.effort)
+                    // Proposal 011 (REQ-009): Show provenance source.
+                    if let source = provenance?.source {
+                        Text("[\(source.rawValue)]")
+                            .foregroundStyle(.tertiary)
+                    }
+                    // Proposal 011 (REQ-010): Cross-family mismatch warning.
+                    if frozen?.hasCrossFamilyMismatch == true {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(DesignTokens.Status.warning)
+                            .help(
+                                "Cross-family binding: model '\(frozen?.model ?? "")' may not match provider family '\(frozen?.providerFamily ?? "")'"
+                            )
+                            .accessibilityIdentifier("cross-family-warning")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Text(
+                        durationString(
+                            from: execution.startedAt, to: execution.completedAt ?? Date()))
+                    if let cost = execution.costCents {
+                        Text("\(cost) cents")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             }
+        }
 
-            Divider()
+        private func durationString(from start: Date, to end: Date) -> String {
+            let formatter = DateComponentsFormatter()
+            let interval = max(0, end.timeIntervalSince(start))
+            formatter.allowedUnits = interval >= 3600 ? [.hour, .minute] : [.minute, .second]
+            formatter.unitsStyle = .abbreviated
+            return formatter.string(from: interval) ?? "0s"
+        }
+    }
 
-            ScrollView {
-                ArtifactContentRenderer(
-                    content: renderedContent,
-                    context: .artifactBacked(artifact: artifact, run: run)
-                )
+    // MARK: - Proposal 008 (REQ-009): Attachment Validation Status Icon
+
+    /// Displays a color-coded icon indicating attachment validation state.
+    /// `reference_only` = paperclip (secondary), `rejected` = warning triangle (red).
+    struct AttachmentStatusIcon: View {
+        let path: String
+
+        private var validation: MVPBoundaryPolicy.AttachmentValidationResult {
+            MVPBoundaryPolicy.validateAttachment(path: path)
+        }
+
+        var body: some View {
+            let isValid = validation.status == .referenceOnly
+            Image(systemName: isValid ? "paperclip" : "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(isValid ? DesignTokens.Status.neutral : DesignTokens.Status.error)
+        }
+    }
+
+    // MARK: - WorkflowArtifactInspectorView
+
+    struct WorkflowArtifactInspectorView: View {
+        @Environment(\.modelContext) private var modelContext
+
+        let run: Run
+        let artifact: Artifact
+
+        @State private var renderedContent = "Loading artifact..."
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(artifact.name)
+                        .font(.headline)
+                        .accessibilityIdentifier("artifact-inspector-title")
+                    Text("\(artifact.stageID) · \(artifact.agentID) · \(artifact.format.rawValue)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(artifact.filePath)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                }
+
+                Divider()
+
+                ScrollView {
+                    ArtifactContentRenderer(
+                        content: renderedContent,
+                        context: .artifactBacked(artifact: artifact, run: run)
+                    )
+                }
+                .accessibilityIdentifier("artifact-inspector-content")
             }
-            .accessibilityIdentifier("artifact-inspector-content")
-        }
-        .padding()
-        .frame(minWidth: 640, minHeight: 480)
-        .accessibilityIdentifier("artifact-inspector-view")
-        .task(id: artifact.id) {
-            renderedContent = loadContent()
-        }
-    }
-
-    private func loadContent() -> String {
-        let workspace = RunWorkspace(
-            runID: run.id,
-            workspaceRoot: URL(fileURLWithPath: run.workspaceRoot),
-            artifactRoot: URL(fileURLWithPath: run.artifactRoot),
-            worktreeRoot: run.worktreeRoot.flatMap { URL(fileURLWithPath: $0) }
-        )
-
-        do {
-            let manager = ArtifactManager(modelContext: modelContext)
-            let data = try manager.readArtifact(artifact, workspace: workspace)
-
-            if let string = String(data: data, encoding: .utf8) {
-                return string
+            .padding()
+            .frame(minWidth: 640, minHeight: 480)
+            .accessibilityIdentifier("artifact-inspector-view")
+            .task(id: artifact.id) {
+                renderedContent = loadContent()
             }
+        }
 
-            return "Binary artifact (\(data.count) bytes)"
-        } catch {
-            return "Failed to load artifact: \(error.localizedDescription)"
+        private func loadContent() -> String {
+            let workspace = RunWorkspace(
+                runID: run.id,
+                workspaceRoot: URL(fileURLWithPath: run.workspaceRoot),
+                artifactRoot: URL(fileURLWithPath: run.artifactRoot),
+                worktreeRoot: run.worktreeRoot.flatMap { URL(fileURLWithPath: $0) }
+            )
+
+            do {
+                let manager = ArtifactManager(modelContext: modelContext)
+                let data = try manager.readArtifact(artifact, workspace: workspace)
+
+                if let string = String(data: data, encoding: .utf8) {
+                    return string
+                }
+
+                return "Binary artifact (\(data.count) bytes)"
+            } catch {
+                return "Failed to load artifact: \(error.localizedDescription)"
+            }
         }
     }
-}
 
-private enum WorkflowStartSnapshotError: LocalizedError {
-    case missingDeliveryProjectDirectory
+    private enum WorkflowStartSnapshotError: LocalizedError {
+        case missingDeliveryProjectDirectory
 
-    var errorDescription: String? {
-        switch self {
-        case .missingDeliveryProjectDirectory:
-            return "Delivery workflow requires a project directory. Set the workspace root on the idea or provide a delivery repo root."
+        var errorDescription: String? {
+            switch self {
+            case .missingDeliveryProjectDirectory:
+                return
+                    "Delivery workflow requires a project directory. Set the workspace root on the idea or provide a delivery repo root."
+            }
         }
     }
-}
 
-private extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
+    extension String {
+        fileprivate var nilIfEmpty: String? {
+            isEmpty ? nil : self
+        }
     }
-}
 #endif
 
 #Preview("Ideas — Operator List") {
@@ -3631,7 +4609,10 @@ private extension String {
             NewIdeaDraft(
                 title: "Canonical delivery dogfood",
                 body: "Use the real repo-backed flow to validate the delivery path end to end.",
-                attachmentPath: PreviewSupport.previewWorkspaceURL("docs/reference/provider-platform.md").path
+                attachmentPath: PreviewSupport.previewWorkspaceURL(
+                    "docs/reference/provider-platform.md"
+                )
+                .path
             )
         ),
         onBrowseAttachment: {},

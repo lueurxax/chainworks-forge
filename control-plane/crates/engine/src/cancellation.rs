@@ -52,7 +52,7 @@ pub async fn begin_settlement(
         .collect();
 
     agent_executions::cancel_running_by_run(pool, run_id, requested_at).await?;
-    work_items::cancel_unfinished_by_run(pool, run_id).await?;
+    work_items::cancel_running_by_run(pool, run_id).await?;
 
     for stage in stages::list_by_run(pool, run_id).await? {
         if stage.status == domain::stage::StageStatus::Running {

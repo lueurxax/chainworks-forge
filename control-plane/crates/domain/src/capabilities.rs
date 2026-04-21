@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[non_exhaustive]
 pub enum CapabilityToolId {
     IdeasCreate,
     IdeasList,
@@ -13,13 +12,13 @@ pub enum CapabilityToolId {
     ApprovalsResolve,
     StagesRetry,
     ReportsGet,
+    ArtifactsOverrideContract,
     StewardRunAnalysis,
     StewardListAnalyses,
     StewardGetAnalysis,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[non_exhaustive]
 pub enum ResourceTemplateId {
     RunEntity,
     IdeaEntity,

@@ -1,16 +1,22 @@
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifacts, command_journal, ideas, projections, runs, scheduler,
-    stages, steward, validation, work_items,
+    agent_executions, approvals, artifact_contracts as artifact_contract_repos, artifacts, ideas,
+    projections, runs, sessions, stages, steward, validation, work_items,
 };
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
+use domain::artifact_contracts::{
+    parse_implementation_self_assessment_v2, ActiveArtifactGenerationInput, ContractParseContext,
+    ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
-use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 use domain::run::{Run, RunStatus};
+use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::steward::{
     CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
@@ -25,6 +31,563 @@ async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
         .await
         .expect("in-memory pool failed")
+}
+
+async fn seed_contract_run(pool: &sqlx::SqlitePool) -> RunId {
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Contract idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-contract".into(),
+        workflow_title: "Contract Workflow".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("state_8_implementation".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(pool, &run).await.unwrap();
+    run.id
+}
+
+async fn insert_contract_artifact(
+    pool: &sqlx::SqlitePool,
+    run_id: RunId,
+    contract_id: &str,
+    name: &str,
+) -> ArtifactId {
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation".into(),
+        agent_id: "code_writer".into(),
+        name: name.into(),
+        contract_id: contract_id.into(),
+        format: ArtifactFormat::Json,
+        file_path: format!("/tmp/art/{name}.json"),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "codex".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(pool, &artifact).await.unwrap();
+    artifact.id
+}
+
+fn contract_context(declared_contract_id: Option<&str>) -> ContractParseContext {
+    ContractParseContext {
+        run_id: "run".into(),
+        run_age: None,
+        declared_contract_id: declared_contract_id.map(str::to_string),
+        canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+        raw_artifact_path: Some(IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into()),
+        source_generation_id: None,
+        artifact_created_at: Some(Utc::now()),
+        v2_generation_seen_for_run: false,
+        legacy_v1_generation_available: false,
+    }
+}
+
+fn valid_v2_handoff_required() -> serde_json::Value {
+    serde_json::json!({
+        "implementation_complete": true,
+        "verification_green": true,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [{
+            "summary": "Collect signed manual smoke evidence.",
+            "owner_class": "manual_evidence",
+            "target_stage": "state_10_release_gate",
+            "blocking_review": true,
+            "evidence": "Manual smoke evidence is intentionally collected after implementation review."
+        }],
+        "known_risks": ["Manual evidence still gates release."],
+        "tests_run": ["cargo test -p domain"],
+        "docs_impacted": []
+    })
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_persists_active_dimensions() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation-self-assessment-v2",
+    )
+    .await;
+    let summary = parse_implementation_self_assessment_v2(
+        &valid_v2_handoff_required(),
+        contract_context(Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)),
+    );
+
+    let stored = artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        artifact_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        &summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stored.artifact_id, artifact_id);
+    assert!(stored.is_active);
+    assert_eq!(stored.source_kind, "v2");
+    assert_eq!(
+        stored.summary.status,
+        ImplementationSelfAssessmentStatus::HandoffRequired
+    );
+    assert_eq!(stored.summary.handoff_task_count, Some(1));
+    assert_eq!(stored.summary.blocking_review_handoff_task_count, Some(1));
+    assert_eq!(
+        stored
+            .summary
+            .owner_class_counts
+            .get("manual_evidence")
+            .copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_active_generation_uses_domain_handoff_required_status() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_path = tmp.path().join("implementation/self-assessment.json");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &raw_path,
+        serde_json::to_vec(&valid_v2_handoff_required()).unwrap(),
+    )
+    .unwrap();
+
+    artifact_contract_repos::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+            canonical_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "complete".into(),
+            generation_id: "handoff-generation".into(),
+            source_agent_execution_id: Some("agent-exec-handoff".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: domain::agent::AgentOutputSettlement::None,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let status = artifact_contract_repos::canonical_contract_field(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v2",
+        "status",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, Some(serde_json::json!("handoff_required")));
+    let handoff_count = artifact_contract_repos::canonical_contract_field(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v2",
+        "blocking_review_handoff_task_count",
+    )
+    .await
+    .unwrap();
+    assert_eq!(handoff_count, Some(serde_json::json!(1)));
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_prefers_invalid_v2_over_legacy_v1() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v1",
+        "implementation-self-assessment-v1",
+    )
+    .await;
+    let legacy_summary = parse_implementation_self_assessment_v2(
+        &serde_json::json!({ "seemingly_complete": true }),
+        contract_context(Some("implementation_self_assessment_v1")),
+    );
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let v2_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        "raw_output",
+        "implementation-self-assessment-raw-v2",
+    )
+    .await;
+    let invalid_v2_summary = parse_implementation_self_assessment_v2(
+        &valid_v2_handoff_required(),
+        contract_context(None),
+    );
+    let active = artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        v2_artifact_id,
+        "raw_output",
+        &invalid_v2_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(active.artifact_id, v2_artifact_id);
+    assert_eq!(active.source_kind, "v2");
+    assert_eq!(
+        active.summary.status,
+        ImplementationSelfAssessmentStatus::Invalid
+    );
+    assert!(active
+        .summary
+        .validation_errors
+        .iter()
+        .any(|issue| issue.code == "raw_only_v2_artifact"));
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_keeps_v2_active_over_later_legacy_same_path() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let v2_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation-self-assessment-v2",
+    )
+    .await;
+    let v2_summary = parse_implementation_self_assessment_v2(
+        &valid_v2_handoff_required(),
+        contract_context(Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)),
+    );
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        v2_artifact_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        &v2_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v1",
+        "implementation-self-assessment-v1",
+    )
+    .await;
+    let legacy_summary = parse_implementation_self_assessment_v2(
+        &serde_json::json!({ "seemingly_complete": true }),
+        contract_context(Some("implementation_self_assessment_v1")),
+    );
+    let active = artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let legacy_record =
+        artifact_contract_repos::find_implementation_self_assessment_summary_by_artifact(
+            &pool,
+            legacy_artifact_id,
+        )
+        .await
+        .unwrap()
+        .expect("legacy summary should be stored");
+
+    assert_eq!(active.artifact_id, v2_artifact_id);
+    assert!(active.is_active);
+    assert!(!legacy_record.is_active);
+    assert!(legacy_record
+        .summary
+        .warnings
+        .iter()
+        .any(|issue| issue.code == "same_path_contract_conflict"));
+}
+
+#[tokio::test]
+async fn v1_fallback_retirement_check_reports_active_non_terminal_legacy_runs() {
+    let pool = test_pool().await;
+    let active_legacy_run_id = seed_contract_run(&pool).await;
+    let active_legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        active_legacy_run_id,
+        "implementation_self_assessment_v1",
+        "active-legacy-implementation-self-assessment",
+    )
+    .await;
+    let legacy_summary = parse_implementation_self_assessment_v2(
+        &serde_json::json!({ "seemingly_complete": true }),
+        contract_context(Some("implementation_self_assessment_v1")),
+    );
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        active_legacy_run_id,
+        active_legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let terminal_legacy_run_id = seed_contract_run(&pool).await;
+    let terminal_legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        terminal_legacy_run_id,
+        "implementation_self_assessment_v1",
+        "terminal-legacy-implementation-self-assessment",
+    )
+    .await;
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        terminal_legacy_run_id,
+        terminal_legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    runs::update_status(&pool, terminal_legacy_run_id, RunStatus::Completed)
+        .await
+        .unwrap();
+
+    let check = artifact_contract_repos::v1_fallback_retirement_check(&pool)
+        .await
+        .unwrap();
+    assert!(!check.safe_to_retire());
+    assert_eq!(check.active_non_terminal_v1_only_run_count(), 1);
+    assert_eq!(
+        check.active_non_terminal_v1_only_run_ids,
+        vec![active_legacy_run_id]
+    );
+
+    runs::update_status(&pool, active_legacy_run_id, RunStatus::Completed)
+        .await
+        .unwrap();
+    let check = artifact_contract_repos::v1_fallback_retirement_check(&pool)
+        .await
+        .unwrap();
+    assert!(check.safe_to_retire());
+    assert_eq!(check.active_non_terminal_v1_only_run_count(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_pool_uses_30_second_busy_timeout() {
+    let pool = test_pool().await;
+
+    let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(busy_timeout_ms, 30_000);
+}
+
+#[tokio::test]
+async fn migrations_create_hot_scheduler_indexes() {
+    let pool = test_pool().await;
+
+    let indexes: Vec<String> = sqlx::query_scalar(
+        r#"SELECT name
+           FROM sqlite_master
+           WHERE type = 'index'
+             AND name IN (
+               'idx_work_items_status_kind_scheduled',
+               'idx_agent_executions_status',
+               'idx_agent_executions_status_provider',
+               'idx_agent_executions_status_stage'
+             )
+           ORDER BY name"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        indexes,
+        vec![
+            "idx_agent_executions_status".to_string(),
+            "idx_agent_executions_status_provider".to_string(),
+            "idx_agent_executions_status_stage".to_string(),
+            "idx_work_items_status_kind_scheduled".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn completing_invoke_agent_enqueues_post_completion_advance_run() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-invoke-completion".into(),
+        workflow_title: "Invoke Completion".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("state_4_proposal_reviewed".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let now = Utc::now();
+    let invoke_id = "p058-invoke:completion-finalizer-test:0";
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: invoke_id.into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run.id.to_string(),
+                "stage_id": "state_4_proposal_reviewed",
+                "stage_execution_id": StageExecutionId::new().to_string(),
+                "agent_id": "proposal_reviewer_architect",
+                "provider": "codex",
+            })
+            .to_string(),
+            status: WorkItemStatus::Running,
+            run_id: Some(run.id),
+            stage_id: Some("state_4_proposal_reviewed".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    work_items::complete(&pool, invoke_id).await.unwrap();
+
+    let items = work_items::list_by_run(&pool, run.id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.id == invoke_id)
+        .expect("completed invoke item");
+    assert_eq!(invoke.status, WorkItemStatus::Completed);
+
+    let pending_advances: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            item.kind == WorkItemKind::AdvanceRun && item.status == WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(
+        pending_advances.len(),
+        1,
+        "completion must leave a durable post-completion AdvanceRun wake-up"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&pending_advances[0].payload_json).unwrap();
+    assert_eq!(payload["run_id"], run.id.to_string());
+    assert_eq!(payload["completed_invoke_work_item_id"], invoke_id);
+    assert_eq!(payload["reason"], "invoke_agent_completed");
 }
 
 #[tokio::test]
@@ -104,6 +667,7 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -190,6 +754,134 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
 }
 
 #[tokio::test]
+async fn session_lookup_helpers_read_by_id() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-session-lookup".into(),
+        workflow_title: "Session Lookup".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let lineage = SessionLineage {
+        id: "session-lineage-lookup".into(),
+        run_id: run.id.to_string(),
+        agent_id: "code_writer".into(),
+        lineage_id: "session-family-lookup".into(),
+        session_reuse_scope: "same_agent_family_within_run".into(),
+        session_family_id: Some("family-lookup".into()),
+        active_generation_id: Some("session-generation-lookup".into()),
+        created_at: Utc::now(),
+        closed_at: None,
+    };
+    sessions::insert_lineage(&pool, &lineage).await.unwrap();
+
+    let generation = SessionGeneration {
+        id: "session-generation-lookup".into(),
+        lineage_id: lineage.id.clone(),
+        generation: 3,
+        invocation_owner_key: "owner-key".into(),
+        provider_session_id: Some("provider-session-lookup".into()),
+        binding_fingerprint: "fingerprint-lookup".into(),
+        rehydrated_from_checkpoint_artifact_id: None,
+        working_directory: "/tmp/ws".into(),
+        workspace_mode: "workspace".into(),
+        runtime_provider: "claude".into(),
+        runtime_model: "sonnet".into(),
+        status: SessionGenerationStatus::Closed,
+        turn_count: 4,
+        estimated_input_tokens: 10,
+        latest_cached_input_tokens: Some(2),
+        latest_output_tokens: Some(8),
+        latest_model_context_window: Some(4096),
+        cumulative_prompt_tokens: 11,
+        cumulative_cost_cents: 12,
+        created_at: Utc::now(),
+        last_activity_at: None,
+        ended_at: None,
+        end_reason: Some("completed".into()),
+    };
+    sessions::insert_generation(&pool, &generation)
+        .await
+        .unwrap();
+
+    let found_lineage = sessions::find_lineage_by_id(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("lineage");
+    let found_generation = sessions::find_generation_by_id(&pool, &generation.id)
+        .await
+        .unwrap()
+        .expect("generation");
+
+    assert_eq!(
+        found_lineage.active_generation_id.as_deref(),
+        Some("session-generation-lookup")
+    );
+    assert_eq!(
+        found_generation.provider_session_id.as_deref(),
+        Some("provider-session-lookup")
+    );
+    assert_eq!(found_generation.status, SessionGenerationStatus::Closed);
+    assert_eq!(found_generation.lineage_id, lineage.id);
+}
+
+#[tokio::test]
+async fn session_lookup_helpers_return_none_for_missing_rows() {
+    let pool = test_pool().await;
+
+    assert!(sessions::find_lineage_by_id(&pool, "missing-lineage")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(sessions::find_generation_by_id(&pool, "missing-generation")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn steward_run_metadata_and_project_key_roundtrip() {
     let pool = test_pool().await;
     let idea = Idea {
@@ -242,6 +934,7 @@ async fn steward_run_metadata_and_project_key_roundtrip() {
         catalog_snapshot_json: Some(r#"{"agents":[]}"#.into()),
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -355,6 +1048,7 @@ async fn steward_analysis_schema_roundtrips_p049_contract() {
             catalog_snapshot_json: Some("{}".into()),
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -459,6 +1153,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -601,6 +1296,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -753,6 +1449,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1014,6 +1711,7 @@ async fn test_run_insert_and_find() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -1067,6 +1765,7 @@ async fn test_run_status_update() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     runs::update_status(&pool, run.id, RunStatus::Running)
@@ -1130,6 +1829,7 @@ async fn test_projection_parity_after_rebuild() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1294,6 +1994,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -1397,1083 +2098,6 @@ async fn test_file_backed_sqlite_durability_across_restart() {
     }
 }
 
-#[tokio::test]
-async fn proposal_061_scheduler_foundation_tables_and_repos_round_trip() {
-    use sqlx::Row;
-
-    let pool = test_pool().await;
-    let rows = sqlx::query(
-        r#"SELECT name
-           FROM sqlite_master
-           WHERE type = 'table'
-             AND name IN (
-               'scheduler_service_state',
-               'scheduler_queue_summaries',
-               'scheduler_health_snapshots',
-               'scheduler_db_writer_observations',
-               'host_interruption_epochs',
-               'host_interruption_affected_executions'
-             )
-           ORDER BY name ASC"#,
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    let table_names: Vec<String> = rows.into_iter().map(|row| row.get("name")).collect();
-
-    assert_eq!(
-        table_names,
-        vec![
-            "host_interruption_affected_executions".to_string(),
-            "host_interruption_epochs".to_string(),
-            "scheduler_db_writer_observations".to_string(),
-            "scheduler_health_snapshots".to_string(),
-            "scheduler_queue_summaries".to_string(),
-            "scheduler_service_state".to_string(),
-        ]
-    );
-    assert!(scheduler::list_queue_summaries(&pool)
-        .await
-        .unwrap()
-        .is_empty());
-
-    let now = Utc::now();
-    let state = scheduler::SchedulerServiceState {
-        scope: "global".into(),
-        scope_id: "".into(),
-        last_served_at: Some(now),
-        last_claimed_work_item_id: Some("work-123".into()),
-        updated_at: now,
-    };
-    scheduler::upsert_service_state(&pool, &state)
-        .await
-        .unwrap();
-    let stored_state = scheduler::get_service_state(&pool, "global", "")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored_state.scope, state.scope);
-    assert_eq!(
-        stored_state.last_claimed_work_item_id,
-        state.last_claimed_work_item_id
-    );
-
-    let snapshot = scheduler::SchedulerHealthSnapshot {
-        id: "snapshot-1".into(),
-        queued_count: 3,
-        oldest_queued_age_ms: 15_000,
-        global_queue_depth: 7,
-        active_agent_executions: 2,
-        db_writer_wait_p95_ms: Some(42),
-        command_latency_p95_ms_json: Some(
-            r#"{"approve_stage":120,"retry_stage":180,"cancel_run":90}"#.into(),
-        ),
-        last_host_interruption_epoch_id: Some("epoch-latest".into()),
-        sustained_backpressure_state: "clear".into(),
-        stale_after_ms: 60_000,
-        updated_at: now,
-    };
-    scheduler::insert_health_snapshot(&pool, &snapshot)
-        .await
-        .unwrap();
-    let latest = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(latest.id, snapshot.id);
-    assert_eq!(latest.queued_count, snapshot.queued_count);
-    assert_eq!(latest.db_writer_wait_p95_ms, Some(42));
-    assert_eq!(
-        latest.command_latency_p95_ms_json,
-        snapshot.command_latency_p95_ms_json
-    );
-    assert_eq!(
-        latest.last_host_interruption_epoch_id,
-        Some("epoch-latest".into())
-    );
-    assert!(!latest.is_stale_at(now + chrono::Duration::milliseconds(59_999)));
-    assert!(latest.is_stale_at(now + chrono::Duration::milliseconds(60_000)));
-}
-
-#[tokio::test]
-async fn proposal_061_scheduler_refresh_populates_runtime_health_metrics() {
-    let pool = test_pool().await;
-    let now = Utc::now();
-
-    for offset in 0..100 {
-        scheduler::record_db_writer_wait_observation(
-            &pool,
-            "fixture_writer_wait",
-            77,
-            now - chrono::Duration::milliseconds(offset),
-        )
-        .await
-        .unwrap();
-    }
-
-    for millis in 1..=20 {
-        let created_at = now - chrono::Duration::seconds(60 - millis);
-        let completed_at = created_at + chrono::Duration::milliseconds(millis);
-        let id = format!("approve-latency-{millis}");
-        command_journal::record(
-            &pool,
-            &id,
-            "ApproveStage",
-            "{}",
-            None,
-            created_at,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        command_journal::complete_entry(&pool, &id, completed_at)
-            .await
-            .unwrap();
-    }
-
-    for millis in [5_i64, 10, 15, 20] {
-        let created_at = now - chrono::Duration::seconds(120 - millis);
-        let completed_at = created_at + chrono::Duration::milliseconds(millis);
-        let id = format!("retry-latency-{millis}");
-        command_journal::record(
-            &pool,
-            &id,
-            "RetryStage",
-            "{}",
-            None,
-            created_at,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        command_journal::complete_entry(&pool, &id, completed_at)
-            .await
-            .unwrap();
-    }
-
-    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
-        .await
-        .unwrap();
-
-    let latest = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .expect("scheduler health snapshot");
-    assert_eq!(latest.db_writer_wait_p95_ms, Some(77));
-
-    let latency_json = latest
-        .command_latency_p95_ms_json
-        .expect("command latency p95 json");
-    let latency: serde_json::Value = serde_json::from_str(&latency_json).unwrap();
-    assert_eq!(latency["approve_stage"], 19);
-    assert_eq!(latency["retry_stage"], 20);
-    assert!(latency["cancel_run"].is_null());
-
-    assert_eq!(
-        scheduler::latest_db_writer_wait_p95_ms(&pool)
-            .await
-            .unwrap(),
-        Some(77)
-    );
-    assert_eq!(
-        scheduler::command_latency_p95_ms_json(&pool).await.unwrap(),
-        Some(latency_json)
-    );
-}
-
-#[tokio::test]
-async fn proposal_061_sustained_backpressure_requires_two_snapshots_to_fire_and_clear() {
-    let pool = test_pool().await;
-    let now = Utc::now();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(&pool, IdeaId::new(), run_id, stage_execution_id, now).await;
-    insert_pending_invoke_agent_work(
-        &pool,
-        "sustained-backpressure-work",
-        run_id,
-        stage_execution_id,
-        "codex",
-        now - chrono::Duration::minutes(6),
-    )
-    .await;
-
-    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
-        .await
-        .unwrap();
-    let first_high = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .expect("first high-pressure snapshot");
-    assert_eq!(first_high.sustained_backpressure_state, "pending_active");
-
-    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
-        .await
-        .unwrap();
-    let second_high = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .expect("second high-pressure snapshot");
-    assert_eq!(second_high.sustained_backpressure_state, "active");
-    let notification = scheduler::latest_backpressure_notification(&pool)
-        .await
-        .unwrap()
-        .expect("active backpressure notification");
-    assert_eq!(notification.run_id, Some(run_id.to_string()));
-    assert_eq!(
-        notification.stage_execution_id,
-        Some(stage_execution_id.to_string())
-    );
-    assert_eq!(notification.provider_family.as_deref(), Some("codex"));
-    assert_eq!(notification.state, "active");
-
-    sqlx::query(
-        "UPDATE work_items SET status = 'cancelled' WHERE id = 'sustained-backpressure-work'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
-        .await
-        .unwrap();
-    let first_clear = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .expect("first clear snapshot");
-    assert_eq!(first_clear.sustained_backpressure_state, "pending_clear");
-
-    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
-        .await
-        .unwrap();
-    let second_clear = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .expect("second clear snapshot");
-    assert_eq!(second_clear.sustained_backpressure_state, "clear");
-    let clear_notification = scheduler::latest_backpressure_notification(&pool)
-        .await
-        .unwrap()
-        .expect("clear backpressure notification");
-    assert_eq!(clear_notification.state, "clear");
-    assert_eq!(clear_notification.top_reason, "clear");
-    assert_eq!(clear_notification.global_queue_depth, 0);
-}
-
-#[tokio::test]
-async fn proposal_061_host_interruption_readback_round_trip_by_run() {
-    let pool = test_pool().await;
-    let idea_id = IdeaId::new();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let agent_execution_id = AgentExecutionId::new();
-    let now = Utc::now();
-
-    sqlx::query(
-        r#"INSERT INTO ideas (id, title, body, status, created_at)
-           VALUES (?1, 'Host interruption idea', 'body', 'active', ?2)"#,
-    )
-    .bind(idea_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"INSERT INTO runs
-           (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
-           VALUES (?1, ?2, 'running', 'wf-p061-host', 'Host interruption workflow', '/tmp/ws', '/tmp/art', ?3)"#,
-    )
-    .bind(run_id.to_string())
-    .bind(idea_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"INSERT INTO stage_executions
-           (id, run_id, stage_id, label, status, started_at)
-           VALUES (?1, ?2, 'stage-p061-host', 'Host interruption stage', 'running', ?3)"#,
-    )
-    .bind(stage_execution_id.to_string())
-    .bind(run_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"INSERT INTO agent_executions
-           (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
-           VALUES (?1, ?2, 'agent-p061-host', 'codex', 'codex', 'running', ?3)"#,
-    )
-    .bind(agent_execution_id.to_string())
-    .bind(stage_execution_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    scheduler::insert_host_interruption_epoch(
-        &pool,
-        &scheduler::HostInterruptionEpoch {
-            id: "epoch-sleep-1".into(),
-            kind: "sleep_wake".into(),
-            started_at: now - chrono::Duration::seconds(90),
-            ended_at: Some(now - chrono::Duration::seconds(30)),
-            monotonic_gap_ms: Some(60_000),
-            wall_clock_gap_ms: Some(90_000),
-            details_json: Some(r#"{"source":"wall_clock_gap"}"#.into()),
-            created_at: now,
-        },
-    )
-    .await
-    .unwrap();
-    scheduler::insert_host_interruption_affected_execution(
-        &pool,
-        &scheduler::HostInterruptionAffectedExecution {
-            epoch_id: "epoch-sleep-1".into(),
-            agent_execution_id: agent_execution_id.to_string(),
-            run_id: Some(run_id.to_string()),
-            stage_execution_id: stage_execution_id.to_string(),
-            provider_family: Some("codex".into()),
-            action: "recovering_from_system_sleep".into(),
-            retry_enqueued_at: Some(now + chrono::Duration::seconds(5)),
-            created_at: now,
-        },
-    )
-    .await
-    .unwrap();
-
-    let readback = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
-        .await
-        .unwrap();
-
-    assert_eq!(readback.len(), 1);
-    assert_eq!(readback[0].epoch.kind, "sleep_wake");
-    assert_eq!(
-        readback[0].affected_executions[0].agent_execution_id,
-        agent_execution_id.to_string()
-    );
-    assert_eq!(
-        readback[0].affected_executions[0].action,
-        "recovering_from_system_sleep"
-    );
-}
-
-#[tokio::test]
-async fn proposal_061_queue_summary_upsert_and_zero_count_cleanup_round_trip() {
-    let pool = test_pool().await;
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let now = Utc::now();
-    let summary = scheduler::SchedulerQueueSummary {
-        scope: "run".into(),
-        scope_id: run_id.to_string(),
-        run_id: Some(run_id.to_string()),
-        stage_execution_id: Some(stage_execution_id.to_string()),
-        provider_family: Some("gemini".into()),
-        top_reason: "provider_capacity".into(),
-        queued_count: 4,
-        oldest_queued_age_ms: 30_000,
-        global_queue_depth: 11,
-        stale_after_ms: 60_000,
-        updated_at: now,
-    };
-
-    scheduler::upsert_queue_summary(&pool, &summary)
-        .await
-        .unwrap();
-
-    let by_run = scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
-        .await
-        .unwrap();
-    assert_eq!(by_run.len(), 1);
-    assert_eq!(by_run[0].provider_family.as_deref(), Some("gemini"));
-    assert_eq!(by_run[0].queued_count, 4);
-    assert_eq!(by_run[0].global_queue_depth, 11);
-    assert!(!by_run[0].is_stale_at(now + chrono::Duration::milliseconds(59_999)));
-    assert!(by_run[0].is_stale_at(now + chrono::Duration::milliseconds(60_000)));
-
-    let by_stage = scheduler::list_queue_summaries_by_stage(&pool, &stage_execution_id.to_string())
-        .await
-        .unwrap();
-    assert_eq!(by_stage, by_run);
-
-    let cleared = scheduler::SchedulerQueueSummary {
-        queued_count: 0,
-        updated_at: now + chrono::Duration::milliseconds(1),
-        ..summary
-    };
-    scheduler::upsert_queue_summary(&pool, &cleared)
-        .await
-        .unwrap();
-
-    assert!(scheduler::list_queue_summaries(&pool)
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-#[tokio::test]
-async fn proposal_061_capacity_claim_skips_blocked_invoke_agent_and_refreshes_projection() {
-    use std::collections::BTreeMap;
-
-    use sqlx::Row;
-
-    let pool = test_pool().await;
-    let now = Utc::now();
-    let idea_id = IdeaId::new();
-    let blocked_run_id = RunId::new();
-    let blocked_stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(
-        &pool,
-        idea_id,
-        blocked_run_id,
-        blocked_stage_execution_id,
-        now,
-    )
-    .await;
-    let eligible_run_id = RunId::new();
-    let eligible_stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(
-        &pool,
-        IdeaId::new(),
-        eligible_run_id,
-        eligible_stage_execution_id,
-        now,
-    )
-    .await;
-
-    sqlx::query(
-        r#"INSERT INTO agent_executions
-           (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
-           VALUES ('active-gemini', ?1, 'agent-active', 'gemini', 'gemini', 'running', ?2)"#,
-    )
-    .bind(blocked_stage_execution_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    insert_pending_invoke_agent_work(
-        &pool,
-        "blocked-gemini-work",
-        blocked_run_id,
-        blocked_stage_execution_id,
-        "gemini",
-        now,
-    )
-    .await;
-    insert_pending_invoke_agent_work(
-        &pool,
-        "eligible-codex-work",
-        eligible_run_id,
-        eligible_stage_execution_id,
-        "codex",
-        now + chrono::Duration::milliseconds(1),
-    )
-    .await;
-
-    let capacity = InvokeAgentCapacityConfig {
-        global_active_agent_executions: 20,
-        per_run_active_agent_executions: 4,
-        provider_caps: BTreeMap::from([
-            (ProviderFamily::Claude, 8),
-            (ProviderFamily::Gemini, 1),
-            (ProviderFamily::Codex, 1),
-            (ProviderFamily::Auggie, 1),
-            (ProviderFamily::Junie, 1),
-        ]),
-    };
-
-    scheduler::refresh_queue_summaries(&pool, &capacity)
-        .await
-        .unwrap();
-    let blocked_summary =
-        scheduler::list_queue_summaries_by_run(&pool, &blocked_run_id.to_string())
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|summary| summary.top_reason == "provider_capacity")
-            .expect("blocked run should have provider-capacity summary");
-    assert_eq!(blocked_summary.provider_family.as_deref(), Some("gemini"));
-    assert_eq!(blocked_summary.queued_count, 1);
-    assert_eq!(blocked_summary.global_queue_depth, 2);
-
-    let claimed = work_items::claim_next_with_invoke_agent_capacity(&pool, &capacity)
-        .await
-        .unwrap()
-        .expect("eligible later candidate should be claimed");
-    assert_eq!(claimed.id, "eligible-codex-work");
-
-    let statuses = sqlx::query(
-        r#"SELECT id, status
-           FROM work_items
-           WHERE id IN ('blocked-gemini-work', 'eligible-codex-work')
-           ORDER BY id ASC"#,
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(statuses[0].get::<String, _>("id"), "blocked-gemini-work");
-    assert_eq!(statuses[0].get::<String, _>("status"), "pending");
-    assert_eq!(statuses[1].get::<String, _>("id"), "eligible-codex-work");
-    assert_eq!(statuses[1].get::<String, _>("status"), "running");
-
-    let global_state = scheduler::get_service_state(&pool, "global", "")
-        .await
-        .unwrap()
-        .expect("global scheduler service state");
-    assert_eq!(
-        global_state.last_claimed_work_item_id.as_deref(),
-        Some("eligible-codex-work")
-    );
-}
-
-#[tokio::test]
-async fn proposal_061_capacity_claim_prefers_least_recently_served_run_within_window() {
-    let pool = test_pool().await;
-    let now = Utc::now();
-    let recently_served_run_id = RunId::new();
-    let recently_served_stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(
-        &pool,
-        IdeaId::new(),
-        recently_served_run_id,
-        recently_served_stage_execution_id,
-        now,
-    )
-    .await;
-    let least_recently_served_run_id = RunId::new();
-    let least_recently_served_stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(
-        &pool,
-        IdeaId::new(),
-        least_recently_served_run_id,
-        least_recently_served_stage_execution_id,
-        now,
-    )
-    .await;
-
-    scheduler::upsert_service_state(
-        &pool,
-        &scheduler::SchedulerServiceState {
-            scope: "run".into(),
-            scope_id: recently_served_run_id.to_string(),
-            last_served_at: Some(now),
-            last_claimed_work_item_id: Some("recently-served-previous".into()),
-            updated_at: now,
-        },
-    )
-    .await
-    .unwrap();
-    scheduler::upsert_service_state(
-        &pool,
-        &scheduler::SchedulerServiceState {
-            scope: "run".into(),
-            scope_id: least_recently_served_run_id.to_string(),
-            last_served_at: Some(now - chrono::Duration::seconds(60)),
-            last_claimed_work_item_id: Some("least-recently-served-previous".into()),
-            updated_at: now,
-        },
-    )
-    .await
-    .unwrap();
-
-    insert_pending_invoke_agent_work(
-        &pool,
-        "recently-served-work",
-        recently_served_run_id,
-        recently_served_stage_execution_id,
-        "codex",
-        now - chrono::Duration::seconds(2),
-    )
-    .await;
-    insert_pending_invoke_agent_work(
-        &pool,
-        "least-recently-served-work",
-        least_recently_served_run_id,
-        least_recently_served_stage_execution_id,
-        "codex",
-        now - chrono::Duration::seconds(1),
-    )
-    .await;
-
-    let claimed = work_items::claim_next_with_invoke_agent_capacity(
-        &pool,
-        &InvokeAgentCapacityConfig::default(),
-    )
-    .await
-    .unwrap()
-    .expect("eligible least-recently-served run candidate should be claimed");
-    assert_eq!(claimed.id, "least-recently-served-work");
-
-    let least_recently_served_state =
-        scheduler::get_service_state(&pool, "run", &least_recently_served_run_id.to_string())
-            .await
-            .unwrap()
-            .expect("least-recently-served run state");
-    assert_eq!(
-        least_recently_served_state
-            .last_claimed_work_item_id
-            .as_deref(),
-        Some("least-recently-served-work")
-    );
-
-    let recently_served_work = sqlx::query_scalar::<_, String>(
-        "SELECT status FROM work_items WHERE id = 'recently-served-work'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(recently_served_work, "pending");
-}
-
-#[tokio::test]
-async fn proposal_061_capacity_claim_reports_all_blocked_window_without_claiming() {
-    use std::collections::BTreeMap;
-
-    use sqlx::Row;
-
-    let pool = test_pool().await;
-    let now = Utc::now();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(&pool, IdeaId::new(), run_id, stage_execution_id, now).await;
-
-    sqlx::query(
-        r#"INSERT INTO agent_executions
-           (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
-           VALUES ('active-codex', ?1, 'agent-active', 'codex', 'codex', 'running', ?2)"#,
-    )
-    .bind(stage_execution_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    insert_pending_invoke_agent_work(
-        &pool,
-        "blocked-codex-work-1",
-        run_id,
-        stage_execution_id,
-        "codex",
-        now - chrono::Duration::seconds(10),
-    )
-    .await;
-    insert_pending_invoke_agent_work(
-        &pool,
-        "blocked-codex-work-2",
-        run_id,
-        stage_execution_id,
-        "codex",
-        now - chrono::Duration::seconds(5),
-    )
-    .await;
-
-    let capacity = InvokeAgentCapacityConfig {
-        global_active_agent_executions: 20,
-        per_run_active_agent_executions: 4,
-        provider_caps: BTreeMap::from([
-            (ProviderFamily::Claude, 8),
-            (ProviderFamily::Gemini, 4),
-            (ProviderFamily::Codex, 1),
-            (ProviderFamily::Auggie, 1),
-            (ProviderFamily::Junie, 1),
-        ]),
-    };
-
-    let result = work_items::claim_next_with_invoke_agent_capacity_result(&pool, &capacity)
-        .await
-        .unwrap();
-    assert!(result.item.is_none());
-    assert!(result.all_invoke_agent_candidates_blocked);
-
-    let statuses = sqlx::query(
-        r#"SELECT id, status
-           FROM work_items
-           WHERE id IN ('blocked-codex-work-1', 'blocked-codex-work-2')
-           ORDER BY id ASC"#,
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(statuses.len(), 2);
-    assert!(statuses
-        .iter()
-        .all(|row| row.get::<String, _>("status") == "pending"));
-
-    assert!(scheduler::get_service_state(&pool, "global", "")
-        .await
-        .unwrap()
-        .is_none());
-
-    scheduler::refresh_queue_summaries(&pool, &capacity)
-        .await
-        .unwrap();
-    let summary = scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|summary| summary.top_reason == "provider_capacity")
-        .expect("blocked candidate window should refresh provider-capacity summary");
-    assert_eq!(summary.provider_family.as_deref(), Some("codex"));
-    assert_eq!(summary.queued_count, 2);
-    assert_eq!(summary.global_queue_depth, 2);
-}
-
-#[tokio::test]
-async fn proposal_061_queue_position_hint_reports_non_eta_run_and_stage_position() {
-    let pool = test_pool().await;
-    let now = Utc::now();
-    let first_run_id = RunId::new();
-    let first_stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(
-        &pool,
-        IdeaId::new(),
-        first_run_id,
-        first_stage_execution_id,
-        now,
-    )
-    .await;
-    let target_run_id = RunId::new();
-    let target_stage_execution_id = StageExecutionId::new();
-    seed_minimal_stage(
-        &pool,
-        IdeaId::new(),
-        target_run_id,
-        target_stage_execution_id,
-        now,
-    )
-    .await;
-
-    insert_pending_invoke_agent_work(
-        &pool,
-        "first-work",
-        first_run_id,
-        first_stage_execution_id,
-        "claude",
-        now - chrono::Duration::seconds(30),
-    )
-    .await;
-    insert_pending_invoke_agent_work(
-        &pool,
-        "target-work-oldest",
-        target_run_id,
-        target_stage_execution_id,
-        "codex",
-        now - chrono::Duration::seconds(20),
-    )
-    .await;
-    insert_pending_invoke_agent_work(
-        &pool,
-        "target-work-newer",
-        target_run_id,
-        target_stage_execution_id,
-        "gemini",
-        now - chrono::Duration::seconds(10),
-    )
-    .await;
-
-    let run_hint = scheduler::queue_position_hint_by_run(&pool, &target_run_id.to_string())
-        .await
-        .unwrap()
-        .expect("target run should have queue position hint");
-    assert_eq!(run_hint.scope, "run");
-    assert_eq!(run_hint.scope_id, target_run_id.to_string());
-    assert_eq!(run_hint.queue_position, 2);
-    assert_eq!(run_hint.queued_ahead_count, 1);
-    assert_eq!(run_hint.global_queue_depth, 3);
-    assert_eq!(run_hint.scoped_queued_count, 2);
-    assert!(run_hint.oldest_queued_age_ms >= 20_000);
-
-    let stage_hint =
-        scheduler::queue_position_hint_by_stage(&pool, &target_stage_execution_id.to_string())
-            .await
-            .unwrap()
-            .expect("target stage should have queue position hint");
-    assert_eq!(stage_hint.scope, "stage");
-    assert_eq!(
-        stage_hint.stage_execution_id.as_deref(),
-        Some(target_stage_execution_id.to_string().as_str())
-    );
-    assert_eq!(stage_hint.queue_position, 2);
-    assert_eq!(stage_hint.scoped_queued_count, 2);
-}
-
-#[tokio::test]
-async fn proposal_061_agent_execution_insert_canonicalizes_provider_family() {
-    use sqlx::Row;
-
-    let pool = test_pool().await;
-    let idea_id = IdeaId::new();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let now = Utc::now();
-    seed_minimal_stage(&pool, idea_id, run_id, stage_execution_id, now).await;
-
-    let execution = AgentExecution {
-        id: AgentExecutionId::new(),
-        stage_execution_id,
-        agent_id: "code_writer".into(),
-        provider: "codex_acp".into(),
-        model: None,
-        started_at: now,
-        completed_at: None,
-        status: AgentStatus::Running,
-        owner_execution_lineage_id: None,
-        session_lineage_id: None,
-        session_generation_id: None,
-        rehydrated_from_checkpoint_artifact_id: None,
-        invocation_owner_key: None,
-        session_reuse_scope: None,
-        session_family_id: None,
-        session_reuse_disposition: None,
-        session_reset_reason: None,
-        backend_profile_id: None,
-        requested_mcp_extensions_json: None,
-        predicted_mcp_extensions_json: None,
-        predicted_mcp_runtime_ids_json: None,
-        actual_mcp_extensions_json: None,
-        actual_mcp_runtime_ids_json: None,
-        denied_mcp_extensions_json: None,
-        mcp_blocking_issues_json: None,
-        actual_mcp_observation_json: None,
-        mcp_session_startup_latency_ms: None,
-    };
-    agent_executions::insert(&pool, &execution).await.unwrap();
-
-    let stored = agent_executions::find_by_id(&pool, execution.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.provider, "codex");
-
-    let row = sqlx::query("SELECT provider, provider_family FROM agent_executions WHERE id = ?1")
-        .bind(execution.id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(row.get::<String, _>("provider"), "codex");
-    assert_eq!(row.get::<String, _>("provider_family"), "codex");
-}
-
-#[tokio::test]
-async fn proposal_061_hot_index_query_plans_cover_scheduler_scans() {
-    let pool = test_pool().await;
-    let idea_id = IdeaId::new();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let now = Utc::now();
-    seed_minimal_stage(&pool, idea_id, run_id, stage_execution_id, now).await;
-
-    for i in 0..1000 {
-        sqlx::query(
-            r#"INSERT INTO work_items
-               (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
-               VALUES (?1, 'invoke_agent', '{}', 'pending', ?2, ?3, ?4, ?5)"#,
-        )
-        .bind(format!("p061-work-{i}"))
-        .bind(run_id.to_string())
-        .bind(stage_execution_id.to_string())
-        .bind(now.to_rfc3339())
-        .bind((now + chrono::Duration::milliseconds(i)).to_rfc3339())
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    for i in 0..500 {
-        sqlx::query(
-            r#"INSERT INTO agent_executions
-               (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
-               VALUES (?1, ?2, ?3, 'gemini', 'gemini', 'running', ?4)"#,
-        )
-        .bind(format!("p061-agent-{i}"))
-        .bind(stage_execution_id.to_string())
-        .bind(format!("agent-{i}"))
-        .bind(now.to_rfc3339())
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    for i in 0..20 {
-        let id = StageExecutionId::new();
-        sqlx::query(
-            r#"INSERT INTO stage_executions
-               (id, run_id, stage_id, label, status, started_at)
-               VALUES (?1, ?2, ?3, ?4, 'pending', ?5)"#,
-        )
-        .bind(id.to_string())
-        .bind(run_id.to_string())
-        .bind(format!("stage-extra-{i}"))
-        .bind(format!("Stage extra {i}"))
-        .bind(now.to_rfc3339())
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    let work_plan = explain_details(
-        &pool,
-        r#"EXPLAIN QUERY PLAN
-           SELECT id FROM work_items
-           WHERE kind = 'invoke_agent' AND status = 'pending' AND scheduled_at <= '9999'
-           ORDER BY scheduled_at ASC
-           LIMIT 50"#,
-    )
-    .await;
-    assert!(
-        work_plan.contains("idx_work_items_kind_status_scheduled_at"),
-        "work item global scan should use hot index, got {work_plan}"
-    );
-
-    let run_work_plan = explain_details(
-        &pool,
-        &format!(
-            r#"EXPLAIN QUERY PLAN
-               SELECT id FROM work_items
-               WHERE run_id = '{}' AND status = 'pending' AND kind = 'invoke_agent' AND scheduled_at <= '9999'
-               ORDER BY scheduled_at ASC
-               LIMIT 50"#,
-            run_id
-        ),
-    )
-    .await;
-    assert!(
-        run_work_plan.contains("idx_work_items_run_status_kind_scheduled_at"),
-        "run-local work item scan should use hot index, got {run_work_plan}"
-    );
-
-    let agent_provider_plan = explain_details(
-        &pool,
-        r#"EXPLAIN QUERY PLAN
-           SELECT id FROM agent_executions
-           WHERE status = 'running' AND provider_family = 'gemini'"#,
-    )
-    .await;
-    assert!(
-        agent_provider_plan.contains("idx_agent_executions_status_provider_family"),
-        "agent provider active-count scan should use hot index, got {agent_provider_plan}"
-    );
-
-    let agent_status_plan = explain_details(
-        &pool,
-        r#"EXPLAIN QUERY PLAN
-           SELECT id FROM agent_executions
-           WHERE status = 'running'"#,
-    )
-    .await;
-    assert!(
-        agent_status_plan.contains("idx_agent_executions_status"),
-        "agent status active-count scan should use hot index, got {agent_status_plan}"
-    );
-
-    let stage_plan = explain_details(
-        &pool,
-        &format!(
-            r#"EXPLAIN QUERY PLAN
-               SELECT id FROM stage_executions
-               WHERE run_id = '{}'
-               ORDER BY id ASC"#,
-            run_id
-        ),
-    )
-    .await;
-    assert!(
-        stage_plan.contains("idx_stage_executions_run_id_id"),
-        "stage run lookup should use hot index, got {stage_plan}"
-    );
-}
-
-async fn explain_details(pool: &sqlx::SqlitePool, sql: &str) -> String {
-    use sqlx::Row;
-
-    let rows = sqlx::query(sql).fetch_all(pool).await.unwrap();
-    rows.into_iter()
-        .map(|row| row.get::<String, _>("detail"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-async fn insert_pending_invoke_agent_work(
-    pool: &sqlx::SqlitePool,
-    id: &str,
-    run_id: RunId,
-    stage_execution_id: StageExecutionId,
-    provider: &str,
-    scheduled_at: chrono::DateTime<Utc>,
-) {
-    let payload = serde_json::json!({
-        "run_id": run_id.to_string(),
-        "stage_id": "stage-p061",
-        "stage_execution_id": stage_execution_id.to_string(),
-        "agent_id": format!("{provider}-agent"),
-        "provider": provider,
-    });
-    sqlx::query(
-        r#"INSERT INTO work_items
-           (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
-           VALUES (?1, 'invoke_agent', ?2, 'pending', ?3, 'stage-p061', ?4, ?5)"#,
-    )
-    .bind(id)
-    .bind(payload.to_string())
-    .bind(run_id.to_string())
-    .bind(scheduled_at.to_rfc3339())
-    .bind(scheduled_at.to_rfc3339())
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
-async fn seed_minimal_stage(
-    pool: &sqlx::SqlitePool,
-    idea_id: IdeaId,
-    run_id: RunId,
-    stage_execution_id: StageExecutionId,
-    now: chrono::DateTime<Utc>,
-) {
-    sqlx::query(
-        r#"INSERT INTO ideas (id, title, body, status, created_at)
-           VALUES (?1, 'P061 idea', 'body', 'active', ?2)"#,
-    )
-    .bind(idea_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"INSERT INTO runs
-           (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
-           VALUES (?1, ?2, 'running', 'wf-p061', 'P061', '/tmp/ws', '/tmp/art', ?3)"#,
-    )
-    .bind(run_id.to_string())
-    .bind(idea_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"INSERT INTO stage_executions
-           (id, run_id, stage_id, label, status, started_at)
-           VALUES (?1, ?2, 'stage-p061', 'Stage P061', 'running', ?3)"#,
-    )
-    .bind(stage_execution_id.to_string())
-    .bind(run_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
 // ---------------------------------------------------------------------------
 // Projection parity comparison harness (REQ-005 / PROD-001)
 //
@@ -2536,6 +2160,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2736,6 +2361,7 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2820,6 +2446,7 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2897,6 +2524,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await

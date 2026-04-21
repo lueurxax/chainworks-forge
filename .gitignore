@@ -29,3 +29,11 @@ traces/
 control-plane/chainworks-control-plane.db
 control-plane/chainworks-control-plane.db-*
 control-plane/crates/daemon/principals.json
+
+# Local SQLite runtime databases at repository root.
+/*.db
+/*.db-shm
+/*.db-wal
+
+# P042 §10.5 release-host credentials (checked via example template only).
+scripts/packaging.env

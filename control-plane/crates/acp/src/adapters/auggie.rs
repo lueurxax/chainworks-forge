@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::adapters::AcpAdapter;
 use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::AcpSessionConfig;
+use crate::transport::{isolate_process_group, AcpSessionConfig};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_AUGGIE_ACP_BINARY";
@@ -64,7 +64,18 @@ impl AcpAdapter for AuggieAdapter {
             "Spawning Auggie ACP subprocess"
         );
 
-        let child = Command::new(&self.binary_path)
+        let mut cmd = Command::new(&self.binary_path);
+        isolate_process_group(&mut cmd);
+        // P050: Inject per-run meta root.
+        if let Some(ref mr) = req.chainworks_meta_root {
+            let absolute = if mr.starts_with('/') {
+                mr.clone()
+            } else {
+                format!("{}/{}", req.workspace_root, mr)
+            };
+            cmd.env("CHAINWORKS_META_ROOT", &absolute);
+        }
+        let child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

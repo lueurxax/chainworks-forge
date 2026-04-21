@@ -1,0 +1,1761 @@
+==> Proposal 029-MCP control-plane gate: auth + capability + audit
+==>   running 63 focused tests from §9.1 inventory
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 58.95s
+     Running unittests src/lib.rs (target/debug/deps/auth-83586cfa8147f95b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/principals_bootstrap.rs (target/debug/deps/principals_bootstrap-8e4ef45d12adb94b)
+
+running 1 test
+test test_principals_file_created_with_owner_only_permissions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/auth-83586cfa8147f95b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/principals_bootstrap.rs (target/debug/deps/principals_bootstrap-8e4ef45d12adb94b)
+
+running 1 test
+test test_principals_bootstrap_token_logged_once_on_first_start ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/auth-83586cfa8147f95b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/principals_bootstrap.rs (target/debug/deps/principals_bootstrap-8e4ef45d12adb94b)
+
+running 1 test
+test test_principals_daemon_refuses_empty_principals_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+   Compiling acp v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/acp)
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+   Compiling mcp-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/mcp-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 57.46s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test http::tests::test_mcp_http_rejects_missing_authorization_header ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.13s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.07s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test http::tests::test_mcp_http_rejects_unknown_bearer_token ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.10s
+
+   Compiling acp v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/acp)
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+   Compiling mcp-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/mcp-server)
+   Compiling graphql-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/graphql-server)
+   Compiling daemon v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 57s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 1 test
+test test_mcp_stdio_rejects_first_frame_other_than_initialize ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 5.20s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+   Compiling graphql-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/graphql-server)
+   Compiling mcp-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/mcp-server)
+   Compiling daemon v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 09s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 1 test
+test test_mcp_stdio_rejects_initialize_without_principal_token ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 3.96s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+   Compiling daemon v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.96s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 1 test
+test test_mcp_stdio_rejects_initialize_with_unknown_principal_token ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 2.32s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.65s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 1 test
+test test_mcp_stdio_binds_principal_for_session_lifetime ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 4.40s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.02s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.37s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 1 test
+test test_mcp_stdio_rejects_reinitialize_mid_session ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 3.28s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+   Compiling acp v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/acp)
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+   Compiling graphql-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/graphql-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 37s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_rejects_missing_authorization_header ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.08s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_rejects_unknown_bearer_token ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.08s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_mutation_reads_principal_from_context ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.14s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_observer_class_cannot_invoke_start_run ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.09s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_ws_rejects_missing_connection_init_auth ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_ws_rejects_unknown_connection_init_token ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test server::tests::test_graphql_ws_accepts_valid_connection_init_token ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+   Compiling mcp-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/mcp-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.21s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_list_filtered_for_operator ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_list_filtered_for_agent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_list_filtered_for_observer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_call_denied_returns_method_not_found ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_resources_list_is_capability_filtered ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_resources_read_denied_returns_not_found ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_list_includes_steward_trio_for_operator ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_list_includes_steward_readers_for_observer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_list_excludes_steward_entirely_for_agent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_call_steward_run_analysis_denied_for_observer_returns_method_not_found ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_tools_call_steward_run_analysis_denied_for_agent_returns_method_not_found ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_resources_list_includes_steward_analysis_template_for_operator_and_observer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_resources_list_excludes_steward_analysis_template_for_agent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::p029_capability_tests::test_mcp_resources_read_steward_analysis_denied_for_agent_returns_not_found ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.73s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 1 test
+test test_command_journal_row_has_caller_mcp_for_runs_start ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Blocking waiting for file lock on artifact directory
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.63s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 1 test
+test test_command_journal_row_has_caller_mcp_for_approvals_resolve ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.03s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 1 test
+test test_command_journal_row_has_caller_mcp_for_steward_run_analysis ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 1 test
+test test_command_journal_row_has_caller_graphql_for_start_run ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 1 test
+test test_command_journal_row_has_caller_graphql_for_approve_stage ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.03s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 1 test
+test test_command_journal_caller_columns_nullable_for_pre_p029_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.03s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_start_run_redacts_delivery_configuration_json ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.01s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_start_run_preserves_ids_and_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_approve_stage_redacts_comment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_approve_stage_preserves_run_and_stage_ids ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_reject_stage_redacts_comment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_reject_stage_preserves_run_and_stage_ids ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_retry_stage_preserves_all_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_cancel_run_preserves_run_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_reset_session_preserves_all_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redact_run_steward_analysis_preserves_reason_and_artifact_base ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 1 test
+test command_journal_redact::tests::test_redaction_matrix_covers_all_command_variants ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::tests::test_mcp_tools_call_response_includes_journal_id_in_content_text ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.05s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::tests::test_mcp_read_only_tool_response_omits_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::tests::test_mcp_steward_run_analysis_response_includes_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::tests::test_mcp_steward_list_analyses_response_omits_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-49d5b508d217e4a3)
+
+running 1 test
+test server::tests::test_mcp_steward_get_analysis_response_omits_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::test_graphql_start_run_started_variant_includes_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.18s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::test_graphql_start_run_blocked_variant_includes_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.09s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::test_graphql_approve_stage_returns_payload_with_approval_and_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::test_graphql_retry_stage_returns_payload_with_retried_and_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.04s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::test_response_omits_journal_id_when_capability_check_fails ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-24eb338ce71518d8)
+
+running 1 test
+test schema::tests::graphql_start_run_blocked_payload_contract_tests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.10s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/engine-df56545a17eaf021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-4a125b9d0e5ddf10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-d6cf99bf77b3760c)
+
+running 1 test
+test test_graphql_and_mcp_produce_identical_run_for_start_run ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/integration.rs (target/debug/deps/integration-abba2aa587881020)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-219f6f8de04d8bc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/release.rs (target/debug/deps/release-33da831956ed91c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+   Compiling acp v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/acp)
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+   Compiling graphql-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/graphql-server)
+   Compiling mcp-server v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/mcp-server)
+   Compiling daemon v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 53.49s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 1 test
+test test_dogfood_mcp_json_contains_chainworks_server_with_auth_header ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/daemon-94cdf3069745fa89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-d3923b691940748e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-f672e864c459b808)
+
+running 1 test
+test test_dogfood_claude_md_matches_committed_mcp_json ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-e1ba59f9eb0be0ad)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-1f05c1f6952a5be9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/acp-48c6c2d1d284437a)
+
+running 7 tests
+test adapters::codex::tests::handles_trailing_slash ... ok
+test adapters::codex::tests::lowercases_both_halves ... ok
+test adapters::codex::tests::splits_bare_model ... ok
+test adapters::codex::tests::splits_combined_model ... ok
+test transport::tests::gemini_uses_longer_handshake_timeout ... ok
+test transport::tests::non_gemini_providers_keep_default_handshake_timeout ... ok
+test transport::tests::stderr_epipe_is_diagnostic_warning ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-3bb18d4f363417a5)
+
+running 9 tests
+test mcp_servers_session_new_serialization_tests ... ok
+test test_claude_adapter_executes_subprocess_and_returns_artifacts ... ok
+test test_gemini_adapter_executes_subprocess_and_returns_artifacts ... ok
+test test_claude_adapter_receives_chainworks_meta_root_env ... ok
+test test_claude_adapter_extracts_chainworks_output_envelopes_without_filesystem_artifacts ... ok
+test test_claude_adapter_reports_expected_output_paths_when_overwriting_existing_file ... ok
+test test_claude_adapter_surfaces_usage_snapshot_from_stream_updates ... ok
+test test_claude_adapter_returns_failed_on_session_error ... ok
+test test_runtime_manager_reuses_live_session_handle ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.09s
+
+     Running unittests src/lib.rs (target/debug/deps/auth-1b76c3772587d1b3)
+
+running 12 tests
+test tests::extract_bearer_token_works ... ok
+test tests::observer_has_all_read_resources ... ok
+test tests::agent_cannot_approve ... ok
+test tests::agent_has_no_steward_tools ... ok
+test tests::observer_has_read_only_steward_tools ... ok
+test tests::observer_read_only ... ok
+test tests::operator_has_all_tools ... ok
+test tests::operator_has_steward_tools ... ok
+test tests::principal_carries_typed_capability_sets ... ok
+test tests::resolve_bearer_works ... ok
+test tests::steward_analysis_resource_policy ... ok
+test tests::typed_filters_and_resource_match_share_principal_sets ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/principals_bootstrap.rs (target/debug/deps/principals_bootstrap-313501cef08124ec)
+
+running 3 tests
+test test_principals_daemon_refuses_empty_principals_file ... ok
+test test_principals_bootstrap_token_logged_once_on_first_start ... ok
+test test_principals_file_created_with_owner_only_permissions ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/daemon-d73c72d4f9715ed4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/control_plane-91e3848aa0c238a4)
+
+running 1 test
+test tests::test_principals_path_rejects_empty_env ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dogfood_config.rs (target/debug/deps/dogfood_config-6af0f6b9fa5a8471)
+
+running 2 tests
+test test_dogfood_mcp_json_contains_chainworks_server_with_auth_header ... ok
+test test_dogfood_claude_md_matches_committed_mcp_json ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-d4ca776370c32521)
+
+running 6 tests
+test test_mcp_stdio_binds_principal_for_session_lifetime ... ok
+test mcp_mode_keeps_stdout_protocol_clean_for_initialize ... ok
+test test_mcp_stdio_rejects_reinitialize_mid_session ... ok
+test test_mcp_stdio_rejects_initialize_with_unknown_principal_token ... ok
+test test_mcp_stdio_rejects_initialize_without_principal_token ... ok
+test test_mcp_stdio_rejects_first_frame_other_than_initialize ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.66s
+
+     Running tests/steward_runtime_bootstrap_tests.rs (target/debug/deps/steward_runtime_bootstrap_tests-8f3233b158bd7be0)
+
+running 2 tests
+test steward_runtime_bootstrap_tests_invalid_config_falls_back_to_default ... ok
+test steward_runtime_bootstrap_tests_config_change_sets_pending_without_work_item ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/db-0e1f997aaa21931d)
+
+running 1 test
+test work_item::tests::steward_analysis_work_item_kind_roundtrips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-ec9479804d3aa550)
+
+running 16 tests
+test agent_execution_provenance_round_trips_without_lineage_joins ... ok
+test session_lineage_migration_renames_legacy_table_and_creates_canonical_tables ... ok
+test proposal_048_persistence_fields_round_trip ... ok
+test run_projection_derives_cancellation_settlement_summary_from_canonical_log ... ok
+test session_generation_usage_update_persists_budget_snapshot_fields ... ok
+test steward_run_metadata_and_project_key_roundtrip ... ok
+test stage_projection_validation_flag_is_attempt_scoped ... ok
+test test_approval_inbox_projection_parity_vs_canonical ... ok
+test steward_analysis_schema_roundtrips_p049_contract ... ok
+test test_file_backed_sqlite_durability_across_restart ... ok
+test test_idea_insert_and_find ... ok
+test test_run_status_update ... ok
+test test_projection_list_before_rebuild_returns_run_with_zero_counts ... ok
+test test_run_insert_and_find ... ok
+test test_projection_parity_after_rebuild ... ok
+test test_projection_parity_matches_canonical_repo_values ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+
+     Running unittests src/lib.rs (target/debug/deps/domain-5fc7bfd745bf701f)
+
+running 3 tests
+test tests::run_status_terminal ... ok
+test tests::stage_status_roundtrip ... ok
+test commands::tests::start_run_cmd_serializes_delivery_configuration_json ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/engine-2cd162ab4dcf8c68)
+
+running 45 tests
+test command_journal_redact::tests::test_redact_reset_session_preserves_all_fields ... ok
+test command_journal_redact::tests::test_redact_cancel_run_preserves_run_id ... ok
+test command_journal_redact::tests::test_redact_start_run_redacts_delivery_configuration_json ... ok
+test command_journal_redact::tests::test_redact_reject_stage_preserves_run_and_stage_ids ... ok
+test command_journal_redact::tests::test_redact_approve_stage_preserves_run_and_stage_ids ... ok
+test command_journal_redact::tests::test_redact_start_run_preserves_ids_and_paths ... ok
+test command_journal_redact::tests::test_redact_approve_stage_redacts_comment ... ok
+test command_journal_redact::tests::test_redact_run_steward_analysis_preserves_reason_and_artifact_base ... ok
+test command_journal_redact::tests::test_redact_reject_stage_redacts_comment ... ok
+test command_journal_redact::tests::test_redact_retry_stage_preserves_all_fields ... ok
+test command_journal_redact::tests::test_redact_start_run_without_delivery_config_preserves_null ... ok
+test command_journal_redact::tests::test_redaction_matrix_covers_all_command_variants ... ok
+test domain_engine::tests::can_advance_when_pending_stage_exists ... ok
+test domain_engine::tests::blocked_when_stage_is_blocked ... ok
+test domain_engine::tests::complete_requires_at_least_one_success ... ok
+test domain_engine::tests::complete_when_all_stages_done ... ok
+test domain_engine::tests::failed_when_all_stages_failed ... ok
+test domain_engine::tests::waiting_approval_when_stage_needs_it ... ok
+test contracts::tests::validate_task_outputs_requires_companion_for_companion_mode ... ok
+test contracts::tests::validate_output_rejects_missing_required_fields ... ok
+test contracts::tests::build_validation_failure_record_uses_operator_inspection_for_missing_output ... ok
+test mcp::tests::does_not_override_explicit_xcode_pid_for_mcpbridge_stdio_entries ... ok
+test mcp::tests::injects_xcode_pid_for_mcpbridge_stdio_entries ... ok
+test orchestrator::tests::scalar_template_resolution_does_not_path_normalize_branch_names ... ok
+test session::budget::tests::compacts_when_transcript_growth_ratio_exceeds_threshold ... ok
+test session::budget::tests::compacts_when_turn_budget_is_exhausted ... ok
+test session::budget::tests::continues_when_all_budget_signals_have_headroom ... ok
+test session::fingerprint::tests::owner_key_matches_explicit_tuple_contract ... ok
+test session::budget::tests::invalidates_when_cumulative_cost_budget_is_exhausted ... ok
+test session::fingerprint::tests::owner_key_changes_when_task_identity_changes ... ok
+test session::budget::tests::invalidates_when_reuse_is_economically_worse_than_fresh ... ok
+test orchestrator::tests::declared_output_target_path_uses_task_alias_not_normalized_identity ... ok
+test session::fingerprint::tests::binding_fingerprint_changes_when_prompt_or_io_contract_changes ... ok
+test mcp::tests::resolves_stdio_registry_entries ... ok
+test steward::cohort::tests::steward_cohort_classifier_tests_primary_key_uses_largest_explicit_cohort ... ok
+test steward::cohort::tests::steward_cohort_classifier_tests_quality_rules_match_p049 ... ok
+test executor::tests::materialize_declared_outputs_writes_machine_and_companion_payloads ... ok
+test session::policy::tests::reuses_matching_active_generation ... ok
+test session::policy::tests::creates_fresh_generation_when_lineage_is_missing ... ok
+test session::policy::tests::owner_mismatch_in_same_invocation_owner_scope_requires_fresh_session ... ok
+test session::policy::tests::family_scope_relaxes_owner_key_check_when_fingerprint_matches ... ok
+test session::policy::tests::maps_reset_end_reason_to_fresh_after_reset ... ok
+test session::policy::tests::resumes_from_checkpointed_generation_when_last_end_reason_carries_artifact_id ... ok
+test session::policy::tests::missing_active_generation_row_fails_closed_as_unverifiable_history ... ok
+test evidence::tests::failed_stage_evidence_packet_tests ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/command_journal_audit.rs (target/debug/deps/command_journal_audit-649408edbf9972e3)
+
+running 6 tests
+test test_command_journal_row_has_caller_mcp_for_steward_run_analysis ... ok
+test test_command_journal_row_has_caller_graphql_for_approve_stage ... ok
+test test_command_journal_row_has_caller_mcp_for_approvals_resolve ... ok
+test test_command_journal_caller_columns_nullable_for_pre_p029_rows ... ok
+test test_command_journal_row_has_caller_mcp_for_runs_start ... ok
+test test_command_journal_row_has_caller_graphql_for_start_run ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/cross_surface_parity.rs (target/debug/deps/cross_surface_parity-c40b2c00a2034fbd)
+
+running 1 test
+test test_graphql_and_mcp_produce_identical_run_for_start_run ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/integration.rs (target/debug/deps/integration-34e30dbf740e1891)
+
+running 62 tests
+test steward_pipeline_tests_persists_failed_analysis_when_deterministic_slice_errors ... ok
+test steward_drift_tests_startup_repair_clears_stuck_running_stage_and_marks_drift ... ok
+test steward_metrics_tests_use_domain_decisions_and_frozen_stage_families ... ok
+test mcp_resolution_persistence_tests ... ok
+test steward_pipeline_tests_runs_optional_catalog_lanes_after_inputs_exist ... ok
+test steward_pipeline_tests_persists_analysis_and_deterministic_artifacts ... ok
+test steward_pipeline_tests_detects_degradation_and_persists_recommendation ... ok
+test test_artifact_field_reads_per_run_meta_root ... ok
+test delivery_preflight_failure_blocks_before_run_creation ... ok
+test delivery_preflight_success_persists_run_owned_result ... ok
+test steward_executor_tests_work_item_runs_active_catalog_agents_through_acp ... ok
+test steward_trigger_tests_manual_command_enqueues_shared_work_item ... ok
+test steward_trigger_tests_completed_run_consumes_config_change_pending_first ... ok
+test test_execution_request_carries_chainworks_meta_root ... ok
+test test_exists_checks_per_run_meta_root ... ok
+test steward_trigger_tests_post_run_hook_honors_interval ... ok
+test test_approve_stage_resolves_approval_and_advances_stage ... ok
+test test_approve_simple_manual_gate_settles_completed ... ok
+test test_approve_manual_gate_with_post_approval_tasks_sets_running ... ok
+test test_cancel_run_eventually_finalizes_to_cancelled ... ok
+test test_cancel_run_phase1_cancels_agent_executions_and_running_work_items ... ok
+test test_daemon_vs_swift_report_behavioral_parity ... ok
+test test_cancel_run_finalize_closes_live_session_via_runtime_manager ... ok
+test test_end_state_with_tasks_does_not_short_circuit ... ok
+test test_invoke_agent_persists_declared_machine_artifact_under_normalized_name ... ok
+test test_mcp_runs_get_exposes_chainworks_meta_root ... ok
+test test_invoke_agent_startup_error_marks_agent_execution_failed ... ok
+test test_invoke_agent_uses_stage_execution_id_as_owner_execution_lineage ... ok
+test test_mcp_runs_list_projection_exposes_chainworks_meta_root ... ok
+test test_normalize_artifacts_ignores_stale_flat_artifact_root_for_post_p050_runs ... ok
+test test_normalize_artifacts_preserves_flat_root_fallback_for_null_legacy_runs ... ok
+test test_normalize_artifacts_uses_run_scoped_source_dir_for_post_p050_runs ... ok
+test test_normalize_path_for_worktree_skips_meta_root_paths ... ok
+test test_normalize_path_for_worktree_still_normalizes_source_paths ... ok
+test test_new_run_gets_isolated_meta_root ... ok
+test test_n_phase_sequence_ordering ... ok
+test test_prompt_input_paths_point_to_per_run_meta_root ... ok
+test test_post_approval_retry_requires_fresh_approval ... ok
+test test_reject_stage_resolves_approval_and_blocks_stage ... ok
+test test_resolve_path_template_does_not_consult_process_env_for_runs ... ok
+test test_resolve_path_template_null_meta_root_uses_template_default ... ok
+test test_resolve_path_template_uses_run_meta_root ... ok
+test test_post_approval_tasks_enqueued_after_approval ... ok
+test test_reset_session_marks_generation_reset_and_next_policy_is_fresh_after_reset ... ok
+test test_retry_stage_creates_new_attempt_and_skips_old ... ok
+test test_run_serde_includes_chainworks_meta_root ... ok
+test test_runs_start_does_not_accept_chainworks_meta_root_override ... ok
+test test_retry_stage_rejects_active_latest_attempt ... ok
+test test_stale_workspace_artifacts_not_visible_to_new_run ... ok
+test test_retry_stage_targets_latest_matching_attempt ... ok
+test test_simple_manual_gate_no_regression ... ok
+test test_startup_repair_recommendation_includes_execution_session_provenance ... ok
+test test_start_run_persists_delivery_configuration_json ... ok
+test test_startup_repair_skips_clean_runs ... ok
+test test_state_11_to_state_12_happy_path ... ok
+test test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation ... ok
+test test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it ... ok
+test test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_cost_budget ... ok
+test test_invoke_agent_end_to_end_with_fixture_binary ... ok
+test test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact ... ok
+test test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact ... ok
+test test_invoke_agent_reuses_live_session_generation_end_to_end ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.88s
+
+     Running tests/proposal_041_parity.rs (target/debug/deps/proposal_041_parity-3cf150c5816a628d)
+
+running 4 tests
+test proposal_041_shadow_side_effect_policy_is_fail_closed ... ok
+test proposal_041_fixture_inventory_and_schema_contract ... ok
+test proposal_041_handoff_artifact_contract_is_ready ... ok
+test proposal_041_offline_replay_emits_behavioral_diff_reports ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running tests/release.rs (target/debug/deps/release-5827118977a94a7a)
+
+running 11 tests
+test delivery_receipt_builder_rejects_metadata_only_backfill_without_release_lineage ... ok
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpmdLAC6/origin.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmp7QnbIK/origin.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpmdLAC6/repo/.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmp7QnbIK/repo/.git/
+Switched to a new branch 'release/test'
+Switched to a new branch 'main'
+[main (root-commit) e0f0f54] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpmdLAC6/master/origin.git/
+[release/test (root-commit) e0f0f54] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpmdLAC6/master/repo/.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpMoI7zz/origin.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpqdYRHJ/origin.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpAQjH23/origin.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpMoI7zz/repo/.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmptNAgXM/origin.git/
+Switched to a new branch 'master'
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmptNAgXM/repo/.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpAQjH23/repo/.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpqdYRHJ/repo/.git/
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpSBpgBC/origin.git/
+test advance_run_does_not_backfill_delivery_receipt_without_release_lineage ... ok
+Switched to a new branch 'release/test'
+test advance_run_backfills_delivery_receipt_when_terminal_release_lineage_exists ... ok
+Initialized empty Git repository in /private/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/.tmpSBpgBC/repo/.git/
+Switched to a new branch 'main'
+Switched to a new branch 'release/test'
+Switched to a new branch 'release/test'
+[master (root-commit) e0f0f54] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[release/test (root-commit) e0f0f54] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+Switched to a new branch 'release/test'
+test git_release_service_rejects_main_and_master_targets ... ok
+[main (root-commit) c1320cd] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[release/test (root-commit) c1320cd] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[release/test (root-commit) c1320cd] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[release/test (root-commit) c1320cd] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+test background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt ... ok
+test background_executor_persists_delivery_receipt_on_git_failure ... ok
+test git_release_service_commits_and_pushes_to_expected_branch ... ok
+test background_executor_persists_delivery_receipt_on_publish_failure ... ok
+test background_executor_preserves_existing_delivery_receipt_without_overwrite ... ok
+test connect_publish_service_creates_receipts_without_failing_on_missing_xcodeproj ... ok
+test background_executor_routes_release_agents_natively ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.79s
+
+     Running unittests src/lib.rs (target/debug/deps/graphql_server-daa07551ad759e15)
+
+running 25 tests
+test schema::tests::mutation_name_converter_covers_command_mutations ... ok
+test schema::tests::runs_query_exposes_cancellation_settlement_summary_only ... ok
+test schema::tests::artifacts_query_decodes_validation_failure_record ... ok
+test schema::tests::execution_mcp_truth_contract_tests ... ok
+test schema::tests::run_query_exposes_cancellation_settlement_log ... ok
+test schema::tests::steward_graphql_readback_tests_exposes_analysis_rows ... ok
+test schema::tests::proposal_041_graphql_readback_parity_surfaces ... ok
+test schema::tests::delivery_preflight_graphql_readback_tests ... ok
+test schema::tests::run_query_exposes_delivery_configuration_json ... ok
+test schema::tests::start_run_accepts_delivery_configuration_json ... ok
+test schema::tests::graphql_start_run_blocked_payload_contract_tests ... ok
+test schema::tests::test_graphql_approve_stage_returns_payload_with_approval_and_journal_id ... ok
+test schema::tests::test_graphql_run_exposes_chainworks_meta_root ... ok
+test server::tests::test_graphql_ws_accepts_valid_connection_init_token ... ok
+test server::tests::test_graphql_ws_rejects_missing_connection_init_auth ... ok
+test server::tests::test_graphql_ws_rejects_unknown_connection_init_token ... ok
+test schema::tests::test_graphql_retry_stage_returns_payload_with_retried_and_journal_id ... ok
+test schema::tests::test_response_omits_journal_id_when_capability_check_fails ... ok
+test server::tests::test_graphql_observer_class_cannot_invoke_start_run ... ok
+test server::tests::test_graphql_rejects_missing_authorization_header ... ok
+test server::tests::test_graphql_rejects_unknown_bearer_token ... ok
+test schema::tests::test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id ... ok
+test schema::tests::test_graphql_start_run_blocked_variant_includes_journal_id ... ok
+test server::tests::test_graphql_mutation_reads_principal_from_context ... ok
+test schema::tests::test_graphql_start_run_started_variant_includes_journal_id ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running unittests src/lib.rs (target/debug/deps/mcp_server-47782c4a7e833d93)
+
+running 40 tests
+test server::p029_capability_tests::test_mcp_tools_call_steward_run_analysis_denied_for_agent_returns_method_not_found ... ok
+test server::p029_capability_tests::test_mcp_tools_call_steward_run_analysis_denied_for_observer_returns_method_not_found ... ok
+test server::p029_capability_tests::test_mcp_tools_call_denied_returns_method_not_found ... ok
+test server::p029_capability_tests::test_mcp_resources_read_steward_analysis_denied_for_agent_returns_not_found ... ok
+test server::p029_capability_tests::test_mcp_resources_list_includes_steward_analysis_template_for_operator_and_observer ... ok
+test server::p029_capability_tests::test_mcp_resources_list_excludes_steward_analysis_template_for_agent ... ok
+test server::p029_capability_tests::test_mcp_resources_list_is_capability_filtered ... ok
+test server::p029_capability_tests::test_mcp_tools_list_excludes_steward_entirely_for_agent ... ok
+test server::p029_capability_tests::test_mcp_tools_list_filtered_for_operator ... ok
+test server::p029_capability_tests::test_mcp_tools_list_filtered_for_agent ... ok
+test server::p029_capability_tests::test_mcp_resources_read_denied_returns_not_found ... ok
+test server::p029_capability_tests::test_mcp_tools_list_includes_steward_readers_for_observer ... ok
+test server::p029_capability_tests::test_mcp_tools_list_filtered_for_observer ... ok
+test server::p029_capability_tests::test_mcp_tools_list_includes_steward_trio_for_operator ... ok
+test server::resource_tests::test_mcp_resource_uri_parser_maps_templates_at_server_boundary ... ok
+test http::tests::test_mcp_http_rejects_missing_authorization_header ... ok
+test server::tests::proposal_041_report_resource_readback_parity_surface ... ok
+test server::tests::run_resource_exposes_delivery_configuration_json ... ok
+test server::tests::steward_mcp_resource_returns_same_persisted_truth_as_tool_readback ... ok
+test http::tests::test_mcp_http_rejects_unknown_bearer_token ... ok
+test server::tests::test_mcp_steward_get_analysis_response_omits_journal_id ... ok
+test server::tests::test_mcp_read_only_tool_response_omits_journal_id ... ok
+test server::tests::report_resource_decodes_validation_failure_payload ... ok
+test server::tests::report_resource_decodes_failed_stage_evidence_payload ... ok
+test server::tests::report_resource_exposes_mcp_execution_truth ... ok
+test tools::reports::tests::reports_get_decodes_validation_failure_payload ... ok
+test tools::reports::tests::reports_mcp_resolution_truth_tests ... ok
+test tools::runs::tests::runs_get_returns_cancellation_settlement_log ... ok
+test server::tests::test_mcp_steward_list_analyses_response_omits_journal_id ... ok
+test server::tests::test_mcp_tools_call_response_includes_journal_id_in_content_text ... ok
+test tools::tests::mcp_tool_converter_covers_registered_tools ... ok
+test tools::reports::tests::reports_failed_stage_evidence_contract_tests ... ok
+test tools::reports::tests::reports_get_includes_release_artifacts_and_report_kind_entries ... ok
+test server::tests::test_mcp_steward_run_analysis_response_includes_journal_id ... ok
+test tools::reports::tests::proposal_041_reports_get_readback_parity_surface ... ok
+test tools::runs::tests::delivery_preflight_mcp_readback_tests ... ok
+test tools::runs::tests::runs_list_returns_projection_summary_not_full_log ... ok
+test tools::steward::tests::steward_mcp_tools_tests_get_analysis_returns_p049_readback ... ok
+test tools::steward::tests::steward_mcp_tools_tests_manual_trigger_enqueues_work_item ... ok
+test tools::runs::tests::runs_start_persists_delivery_configuration_json ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s
+
+     Running unittests src/lib.rs (target/debug/deps/workflow-1f82d21aff6962b8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-554018b705c1c149)
+
+running 9 tests
+test test_parse_full_mvp_live_workflow ... ok
+test test_contract_binding_uses_versioned_and_stem_fallbacks ... ok
+test test_output_contract_is_authoritative_and_carries_human_format ... ok
+test test_contract_binding_matches_normalized_and_raw_artifacts_exactly ... ok
+test steward_metadata_contract_tests_freeze_workflow_metadata_and_parsed_snapshots ... ok
+test steward_metadata_contract_tests_snapshot_hashes_are_canonical_over_yaml_ordering ... ok
+test test_parse_agent_catalog ... ok
+test test_compile_n_phase_ordering ... ok
+test test_compile_full_mvp_live_plan ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests acp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests auth
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests daemon
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests db
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests domain
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests graphql_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mcp_server
+
+running 1 test
+test crates/mcp-server/src/http.rs - http::routes (line 25) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests workflow
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+==> Proposal 029-MCP control-plane gate passed

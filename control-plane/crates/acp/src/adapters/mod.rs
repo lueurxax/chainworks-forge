@@ -6,6 +6,7 @@ pub mod junie;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tracing::warn;
 
 use crate::session::AcpSessionHandle;
 use crate::{ExecutionRequest, ExecutionResult};
@@ -22,8 +23,21 @@ pub trait AcpAdapter: Send + Sync {
     /// Execute an agent session and return the result.
     async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
         let session = self.open_session(&req).await?;
-        let mut result = session.prompt(&req).await?;
-        session.close().await?;
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(prompt_error) => {
+                if let Err(close_error) = session.close().await {
+                    warn!(
+                        provider = %req.provider,
+                        run_id = %req.run_id,
+                        stage_id = %req.stage_id,
+                        "ACP session close after prompt error failed: {close_error}"
+                    );
+                }
+                return Err(prompt_error);
+            }
+        };
+        result.close_diagnostic = session.close().await?;
         result.session_generation_id = None;
         Ok(result)
     }

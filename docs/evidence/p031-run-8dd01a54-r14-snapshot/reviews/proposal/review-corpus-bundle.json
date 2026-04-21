@@ -1,0 +1,52 @@
+{
+  "review_pass_id": "rp-031-001",
+  "review_iteration_id": "ri-031-r9-001",
+  "source_proposal_artifact": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/proposals/current/proposal.md",
+  "raw_review_artifacts": [
+    {
+      "reviewer_id": "product_owner",
+      "role": "product_owner",
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/product-owner.json",
+      "score": 8,
+      "decision": "approve_with_conditions",
+      "blocker_count": 0,
+      "non_blocking_count": 5,
+      "suggestion_count": 3,
+      "issue_ids": ["PO-R9-01", "PO-R9-02", "PO-R9-03", "PO-R9-04", "PO-R9-05"]
+    },
+    {
+      "reviewer_id": "ux_designer_gemini",
+      "role": "UX Designer",
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/ux.json",
+      "score": 8.5,
+      "decision": "approve",
+      "blocker_count": 0,
+      "non_blocking_count": 2,
+      "suggestion_count": 2,
+      "issue_ids": ["UX-R9-01", "UX-R9-02"]
+    },
+    {
+      "reviewer_id": "ui_designer",
+      "role": "ui_designer",
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/ui.json",
+      "score": 8,
+      "decision": "approve_with_comments",
+      "blocker_count": 0,
+      "non_blocking_count": 3,
+      "suggestion_count": 3,
+      "issue_ids": ["UI-01", "UI-02", "UI-03"]
+    },
+    {
+      "reviewer_id": "architect",
+      "role": "architect",
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/architect.json",
+      "score": 8,
+      "decision": "approve_with_conditions",
+      "blocker_count": 1,
+      "non_blocking_count": 4,
+      "suggestion_count": 4,
+      "issue_ids": ["ARCH-R9-01", "ARCH-R9-02", "ARCH-R9-03", "ARCH-R9-04", "ARCH-R9-05"]
+    }
+  ],
+  "aggregate_summary_artifact": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/summary.json"
+}

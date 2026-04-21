@@ -141,4 +141,10 @@ pub struct Run {
     pub drift_detected_at: Option<DateTime<Utc>>,
     /// Canonical drift details JSON.
     pub drift_details_json: Option<String>,
+    // ── Per-run workspace isolation (Proposal 050) ──────────────────────
+    /// Per-run meta root, e.g. `.chainworks/runs/{run_id}`.
+    /// When set, all YAML `${CHAINWORKS_META_ROOT:-.chainworks}` templates
+    /// resolve to this path instead of the shared `.chainworks/`.
+    /// NULL for legacy pre-P050 runs (fallback to template default).
+    pub chainworks_meta_root: Option<String>,
 }

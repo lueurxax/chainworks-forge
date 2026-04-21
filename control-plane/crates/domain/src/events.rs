@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::approval::ApprovalDecision;
 use crate::ids::{ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use crate::lifecycle::DaemonStatus;
 use crate::run::RunStatus;
 use crate::stage::StageStatus;
 
@@ -43,16 +44,10 @@ pub enum DomainEvent {
         /// "session_started" | "session_completed" | "session_failed"
         event_kind: String,
     },
-    SchedulerBackpressureChanged {
-        run_id: Option<String>,
-        stage_execution_id: Option<String>,
-        provider_family: Option<String>,
-        top_reason: String,
-        queued_count: i64,
-        oldest_queued_age_ms: i64,
-        global_queue_depth: i64,
-        state: String,
-        updated_at: String,
-        is_stale: bool,
+    /// Daemon lifecycle state changed (Proposal 042 §5.1). Emitted by the
+    /// lifecycle reporter on every transition so the `daemonStatusChanged`
+    /// GraphQL subscription can push the updated snapshot.
+    DaemonStatusChanged {
+        status: DaemonStatus,
     },
 }

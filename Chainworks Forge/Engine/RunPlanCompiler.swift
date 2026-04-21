@@ -382,6 +382,9 @@ final class RunPlanCompiler {
         if trimmed == "approval.granted == true" {
             return .approvalGranted
         }
+        if trimmed == "approval.rejected == true" {
+            return .approvalRejected
+        }
 
         // exists('artifact_name')
         if trimmed.hasPrefix("exists(") {

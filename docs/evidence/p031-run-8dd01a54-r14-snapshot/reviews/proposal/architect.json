@@ -1,0 +1,199 @@
+{
+  "agent_id": "architect",
+  "role": "architect",
+  "score": 8.4,
+  "decision": "approve_with_conditions",
+  "verdict": "P031 r10 is architecturally fit to enter Phase 0 contract hardening, but it is not ready for Swift screen migration or dogfood until its own Phase 0 gates are completed. The proposal now has a coherent GraphQL-only read boundary: P031-owned macOS UI consumes server projections, subscriptions, bounded polling, and targeted read refresh only, while MCP, GraphQL mutations, local workflow services, raw artifacts, and SwiftData workflow truth are excluded from governed UI. The remaining risks are practical implementation hazards: stale source artifacts still say GraphQL+MCP, P043 still assigns command/control responsibilities to P031 UI, the P031 gate is not registered, the proposed diagnostic/report metadata fields are not yet backed by current GraphQL types, and the static guard boundary must become machine-checkable before migration.",
+  "summary": "The revised proposal resolves the prior architecture blocker at the proposal level by making P043/P031 reconciliation a Phase 0a exit gate and by explicitly removing command completion, command receipts, and MCP command-control from P031-owned UI. Targeted repo inspection supports the migration: current Swift screens still use SwiftData and local ExecutionService/RecoveryCoordinator/RunPlanCompiler paths, while current Rust GraphQL already exposes projection-backed runs, stages, approvals, artifacts, daemon lifecycle, subscriptions, and partial report metadata. The architecture is appropriately conservative for a first visible cutover because it makes the app a read-only projection renderer and defers UI writes to separate follow-up proposals. Approval is conditional because implementation can still drift if teams consume the stale idea brief, the unreconciled P043 reference, or the short checked-in proposal instead of the run-local r10 contract.",
+  "issues": [
+    {
+      "id": "ARCH-R10-01",
+      "severity": "high",
+      "title": "Source artifacts still conflict with the GraphQL-only contract",
+      "description": "The governing run-local r10 proposal is GraphQL-only, but the input idea brief still describes a GraphQL+MCP control cutover and says all listed mutating actions route through MCP. The checked-in P031 proposal is directionally corrected but shorter than r10, and current P043 reference text still says MCP remains the command/control plane, approval decisions resolve through MCP, P031 owns command-completion refresh, and P031 owns command receipt display.",
+      "impact": "Implementation can satisfy older handoff text while violating r10 by adding UI MCP calls, command receipts, command-correlation state, or approval write behavior inside the macOS UI.",
+      "required_change": "Before Phase 1, promote r10 or add a checked-in implementation addendum that names r10 as governing and reconciles the idea brief, checked-in proposal, P043 reference, and P031 gate language around the GraphQL-only boundary.",
+      "acceptance_criteria": [
+        "One checked-in governing artifact states that P031 UI owns GraphQL reads only and owns no UI MCP, GraphQL mutation, command-completion, command receipt, or command-correlation behavior.",
+        "The stale idea-brief MCP-write acceptance criteria are superseded or explicitly marked historical for this run.",
+        "Implementation tickets link exactly one governing r10/addendum artifact before Swift screen migration starts."
+      ],
+      "blocking_scope": "Blocks Phase 1 screen migration and implementation handoff, not Phase 0 reconciliation work.",
+      "confidence": "high"
+    },
+    {
+      "id": "ARCH-R10-02",
+      "severity": "high",
+      "title": "P031 gate and P043 reconciliation remain active implementation dependencies",
+      "description": "r10 correctly sequences P043 reconciliation as Phase 0a, but current repository evidence shows `proposal-031|p031` is not registered in `scripts/test-gate.sh` or `docs/reference/test-gates.md`; only P043 validation currently exists. The existing P043 gate also still validates command-completion refresh and command receipt text that r10 says must be removed from P031 UI scope.",
+      "impact": "Without an executable P031 gate, the no-UI-write boundary depends on prose review and can miss MCP imports, GraphQL mutations, local service calls, raw artifact truth reads, or enabled legacy write controls.",
+      "required_change": "Implement the P031 gate as a first Phase 0 deliverable and update P043/P031 reference validation so P031 UI command/control obligations are impossible to satisfy accidentally.",
+      "acceptance_criteria": [
+        "`proposal-031` and `p031` are registered in `scripts/test-gate.sh` and documented in `docs/reference/test-gates.md`.",
+        "The gate fails on UI MCP calls, generated GraphQL mutations, command receipt state, client_command_id correlation, ActionInvocationIdentity/identity-to-MCP mapping, local workflow mutation services, raw report/artifact truth probing, and enabled removed write controls.",
+        "P043 reference validation no longer requires command-completion refresh or command receipt behavior for P031-owned UI."
+      ],
+      "blocking_scope": "Blocks Phase 0b exit and any governed UI migration.",
+      "confidence": "high"
+    },
+    {
+      "id": "ARCH-R10-03",
+      "severity": "medium",
+      "title": "The new metadata schema matrix is specified but not yet executable",
+      "description": "r10 usefully defines `freshnessState`, `disabledReasonCode`, `writePathState`, `diagnosticId`, `payloadAvailabilityState`, `payloadUnavailableReasonCode`, and `serverDebugDetail`, but current GraphQL types do not expose most of these fields. Current report metadata is artifact-backed (`GqlArtifact` report fields), while r10 also names `GqlReportMetadata` and `reports(runID:)` as if they are first-class surfaces.",
+      "impact": "Swift presenters may reintroduce local inference for disabled states, approval diagnostics, freshness, or report availability; report UI implementation may split between artifact heuristics and a future first-class report query.",
+      "required_change": "During Phase 0a, turn the schema matrix into an executable GraphQL contract or explicitly downgrade missing fields/surfaces to disabled/deferred behavior.",
+      "acceptance_criteria": [
+        "Every visible P031 workflow field has exactly one named server-owned GraphQL source or is explicitly disabled/deferred.",
+        "Approval diagnostic fields are server-owned enough for UI copy without Swift status inference.",
+        "Report payload availability and unavailable reason come from one named read contract, either first-class `reports(runID:)`/`GqlReportMetadata` or a documented artifact-backed metadata view.",
+        "Operator and unauthorized redaction tests exist for diagnostic/debug fields; observer behavior is either implemented or consistently deferred under the P043 V1 principal policy."
+      ],
+      "blocking_scope": "Blocks migration of affected approval, report, disabled-state, and freshness UI.",
+      "confidence": "high"
+    },
+    {
+      "id": "ARCH-R10-04",
+      "severity": "medium",
+      "title": "The UI ownership inventory must become machine-checkable",
+      "description": "r10 adds the right design-level inventory of governed Swift files, legacy-only files, generated GraphQL locations, forbidden patterns, and exclusions. It still contains flexible entries such as conditional Run Detail ownership and future generated GraphQL locations, which is too loose for a static guard that must catch bypasses across large Swift views and generated code.",
+      "impact": "A local mutation path, raw artifact truth path, or GraphQL mutation can remain reachable just outside the scanned set while the P031 gate appears green.",
+      "required_change": "Check in a machine-readable file/type inventory or gate-owned allowlist/glob set before screen work begins.",
+      "acceptance_criteria": [
+        "The P031 gate scans all governed views, presenters, reducers, stores, checked-in GraphQL documents, and generated client code locations.",
+        "Legacy rollback files are explicitly excluded only behind `legacy` mode and cannot be called from `thin-read` or `dogfood` screens.",
+        "Adding a new governed Swift view or GraphQL operation without inventory coverage fails closed."
+      ],
+      "blocking_scope": "Blocks Phase 0b exit and screen migration.",
+      "confidence": "high"
+    },
+    {
+      "id": "ARCH-R10-05",
+      "severity": "medium",
+      "title": "Operator write-path diagnostics need a stable contract with external workflows",
+      "description": "The proposal correctly requires a pre-dogfood operator write-path guide, but it does not yet define the guide artifact path, row schema, required identifiers, or exact linkage from UI diagnostics. The UI will expose copyable identifiers while actual write workflows live outside P031, so the contract between those two surfaces must be precise.",
+      "impact": "Dogfood can pass technical no-write checks while operators cannot complete run workflows because copied diagnostic IDs and external CLI/MCP/automation procedures do not line up.",
+      "required_change": "Treat the operator write-path guide as a versioned contract artifact consumed by UI diagnostics and dogfood evidence, not only release documentation.",
+      "acceptance_criteria": [
+        "The guide maps 100 percent of removed controls to an external workflow or named follow-up.",
+        "Each guide row lists the required identifiers, and those identifiers are exposed by GraphQL read models or visible copy affordances.",
+        "Dogfood evidence includes at least one approval diagnostic and one removed-control workflow where copied identifiers match the guide."
+      ],
+      "blocking_scope": "Blocks Phase 0d exit and dogfood start.",
+      "confidence": "medium"
+    },
+    {
+      "id": "ARCH-R10-06",
+      "severity": "low",
+      "title": "Principal and redaction scope should be narrowed to current read policy",
+      "description": "The schema matrix mentions operator, observer, and unauthorized redaction behavior, while current P043 V1 is primarily operator-only for production macOS reads and some current resolvers use mixed operator/observer access. The proposal is directionally right to require redaction tests, but it should avoid implying broader observer support is part of P031 unless the authorization contract expands.",
+      "impact": "Implementation may spend effort on unsupported observer semantics or accidentally expose diagnostic/debug detail under a principal model that P031 does not own.",
+      "required_change": "Restate P031 read authorization as operator-only unless a separate auth/redaction expansion lands, and make observer rows explicit deferrals where applicable.",
+      "acceptance_criteria": [
+        "Diagnostic and debug fields are operator-only by default.",
+        "Unauthorized behavior is covered by server tests and never falls back to local storage.",
+        "Any observer-visible diagnostic/report fields are introduced only with explicit auth policy and redaction tests."
+      ],
+      "blocking_scope": "Does not block Phase 0, but should be settled before adding diagnostic/debug fields.",
+      "confidence": "medium"
+    }
+  ],
+  "blocking_issues": [],
+  "non_blocking_issues": [
+    {
+      "id": "ARCH-R10-01",
+      "severity": "high",
+      "title": "Source artifacts still conflict with the GraphQL-only contract",
+      "blocking_scope": "Blocks Phase 1 screen migration and implementation handoff, not Phase 0 reconciliation work."
+    },
+    {
+      "id": "ARCH-R10-02",
+      "severity": "high",
+      "title": "P031 gate and P043 reconciliation remain active implementation dependencies",
+      "blocking_scope": "Blocks Phase 0b exit and any governed UI migration."
+    },
+    {
+      "id": "ARCH-R10-03",
+      "severity": "medium",
+      "title": "The new metadata schema matrix is specified but not yet executable",
+      "blocking_scope": "Blocks migration of affected approval, report, disabled-state, and freshness UI."
+    },
+    {
+      "id": "ARCH-R10-04",
+      "severity": "medium",
+      "title": "The UI ownership inventory must become machine-checkable",
+      "blocking_scope": "Blocks Phase 0b exit and screen migration."
+    },
+    {
+      "id": "ARCH-R10-05",
+      "severity": "medium",
+      "title": "Operator write-path diagnostics need a stable contract with external workflows",
+      "blocking_scope": "Blocks Phase 0d exit and dogfood start."
+    },
+    {
+      "id": "ARCH-R10-06",
+      "severity": "low",
+      "title": "Principal and redaction scope should be narrowed to current read policy",
+      "blocking_scope": "Does not block Phase 0, but should be settled before adding diagnostic/debug fields."
+    }
+  ],
+  "suggestions": [
+    {
+      "id": "ARCH-SUG-R10-01",
+      "title": "Keep Phase 0 contract-only until gates exist",
+      "description": "Land P043/P031 reference cleanup, P031 gate registration, schema additions, generated read-client/test doubles, source-governance addendum, and static guards before migrating visible screens."
+    },
+    {
+      "id": "ARCH-SUG-R10-02",
+      "title": "Store the guard inventory as data",
+      "description": "Use a checked-in JSON/YAML inventory for governed Swift paths, generated GraphQL paths, legacy exclusions, and forbidden pattern groups so `scripts/test-gate.sh p031` can consume the same boundary implementers review."
+    },
+    {
+      "id": "ARCH-SUG-R10-03",
+      "title": "Choose one report metadata contract early",
+      "description": "Either add first-class `reports(runID:)`/`GqlReportMetadata` or document report metadata as an artifact projection view. Do not let Swift infer reports from raw files, filenames, or artifact directory shape."
+    },
+    {
+      "id": "ARCH-SUG-R10-04",
+      "title": "Bind diagnostic copy to external workflows",
+      "description": "Define copied identifiers and operator guide rows together for every diagnostic-only removed control so UI diagnostics and external procedures cannot drift independently."
+    },
+    {
+      "id": "ARCH-SUG-R10-05",
+      "title": "Reuse the existing GraphQL lifecycle client shape",
+      "description": "Use the current daemon lifecycle GraphQL client pattern as the workflow read-client model unless Phase 0 finds a concrete incompatibility; it already exercises authenticated query/subscription/read-failure behavior."
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "ARCH-ASM-R10-01",
+      "assumption": "This is an architecture-only proposal review. No build, Xcode run, daemon startup, cargo test, UI smoke, benchmark, load test, fuzzing, or test-gate execution was performed.",
+      "risk": "Compiler, runtime, and integration failures may still surface when Phase 0 gates are implemented."
+    },
+    {
+      "id": "ARCH-ASM-R10-02",
+      "assumption": "The reviewed governing proposal is `/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/proposals/current/proposal.md`, revision `031-2026-04-20-run-8dd01a54-r10-graphql-only-contract-hardening`.",
+      "risk": "Using the stale idea brief, older review corpus, or shorter checked-in proposal as implementation sign-off can reintroduce MCP command/control assumptions."
+    },
+    {
+      "id": "ARCH-ASM-R10-03",
+      "assumption": "Current Swift workflow UI still contains SwiftData and local mutation paths in relevant views such as RunsHomeView, ApprovalGateView, RecoverySheet, BlockedRunRecoveryView, Artifact/Report/Comparison surfaces, and supporting engine services.",
+      "risk": "Without precise static guards, legacy workflow truth can remain reachable behind a GraphQL-rendered surface."
+    },
+    {
+      "id": "ARCH-ASM-R10-04",
+      "assumption": "Current GraphQL projections are sufficient for core run/stage/approval/artifact read migration, but the r10 diagnostic/report metadata fields require additional schema work or explicit deferral.",
+      "risk": "Swift may recreate local inference if the fields are not made server-owned before UI work."
+    },
+    {
+      "id": "ARCH-ASM-R10-05",
+      "assumption": "No separately approved non-MCP, non-GraphQL approval write transport is present in the provided artifacts.",
+      "risk": "Approval decisions must remain diagnostic-only in P031, or a new write-path owner outside this proposal is required."
+    },
+    {
+      "id": "ARCH-ASM-R10-06",
+      "assumption": "MCP remains allowed for agents, CLI/operator diagnostics, automation, and debug/control workflows outside the governed macOS UI boundary.",
+      "risk": "Static checks must distinguish UI target code from valid non-UI operational tooling."
+    }
+  ]
+}

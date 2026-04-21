@@ -4,11 +4,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use domain::artifact::ArtifactFormat;
+use domain::artifact_contracts::{
+    parse_implementation_self_assessment_v2, ContractParseContext,
+    ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+};
 use domain::validation::{
     ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
     ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
 };
 use workflow::plan::OutputSchema;
+
+pub use domain::artifact_contracts::{
+    normalize_contract_status, DegradedOutputPolicy, DegradedOutputPolicyMode,
+    FailedExecutionSettlement,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeclaredOutput {
@@ -116,6 +126,46 @@ pub fn validate_output(
                 raw_payload_size: content.len(),
             };
         };
+
+        if schema.contract_id == IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID {
+            let summary = parse_implementation_self_assessment_v2(
+                &serde_json::Value::Object(obj.clone()),
+                ContractParseContext {
+                    run_id: String::new(),
+                    run_age: None,
+                    declared_contract_id: Some(schema.contract_id.clone()),
+                    canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH
+                        .to_string(),
+                    raw_artifact_path: None,
+                    source_generation_id: None,
+                    artifact_created_at: None,
+                    v2_generation_seen_for_run: true,
+                    legacy_v1_generation_available: false,
+                },
+            );
+            if summary.status == ImplementationSelfAssessmentStatus::Invalid {
+                let validation_error = summary
+                    .validation_errors
+                    .iter()
+                    .map(|issue| {
+                        if issue.pointer.is_empty() {
+                            issue.message.clone()
+                        } else {
+                            format!("{}: {}", issue.pointer, issue.message)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return OutputValidationResult {
+                    output_name: output_name.to_string(),
+                    contract_id: Some(schema.contract_id.clone()),
+                    status: ValidationStatus::Failed,
+                    missing_fields: Vec::new(),
+                    validation_error: Some(validation_error),
+                    raw_payload_size: content.len(),
+                };
+            }
+        }
 
         let missing_fields: Vec<String> = schema
             .required_fields
@@ -413,6 +463,52 @@ mod tests {
             record.failure_class,
             ValidationFailureClass::NoOutputProduced
         );
+        assert!(!record.transcript_exists);
         assert_eq!(record.recovery_recommendation.action, "operator_inspection");
+    }
+
+    #[test]
+    fn validate_output_rejects_invalid_nested_v2_self_assessment_fields() {
+        let mut schema = structured_schema();
+        schema.contract_id =
+            domain::artifact_contracts::IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.to_string();
+        schema.required_fields = vec![
+            "implementation_complete".to_string(),
+            "verification_green".to_string(),
+            "remaining_code_tasks".to_string(),
+            "handoff_tasks".to_string(),
+            "known_risks".to_string(),
+            "tests_run".to_string(),
+            "docs_impacted".to_string(),
+        ];
+
+        let result = validate_output(
+            "implementation_self_assessment",
+            br#"{
+                "implementation_complete": false,
+                "verification_green": false,
+                "remaining_code_tasks": [{
+                    "summary": "Fix compile error",
+                    "owner": "code_writer",
+                    "evidence": "cargo test failed before compilation"
+                }],
+                "handoff_tasks": [],
+                "known_risks": [],
+                "tests_run": [],
+                "docs_impacted": []
+            }"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Failed);
+        assert!(
+            result
+                .validation_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/remaining_code_tasks/0/blocking"),
+            "nested missing boolean must fail closed: {:?}",
+            result.validation_error
+        );
     }
 }

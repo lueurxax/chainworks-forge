@@ -1,0 +1,136 @@
+{
+  "schema_version": "behavioral-diff-report.v1",
+  "report_id": "approval-pause-resume-regeneration",
+  "mode": "fixture_regeneration",
+  "proof_mode": "fixture_lifecycle",
+  "run_fixture_id": "approval-pause-resume",
+  "fixture_revision": 1,
+  "client_snapshot_ref": "/Users/user/Documents/Chainworks Forge/control-plane/crates/engine/tests/fixtures/parity/golden-runs/approval-pause-resume/fixture.json",
+  "server_replay_ref": null,
+  "regeneration": {
+    "author": "p041-initial-fixture-lifecycle",
+    "reason": "Initial checked-in P041 V1 fixture capture baseline",
+    "previous_fixture_dir": null,
+    "initial_capture_without_prior": true
+  },
+  "comparison_surface": [
+    "canonical_state",
+    "projections",
+    "artifacts",
+    "reports",
+    "operator_summary"
+  ],
+  "surface_comparisons": [
+    {
+      "surface": "canonical_state",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "run_status": "completed",
+        "stages": [
+          {
+            "stage_id": "prepare",
+            "label": "Prepare",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "manual_approval",
+            "label": "Manual Approval",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "resume",
+            "label": "Resume",
+            "status": "completed",
+            "attempt_number": 1
+          }
+        ]
+      }
+    },
+    {
+      "surface": "projections",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "run_status": "completed",
+        "stages": [
+          {
+            "stage_id": "prepare",
+            "label": "Prepare",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "manual_approval",
+            "label": "Manual Approval",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "resume",
+            "label": "Resume",
+            "status": "completed",
+            "attempt_number": 1
+          }
+        ],
+        "readback_surfaces": [
+          "run_projection",
+          "stage_projection",
+          "artifact_index",
+          "graphql_readback",
+          "mcp_report_readback"
+        ]
+      }
+    },
+    {
+      "surface": "artifacts",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "artifacts": [
+          {
+            "name": "approval_packet",
+            "contract_id": "operator.approval",
+            "stage_id": "manual_approval",
+            "format": "json",
+            "report_kind": "approval_evidence"
+          }
+        ]
+      }
+    },
+    {
+      "surface": "reports",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "schema_version": "expected-reports.v1",
+        "reports": [
+          {
+            "kind": "parity_summary",
+            "version": 1,
+            "fixture_id": "approval-pause-resume"
+          }
+        ]
+      }
+    },
+    {
+      "surface": "operator_summary",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "status": "ready",
+        "summary": "Approval pause/resume parity is ready."
+      }
+    }
+  ],
+  "divergences": [],
+  "summary": {
+    "blocking_count": 0,
+    "warning_count": 0,
+    "info_count": 0,
+    "operator_message": "Fixture regeneration diff recorded."
+  },
+  "verdict": "ready"
+}

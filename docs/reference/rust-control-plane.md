@@ -113,6 +113,9 @@ The daemon exposes two northbound surfaces on a single port (default `0.0.0.0:40
 
 Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
 
+**Implementation self-assessment summary extension:**
+The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
+
 Mutations: `startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`.
 
 Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
@@ -136,6 +139,9 @@ Tools are namespaced:
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
 | `stages.*` | `stages.retry` |
 | `reports.*` | `reports.get` |
+
+**Implementation self-assessment detail extension:**
+`runs.get` and `runs.list` (detail view) include `implementation_self_assessment_summary` in the response payload.
 
 Resources follow two URI families:
 
@@ -194,8 +200,12 @@ After a stage completes, the orchestrator evaluates transition conditions in ord
 | `"true"` / `"false"` | Boolean literals |
 | `exists('artifact_name')` | Checks filesystem for artifact at catalog path |
 | `approval.granted == true` | Checks if any approval for the run was granted |
+| `approval.rejected == true` | Checks if any approval for the run was rejected |
 | `lhs == rhs`, `!=`, `<`, `<=`, `>`, `>=` | Comparison (numeric or string) |
 | `expr and expr`, `expr or expr` | Logical connectives (parenthesis-aware split) |
+
+**Implementation self-assessment mapping:**
+Transition expressions can inspect `implementation_self_assessment_v2.status` and other fields. These resolve against the domain-owned assessment summary projection rather than raw files.
 
 Value resolution supports: `vars.name` (plan variables), `artifact.field` (read JSON file, extract field with dot-path), boolean/number/string literals.
 
@@ -218,8 +228,8 @@ Defined in `crates/acp/src/transport.rs`:
 1. **`initialize`** -- establish protocol version and client identity (`chainworks-control-plane 0.1.0`).
 2. **`session/new`** -- start an agent session with provider-specific config (model, mode, extras). Returns `sessionId`.
 3. **`session/prompt`** -- submit the prompt. Stream `session/update` notifications until the terminal response arrives.
-4. **`session/close`** -- clean shutdown request (best-effort).
-5. Drop stdin (EOF) and wait up to 5 seconds for graceful exit, then SIGKILL.
+4. **`session/close`** -- clean shutdown request (best-effort). The runtime manager sends this even when `session/prompt` returns a transport error after `session/new`.
+5. Drop stdin (EOF) and wait up to 5 seconds for graceful exit, then signal the provider subprocess process group before falling back to direct kill.
 
 ### Permission auto-grant
 
@@ -251,11 +261,11 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 | `AuggieAdapter` | `auggie` | `AUGGIE_ACP_BIN` |
 | `JunieAdapter` | `junie` | `JUNIE_ACP_BIN` |
 
-Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio when `execute()` is called.
+Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called.
 
 ### Timeouts
 
-- Handshake: 30 seconds
+- Handshake: 90 seconds by default; 120 seconds for Gemini
 - Idle (no message): 300 seconds (reset on every received line)
 - Shutdown wait: 5 seconds
 
@@ -266,10 +276,21 @@ Each adapter reads its binary path from the environment at construction and spaw
 The `db` crate creates the pool at `crates/db/src/pool.rs`:
 
 - WAL journal mode (concurrent readers + one writer)
-- 5-second busy timeout
+- 30-second busy timeout
 - Up to 5 connections
 - Auto-create database file if missing
 - Migrations applied automatically on pool creation
+
+### Local concurrency target
+
+The active local target, tracked by [P061](../proposals/061-sqlite-write-serialization-and-executor-backpressure.md), keeps SQLite as the source of truth and scales by bounding work rather than by adding external infrastructure:
+
+- 5 active runs should be stable without operator babysitting.
+- 10 active runs are allowed only when executor backpressure keeps active agent executions bounded.
+- Active run count is not active agent execution count; surplus agent work may remain queued.
+- Active execution target: 20 total.
+- Initial provider caps: Gemini 4, Codex 3, Claude 8, Auggie 1, Junie 1.
+- Capacity pressure should leave work pending/backpressured; capacity alone must not mark work failed.
 
 ### Schema
 
@@ -329,6 +350,8 @@ The work queue (`crates/engine/src/work_queue.rs`) wraps the `work_items` SQLite
 | `StartupRepair` | Runs the recovery service. Inline. |
 
 The background executor (`crates/engine/src/executor.rs`) polls the queue in a loop with 100ms sleep when idle. `InvokeAgent` items are spawned as concurrent tasks; all other kinds run inline on the executor loop.
+
+The current baseline has a count-based capacity-aware claim/start gate for `InvokeAgent`: the executor checks global, provider, and per-run active execution caps before mutating ownership, and leaves capacity-blocked work pending. `InvokeAgent` completion inserts an idempotent post-completion `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the completed work item before settling the stage. P061 tracks the remaining target behavior: durable queued/backpressured readback, stronger scheduler fairness, and gate evidence for the 20-agent ceiling.
 
 ## Command handler
 
@@ -453,7 +476,7 @@ Integration tests are located in:
 
 ## Key design decisions
 
-These decisions are fixed for the baseline and are not under reconsideration:
+These decisions are fixed for the baseline and are not under reconsideration. Active proposals may add bounded targets without changing these baseline choices:
 
 1. **Local-first topology.** One daemon, one SQLite database, one local file store. No external orchestration platform, no distributed deployment.
 
@@ -469,7 +492,18 @@ These decisions are fixed for the baseline and are not under reconsideration:
 
 7. **Client remains canonical during parity.** The SwiftUI app owns user-visible behavior until the thin-client cutover (P031). The daemon provides verifiable shadow truth.
 
-8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 5-second busy timeout.
+8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. P061 keeps SQLite but targets explicit write serialization, a longer busy timeout, and executor backpressure instead of relying on more writer concurrency.
+
+9. **Bounded local concurrency target.** The local daemon target is 5 active runs stable, 10 active runs only with bounded scheduling, and up to 20 active agent executions. Excess work should queue visibly instead of starting every fan-out task immediately.
+
+## Local daemon lifecycle and packaging
+
+The control-plane daemon is a product-owned local macOS component, not just a developer process. Its typed lifecycle state, health/readiness surfaces, packaged supervision, PID lock, crash budget, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes are documented in [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md).
+
+The retained gate aliases are operational:
+
+- `./scripts/test-gate.sh proposal-042` proves implementation readiness for the local daemon lifecycle slice.
+- `./scripts/test-gate.sh proposal-042-packaging` proves signed/notarized packaged-app readiness on a release host.
 
 ## Non-goals
 
@@ -477,8 +511,7 @@ The following items are explicitly out of scope for this baseline:
 
 - **Thin-client cutover** -- authority transfer from client to daemon (P031).
 - **Parity harness** -- golden-run comparison and behavioral diff tooling (P041).
-- **Daemon lifecycle management** -- supervision, packaging, health checks (P042).
-- **Finalized projection contracts** -- client consumption API stabilization (P043).
+- **Thin-client UI cutover** -- P043 finalized the GraphQL projection read contract, but user-visible macOS cutover remains owned by P031.
 - **Northbound MCP command plane** -- full external command surface (P029).
 - **Multi-host or distributed deployment** -- no remote workflow platformization.
 - **Proposal-loop telemetry projections** -- the `proposal_loop_metrics` table from the original design is deferred to a future telemetry slice.

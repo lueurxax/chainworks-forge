@@ -236,6 +236,11 @@ MCP server не должен публиковать внутренние низ�
 
 Никакой обязательной внешней инфраструктуры.
 
+Важное уточнение по параллелизму:
+- SQLite остаётся целевой persistence-моделью для текущего этапа.
+- Масштабирование локальных proposal runs достигается не увеличением числа writers, а короткими сериализованными write transactions и executor backpressure.
+- Активный run и активное агентное выполнение — разные вещи: run может оставаться активным, пока его следующий agent work item стоит в очереди из-за capacity.
+
 ## 5.8 Run Compaction and Artifact Governance
 Сервер обязан поддерживать server-owned maintenance command для compaction eligible runs.
 
@@ -493,6 +498,32 @@ Target state intentionally остаётся **локальным**.
 - exactly-once guarantees не являются текущим обязательным свойством;
 - multi-user and remote deployment are out of scope.
 
+### Целевой локальный параллелизм
+
+Текущий product target для локального single-process singleton:
+
+- **5 active runs** должны работать стабильно без ручного babysitting.
+- **10 active runs** допустимы как bounded stretch target, если executor backpressure держит количество одновременно активных agent executions в пределах capacity.
+- **20 одновременно активных agent executions** являются целевым потолком для review fan-out, но только через явные global/per-run/provider caps.
+
+Начальная capacity-модель:
+
+- глобальный лимит активных agent executions: 20;
+- per-run лимит активных agent executions: 4;
+- provider caps по умолчанию: Gemini 4, Codex 3, Claude 8, Auggie 1, Junie 1.
+- ACP provider subprocess запускается в отдельной process group; `session/close` вызывается даже после transport error в `session/prompt`, чтобы не оставлять MCP/plugin descendants после idle timeout.
+- Sleep/wake ноутбука и смена Wi-Fi/network path считаются host interruption epoch: running ACP executions, пересёкшие такой epoch, должны закрываться, классифицироваться как retryable host interruption, и переочередиться с jitter/backoff под теми же capacity caps, а не превращаться в массовые permanent provider failures.
+
+Когда capacity закончилась, правильное поведение системы:
+
+- не падать и не помечать work как failed только из-за capacity;
+- оставить work pending/backpressured;
+- показать причину backpressure в projections/GraphQL/MCP;
+- продолжить выполнение, когда освободится слот.
+- после завершения последнего `InvokeAgent` надежно разбудить/запланировать `AdvanceRun` или finalizer, чтобы stage не оставался `running` без активных agents и без pending work.
+
+Это означает, что целевая система должна выдерживать 5-10 active runs как operator workload и до 20 внешних agent processes только в рамках capacity-модели, а не через бесконтрольный fan-out.
+
 ---
 
 ## 12. Security / trust model
@@ -575,11 +606,13 @@ Target state не требует сейчас:
 - Temporal,
 - Kafka/NATS/Redis,
 - внешней workflow-платформы,
+- Postgres как обязательной замены SQLite,
 - multi-region deployment,
 - server cloud migration,
 - сложной auth federation,
 - строгих exactly-once guarantees,
 - полного отказа от локального режима,
+- 10-20 одновременно активных agent executions,
 - compaction для running runs.
 
 ---
@@ -601,6 +634,9 @@ Target state не требует сейчас:
 11. Server-owned projections достаточны, чтобы UI не реконструировал правду сам.
 12. Server-owned run compaction exists for `completed`, `failed`, and `blocked` runs.
 13. Compaction emits a canonical compact snapshot, preserves archive truth, and materially reduces active artifact noise.
+14. 5 active runs работают стабильно на локальном Rust/SQLite daemon без SQLite lock failures, stale running executions и ручного babysitting.
+15. До 10 active runs могут находиться в системе одновременно, при этом surplus agent work явно queued/backpressured, а не запускается бесконтрольно.
+16. До 20 active agent executions могут выполняться одновременно только под global/per-run/provider caps и с доказательством через proposal-061 gate.
 
 ---
 

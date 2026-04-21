@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::adapters::AcpAdapter;
 use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::AcpSessionConfig;
+use crate::transport::{isolate_process_group, AcpSessionConfig};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
@@ -72,12 +72,23 @@ impl AcpAdapter for CodexAdapter {
         // Build environment matching Swift makeSessionEnvironment
         let env = make_session_environment(&runtime_home);
 
-        let child = Command::new(&self.binary_path)
-            .envs(env)
+        let mut cmd = Command::new(&self.binary_path);
+        isolate_process_group(&mut cmd);
+        cmd.envs(env)
             // Suppress verbose codex_otel/codex_core/rmcp INFO tracing that
             // floods stderr and causes memory pressure. codex-acp reads RUST_LOG
             // via EnvFilter::from_default_env(). Only show warnings and errors.
-            .env("RUST_LOG", "warn")
+            .env("RUST_LOG", "warn");
+        // P050: Inject per-run meta root so YAML ${CHAINWORKS_META_ROOT} resolves correctly.
+        if let Some(ref mr) = req.chainworks_meta_root {
+            let absolute = if mr.starts_with('/') {
+                mr.clone()
+            } else {
+                format!("{}/{}", req.workspace_root, mr)
+            };
+            cmd.env("CHAINWORKS_META_ROOT", &absolute);
+        }
+        let child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -203,10 +214,37 @@ fn sanitize_runtime_config(source: &str) -> String {
 fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
     let home = runtime_home.to_string_lossy().to_string();
     let bin = runtime_home.join("bin").to_string_lossy().to_string();
-    let tmp = runtime_home.join("tmp").to_string_lossy().to_string();
     let cache = runtime_home.join(".cache").to_string_lossy().to_string();
+    let session_name = runtime_home
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session");
+    let toolchain_root = std::env::temp_dir()
+        .join("chainworks-forge-codex-tooling")
+        .join(session_name);
+    let tmp = toolchain_root.join("tmp");
+    let rustup_home = toolchain_root.join(".rustup");
+    let cargo_home = toolchain_root.join(".cargo");
+
+    // Keep Rust toolchain caches outside CODEX_HOME: Codex tool calls may run
+    // under a sandbox where the isolated runtime home is readable but not a
+    // writable root.
+    for dir in [&tmp, &rustup_home, &cargo_home] {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create {} directory", dir.display()))
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %error,
+                    "Codex session environment: failed to create toolchain cache dir"
+                );
+            });
+    }
 
     let path = format!("{}:{}", bin, std::env::var("PATH").unwrap_or_default());
+    let tmp = tmp.to_string_lossy().to_string();
+    let rustup_home = rustup_home.to_string_lossy().to_string();
+    let cargo_home = cargo_home.to_string_lossy().to_string();
 
     vec![
         ("CODEX_HOME".into(), home.clone()),
@@ -214,6 +252,8 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
         ("TMPDIR".into(), tmp),
         ("PATH".into(), path),
         ("XDG_CACHE_HOME".into(), cache),
+        ("RUSTUP_HOME".into(), rustup_home),
+        ("CARGO_HOME".into(), cargo_home),
     ]
 }
 
@@ -265,5 +305,30 @@ mod tests {
             split_codex_model_effort("gpt-5.4/"),
             ("gpt-5.4/".into(), None)
         );
+    }
+
+    #[test]
+    fn session_environment_keeps_rust_toolchain_cache_outside_runtime_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_home = tmp.path().join(".forge-codex-acp").join("session-1");
+        std::fs::create_dir_all(&runtime_home).unwrap();
+
+        let env = make_session_environment(&runtime_home);
+        let value = |key: &str| {
+            env.iter()
+                .find_map(|(name, value)| (name == key).then_some(value.as_str()))
+                .expect("env key should exist")
+        };
+
+        assert_eq!(value("CODEX_HOME"), runtime_home.to_string_lossy());
+        assert_eq!(value("HOME"), runtime_home.to_string_lossy());
+        assert!(value("TMPDIR").contains("chainworks-forge-codex-tooling"));
+        assert!(value("RUSTUP_HOME").contains("chainworks-forge-codex-tooling"));
+        assert!(value("CARGO_HOME").contains("chainworks-forge-codex-tooling"));
+        assert!(!value("RUSTUP_HOME").starts_with(runtime_home.to_string_lossy().as_ref()));
+        assert!(!value("CARGO_HOME").starts_with(runtime_home.to_string_lossy().as_ref()));
+        assert!(std::path::Path::new(value("TMPDIR")).is_dir());
+        assert!(std::path::Path::new(value("RUSTUP_HOME")).is_dir());
+        assert!(std::path::Path::new(value("CARGO_HOME")).is_dir());
     }
 }

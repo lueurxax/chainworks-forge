@@ -1,0 +1,8 @@
+interface:
+  display_name: "Proposal Review Router"
+  short_description: "Routes proposal reviews to selective Apple, Rust, Go, API, rollout, and product specialists."
+  default_prompt: "Use $proposal-review-router on the provided proposal. Default to auto mode unless I specify another mode. Build local evidence first from the proposal, adjacent docs, baseline artifacts, prior review artifacts, manifests, and only necessary current code-path slices. Fingerprint stack, surface, and risk tags with evidence IDs, then select only the reviewers that fit. Return routing rationale, rejected alternatives, proposal completeness judgment, and evidence-backed findings. Do not require build/run, simulator, service startup, benchmarks, load tests, or fuzzing in proposal-readiness mode."
+  brand_color: "#0E4F8A"
+
+policy:
+  allow_implicit_invocation: false
