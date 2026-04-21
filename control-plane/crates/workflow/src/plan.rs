@@ -114,10 +114,10 @@ pub struct CompiledTask {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     /// Resolved output schemas keyed by output artifact name.
-    /// Populated from the agent's explicit `output_contract` first, then by
-    /// exact normalized/raw artifact-name matches, and finally by version
-    /// stem fallbacks. Consumed by the prompt builder to embed required field
-    /// lists and contract metadata in task directives.
+    /// Populated from an explicit `output_contract` for single-output agents
+    /// or matching multi-output aliases, then by exact normalized/raw artifact
+    /// names and version stem fallbacks. Consumed by the prompt builder to
+    /// embed required field lists and contract metadata in task directives.
     #[serde(default)]
     pub output_schemas: HashMap<String, OutputSchema>,
     /// Whether this task runs in parallel with siblings.

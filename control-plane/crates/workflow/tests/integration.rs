@@ -645,6 +645,82 @@ agents:
 }
 
 #[test]
+fn test_multi_output_agent_output_contract_only_binds_matching_output() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: writer
+    run:
+      sequence:
+        - agent: writer
+          task: write_outputs
+          outputs:
+            - implementation_progress
+            - implementation_self_assessment
+            - changed_files_manifest
+            - tests_result
+"#,
+        r#"
+backend_profiles:
+  writer_profile:
+    provider: codex_acp
+contracts:
+  implementation_self_assessment_v1:
+    format: json
+    validation_mode: strict_structured
+    required_fields:
+      - seemingly_complete
+  implementation_self_assessment_v2:
+    format: json
+    validation_mode: strict_structured
+    required_fields:
+      - implementation_complete
+  implementation_progress:
+    format: markdown
+    validation_mode: lenient
+    required_fields: []
+  changed_files_manifest:
+    format: json
+    validation_mode: strict_structured
+    required_fields:
+      - files
+  tests_result:
+    format: json
+    validation_mode: strict_structured
+    required_fields:
+      - status
+agents:
+  - id: writer
+    backend_profile: writer_profile
+    outputs:
+      - implementation_progress
+      - implementation_self_assessment
+      - changed_files_manifest
+      - tests_result
+    output_contract: implementation_self_assessment_v2
+"#,
+    );
+
+    let schemas = &plan.states["start"].tasks[0].output_schemas;
+    assert_eq!(
+        schemas["implementation_self_assessment"].contract_id,
+        "implementation_self_assessment_v2"
+    );
+    assert_eq!(
+        schemas["implementation_progress"].contract_id,
+        "implementation_progress"
+    );
+    assert_eq!(
+        schemas["changed_files_manifest"].contract_id,
+        "changed_files_manifest"
+    );
+    assert_eq!(schemas["tests_result"].contract_id, "tests_result");
+}
+
+#[test]
 fn test_contract_binding_matches_normalized_and_raw_artifacts_exactly() {
     let plan = compile_from_strings(
         r#"

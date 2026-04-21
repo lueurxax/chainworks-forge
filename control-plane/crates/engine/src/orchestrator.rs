@@ -2368,6 +2368,17 @@ fn build_task_prompt(
             for field in &schema.required_fields {
                 parts.push(format!("- `{}`", field));
             }
+            if schema.contract_id == "implementation_self_assessment_v2" {
+                parts.push(String::from(
+                    "Required nested shapes for `implementation_self_assessment_v2`:\n\
+                     - `remaining_code_tasks` must be an array of objects: \
+                     `{ \"summary\": string, \"owner\": string, \"blocking\": boolean, \"evidence\": string }`.\n\
+                     - `handoff_tasks` must be an array of objects: \
+                     `{ \"summary\": string, \"owner_class\": one of [\"docs\", \"manual_evidence\", \"release\", \"ops\", \"product\", \"human_operator\", \"unknown\"], \"target_stage\": string, \"blocking_review\": boolean, \"evidence\": string }`.\n\
+                     - `known_risks`, `tests_run`, and `docs_impacted` must be arrays of strings.\n\
+                     - Do not use strings in `remaining_code_tasks`; do not use booleans in `docs_impacted`; do not invent owner classes such as `docs-agent`, `operator`, `security-owner`, or `release-owner`.",
+                ));
+            }
         }
     }
 

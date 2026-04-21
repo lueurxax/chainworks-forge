@@ -133,13 +133,42 @@ struct ContractLookup {
 }
 
 impl ContractLookup {
-    fn resolve(&self, output_name: &str, explicit_contract: Option<&str>) -> Option<OutputSchema> {
+    fn resolve(
+        &self,
+        output_name: &str,
+        explicit_contract: Option<&str>,
+        output_count: usize,
+    ) -> Option<OutputSchema> {
         if let Some(contract_id) = explicit_contract {
-            return self.by_contract_id.get(contract_id).cloned();
+            if output_count == 1 || self.output_matches_contract(output_name, contract_id) {
+                return self.by_contract_id.get(contract_id).cloned();
+            }
         }
 
         self.by_output.get(output_name).cloned().or_else(|| {
             strip_version_suffix(output_name).and_then(|stem| self.by_output.get(&stem).cloned())
+        })
+    }
+
+    fn output_matches_contract(&self, output_name: &str, contract_id: &str) -> bool {
+        let Some(schema) = self.by_contract_id.get(contract_id) else {
+            return false;
+        };
+
+        let output_stem = strip_version_suffix(output_name);
+        let mut aliases = vec![contract_id];
+        if let Some(alias) = schema.normalized_artifact_name.as_deref() {
+            aliases.push(alias);
+        }
+        if let Some(alias) = schema.raw_artifact_name.as_deref() {
+            aliases.push(alias);
+        }
+
+        aliases.into_iter().any(|alias| {
+            output_name == alias
+                || strip_version_suffix(alias).as_deref() == Some(output_name)
+                || output_stem.as_deref() == Some(alias)
+                || output_stem.as_deref() == strip_version_suffix(alias).as_deref()
         })
     }
 }
@@ -588,14 +617,14 @@ fn compile_agent_task(
     let outputs = at.outputs.clone().unwrap_or_default();
     let explicit_contract = agent.output_contract.as_deref();
 
-    // Resolve output schemas: for each output, look up its contract via
-    // explicit output_contract first, then normalized/raw artifact aliases,
-    // then versioned/stem fallbacks. Agents get required-field lists and
-    // contract metadata in their task directive so they know what structure
-    // to produce.
+    // Resolve output schemas. For single-output agents, an explicit
+    // output_contract is authoritative. For multi-output agents, the explicit
+    // contract only binds outputs whose alias/stem matches that contract; other
+    // outputs resolve through their own artifact aliases.
     let mut output_schemas = HashMap::new();
+    let output_count = outputs.len();
     for output_name in &outputs {
-        if let Some(schema) = contracts.resolve(output_name, explicit_contract) {
+        if let Some(schema) = contracts.resolve(output_name, explicit_contract, output_count) {
             output_schemas.insert(output_name.clone(), schema);
         } else if let Some(contract_id) = explicit_contract {
             warn!(

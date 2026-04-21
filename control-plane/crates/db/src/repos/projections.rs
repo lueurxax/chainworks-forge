@@ -5,6 +5,8 @@ use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 
+use super::artifact_contracts;
+
 // ---------------------------------------------------------------------------
 // Projection read types (ARCH-002 fix)
 // ---------------------------------------------------------------------------
@@ -584,6 +586,7 @@ pub async fn rebuild_all_for_run(pool: &SqlitePool, run_id: RunId) -> Result<()>
     rebuild_stage_summaries(pool, run_id).await?;
     rebuild_approval_inbox(pool, run_id).await?;
     upsert_artifact_index_entry(pool, run_id).await?;
+    artifact_contracts::rebuild_projection_and_exports(pool, run_id).await?;
     info!(run_id = %run_id, "Full projection rebuild complete");
     Ok(())
 }
