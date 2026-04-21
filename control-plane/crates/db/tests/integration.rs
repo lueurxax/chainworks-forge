@@ -1,14 +1,22 @@
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifacts, ideas, projections, runs, stages, steward, validation,
+    agent_executions, approvals, artifact_contracts as artifact_contract_repos, artifacts, ideas,
+    projections, runs, sessions, stages, steward, validation, work_items,
 };
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
+use domain::artifact_contracts::{
+    parse_implementation_self_assessment_v2, ActiveArtifactGenerationInput, ContractParseContext,
+    ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
+use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::steward::{
     CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
@@ -23,6 +31,563 @@ async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
         .await
         .expect("in-memory pool failed")
+}
+
+async fn seed_contract_run(pool: &sqlx::SqlitePool) -> RunId {
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Contract idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-contract".into(),
+        workflow_title: "Contract Workflow".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("state_8_implementation".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(pool, &run).await.unwrap();
+    run.id
+}
+
+async fn insert_contract_artifact(
+    pool: &sqlx::SqlitePool,
+    run_id: RunId,
+    contract_id: &str,
+    name: &str,
+) -> ArtifactId {
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation".into(),
+        agent_id: "code_writer".into(),
+        name: name.into(),
+        contract_id: contract_id.into(),
+        format: ArtifactFormat::Json,
+        file_path: format!("/tmp/art/{name}.json"),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "codex".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(pool, &artifact).await.unwrap();
+    artifact.id
+}
+
+fn contract_context(declared_contract_id: Option<&str>) -> ContractParseContext {
+    ContractParseContext {
+        run_id: "run".into(),
+        run_age: None,
+        declared_contract_id: declared_contract_id.map(str::to_string),
+        canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+        raw_artifact_path: Some(IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into()),
+        source_generation_id: None,
+        artifact_created_at: Some(Utc::now()),
+        v2_generation_seen_for_run: false,
+        legacy_v1_generation_available: false,
+    }
+}
+
+fn valid_v2_handoff_required() -> serde_json::Value {
+    serde_json::json!({
+        "implementation_complete": true,
+        "verification_green": true,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [{
+            "summary": "Collect signed manual smoke evidence.",
+            "owner_class": "manual_evidence",
+            "target_stage": "state_10_release_gate",
+            "blocking_review": true,
+            "evidence": "Manual smoke evidence is intentionally collected after implementation review."
+        }],
+        "known_risks": ["Manual evidence still gates release."],
+        "tests_run": ["cargo test -p domain"],
+        "docs_impacted": []
+    })
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_persists_active_dimensions() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation-self-assessment-v2",
+    )
+    .await;
+    let summary = parse_implementation_self_assessment_v2(
+        &valid_v2_handoff_required(),
+        contract_context(Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)),
+    );
+
+    let stored = artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        artifact_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        &summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stored.artifact_id, artifact_id);
+    assert!(stored.is_active);
+    assert_eq!(stored.source_kind, "v2");
+    assert_eq!(
+        stored.summary.status,
+        ImplementationSelfAssessmentStatus::HandoffRequired
+    );
+    assert_eq!(stored.summary.handoff_task_count, Some(1));
+    assert_eq!(stored.summary.blocking_review_handoff_task_count, Some(1));
+    assert_eq!(
+        stored
+            .summary
+            .owner_class_counts
+            .get("manual_evidence")
+            .copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_active_generation_uses_domain_handoff_required_status() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_path = tmp.path().join("implementation/self-assessment.json");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &raw_path,
+        serde_json::to_vec(&valid_v2_handoff_required()).unwrap(),
+    )
+    .unwrap();
+
+    artifact_contract_repos::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+            canonical_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "complete".into(),
+            generation_id: "handoff-generation".into(),
+            source_agent_execution_id: Some("agent-exec-handoff".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: domain::agent::AgentOutputSettlement::None,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let status = artifact_contract_repos::canonical_contract_field(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v2",
+        "status",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, Some(serde_json::json!("handoff_required")));
+    let handoff_count = artifact_contract_repos::canonical_contract_field(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v2",
+        "blocking_review_handoff_task_count",
+    )
+    .await
+    .unwrap();
+    assert_eq!(handoff_count, Some(serde_json::json!(1)));
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_prefers_invalid_v2_over_legacy_v1() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v1",
+        "implementation-self-assessment-v1",
+    )
+    .await;
+    let legacy_summary = parse_implementation_self_assessment_v2(
+        &serde_json::json!({ "seemingly_complete": true }),
+        contract_context(Some("implementation_self_assessment_v1")),
+    );
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let v2_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        "raw_output",
+        "implementation-self-assessment-raw-v2",
+    )
+    .await;
+    let invalid_v2_summary = parse_implementation_self_assessment_v2(
+        &valid_v2_handoff_required(),
+        contract_context(None),
+    );
+    let active = artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        v2_artifact_id,
+        "raw_output",
+        &invalid_v2_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(active.artifact_id, v2_artifact_id);
+    assert_eq!(active.source_kind, "v2");
+    assert_eq!(
+        active.summary.status,
+        ImplementationSelfAssessmentStatus::Invalid
+    );
+    assert!(active
+        .summary
+        .validation_errors
+        .iter()
+        .any(|issue| issue.code == "raw_only_v2_artifact"));
+}
+
+#[tokio::test]
+async fn artifact_contract_summary_keeps_v2_active_over_later_legacy_same_path() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let v2_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation-self-assessment-v2",
+    )
+    .await;
+    let v2_summary = parse_implementation_self_assessment_v2(
+        &valid_v2_handoff_required(),
+        contract_context(Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)),
+    );
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        v2_artifact_id,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        &v2_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        run_id,
+        "implementation_self_assessment_v1",
+        "implementation-self-assessment-v1",
+    )
+    .await;
+    let legacy_summary = parse_implementation_self_assessment_v2(
+        &serde_json::json!({ "seemingly_complete": true }),
+        contract_context(Some("implementation_self_assessment_v1")),
+    );
+    let active = artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let legacy_record =
+        artifact_contract_repos::find_implementation_self_assessment_summary_by_artifact(
+            &pool,
+            legacy_artifact_id,
+        )
+        .await
+        .unwrap()
+        .expect("legacy summary should be stored");
+
+    assert_eq!(active.artifact_id, v2_artifact_id);
+    assert!(active.is_active);
+    assert!(!legacy_record.is_active);
+    assert!(legacy_record
+        .summary
+        .warnings
+        .iter()
+        .any(|issue| issue.code == "same_path_contract_conflict"));
+}
+
+#[tokio::test]
+async fn v1_fallback_retirement_check_reports_active_non_terminal_legacy_runs() {
+    let pool = test_pool().await;
+    let active_legacy_run_id = seed_contract_run(&pool).await;
+    let active_legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        active_legacy_run_id,
+        "implementation_self_assessment_v1",
+        "active-legacy-implementation-self-assessment",
+    )
+    .await;
+    let legacy_summary = parse_implementation_self_assessment_v2(
+        &serde_json::json!({ "seemingly_complete": true }),
+        contract_context(Some("implementation_self_assessment_v1")),
+    );
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        active_legacy_run_id,
+        active_legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let terminal_legacy_run_id = seed_contract_run(&pool).await;
+    let terminal_legacy_artifact_id = insert_contract_artifact(
+        &pool,
+        terminal_legacy_run_id,
+        "implementation_self_assessment_v1",
+        "terminal-legacy-implementation-self-assessment",
+    )
+    .await;
+    artifact_contract_repos::persist_implementation_self_assessment_summary(
+        &pool,
+        terminal_legacy_run_id,
+        terminal_legacy_artifact_id,
+        "implementation_self_assessment_v1",
+        &legacy_summary,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    runs::update_status(&pool, terminal_legacy_run_id, RunStatus::Completed)
+        .await
+        .unwrap();
+
+    let check = artifact_contract_repos::v1_fallback_retirement_check(&pool)
+        .await
+        .unwrap();
+    assert!(!check.safe_to_retire());
+    assert_eq!(check.active_non_terminal_v1_only_run_count(), 1);
+    assert_eq!(
+        check.active_non_terminal_v1_only_run_ids,
+        vec![active_legacy_run_id]
+    );
+
+    runs::update_status(&pool, active_legacy_run_id, RunStatus::Completed)
+        .await
+        .unwrap();
+    let check = artifact_contract_repos::v1_fallback_retirement_check(&pool)
+        .await
+        .unwrap();
+    assert!(check.safe_to_retire());
+    assert_eq!(check.active_non_terminal_v1_only_run_count(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_pool_uses_30_second_busy_timeout() {
+    let pool = test_pool().await;
+
+    let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(busy_timeout_ms, 30_000);
+}
+
+#[tokio::test]
+async fn migrations_create_hot_scheduler_indexes() {
+    let pool = test_pool().await;
+
+    let indexes: Vec<String> = sqlx::query_scalar(
+        r#"SELECT name
+           FROM sqlite_master
+           WHERE type = 'index'
+             AND name IN (
+               'idx_work_items_status_kind_scheduled',
+               'idx_agent_executions_status',
+               'idx_agent_executions_status_provider',
+               'idx_agent_executions_status_stage'
+             )
+           ORDER BY name"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        indexes,
+        vec![
+            "idx_agent_executions_status".to_string(),
+            "idx_agent_executions_status_provider".to_string(),
+            "idx_agent_executions_status_stage".to_string(),
+            "idx_work_items_status_kind_scheduled".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn completing_invoke_agent_enqueues_post_completion_advance_run() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-invoke-completion".into(),
+        workflow_title: "Invoke Completion".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("state_4_proposal_reviewed".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let now = Utc::now();
+    let invoke_id = "p058-invoke:completion-finalizer-test:0";
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: invoke_id.into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run.id.to_string(),
+                "stage_id": "state_4_proposal_reviewed",
+                "stage_execution_id": StageExecutionId::new().to_string(),
+                "agent_id": "proposal_reviewer_architect",
+                "provider": "codex",
+            })
+            .to_string(),
+            status: WorkItemStatus::Running,
+            run_id: Some(run.id),
+            stage_id: Some("state_4_proposal_reviewed".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    work_items::complete(&pool, invoke_id).await.unwrap();
+
+    let items = work_items::list_by_run(&pool, run.id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.id == invoke_id)
+        .expect("completed invoke item");
+    assert_eq!(invoke.status, WorkItemStatus::Completed);
+
+    let pending_advances: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            item.kind == WorkItemKind::AdvanceRun && item.status == WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(
+        pending_advances.len(),
+        1,
+        "completion must leave a durable post-completion AdvanceRun wake-up"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&pending_advances[0].payload_json).unwrap();
+    assert_eq!(payload["run_id"], run.id.to_string());
+    assert_eq!(payload["completed_invoke_work_item_id"], invoke_id);
+    assert_eq!(payload["reason"], "invoke_agent_completed");
 }
 
 #[tokio::test]
@@ -102,6 +667,7 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -188,6 +754,134 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
 }
 
 #[tokio::test]
+async fn session_lookup_helpers_read_by_id() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-session-lookup".into(),
+        workflow_title: "Session Lookup".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let lineage = SessionLineage {
+        id: "session-lineage-lookup".into(),
+        run_id: run.id.to_string(),
+        agent_id: "code_writer".into(),
+        lineage_id: "session-family-lookup".into(),
+        session_reuse_scope: "same_agent_family_within_run".into(),
+        session_family_id: Some("family-lookup".into()),
+        active_generation_id: Some("session-generation-lookup".into()),
+        created_at: Utc::now(),
+        closed_at: None,
+    };
+    sessions::insert_lineage(&pool, &lineage).await.unwrap();
+
+    let generation = SessionGeneration {
+        id: "session-generation-lookup".into(),
+        lineage_id: lineage.id.clone(),
+        generation: 3,
+        invocation_owner_key: "owner-key".into(),
+        provider_session_id: Some("provider-session-lookup".into()),
+        binding_fingerprint: "fingerprint-lookup".into(),
+        rehydrated_from_checkpoint_artifact_id: None,
+        working_directory: "/tmp/ws".into(),
+        workspace_mode: "workspace".into(),
+        runtime_provider: "claude".into(),
+        runtime_model: "sonnet".into(),
+        status: SessionGenerationStatus::Closed,
+        turn_count: 4,
+        estimated_input_tokens: 10,
+        latest_cached_input_tokens: Some(2),
+        latest_output_tokens: Some(8),
+        latest_model_context_window: Some(4096),
+        cumulative_prompt_tokens: 11,
+        cumulative_cost_cents: 12,
+        created_at: Utc::now(),
+        last_activity_at: None,
+        ended_at: None,
+        end_reason: Some("completed".into()),
+    };
+    sessions::insert_generation(&pool, &generation)
+        .await
+        .unwrap();
+
+    let found_lineage = sessions::find_lineage_by_id(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("lineage");
+    let found_generation = sessions::find_generation_by_id(&pool, &generation.id)
+        .await
+        .unwrap()
+        .expect("generation");
+
+    assert_eq!(
+        found_lineage.active_generation_id.as_deref(),
+        Some("session-generation-lookup")
+    );
+    assert_eq!(
+        found_generation.provider_session_id.as_deref(),
+        Some("provider-session-lookup")
+    );
+    assert_eq!(found_generation.status, SessionGenerationStatus::Closed);
+    assert_eq!(found_generation.lineage_id, lineage.id);
+}
+
+#[tokio::test]
+async fn session_lookup_helpers_return_none_for_missing_rows() {
+    let pool = test_pool().await;
+
+    assert!(sessions::find_lineage_by_id(&pool, "missing-lineage")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(sessions::find_generation_by_id(&pool, "missing-generation")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn steward_run_metadata_and_project_key_roundtrip() {
     let pool = test_pool().await;
     let idea = Idea {
@@ -240,6 +934,7 @@ async fn steward_run_metadata_and_project_key_roundtrip() {
         catalog_snapshot_json: Some(r#"{"agents":[]}"#.into()),
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -353,6 +1048,7 @@ async fn steward_analysis_schema_roundtrips_p049_contract() {
             catalog_snapshot_json: Some("{}".into()),
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -457,6 +1153,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -599,6 +1296,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -751,6 +1449,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1012,6 +1711,7 @@ async fn test_run_insert_and_find() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -1065,6 +1765,7 @@ async fn test_run_status_update() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     runs::update_status(&pool, run.id, RunStatus::Running)
@@ -1128,6 +1829,7 @@ async fn test_projection_parity_after_rebuild() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1292,6 +1994,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -1457,6 +2160,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1657,6 +2361,7 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1741,6 +2446,7 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1818,6 +2524,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await

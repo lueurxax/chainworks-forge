@@ -1,0 +1,73 @@
+scenarios:
+  - id: reuse-rust-proposal-review-selection
+    prompt: "Use $proposal-implementation-audit in auto mode for docs/proposals/RUST_QUEUE_RETRY.md. Reuse prior proposal-review routing if valid and write the versioned report beside the proposal."
+    must_pass:
+      - Discover prior proposal-review artifacts beside the proposal.
+      - Reuse `rust_arch_reviewer` and `rust_reliability_reviewer` when implementation evidence still matches retry/idempotency risks.
+      - Add `observability_rollout_reviewer` only if implementation evidence shows flags, telemetry, rollout, migration, or rollback surfaces.
+      - Keep `REQ-*` statuses tied to explicit proposal commitments.
+
+  - id: go-security-delta-from-prior-routing
+    prompt: "Use $proposal-implementation-audit in reuse-proposal-review-selection mode for docs/proposals/GO_PUBLIC_API.md and audit the current PR diff."
+    must_pass:
+      - Start from the prior selected reviewers.
+      - Detect auth/JWT/request-validation changes in implementation evidence.
+      - Add or justify `go_security_reviewer` as a delta reviewer.
+      - Record why any displaced reviewer was removed if the hard cap is reached.
+
+  - id: apple-ui-ux-implementation-proof
+    prompt: "Use $proposal-implementation-audit in auto mode for docs/proposals/IOS_ONBOARDING_FLOW.md."
+    must_pass:
+      - Select Apple UI/UX reviewers only for user-visible iOS/macOS surfaces.
+      - Distinguish code-level SwiftUI evidence from runtime, screenshot, or UI-test evidence.
+      - Preserve `Not Verifiable` for a critical UI flow when live proof is missing.
+
+  - id: cross-stack-client-server-contract
+    prompt: "Use $proposal-implementation-audit in auto mode for docs/proposals/PROFILE_API_V2.md against the current implementation."
+    must_pass:
+      - Route across client and backend surfaces when both are touched.
+      - Include `api_contract_reviewer` for shared schema/protobuf/OpenAPI changes.
+      - Verify generated code/client-server compatibility rather than checking only the schema file.
+      - Keep selected reviewer count within the hard cap.
+
+  - id: implemented-but-not-ready
+    prompt: "Use $proposal-implementation-audit in implementation-readiness mode for docs/proposals/MIGRATION_ROLLOUT.md."
+    must_pass:
+      - Allow `Overall Conformance = Implemented` while `Overall Implementation Readiness` is lower when rollout or rollback evidence is insufficient, but only if same-tree full regression or canonical full/proposal gate evidence passed.
+      - Include `observability_rollout_reviewer` for migration/rollback/flag surfaces.
+      - Produce at least one `OPS-*` or `READY-*` finding when readiness is blocked.
+
+  - id: successful-verdict-requires-full-regression
+    prompt: "Use $proposal-implementation-audit in auto mode for docs/proposals/ALL_REQS_MATCH.md."
+    must_pass:
+      - If every `REQ-*` is implemented but same-tree full regression or the canonical full/proposal gate is unavailable, red, stale, or from a different tree, fail closed instead of reporting `Overall Conformance = Implemented`.
+      - Do not report `Overall Implementation Readiness = Ready` or `Ready with Risks` without passing same-tree full regression or canonical gate evidence.
+      - Record the missing, stale, or failed gate in the verification log and readiness checklist.
+
+  - id: conformance-only-no-reviewer-drift
+    prompt: "Use $proposal-implementation-audit in conformance-only mode for docs/proposals/SCOPED_SCHEMA_FIX.md."
+    must_pass:
+      - Produce the `REQ-*` audit without broad specialist review.
+      - Mention that specialist findings were intentionally skipped due to mode.
+      - Avoid generic code review drift.
+
+  - id: prior-review-required-change-follow-through
+    prompt: "Use $proposal-implementation-audit in auto mode for docs/proposals/DEEP_LINK_REFACTOR.md. The prior proposal review listed required changes before implementation."
+    must_pass:
+      - Extract prior required changes from the prior proposal-review report.
+      - Verify whether the implementation addressed each required change.
+      - Do not treat prior review text as implementation proof.
+
+  - id: performance-claim-needs-benchmark-proof
+    prompt: "Use $proposal-implementation-audit in auto mode for docs/proposals/RUST_STREAMING_FAST_PATH.md."
+    must_pass:
+      - Select `rust_performance_reviewer` when the proposal or implementation includes hot-path/latency/throughput claims.
+      - Distinguish benchmark files from benchmark results.
+      - Mark performance-related requirements `Not Verifiable` or partial when benchmark proof is absent.
+
+  - id: no-unrelated-review-sweep
+    prompt: "Use $proposal-implementation-audit in diff-only mode for docs/proposals/GO_WORKER_TIMEOUTS.md."
+    must_pass:
+      - Stay focused on the changed worker/reliability slice and adjacent context.
+      - Avoid reviewing unrelated packages or UI surfaces.
+      - Record implementation evidence gaps instead of broadening the audit.

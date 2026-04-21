@@ -200,6 +200,18 @@ enum OutputContractResolverV2 {
             // Valid JSON — check required fields
             let missingFields = schema.requiredFields.filter { dict[$0] == nil }
             if missingFields.isEmpty {
+                if schema.contractID == "implementation_self_assessment_v2",
+                   let validationError = implementationSelfAssessmentV2ValidationError(in: dict) {
+                    return OutputValidationResult(
+                        outputName: name,
+                        contractID: schema.contractID,
+                        status: .failed,
+                        missingFields: [],
+                        validationError: validationError,
+                        rawPayloadSize: data.count
+                    )
+                }
+
                 return OutputValidationResult(
                     outputName: name,
                     contractID: schema.contractID,
@@ -262,6 +274,98 @@ enum OutputContractResolverV2 {
             return nil
         }
         return try? JSONSerialization.jsonObject(with: repairedData)
+    }
+
+    static func implementationSelfAssessmentV2ValidationError(in json: [String: Any]) -> String? {
+        guard strictBool(json["implementation_complete"]) != nil else {
+            return "implementation_self_assessment_v2 field 'implementation_complete' must be a boolean"
+        }
+        guard strictBool(json["verification_green"]) != nil else {
+            return "implementation_self_assessment_v2 field 'verification_green' must be a boolean"
+        }
+        guard let remainingCodeTasks = json["remaining_code_tasks"] as? [Any] else {
+            return "implementation_self_assessment_v2 field 'remaining_code_tasks' must be an array"
+        }
+        guard let handoffTasks = json["handoff_tasks"] as? [Any] else {
+            return "implementation_self_assessment_v2 field 'handoff_tasks' must be an array"
+        }
+        guard json["known_risks"] is [Any] else {
+            return "implementation_self_assessment_v2 field 'known_risks' must be an array"
+        }
+        guard json["tests_run"] is [Any] else {
+            return "implementation_self_assessment_v2 field 'tests_run' must be an array"
+        }
+        guard json["docs_impacted"] is [Any] else {
+            return "implementation_self_assessment_v2 field 'docs_impacted' must be an array"
+        }
+
+        for (index, value) in remainingCodeTasks.enumerated() {
+            guard let task = value as? [String: Any] else {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)] must be an object"
+            }
+            if nonEmptyString(task["summary"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].summary must be a non-empty string"
+            }
+            if nonEmptyString(task["owner"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].owner must be a non-empty string"
+            }
+            if strictBool(task["blocking"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].blocking must be a boolean"
+            }
+            if nonEmptyString(task["evidence"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].evidence must be a non-empty string"
+            }
+        }
+
+        let allowedOwnerClasses: Set<String> = [
+            "docs",
+            "manual_evidence",
+            "release",
+            "ops",
+            "product",
+            "human_operator",
+            "unknown"
+        ]
+        for (index, value) in handoffTasks.enumerated() {
+            guard let task = value as? [String: Any] else {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)] must be an object"
+            }
+            if nonEmptyString(task["summary"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].summary must be a non-empty string"
+            }
+            guard let ownerClass = nonEmptyString(task["owner_class"]),
+                  allowedOwnerClasses.contains(ownerClass) else {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].owner_class must be one of docs, manual_evidence, release, ops, product, human_operator, unknown"
+            }
+            if nonEmptyString(task["target_stage"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].target_stage must be a non-empty string"
+            }
+            if strictBool(task["blocking_review"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].blocking_review must be a boolean"
+            }
+            if nonEmptyString(task["evidence"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].evidence must be a non-empty string"
+            }
+        }
+
+        return nil
+    }
+
+    private static func strictBool(_ value: Any?) -> Bool? {
+        if let boolValue = value as? Bool {
+            return boolValue
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return number.boolValue
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func repairedJSONDataIfLikelyQuotedStringIssue(_ data: Data) -> Data? {

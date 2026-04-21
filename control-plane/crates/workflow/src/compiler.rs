@@ -416,6 +416,8 @@ fn compile_state(
         .loop_config
         .as_ref()
         .map(|lc| compile_loop(lc, variables));
+    let degraded_output_policy =
+        compile_degraded_output_policy(state.degraded_output_policy.as_ref(), contracts)?;
 
     Ok(CompiledState {
         id: state_id.to_string(),
@@ -428,7 +430,59 @@ fn compile_state(
         post_approval_tasks,
         transitions,
         loop_config,
+        degraded_output_policy,
     })
+}
+
+fn compile_degraded_output_policy(
+    policy: Option<&definition::DegradedOutputPolicyDef>,
+    contracts: &ContractLookup,
+) -> Result<DegradedOutputPolicy> {
+    let Some(policy) = policy else {
+        return Ok(DegradedOutputPolicy::default());
+    };
+    match policy.mode.as_str() {
+        "deny" => Ok(DegradedOutputPolicy::default()),
+        "allow_valid_contract_outputs" => {
+            let contract_ids = policy.contracts.clone().unwrap_or_default();
+            if contract_ids.is_empty() {
+                anyhow::bail!(
+                    "degraded_output_policy allow_valid_contract_outputs requires contracts"
+                );
+            }
+            for contract_id in &contract_ids {
+                if !contracts.by_contract_id.contains_key(contract_id) {
+                    anyhow::bail!("unknown degraded_output_policy contract_id: {contract_id}");
+                }
+            }
+            let failure_kinds = policy.failure_kinds.clone().unwrap_or_default();
+            for failure_kind in &failure_kinds {
+                if !matches!(
+                    failure_kind.as_str(),
+                    "provider_failure"
+                        | "provider_quota"
+                        | "provider_timeout"
+                        | "transport_interrupted"
+                ) {
+                    anyhow::bail!("unknown degraded_output_policy failure_kind: {failure_kind}");
+                }
+            }
+            let max_settlement = policy
+                .max_settlement
+                .clone()
+                .unwrap_or_else(|| "valid_outputs_from_failed_execution".to_string());
+            if max_settlement != "valid_outputs_from_failed_execution" {
+                anyhow::bail!("unknown degraded_output_policy max_settlement: {max_settlement}");
+            }
+            Ok(DegradedOutputPolicy {
+                mode: "allow_valid_contract_outputs".to_string(),
+                contracts: contract_ids,
+                failure_kinds,
+                max_settlement,
+            })
+        }
+        other => anyhow::bail!("unknown degraded_output_policy mode: {other}"),
+    }
 }
 
 fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Result<ResolvedAgent> {

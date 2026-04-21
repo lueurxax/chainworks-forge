@@ -258,6 +258,7 @@ mod tests {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         };
         runs::insert(&pool, &run).await.unwrap();
         stages::insert(

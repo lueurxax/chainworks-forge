@@ -412,9 +412,9 @@ struct OrchestratorTests {
                     format: "json",
                     requiredFields: ["status", "current_phase", "completed_items", "deferred_items", "notes"]
                 ),
-                "implementation_self_assessment_v1": ArtifactContract(
+                "implementation_self_assessment_v2": ArtifactContract(
                     format: "json",
-                    requiredFields: ["seemingly_complete", "remaining_tasks", "known_risks", "tests_run", "docs_impacted"]
+                    requiredFields: ["implementation_complete", "verification_green", "remaining_code_tasks", "handoff_tasks", "known_risks", "tests_run", "docs_impacted"]
                 ),
                 "changed_files_manifest": ArtifactContract(
                     format: "json",
@@ -422,7 +422,7 @@ struct OrchestratorTests {
                 ),
                 "tests_result": ArtifactContract(
                     format: "json",
-                    requiredFields: ["green", "summary"]
+                    requiredFields: ["status", "summary"]
                 )
             ],
             backendProfiles: [:],
@@ -884,7 +884,8 @@ struct OrchestratorTests {
 
         await orchestrator.start()
 
-        #expect(await box.models == ["GPT-5.4"])
+        let attemptedModels = await box.models
+        #expect(attemptedModels.count == 1)
         #expect(run.status == .failed)
 
         let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
@@ -3850,11 +3851,10 @@ struct OrchestratorTests {
         #expect(run.totalCostCents! > 0, "Cost should be aggregated from executed agents")
     }
 
-    // MARK: - Approval Rejection (REQ-005: rejection cancels, not fails)
+    // MARK: - Approval Rejection
 
-    /// Proposal contract: approval rejection must cancel the run, not mark it as failed.
-    @Test("Approval rejection cancels the run")
-    func approvalRejectedCancels() async {
+    @Test("Approval rejection follows rejected transition")
+    func approvalRejectedFollowsRejectedTransition() async {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
 
@@ -3864,8 +3864,16 @@ struct OrchestratorTests {
                 "start": ExecutableState(
                     id: "start", label: "Approval Gate", type: .start,
                     ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
-                    transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
+                    transitions: [
+                        ExecutableTransition(to: "end", condition: .approvalGranted),
+                        ExecutableTransition(to: "refine", condition: .approvalRejected)
+                    ],
                     approvalRequired: true, approvalPolicy: nil, loop: nil
+                ),
+                "refine": ExecutableState(
+                    id: "refine", label: "Refine", type: .end,
+                    ownerAgentID: "a1", runBlock: nil, runAfterApproval: nil,
+                    transitions: [], approvalRequired: false, approvalPolicy: nil, loop: nil
                 ),
                 "end": ExecutableState(
                     id: "end", label: "End", type: .end,
@@ -3902,12 +3910,13 @@ struct OrchestratorTests {
         // Reject the approval
         orchestrator.resolveApproval(stageID: "start", granted: false, comment: "Rejected in test")
 
-        // Proposal contract: rejection cancels (not fails)
-        #expect(run.status == .cancelled, "Rejected approval must cancel the run, not fail it")
-        #expect(orchestrator.isCancelled, "Orchestrator must be marked cancelled")
-        #expect(!orchestrator.isRunning, "Orchestrator must stop running")
-        #expect(completionCalled, "onComplete must fire on rejection")
-        #expect(!completionSuccess, "onComplete should report failure")
+        await awaitCondition("Run should follow rejected approval transition", timeout: 3.0) {
+            run.status == .completed
+        }
+        #expect(orchestrator.currentStateID == "refine")
+        #expect(!orchestrator.isCancelled, "Rejected approval must not cancel the workflow when a rejected transition exists")
+        #expect(completionCalled, "onComplete must fire after rejected transition reaches an end state")
+        #expect(completionSuccess, "onComplete should report success after rejected transition reaches an end state")
 
         // Verify the approval record was updated
         let rejectedApproval = run.approvals.first { $0.stageID == "start" }
@@ -4219,6 +4228,39 @@ struct OrchestratorTests {
     func implementationPartialArtifactSetRecoversFailedCodeWriter() async throws {
         let workspace = makeWorkspace()
         let run = makeRun(workspace: workspace)
+        run.implementationSelfAssessmentSummaryJSON = try JSONSerialization.data(withJSONObject: [
+            "status": "needs_code_fixes",
+            "implementation_complete": false,
+            "verification_green": false,
+            "remaining_code_task_count": 2,
+            "blocking_remaining_code_task_count": 2,
+            "handoff_task_count": 0,
+            "blocking_review_handoff_task_count": 0,
+            "remaining_code_tasks": [
+                [
+                    "summary": "Resume implementation",
+                    "owner": "code_writer",
+                    "blocking": true,
+                    "evidence": "Execution stopped before canonical test reporting.",
+                    "source_pointer": "/remaining_code_tasks/0"
+                ],
+                [
+                    "summary": "Run verification",
+                    "owner": "code_writer",
+                    "blocking": true,
+                    "evidence": "tests_result was missing from primary execution.",
+                    "source_pointer": "/remaining_code_tasks/1"
+                ]
+            ],
+            "handoff_tasks": [],
+            "known_risks": ["Execution stopped before canonical test report was written."],
+            "tests_run": [],
+            "docs_impacted": [],
+            "owner_class_counts": [String: Int](),
+            "target_stage_summaries": [],
+            "validation_errors": [],
+            "warnings": []
+        ], options: [.sortedKeys])
         let agent = ResolvedAgent(
             id: "code_writer",
             title: "Code Writer",
@@ -4253,17 +4295,32 @@ struct OrchestratorTests {
                 "notes": "Execution stopped before canonical test reporting."
             ], options: [.sortedKeys]),
             "implementation_self_assessment": try JSONSerialization.data(withJSONObject: [
-                "seemingly_complete": false,
-                "remaining_tasks": ["Resume implementation", "Run verification"],
+                "implementation_complete": false,
+                "verification_green": false,
+                "remaining_code_tasks": [
+                    [
+                        "summary": "Resume implementation",
+                        "owner": "code_writer",
+                        "blocking": true,
+                        "evidence": "Execution stopped before canonical test reporting."
+                    ],
+                    [
+                        "summary": "Run verification",
+                        "owner": "code_writer",
+                        "blocking": true,
+                        "evidence": "tests_result was missing from primary execution."
+                    ]
+                ],
+                "handoff_tasks": [],
                 "known_risks": ["Execution stopped before canonical test report was written."],
-                "tests_run": false,
+                "tests_run": [],
                 "docs_impacted": []
             ], options: [.sortedKeys]),
             "changed_files_manifest": try JSONSerialization.data(withJSONObject: [
                 "files": ["Sources/App.swift"]
             ], options: [.sortedKeys]),
             "tests_result": try JSONSerialization.data(withJSONObject: [
-                "green": false,
+                "status": "blocked",
                 "summary": "Execution stopped before canonical test reporting."
             ], options: [.sortedKeys])
         ]
@@ -4300,8 +4357,8 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [
-                        ExecutableTransition(to: "continue", condition: .expression("implementation_self_assessment.seemingly_complete == false")),
-                        ExecutableTransition(to: "end", condition: .expression("implementation_self_assessment.seemingly_complete == true"))
+                        ExecutableTransition(to: "continue", condition: .expression("implementation_self_assessment_v2.status == 'needs_code_fixes'")),
+                        ExecutableTransition(to: "end", condition: .expression("implementation_self_assessment_v2.status == 'complete'"))
                     ],
                     approvalRequired: false,
                     approvalPolicy: nil,

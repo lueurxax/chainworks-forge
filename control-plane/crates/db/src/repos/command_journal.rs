@@ -6,6 +6,11 @@ use sqlx::SqlitePool;
 ///
 /// The journal is a write-once audit trail; entries are never mutated after
 /// the initial insert — they are closed by `complete_entry` or `fail_entry`.
+///
+/// `request_id` is the P042 §9.3 correlation id attached to the inbound
+/// request by the `X-Request-ID` middleware. `None` for MCP-stdio mode
+/// (which has no HTTP envelope) and for legacy callers that bypass the
+/// middleware; all HTTP-born commands carry a populated value.
 pub async fn record(
     pool: &SqlitePool,
     id: &str,
@@ -17,10 +22,11 @@ pub async fn record(
     caller_principal_id: Option<&str>,
     caller_principal_class: Option<&str>,
     caller_tool: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool)
-           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id)
+           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
     )
     .bind(id)
     .bind(command_type)
@@ -31,10 +37,23 @@ pub async fn record(
     .bind(caller_principal_id)
     .bind(caller_principal_class)
     .bind(caller_tool)
+    .bind(request_id)
     .execute(pool)
     .await
     .context("record command journal entry")?;
     Ok(())
+}
+
+/// Look up a journal entry's `request_id` (§9.3 cross-surface
+/// correlation test helper).
+pub async fn find_request_id(pool: &SqlitePool, id: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT request_id FROM command_journal WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .context("find journal request_id")?;
+    Ok(row.and_then(|(request_id,)| request_id))
 }
 
 /// Mark a journal entry as successfully completed.

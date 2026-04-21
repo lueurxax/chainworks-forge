@@ -146,7 +146,9 @@ final class ExecutionService {
         RuntimeHelperProcessJanitor.live.sweepStaleHelpers()
         rebuildPersistedPendingApprovals()
         startMaintenanceLoop()
-        scheduleReportHistoryCompaction()
+        if !Self.isXCTestHost {
+            scheduleReportHistoryCompaction()
+        }
     }
 
     var liveRuntimeConfiguration: LiveRuntimeConfiguration? {
@@ -167,6 +169,10 @@ final class ExecutionService {
             guard let runtimeExecutor = orchestrator.executor as? RuntimeAgentExecutor else { continue }
             runtimeExecutor.prepareForAppTermination()
         }
+    }
+
+    private static var isXCTestHost: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 
     private func scheduleReportHistoryCompaction() {

@@ -180,6 +180,60 @@ fn test_compile_full_mvp_live_plan() {
 }
 
 #[test]
+fn p054_workflow_transitions_use_v2_status_and_rejection_loopback() {
+    let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+
+    for workflow_name in ["full-mvp-live.yaml", "workflow.yaml"] {
+        let wf_path = format!("{}/workflows/{workflow_name}", fixtures_dir());
+        let plan = compiler::compile(&wf_path, &cat_path).expect("should compile plan");
+
+        let state6 = &plan.states["state_6_implementation_approval"];
+        assert!(
+            state6
+                .transitions
+                .iter()
+                .any(|t| t.to == "state_5_proposal_refined"
+                    && t.condition == "approval.rejected == true"),
+            "{workflow_name}: state_6 must loop rejected implementation approval back to proposal refinement"
+        );
+
+        let state7 = &plan.states["state_7_implementation_started"];
+        let state8 = &plan.states["state_8_implementation_continued"];
+        for state in [state7, state8] {
+            assert!(
+                state
+                    .transitions
+                    .iter()
+                    .any(|t| t.to == "state_8_implementation_continued"
+                        && t.condition.contains("implementation_self_assessment_v2.status")
+                        && t.condition.contains("'needs_code_fixes'")
+                        && t.condition.contains("'invalid'")
+                        && t.condition.contains("'unknown'")),
+                "{workflow_name}: {} must route invalid/unknown/needs_code_fixes statuses into the code loop",
+                state.id
+            );
+            assert!(
+                state
+                    .transitions
+                    .iter()
+                    .any(|t| t.to == "state_9_implementation_reviewed"
+                        && t.condition.contains("implementation_self_assessment_v2.status")
+                        && t.condition.contains("'complete'")
+                        && t.condition.contains("'handoff_required'")
+                        && t.condition.contains("'blocked'")),
+                "{workflow_name}: {} must exit the code loop only for complete, handoff_required, or blocked",
+                state.id
+            );
+        }
+
+        assert!(
+            !state8.label.contains("seemingly complete"),
+            "{workflow_name}: state_8 operator label must not preserve deprecated seemingly_complete wording"
+        );
+    }
+}
+
+#[test]
 fn steward_metadata_contract_tests_freeze_workflow_metadata_and_parsed_snapshots() {
     let plan = compile_from_strings(
         r#"
@@ -298,6 +352,120 @@ workflow:
     assert_eq!(plan_a.catalog_snapshot_json, plan_b.catalog_snapshot_json);
     assert_eq!(plan_a.workflow_snapshot_hash, plan_b.workflow_snapshot_hash);
     assert_eq!(plan_a.catalog_snapshot_hash, plan_b.catalog_snapshot_hash);
+}
+
+#[test]
+fn proposal_057_degraded_output_policy_is_compiled_and_validated() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: review
+states:
+  review:
+    label: Review
+    owner: reviewer
+    degraded_output_policy:
+      mode: allow_valid_contract_outputs
+      contracts:
+        - prepush_review_v1
+      failure_kinds:
+        - provider_failure
+      max_settlement: valid_outputs_from_failed_execution
+    run:
+      sequence:
+        - agent: reviewer
+          task: check
+          outputs:
+            - prepush_review_v1
+"#,
+        r#"
+backend_profiles:
+  reviewer_profile:
+    provider: claude
+agents:
+  - id: reviewer
+    backend_profile: reviewer_profile
+    prompt: "review"
+contracts:
+  prepush_review_v1:
+    format: json
+    machine_format: json
+    normalized_artifact_name: prepush_review_v1
+    required_fields: [status]
+"#,
+    );
+
+    let policy = &plan.states["review"].degraded_output_policy;
+    assert_eq!(policy.mode, "allow_valid_contract_outputs");
+    assert_eq!(policy.contracts, vec!["prepush_review_v1"]);
+    assert_eq!(policy.failure_kinds, vec!["provider_failure"]);
+    assert_eq!(policy.max_settlement, "valid_outputs_from_failed_execution");
+}
+
+#[test]
+fn proposal_057_degraded_output_policy_rejects_unknown_contracts() {
+    let workflow_yaml = r#"
+workflow:
+  id: p057-invalid-policy
+  family: p057
+initial_state: review
+states:
+  review:
+    label: Review
+    owner: reviewer
+    degraded_output_policy:
+      mode: allow_valid_contract_outputs
+      contracts:
+        - missing_contract_v1
+"#;
+    let catalog_yaml = r#"
+backend_profiles:
+  reviewer_profile:
+    provider: claude
+agents:
+  - id: reviewer
+    backend_profile: reviewer_profile
+    prompt: "review"
+"#;
+    let wf_path = write_temp_fixture("p057-invalid-policy-workflow.yaml", workflow_yaml);
+    let cat_path = write_temp_fixture("p057-invalid-policy-catalog.yaml", catalog_yaml);
+    let err = compiler::compile(&wf_path, &cat_path).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("unknown degraded_output_policy contract_id"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn proposal_057_live_workflows_use_canonical_implementation_contract_guards() {
+    let examples = fixtures_dir();
+    for workflow_name in ["workflow.yaml", "full-mvp-live.yaml"] {
+        let workflow_path = format!("{examples}/workflows/{workflow_name}");
+        let workflow_text =
+            fs::read_to_string(&workflow_path).expect("workflow fixture should be readable");
+        assert!(
+            !workflow_text.contains("implementation_self_assessment.seemingly_complete"),
+            "{workflow_name} must not transition on legacy self-assessment boolean truth"
+        );
+        assert!(
+            !workflow_text.contains("tests_result.green"),
+            "{workflow_name} must not transition on legacy tests boolean truth"
+        );
+        assert!(
+            workflow_text.contains("implementation_self_assessment_v2.implementation_complete"),
+            "{workflow_name} must read implementation completeness from canonical active contract truth"
+        );
+        assert!(
+            workflow_text.contains("tests_result_v1.status"),
+            "{workflow_name} must read test status from canonical active contract truth"
+        );
+    }
+
+    let catalog_text = fs::read_to_string(format!("{examples}/agents/agents.yaml"))
+        .expect("agent catalog fixture should be readable");
+    assert!(catalog_text.contains("implementation_self_assessment_v2:"));
+    assert!(catalog_text.contains("tests_result_v1:"));
+    assert!(!catalog_text.contains("output_contract: implementation_self_assessment_v1"));
 }
 
 #[test]

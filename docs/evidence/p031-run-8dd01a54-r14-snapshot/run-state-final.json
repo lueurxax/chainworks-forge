@@ -1,0 +1,13 @@
+{
+  "active_artifacts": {},
+  "active_index_owner": "sqlite",
+  "advisory_artifacts": [],
+  "current_state": "state_5_proposal_refined",
+  "exported_path": ".chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/state/run-state.json",
+  "invalid_required_artifacts": [],
+  "operator_overrides": [],
+  "run_id": "8dd01a54-0791-43e0-b526-5ed92c95b34f",
+  "schema_version": "run-state-projection.v1",
+  "status": "blocked",
+  "warnings": []
+}

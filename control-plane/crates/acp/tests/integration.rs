@@ -140,6 +140,66 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server script that completes session/new, then
+    /// closes stdout during session/prompt while keeping stdin alive. The
+    /// adapter should still send session/close before returning the prompt
+    /// transport error.
+    pub fn create_prompt_stdout_close_script(
+        tmpdir: &std::path::Path,
+        marker_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_prompt_stdout_close.py");
+        let marker = marker_path.to_string_lossy();
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, os
+
+MARKER = {marker:?}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": "fixture-stdout-close"}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+os.close(sys.stdout.fileno())
+close_msg = recv()
+if close_msg and close_msg.get("method") == "session/close":
+    with open(MARKER, "w") as f:
+        f.write("closed\n")
+"#
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that overwrites a pre-existing
     /// canonical output file instead of creating a brand-new one.
     pub fn create_overwrite_script(tmpdir: &std::path::Path) -> String {
@@ -259,6 +319,71 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server script that emits a JSON-object
+    /// CHAINWORKS_OUTPUT envelope over `session/update`.
+    pub fn create_json_object_envelope_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_json_object_envelope.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-json-envelope"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+payload = {
+    "CHAINWORKS_OUTPUT": {
+        "proposal_review": {"status": "green"},
+        "/tmp/run/implementation/progress.md": {"seemingly_complete": True}
+    }
+}
+send({
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": json.dumps(payload)}
+        }
+    }
+})
+
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that keeps a single session alive
     /// across two prompt turns and exits only after `session/close`.
     pub fn create_reuse_script(tmpdir: &std::path::Path) -> String {
@@ -311,6 +436,57 @@ send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "s
 msg = recv()
 if msg is None or msg.get("method") != "session/close":
     sys.exit(1)
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Write a fixture ACP server script that exits cleanly after the first
+    /// prompt even though the manager was asked to keep the session alive.
+    pub fn create_exits_after_first_prompt_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_exits_after_first_prompt.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {}).get("cwd", "/tmp")
+session_id = "fixture-session-exits-after-first-prompt"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+with open(os.path.join(cwd, "first.json"), "w") as f:
+    f.write('{"turn": 1}\n')
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+
 sys.exit(0)
 "#;
         std::fs::write(&script, code).unwrap();
@@ -420,6 +596,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -477,6 +654,7 @@ async fn mcp_servers_session_new_serialization_tests() {
                     .collect(),
             },
         }],
+        chainworks_meta_root: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -524,6 +702,7 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -536,6 +715,57 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
     assert!(
         result.artifact_paths.is_empty(),
         "failed session must have no artifact paths"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn adapter_execute_closes_session_after_prompt_transport_error() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let close_marker = tmp.path().join("session_close_seen.txt");
+    let script = fixture::create_prompt_stdout_close_script(tmp.path(), &close_marker);
+
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_prompt_transport_error".into(),
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "trigger stdout close".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+    };
+
+    let error = adapter
+        .execute(req)
+        .await
+        .expect_err("closed stdout during prompt should surface a transport error");
+
+    assert!(
+        error
+            .to_string()
+            .contains("ACP stdout closed before terminal response"),
+        "unexpected prompt error: {error:#}"
+    );
+    assert!(
+        close_marker.is_file(),
+        "adapter must send session/close even after prompt transport errors"
     );
 }
 
@@ -588,6 +818,7 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -630,6 +861,7 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -674,6 +906,7 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -689,6 +922,65 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
     assert_eq!(
         std::str::from_utf8(&result.discovered_artifacts[0].content).unwrap(),
         "{\"status\":\"green\"}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_json_object_envelope_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_json_envelope".into(),
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "emit json object envelope".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(result.artifact_paths.is_empty());
+    assert_eq!(result.discovered_artifacts.len(), 2);
+    assert!(result
+        .discovered_artifacts
+        .iter()
+        .any(|artifact| artifact.name == "proposal_review"
+            && artifact.content == br#"{"status":"green"}"#));
+    assert!(result
+        .discovered_artifacts
+        .iter()
+        .any(
+            |artifact| artifact.name == "/tmp/run/implementation/progress.md"
+                && artifact.content == br#"{"seemingly_complete":true}"#
+        ));
+    assert!(
+        result
+            .transcript_text
+            .as_deref()
+            .is_some_and(|text| text.contains("CHAINWORKS_OUTPUT")),
+        "stream transcript should preserve the emitted JSON envelope"
     );
 }
 
@@ -727,6 +1019,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -761,6 +1054,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -777,6 +1071,87 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         .close_session(&session_generation_id)
         .await
         .expect("manager should close the reused live session");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::{AcpRuntimeManager, ExecutionRequest};
+    use domain::ids::RunId;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_exits_after_first_prompt_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let manager =
+        AcpRuntimeManager::new_with_adapters(vec![Arc::new(adapter) as Arc<dyn AcpAdapter>]);
+
+    let first_req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_first".into(),
+        agent_id: "reuse-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "first turn".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        keep_session_alive: true,
+        reuse_existing_session: false,
+        session_generation_id: Some("generation-1".into()),
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+    };
+
+    let first_result = manager.execute(first_req).await.unwrap();
+    let session_generation_id = first_result
+        .session_generation_id
+        .clone()
+        .expect("live session result should include a generation id");
+    let provider_session_id = first_result.provider_session_id.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        !manager
+            .has_live_session(&session_generation_id, provider_session_id.as_deref())
+            .await,
+        "exited ACP subprocess must not pass live-session reuse healthcheck"
+    );
+
+    let reuse_req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_second".into(),
+        agent_id: "reuse-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "second turn".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: true,
+        session_generation_id: Some(session_generation_id),
+        provider_session_id,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+    };
+
+    let error = manager.execute(reuse_req).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("No live ACP session registered for generation id"),
+        "stale live handle should be removed before prompt reuse: {error}"
+    );
 }
 
 #[cfg(unix)]
@@ -810,6 +1185,7 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -822,4 +1198,92 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
     assert_eq!(usage.cached_input_tokens, Some(6_000));
     assert_eq!(usage.output_tokens, Some(1_200));
     assert_eq!(usage.model_context_window, Some(200_000));
+}
+
+// ---------------------------------------------------------------------------
+// P050: Non-Codex adapter receives CHAINWORKS_META_ROOT env var
+// ---------------------------------------------------------------------------
+
+/// P050 proof: Claude adapter subprocess receives CHAINWORKS_META_ROOT env var
+/// when ExecutionRequest.chainworks_meta_root is set.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_receives_chainworks_meta_root_env() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+
+    // Create a fixture that writes the CHAINWORKS_META_ROOT env to a file.
+    let tmp = tempfile::tempdir().unwrap();
+    let env_probe_path = tmp.path().join("meta_root_env.txt");
+    let script = tmp.path().join("acp_env_probe.py");
+    let code = format!(
+        r#"#!/usr/bin/env python3
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line: return None
+    try: return json.loads(line.strip())
+    except: return None
+
+# Record the env var before any protocol
+meta_root = os.environ.get('CHAINWORKS_META_ROOT', '<NOT SET>')
+with open('{}', 'w') as f:
+    f.write(meta_root)
+
+msg = recv()
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+msg = recv()
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": "probe"}}}})
+msg = recv()
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": "probe"}}}})
+sys.exit(0)
+"#,
+        env_probe_path.to_string_lossy().replace('\\', "\\\\")
+    );
+    std::fs::write(&script, code).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+    }
+
+    let adapter = ClaudeAgentAdapter::new_with_binary(script.to_str().unwrap());
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "env_probe".into(),
+        agent_id: "env-probe-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "probe env".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: vec![],
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: vec![],
+        chainworks_meta_root: Some(".chainworks/runs/env-test-run".into()),
+    };
+
+    let _ = adapter.execute(req).await;
+
+    // The fixture wrote the env var value to a file.
+    let recorded =
+        std::fs::read_to_string(&env_probe_path).unwrap_or_else(|_| "<file not found>".into());
+    assert!(
+        recorded.contains("/.chainworks/runs/env-test-run"),
+        "Claude adapter subprocess must receive CHAINWORKS_META_ROOT env var, got: {recorded}"
+    );
 }

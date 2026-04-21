@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Context, Result};
 use domain::agent::AgentStatus;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -26,8 +27,8 @@ use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
 use crate::{
-    AcpMcpServerPayload, DiscoveredArtifact, ExecutionRequest, McpActualObservation,
-    ResolvedMcpServerTransport, UsageSnapshot,
+    AcpCloseDiagnostic, AcpMcpServerPayload, DiscoveredArtifact, ExecutionRequest,
+    McpActualObservation, ResolvedMcpServerTransport, UsageSnapshot,
 };
 
 /// Strip ANSI escape sequences from a string for clean log output.
@@ -178,14 +179,59 @@ fn mcp_servers_wire_value(servers: &[AcpMcpServerPayload]) -> Result<Value> {
     Ok(Value::Array(wire_servers))
 }
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+const GEMINI_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(10);
 /// Max silence between messages before we consider the session hung.
 /// Reset on every received line (including notifications).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+const FORCE_KILL_WAIT: Duration = Duration::from_secs(1);
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
 const OUTPUT_END_MARKER: &str = "<<<END_CHAINWORKS_OUTPUT>>>";
+
+fn handshake_timeout_for_provider(provider: &str) -> Duration {
+    if provider.eq_ignore_ascii_case("gemini") {
+        GEMINI_HANDSHAKE_TIMEOUT
+    } else {
+        DEFAULT_HANDSHAKE_TIMEOUT
+    }
+}
+
+/// Put each provider subprocess in its own process group so forced shutdown can
+/// reap MCP/plugin children that outlive the ACP parent process.
+pub fn isolate_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: libc::c_int) {
+    if pid > libc::pid_t::MAX as u32 {
+        return;
+    }
+    // Safety: killpg only observes the numeric process-group id and signal.
+    let rc = unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        let errno = error.raw_os_error();
+        if errno != Some(libc::ESRCH) {
+            warn!(
+                pid,
+                signal,
+                error = %error,
+                "ACP process-group signal failed"
+            );
+        }
+    }
+}
+
+fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
+    line.contains("EPIPE") || line.contains("write EPIPE")
+}
 
 // ---------------------------------------------------------------------------
 // Workspace snapshot — used for artifact discovery
@@ -320,6 +366,10 @@ fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSna
         .or(current.model_context_window);
 }
 
+fn non_empty_transcript(text: String) -> Option<String> {
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn observe_mcp_actuals(
     session_new_result: &Value,
     req: &ExecutionRequest,
@@ -441,7 +491,74 @@ fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
         cursor = content_end + OUTPUT_END_MARKER.len();
     }
 
+    let mut seen: HashSet<String> = artifacts
+        .iter()
+        .map(|artifact| artifact.name.clone())
+        .collect();
+    for artifact in extract_json_object_output_envelopes(stream_text) {
+        if seen.insert(artifact.name.clone()) {
+            artifacts.push(artifact);
+        }
+    }
+
     artifacts
+}
+
+fn extract_json_object_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
+    let mut artifacts = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found_rel) = stream_text[cursor..].find("\"CHAINWORKS_OUTPUT\"") {
+        let found = cursor + found_rel;
+        let Some(value) = parse_enclosing_json_object_with_chainworks_output(stream_text, found)
+        else {
+            cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
+            continue;
+        };
+        artifacts.extend(chainworks_output_artifacts_from_value(&value));
+        cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
+    }
+    artifacts
+}
+
+fn parse_enclosing_json_object_with_chainworks_output(
+    stream_text: &str,
+    marker: usize,
+) -> Option<Value> {
+    let mut starts: Vec<usize> = stream_text[..marker]
+        .match_indices('{')
+        .map(|(idx, _)| idx)
+        .collect();
+    starts.push(marker);
+    starts.into_iter().rev().find_map(|start| {
+        let candidate = &stream_text[start..];
+        let mut deserializer = serde_json::Deserializer::from_str(candidate);
+        let value = Value::deserialize(&mut deserializer).ok()?;
+        value.get("CHAINWORKS_OUTPUT").is_some().then_some(value)
+    })
+}
+
+fn chainworks_output_artifacts_from_value(value: &Value) -> Vec<DiscoveredArtifact> {
+    let Some(Value::Object(outputs)) = value.get("CHAINWORKS_OUTPUT") else {
+        return Vec::new();
+    };
+
+    outputs
+        .iter()
+        .filter_map(|(name, payload)| {
+            if name.trim().is_empty() {
+                return None;
+            }
+            let content = match payload {
+                Value::String(text) => text.as_bytes().to_vec(),
+                other => serde_json::to_vec(other).ok()?,
+            };
+            Some(DiscoveredArtifact {
+                name: name.clone(),
+                content,
+                source_path: None,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +585,7 @@ async fn await_response(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     expected_id: u64,
     time_limit: Duration,
+    phase: &str,
 ) -> Result<Value> {
     let start = Instant::now();
     let mut line = String::new();
@@ -475,15 +593,26 @@ async fn await_response(
     loop {
         let elapsed = start.elapsed();
         if elapsed >= time_limit {
-            bail!("ACP handshake timed out waiting for response id={expected_id}");
+            return diagnose_late_handshake_response(reader, expected_id, phase, start, time_limit)
+                .await;
         }
         let remaining = time_limit - elapsed;
 
         line.clear();
-        let n = timeout(remaining, reader.read_line(&mut line))
-            .await
-            .context("ACP handshake read timeout")?
-            .context("ACP handshake read_line error")?;
+        let n = match timeout(remaining, reader.read_line(&mut line)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err).context("ACP handshake read_line error"),
+            Err(_) => {
+                return diagnose_late_handshake_response(
+                    reader,
+                    expected_id,
+                    phase,
+                    start,
+                    time_limit,
+                )
+                .await;
+            }
+        };
 
         if n == 0 {
             bail!("ACP subprocess stdout closed before responding to id={expected_id}");
@@ -530,6 +659,78 @@ async fn await_response(
             .get("result")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default())));
+    }
+}
+
+async fn diagnose_late_handshake_response(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    expected_id: u64,
+    phase: &str,
+    start: Instant,
+    time_limit: Duration,
+) -> Result<Value> {
+    let mut line = String::new();
+    match timeout(LATE_RESPONSE_DIAGNOSTIC_WINDOW, reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => {
+            bail!(
+                "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; subprocess stdout closed during late-response diagnostic window",
+                time_limit.as_secs()
+            );
+        }
+        Ok(Ok(_)) => {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                bail!(
+                    "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; only an empty late line arrived within {}s",
+                    time_limit.as_secs(),
+                    LATE_RESPONSE_DIAGNOSTIC_WINDOW.as_secs()
+                );
+            }
+
+            let parsed: Option<Value> = serde_json::from_str(trimmed).ok();
+            let late_id = parsed.as_ref().and_then(|value| match value.get("id") {
+                Some(Value::Number(n)) => n.as_u64(),
+                Some(Value::String(s)) => s.parse().ok(),
+                _ => None,
+            });
+            let elapsed_ms = start.elapsed().as_millis();
+
+            if late_id == Some(expected_id) {
+                warn!(
+                    phase = %phase,
+                    expected_id,
+                    elapsed_ms,
+                    timeout_ms = time_limit.as_millis() as u64,
+                    "ACP late handshake response arrived after timeout"
+                );
+                bail!(
+                    "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; matching response arrived late after {elapsed_ms}ms",
+                    time_limit.as_secs()
+                );
+            }
+
+            warn!(
+                phase = %phase,
+                expected_id,
+                late_id = ?late_id,
+                elapsed_ms,
+                late_line = %trimmed,
+                "ACP observed non-matching late handshake line after timeout"
+            );
+            bail!(
+                "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; non-matching late line arrived within {}s",
+                time_limit.as_secs(),
+                LATE_RESPONSE_DIAGNOSTIC_WINDOW.as_secs()
+            );
+        }
+        Ok(Err(err)) => Err(err).context("ACP late handshake diagnostic read_line error"),
+        Err(_) => {
+            bail!(
+                "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; no late response within {}s",
+                time_limit.as_secs(),
+                LATE_RESPONSE_DIAGNOSTIC_WINDOW.as_secs()
+            );
+        }
     }
 }
 
@@ -646,6 +847,14 @@ impl AcpTransportSession {
                                     provider = %provider,
                                     "{clean}"
                                 );
+                            } else if stderr_line_is_diagnostic_warning(&clean) {
+                                warn!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    provider = %provider,
+                                    diagnostic = "acp_subprocess_write_after_parent_pipe_closed",
+                                    "{clean}"
+                                );
                             } else if clean.contains("WARN") || clean.contains("usage_limit") {
                                 warn!(run_id = %run_id, provider = %provider, "{clean}");
                             } else {
@@ -665,6 +874,12 @@ impl AcpTransportSession {
         }
 
         let mut reader = BufReader::new(stdout);
+        let handshake_timeout = handshake_timeout_for_provider(&req.provider);
+        debug!(
+            provider = %req.provider,
+            timeout_ms = handshake_timeout.as_millis() as u64,
+            "ACP handshake timeout selected"
+        );
         let mut req_counter: u64 = 0;
         macro_rules! next_id {
             () => {{
@@ -702,7 +917,7 @@ impl AcpTransportSession {
         .await
         .context("ACP: send initialize")?;
 
-        await_response(&mut reader, init_id, HANDSHAKE_TIMEOUT)
+        await_response(&mut reader, init_id, handshake_timeout, "initialize")
             .await
             .context("ACP: initialize handshake")?;
 
@@ -723,7 +938,7 @@ impl AcpTransportSession {
             .context("ACP: send session/new")?;
         }
 
-        let sn_result = await_response(&mut reader, sn_id, HANDSHAKE_TIMEOUT)
+        let sn_result = await_response(&mut reader, sn_id, handshake_timeout, "session/new")
             .await
             .context("ACP: session/new handshake")?;
 
@@ -761,7 +976,14 @@ impl AcpTransportSession {
                 continue;
             }
 
-            match await_response(&mut reader, sco_id, HANDSHAKE_TIMEOUT).await {
+            match await_response(
+                &mut reader,
+                sco_id,
+                handshake_timeout,
+                "session/set_config_option",
+            )
+            .await
+            {
                 Ok(_) => {
                     debug!(
                         session_id = %session_id,
@@ -807,6 +1029,33 @@ impl AcpTransportSession {
         self.mcp_session_startup_latency_ms
     }
 
+    pub fn is_alive(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.closed = true;
+                warn!(
+                    session_id = %self.session_id,
+                    exit_status = ?status,
+                    "ACP subprocess exited before session reuse healthcheck"
+                );
+                false
+            }
+            Ok(None) => true,
+            Err(error) => {
+                self.closed = true;
+                warn!(
+                    session_id = %self.session_id,
+                    "ACP subprocess healthcheck failed: {error}"
+                );
+                false
+            }
+        }
+    }
+
     pub async fn prompt(
         &mut self,
         req: &ExecutionRequest,
@@ -814,6 +1063,7 @@ impl AcpTransportSession {
         AgentStatus,
         Vec<String>,
         Vec<DiscoveredArtifact>,
+        Option<String>,
         Option<UsageSnapshot>,
     )> {
         self.request_counter += 1;
@@ -925,7 +1175,13 @@ impl AcpTransportSession {
                             session_id = %self.session_id,
                             "ACP session/prompt returned error: {err_msg}"
                         );
-                        return Ok((AgentStatus::Failed, vec![], vec![], latest_usage_snapshot));
+                        return Ok((
+                            AgentStatus::Failed,
+                            vec![],
+                            vec![],
+                            non_empty_transcript(streamed_text),
+                            latest_usage_snapshot,
+                        ));
                     }
                     if let Some(chunk) = extract_text_chunk(&parsed) {
                         streamed_text.push_str(&strip_ansi(&chunk));
@@ -977,18 +1233,20 @@ impl AcpTransportSession {
             AgentStatus::Completed,
             new_files,
             discovered_artifacts,
+            non_empty_transcript(streamed_text),
             latest_usage_snapshot,
         ))
     }
 
-    pub async fn close(&mut self) -> Result<()> {
+    pub async fn close(&mut self) -> Result<Option<AcpCloseDiagnostic>> {
         if self.closed {
-            return Ok(());
+            return Ok(None);
         }
 
+        let mut close_diagnostic: Option<AcpCloseDiagnostic> = None;
         self.request_counter += 1;
         let close_id = self.request_counter;
-        let _ = send_ndjson(
+        if let Err(error) = send_ndjson(
             &mut self.stdin,
             &serde_json::json!({
                 "jsonrpc": "2.0",
@@ -997,13 +1255,36 @@ impl AcpTransportSession {
                 "params": {"sessionId": self.session_id}
             }),
         )
-        .await;
+        .await
+        {
+            merge_close_diagnostic(
+                &mut close_diagnostic,
+                Some(format!("session/close write failed: {error}")),
+                transport_error_code_from_message(&error.to_string()),
+                None,
+            );
+        }
 
-        let _ = AsyncWriteExt::shutdown(&mut self.stdin).await;
+        if let Err(error) = AsyncWriteExt::shutdown(&mut self.stdin).await {
+            merge_close_diagnostic(
+                &mut close_diagnostic,
+                Some(format!("session stdin shutdown failed: {error}")),
+                transport_error_code_from_message(&error.to_string()),
+                None,
+            );
+        }
 
         let exit_success = match timeout(SHUTDOWN_WAIT, self.child.wait()).await {
             Ok(Ok(status)) => {
                 debug!(exit_status = ?status, session_id = %self.session_id, "ACP subprocess exited");
+                if !status.success() {
+                    merge_close_diagnostic(
+                        &mut close_diagnostic,
+                        Some(format!("ACP subprocess exited with status {status}")),
+                        None,
+                        status.code().map(i64::from),
+                    );
+                }
                 status.success()
             }
             _ => {
@@ -1012,8 +1293,35 @@ impl AcpTransportSession {
                     "ACP subprocess did not exit within {}s — force-killing",
                     SHUTDOWN_WAIT.as_secs()
                 );
-                let _ = self.child.kill().await;
-                let _ = self.child.wait().await;
+                #[cfg(unix)]
+                if let Some(pid) = self.child.id() {
+                    signal_process_group(pid, libc::SIGTERM);
+                }
+                match timeout(FORCE_KILL_WAIT, self.child.wait()).await {
+                    Ok(Ok(status)) => {
+                        debug!(
+                            exit_status = ?status,
+                            session_id = %self.session_id,
+                            "ACP subprocess exited after process-group SIGTERM"
+                        );
+                    }
+                    _ => {
+                        #[cfg(unix)]
+                        if let Some(pid) = self.child.id() {
+                            signal_process_group(pid, libc::SIGKILL);
+                        }
+                        let _ = self.child.kill().await;
+                    }
+                }
+                merge_close_diagnostic(
+                    &mut close_diagnostic,
+                    Some(format!(
+                        "ACP subprocess did not exit within {}s after session/close",
+                        SHUTDOWN_WAIT.as_secs()
+                    )),
+                    None,
+                    None,
+                );
                 false
             }
         };
@@ -1022,7 +1330,43 @@ impl AcpTransportSession {
         if !exit_success {
             warn!(session_id = %self.session_id, "ACP subprocess exited with non-zero status");
         }
-        Ok(())
+        Ok(close_diagnostic)
+    }
+}
+
+fn transport_error_code_from_message(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("epipe") || lower.contains("broken pipe")).then(|| "EPIPE".to_string())
+}
+
+fn merge_close_diagnostic(
+    diagnostic: &mut Option<AcpCloseDiagnostic>,
+    message: Option<String>,
+    transport_error_code: Option<String>,
+    provider_exit_status: Option<i64>,
+) {
+    match diagnostic {
+        Some(existing) => {
+            if let Some(message) = message {
+                if !existing.message.is_empty() {
+                    existing.message.push_str("; ");
+                }
+                existing.message.push_str(&message);
+            }
+            if existing.transport_error_code.is_none() {
+                existing.transport_error_code = transport_error_code;
+            }
+            if existing.provider_exit_status.is_none() {
+                existing.provider_exit_status = provider_exit_status;
+            }
+        }
+        None => {
+            *diagnostic = Some(AcpCloseDiagnostic {
+                transport_error_code,
+                provider_exit_status,
+                message: message.unwrap_or_else(|| "ACP session close diagnostic".to_string()),
+            });
+        }
     }
 }
 
@@ -1035,7 +1379,45 @@ pub async fn run_acp_session(
     config: &AcpSessionConfig<'_>,
 ) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>)> {
     let mut session = AcpTransportSession::start(child, req, config).await?;
-    let (status, paths, artifacts, _usage) = session.prompt(req).await?;
+    let (status, paths, artifacts, _transcript_text, _usage) = session.prompt(req).await?;
     let _ = session.close().await;
     Ok((status, paths, artifacts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_uses_longer_handshake_timeout() {
+        assert_eq!(
+            handshake_timeout_for_provider("gemini"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            handshake_timeout_for_provider("Gemini"),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn non_gemini_providers_keep_default_handshake_timeout() {
+        assert_eq!(
+            handshake_timeout_for_provider("claude"),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            handshake_timeout_for_provider("codex"),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn stderr_epipe_is_diagnostic_warning() {
+        assert!(stderr_line_is_diagnostic_warning(
+            "ACP write error: Error: write EPIPE"
+        ));
+        assert!(stderr_line_is_diagnostic_warning("code: 'EPIPE'"));
+        assert!(!stderr_line_is_diagnostic_warning("ordinary debug detail"));
+    }
 }

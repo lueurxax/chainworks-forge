@@ -164,6 +164,7 @@ struct LiveProposalWorkflowTests {
         let context = TransitionEvaluator.EvaluationContext(
             producedArtifactNames: ["proposal_review_summary"],
             approvalGranted: false,
+            approvalRejected: false,
             variables: plan.variables,
             artifactFields: [
                 "proposal_review_summary": [

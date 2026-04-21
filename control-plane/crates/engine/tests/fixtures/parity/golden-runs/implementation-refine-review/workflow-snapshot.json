@@ -1,0 +1,36 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "implementation-refine-review",
+  "title": "Implementation Refine Review",
+  "initial_state": "implement",
+  "states": [
+    {
+      "stage_id": "implement",
+      "label": "Implement",
+      "owner": "fixture_agent",
+      "outputs": [
+        "implementation_patch"
+      ],
+      "next_stage": "refine",
+      "terminal": false
+    },
+    {
+      "stage_id": "refine",
+      "label": "Refine",
+      "owner": "fixture_agent",
+      "outputs": [],
+      "next_stage": "review",
+      "terminal": false
+    },
+    {
+      "stage_id": "review",
+      "label": "Review",
+      "owner": "fixture_agent",
+      "outputs": [
+        "review_notes"
+      ],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

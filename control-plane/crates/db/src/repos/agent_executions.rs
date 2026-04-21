@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
@@ -15,6 +15,13 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 mcp_session_startup_latency_ms"#;
 
 pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_tx(&mut tx, exec).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) -> Result<()> {
     sqlx::query(
         "INSERT INTO agent_executions
          (id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
@@ -54,7 +61,7 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
     .bind(&exec.mcp_blocking_issues_json)
     .bind(&exec.actual_mcp_observation_json)
     .bind(exec.mcp_session_startup_latency_ms)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -136,6 +143,38 @@ pub async fn update_mcp_actual(
     .bind(actual_mcp_runtime_ids_json)
     .bind(actual_mcp_observation_json)
     .bind(mcp_session_startup_latency_ms)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_session_provenance(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    session_lineage_id: Option<&str>,
+    session_generation_id: Option<&str>,
+    rehydrated_from_checkpoint_artifact_id: Option<&str>,
+    invocation_owner_key: Option<&str>,
+    session_reuse_disposition: Option<&str>,
+    session_reset_reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_executions
+         SET session_lineage_id = ?,
+             session_generation_id = ?,
+             rehydrated_from_checkpoint_artifact_id = ?,
+             invocation_owner_key = ?,
+             session_reuse_disposition = ?,
+             session_reset_reason = ?
+         WHERE id = ?",
+    )
+    .bind(session_lineage_id)
+    .bind(session_generation_id)
+    .bind(rehydrated_from_checkpoint_artifact_id)
+    .bind(invocation_owner_key)
+    .bind(session_reuse_disposition)
+    .bind(session_reset_reason)
     .bind(id.to_string())
     .execute(pool)
     .await?;

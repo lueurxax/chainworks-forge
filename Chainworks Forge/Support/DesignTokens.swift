@@ -11,6 +11,7 @@ enum DesignTokens {
         static let warning = ForgeStatusColor.warning
         static let error = ForgeStatusColor.error
         static let running = ForgeStatusColor.running
+        static let info = ForgeStatusColor.running
         static let neutral = ForgeStatusColor.neutral
         static let cancelled = ForgeStatusColor.cancelled
     }

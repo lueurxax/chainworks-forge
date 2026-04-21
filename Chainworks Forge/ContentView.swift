@@ -10,6 +10,13 @@ struct ContentView: View {
     @Environment(ExecutionService.self) private var executionService
     @Environment(AppConfigurationStore.self) private var appConfigurationStore
     @State private var selectedTab: Tab = .ideas
+    /// P042 §5.3: daemon lifecycle view model. Seeded with a client that
+    /// points at whatever `daemon.port` advertises; refreshes on appear
+    /// and opens the `daemonStatusChanged` subscription so transitions
+    /// update the banner without polling. The Ready/Degraded/Failed
+    /// banner renders nothing when the daemon is unavailable but keeps
+    /// the Retry + Export Diagnostics affordances alive.
+    @StateObject private var daemonStatus = DaemonStatusViewModel.bootstrap()
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
 
@@ -74,7 +81,25 @@ struct ContentView: View {
             if let forcedUISurface {
                 directSurfaceView(for: forcedUISurface)
             } else {
-                tabShell
+                VStack(spacing: 0) {
+                    // P042 §5.3: operator-visible daemon lifecycle band.
+                    // Only renders when there is something to report —
+                    // a running daemon that's Ready hides the banner so
+                    // the main UI keeps its real estate.
+                    if daemonStatus.shouldDisplayBanner {
+                        DaemonLifecycleBanner(viewModel: daemonStatus)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 8)
+                    }
+                    tabShell
+                }
+                .task {
+                    // Kick the snapshot + subscription pair at launch.
+                    // `startSnapshotPlusSubscribe` is idempotent — a
+                    // repeat call during view lifecycle just cancels
+                    // the prior task and re-seeds.
+                    await daemonStatus.startSnapshotPlusSubscribe()
+                }
             }
         }
     }

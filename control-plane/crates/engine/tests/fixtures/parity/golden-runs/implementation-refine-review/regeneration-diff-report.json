@@ -1,0 +1,143 @@
+{
+  "schema_version": "behavioral-diff-report.v1",
+  "report_id": "implementation-refine-review-regeneration",
+  "mode": "fixture_regeneration",
+  "proof_mode": "fixture_lifecycle",
+  "run_fixture_id": "implementation-refine-review",
+  "fixture_revision": 1,
+  "client_snapshot_ref": "/Users/user/Documents/Chainworks Forge/control-plane/crates/engine/tests/fixtures/parity/golden-runs/implementation-refine-review/fixture.json",
+  "server_replay_ref": null,
+  "regeneration": {
+    "author": "p041-initial-fixture-lifecycle",
+    "reason": "Initial checked-in P041 V1 fixture capture baseline",
+    "previous_fixture_dir": null,
+    "initial_capture_without_prior": true
+  },
+  "comparison_surface": [
+    "canonical_state",
+    "projections",
+    "artifacts",
+    "reports",
+    "operator_summary"
+  ],
+  "surface_comparisons": [
+    {
+      "surface": "canonical_state",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "run_status": "completed",
+        "stages": [
+          {
+            "stage_id": "implement",
+            "label": "Implement",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "refine",
+            "label": "Refine",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "review",
+            "label": "Review",
+            "status": "completed",
+            "attempt_number": 1
+          }
+        ]
+      }
+    },
+    {
+      "surface": "projections",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "run_status": "completed",
+        "stages": [
+          {
+            "stage_id": "implement",
+            "label": "Implement",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "refine",
+            "label": "Refine",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "review",
+            "label": "Review",
+            "status": "completed",
+            "attempt_number": 1
+          }
+        ],
+        "readback_surfaces": [
+          "run_projection",
+          "stage_projection",
+          "artifact_index",
+          "graphql_readback",
+          "mcp_report_readback"
+        ]
+      }
+    },
+    {
+      "surface": "artifacts",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "artifacts": [
+          {
+            "name": "implementation_patch",
+            "contract_id": "claude.output",
+            "stage_id": "implement",
+            "format": "json",
+            "report_kind": null
+          },
+          {
+            "name": "review_notes",
+            "contract_id": "claude.output",
+            "stage_id": "review",
+            "format": "json",
+            "report_kind": "parity_summary"
+          }
+        ]
+      }
+    },
+    {
+      "surface": "reports",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "schema_version": "expected-reports.v1",
+        "reports": [
+          {
+            "kind": "parity_summary",
+            "version": 1,
+            "fixture_id": "implementation-refine-review"
+          }
+        ]
+      }
+    },
+    {
+      "surface": "operator_summary",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "status": "ready",
+        "summary": "Implementation/refine/review parity is ready."
+      }
+    }
+  ],
+  "divergences": [],
+  "summary": {
+    "blocking_count": 0,
+    "warning_count": 0,
+    "info_count": 0,
+    "operator_message": "Fixture regeneration diff recorded."
+  },
+  "verdict": "ready"
+}

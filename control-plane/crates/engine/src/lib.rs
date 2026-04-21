@@ -6,6 +6,8 @@ pub mod domain_engine;
 pub mod event_bus;
 pub mod evidence;
 pub mod executor;
+pub mod failure_classifier;
+pub mod lifecycle_reporter;
 pub mod mcp;
 pub mod orchestrator;
 pub mod preflight;

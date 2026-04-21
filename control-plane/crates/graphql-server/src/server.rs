@@ -3,11 +3,14 @@ use async_graphql::http::ALL_WEBSOCKET_PROTOCOLS;
 use async_graphql_axum::{GraphQLProtocol, GraphQLRequest, GraphQLResponse, GraphQLWebSocket};
 use axum::{
     extract::{Extension, WebSocketUpgrade},
+    http::StatusCode,
     middleware,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Json},
     routing::get,
     Router,
 };
+use domain::lifecycle::DaemonLifecycleState;
+use engine::lifecycle_reporter::LifecycleReporter;
 use tracing::info;
 
 use crate::schema::AppSchema;
@@ -19,17 +22,76 @@ async fn graphql_playground() -> impl IntoResponse {
     ))
 }
 
+/// Liveness probe (Proposal 042 §5.2). Returns 200 iff the process is
+/// live-and-serving — `Ready` or `Degraded`. `Degraded` explicitly stays
+/// 200 so a supervisor's liveness-keyed restart does not loop-restart a
+/// recoverable daemon.
+///
+/// Response body shape:
+/// - `state=ready`: `{state, schema_version, pid}`
+/// - `state=degraded`: adds `degraded: [{kind, since, ...}]`
+/// - `state=failed`: adds `failure: {kind, detail, since, backup_path?}`
+pub(crate) async fn health_handler(
+    Extension(reporter): Extension<LifecycleReporter>,
+) -> impl IntoResponse {
+    let status = reporter.snapshot();
+    let code = match status.state {
+        DaemonLifecycleState::Ready | DaemonLifecycleState::Degraded => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (code, Json(status))
+}
+
+/// Readiness probe (Proposal 042 §5.2). Returns 200 only when the daemon
+/// is `Ready`; `Degraded` returns 503 so client bootstrap surfaces the
+/// condition to the user.
+pub(crate) async fn ready_handler(
+    Extension(reporter): Extension<LifecycleReporter>,
+) -> impl IntoResponse {
+    let status = reporter.snapshot();
+    let code = if status.state == DaemonLifecycleState::Ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(status))
+}
+
 #[cfg(test)]
 const GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE: u16 = 1002;
 
 async fn graphql_http_handler(
     Extension(schema): Extension<AppSchema>,
     Extension(principal): Extension<auth::Principal>,
+    // P042 §9.3: the request-id middleware attaches this to every
+    // inbound HTTP request; we inject it into the async-graphql request
+    // data so mutation resolvers can stamp `CallerContext.request_id`
+    // and the command journal picks it up in the same transaction.
+    request_id: Option<Extension<crate::request_id::RequestId>>,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
     let mut request = request.into_inner();
     request = request.data(principal);
-    schema.execute(request).await.into()
+    // Keep a copy of the id around so we can stamp every outbound
+    // error with it even after we move the `RequestId` into request
+    // data (R12 API-001 / AC-15: "GraphQL errors must include the
+    // request id").
+    let rid_for_errors: Option<String> = request_id.as_ref().map(|Extension(rid)| rid.0.clone());
+    if let Some(Extension(rid)) = request_id {
+        request = request.data(rid);
+    }
+    let mut response = schema.execute(request).await;
+    if let Some(rid) = rid_for_errors {
+        for err in response.errors.iter_mut() {
+            // `ErrorExtensionValues::set` owns the value; clone for
+            // each error so all entries in a multi-error response
+            // carry the id independently.
+            err.extensions
+                .get_or_insert_with(async_graphql::ErrorExtensionValues::default)
+                .set("request_id", rid.clone());
+        }
+    }
+    response.into()
 }
 
 async fn connection_init_data(
@@ -88,8 +150,9 @@ pub async fn start(
     schema: AppSchema,
     addr: &str,
     principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
 ) -> Result<()> {
-    start_with_extra_routes(schema, addr, Router::new(), principal_table).await
+    start_with_extra_routes(schema, addr, Router::new(), principal_table, reporter).await
 }
 
 /// Start the GraphQL server with additional axum routes merged in.
@@ -98,13 +161,17 @@ pub async fn start(
 /// Auth middleware is mounted on the `/graphql` route only.
 /// The subscription route (`/graphql/ws`) is outside the auth layer
 /// because WS auth happens in `connection_init`, not at upgrade (P029 §4.1.c).
+/// `/health` and `/ready` are also outside auth per P042 §5.2 — they are
+/// loopback-only probes used by supervisors and client bootstrap before
+/// a bearer token is in scope.
 pub async fn start_with_extra_routes(
     schema: AppSchema,
     addr: &str,
     extra: Router,
     principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
 ) -> Result<()> {
-    let app = build_router(schema, extra, principal_table);
+    let app = build_router(schema, extra, principal_table, reporter);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(addr = %addr, "Server listening (GraphQL + MCP)");
@@ -112,7 +179,54 @@ pub async fn start_with_extra_routes(
     Ok(())
 }
 
-fn build_router(schema: AppSchema, extra: Router, principal_table: auth::PrincipalTable) -> Router {
+/// Serve on an already-bound listener (P042 §7.3). The daemon binds the
+/// preferred port (with ephemeral fallback + `daemon.port` write) before
+/// calling into the GraphQL server so the port-allocation decision stays
+/// in the `daemon::packaging` layer and the GraphQL server only has to
+/// wire routes + run `axum::serve`.
+pub async fn serve_with_listener(
+    schema: AppSchema,
+    listener: tokio::net::TcpListener,
+    extra: Router,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+) -> Result<()> {
+    let app = build_router(schema, extra, principal_table, reporter);
+    let local_addr = listener.local_addr().ok();
+    info!(addr = ?local_addr, "Server listening (GraphQL + MCP)");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Serve until the supplied shutdown future resolves (P042 §6.3 graceful
+/// shutdown). Axum finishes in-flight requests before the serve future
+/// returns so clients see a clean close rather than a reset connection.
+pub async fn serve_with_listener_until<F>(
+    schema: AppSchema,
+    listener: tokio::net::TcpListener,
+    extra: Router,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let app = build_router(schema, extra, principal_table, reporter);
+    let local_addr = listener.local_addr().ok();
+    info!(addr = ?local_addr, "Server listening (GraphQL + MCP) — graceful shutdown armed");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
+pub(crate) fn build_router(
+    schema: AppSchema,
+    extra: Router,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+) -> Router {
     let pt = principal_table.clone();
     Router::new()
         .route(
@@ -124,9 +238,26 @@ fn build_router(schema: AppSchema, extra: Router, principal_table: auth::Princip
             async move { crate::auth_layer::require_auth(req, next, table).await }
         }))
         .route("/graphql/ws", get(graphql_ws_handler))
+        // P042 §5.2: liveness/readiness are unauthenticated loopback probes.
+        // Mounted after the auth layer so the `require_auth` middleware
+        // does not apply to them.
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
         .layer(Extension(schema))
         .layer(Extension(principal_table))
+        .layer(Extension(reporter))
+        // P042 §9.3 / R13 API-003: merge `extra` (MCP HTTP routes,
+        // diagnostic endpoints…) BEFORE the request-id layer so the
+        // layer wraps BOTH the GraphQL routes and the merged routes.
+        // `Router::layer` only wraps routes that exist at the moment
+        // it is called; anything `.merge`d after the layer is
+        // silently un-wrapped. Prior to this fix, MCP HTTP never
+        // received an `X-Request-ID` extension from the middleware
+        // and the `mcp_caller` helper always observed `None`, which
+        // dropped the correlation id from every `command_journal`
+        // row landed via the MCP HTTP transport.
         .merge(extra)
+        .layer(middleware::from_fn(crate::request_id::layer))
 }
 
 #[cfg(test)]
@@ -139,11 +270,22 @@ mod tests {
     use db::repos::ideas;
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::IdeaId;
+    use domain::lifecycle::{DaemonLifecycleState, DegradedKind};
     use engine::command_handler::CommandHandler;
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn test_reporter() -> LifecycleReporter {
+        LifecycleReporter::new(0, "test-sha", event_bus::new_bus(16))
+    }
+
+    fn test_reporter_in_state(state: DaemonLifecycleState) -> LifecycleReporter {
+        let reporter = test_reporter();
+        reporter.set_state(state);
+        reporter
+    }
 
     #[tokio::test]
     async fn test_graphql_mutation_reads_principal_from_context() {
@@ -155,8 +297,14 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
-        let app = build_router(schema, Router::new(), auth::PrincipalTable::test_fixture());
+        let app = build_router(
+            schema,
+            Router::new(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
         let body = serde_json::json!({
             "query": start_run_mutation(&idea_id),
         });
@@ -205,8 +353,9 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             principal_table.clone(),
+            test_reporter(),
         );
-        let app = build_router(schema, Router::new(), principal_table);
+        let app = build_router(schema, Router::new(), principal_table, test_reporter());
         let body = serde_json::json!({
             "query": start_run_mutation(&idea_id),
         });
@@ -243,8 +392,14 @@ mod tests {
             make_command_handler(pool),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
-        let app = build_router(schema, Router::new(), auth::PrincipalTable::test_fixture());
+        let app = build_router(
+            schema,
+            Router::new(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
 
         let response = app
             .oneshot(
@@ -272,8 +427,14 @@ mod tests {
             make_command_handler(pool),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
-        let app = build_router(schema, Router::new(), auth::PrincipalTable::test_fixture());
+        let app = build_router(
+            schema,
+            Router::new(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
 
         let response = app
             .oneshot(
@@ -393,5 +554,94 @@ mod tests {
             "{}/../../../examples/agents/agents.yaml",
             env!("CARGO_MANIFEST_DIR")
         )
+    }
+
+    // ── Proposal 042 §5.2 health/ready probe tests ────────────────────
+
+    async fn probe(router: Router, path: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let code = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (code, json)
+    }
+
+    fn build_probe_router(reporter: LifecycleReporter) -> Router {
+        // We only need the two probe routes + the reporter extension.
+        Router::new()
+            .route("/health", get(health_handler))
+            .route("/ready", get(ready_handler))
+            .layer(Extension(reporter))
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_returns_200_when_ready() {
+        let reporter = test_reporter_in_state(DaemonLifecycleState::Ready);
+        let (code, body) = probe(build_probe_router(reporter), "/health").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["state"], "ready");
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_returns_200_in_degraded() {
+        let reporter = test_reporter_in_state(DaemonLifecycleState::Ready);
+        reporter.raise_degraded(DegradedKind::StaleProjection, "test");
+        let (code, body) = probe(build_probe_router(reporter), "/health").await;
+        // Critical invariant: liveness stays 200 in Degraded (P042 §5.2).
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["state"], "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_returns_503_only_when_starting_failed_or_shutdown() {
+        for (state, expected_str) in [
+            (DaemonLifecycleState::Starting, "starting"),
+            (DaemonLifecycleState::Failed, "failed"),
+            (DaemonLifecycleState::Shutdown, "shutdown"),
+            (DaemonLifecycleState::Restarting, "restarting"),
+        ] {
+            let reporter = test_reporter_in_state(state);
+            let (code, body) = probe(build_probe_router(reporter), "/health").await;
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "state {expected_str} should return 503"
+            );
+            assert_eq!(body["state"], expected_str);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_returns_200_only_when_ready() {
+        let reporter = test_reporter_in_state(DaemonLifecycleState::Ready);
+        let (code, _) = probe(build_probe_router(reporter), "/ready").await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_returns_503_in_degraded() {
+        let reporter = test_reporter_in_state(DaemonLifecycleState::Ready);
+        reporter.raise_degraded(DegradedKind::StaleProjection, "test");
+        let (code, body) = probe(build_probe_router(reporter), "/ready").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["state"], "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_daemon_status_failure_field_populated_only_when_failed() {
+        use domain::lifecycle::FailureKind;
+        // Ready → no failure field in JSON.
+        let reporter = test_reporter_in_state(DaemonLifecycleState::Ready);
+        let (_, body) = probe(build_probe_router(reporter), "/health").await;
+        assert!(body.get("failure").is_none(), "{body}");
+        // Failed → failure populated.
+        let reporter = test_reporter();
+        reporter.set_failed(FailureKind::MigrationFailed, "test", Some("/tmp/bk".into()));
+        let (_, body) = probe(build_probe_router(reporter), "/health").await;
+        assert_eq!(body["failure"]["kind"], "migration_failed");
+        assert_eq!(body["failure"]["backup_path"], "/tmp/bk");
     }
 }

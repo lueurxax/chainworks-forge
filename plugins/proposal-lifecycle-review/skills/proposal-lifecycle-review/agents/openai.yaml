@@ -1,0 +1,6 @@
+interface:
+  display_name: "Proposal Lifecycle Review"
+  short_description: "Thin dispatcher for proposal review vs implementation audit"
+  default_prompt: "Use $proposal-lifecycle-review for <proposal-path>. Choose proposal review or implementation audit based on the task phase, then delegate to the right primary skill."
+policy:
+  allow_implicit_invocation: false

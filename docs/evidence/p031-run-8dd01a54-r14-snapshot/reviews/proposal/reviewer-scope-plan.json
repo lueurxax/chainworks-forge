@@ -1,0 +1,62 @@
+{
+  "review_pass_id": "rp-031-001",
+  "review_iteration_id": "ri-031-r9-001",
+  "proposal_revision_id": "031-2026-04-20-run-8dd01a54-r9-graphql-only-refinement",
+  "reviewers": [
+    {
+      "reviewer_id": "product_owner",
+      "role": "product_owner",
+      "status": "complete",
+      "scope": ["scope_change_assessment", "operator_write_gap", "user_outcome_metrics", "dogfood_evidence", "follow_up_prioritization", "prior_issue_resolution", "effort_estimates", "dogfood_population", "rollback_drill", "legacy_expiry"],
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/product-owner.json",
+      "coverage_notes": "Confirmed all r7 PO issues resolved. Assessed scope change from control cutover to read-only cutover. Approved with conditions: document write-path alternatives before dogfood, add user-outcome metric. Five non-blocking issues, three suggestions."
+    },
+    {
+      "reviewer_id": "ux_designer_gemini",
+      "role": "UX Designer",
+      "status": "complete",
+      "scope": ["read_only_ux", "approval_task_flow", "disabled_control_patterns", "syncing_pattern", "read_refresh_feedback", "report_payload_indicators", "accessibility"],
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/ux.json",
+      "coverage_notes": "Evaluated read-only UX patterns, approval task flow fragmentation, Syncing slot, targeted read-refresh feedback, and payload availability indicators. No blockers. Two non-blocking issues: approval button UX and ambiguous recovery guidance."
+    },
+    {
+      "reviewer_id": "ui_designer",
+      "role": "ui_designer",
+      "status": "complete",
+      "scope": ["component_reuse", "state_matrix", "syncing_placement", "disabled_control_visuals", "report_indicators", "density"],
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/ui.json",
+      "coverage_notes": "Evaluated visual state matrix, component reuse, Syncing placement in detail views, disabled approval visual coherence, and report payload indicator specificity. No blockers. Three non-blocking issues, three suggestions."
+    },
+    {
+      "reviewer_id": "architect",
+      "role": "architect",
+      "status": "complete",
+      "scope": ["graphql_only_boundary", "p043_dependency_contract", "schema_field_mapping", "ui_file_boundary", "approval_disabled_contract", "source_governance", "static_guards"],
+      "artifact_path": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/reviews/proposal/architect.json",
+      "coverage_notes": "Performed targeted repo inspection. Confirmed GraphQL-only boundary is correct. One blocker: P043 reference contract conflict. Four non-blocking: schema fields, file boundary, approval contract, source governance. Confirms r7 command/MCP issues are superseded by operator correction."
+    }
+  ],
+  "panel_coverage_assessment": {
+    "covered_areas": ["product_scope_change", "architecture", "graphql_only_boundary", "ux_patterns", "ui_specification", "rollout_strategy", "dependency_contracts", "static_guards", "approval_boundary", "report_metadata", "accessibility", "dogfood_evidence"],
+    "gaps": [],
+    "consensus_areas": [
+      "GraphQL-only read plane is the correct narrowing for a first visible cutover",
+      "No UI MCP and no UI GraphQL mutations is architecturally sound",
+      "Approval decision controls are the riskiest seam and need a tighter disabled-state contract",
+      "Operator write-path gap needs documentation before dogfood",
+      "Source artifact governance correctly marks r9 as governing"
+    ],
+    "disagreement_areas": [
+      {
+        "area": "readiness_to_proceed",
+        "positions": {
+          "product_owner": "approve_with_conditions (write-path docs + user-outcome metric)",
+          "ux_designer": "approve (no blockers)",
+          "ui_designer": "approve_with_comments (no blockers)",
+          "architect": "approve_with_conditions (1 blocker: P043 contract conflict)"
+        },
+        "resolution": "Architect blocker governs: proposal requires revision to reconcile P043 dependency contract with the GraphQL-only correction before Phase 1."
+      }
+    ]
+  }
+}

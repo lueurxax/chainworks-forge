@@ -50,10 +50,15 @@ struct ImplementationFailureArtifactSynthesizer {
 
         if outputs[selfAssessmentArtifactName] == nil, expectedOutputs.contains(selfAssessmentArtifactName) {
             outputs[selfAssessmentArtifactName] = makeJSONData([
-                "seemingly_complete": false,
-                "remaining_tasks": remainingTasks(changedFiles: changedFiles, missingOutputs: missingOutputs),
+                "implementation_complete": false,
+                "verification_green": false,
+                "remaining_code_tasks": remainingCodeTasks(
+                    changedFiles: changedFiles,
+                    missingOutputs: missingOutputs
+                ),
+                "handoff_tasks": [] as [[String: Any]],
                 "known_risks": [failureSummary],
-                "tests_run": false,
+                "tests_run": [] as [String],
                 "docs_impacted": docsImpacted,
             ])
         }
@@ -69,7 +74,7 @@ struct ImplementationFailureArtifactSynthesizer {
 
         if outputs[testsResultArtifactName] == nil, expectedOutputs.contains(testsResultArtifactName) {
             outputs[testsResultArtifactName] = makeJSONData([
-                "green": false,
+                "status": "blocked",
                 "summary": "Execution stopped before the required test report was written: \(failureSummary)",
             ])
         }
@@ -92,14 +97,39 @@ struct ImplementationFailureArtifactSynthesizer {
         return !supportedArtifactNames.isDisjoint(with: expectedOutputs)
     }
 
-    private nonisolated static func remainingTasks(changedFiles: [String], missingOutputs: [String]) -> [String] {
-        var tasks = missingOutputs.map { "Produce required artifact: \($0)" }
-        if changedFiles.isEmpty {
-            tasks.append("Resume implementation from a clean blocked state.")
-        } else {
-            tasks.append("Review partial worktree edits and continue implementation.")
+    private nonisolated static func remainingCodeTasks(
+        changedFiles: [String],
+        missingOutputs: [String]
+    ) -> [[String: Any]] {
+        var tasks = missingOutputs.map {
+            [
+                "summary": "Produce required artifact.",
+                "owner": "code_writer",
+                "blocking": true,
+                "evidence": "Missing output: \($0)."
+            ] as [String: Any]
         }
-        tasks.append("Run verification and emit a canonical tests_result artifact.")
+        if changedFiles.isEmpty {
+            tasks.append([
+                "summary": "Resume implementation from a clean blocked state.",
+                "owner": "code_writer",
+                "blocking": true,
+                "evidence": "Execution stopped before leaving worktree edits."
+            ])
+        } else {
+            tasks.append([
+                "summary": "Review partial worktree edits and continue implementation.",
+                "owner": "code_writer",
+                "blocking": true,
+                "evidence": "Execution left partial edits in \(changedFiles.count) file(s)."
+            ])
+        }
+        tasks.append([
+            "summary": "Run verification and emit a canonical tests_result artifact.",
+            "owner": "code_writer",
+            "blocking": true,
+            "evidence": "Executor failure prevented canonical verification reporting."
+        ])
         return tasks
     }
 

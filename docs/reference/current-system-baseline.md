@@ -36,6 +36,8 @@ At the current baseline, the product includes:
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
 - repo-backed full delivery with dedicated worktrees and manual release,
+- implementation completeness and handoff contract with structured status and verification truth,
+- rejected implementation approval loopback to proposal refinement,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
 - Forge Steward system-health analysis,
 - a stable design-kit authority for future visual changes.
@@ -143,8 +145,10 @@ The following flows should be treated as implemented system behavior:
 4. run progress, artifact inspection, and recovery from the operator shell,
 5. workflow-map rendering and fallback handling,
 6. repo-backed full delivery using dedicated worktrees and manual release,
-7. evidence-pack export for repo-backed runs,
-8. benchmark/sign-off evaluation and export.
+7. implementation self-assessment and handoff routing,
+8. rejected implementation approval loopback to proposal refinement,
+9. evidence-pack export for repo-backed runs,
+10. benchmark/sign-off evaluation and export.
 
 ## Current review posture
 

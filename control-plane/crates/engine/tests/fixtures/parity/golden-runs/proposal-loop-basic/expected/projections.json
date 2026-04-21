@@ -1,0 +1,1 @@
+{"run_status":"completed","stages":[{"stage_id":"draft","label":"Draft","status":"completed","attempt_number":1},{"stage_id":"review","label":"Review","status":"completed","attempt_number":1}],"readback_surfaces":["run_projection","stage_projection","artifact_index","graphql_readback","mcp_report_readback"]}

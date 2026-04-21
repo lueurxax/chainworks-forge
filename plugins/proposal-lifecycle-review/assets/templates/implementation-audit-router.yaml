@@ -1,0 +1,29 @@
+version: 1
+schema: proposal-implementation-audit.repo-routing
+
+reviewer_registry:
+  built_in: skills/proposal-implementation-audit/assets/implementation-reviewer-registry.yaml
+  repo_local_reviewers_glob: .codex/reviewers/*.yaml
+  repo_local_implementation_reviewers_glob: .codex/implementation-reviewers/*.yaml
+
+defaults:
+  reuse_prior_proposal_selection: true
+  reviewer_selection_artifact: "<proposal>.review/reviewer-selection.yaml"
+  fallback_markdown_discovery: true
+  allow_explicit_reroute: true
+  max_delta_reviewers_when_reusing: 2
+  hard_cap: 5
+
+delta_reviewer_triggers:
+  api_contract_reviewer:
+    surfaces: [api-contract, schema, protobuf, openapi, generated-code]
+  observability_rollout_reviewer:
+    surfaces: [feature-flag, migration, telemetry, rollout, rollback]
+  rust_reliability_reviewer:
+    surfaces: [retry, idempotency, backpressure, cancellation, shutdown]
+  go_security_reviewer:
+    surfaces: [auth, public-endpoint, request-validation, token]
+
+successful_verdict_gate:
+  require_same_tree_full_regression: true
+  allow_canonical_full_proposal_gate: true

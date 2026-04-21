@@ -23,7 +23,7 @@ There are two coexisting codebases in this repository:
 ./scripts/test-gate.sh fast       # guardrails + build + high-ROI unit/runtime tests (default inner loop)
 ./scripts/test-gate.sh guardrails # cheap source-tree lints (no build)
 ./scripts/test-gate.sh full       # full xcodebuild test sign-off gate
-./scripts/test-gate.sh proposal-XXX   # focused proposal proof gates (see `list`)
+./scripts/test-gate.sh proposal-XXX   # other focused proposal proof gates (see `list`)
 ```
 
 **UI tests are remote-only by repo policy.** They run over SSH against an approved remote macOS host (`test@SMacBook.local`), not locally. See [`docs/reference/agent-ui-test-execution.md`](docs/reference/agent-ui-test-execution.md) and [`docs/reference/test-gates.md`](docs/reference/test-gates.md) for the full protocol. Typical remote gate invocation:

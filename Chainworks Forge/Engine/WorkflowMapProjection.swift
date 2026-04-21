@@ -229,6 +229,8 @@ struct WorkflowMapTopologyBuilder {
             return "exists(\(name))"
         case .approvalGranted:
             return "approval granted"
+        case .approvalRejected:
+            return "approval rejected"
         case .expression(let expr):
             return expr
         }

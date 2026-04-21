@@ -6,6 +6,8 @@ use domain::validation::ValidationFailureRecord;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::types::stage::AgentOutputSettlement;
+
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(complex)]
 pub struct GqlArtifact {
@@ -25,6 +27,14 @@ pub struct GqlArtifact {
     pub is_pinned: bool,
     pub report_kind: Option<String>,
     pub report_version: Option<i64>,
+    pub artifact_generation_id: Option<String>,
+    pub source_agent_execution_id: Option<String>,
+    pub source_stage_execution_id: Option<String>,
+    pub source_session_generation_id: Option<String>,
+    pub source_work_item_id: Option<String>,
+    pub supersedes_artifact_generation_id: Option<String>,
+    pub output_settlement: Option<AgentOutputSettlement>,
+    pub source_generation_verified: Option<bool>,
 }
 
 #[derive(SimpleObject, Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -111,12 +121,24 @@ impl From<Artifact> for GqlArtifact {
             is_pinned: a.is_pinned,
             report_kind: a.report_kind,
             report_version: a.report_version,
+            artifact_generation_id: None,
+            source_agent_execution_id: None,
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_artifact_generation_id: None,
+            output_settlement: None,
+            source_generation_verified: None,
         }
     }
 }
 
 impl From<ArtifactIndexRow> for GqlArtifact {
     fn from(r: ArtifactIndexRow) -> Self {
+        let output_settlement = r
+            .output_settlement
+            .as_deref()
+            .and_then(output_settlement_from_db);
         GqlArtifact {
             id: ID(r.id),
             run_id: ID(r.run_id),
@@ -134,7 +156,31 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             is_pinned: r.is_pinned,
             report_kind: r.report_kind,
             report_version: r.report_version,
+            artifact_generation_id: r.artifact_generation_id,
+            source_agent_execution_id: r.source_agent_execution_id,
+            source_stage_execution_id: r.source_stage_execution_id,
+            source_session_generation_id: r.source_session_generation_id,
+            source_work_item_id: r.source_work_item_id,
+            supersedes_artifact_generation_id: r.supersedes_artifact_generation_id,
+            output_settlement,
+            source_generation_verified: r.source_generation_verified,
         }
+    }
+}
+
+fn output_settlement_from_db(value: &str) -> Option<AgentOutputSettlement> {
+    match value {
+        "none" => Some(AgentOutputSettlement::None),
+        "missing_required_outputs" => Some(AgentOutputSettlement::MissingRequiredOutputs),
+        "invalid_required_outputs" => Some(AgentOutputSettlement::InvalidRequiredOutputs),
+        "valid_outputs_from_completed_execution" => {
+            Some(AgentOutputSettlement::ValidOutputsFromCompletedExecution)
+        }
+        "valid_outputs_from_failed_execution" => {
+            Some(AgentOutputSettlement::ValidOutputsFromFailedExecution)
+        }
+        "ignored_late_outputs" => Some(AgentOutputSettlement::IgnoredLateOutputs),
+        _ => None,
     }
 }
 

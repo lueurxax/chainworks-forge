@@ -1,0 +1,31 @@
+{
+  "name": "proposal-lifecycle-review",
+  "version": "0.1.0",
+  "description": "Proposal lifecycle review plugin with separate proposal-review routing and proposal-anchored implementation audit workflows.",
+  "license": "UNLICENSED",
+  "keywords": [
+    "proposal-review",
+    "implementation-audit",
+    "review-routing",
+    "codex-skills"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Proposal Lifecycle Review",
+    "shortDescription": "Review proposals before implementation and audit implementations afterward.",
+    "longDescription": "Packages proposal-review-router and proposal-implementation-audit as separate first-class skills, preserving reviewer-id continuity, prior-review reuse, evidence packs, audit reports, scripts, tests, templates, rubrics, and eval coverage.",
+    "developerName": "Local",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Review"
+    ],
+    "defaultPrompt": [
+      "Review this proposal with $proposal-review-router.",
+      "Audit this implementation with $proposal-implementation-audit.",
+      "Use $proposal-lifecycle-review for the right review phase."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

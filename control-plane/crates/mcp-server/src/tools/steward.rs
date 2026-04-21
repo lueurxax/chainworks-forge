@@ -2,10 +2,11 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::steward as steward_repo;
-use domain::commands::{CallerContext, Command, RunStewardAnalysisCmd};
+use domain::commands::{Command, RunStewardAnalysisCmd};
 use engine::command_handler::{CommandHandler, CommandResult};
 
 use crate::protocol::McpTool;
+use crate::request_context::mcp_caller;
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -56,7 +57,7 @@ pub async fn execute(
     match tool_name {
         "steward.run_analysis" => {
             let reason = params["reason"].as_str().unwrap_or("manual").to_string();
-            let caller = CallerContext::mcp(&principal.id, &principal.class, tool_name);
+            let caller = mcp_caller(&principal.id, &principal.class, tool_name);
             let commanded = cmd_handler
                 .handle(
                     Command::RunStewardAnalysis(RunStewardAnalysisCmd {
@@ -231,6 +232,7 @@ mod tests {
                 catalog_snapshot_json: Some("{}".into()),
                 drift_detected_at: None,
                 drift_details_json: None,
+                chainworks_meta_root: None,
             },
         )
         .await

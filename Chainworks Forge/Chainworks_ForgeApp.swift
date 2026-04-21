@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 #if os(macOS)
 import AppKit
+import ServiceManagement
 #endif
 
 private enum UIAutomationDiagnostics {
@@ -199,7 +200,167 @@ struct Chainworks_ForgeApp: App {
             "app.init uiAutomation=\(Self.isUIAutomationHost) unitTest=\(Self.isUnitTestHost) " +
             "directSurface=\(Self.processEnvironment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] ?? "nil")"
         )
+        // P042 §7.2 / §6 launch supervision. When the app runs out of a
+        // packaged bundle, ask `SMAppService` to register the embedded
+        // daemon agent so the singleton + crash-budget contract applies.
+        // Dev/test runs (no embedded binary) skip registration silently.
+        Self.registerPackagedDaemonAgentIfAvailable()
     }
+
+    /// Look for an embedded daemon agent plist named
+    /// `com.chainworks.forge.daemon.plist` inside the app bundle's
+    /// `Contents/Library/LaunchAgents/`. If present, register the
+    /// matching `SMAppService.agent(plistName:)` so macOS launches the
+    /// daemon at login and enforces the §6 singleton policy. Missing
+    /// plist → silent skip (dev workstation + unit-test hosts).
+    ///
+    /// Note: `SMAppService.agent(plistName:)` resolves plists out of
+    /// `Contents/Library/LaunchAgents/`, NOT `LaunchDaemons/`. The
+    /// former is per-user (our case — the daemon runs as the logged-in
+    /// operator); the latter is system-wide and requires root.
+    private static func registerPackagedDaemonAgentIfAvailable() {
+        #if os(macOS)
+        guard !isTestHost, !isUIAutomationHost else { return }
+        let plistName = "com.chainworks.forge.daemon.plist"
+        guard let bundleURL = Bundle.main.bundleURL
+            .appendingPathComponent(
+                "Contents/Library/LaunchAgents/\(plistName)",
+                isDirectory: false
+            )
+            as URL?,
+            FileManager.default.fileExists(atPath: bundleURL.path)
+        else {
+            return
+        }
+        let service = SMAppService.agent(plistName: plistName)
+        do {
+            try service.register()
+            UIAutomationDiagnostics.log("SMAppService.register ok for \(plistName)")
+        } catch {
+            // The operator sees the failure in the lifecycle banner's
+            // Unavailable panel once the daemon fails to come up. No
+            // UI pop-up here — the banner is the canonical surface.
+            UIAutomationDiagnostics.log(
+                "SMAppService.register failed for \(plistName): \(error)"
+            )
+        }
+        // §7.2 + §6.1 supervision probe: on macOS 13+ SMAppService's
+        // Launchd Constraint Rule refuses to spawn agents signed with
+        // Apple Development certificates — it demands Developer ID
+        // Application. A release-host build with a notarised Developer
+        // ID bundle satisfies the rule and launchd starts the daemon
+        // on its own. In Debug builds (typical dev-machine Xcode run)
+        // we spawn the daemon directly as a child `Process` after a
+        // short grace window, so the rest of the pipeline is
+        // exercisable without a release identity.
+        //
+        // P042 §6.1 / ARCH-001: we now run the same probe in Release.
+        // If SMAppService succeeds, the probe spawns into the
+        // DuplicateHealthy path (exit 0 — no UI). If SMAppService's
+        // spawn failed before HTTP bind — for instance because the
+        // previous daemon left a stale PID-lock — the probe captures
+        // the exit code (EX_TEMPFAIL 75) via `Process.terminationHandler`
+        // and routes it to `DaemonProcessSupervisor.shared`, which in
+        // turn drives the operator alert. Without this, a Release
+        // pre-bind failure would leave launchd with the only copy of
+        // the exit code and the UI would never learn about it.
+        scheduleDaemonSupervisionProbe()
+        #endif
+    }
+
+    #if os(macOS)
+    private static func scheduleDaemonSupervisionProbe() {
+        let daemonURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/chainworks-forge-daemon",
+                                    isDirectory: false)
+        guard FileManager.default.isExecutableFile(atPath: daemonURL.path) else {
+            return
+        }
+        // Give SMAppService 3 seconds (Debug) or 8 seconds (Release) to
+        // bring up `daemon.port`. If nothing appears by the deadline,
+        // assume SMAppService either hit LWCR (Debug, Apple Development
+        // signing) or hit a pre-bind failure (Release) and spawn the
+        // daemon as a child Process so we can observe its exit code.
+        // Release gets a longer grace because a cold notarised launch
+        // on macOS can stall a few extra seconds behind `syspolicyd`.
+        #if DEBUG
+        let graceSeconds: TimeInterval = 3.0
+        #else
+        let graceSeconds: TimeInterval = 8.0
+        #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + graceSeconds) {
+            let appSupport = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Chainworks Forge",
+                                        isDirectory: true)
+            let portFile = appSupport.appendingPathComponent("daemon.port",
+                                                             isDirectory: false)
+            if FileManager.default.fileExists(atPath: portFile.path) {
+                UIAutomationDiagnostics.log(
+                    "daemon supervision probe: daemon.port present, SMAppService ok"
+                )
+                return
+            }
+            NSLog("daemon supervision probe: spawning daemon via Process to observe exit code")
+            let proc = Process()
+            proc.executableURL = daemonURL
+            var env: [String: String] = [
+                "MODE": "packaged-app",
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            ]
+            // P042 §7.1 + packaged-mode dev-fallback: pass absolute
+            // paths for the catalog + workflow YAMLs that the daemon
+            // needs at startup. Without these env vars the daemon
+            // falls back to `examples/agents/agents.yaml` relative to
+            // its cwd, which is `/` under launchd/`open`.
+            if let catalog = Bundle.main.url(forResource: "agents", withExtension: "yaml") {
+                env["AGENT_CATALOG_PATH"] = catalog.path
+            }
+            if let workflow = Bundle.main.url(forResource: "workflow", withExtension: "yaml") {
+                env["WORKFLOW_YAML_PATH"] = workflow.path
+            }
+            proc.environment = env
+            // §6.1 supervisor hook: classify the daemon's exit code
+            // when the child process terminates. Exit 75 (EX_TEMPFAIL)
+            // = anomalous PID-lock holder → operator dialog. Exit 0 =
+            // clean (DuplicateHealthy or graceful drain). Non-zero =
+            // generic startup failure banner.
+            proc.terminationHandler = { process in
+                let status = process.terminationStatus
+                let reason = process.terminationReason
+                // `terminationHandler` is called on a private Foundation
+                // queue, not the main actor — hop explicitly so we
+                // satisfy `DaemonProcessSupervisor`'s `@MainActor`
+                // isolation. A `Task { @MainActor in ... }` hop is
+                // preferred over `DispatchQueue.main.async` because it
+                // participates in Swift structured concurrency and
+                // propagates the actor isolation the compiler checks.
+                //
+                // Both Debug and Release reach this hook: Debug probes
+                // are the primary supervision path (SMAppService can't
+                // launch an Apple Development-signed agent), while in
+                // Release the probe is a fallback that only runs when
+                // SMAppService didn't produce `daemon.port` within the
+                // grace window — in that case the probe is how we see
+                // exit-75 and other pre-bind failures.
+                Task { @MainActor in
+                    DaemonProcessSupervisor.shared.record(status: status, reason: reason)
+                }
+                NSLog(
+                    "daemon supervision probe: daemon exited status=\(status) reason=\(reason.rawValue)"
+                )
+            }
+            // Daemon is long-running; no waitUntilExit. Orphan it from
+            // this process so Cmd+Q doesn't kill the daemon.
+            do {
+                try proc.run()
+                NSLog("daemon supervision probe: launched pid \(proc.processIdentifier)")
+            } catch {
+                NSLog("daemon supervision probe: Process.run failed \(error)")
+            }
+        }
+    }
+    #endif
 
     var body: some Scene {
         Window("Chainworks Forge", id: "main-window") {
@@ -207,6 +368,19 @@ struct Chainworks_ForgeApp: App {
                 .modifier(OptionalModelContainerModifier(enabled: Self.requiresSharedModelContainer(for: Self.initialForcedUISurface)))
         }
         .defaultSize(width: Self.uiWindowSize.width, height: Self.uiWindowSize.height)
+        .commands {
+            // P042 §9.4 / §9.5: File → Export Diagnostics produces the
+            // zero-network support-ticket bundle regardless of whether
+            // the daemon is running. The menu entry is keyboard-shortcut
+            // `⇧⌘D` so an operator with a failed daemon can reach it
+            // even if the main UI is wedged behind a modal.
+            CommandGroup(after: .importExport) {
+                Button("Export Diagnostics…") {
+                    DaemonDiagnosticsExportCommand.run()
+                }
+                .keyboardShortcut("D", modifiers: [.command, .shift])
+            }
+        }
     }
 
 }

@@ -1,0 +1,26 @@
+version: 1
+
+# Place repo-local reviewer definitions under .codex/implementation-reviewers/<reviewer-id>.yaml
+# Use only for stable repo-specific seams that built-in reviewers do not cover well.
+
+reviewers:
+  - id: example_domain_reviewer
+    display_name: Example Domain Implementation Reviewer
+    extends: null
+    mode: domain-only
+    stacks: [go-backend]
+    surfaces: [domain-logic, api-contract, persistence]
+    risks: [business-rule-drift, migration-risk]
+    finding_prefixes: [DOMAIN, API, READY]
+    strong_proposal_keywords:
+      - canonical domain term
+      - important invariant
+    strong_changed_files:
+      - "internal/example/**"
+      - "migrations/**example**"
+    implementation_checks:
+      - Verify proposal-defined domain invariants against actual code paths and tests.
+      - Check migrations and compatibility for existing data.
+      - Do not re-review generic Go architecture unless it affects the domain invariant.
+    usually_pair_with: [go_service_arch_reviewer, api_contract_reviewer]
+    preferred_agent_names: [example_domain_reviewer]

@@ -1,11 +1,12 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use domain::commands::{CallerContext, Command, RetryStageCmd};
+use domain::commands::{Command, RetryStageCmd};
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
+use crate::request_context::mcp_caller;
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![McpTool {
@@ -39,9 +40,16 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
                 .to_string();
+            let consume_quota_budget_now = params["consume_quota_budget_now"]
+                .as_bool()
+                .unwrap_or(false);
 
-            let caller = CallerContext::mcp(&principal.id, &principal.class, "stages.retry");
-            let cmd = Command::RetryStage(RetryStageCmd { run_id, stage_id });
+            let caller = mcp_caller(&principal.id, &principal.class, "stages.retry");
+            let cmd = Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id,
+                consume_quota_budget_now,
+            });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({
                 "scheduled": true,

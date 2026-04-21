@@ -1,11 +1,13 @@
 pub mod agent;
 pub mod approval;
 pub mod artifact;
+pub mod artifact_contracts;
 pub mod capabilities;
 pub mod commands;
 pub mod events;
 pub mod idea;
 pub mod ids;
+pub mod lifecycle;
 pub mod run;
 pub mod session;
 pub mod stage;
@@ -15,6 +17,11 @@ pub mod validation;
 // P029: PrincipalClass is canonically defined in domain::commands.
 pub use capabilities::{CapabilityToolId, ResourceTemplateId};
 pub use commands::PrincipalClass;
+
+// P042: daemon lifecycle types are the canonical readback contract.
+pub use lifecycle::{
+    DaemonLifecycleState, DaemonStatus, DegradedKind, DegradedReason, FailureKind, FailureReason,
+};
 
 #[cfg(test)]
 mod tests {

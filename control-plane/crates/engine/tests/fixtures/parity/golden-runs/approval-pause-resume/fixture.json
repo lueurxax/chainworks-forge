@@ -1,0 +1,41 @@
+{
+  "schema_version": "golden-run-fixture.v1",
+  "fixture_id": "approval-pause-resume",
+  "fixture_revision": 1,
+  "captured_at": "2026-04-18T00:00:00Z",
+  "captured_from": {
+    "owner": "swift-client",
+    "source_paths": [
+      "Chainworks Forge/Engine/WorkflowOrchestrator.swift",
+      "Chainworks Forge/Engine/RunPlanCompiler.swift",
+      "Chainworks Forge/Engine/RecoveryCoordinator.swift",
+      "Chainworks Forge/Engine/RunReportBuilder.swift"
+    ],
+    "capture_command": "./scripts/parity/capture-golden-run.sh approval-pause-resume"
+  },
+  "frozen_inputs": {
+    "workflow_snapshot": "workflow-snapshot.json",
+    "agent_catalog_snapshot": "agent-catalog-snapshot.json",
+    "provider_profile": "provider-profile.json",
+    "runtime_events": "runtime-events.json",
+    "operator_decisions": "operator-decisions.json"
+  },
+  "expected_client_truth": {
+    "canonical_state": "expected/canonical-state.json",
+    "projections": "expected/projections.json",
+    "artifacts": "expected/artifacts.json",
+    "reports": "expected/reports.json",
+    "operator_summary": "expected/operator-summary.json"
+  },
+  "normalization_rules": [
+    "normalize_timestamps_to_sequence",
+    "normalize_absolute_paths_to_fixture_root",
+    "normalize_generated_ids_to_stable_aliases",
+    "ignore_transport_latency"
+  ],
+  "regeneration": {
+    "allowed_when": "client semantics intentionally change or fixture schema is migrated",
+    "requires_reason": true,
+    "requires_diff_report": true
+  }
+}

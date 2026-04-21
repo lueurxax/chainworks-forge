@@ -1049,7 +1049,7 @@ struct RuntimeAgentExecutorTests {
                     continuation.yield(.promptSubmitted(raw: #"{"session_id":"acp-stall-session"}"#))
                     continuation.yield(.textChunk(text: "Need to read the proposal and idea brief before I can review."))
                     continuation.yield(.toolCallStarted(toolName: "read", raw: #"{"tool_name":"read","tool_call_id":"call-read-1"}"#))
-                    continuation.yield(.toolCallStarted(toolName: "permission:read", raw: #"{"tool_name":"permission:read","tool_call_id":"call-perm-1"}"#))
+                    continuation.yield(.toolCallStarted(toolName: "read_file", raw: #"{"tool_name":"read_file","tool_call_id":"call-read-2"}"#))
                     try? await Task.sleep(for: .seconds(5))
                 }
             }

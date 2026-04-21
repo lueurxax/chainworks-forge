@@ -1,0 +1,28 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "retry-recovery-flow",
+  "title": "Retry Recovery Flow",
+  "initial_state": "attempt_1",
+  "states": [
+    {
+      "stage_id": "attempt_1",
+      "label": "Attempt 1",
+      "owner": "fixture_agent",
+      "outputs": [
+        "recovery_snapshot"
+      ],
+      "next_stage": "retry_1",
+      "terminal": false
+    },
+    {
+      "stage_id": "retry_1",
+      "label": "Retry 1",
+      "owner": "fixture_agent",
+      "outputs": [
+        "retry_result"
+      ],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

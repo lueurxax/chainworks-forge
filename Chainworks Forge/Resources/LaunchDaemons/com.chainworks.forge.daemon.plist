@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  P042 §6 / §7 LaunchAgent plist for SMAppService.agent.
+
+  Copied into the app bundle at
+  `Contents/Library/LaunchAgents/com.chainworks.forge.daemon.plist`
+  by the "Embed LaunchAgent Plist" build phase. App registers the
+  matching `SMAppService.agent(plistName:)` at launch; launchd then
+  supervises the embedded daemon.
+
+  Notes on launchd plist authoring:
+    • `BundleProgram` is resolved relative to the app bundle's
+      `Contents/` — it's the only path that may be relative.
+    • `StandardOutPath` / `StandardErrorPath` MUST be absolute.
+      launchd tilde-expansion is fragile; we use a fixed path under
+      the user's `~/Library/Logs/Chainworks Forge/` that the daemon
+      itself also writes to (daemon emits JSON log lines via
+      tracing-appender; launchd captures stdout/stderr for pre-tracing
+      panics).
+    • No `Sockets` section: the daemon does its own `bind()` with
+      ephemeral fallback (§7.3). Socket-activation (inetd style)
+      would require `launch_activate_socket()` in Rust, which we do
+      not implement.
+    • `KeepAlive` is limited to the `Crashed` + `SuccessfulExit=false`
+      cases so launchd honours the daemon's own §8.7 failed-serve
+      mode (process stays alive → launchd treats as still running).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.chainworks.forge.daemon</string>
+
+    <!-- Resolved relative to the app bundle's Contents/. -->
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/chainworks-forge-daemon</string>
+
+    <!-- Launch the daemon when the user logs in; restart on crash
+         per the §6.1 crash-budget contract. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- §6.2 crash-loop window: ThrottleInterval is 10 s so a sane
+         daemon has the full 60 s budget before macOS starts deferring
+         restarts. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- §7.1 mode dispatch: packaged-app mode enables the
+         `~/Library/Application Support/Chainworks Forge/` path matrix
+         and loopback-only binding. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MODE</key>
+        <string>packaged-app</string>
+    </dict>
+
+    <!-- Absolute paths — launchd rejects the relative form with
+         EX_CONFIG at spawn time. The daemon's own rotating JSON log
+         lives next to these in daemon.log.YYYY-MM-DD; the launchd
+         pipes here catch only early-startup panics before tracing is
+         initialised. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/chainworks-forge-daemon.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/chainworks-forge-daemon.launchd.err.log</string>
+</dict>
+</plist>

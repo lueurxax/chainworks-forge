@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::{AcpCloseDiagnostic, ExecutionRequest, ExecutionResult};
 use domain::ids::AgentExecutionId;
 
 /// Transport-backed ACP session that can accept multiple prompt turns before
@@ -42,7 +42,7 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
-        let (status, artifact_paths, discovered_artifacts, usage) =
+        let (status, artifact_paths, discovered_artifacts, transcript_text, usage) =
             self.transport.prompt(req).await?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
@@ -58,6 +58,7 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
+            transcript_text,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,
             provider_session_id: Some(self.transport.session_id().to_string()),
@@ -67,16 +68,17 @@ impl AcpSession {
             actual_mcp_extensions,
             actual_mcp_runtime_ids,
             mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
+            close_diagnostic: None,
         })
     }
 
     /// Close the live ACP session and wait for the subprocess to exit.
-    pub async fn close(&mut self) -> Result<()> {
-        self.transport.close().await?;
+    pub async fn close(&mut self) -> Result<Option<AcpCloseDiagnostic>> {
+        let close_diagnostic = self.transport.close().await?;
         if let Some(path) = self.cleanup_path.take() {
             let _ = std::fs::remove_dir_all(path);
         }
-        Ok(())
+        Ok(close_diagnostic)
     }
 }
 
@@ -103,9 +105,14 @@ impl AcpSessionHandle {
     }
 
     /// Close the live session.
-    pub async fn close(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<Option<AcpCloseDiagnostic>> {
         let mut session = self.inner.lock().await;
         session.close().await
+    }
+
+    pub async fn is_alive(&self) -> bool {
+        let mut session = self.inner.lock().await;
+        session.transport.is_alive()
     }
 
     pub async fn provider_session_id(&self) -> String {

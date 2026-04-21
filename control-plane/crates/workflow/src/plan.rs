@@ -48,6 +48,8 @@ pub struct CompiledState {
     pub post_approval_tasks: Vec<CompiledTask>,
     pub transitions: Vec<CompiledTransition>,
     pub loop_config: Option<CompiledLoop>,
+    #[serde(default)]
+    pub degraded_output_policy: DegradedOutputPolicy,
 }
 
 /// A resolved agent binding: agent ID → provider + model.
@@ -154,4 +156,24 @@ pub struct CompiledTransition {
 pub struct CompiledLoop {
     pub counter: String,
     pub max: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DegradedOutputPolicy {
+    pub mode: String,
+    pub contracts: Vec<String>,
+    pub failure_kinds: Vec<String>,
+    pub max_settlement: String,
+}
+
+impl Default for DegradedOutputPolicy {
+    fn default() -> Self {
+        Self {
+            mode: "deny".to_string(),
+            contracts: Vec::new(),
+            failure_kinds: Vec::new(),
+            max_settlement: "valid_outputs_from_failed_execution".to_string(),
+        }
+    }
 }

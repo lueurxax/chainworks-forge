@@ -2,11 +2,12 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::approvals;
-use domain::commands::{ApproveStageCmd, CallerContext, Command, RejectStageCmd};
+use domain::commands::{ApproveStageCmd, Command, RejectStageCmd};
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
+use crate::request_context::mcp_caller;
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -66,7 +67,7 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
             let comment = params["comment"].as_str().map(|s| s.to_string());
 
-            let caller = CallerContext::mcp(&principal.id, &principal.class, "approvals.resolve");
+            let caller = mcp_caller(&principal.id, &principal.class, "approvals.resolve");
             let cmd = match decision {
                 "granted" => Command::ApproveStage(ApproveStageCmd {
                     run_id,

@@ -1,0 +1,137 @@
+{
+  "proposal_revision_id": "031-2026-04-20-run-8dd01a54-r9-graphql-only-refinement",
+  "claims": [
+    {
+      "id": "CLAIM-001",
+      "category": "architecture",
+      "claim": "GraphQL is the only macOS UI data plane for workflow truth: queries, subscriptions, and polling only. No GraphQL mutations.",
+      "source_section": "architecture.read_plane"
+    },
+    {
+      "id": "CLAIM-002",
+      "category": "architecture",
+      "claim": "P031-owned UI is strictly read-only. No MCP usage, no GraphQL mutations, no local workflow writes. MCP remains for agents, CLI, automation, and debug outside the UI.",
+      "source_section": "architecture.ui_write_prohibition"
+    },
+    {
+      "id": "CLAIM-003",
+      "category": "scope_change",
+      "claim": "r8/r9 operator correction materially changes P031 from a GraphQL+MCP thin-client control cutover into a GraphQL-only read/inspection cutover. This is not an incremental refinement of r7.",
+      "source_section": "executive_summary, review_feedback_resolution (OPERATOR-CORRECTION-R8-01/02/03)"
+    },
+    {
+      "id": "CLAIM-004",
+      "category": "scope",
+      "claim": "Create Idea, Start Run, Cancel Run, Stage Retry, Steward, runtime-health, session, clone, compare, and experiment write controls are removed or disabled from P031-owned screens.",
+      "source_section": "scope.removed_or_disabled_writes"
+    },
+    {
+      "id": "CLAIM-005",
+      "category": "scope",
+      "claim": "Approval decision controls are the only surviving approval-related controls. They must not use UI MCP or GraphQL mutation. Absent a separately approved transport, they render disabled/read-only with Copy Diagnostic ID.",
+      "source_section": "scope.in_scope_operator_controls, architecture.ui_write_prohibition.rules[4]"
+    },
+    {
+      "id": "CLAIM-006",
+      "category": "architecture",
+      "claim": "Static guards fail the P031 gate if P031-owned UI imports MCP, defines/executes GraphQL mutations, calls local recovery/execution mutations, constructs MCP parameter dictionaries, or creates ActionInvocationIdentity payloads.",
+      "source_section": "architecture.ui_write_prohibition.static_guards"
+    },
+    {
+      "id": "CLAIM-007",
+      "category": "architecture",
+      "claim": "Server read metadata exposes disabledReasonCode, payloadAvailabilityState, payloadUnavailableReasonCode, diagnosticId, and optional serverDebugDetail. No executable command fields (commandToolName, identity payloads, MCP parameters, journal/receipt fields) in P031 UI read models.",
+      "source_section": "architecture.server_read_metadata_contract"
+    },
+    {
+      "id": "CLAIM-008",
+      "category": "architecture",
+      "claim": "Swift thin-client boundary has 7 allowed types (WorkflowGraphQLReadClient, WorkflowGraphQLSubscriptionClient, WorkflowProjectionStore, WorkflowFreshnessReducer, DisabledReasonPresenter, PayloadUnavailableReasonPresenter, ThinUIAuthContext) and 5 explicitly forbidden type categories.",
+      "source_section": "architecture.swift_thin_client_boundary"
+    },
+    {
+      "id": "CLAIM-009",
+      "category": "architecture",
+      "claim": "Read refresh is a targeted GraphQL refetch with active visual feedback. It cannot execute MCP, GraphQL mutation, or local mutation. r7 Check Status/command recovery is superseded.",
+      "source_section": "architecture.read_refresh_contract"
+    },
+    {
+      "id": "CLAIM-010",
+      "category": "ux",
+      "claim": "Refreshing and projection_lag share one Syncing visual pattern with a reserved fixed-width slot after StatusCapsule. No per-field spinners, no layout shift.",
+      "source_section": "ux_ui_notes.component_requirements"
+    },
+    {
+      "id": "CLAIM-011",
+      "category": "ux",
+      "claim": "Reports list rows show payloadAvailabilityState before drill-in: Payload available, Metadata only, Payload deferred, Generating, or Unavailable.",
+      "source_section": "architecture.graphql_read_model_contract.reports"
+    },
+    {
+      "id": "CLAIM-012",
+      "category": "ux",
+      "claim": "CommandStatusCapsule is removed from P031 after the GraphQL-only correction. Remaining indicators use state-specific VoiceOver labels.",
+      "source_section": "ux_ui_notes.component_requirements"
+    },
+    {
+      "id": "CLAIM-013",
+      "category": "scope",
+      "claim": "Report metadata inspection is the P031 report deliverable. Full payload rendering is deferred to P031-FOLLOWUP-REPORT-PAYLOAD.",
+      "source_section": "goals, follow_ups"
+    },
+    {
+      "id": "CLAIM-014",
+      "category": "rollout",
+      "claim": "Three rollout modes: legacy, thin-read, dogfood. thin-command mode is removed by the GraphQL-only correction.",
+      "source_section": "rollout.mode_enum"
+    },
+    {
+      "id": "CLAIM-015",
+      "category": "rollout",
+      "claim": "Phase 0 has four sub-checkpoints (0a-0d). Total effort estimate: 8.5-15 implementation days across all phases.",
+      "source_section": "implementation_plan, effort_estimate"
+    },
+    {
+      "id": "CLAIM-016",
+      "category": "rollout",
+      "claim": "Dogfood population: 1-3 internal operators, same workflow family, two runs, with four scaling triggers for additional evidence.",
+      "source_section": "rollout.dogfood_population"
+    },
+    {
+      "id": "CLAIM-017",
+      "category": "rollout",
+      "claim": "Legacy expiry: 10 business days after flag removal with written release-owner extension for exceptional gaps.",
+      "source_section": "rollout.legacy_expiry"
+    },
+    {
+      "id": "CLAIM-018",
+      "category": "rollout",
+      "claim": "Rollback drill result or release-owner waiver required before dogfood evidence acceptance.",
+      "source_section": "implementation_plan Phase 0d"
+    },
+    {
+      "id": "CLAIM-019",
+      "category": "governance",
+      "claim": "Run-local r9 artifact is the governing implementation contract until synchronized to the checked-in proposal path.",
+      "source_section": "architecture.source_artifact_governance"
+    },
+    {
+      "id": "CLAIM-020",
+      "category": "dependency",
+      "claim": "Prerequisites: P027, P041, P042, P043. P029 is no longer listed (MCP auth not needed for GraphQL-only UI).",
+      "source_section": "rollout.hold_criteria, implementation_plan Phase 3"
+    },
+    {
+      "id": "CLAIM-021",
+      "category": "scope",
+      "claim": "Three follow-ups: P031-FOLLOWUP-REPORT-PAYLOAD, P031-FOLLOWUP-APPROVAL-WRITE-PATH, P031-FOLLOWUP-UI-CONTROL-SURFACE.",
+      "source_section": "follow_ups"
+    },
+    {
+      "id": "CLAIM-022",
+      "category": "metrics",
+      "claim": "13 metrics covering read ownership, projection correctness, UI MCP usage (0), GraphQL mutation usage (0), removed write controls (0), local truth bypasses (0), unsafe freshness, GraphQL freshness baseline, targeted read-refresh feedback, report payload visibility, time to Runs Home (2s/95%), Syncing stability, and disabled reason accessibility.",
+      "source_section": "metrics"
+    }
+  ]
+}

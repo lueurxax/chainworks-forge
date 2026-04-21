@@ -179,7 +179,10 @@ pub fn extract_bearer_token(header_value: &str) -> Result<&str, AuthError> {
 pub fn filter_tools(principal: &Principal, ids: &[CapabilityToolId]) -> Vec<CapabilityToolId> {
     ids.iter()
         .copied()
-        .filter(|id| principal.tool_capabilities.contains(id))
+        .filter(|id| {
+            tool_allowed_for_class(&principal.class, *id)
+                && principal.tool_capabilities.contains(id)
+        })
         .collect()
 }
 
@@ -189,7 +192,10 @@ pub fn filter_resources(
 ) -> Vec<ResourceTemplateId> {
     ids.iter()
         .copied()
-        .filter(|id| principal.resource_capabilities.contains(id))
+        .filter(|id| {
+            resource_allowed_for_class(&principal.class, *id)
+                && principal.resource_capabilities.contains(id)
+        })
         .collect()
 }
 
@@ -198,69 +204,71 @@ pub fn is_tool_allowed(principal: &Principal, tool_name: &str) -> bool {
     let Some(id) = capability_tool_id_for_name(tool_name) else {
         return false;
     };
-    principal.tool_capabilities.contains(&id)
+    filter_tools(principal, &[id]).len() == 1
 }
 
 fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolId> {
-    match class {
-        PrincipalClass::Operator => [
-            CapabilityToolId::IdeasCreate,
-            CapabilityToolId::IdeasList,
-            CapabilityToolId::RunsStart,
-            CapabilityToolId::RunsList,
-            CapabilityToolId::RunsGet,
-            CapabilityToolId::RunsCancel,
-            CapabilityToolId::ApprovalsList,
-            CapabilityToolId::ApprovalsResolve,
-            CapabilityToolId::StagesRetry,
-            CapabilityToolId::ReportsGet,
-            CapabilityToolId::StewardRunAnalysis,
-            CapabilityToolId::StewardListAnalyses,
-            CapabilityToolId::StewardGetAnalysis,
-        ]
+    all_tool_capabilities()
         .into_iter()
-        .collect(),
-        PrincipalClass::Agent => [
-            CapabilityToolId::IdeasCreate,
-            CapabilityToolId::IdeasList,
-            CapabilityToolId::RunsStart,
-            CapabilityToolId::RunsList,
-            CapabilityToolId::RunsGet,
-            CapabilityToolId::ReportsGet,
-        ]
-        .into_iter()
-        .collect(),
-        PrincipalClass::Observer => [
-            CapabilityToolId::IdeasList,
-            CapabilityToolId::RunsList,
-            CapabilityToolId::RunsGet,
-            CapabilityToolId::ApprovalsList,
-            CapabilityToolId::ReportsGet,
-            CapabilityToolId::StewardListAnalyses,
-            CapabilityToolId::StewardGetAnalysis,
-        ]
-        .into_iter()
-        .collect(),
+        .filter(|id| tool_allowed_for_class(class, *id))
+        .collect()
+}
+
+fn all_tool_capabilities() -> [CapabilityToolId; 14] {
+    [
+        CapabilityToolId::IdeasCreate,
+        CapabilityToolId::IdeasList,
+        CapabilityToolId::RunsStart,
+        CapabilityToolId::RunsList,
+        CapabilityToolId::RunsGet,
+        CapabilityToolId::RunsCancel,
+        CapabilityToolId::ApprovalsList,
+        CapabilityToolId::ApprovalsResolve,
+        CapabilityToolId::StagesRetry,
+        CapabilityToolId::ReportsGet,
+        CapabilityToolId::ArtifactsOverrideContract,
+        CapabilityToolId::StewardRunAnalysis,
+        CapabilityToolId::StewardListAnalyses,
+        CapabilityToolId::StewardGetAnalysis,
+    ]
+}
+
+fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool {
+    match id {
+        CapabilityToolId::IdeasCreate => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
+        }
+        CapabilityToolId::IdeasList => true,
+        CapabilityToolId::RunsStart => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
+        }
+        CapabilityToolId::RunsList => true,
+        CapabilityToolId::RunsGet => true,
+        CapabilityToolId::RunsCancel => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::ApprovalsList => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::ApprovalsResolve => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::StagesRetry => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::ReportsGet => true,
+        CapabilityToolId::ArtifactsOverrideContract => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::StewardRunAnalysis => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::StewardListAnalyses => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::StewardGetAnalysis => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
     }
 }
 
 // ── Resource capability filtering ───────────────────────────────────────
 
 fn default_resource_capabilities(class: &PrincipalClass) -> BTreeSet<ResourceTemplateId> {
-    match class {
-        PrincipalClass::Operator => all_resource_templates().into_iter().collect(),
-        PrincipalClass::Agent => [
-            ResourceTemplateId::RunEntity,
-            ResourceTemplateId::IdeaEntity,
-            ResourceTemplateId::ArtifactEntity,
-            ResourceTemplateId::ReportEntity,
-            ResourceTemplateId::ChainworksRuns,
-            ResourceTemplateId::ChainworksIdeas,
-        ]
+    all_resource_templates()
         .into_iter()
-        .collect(),
-        PrincipalClass::Observer => all_resource_templates().into_iter().collect(),
-    }
+        .filter(|id| resource_allowed_for_class(class, *id))
+        .collect()
 }
 
 pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
@@ -279,7 +287,31 @@ pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
 }
 
 pub fn is_resource_allowed(principal: &Principal, id: ResourceTemplateId) -> bool {
-    principal.resource_capabilities.contains(&id)
+    resource_allowed_for_class(&principal.class, id)
+        && principal.resource_capabilities.contains(&id)
+}
+
+fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) -> bool {
+    match id {
+        ResourceTemplateId::RunEntity => true,
+        ResourceTemplateId::IdeaEntity => true,
+        ResourceTemplateId::ArtifactEntity => true,
+        ResourceTemplateId::ReportEntity => true,
+        ResourceTemplateId::StewardAnalysisEntity => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        ResourceTemplateId::ChainworksRuns => true,
+        ResourceTemplateId::ChainworksIdeas => true,
+        ResourceTemplateId::ChainworksApprovalsInbox => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        ResourceTemplateId::ChainworksRunStages => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        ResourceTemplateId::ChainworksRunArtifacts => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+    }
 }
 
 pub fn match_resource_uri<F>(
@@ -291,7 +323,7 @@ where
     F: FnOnce(&str) -> Option<ResourceTemplateId>,
 {
     let id = classify_uri(uri)?;
-    principal.resource_capabilities.contains(&id).then_some(id)
+    is_resource_allowed(principal, id).then_some(id)
 }
 
 fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
@@ -306,6 +338,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
+        "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),

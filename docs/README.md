@@ -45,7 +45,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Outputs, contracts, and feedback
 
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, failed-stage evidence, narrow recovery
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, narrow recovery
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry
 
@@ -53,7 +53,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/run-control.md](reference/run-control.md) — Stop/cancel, two-phase cancellation settlement, terminal-history rules
 - [reference/release-gate.md](reference/release-gate.md) — Manual release gate: post-approval execution, native git/publish, delivery receipts
-- [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Repo-backed delivery slice: worktrees, implementation loop, manual release, evidence export
+- [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Repo-backed delivery slice: worktrees, implementation loop, manual release, assessment and handoff
 - [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Idea-owned workspace and frozen run project contract
 - [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Provider/model truth and provenance contract
 - [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — Benchmark, recovery/export, launch-gate sign-off

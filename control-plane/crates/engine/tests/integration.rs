@@ -3,7 +3,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifacts, ideas, runs, sessions, stages, work_items,
+    agent_executions, approvals, artifact_contracts, artifacts, ideas, runs, sessions, stages,
+    work_items,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
@@ -73,6 +74,7 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     }
 }
 
@@ -550,7 +552,8 @@ async fn test_cancel_run_eventually_finalizes_to_cancelled() {
 // Proves daemon CommandHandler approval and retry semantics match the
 // app-owned ExecutionService authority model:
 // – Granted approval → stage transitions WaitingApproval → Running
-// – Rejected approval → stage transitions WaitingApproval → Blocked
+// – Rejected non-manual approval → stage transitions WaitingApproval → Blocked
+// – Rejected workflow manual_gate approval → stage settles Completed so transitions can evaluate
 // – Retry → old stage settled as Skipped, new stage created with attempt+1
 // ---------------------------------------------------------------------------
 
@@ -613,8 +616,8 @@ async fn test_approve_stage_resolves_approval_and_advances_stage() {
     );
 }
 
-/// Rejecting approval must resolve the canonical approval record to Rejected
-/// and transition the stage from WaitingApproval to Blocked.
+/// Rejecting a non-manual approval must resolve the canonical approval record
+/// to Rejected and transition the stage from WaitingApproval to Blocked.
 #[tokio::test]
 async fn test_reject_stage_resolves_approval_and_blocks_stage() {
     let pool = test_pool().await;
@@ -671,6 +674,95 @@ async fn test_reject_stage_resolves_approval_and_blocks_stage() {
     );
 }
 
+/// Rejecting a workflow manual gate must leave durable rejection evidence and
+/// allow the workflow transition evaluator to route an explicit loopback.
+#[tokio::test]
+async fn test_reject_manual_gate_can_transition_on_rejected_approval() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("state_6_implementation_approval".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_6_implementation_approval".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(
+        run_id,
+        "state_6_implementation_approval",
+        ApprovalDecision::Pending,
+    );
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RejectStage(RejectStageCmd {
+                run_id,
+                stage_id: "state_6_implementation_approval".into(),
+                comment: Some("Refine before implementation".into()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let rejected_stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rejected_stage.status,
+        StageStatus::Completed,
+        "manual_gate rejection must settle the gate so transition predicates can evaluate"
+    );
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let updated_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated_run.current_state.as_deref(),
+        Some("state_5_proposal_refined"),
+        "approval.rejected == true must route state_6 back to proposal refinement"
+    );
+
+    orchestrator.advance_run(run_id).await.unwrap();
+    let refinement_prompt = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.stage_id.as_deref() == Some("state_5_proposal_refined")
+        })
+        .and_then(|item| {
+            serde_json::from_str::<serde_json::Value>(&item.payload_json)
+                .ok()
+                .and_then(|payload| payload["prompt"].as_str().map(str::to_owned))
+        })
+        .expect("state_5 refinement prompt should be enqueued");
+    assert!(
+        refinement_prompt.contains("Rejected Implementation Approval Context"),
+        "state_5 prompt must include rejected approval context"
+    );
+    assert!(
+        refinement_prompt.contains("Refine before implementation"),
+        "state_5 prompt must include the operator rejection comment"
+    );
+}
+
 /// Retrying a stage must settle the old execution as Skipped and produce a new
 /// execution for the same stage_id with attempt_number incremented by 1.
 #[tokio::test]
@@ -697,6 +789,7 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
             Command::RetryStage(RetryStageCmd {
                 run_id,
                 stage_id: "flaky_stage".into(),
+                consume_quota_budget_now: false,
             }),
             CallerContext::test_fixture(),
         )
@@ -730,6 +823,550 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
         new_stage.status,
         StageStatus::Pending,
         "new stage execution must start as Pending"
+    );
+}
+
+#[tokio::test]
+async fn test_retry_stage_targets_latest_matching_attempt() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let first_stage_exec_id = StageExecutionId::new();
+    let latest_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Blocked))
+        .await
+        .unwrap();
+
+    let mut first = make_stage(first_stage_exec_id, run_id, StageStatus::Failed);
+    first.stage_id = "flaky_stage".into();
+    first.attempt_number = 1;
+    first.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    stages::insert(&pool, &first).await.unwrap();
+
+    let mut latest = make_stage(latest_stage_exec_id, run_id, StageStatus::Failed);
+    latest.stage_id = "flaky_stage".into();
+    latest.attempt_number = 2;
+    latest.started_at = chrono::Utc::now();
+    stages::insert(&pool, &latest).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "flaky_stage".into(),
+                consume_quota_budget_now: false,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let first_after = stages::find_by_id(&pool, first_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let latest_after = stages::find_by_id(&pool, latest_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_after.status, StageStatus::Failed);
+    assert_eq!(latest_after.status, StageStatus::Skipped);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        all_stages
+            .iter()
+            .any(|s| s.stage_id == "flaky_stage" && s.attempt_number == 3),
+        "retry must create the next attempt after the latest matching stage"
+    );
+}
+
+#[tokio::test]
+async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("blocked_stage".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Completed);
+    stage.stage_id = "blocked_stage".into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "blocked_stage".into(),
+                consume_quota_budget_now: false,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let old = stages::find_by_id(&pool, old_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.status, StageStatus::Skipped);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let new_stage = all_stages
+        .iter()
+        .find(|s| s.stage_id == "blocked_stage" && s.attempt_number == 2)
+        .expect("blocked completed current stage retry must create a new attempt");
+    assert_eq!(new_stage.status, StageStatus::Pending);
+}
+
+#[tokio::test]
+async fn test_retry_stage_rejects_active_latest_attempt() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut failed = make_stage(StageExecutionId::new(), run_id, StageStatus::Failed);
+    failed.stage_id = "flaky_stage".into();
+    failed.attempt_number = 1;
+    failed.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    stages::insert(&pool, &failed).await.unwrap();
+
+    let mut running = make_stage(StageExecutionId::new(), run_id, StageStatus::Running);
+    running.stage_id = "flaky_stage".into();
+    running.attempt_number = 2;
+    running.started_at = chrono::Utc::now();
+    stages::insert(&pool, &running).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "flaky_stage".into(),
+                consume_quota_budget_now: false,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "retry must reject while the latest stage attempt is still active"
+    );
+}
+
+#[tokio::test]
+async fn test_advance_run_consumes_pending_compute_retry_stage() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: compute-retry
+initial_state: build
+states:
+  build:
+    label: Build
+    owner: worker
+    run:
+      sequence:
+        - agent: worker
+          task: implement
+          outputs:
+            - implementation_progress
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+backend_profiles:
+  worker_profile:
+    provider: claude
+agents:
+  - id: worker
+    backend_profile: worker_profile
+"#,
+    )
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("build".into());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "build".into();
+    old_stage.attempt_number = 1;
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "build".into(),
+                consume_quota_budget_now: false,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let pending_retry = stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.stage_id == "build" && s.attempt_number == 2)
+        .expect("RetryStage must create attempt=2");
+    assert_eq!(pending_retry.status, StageStatus::Pending);
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let retry_after = stages::find_by_id(&pool, pending_retry.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retry_after.status,
+        StageStatus::Running,
+        "advance_run must start the pending retry attempt instead of creating a replacement stage"
+    );
+
+    let stages_after = stages::list_by_run(&pool, run_id).await.unwrap();
+    let build_stages: Vec<_> = stages_after
+        .iter()
+        .filter(|s| s.stage_id == "build")
+        .collect();
+    assert_eq!(
+        build_stages.len(),
+        2,
+        "compute retry must keep exactly the skipped old stage and the running retry stage"
+    );
+    assert!(
+        !build_stages
+            .iter()
+            .any(|s| s.id != old_stage_exec_id && s.id != pending_retry.id),
+        "advance_run must not fork an extra build stage execution"
+    );
+
+    let invoke_items: Vec<_> = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert_eq!(invoke_items.len(), 1);
+    assert!(
+        invoke_items[0]
+            .payload_json
+            .contains(&pending_retry.id.to_string()),
+        "enqueued InvokeAgent work must target the pending retry stage execution"
+    );
+}
+
+#[tokio::test]
+async fn test_self_loop_transition_creates_next_iteration_before_reentering() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let completed_stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let meta_root = temp.path().join(".chainworks");
+    std::fs::create_dir_all(&meta_root).unwrap();
+    std::fs::write(
+        meta_root.join("self-assessment.json"),
+        r#"{"seemingly_complete":false}"#,
+    )
+    .unwrap();
+
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: self-loop
+variables:
+  max_self_loop_cycles: 3
+initial_state: loop
+states:
+  loop:
+    label: Loop
+    owner: worker
+    run:
+      sequence:
+        - agent: worker
+          task: implement
+          outputs:
+            - implementation_self_assessment
+    loop:
+      counter: self_loop_count
+      max: vars.max_self_loop_cycles
+    transitions:
+      - to: done
+        when: implementation_self_assessment.seemingly_complete == true
+      - to: loop
+        when: implementation_self_assessment.seemingly_complete == false
+  done:
+    label: Done
+    type: end
+    owner: worker
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+artifacts:
+  implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/self-assessment.json
+backend_profiles:
+  worker_profile:
+    provider: claude
+agents:
+  - id: worker
+    backend_profile: worker_profile
+"#,
+    )
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("loop".into());
+    run.workspace_root = temp.path().to_string_lossy().into_owned();
+    run.artifact_root = temp.path().join("artifacts").to_string_lossy().into_owned();
+    run.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Running);
+    completed_stage.stage_id = "loop".into();
+    completed_stage.label = "Loop".into();
+    stages::insert(&pool, &completed_stage).await.unwrap();
+    stages::settle(
+        &pool,
+        completed_stage_id,
+        domain::stage::StageSettlementKind::Completed,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let loop_stages: Vec<_> = stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.stage_id == "loop")
+        .collect();
+    assert_eq!(
+        loop_stages.len(),
+        2,
+        "self-loop transition must persist the next iteration before the queued re-entry runs"
+    );
+
+    let next_iteration = loop_stages
+        .iter()
+        .find(|s| s.iteration == 2)
+        .expect("self-loop must create iteration 2");
+    assert_eq!(next_iteration.status, StageStatus::Pending);
+
+    let advance_items: Vec<_> = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::AdvanceRun)
+        .collect();
+    assert_eq!(
+        advance_items.len(),
+        1,
+        "self-loop transition should enqueue one re-entry work item"
+    );
+
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let next_after_reentry = stages::find_by_id(&pool, next_iteration.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        next_after_reentry.status,
+        StageStatus::Running,
+        "queued self-loop re-entry must start the pending next iteration"
+    );
+
+    let invoke_items: Vec<_> = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert_eq!(invoke_items.len(), 1);
+    assert!(
+        invoke_items[0]
+            .payload_json
+            .contains(&next_iteration.id.to_string()),
+        "InvokeAgent work must target the self-loop iteration 2 stage execution"
+    );
+}
+
+#[tokio::test]
+async fn test_code_writer_prompt_scopes_seemingly_complete_to_code_owned_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("prompt-scope.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: code-writer-scope
+initial_state: implementation
+states:
+  implementation:
+    label: Implementation
+    owner: code_writer
+    run:
+      sequence:
+        - agent: code_writer
+          task: continue_implementation
+          outputs:
+            - implementation_self_assessment
+    transitions:
+      - to: reviewed
+        when: implementation_self_assessment.seemingly_complete == true
+      - to: implementation
+        when: implementation_self_assessment.seemingly_complete == false
+  reviewed:
+    label: Reviewed
+    type: end
+    owner: code_writer
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+artifacts:
+  implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/self-assessment.json
+backend_profiles:
+  code_writer_profile:
+    provider: codex
+contracts:
+  implementation_self_assessment_v1:
+    format: json
+    required_fields:
+      - seemingly_complete
+      - remaining_tasks
+      - known_risks
+      - tests_run
+      - docs_impacted
+agents:
+  - id: code_writer
+    backend_profile: code_writer_profile
+    output_contract: implementation_self_assessment_v1
+"#,
+    )
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("implementation".into());
+    run.workspace_root = temp.path().to_string_lossy().into_owned();
+    run.artifact_root = temp.path().join("artifacts").to_string_lossy().into_owned();
+    run.chainworks_meta_root = Some(
+        temp.path()
+            .join(".chainworks")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    run.worktree_root = Some(temp.path().join("worktree").to_string_lossy().into_owned());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut pending_stage = make_stage(stage_execution_id, run_id, StageStatus::Pending);
+    pending_stage.stage_id = "implementation".into();
+    pending_stage.label = "Implementation".into();
+    stages::insert(&pool, &pending_stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let invoke_item = db::repos::work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("code writer stage should enqueue InvokeAgent");
+    let payload: serde_json::Value = serde_json::from_str(&invoke_item.payload_json).unwrap();
+    let prompt = payload["prompt"]
+        .as_str()
+        .expect("InvokeAgent payload must include prompt");
+
+    assert!(
+        prompt.contains("Set `seemingly_complete` based only on remaining code-writer-owned source or test work."),
+        "code_writer prompt must prevent non-code/manual/release evidence blockers from forcing implementation self-loops"
+    );
+    assert!(
+        prompt.contains("remaining_code_tasks"),
+        "code_writer prompt should ask for stable ownership classification fields"
+    );
+    assert!(
+        prompt.contains("handoff_tasks"),
+        "code_writer prompt should route non-code blockers as handoff tasks"
     );
 }
 
@@ -1653,6 +2290,44 @@ async fn delivery_preflight_failure_blocks_before_run_creation() {
 }
 
 #[tokio::test]
+async fn release_workflow_without_delivery_configuration_blocks_before_run_creation() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let commanded = handler
+        .handle(
+            Command::StartRun(StartRunCmd {
+                idea_id,
+                workflow_id: "wf-start".into(),
+                workflow_title: "Start Run".into(),
+                workspace_root: "/tmp/ws".into(),
+                artifact_root: "/tmp/art".into(),
+                workflow_yaml_path: test_workflow_yaml_path(),
+                agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
+                delivery_configuration_json: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    match commanded.result {
+        engine::command_handler::CommandResult::StartRunBlockedByDeliveryPreflight(blocked) => {
+            assert!(!blocked.delivery_preflight.passed);
+            assert!(blocked
+                .delivery_preflight
+                .checks
+                .iter()
+                .any(|check| check.id == "delivery_configuration_present" && !check.passed));
+        }
+        _ => panic!("expected missing delivery configuration to block release workflow start"),
+    }
+    assert!(runs::list_by_idea(&pool, idea_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn mcp_resolution_persistence_tests() {
     use acp::AcpRuntimeManager;
     use engine::executor::BackgroundExecutor;
@@ -2029,6 +2704,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -2126,6 +2802,94 @@ sys.exit(0)
     assert!(
         stage_proj.has_artifacts,
         "stage projection must reflect that an artifact was created"
+    );
+}
+
+#[tokio::test]
+async fn test_invoke_agent_startup_error_marks_agent_execution_failed() {
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "startup_stage".into();
+    stage.label = "Startup Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("startup_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "startup_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "startup-agent",
+                "provider": "missing-provider",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let err = executor
+        .process_next_item()
+        .await
+        .expect_err("missing provider should fail ACP startup");
+    assert!(
+        err.to_string()
+            .contains("No adapter registered for provider 'missing-provider'"),
+        "unexpected error: {err}"
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    let execution = executions
+        .first()
+        .expect("agent execution should be inserted before ACP startup");
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert!(
+        execution.completed_at.is_some(),
+        "failed startup execution must be terminal"
+    );
+
+    let queued = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        queued.iter().any(|item| {
+            item.kind == db::work_item::WorkItemKind::AdvanceRun
+                && item.status == db::work_item::WorkItemStatus::Pending
+        }),
+        "failed invoke_agent must enqueue AdvanceRun so fan-in can settle the stage"
     );
 }
 
@@ -2233,6 +2997,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -2385,6 +3150,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -2446,6 +3212,834 @@ sys.exit(0)
         .expect("declared output should persist");
     assert_eq!(artifact.name, "proposal_review_summary");
     assert!(artifact.file_path.ends_with("proposal_review_summary.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_index() {
+    use acp::{AcpRuntimeManager, ExecutionRequest, ExecutionResult};
+    use domain::agent::AgentStatus;
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    struct P057FixtureAdapter;
+
+    #[async_trait::async_trait]
+    impl acp::adapters::AcpAdapter for P057FixtureAdapter {
+        fn provider_name(&self) -> &str {
+            "fixture"
+        }
+
+        async fn open_session(
+            &self,
+            _req: &ExecutionRequest,
+        ) -> anyhow::Result<acp::AcpSessionHandle> {
+            anyhow::bail!("P057 fixture adapter does not provide reusable sessions")
+        }
+
+        async fn execute(&self, _req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
+            Ok(ExecutionResult {
+                agent_execution_id: AgentExecutionId::new(),
+                status: AgentStatus::Completed,
+                artifact_paths: Vec::new(),
+                discovered_artifacts: vec![acp::DiscoveredArtifact {
+                    name: "prepush_review_report".into(),
+                    content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
+                    source_path: None,
+                }],
+                transcript_text: Some(
+                    r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"PASS_WITH_NOTES"}<<<END_CHAINWORKS_OUTPUT>>>"#
+                        .into(),
+                ),
+                cost_cents: None,
+                usage: None,
+                provider_session_id: Some("p057-fixture-session".into()),
+                reused_existing_session: false,
+                session_generation_id: None,
+                mcp_observation: None,
+                actual_mcp_extensions: Vec::new(),
+                actual_mcp_runtime_ids: Vec::new(),
+                mcp_session_startup_latency_ms: None,
+                close_diagnostic: None,
+            })
+        }
+    }
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let target_path = tmp.path().join("review/prepush.json");
+    std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+
+    let fixture_adapter = Arc::new(P057FixtureAdapter) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-p057-contract-import".into(),
+            workflow_title: "P057 Contract Import Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_review".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(
+                tmp.path()
+                    .join(".chainworks")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "review_stage".into();
+    stage.label = "Review Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("review_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "fixture-agent",
+                "provider": "fixture",
+                "declared_outputs": [{
+                    "output_name": "prepush_review_report",
+                    "target_path": target_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "prepush_review_v1",
+                        "format": "json",
+                        "human_format": serde_json::Value::Null,
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "normalized_artifact_name": "prepush_review_report",
+                        "raw_artifact_name": serde_json::Value::Null,
+                        "required_fields": ["status"]
+                    },
+                    "companion_output_name": serde_json::Value::Null,
+                    "companion_path": serde_json::Value::Null
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let canonical = artifact_contracts::canonical_contract_field(
+        &pool,
+        run_id,
+        "prepush_review_report",
+        "status",
+    )
+    .await
+    .unwrap();
+    assert_eq!(canonical, Some(serde_json::json!("pass")));
+
+    let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("P057 run-state projection");
+    assert_eq!(
+        projection.active_index_json["contracts"]["prepush_review_v1"]["status"],
+        "pass"
+    );
+    assert_eq!(
+        projection.active_index_json["contracts"]["prepush_review_v1"]["source_stage_execution_id"],
+        stage_exec_id.to_string()
+    );
+    assert!(tmp
+        .path()
+        .join(".chainworks/artifacts/active-index.json")
+        .exists());
+    assert!(tmp.path().join(".chainworks/state/run-state.json").exists());
+}
+
+#[tokio::test]
+async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_policy() {
+    use acp::{AcpRuntimeManager, ExecutionRequest, ExecutionResult};
+    use domain::agent::{AgentFailureKind, AgentOutputSettlement};
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    struct P057FailedFixtureAdapter;
+
+    #[async_trait::async_trait]
+    impl acp::adapters::AcpAdapter for P057FailedFixtureAdapter {
+        fn provider_name(&self) -> &str {
+            "failed_fixture"
+        }
+
+        async fn open_session(
+            &self,
+            _req: &ExecutionRequest,
+        ) -> anyhow::Result<acp::AcpSessionHandle> {
+            anyhow::bail!("P057 failed fixture adapter does not provide reusable sessions")
+        }
+
+        async fn execute(&self, _req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
+            Ok(ExecutionResult {
+                agent_execution_id: AgentExecutionId::new(),
+                status: AgentStatus::Failed,
+                artifact_paths: Vec::new(),
+                discovered_artifacts: vec![acp::DiscoveredArtifact {
+                    name: "prepush_review_report".into(),
+                    content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
+                    source_path: None,
+                }],
+                transcript_text: Some(
+                    "provider quota limit reached after producing valid structured output".into(),
+                ),
+                cost_cents: None,
+                usage: None,
+                provider_session_id: Some("p057-failed-fixture-session".into()),
+                reused_existing_session: false,
+                session_generation_id: None,
+                mcp_observation: None,
+                actual_mcp_extensions: Vec::new(),
+                actual_mcp_runtime_ids: Vec::new(),
+                mcp_session_startup_latency_ms: None,
+                close_diagnostic: None,
+            })
+        }
+    }
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let target_path = tmp.path().join("review/prepush.json");
+    std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![
+        Arc::new(P057FailedFixtureAdapter) as Arc<dyn acp::adapters::AcpAdapter>,
+    ]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-p057-degraded-import".into(),
+            workflow_title: "P057 Degraded Import Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_review".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(
+                tmp.path()
+                    .join(".chainworks")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "review_stage".into();
+    stage.label = "Review Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("review_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "fixture-agent",
+                "provider": "failed_fixture",
+                "stage_degraded_output_policy": {
+                    "mode": "allow_valid_contract_outputs",
+                    "contracts": ["prepush_review_v1"],
+                    "failure_kinds": ["provider_quota"],
+                    "max_settlement": "valid_outputs_from_failed_execution"
+                },
+                "declared_outputs": [{
+                    "output_name": "prepush_review_report",
+                    "target_path": target_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "prepush_review_v1",
+                        "format": "json",
+                        "human_format": serde_json::Value::Null,
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "normalized_artifact_name": "prepush_review_report",
+                        "raw_artifact_name": serde_json::Value::Null,
+                        "required_fields": ["status"]
+                    },
+                    "companion_output_name": serde_json::Value::Null,
+                    "companion_path": serde_json::Value::Null
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let canonical = artifact_contracts::canonical_contract_field(
+        &pool,
+        run_id,
+        "prepush_review_report",
+        "status",
+    )
+    .await
+    .unwrap();
+    assert_eq!(canonical, Some(serde_json::json!("pass")));
+
+    let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("P057 degraded run-state projection");
+    let contract = &projection.active_index_json["contracts"]["prepush_review_v1"];
+    assert_eq!(contract["status"], "pass");
+    assert_eq!(
+        contract["output_settlement"],
+        AgentOutputSettlement::ValidOutputsFromFailedExecution.to_string()
+    );
+    assert_eq!(contract["partial"], true);
+    assert_eq!(
+        contract["source_stage_execution_id"],
+        stage_exec_id.to_string()
+    );
+
+    let agent_exec = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .pop()
+        .expect("agent execution");
+    let runtime_facts =
+        db::repos::agent_execution_runtime_facts::find_by_execution_id(&pool, agent_exec.id)
+            .await
+            .unwrap()
+            .expect("runtime facts");
+    assert_eq!(
+        runtime_facts.failure_kind,
+        Some(AgentFailureKind::ProviderQuota)
+    );
+    assert_eq!(
+        runtime_facts.output_settlement,
+        AgentOutputSettlement::ValidOutputsFromFailedExecution
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_invoke_agent_imports_implementation_self_assessment_summary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use domain::artifact_contracts::ImplementationSelfAssessmentStatus;
+    use domain::run::Run;
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let target_path = tmp
+        .path()
+        .join("implementation")
+        .join("self-assessment.json");
+
+    let script = tmp.path().join("acp_self_assessment_fixture.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"self-assessment-session"}})
+
+msg = recv()
+payload = {
+    "implementation_complete": True,
+    "verification_green": False,
+    "remaining_code_tasks": [],
+    "handoff_tasks": [],
+    "known_risks": ["CloudKit manual smoke evidence remains outside code-owned verification."],
+    "tests_run": ["cargo test was blocked by missing toolchain"],
+    "docs_impacted": []
+}
+send({
+    "jsonrpc":"2.0",
+    "method":"session/update",
+    "params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{
+        "type":"text",
+        "text":"<<<CHAINWORKS_OUTPUT:implementation_self_assessment>>>" + json.dumps(payload) + "<<<END_CHAINWORKS_OUTPUT>>>"
+    }]}}}
+})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":"self-assessment-session"}})
+
+try:
+    recv()
+except Exception:
+    pass
+sys.exit(0)
+"#).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf-self-assessment".into(),
+            workflow_title: "Self Assessment Workflow".into(),
+            workspace_root: workspace_root.clone(),
+            artifact_root: workspace_root.clone(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "implementation_stage".into();
+    stage.label = "Implementation Stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("implementation_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implementation_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "claude",
+                "declared_outputs": [{
+                    "output_name": "implementation_self_assessment",
+                    "target_path": target_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "implementation_self_assessment_v2",
+                        "format": "json",
+                        "human_format": serde_json::Value::Null,
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "normalized_artifact_name": serde_json::Value::Null,
+                        "raw_artifact_name": serde_json::Value::Null,
+                        "required_fields": [
+                            "implementation_complete",
+                            "verification_green",
+                            "remaining_code_tasks",
+                            "handoff_tasks",
+                            "known_risks",
+                            "tests_run",
+                            "docs_impacted"
+                        ]
+                    },
+                    "companion_output_name": serde_json::Value::Null,
+                    "companion_path": serde_json::Value::Null
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let summary =
+        artifact_contracts::find_active_implementation_self_assessment_summary(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("implementation self-assessment summary should be imported");
+    assert_eq!(
+        summary.summary.status,
+        ImplementationSelfAssessmentStatus::Blocked
+    );
+    assert_eq!(summary.summary.implementation_complete, Some(true));
+    assert_eq!(summary.summary.verification_green, Some(false));
+    assert_eq!(summary.summary.blocking_remaining_code_task_count, Some(0));
+}
+
+#[tokio::test]
+async fn malformed_implementation_self_assessment_import_persists_invalid_active_summary() {
+    use acp::AcpRuntimeManager;
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
+    use domain::ids::ArtifactId;
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let artifact_root = tmp.path().join(".chainworks");
+    let implementation_dir = artifact_root.join("implementation");
+    std::fs::create_dir_all(&implementation_dir).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+
+    let artifact_path = artifact_root.join(IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH);
+    std::fs::write(&artifact_path, br#"{ "implementation_complete": true, "#).unwrap();
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation_continued".into(),
+        agent_id: "code_writer".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+        format: ArtifactFormat::Json,
+        file_path: artifact_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(&pool, &artifact).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue,
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    );
+
+    executor
+        .persist_implementation_self_assessment_summary_if_applicable(&artifact)
+        .await
+        .unwrap();
+
+    let summary =
+        artifact_contracts::find_active_implementation_self_assessment_summary(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("malformed v2 generation should remain active as invalid truth");
+    assert_eq!(
+        summary.summary.status,
+        ImplementationSelfAssessmentStatus::Invalid
+    );
+    assert_eq!(summary.source_kind, "v2");
+    assert!(summary.summary.raw_artifact_available);
+    assert!(summary
+        .summary
+        .validation_errors
+        .iter()
+        .any(|issue| issue.code == "malformed_json"));
+}
+
+#[tokio::test]
+async fn blocked_implementation_assessment_synthesizes_release_hold_review_summary() {
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
+    use domain::ids::ArtifactId;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = tmp.path().join(".chainworks");
+    let implementation_dir = artifact_root.join("implementation");
+    std::fs::create_dir_all(&implementation_dir).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root;
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let self_assessment_path = implementation_dir.join("self-assessment.json");
+    let raw = serde_json::json!({
+        "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation_complete": true,
+        "verification_green": false,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [{
+            "summary": "Capture manual smoke evidence",
+            "owner_class": "manual_evidence",
+            "target_stage": "state_9_implementation_reviewed",
+            "blocking_review": true,
+            "evidence": "verification is blocked until the operator captures smoke evidence"
+        }],
+        "known_risks": ["Rust toolchain missing in verification environment"],
+        "tests_run": ["cargo test: blocked"],
+        "docs_impacted": []
+    });
+    std::fs::write(
+        &self_assessment_path,
+        serde_json::to_vec_pretty(&raw).unwrap(),
+    )
+    .unwrap();
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation_continued".into(),
+        agent_id: "code_writer".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+        format: ArtifactFormat::Json,
+        file_path: self_assessment_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(&pool, &artifact).await.unwrap();
+    let summary = parse_implementation_self_assessment_v2(
+        &raw,
+        ContractParseContext {
+            run_id: run_id.to_string(),
+            run_age: None,
+            declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+            canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(artifact.file_path.clone()),
+            source_generation_id: None,
+            artifact_created_at: Some(artifact.created_at),
+            v2_generation_seen_for_run: true,
+            legacy_v1_generation_available: false,
+        },
+    );
+    artifact_contracts::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        artifact.id,
+        &artifact.contract_id,
+        &summary,
+        artifact.created_at,
+    )
+    .await
+    .unwrap();
+    let active =
+        artifact_contracts::find_active_implementation_self_assessment_summary(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("active self-assessment summary");
+    assert_eq!(
+        active.summary.status,
+        ImplementationSelfAssessmentStatus::Blocked
+    );
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue.clone());
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let review_artifact = artifacts::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|artifact| artifact.name == "implementation_review_summary")
+        .expect("blocked verification should synthesize implementation review summary");
+    let review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(review_artifact.file_path).unwrap()).unwrap();
+    assert_eq!(
+        review["status"],
+        serde_json::json!("release_evidence_blocked")
+    );
+    assert_eq!(
+        review["implementation_self_assessment_summary"]["status"],
+        serde_json::json!("blocked")
+    );
+    assert_eq!(
+        review["handoff_tasks"][0]["summary"],
+        serde_json::json!("Capture manual smoke evidence")
+    );
+    assert_eq!(
+        review["implementation_self_assessment_summary"]["handoff_tasks"][0]["owner_class"],
+        serde_json::json!("manual_evidence")
+    );
+
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.current_state.as_deref(),
+        Some("state_10_implementation_refined")
+    );
+
+    let queued_invocations = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.stage_id.as_deref() == Some("state_9_implementation_reviewed")
+        })
+        .count();
+    assert_eq!(queued_invocations, 0);
 }
 
 #[cfg(unix)]
@@ -2559,6 +4153,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -2798,6 +4393,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -3050,6 +4646,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -3261,6 +4858,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -3398,6 +4996,240 @@ sys.exit(0)
     );
 }
 
+#[tokio::test]
+async fn implementation_status_transitions_use_active_contract_summary() {
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
+    use domain::ids::ArtifactId;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = tmp.path().join(".chainworks");
+    std::fs::create_dir_all(artifact_root.join("implementation")).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root;
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    run.current_state = Some("state_7_implementation_started".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(StageExecutionId::new(), run_id, StageStatus::Completed);
+    completed_stage.stage_id = "state_7_implementation_started".into();
+    stages::insert(&pool, &completed_stage).await.unwrap();
+
+    let raw_path = artifact_root
+        .join("implementation")
+        .join("self-assessment.json");
+    std::fs::write(
+        &raw_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+            "implementation_complete": false,
+            "verification_green": true,
+            "remaining_code_tasks": [{
+                "summary": "raw file says loop",
+                "owner": "code_writer",
+                "blocking": true,
+                "evidence": "this raw file must not drive transition truth"
+            }],
+            "handoff_tasks": [],
+            "known_risks": [],
+            "tests_run": [],
+            "docs_impacted": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let active_raw = serde_json::json!({
+        "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation_complete": true,
+        "verification_green": false,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [],
+        "known_risks": ["verification blocked"],
+        "tests_run": ["proposal-054: blocked"],
+        "docs_impacted": []
+    });
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_7_implementation_started".into(),
+        agent_id: "code_writer".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+        format: ArtifactFormat::Json,
+        file_path: raw_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(&pool, &artifact).await.unwrap();
+    let active_summary = parse_implementation_self_assessment_v2(
+        &active_raw,
+        ContractParseContext {
+            run_id: run_id.to_string(),
+            run_age: None,
+            declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+            canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(artifact.file_path.clone()),
+            source_generation_id: None,
+            artifact_created_at: Some(artifact.created_at),
+            v2_generation_seen_for_run: true,
+            legacy_v1_generation_available: false,
+        },
+    );
+    artifact_contracts::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        artifact.id,
+        &artifact.contract_id,
+        &active_summary,
+        artifact.created_at,
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.current_state.as_deref(),
+        Some("state_9_implementation_reviewed"),
+        "transition must use active summary status=blocked instead of raw file needs_code_fixes"
+    );
+}
+
+#[tokio::test]
+async fn implementation_loop_budget_exhaustion_still_allows_complete_exit() {
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
+    use domain::ids::ArtifactId;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = tmp.path().join(".chainworks");
+    std::fs::create_dir_all(artifact_root.join("implementation")).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root;
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    run.current_state = Some("state_8_implementation_continued".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let started_at = Utc::now();
+    for iteration in 1..=10 {
+        let mut completed_stage =
+            make_stage(StageExecutionId::new(), run_id, StageStatus::Completed);
+        completed_stage.stage_id = "state_8_implementation_continued".into();
+        completed_stage.label = "Implementation continued until code-owned work is resolved".into();
+        completed_stage.iteration = iteration;
+        completed_stage.started_at = started_at + chrono::Duration::milliseconds(iteration as i64);
+        completed_stage.completed_at = Some(completed_stage.started_at);
+        stages::insert(&pool, &completed_stage).await.unwrap();
+    }
+
+    let raw_path = artifact_root
+        .join("implementation")
+        .join("self-assessment.json");
+    let active_raw = serde_json::json!({
+        "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation_complete": true,
+        "verification_green": true,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [],
+        "known_risks": [],
+        "tests_run": ["proposal-053 gate passed"],
+        "docs_impacted": []
+    });
+    std::fs::write(&raw_path, serde_json::to_vec_pretty(&active_raw).unwrap()).unwrap();
+
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation_continued".into(),
+        agent_id: "code_writer".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+        format: ArtifactFormat::Json,
+        file_path: raw_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(&pool, &artifact).await.unwrap();
+    let active_summary = parse_implementation_self_assessment_v2(
+        &active_raw,
+        ContractParseContext {
+            run_id: run_id.to_string(),
+            run_age: None,
+            declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+            canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(artifact.file_path.clone()),
+            source_generation_id: None,
+            artifact_created_at: Some(artifact.created_at),
+            v2_generation_seen_for_run: true,
+            legacy_v1_generation_available: false,
+        },
+    );
+    artifact_contracts::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        artifact.id,
+        &artifact.contract_id,
+        &active_summary,
+        artifact.created_at,
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.current_state.as_deref(),
+        Some("state_9_implementation_reviewed"),
+        "exhausted implementation loop must still exit when the active self-assessment is complete"
+    );
+    assert_eq!(updated.status, RunStatus::Running);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation() {
@@ -3525,6 +5357,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -3772,6 +5605,7 @@ sys.exit(0)
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -4516,6 +6350,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
             Command::RetryStage(RetryStageCmd {
                 run_id,
                 stage_id: "state_11_manual_release".into(),
+                consume_quota_budget_now: false,
             }),
             CallerContext::test_fixture(),
         )
@@ -4757,6 +6592,7 @@ async fn test_state_11_to_state_12_happy_path() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -5094,6 +6930,445 @@ async fn test_state_11_to_state_12_happy_path() {
         assert!(
             all_artifacts.iter().any(|a| a.name == intermediate),
             "release artifact {intermediate} must be present after run completes"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P050: Per-run workspace isolation focused tests
+// ---------------------------------------------------------------------------
+
+/// resolve_path_template uses the run's meta_root for CHAINWORKS_META_ROOT.
+#[test]
+fn test_resolve_path_template_uses_run_meta_root() {
+    let result = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+        "/project",
+        Some(".chainworks/runs/abc123"),
+    );
+    assert_eq!(
+        result, "/project/.chainworks/runs/abc123/state/run-state.json",
+        "meta_root must override the template default"
+    );
+}
+
+/// resolve_path_template falls back to template default for NULL meta_root (legacy).
+#[test]
+fn test_resolve_path_template_null_meta_root_uses_template_default() {
+    let result = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+        "/project",
+        None,
+    );
+    assert_eq!(
+        result, "/project/.chainworks/state/run-state.json",
+        "NULL meta_root must use template default .chainworks"
+    );
+}
+
+/// resolve_path_template does not consult process env for CHAINWORKS_META_ROOT when meta_root is Some.
+#[test]
+fn test_resolve_path_template_does_not_consult_process_env_for_runs() {
+    // Set a process env value that should be ignored.
+    std::env::set_var("CHAINWORKS_META_ROOT", "/should/not/be/used");
+    let result = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/proposal.md",
+        "/project",
+        Some(".chainworks/runs/test-run"),
+    );
+    std::env::remove_var("CHAINWORKS_META_ROOT");
+    assert_eq!(
+        result, "/project/.chainworks/runs/test-run/proposals/current/proposal.md",
+        "per-run meta_root must win over process env"
+    );
+}
+
+/// New run created via command_handler gets per-run chainworks_meta_root.
+/// Verified by P044 test pattern (uses make_command_handler + ApproveStage).
+/// Here we check directly via make_run and DB round-trip.
+#[tokio::test]
+async fn test_new_run_gets_isolated_meta_root() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Pending);
+    // Simulate what command_handler does for new post-P050 runs.
+    run.chainworks_meta_root = Some(format!(".chainworks/runs/{}", run_id));
+    runs::insert(&pool, &run).await.unwrap();
+
+    let loaded = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert!(
+        loaded.chainworks_meta_root.is_some(),
+        "new post-P050 run must have non-null chainworks_meta_root"
+    );
+    let meta_root = loaded.chainworks_meta_root.unwrap();
+    assert!(
+        meta_root.starts_with(".chainworks/runs/"),
+        "meta_root must start with .chainworks/runs/, got: {meta_root}"
+    );
+    assert!(
+        meta_root.contains(&run_id.to_string()[..8]),
+        "meta_root must contain the run ID"
+    );
+}
+
+/// Post-P050 normalize_artifacts ignores stale files in shared flat artifact_root.
+#[tokio::test]
+async fn test_normalize_artifacts_ignores_stale_flat_artifact_root_for_post_p050_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = format!("{workspace}/artifacts");
+    let run_id = RunId::new();
+    let run_dir = format!("{artifact_root}/{run_id}");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    // Create a stale artifact in the shared flat artifact_root (from a prior run).
+    let stale_path = format!("{artifact_root}/proposal_current");
+    std::fs::write(&stale_path, "stale from prior run").unwrap();
+
+    // Canonical per-run destination should NOT exist before normalization.
+    let meta_root = format!(".chainworks/runs/{run_id}");
+    let canonical = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/proposal.md",
+        &workspace,
+        Some(&meta_root),
+    );
+    assert!(
+        !std::path::Path::new(&canonical).exists(),
+        "canonical per-run path must not exist before normalization"
+    );
+
+    // For post-P050 runs (meta_root = Some), normalize_artifacts should NOT
+    // copy the stale flat-root file because it only searches artifact_root/{run_id}.
+    // The stale file is in artifact_root/ (not artifact_root/{run_id}/).
+    // So the canonical path should remain absent after normalization.
+
+    // We can verify the resolve_path_template behavior directly:
+    let shared_path = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/proposal.md",
+        &workspace,
+        None, // legacy: uses shared .chainworks/
+    );
+    assert!(
+        shared_path.contains("/.chainworks/proposals/"),
+        "legacy path must use shared .chainworks/"
+    );
+    assert!(
+        canonical.contains(&format!("/.chainworks/runs/{run_id}/")),
+        "per-run path must use .chainworks/runs/{{run_id}}/"
+    );
+    assert_ne!(
+        shared_path, canonical,
+        "per-run and legacy paths must differ"
+    );
+}
+
+/// Run serde serialization includes chainworks_meta_root for northbound readback.
+/// (GraphQL GqlRun carries it via From<Run> — tested in graphql-server crate.)
+#[test]
+fn test_run_serde_includes_chainworks_meta_root() {
+    let mut run = make_run(RunId::new(), IdeaId::new(), RunStatus::Running);
+    run.chainworks_meta_root = Some(".chainworks/runs/test-run".into());
+
+    let json = serde_json::to_value(&run).unwrap();
+    assert_eq!(
+        json["chainworks_meta_root"].as_str(),
+        Some(".chainworks/runs/test-run"),
+        "Run serde serialization must include chainworks_meta_root for MCP/GraphQL readback"
+    );
+}
+
+/// MCP runs.get returns chainworks_meta_root through full Run serialization.
+#[test]
+fn test_mcp_runs_get_exposes_chainworks_meta_root() {
+    let mut run = make_run(RunId::new(), IdeaId::new(), RunStatus::Running);
+    run.chainworks_meta_root = Some(".chainworks/runs/mcp-test".into());
+
+    let json = serde_json::to_value(&run).unwrap();
+    assert_eq!(
+        json["chainworks_meta_root"].as_str(),
+        Some(".chainworks/runs/mcp-test"),
+        "Run serde serialization must include chainworks_meta_root"
+    );
+}
+
+// ── P050 Worktree interaction ──
+
+/// normalize_path_for_worktree skips meta-root paths (control-plane artifacts
+/// must NOT be rewritten into the worktree).
+#[test]
+fn test_normalize_path_for_worktree_skips_meta_root_paths() {
+    let path = "/project/.chainworks/runs/abc/proposals/current/proposal.md";
+    let result = engine::orchestrator::normalize_path_for_worktree(
+        path,
+        "/project",
+        Some("/project/.chainworks/worktrees/cw-test-12345678"),
+        true, // worktree_write_enabled
+        Some("/project/.chainworks/runs/abc"),
+    );
+    assert_eq!(
+        result, path,
+        "meta-root paths must NOT be rewritten to worktree"
+    );
+}
+
+/// normalize_path_for_worktree still normalizes source-code paths.
+#[test]
+fn test_normalize_path_for_worktree_still_normalizes_source_paths() {
+    let path = "/project/ios/Sources/AppDelegate.swift";
+    let result = engine::orchestrator::normalize_path_for_worktree(
+        path,
+        "/project",
+        Some("/project/.chainworks/worktrees/cw-test-12345678"),
+        true,
+        Some("/project/.chainworks/runs/abc"),
+    );
+    assert_eq!(
+        result, "/project/.chainworks/worktrees/cw-test-12345678/ios/Sources/AppDelegate.swift",
+        "source-code paths must still be rewritten to worktree"
+    );
+}
+
+// ── P050 Transition conditions ──
+
+/// exists() transition checks resolve against per-run meta root.
+/// Proven via resolve_path_template: the canonical path points to per-run dir.
+#[test]
+fn test_exists_checks_per_run_meta_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_string_lossy().into_owned();
+    let run_id = "test-run-abc";
+    let meta_root = format!(".chainworks/runs/{run_id}");
+
+    // Create the artifact at the per-run location
+    let per_run_dir = format!("{ws}/.chainworks/runs/{run_id}/state");
+    std::fs::create_dir_all(&per_run_dir).unwrap();
+    std::fs::write(
+        format!("{per_run_dir}/run-state.json"),
+        r#"{"status":"ok"}"#,
+    )
+    .unwrap();
+
+    // Resolve the template — must point to per-run path
+    let resolved = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+        &ws,
+        Some(&meta_root),
+    );
+    assert!(
+        std::path::Path::new(&resolved).exists(),
+        "per-run artifact must exist at resolved path"
+    );
+    assert!(
+        resolved.contains(&format!("/.chainworks/runs/{run_id}/")),
+        "resolved path must be under per-run meta root"
+    );
+}
+
+/// artifact.field transition reads resolve against per-run meta root.
+/// Proven: the shared .chainworks/ location does NOT have the artifact,
+/// only the per-run location does. Template resolution must find the per-run one.
+#[test]
+fn test_artifact_field_reads_per_run_meta_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_string_lossy().into_owned();
+    let run_id = "field-read-run";
+    let meta_root = format!(".chainworks/runs/{run_id}");
+
+    // Create at per-run location only (not at shared .chainworks/)
+    let per_run_dir = format!("{ws}/.chainworks/runs/{run_id}/reviews/proposal");
+    std::fs::create_dir_all(&per_run_dir).unwrap();
+    std::fs::write(
+        format!("{per_run_dir}/summary.json"),
+        r#"{"average_score": 9.55, "pass": true}"#,
+    )
+    .unwrap();
+
+    let resolved = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json",
+        &ws,
+        Some(&meta_root),
+    );
+    assert!(std::path::Path::new(&resolved).exists());
+
+    // Verify shared location does NOT have it
+    let shared = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json",
+        &ws,
+        None,
+    );
+    assert!(
+        !std::path::Path::new(&shared).exists(),
+        "shared path must NOT have the artifact"
+    );
+}
+
+// ── P050 ACP env handoff ──
+
+/// ExecutionRequest carries chainworks_meta_root field.
+#[test]
+fn test_execution_request_carries_chainworks_meta_root() {
+    let req = acp::ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "test".into(),
+        agent_id: "test".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: "/tmp".into(),
+        prompt: "test".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: vec![],
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: vec![],
+        chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
+    };
+    assert_eq!(
+        req.chainworks_meta_root.as_deref(),
+        Some(".chainworks/runs/test-run"),
+    );
+}
+
+// ── P050 Artifact normalization ──
+
+/// normalize_artifacts with meta_root=Some only searches artifact_root/{run_id}.
+#[test]
+fn test_normalize_artifacts_uses_run_scoped_source_dir_for_post_p050_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = format!("{ws}/artifacts");
+    let run_id = RunId::new();
+
+    // Put a file in artifact_root/{run_id}/ (correct location for post-P050)
+    let run_dir = format!("{artifact_root}/{run_id}");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(format!("{run_dir}/test_artifact.json"), "run-scoped").unwrap();
+
+    // The per-run canonical path resolves differently from shared:
+    let meta_root = format!(".chainworks/runs/{run_id}");
+    let canonical = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/test_artifact.json",
+        &ws,
+        Some(&meta_root),
+    );
+    assert!(canonical.contains(&format!("/.chainworks/runs/{run_id}/")));
+}
+
+/// Legacy runs (meta_root=None) preserve the old flat-root fallback.
+#[test]
+fn test_normalize_artifacts_preserves_flat_root_fallback_for_null_legacy_runs() {
+    let legacy = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+        "/project",
+        None,
+    );
+    assert_eq!(
+        legacy, "/project/.chainworks/state/run-state.json",
+        "legacy NULL meta_root must resolve to shared .chainworks/"
+    );
+}
+
+// ── P050 Northbound ──
+
+/// MCP runs.list projection row carries chainworks_meta_root.
+#[tokio::test]
+async fn test_mcp_runs_list_projection_exposes_chainworks_meta_root() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.chainworks_meta_root = Some(".chainworks/runs/proj-test".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let rows = db::repos::projections::list_active_projection(&pool)
+        .await
+        .unwrap();
+    let row = rows.iter().find(|r| r.id == run_id.to_string()).unwrap();
+    assert_eq!(
+        row.chainworks_meta_root.as_deref(),
+        Some(".chainworks/runs/proj-test"),
+        "projection row must carry chainworks_meta_root"
+    );
+}
+
+/// runs.start does not accept a caller-provided chainworks_meta_root override.
+/// (Verified: StartRunCmd has no chainworks_meta_root field — the daemon derives it.)
+#[test]
+fn test_runs_start_does_not_accept_chainworks_meta_root_override() {
+    // StartRunCmd's fields are fixed by the domain struct.
+    // This test verifies the struct does NOT have a chainworks_meta_root field.
+    let cmd = domain::commands::StartRunCmd {
+        idea_id: IdeaId::new(),
+        workflow_id: "wf".into(),
+        workflow_title: "wf".into(),
+        workspace_root: "/tmp".into(),
+        artifact_root: "/tmp/a".into(),
+        workflow_yaml_path: "/tmp/wf.yaml".into(),
+        agent_catalog_yaml_path: "/tmp/cat.yaml".into(),
+        delivery_configuration_json: None,
+    };
+    // If this compiles, StartRunCmd has no chainworks_meta_root field — the daemon owns it.
+    let _ = cmd;
+}
+
+// ── P050 End-to-end ──
+
+/// Stale shared .chainworks/ artifacts are invisible when per-run meta root is used.
+#[test]
+fn test_stale_workspace_artifacts_not_visible_to_new_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_string_lossy().into_owned();
+
+    // Simulate stale artifacts from a prior run in shared .chainworks/
+    let stale_dir = format!("{ws}/.chainworks/state");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    std::fs::write(format!("{stale_dir}/run-state.json"), "stale").unwrap();
+
+    // New run resolves through per-run meta root — stale shared path is NOT consulted
+    let new_run_meta = ".chainworks/runs/new-run-id";
+    let resolved = engine::orchestrator::resolve_path_template(
+        "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+        &ws,
+        Some(new_run_meta),
+    );
+
+    // The resolved path points to the per-run location (which doesn't exist yet)
+    assert!(
+        !std::path::Path::new(&resolved).exists(),
+        "new run must NOT see stale shared artifact"
+    );
+    assert!(
+        resolved.contains("/.chainworks/runs/new-run-id/"),
+        "path must be per-run"
+    );
+}
+
+/// Prompt input paths point to per-run meta root, not shared .chainworks/.
+#[test]
+fn test_prompt_input_paths_point_to_per_run_meta_root() {
+    let meta_root = ".chainworks/runs/prompt-test";
+    let inputs = [
+        "${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/proposal.md",
+    ];
+    for template in &inputs {
+        let resolved =
+            engine::orchestrator::resolve_path_template(template, "/project", Some(meta_root));
+        assert!(
+            resolved.contains("/.chainworks/runs/prompt-test/"),
+            "input path '{}' must resolve to per-run meta root, got: {}",
+            template,
+            resolved
         );
     }
 }

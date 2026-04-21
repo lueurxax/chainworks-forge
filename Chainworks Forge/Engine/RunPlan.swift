@@ -140,6 +140,8 @@ enum TransitionCondition: Sendable {
     case artifactExists(String)
     /// when: approval.granted == true
     case approvalGranted
+    /// when: approval.rejected == true
+    case approvalRejected
     /// when: <complex expression> — evaluated at runtime
     case expression(String)
 }

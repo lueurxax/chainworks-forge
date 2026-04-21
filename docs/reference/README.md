@@ -20,7 +20,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
 - [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), and persisted runtime truth
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, and durable validation-failure substrate
-- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, aggregate summary hardening, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
+- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
@@ -28,6 +28,10 @@ If you need a current-head orientation first, start with [current-system-baselin
 ## Control Plane
 
 - [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration
+- [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
+- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
+- [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, and P031 consumption rules
 
 ## Live Execution
 
@@ -44,7 +48,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling
 - [idea-lifecycle.md](idea-lifecycle.md) — Active vs archived idea contract, archive/restore eligibility, cross-surface truth
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
-- [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, evidence export
+- [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, implementation self-assessment, and handoff routing
 - [mvp-sign-off.md](mvp-sign-off.md) — Benchmark, replayable `GO/HOLD`, export hub, approval relaunch, and current-head sign-off contract
 - [current-system-baseline.md](current-system-baseline.md) — Current-head subsystem map and reusable baseline for review and planning work
 

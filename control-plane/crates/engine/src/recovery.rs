@@ -3,8 +3,11 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use db::repos::{agent_executions, runs, stages, startup_repairs};
+use db::repos::{
+    agent_execution_runtime_facts, agent_executions, runs, stages, startup_repairs, work_items,
+};
 use db::work_item::WorkItemKind;
+use domain::agent::{AgentFailureKind, AgentOutputSettlement};
 use domain::run::Run;
 use domain::stage::StageStatus;
 
@@ -16,6 +19,36 @@ pub struct RecoveryService {
     work_queue: WorkQueue,
     #[allow(dead_code)]
     events: EventSender,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_058_recovery_action_uses_failure_kind_and_output_settlement() {
+        let mut facts = domain::agent::AgentExecutionRuntimeFacts::defaults_for(
+            domain::ids::AgentExecutionId::new(),
+            Utc::now(),
+        );
+        facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+
+        assert_eq!(
+            recovery_action_from_runtime_facts(Some(&facts)),
+            ("wait_until_retry_after", "provider_quota_retry_budget")
+        );
+
+        facts.failure_kind = None;
+        facts.output_settlement = AgentOutputSettlement::ValidOutputsFromFailedExecution;
+        assert_eq!(
+            recovery_action_from_runtime_facts(Some(&facts)),
+            (
+                "accept_or_retry_degraded_outputs",
+                "valid_outputs_from_failed_execution"
+            )
+        );
+    }
 }
 
 pub struct RecoverySummary {
@@ -33,16 +66,26 @@ pub async fn persist_failed_stage_recovery_snapshot(
         Some(stage) => {
             let executions = agent_executions::find_by_stage(pool, stage_execution_id).await?;
             let latest_execution = executions.last();
+            let runtime_facts = match latest_execution {
+                Some(execution) => {
+                    agent_execution_runtime_facts::find_by_execution_id(pool, execution.id).await?
+                }
+                None => None,
+            };
+            let (action, reason) = recovery_action_from_runtime_facts(runtime_facts.as_ref());
             serde_json::json!({
                 "status": "available",
-                "action": "retry_stage",
-                "reason": "stage_settled_failed",
+                "action": action,
+                "reason": reason,
                 "stage_execution_id": stage_execution_id.to_string(),
                 "run_id": stage.run_id.to_string(),
                 "stage_id": stage.stage_id,
                 "failed_at": failed_at,
                 "latest_agent_execution_id": latest_execution.map(|execution| execution.id.to_string()),
                 "latest_agent_status": latest_execution.map(|execution| execution.status.to_string()),
+                "failure_kind": runtime_facts.as_ref().and_then(|facts| facts.failure_kind.as_ref()).map(ToString::to_string),
+                "output_settlement": runtime_facts.as_ref().map(|facts| facts.output_settlement.to_string()),
+                "retry_after": runtime_facts.as_ref().and_then(|facts| facts.retry_after.map(|dt| dt.to_rfc3339())),
                 "validation_failure_present": stage.validation_failure_json.is_some(),
             })
         }
@@ -56,6 +99,41 @@ pub async fn persist_failed_stage_recovery_snapshot(
     let encoded = serde_json::to_string_pretty(&snapshot)?;
     stages::update_recovery_snapshot_json(pool, stage_execution_id, &encoded).await?;
     Ok(encoded)
+}
+
+fn recovery_action_from_runtime_facts(
+    facts: Option<&domain::agent::AgentExecutionRuntimeFacts>,
+) -> (&'static str, &'static str) {
+    let Some(facts) = facts else {
+        return ("retry_stage", "stage_settled_failed");
+    };
+    match (&facts.failure_kind, &facts.output_settlement) {
+        (Some(AgentFailureKind::ProviderQuota), _) => {
+            ("wait_until_retry_after", "provider_quota_retry_budget")
+        }
+        (Some(AgentFailureKind::ProviderPermissionRequired), _) => {
+            ("authorize_provider", "provider_permission_required")
+        }
+        (Some(AgentFailureKind::McpPermissionModalStall), _) => {
+            ("authorize_xcode", "mcp_permission_modal_stall")
+        }
+        (Some(AgentFailureKind::MissingRequiredOutputs), _)
+        | (_, AgentOutputSettlement::MissingRequiredOutputs) => {
+            ("inspect_outputs_then_retry", "missing_required_outputs")
+        }
+        (Some(AgentFailureKind::InvalidOutputContract), _)
+        | (_, AgentOutputSettlement::InvalidRequiredOutputs) => {
+            ("inspect_contract_then_retry", "invalid_required_outputs")
+        }
+        (_, AgentOutputSettlement::ValidOutputsFromFailedExecution) => (
+            "accept_or_retry_degraded_outputs",
+            "valid_outputs_from_failed_execution",
+        ),
+        (Some(AgentFailureKind::SupersededByRetry), _) => {
+            ("inspect_retry_successor", "superseded_by_retry")
+        }
+        _ => ("retry_stage", "runtime_failure"),
+    }
 }
 
 impl RecoveryService {
@@ -114,8 +192,27 @@ impl RecoveryService {
             .collect();
 
         let now = Utc::now();
+        let mut blocked_running_stages = 0usize;
 
         for stage in &running_stages {
+            let requeued_preclaimed = work_items::requeue_running_preclaimed_invoke_for_stage(
+                &self.pool,
+                run.id,
+                stage.id,
+                &stage.stage_id,
+            )
+            .await?;
+            if requeued_preclaimed > 0 {
+                info!(
+                    run_id = %run.id,
+                    stage_id = %stage.stage_id,
+                    requeued = %requeued_preclaimed,
+                    "Requeued preclaimed P058 InvokeAgent work item during startup repair"
+                );
+                requeued += requeued_preclaimed;
+                continue;
+            }
+
             let provenance_suffix = self
                 .latest_execution_provenance_suffix(stage.id)
                 .await
@@ -167,9 +264,10 @@ impl RecoveryService {
                 now,
             )
             .await;
+            blocked_running_stages += 1;
         }
 
-        if !running_stages.is_empty() {
+        if blocked_running_stages > 0 {
             // Re-enqueue an AdvanceRun for this run to recheck state
             self.work_queue
                 .enqueue(
