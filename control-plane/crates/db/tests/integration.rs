@@ -2197,6 +2197,82 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
     );
 }
 
+#[tokio::test]
+async fn rebuild_all_for_run_refreshes_run_state_projection_status() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-status".into(),
+        workflow_title: "Status Projection".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("state_1".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
+    let initial = artifact_contract_repos::find_run_state_projection(&pool, run.id)
+        .await
+        .unwrap()
+        .expect("run-state projection");
+    let initial_state = initial.run_state_json;
+    assert_eq!(initial_state["status"], "running");
+
+    runs::update_status(&pool, run.id, RunStatus::Blocked)
+        .await
+        .unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
+
+    let refreshed = artifact_contract_repos::find_run_state_projection(&pool, run.id)
+        .await
+        .unwrap()
+        .expect("run-state projection");
+    let refreshed_state = refreshed.run_state_json;
+    assert_eq!(refreshed_state["status"], "blocked");
+}
+
 /// R7 bar: executed approval_inbox projection-vs-canonical parity.
 /// Proves list_pending_inbox_projection() equals filtering canonical approvals
 /// repo by decision ∈ {Pending, Requested}.
