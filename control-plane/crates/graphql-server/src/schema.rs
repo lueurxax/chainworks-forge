@@ -5,15 +5,17 @@ use async_graphql::*;
 use sqlx::SqlitePool;
 use tokio_stream::wrappers::BroadcastStream;
 
-use db::repos::{approvals, ideas, projections, runs, steward as steward_repo};
+use db::repos::{approvals, artifact_contracts, ideas, projections, runs, steward as steward_repo};
 use domain::commands::{
     ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
     StartRunCmd,
 };
 use domain::events::DomainEvent;
 use domain::ids::{IdeaId, RunId};
+use domain::lifecycle::DaemonStatus;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
+use engine::lifecycle_reporter::LifecycleReporter;
 
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::GqlArtifact;
@@ -31,16 +33,104 @@ pub fn build_schema(
     cmd_handler: Arc<CommandHandler>,
     events: EventSender,
     principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
 ) -> AppSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(pool)
         .data(cmd_handler)
         .data(events)
         .data(principal_table)
+        .data(reporter)
         .finish()
 }
 
 pub struct QueryRoot;
+
+fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
+    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
+        if principal.class != auth::PrincipalClass::Operator {
+            return Err(Error::new("forbidden"));
+        }
+    }
+    Ok(())
+}
+
+fn require_operator_or_observer_read(ctx: &Context<'_>) -> Result<()> {
+    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
+        if !matches!(
+            principal.class,
+            auth::PrincipalClass::Operator | auth::PrincipalClass::Observer
+        ) {
+            return Err(Error::new("forbidden"));
+        }
+    }
+    Ok(())
+}
+
+async fn run_from_projection_or_canonical(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<Option<GqlRun>> {
+    let item = runs::find_by_id(pool, run_id).await?;
+    if let Some(run) = item {
+        if let Some(projection) =
+            projections::find_run_projection(pool, &run_id.to_string()).await?
+        {
+            let mut gql = GqlRun::from_projection_and_run(projection, run);
+            enrich_run_with_artifact_contracts(pool, run_id, &mut gql).await?;
+            Ok(Some(gql))
+        } else {
+            let mut gql = GqlRun::from(run);
+            enrich_run_with_artifact_contracts(pool, run_id, &mut gql).await?;
+            Ok(Some(gql))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+async fn enrich_run_with_artifact_contracts(
+    pool: &SqlitePool,
+    run_id: RunId,
+    gql: &mut GqlRun,
+) -> Result<()> {
+    if let Some(projection) =
+        db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
+    {
+        gql.active_artifact_index_json =
+            Some(serde_json::to_string(&projection.active_index_json)?);
+        gql.run_state_projection_json = Some(serde_json::to_string(&projection.run_state_json)?);
+        let overrides = db::repos::artifact_contracts::list_overrides(pool, run_id).await?;
+        gql.operator_overrides_json = Some(serde_json::to_string(&overrides)?);
+    }
+    gql.implementation_self_assessment_summary =
+        artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
+            .await?
+            .map(|stored| stored.summary.into());
+    Ok(())
+}
+
+async fn stage_from_projection_or_canonical(
+    pool: &SqlitePool,
+    stage_execution_id: domain::ids::StageExecutionId,
+) -> Result<Option<GqlStageExecution>> {
+    let item = db::repos::stages::find_by_id(pool, stage_execution_id).await?;
+    if let Some(stage) = item {
+        let projection = projections::list_stages_projection(pool, &stage.run_id.to_string())
+            .await?
+            .into_iter()
+            .find(|row| row.id == stage.id.to_string());
+        if let Some(projection) = projection {
+            Ok(Some(GqlStageExecution::from_projection_and_stage(
+                projection, stage,
+            )))
+        } else {
+            Ok(Some(GqlStageExecution::from(stage)))
+        }
+    } else {
+        Ok(None)
+    }
+}
 
 #[Object]
 impl QueryRoot {
@@ -65,53 +155,56 @@ impl QueryRoot {
     }
 
     async fn runs(&self, ctx: &Context<'_>, idea_id: Option<ID>) -> Result<Vec<GqlRun>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            runs_with_implementation_summaries(pool, items.into_iter().map(GqlRun::from).collect())
+                .await
         } else {
             let items = projections::list_active_projection(pool).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            runs_with_implementation_summaries(pool, items.into_iter().map(GqlRun::from).collect())
+                .await
         }
     }
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let run_id: RunId = id
             .parse()
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-        let item = runs::find_by_id(pool, run_id).await?;
-        Ok(item.map(GqlRun::from))
+        run_from_projection_or_canonical(pool, run_id).await
     }
 
     async fn approval_inbox(&self, ctx: &Context<'_>) -> Result<Vec<GqlApproval>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_pending_inbox_projection(pool).await?;
         Ok(items.into_iter().map(GqlApproval::from).collect())
     }
 
     async fn artifacts(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlArtifact>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_artifacts_projection(pool, run_id.as_str()).await?;
         Ok(items.into_iter().map(GqlArtifact::from).collect())
     }
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
-        let parsed_run_id: RunId = run_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-        let items = db::repos::stages::list_by_run(pool, parsed_run_id).await?;
+        let items = projections::list_stages_projection(pool, run_id.as_str()).await?;
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
     }
 
     async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
+        require_operator_or_observer_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = id
             .parse()
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-        let item = db::repos::stages::find_by_id(pool, stage_execution_id).await?;
-        Ok(item.map(GqlStageExecution::from))
+        stage_from_projection_or_canonical(pool, stage_execution_id).await
     }
 
     async fn agent_executions(
@@ -119,6 +212,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<Vec<GqlAgentExecution>> {
+        require_operator_or_observer_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = stage_execution_id
             .parse()
@@ -196,6 +290,202 @@ impl QueryRoot {
             .map(GqlStewardRecommendation::from)
             .collect())
     }
+
+    /// P042 §5.2 readback surface. Returns the authoritative
+    /// `DaemonStatus` owned by the in-process lifecycle reporter.
+    /// Operator-only — matches the `/health` vs `daemonStatus` trust
+    /// split: any authenticated operator can read the full typed status,
+    /// unauthenticated loopback probes get the JSON snapshot at `/health`.
+    async fn daemon_status(&self, ctx: &Context<'_>) -> Result<GqlDaemonStatus> {
+        require_operator_read(ctx)?;
+        let reporter = ctx.data::<LifecycleReporter>()?;
+        Ok(GqlDaemonStatus::from(reporter.snapshot()))
+    }
+}
+
+/// GraphQL wrapper around [`DaemonStatus`] (P042 §5.2). Every field of the
+/// domain type is exposed as a first-class GraphQL field: `state`,
+/// `degraded`, and `failure` are typed enum/object values so clients can
+/// pattern-match terminal reasons without parsing a stringified JSON.
+///
+/// The `json` field is retained as a convenience for clients that want
+/// the canonical snake-case serialization (matching `/health` wire
+/// format) without re-serializing the typed fields.
+#[derive(SimpleObject, Clone)]
+pub struct GqlDaemonStatus {
+    pub state: GqlDaemonLifecycleState,
+    pub schema_version: i32,
+    pub binary_schema_version: i32,
+    pub build_sha: String,
+    /// ISO-8601 UTC. `None` before the daemon has reached `Ready`.
+    pub started_at: Option<String>,
+    pub last_state_change_at: String,
+    pub restart_count_since_boot: i32,
+    pub pid: i32,
+    /// Non-empty iff `state == DEGRADED`.
+    pub degraded: Vec<GqlDegradedReason>,
+    /// Populated iff `state == FAILED` (P042 §4.1 invariant).
+    pub failure: Option<GqlFailureReason>,
+    /// Canonical JSON per P042 §5.2 (`{state, schema_version, pid,
+    /// degraded?, failure?}`). Kept for clients that prefer the
+    /// snake-case wire shape identical to `/health`.
+    pub json: String,
+}
+
+/// GraphQL mirror of [`domain::lifecycle::DaemonLifecycleState`]. Names
+/// match the domain enum exactly so the `#[Enum]` mapping round-trips.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlDaemonLifecycleState {
+    NotStarted,
+    Starting,
+    Ready,
+    Degraded,
+    Restarting,
+    Failed,
+    Shutdown,
+}
+
+impl From<domain::lifecycle::DaemonLifecycleState> for GqlDaemonLifecycleState {
+    fn from(s: domain::lifecycle::DaemonLifecycleState) -> Self {
+        use domain::lifecycle::DaemonLifecycleState::*;
+        match s {
+            NotStarted => Self::NotStarted,
+            Starting => Self::Starting,
+            Ready => Self::Ready,
+            Degraded => Self::Degraded,
+            Restarting => Self::Restarting,
+            Failed => Self::Failed,
+            Shutdown => Self::Shutdown,
+        }
+    }
+}
+
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlDegradedKind {
+    BackgroundExecutorStalled,
+    AcpRuntimeUnavailable,
+    StaleProjection,
+    AuthPrincipalTableUnreadable,
+    DiskSpaceLow,
+}
+
+impl From<domain::lifecycle::DegradedKind> for GqlDegradedKind {
+    fn from(k: domain::lifecycle::DegradedKind) -> Self {
+        use domain::lifecycle::DegradedKind::*;
+        match k {
+            BackgroundExecutorStalled => Self::BackgroundExecutorStalled,
+            AcpRuntimeUnavailable => Self::AcpRuntimeUnavailable,
+            StaleProjection => Self::StaleProjection,
+            AuthPrincipalTableUnreadable => Self::AuthPrincipalTableUnreadable,
+            DiskSpaceLow => Self::DiskSpaceLow,
+        }
+    }
+}
+
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlFailureKind {
+    MigrationFailed,
+    SchemaNewerThanBinary,
+    BackupFailed,
+    CrashLoopBudgetExhausted,
+}
+
+impl From<domain::lifecycle::FailureKind> for GqlFailureKind {
+    fn from(k: domain::lifecycle::FailureKind) -> Self {
+        use domain::lifecycle::FailureKind::*;
+        match k {
+            MigrationFailed => Self::MigrationFailed,
+            SchemaNewerThanBinary => Self::SchemaNewerThanBinary,
+            BackupFailed => Self::BackupFailed,
+            CrashLoopBudgetExhausted => Self::CrashLoopBudgetExhausted,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct GqlDegradedReason {
+    pub kind: GqlDegradedKind,
+    pub detail: String,
+    /// ISO-8601 UTC.
+    pub since: String,
+}
+
+impl From<domain::lifecycle::DegradedReason> for GqlDegradedReason {
+    fn from(r: domain::lifecycle::DegradedReason) -> Self {
+        Self {
+            kind: r.kind.into(),
+            detail: r.detail,
+            since: r.since.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct GqlFailureReason {
+    pub kind: GqlFailureKind,
+    pub detail: String,
+    /// ISO-8601 UTC.
+    pub since: String,
+    /// Absolute path of the pre-migration backup when applicable.
+    pub backup_path: Option<String>,
+}
+
+impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
+    fn from(r: domain::lifecycle::FailureReason) -> Self {
+        Self {
+            kind: r.kind.into(),
+            detail: r.detail,
+            since: r.since.to_rfc3339(),
+            backup_path: r.backup_path,
+        }
+    }
+}
+
+impl From<DaemonStatus> for GqlDaemonStatus {
+    fn from(s: DaemonStatus) -> Self {
+        let json = serde_json::to_string(&s).unwrap_or_else(|_| "{}".to_string());
+        Self {
+            state: s.state.into(),
+            schema_version: s.schema_version as i32,
+            binary_schema_version: s.binary_schema_version as i32,
+            build_sha: s.build_sha,
+            started_at: s.started_at.map(|t| t.to_rfc3339()),
+            last_state_change_at: s.last_state_change_at.to_rfc3339(),
+            restart_count_since_boot: s.restart_count_since_boot as i32,
+            pid: s.pid as i32,
+            degraded: s
+                .degraded
+                .into_iter()
+                .map(GqlDegradedReason::from)
+                .collect(),
+            failure: s.failure.map(GqlFailureReason::from),
+            json,
+        }
+    }
+}
+
+async fn runs_with_implementation_summaries(
+    pool: &SqlitePool,
+    runs: Vec<GqlRun>,
+) -> Result<Vec<GqlRun>> {
+    let mut with_summaries = Vec::with_capacity(runs.len());
+    for run in runs {
+        with_summaries.push(run_with_implementation_summary(pool, run).await?);
+    }
+    Ok(with_summaries)
+}
+
+async fn run_with_implementation_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<GqlRun> {
+    let run_id: RunId = run
+        .id
+        .as_str()
+        .parse()
+        .map_err(|error: uuid::Error| Error::new(error.to_string()))?;
+    run.implementation_self_assessment_summary =
+        artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
+            .await?
+            .map(|stored| stored.summary.into());
+    Ok(run)
 }
 
 pub struct MutationRoot;
@@ -222,6 +512,22 @@ pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
 
 fn mutation_allowed(principal: &auth::Principal, mutation: MutationName) -> bool {
     auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1
+}
+
+/// Build the GraphQL caller context for a mutation and attach the
+/// `X-Request-ID` from the async-graphql request data (P042 §9.3) when
+/// the outer axum middleware injected one. The command journal INSERT
+/// picks it up transparently via `CallerContext.request_id`.
+fn graphql_caller_with_request_id(
+    ctx: &Context<'_>,
+    principal: &auth::Principal,
+    mutation_name: &str,
+) -> CallerContext {
+    let mut caller = CallerContext::graphql(&principal.id, &principal.class, mutation_name);
+    if let Ok(rid) = ctx.data::<crate::request_id::RequestId>() {
+        caller = caller.with_request_id(&rid.0);
+    }
+    caller
 }
 
 #[derive(SimpleObject)]
@@ -330,7 +636,7 @@ impl MutationRoot {
             return Err(Error::new("forbidden"));
         }
 
-        let caller = CallerContext::graphql(&principal.id, &principal.class, "startRun");
+        let caller = graphql_caller_with_request_id(ctx, &principal, "startRun");
 
         let iid: IdeaId = idea_id
             .parse()
@@ -388,7 +694,7 @@ impl MutationRoot {
             return Err(Error::new("forbidden"));
         }
 
-        let caller = CallerContext::graphql(&principal.id, &principal.class, "approveStage");
+        let caller = graphql_caller_with_request_id(ctx, &principal, "approveStage");
 
         let rid: RunId = run_id
             .parse()
@@ -436,7 +742,7 @@ impl MutationRoot {
             return Err(Error::new("forbidden"));
         }
 
-        let caller = CallerContext::graphql(&principal.id, &principal.class, "rejectStage");
+        let caller = graphql_caller_with_request_id(ctx, &principal, "rejectStage");
 
         let rid: RunId = run_id
             .parse()
@@ -470,6 +776,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         run_id: ID,
         stage_id: String,
+        consume_quota_budget_now: Option<bool>,
     ) -> Result<RetryStagePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
@@ -482,7 +789,7 @@ impl MutationRoot {
             return Err(Error::new("forbidden"));
         }
 
-        let caller = CallerContext::graphql(&principal.id, &principal.class, "retryStage");
+        let caller = graphql_caller_with_request_id(ctx, &principal, "retryStage");
 
         let rid: RunId = run_id
             .parse()
@@ -491,6 +798,7 @@ impl MutationRoot {
         let cmd = Command::RetryStage(RetryStageCmd {
             run_id: rid,
             stage_id,
+            consume_quota_budget_now: consume_quota_budget_now.unwrap_or(false),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -512,7 +820,7 @@ impl MutationRoot {
             return Err(Error::new("forbidden"));
         }
 
-        let caller = CallerContext::graphql(&principal.id, &principal.class, "cancelRun");
+        let caller = graphql_caller_with_request_id(ctx, &principal, "cancelRun");
 
         let rid: RunId = run_id
             .parse()
@@ -558,8 +866,10 @@ impl SubscriptionRoot {
                                 return None;
                             }
                         }
-                        let run = runs::find_by_id(&pool, run_id).await.ok()??;
-                        Some(Ok(Some(GqlRun::from(run))))
+                        match run_from_projection_or_canonical(&pool, run_id).await {
+                            Ok(run) => Some(Ok(run)),
+                            Err(err) => Some(Err(err)),
+                        }
                     }
                     _ => None,
                 }
@@ -596,10 +906,10 @@ impl SubscriptionRoot {
                         if run_id != filter_run_id {
                             return None;
                         }
-                        let stage = db::repos::stages::find_by_id(&pool, stage_execution_id)
-                            .await
-                            .ok()??;
-                        Some(Ok(Some(GqlStageExecution::from(stage))))
+                        match stage_from_projection_or_canonical(&pool, stage_execution_id).await {
+                            Ok(stage) => Some(Ok(stage)),
+                            Err(err) => Some(Err(err)),
+                        }
                     }
                     _ => None,
                 }
@@ -626,6 +936,34 @@ impl SubscriptionRoot {
                 let event = msg.ok()?;
                 match event {
                     DomainEvent::ApprovalRequested { approval_id, .. } => {
+                        let approval = approvals::find_by_id(&pool, approval_id).await.ok()??;
+                        Some(Ok(Some(GqlApproval::from(approval))))
+                    }
+                    _ => None,
+                }
+            };
+            fut
+        }))
+    }
+
+    async fn approval_resolved(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
+        let _principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let events = ctx.data::<EventSender>()?.clone();
+
+        let rx = events.subscribe();
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
+            let pool = pool.clone();
+            let fut = async move {
+                let event = msg.ok()?;
+                match event {
+                    DomainEvent::ApprovalResolved { approval_id, .. } => {
                         let approval = approvals::find_by_id(&pool, approval_id).await.ok()??;
                         Some(Ok(Some(GqlApproval::from(approval))))
                     }
@@ -684,6 +1022,38 @@ impl SubscriptionRoot {
             fut
         }))
     }
+
+    /// P042 §5.2 push surface. Emits a `GqlDaemonStatus` frame on every
+    /// lifecycle transition (driven by the same EventBus the reporter
+    /// broadcasts into). Clients typically call `daemonStatus` once at
+    /// connect time to seed state, then subscribe here to stay in sync.
+    ///
+    /// Operator-only per P042 §5.2 readback-surfaces table. A principal
+    /// of any other class receives `unauthorized`; the check runs
+    /// before `events.subscribe()` so a non-operator never even sees the
+    /// first frame.
+    async fn daemon_status_changed(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<GqlDaemonStatus>>> {
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        if principal.class != auth::PrincipalClass::Operator {
+            return Err(Error::new("forbidden"));
+        }
+        let events = ctx.data::<EventSender>()?.clone();
+        let rx = events.subscribe();
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| async move {
+            let event = msg.ok()?;
+            match event {
+                DomainEvent::DaemonStatusChanged { status } => {
+                    Some(Ok(GqlDaemonStatus::from(status)))
+                }
+                _ => None,
+            }
+        }))
+    }
 }
 
 /// Runtime lifecycle event surfaced to GraphQL subscribers.
@@ -705,8 +1075,13 @@ mod tests {
     use async_graphql::Request;
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifacts, ideas, projections, runs, steward};
+    use db::repos::{artifact_contracts, artifacts, ideas, projections, runs, stages, steward};
     use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
     use domain::steward::{
@@ -719,7 +1094,26 @@ mod tests {
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    /// Shared in-process `LifecycleReporter` for tests. Every `build_schema`
+    /// call now requires a reporter per P042 §5.2; tests get a default one
+    /// seeded in `NotStarted` unless they need a specific transition.
+    fn test_reporter() -> LifecycleReporter {
+        LifecycleReporter::new(0, "test", event_bus::new_bus(16))
+    }
+
+    const P041_FIXTURES: &[&str] = &[
+        "proposal-loop-basic",
+        "implementation-refine-review",
+        "approval-pause-resume",
+        "retry-recovery-flow",
+        "cancelled-or-blocked-run",
+        "terminal-report-evidence",
+        "projection-readback-surface",
+    ];
 
     #[test]
     fn mutation_name_converter_covers_command_mutations() {
@@ -798,6 +1192,7 @@ mod tests {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         }
     }
 
@@ -821,10 +1216,74 @@ mod tests {
             .expect("in-memory pool failed")
     }
 
+    async fn p043_test_pool() -> sqlx::SqlitePool {
+        let path =
+            std::env::temp_dir().join(format!("chainworks-p043-{}.sqlite", uuid::Uuid::new_v4()));
+        create_pool(&format!("sqlite://{}", path.to_string_lossy()))
+            .await
+            .expect("P043 file-backed pool failed")
+    }
+
     fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
         let events = event_bus::new_bus(64);
         let work_queue = WorkQueue::new(pool.clone());
         Arc::new(CommandHandler::new(pool, events, work_queue))
+    }
+
+    async fn persist_blocked_implementation_summary(pool: &sqlx::SqlitePool, run_id: RunId) {
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_8_implementation_continued".into(),
+            agent_id: "code_writer".into(),
+            name: "implementation_self_assessment".into(),
+            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/implementation/self-assessment.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(pool, &artifact).await.unwrap();
+        let raw = serde_json::json!({
+            "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+            "implementation_complete": true,
+            "verification_green": false,
+            "remaining_code_tasks": [],
+            "handoff_tasks": [],
+            "known_risks": ["verification blocked by environment"],
+            "tests_run": ["cargo test: blocked"],
+            "docs_impacted": []
+        });
+        let summary = parse_implementation_self_assessment_v2(
+            &raw,
+            ContractParseContext {
+                run_id: run_id.to_string(),
+                run_age: None,
+                declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+                canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+                raw_artifact_path: Some(artifact.file_path.clone()),
+                source_generation_id: None,
+                artifact_created_at: Some(artifact.created_at),
+                v2_generation_seen_for_run: true,
+                legacy_v1_generation_available: false,
+            },
+        );
+        artifact_contracts::persist_implementation_self_assessment_summary(
+            pool,
+            run_id,
+            artifact.id,
+            &artifact.contract_id,
+            &summary,
+            artifact.created_at,
+        )
+        .await
+        .unwrap();
     }
 
     async fn seed_validation_attempt(
@@ -1004,6 +1463,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(
@@ -1049,7 +1509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_run_blocked_preflight_returns_typed_payload() {
+    async fn graphql_start_run_blocked_payload_contract_tests() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
@@ -1059,6 +1519,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(
@@ -1133,6 +1594,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let start = schema
             .execute(Request::new(
@@ -1194,8 +1656,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_preflight_graphql_readback_tests() {
+    async fn run_query_exposes_implementation_self_assessment_summary() {
         let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_blocked_implementation_summary(&pool, run_id).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(Request::new(format!(
+                r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    id
+                    implementationSelfAssessmentSummary {{
+                      status
+                      implementationComplete
+                      verificationGreen
+                      blockingRemainingCodeTaskCount
+                      testsRun
+                    }}
+                  }}
+                }}
+                "#
+            )))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let summary = &json["run"]["implementationSelfAssessmentSummary"];
+        assert_eq!(summary["status"], serde_json::json!("blocked"));
+        assert_eq!(summary["implementationComplete"], serde_json::json!(true));
+        assert_eq!(summary["verificationGreen"], serde_json::json!(false));
+        assert_eq!(
+            summary["blockingRemainingCodeTaskCount"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_preflight_graphql_readback_tests() {
+        let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1216,6 +1730,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let start = schema
             .execute(
@@ -1282,7 +1797,7 @@ mod tests {
 
     #[tokio::test]
     async fn execution_mcp_truth_contract_tests() {
-        let pool = test_pool().await;
+        let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
@@ -1296,6 +1811,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(format!(
@@ -1345,6 +1861,611 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_043_run_query_uses_projection_summary_fields() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: domain::ids::ApprovalId::new(),
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P043RunDetail {{
+                      run(id: "{run_id}") {{
+                        id
+                        projectionPresent
+                        projectionUpdatedAt
+                        projectionLag
+                        totalStages
+                        failedStages
+                        pendingApprovals
+                      }}
+                      stage(id: "{stage_execution_id}") {{
+                        id
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P043 run detail query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["run"]["projectionPresent"], serde_json::json!(true));
+        assert!(json["run"]["projectionUpdatedAt"].is_string());
+        assert_eq!(json["run"]["projectionLag"], serde_json::json!(false));
+        assert_eq!(json["run"]["totalStages"], serde_json::json!(1));
+        assert_eq!(json["run"]["failedStages"], serde_json::json!(1));
+        assert_eq!(json["run"]["pendingApprovals"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn proposal_043_stage_queries_expose_projection_decision_flags() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, agent_execution_id) = seed_validation_attempt(&pool, run_id).await;
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: domain::ids::ApprovalId::new(),
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let payload_path = std::env::temp_dir().join(format!("p043-artifact-{run_id}.json"));
+        std::fs::write(&payload_path, br#"{"ok":true}"#).unwrap();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "stage_1".into(),
+            agent_id: "validation_agent".into(),
+            name: "validation_failure_validation_agent".into(),
+            contract_id: "validation_failure_record".into(),
+            format: ArtifactFormat::Json,
+            file_path: payload_path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "system".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("validation_failure".into()),
+            report_version: None,
+        };
+        artifacts::insert(&pool, &artifact).await.unwrap();
+        let record =
+            validation_failure_record(artifact.id, run_id, stage_execution_id, agent_execution_id);
+        db::repos::validation::insert(&pool, &record).await.unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P043StageReadback {{
+                      stages(runId: "{run_id}") {{
+                        id
+                        projectionPresent
+                        projectionUpdatedAt
+                        projectionLag
+                        hasArtifacts
+                        hasPendingApproval
+                        hasValidationFailure
+                      }}
+                      stage(id: "{stage_execution_id}") {{
+                        id
+                        projectionPresent
+                        projectionUpdatedAt
+                        projectionLag
+                        hasArtifacts
+                        hasPendingApproval
+                        hasValidationFailure
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P043 stage readback query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(
+            json["stages"][0]["projectionPresent"],
+            serde_json::json!(true)
+        );
+        assert!(json["stages"][0]["projectionUpdatedAt"].is_string());
+        assert_eq!(json["stages"][0]["projectionLag"], serde_json::json!(false));
+        assert_eq!(json["stages"][0]["hasArtifacts"], serde_json::json!(true));
+        assert_eq!(
+            json["stages"][0]["hasPendingApproval"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            json["stages"][0]["hasValidationFailure"],
+            serde_json::json!(true)
+        );
+        assert_eq!(json["stage"]["projectionPresent"], serde_json::json!(true));
+        assert!(json["stage"]["projectionUpdatedAt"].is_string());
+        assert_eq!(json["stage"]["projectionLag"], serde_json::json!(false));
+        assert_eq!(json["stage"]["hasArtifacts"], serde_json::json!(true));
+        assert_eq!(json["stage"]["hasPendingApproval"], serde_json::json!(true));
+        assert_eq!(
+            json["stage"]["hasValidationFailure"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_043_graphql_reads_are_operator_only_v1() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P043OperatorOnly {
+                      runs { id }
+                    }
+                    "#,
+                )
+                .data(observer_principal()),
+            )
+            .await;
+
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "P043 V1 reads must reject non-operator principals: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_043_run_subscription_uses_projection_summary_fields() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = p043_test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        seed_validation_attempt(&pool, run_id).await;
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: domain::ids::ApprovalId::new(),
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let mut stream = schema.execute_stream(
+            Request::new(format!(
+                r#"
+                subscription P043RunSubscription {{
+                  runStatusChanged(runId: "{run_id}") {{
+                    id
+                    projectionPresent
+                    projectionUpdatedAt
+                    projectionLag
+                    totalStages
+                    pendingApprovals
+                  }}
+                }}
+                "#
+            ))
+            .data(test_principal()),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: domain::run::RunStatus::Ready,
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("P043 run subscription frame timed out")
+            .expect("P043 run subscription ended");
+        assert!(
+            frame.errors.is_empty(),
+            "P043 run subscription must succeed: {frame:?}"
+        );
+        let json = frame.data.into_json().unwrap();
+        assert_eq!(
+            json["runStatusChanged"]["projectionPresent"],
+            serde_json::json!(true)
+        );
+        assert!(json["runStatusChanged"]["projectionUpdatedAt"].is_string());
+        assert_eq!(
+            json["runStatusChanged"]["projectionLag"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            json["runStatusChanged"]["totalStages"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            json["runStatusChanged"]["pendingApprovals"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_043_stage_subscription_uses_projection_decision_flags() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = p043_test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, agent_execution_id) = seed_validation_attempt(&pool, run_id).await;
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: domain::ids::ApprovalId::new(),
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let payload_path = std::env::temp_dir().join(format!("p043-sub-artifact-{run_id}.json"));
+        std::fs::write(&payload_path, br#"{"ok":true}"#).unwrap();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "stage_1".into(),
+            agent_id: "validation_agent".into(),
+            name: "validation_failure_validation_agent".into(),
+            contract_id: "validation_failure_record".into(),
+            format: ArtifactFormat::Json,
+            file_path: payload_path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "system".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("validation_failure".into()),
+            report_version: None,
+        };
+        artifacts::insert(&pool, &artifact).await.unwrap();
+        let record =
+            validation_failure_record(artifact.id, run_id, stage_execution_id, agent_execution_id);
+        db::repos::validation::insert(&pool, &record).await.unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let mut stream = schema.execute_stream(
+            Request::new(format!(
+                r#"
+                subscription P043StageSubscription {{
+                  stageStatusChanged(runId: "{run_id}") {{
+                    id
+                    projectionPresent
+                    projectionUpdatedAt
+                    projectionLag
+                    hasArtifacts
+                    hasPendingApproval
+                    hasValidationFailure
+                  }}
+                }}
+                "#
+            ))
+            .data(test_principal()),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id,
+                status: domain::stage::StageStatus::Failed,
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("P043 stage subscription frame timed out")
+            .expect("P043 stage subscription ended");
+        assert!(
+            frame.errors.is_empty(),
+            "P043 stage subscription must succeed: {frame:?}"
+        );
+        let json = frame.data.into_json().unwrap();
+        assert_eq!(
+            json["stageStatusChanged"]["projectionPresent"],
+            serde_json::json!(true)
+        );
+        assert!(json["stageStatusChanged"]["projectionUpdatedAt"].is_string());
+        assert_eq!(
+            json["stageStatusChanged"]["projectionLag"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            json["stageStatusChanged"]["hasArtifacts"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            json["stageStatusChanged"]["hasPendingApproval"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            json["stageStatusChanged"]["hasValidationFailure"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_043_approval_resolved_subscription_is_available() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = p043_test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let mut stream = schema.execute_stream(
+            Request::new(
+                r#"
+                subscription P043ApprovalResolved {
+                  approvalResolved {
+                    id
+                    decision
+                    decidedAt
+                  }
+                }
+                "#,
+            )
+            .data(test_principal()),
+        );
+        let pool_for_event = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            approvals::resolve(
+                &pool_for_event,
+                approval_id,
+                domain::approval::ApprovalDecision::Granted,
+                Utc::now(),
+                Some("approved".into()),
+            )
+            .await
+            .unwrap();
+            let _ = bus.send(DomainEvent::ApprovalResolved {
+                approval_id,
+                decision: domain::approval::ApprovalDecision::Granted,
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("P043 approvalResolved subscription frame timed out")
+            .expect("P043 approvalResolved subscription ended");
+        assert!(
+            frame.errors.is_empty(),
+            "P043 approvalResolved subscription must succeed: {frame:?}"
+        );
+        let json = frame.data.into_json().unwrap();
+        assert_eq!(
+            json["approvalResolved"]["decision"],
+            serde_json::json!("granted")
+        );
+        assert!(
+            json["approvalResolved"]["decidedAt"].is_string(),
+            "resolved approval subscription must expose decidedAt: {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_043_missing_projection_rows_are_explicit_lag_state() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P043MissingProjectionLag {{
+                      run(id: "{run_id}") {{
+                        projectionPresent
+                        projectionUpdatedAt
+                        projectionLag
+                        pendingApprovals
+                      }}
+                      stage(id: "{stage_execution_id}") {{
+                        projectionPresent
+                        projectionUpdatedAt
+                        projectionLag
+                        hasPendingApproval
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P043 missing projection query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["run"]["projectionPresent"], serde_json::json!(false));
+        assert_eq!(json["run"]["projectionUpdatedAt"], serde_json::Value::Null);
+        assert_eq!(json["run"]["projectionLag"], serde_json::json!(true));
+        assert_eq!(json["stage"]["projectionPresent"], serde_json::json!(false));
+        assert_eq!(
+            json["stage"]["projectionUpdatedAt"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["stage"]["projectionLag"], serde_json::json!(true));
+        assert_ne!(
+            json["run"]["projectionLag"],
+            serde_json::json!(false),
+            "missing projection must not be indistinguishable from normal zero-count truth"
+        );
+        assert_ne!(
+            json["stage"]["projectionLag"],
+            serde_json::json!(false),
+            "missing stage projection must not be indistinguishable from normal false flags"
+        );
+    }
+
+    #[tokio::test]
     async fn run_query_exposes_cancellation_settlement_log() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -1378,6 +2499,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(format!(
@@ -1463,6 +2585,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(
@@ -1540,6 +2663,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(format!(
@@ -1671,6 +2795,7 @@ mod tests {
             make_command_handler(pool.clone()),
             event_bus::new_bus(64),
             auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
         let response = schema
             .execute(Request::new(
@@ -1702,6 +2827,968 @@ mod tests {
         assert_eq!(
             response.data.into_json().unwrap()["stewardAnalyses"][0]["id"],
             "analysis-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_041_graphql_readback_parity_surfaces() {
+        for fixture_id in P041_FIXTURES {
+            // The engine crate's `proposal_041_parity.rs` integration
+            // test produces `target/parity/reports/<fixture_id>/behavioral-diff-report.json`
+            // + the SQLite DB at the path that report's `database_ref`
+            // points to. Under `cargo test --workspace` the engine
+            // integration binary and this graphql-server lib binary
+            // run in parallel slots — there is no ordering guarantee.
+            // If the engine binary hasn't produced the report yet (or
+            // was cleaned between runs), skip instead of failing. The
+            // engine-side gate still enforces that the report IS
+            // produced; this test exercises the readback contract
+            // only when the artifacts exist. The dedicated
+            // `./scripts/test-gate.sh proposal-041` lane runs both in
+            // the right order and is the authoritative readiness
+            // signal for P041.
+            let report_path = p041_report_path(fixture_id);
+            let replay_path = p041_replay_path(fixture_id);
+            if !report_path.is_file() || !replay_path.is_file() {
+                eprintln!(
+                    "P041 readback: skipping fixture '{fixture_id}' — engine-side replay has \
+                     not produced {} yet. Run `cargo test -p engine --test proposal_041_parity` \
+                     first, or use `./scripts/test-gate.sh proposal-041`.",
+                    report_path.display()
+                );
+                return;
+            }
+            let mut report = p041_report(fixture_id);
+            let replay = p041_replay(fixture_id);
+            let run_id = replay["run_id"].as_str().expect("run_id");
+            let idea_id = replay["run_projection"]["idea_id"]
+                .as_str()
+                .expect("idea_id");
+            let db_path =
+                workspace_root().join(report["database_ref"].as_str().expect("database_ref"));
+            if !db_path.is_file() {
+                eprintln!(
+                    "P041 readback: skipping fixture '{fixture_id}' — engine-side replay DB \
+                     {} is missing (likely cleaned between runs).",
+                    db_path.display()
+                );
+                return;
+            }
+            let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+                .await
+                .expect("open P041 fixture DB");
+            let schema = build_schema(
+                pool.clone(),
+                make_command_handler(pool.clone()),
+                event_bus::new_bus(64),
+                auth::PrincipalTable::test_fixture(),
+                test_reporter(),
+            );
+            let response = schema
+                .execute(Request::new(format!(
+                    r#"
+                    query P041FixtureReadback {{
+                      run(id: "{run_id}") {{
+                        id
+                        status
+                        workflowId
+                      }}
+                      runs(ideaId: "{idea_id}") {{
+                        id
+                        totalStages
+                        completedStages
+                        failedStages
+                        pendingApprovals
+                      }}
+                      stages(runId: "{run_id}") {{
+                        stageId
+                        label
+                        status
+                      }}
+                      artifacts(runId: "{run_id}") {{
+                        name
+                        contractId
+                        reportKind
+                      }}
+                    }}
+                    "#
+                )))
+                .await;
+            assert!(
+                response.errors.is_empty(),
+                "P041 GraphQL fixture readback query must succeed for {fixture_id}: {response:?}"
+            );
+            let data = response.data.into_json().unwrap();
+            let actual = normalize_p041_graphql_actual(data, run_id);
+            update_p041_surface(
+                &mut report,
+                "graphql_readback",
+                actual,
+                "graphql-server::schema::build_schema",
+            );
+            write_p041_report(fixture_id, &report);
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("graphql crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn control_plane_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("graphql crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn p041_report_path(fixture_id: &str) -> PathBuf {
+        control_plane_root()
+            .join("target/parity/reports")
+            .join(fixture_id)
+            .join("behavioral-diff-report.json")
+    }
+
+    fn p041_replay_path(fixture_id: &str) -> PathBuf {
+        control_plane_root()
+            .join("target/parity")
+            .join(fixture_id)
+            .join("server-replay.json")
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("read JSON")).expect("parse JSON")
+    }
+
+    fn p041_report(fixture_id: &str) -> serde_json::Value {
+        read_json(&p041_report_path(fixture_id))
+    }
+
+    fn p041_replay(fixture_id: &str) -> serde_json::Value {
+        read_json(&p041_replay_path(fixture_id))
+    }
+
+    fn write_p041_report(fixture_id: &str, report: &serde_json::Value) {
+        fs::write(
+            p041_report_path(fixture_id),
+            serde_json::to_string_pretty(report).expect("serialize P041 report"),
+        )
+        .expect("write P041 report");
+    }
+
+    fn normalize_p041_graphql_actual(data: serde_json::Value, run_id: &str) -> serde_json::Value {
+        let mut stages = data["stages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|stage| {
+                serde_json::json!({
+                    "stage_id": stage["stageId"],
+                    "label": stage["label"],
+                    "status": stage["status"],
+                })
+            })
+            .collect::<Vec<_>>();
+        stages.sort_by(|left, right| {
+            left["stage_id"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["stage_id"].as_str().unwrap_or_default())
+        });
+        let mut artifacts = data["artifacts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|artifact| {
+                serde_json::json!({
+                    "name": artifact["name"],
+                    "contract_id": artifact["contractId"],
+                    "report_kind": artifact["reportKind"],
+                })
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        });
+        serde_json::json!({
+            "collector_owner": "graphql-server::schema::build_schema",
+            "query": "P041FixtureReadback",
+            "run": {
+                "id": "$run_id",
+                "status": data["run"]["status"],
+                "workflow_id": data["run"]["workflowId"],
+            },
+            "runs_by_idea": data["runs"].as_array().cloned().unwrap_or_default().into_iter().map(|run| {
+                serde_json::json!({
+                    "id": if run["id"] == serde_json::json!(run_id) { serde_json::json!("$run_id") } else { run["id"].clone() },
+                    "total_stages": run["totalStages"],
+                    "completed_stages": run["completedStages"],
+                    "failed_stages": run["failedStages"],
+                    "pending_approvals": run["pendingApprovals"],
+                })
+            }).collect::<Vec<_>>(),
+            "stages": stages,
+            "artifacts": artifacts,
+        })
+    }
+
+    fn update_p041_surface(
+        report: &mut serde_json::Value,
+        surface: &str,
+        actual: serde_json::Value,
+        collector_owner: &str,
+    ) {
+        let comparisons = report["surface_comparisons"]
+            .as_array_mut()
+            .expect("surface_comparisons");
+        let comparison = comparisons
+            .iter_mut()
+            .find(|item| item["surface"] == serde_json::json!(surface))
+            .expect("surface comparison");
+        let expected = comparison["expected"].clone();
+        let matched = expected == actual;
+        comparison["actual"] = actual.clone();
+        comparison["collector_owner"] = serde_json::json!(collector_owner);
+        comparison["status"] = serde_json::json!(if matched { "matched" } else { "diverged" });
+
+        let divergences = report["divergences"].as_array_mut().expect("divergences");
+        divergences.retain(|item| item["owner_surface"] != serde_json::json!(surface));
+        if !matched {
+            divergences.push(serde_json::json!({
+                "path": format!("$.{surface}"),
+                "expected": expected,
+                "actual": actual,
+                "severity": "blocking",
+                "owner_surface": surface,
+                "investigation_hint": "P041 fixture-bound GraphQL readback diverged from expected client truth."
+            }));
+        }
+        let blocking_count = divergences
+            .iter()
+            .filter(|item| item["severity"] == "blocking")
+            .count();
+        report["summary"]["blocking_count"] = serde_json::json!(blocking_count);
+        report["verdict"] = serde_json::json!(if blocking_count == 0 { "ready" } else { "red" });
+    }
+
+    // ── P050 GraphQL readback proof ──
+
+    #[tokio::test]
+    async fn test_graphql_run_exposes_chainworks_meta_root() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+
+        ideas::insert(
+            &pool,
+            &Idea {
+                id: idea_id,
+                title: "P050 GraphQL proof".into(),
+                body: "body".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: IdeaStatus::Active,
+                created_at: Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut run = make_run(run_id, idea_id);
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+        runs::insert(&pool, &run).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(async_graphql::Request::new(format!(
+                r#"{{ run(id: "{}") {{ chainworksMetaRoot }} }}"#,
+                run_id
+            )))
+            .await;
+        assert!(
+            response.errors.is_empty(),
+            "GraphQL errors: {:?}",
+            response.errors
+        );
+        let data = response.data.into_json().unwrap();
+        let meta_root = data["run"]["chainworksMetaRoot"].as_str();
+        assert!(
+            meta_root.is_some(),
+            "GraphQL run query must expose chainworksMetaRoot"
+        );
+        assert!(
+            meta_root.unwrap().contains(".chainworks/runs/"),
+            "chainworksMetaRoot must contain per-run path, got: {:?}",
+            meta_root
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Proposal 029 §4.4.b / §9.1 — `journalId` surfacing on mutations
+    // ───────────────────────────────────────────────────────────────────
+    //
+    // Every GraphQL mutation that invokes `CommandHandler` returns a
+    // dedicated payload wrapper that exposes `journalId: ID!`. These tests
+    // cover the success path for every command mutation plus two denial
+    // paths:
+    //
+    //   - `test_graphql_start_run_started_variant_includes_journal_id`
+    //   - `test_graphql_start_run_blocked_variant_includes_journal_id`
+    //   - `test_graphql_approve_stage_returns_payload_with_approval_and_journal_id`
+    //   - `test_graphql_retry_stage_returns_payload_with_retried_and_journal_id`
+    //   - `test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id`
+    //   - `test_response_omits_journal_id_when_capability_check_fails`
+    //
+    // See also AC-11 at proposal §8.
+
+    use db::repos::approvals;
+    use domain::approval::{Approval, ApprovalDecision};
+    use domain::ids::{ApprovalId, StageExecutionId};
+    use domain::stage::{StageExecution, StageStatus};
+
+    fn make_approval(run_id: RunId, stage_id: &str) -> Approval {
+        Approval {
+            id: ApprovalId::new(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            decision: ApprovalDecision::Pending,
+            requested_at: Utc::now(),
+            decided_at: None,
+            comment: None,
+            expires_at: None,
+        }
+    }
+
+    fn make_manual_gate_stage(run_id: RunId, stage_id: &str) -> StageExecution {
+        StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            label: stage_id.to_string(),
+            status: StageStatus::WaitingApproval,
+            iteration: 0,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: Some("manual_gate".into()),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        }
+    }
+
+    fn observer_principal() -> auth::Principal {
+        auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
+    }
+
+    #[tokio::test]
+    async fn test_graphql_start_run_started_variant_includes_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init");
+        let worktrees = tempfile::tempdir().unwrap();
+        let delivery_json = format!(
+            r#"{{"repo_identifier":"repo-ok","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
+            repo.path().display(),
+            worktrees.path().display()
+        );
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    mutation StartRun {
+                      startRun(
+                        ideaId: "IDEA_ID",
+                        workflowId: "wf-1",
+                        workflowTitle: "t",
+                        workspaceRoot: "/tmp/ws",
+                        artifactRoot: "/tmp/art",
+                        workflowYamlPath: "WORKFLOW_YAML_PATH",
+                        agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
+                        deliveryConfigurationJson: DELIVERY_CONFIG
+                      ) {
+                        ... on StartRunStartedPayload { run { id } journalId }
+                        ... on StartRunBlockedPayload { journalId }
+                      }
+                    }
+                    "#
+                    .replace("IDEA_ID", &idea_id.to_string())
+                    .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                    .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
+                    .replace(
+                        "DELIVERY_CONFIG",
+                        &serde_json::to_string(&delivery_json).unwrap(),
+                    ),
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "mutation must succeed: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        let jid = data["startRun"]["journalId"]
+            .as_str()
+            .expect("StartRunStartedPayload.journalId");
+        assert!(
+            !jid.is_empty(),
+            "journalId on StartRunStartedPayload must be a non-empty uuid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_start_run_blocked_variant_includes_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(Request::new(r#"
+                mutation StartRun {
+                  startRun(
+                    ideaId: "IDEA_ID",
+                    workflowId: "wf-blk",
+                    workflowTitle: "Blocked",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    workflowYamlPath: "WORKFLOW_YAML_PATH",
+                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
+                    deliveryConfigurationJson: "{\"repo_identifier\":\"r\",\"repo_root\":\"/definitely/missing\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp\",\"target_branch\":\"cw/release\",\"release_target_id\":\"app-store\"}"
+                  ) {
+                    ... on StartRunStartedPayload { run { id } journalId }
+                    ... on StartRunBlockedPayload { journalId deliveryPreflight { passed } }
+                  }
+                }
+                "#
+                .replace("IDEA_ID", &idea_id.to_string())
+                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
+                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
+            ).data(test_principal()))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "blocked mutation must surface as payload, not top-level error: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        assert_eq!(
+            data["startRun"]["deliveryPreflight"]["passed"],
+            serde_json::json!(false),
+            "blocked variant must report preflight failure"
+        );
+        let jid = data["startRun"]["journalId"]
+            .as_str()
+            .expect("StartRunBlockedPayload.journalId");
+        assert!(
+            !jid.is_empty(),
+            "journalId must be present on the blocked variant too"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_approve_stage_returns_payload_with_approval_and_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveStage(runId: "{}", stageId: "state_6") {{
+                        approval {{ id }}
+                        journalId
+                      }}
+                    }}"#,
+                    run_id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "approveStage must succeed: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        let approval_id = data["approveStage"]["approval"]["id"]
+            .as_str()
+            .expect("approveStage.approval.id");
+        assert_eq!(approval_id, approval.id.to_string());
+
+        let jid = data["approveStage"]["journalId"]
+            .as_str()
+            .expect("approveStage.journalId");
+        assert!(!jid.is_empty(), "journalId on ApproveStagePayload");
+    }
+
+    #[tokio::test]
+    async fn test_graphql_retry_stage_returns_payload_with_retried_and_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      retryStage(runId: "{}", stageId: "state_7") {{
+                        retried
+                        journalId
+                      }}
+                    }}"#,
+                    run_id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        // retry_stage may succeed or fail depending on work-queue state —
+        // the contract we care about is that the payload wrapper includes
+        // journalId whenever it returns (not errors).
+        if response.errors.is_empty() {
+            let data = response.data.into_json().unwrap();
+            assert_eq!(data["retryStage"]["retried"], serde_json::json!(true));
+            let jid = data["retryStage"]["journalId"]
+                .as_str()
+                .expect("retryStage.journalId");
+            assert!(!jid.is_empty(), "journalId on RetryStagePayload");
+        } else {
+            // Even on error, the command_journal row was written. Assert
+            // that from the DB directly to prove journal_id was generated.
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "retryStage must still leave an audit row");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      cancelRun(runId: "{}") {{
+                        cancelled
+                        journalId
+                      }}
+                    }}"#,
+                    run_id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "cancelRun must succeed: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        assert_eq!(data["cancelRun"]["cancelled"], serde_json::json!(true));
+        let jid = data["cancelRun"]["journalId"]
+            .as_str()
+            .expect("cancelRun.journalId");
+        assert!(!jid.is_empty(), "journalId on CancelRunPayload");
+    }
+
+    #[tokio::test]
+    async fn test_response_omits_journal_id_when_capability_check_fails() {
+        // Observer class is forbidden from `startRun`. The mutation returns
+        // a GraphQL error of kind `forbidden`, and no payload — therefore
+        // no `journalId`. Proof: response.data is null/missing for the
+        // startRun field, and response.errors[0].message matches "forbidden".
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"mutation {
+                      startRun(
+                        ideaId: "IDEA_ID",
+                        workflowId: "wf",
+                        workflowTitle: "t",
+                        workspaceRoot: "/tmp/ws",
+                        artifactRoot: "/tmp/art",
+                        workflowYamlPath: "WFP",
+                        agentCatalogYamlPath: "AGP"
+                      ) {
+                        ... on StartRunStartedPayload { journalId }
+                        ... on StartRunBlockedPayload { journalId }
+                      }
+                    }"#
+                    .replace("IDEA_ID", &idea_id.to_string())
+                    .replace("WFP", &test_workflow_yaml_path())
+                    .replace("AGP", &test_agent_catalog_yaml_path()),
+                )
+                .data(observer_principal()),
+            )
+            .await;
+
+        assert!(
+            !response.errors.is_empty(),
+            "observer must be denied with an error, got {response:?}"
+        );
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|e| e.message.contains("forbidden")),
+            "denial reason must mention 'forbidden', got {:?}",
+            response.errors
+        );
+
+        // Data field must not carry a journalId for the denied mutation.
+        let data = response.data.into_json().unwrap_or(serde_json::json!(null));
+        let has_jid = data
+            .get("startRun")
+            .and_then(|v| v.get("journalId"))
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        assert!(
+            !has_jid,
+            "denied mutation must NOT leak a journalId (got {data})"
+        );
+
+        // And there must be NO command_journal row — denied at capability
+        // check, never reaches CommandHandler::handle.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "denied mutation must not write any audit row");
+    }
+
+    // ── P042 §5.2: daemonStatus query + daemonStatusChanged subscription ──
+
+    fn operator_principal() -> auth::Principal {
+        auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[tokio::test]
+    async fn test_daemon_status_query_includes_build_sha_and_schema_versions() {
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let reporter = LifecycleReporter::new(14, "cafe-babe", bus.clone());
+        reporter.set_state(domain::lifecycle::DaemonLifecycleState::Starting);
+        reporter.set_state(domain::lifecycle::DaemonLifecycleState::Ready);
+
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(pool.clone())
+            .data(make_command_handler(pool.clone()))
+            .data(bus)
+            .data(auth::PrincipalTable::test_fixture())
+            .data(reporter)
+            .finish();
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"{
+                      daemonStatus {
+                        state schemaVersion binarySchemaVersion buildSha
+                        pid lastStateChangeAt json
+                      }
+                    }"#,
+                )
+                .data(operator_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "daemonStatus errored: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        // GraphQL enums serialize as SCREAMING_SNAKE_CASE per spec.
+        assert_eq!(data["daemonStatus"]["state"], "READY");
+        assert_eq!(data["daemonStatus"]["binarySchemaVersion"], 14);
+        assert_eq!(data["daemonStatus"]["buildSha"], "cafe-babe");
+        // The json field carries the full P042 §5.2 wire shape (snake_case).
+        let json_str = data["daemonStatus"]["json"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed["state"], "ready");
+        assert_eq!(parsed["binary_schema_version"], 14);
+    }
+
+    #[tokio::test]
+    async fn daemon_status_query_is_operator_only() {
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let reporter = LifecycleReporter::new(14, "dev", bus.clone());
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(pool.clone())
+            .data(make_command_handler(pool.clone()))
+            .data(bus)
+            .data(auth::PrincipalTable::test_fixture())
+            .data(reporter)
+            .finish();
+        let response = schema
+            .execute(Request::new("{ daemonStatus { state } }").data(observer_principal()))
+            .await;
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|e| e.message.contains("forbidden")),
+            "observer must be denied, got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_status_query_populates_failure_field_when_failed() {
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let reporter = LifecycleReporter::new(14, "dev", bus.clone());
+        reporter.set_failed(
+            domain::lifecycle::FailureKind::MigrationFailed,
+            "test failure",
+            Some("/tmp/bk.sqlite".into()),
+        );
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(pool.clone())
+            .data(make_command_handler(pool.clone()))
+            .data(bus)
+            .data(auth::PrincipalTable::test_fixture())
+            .data(reporter)
+            .finish();
+        let response = schema
+            .execute(
+                Request::new("{ daemonStatus { state failure { kind detail backupPath } json } }")
+                    .data(operator_principal()),
+            )
+            .await;
+        assert!(response.errors.is_empty(), "{response:?}");
+        let data = response.data.into_json().unwrap();
+        assert_eq!(data["daemonStatus"]["state"], "FAILED");
+        // Typed `failure` field is now first-class GraphQL (not nested in
+        // a stringified json). `kind` is a GraphQL enum, so it serializes
+        // as SCREAMING_SNAKE_CASE.
+        assert_eq!(data["daemonStatus"]["failure"]["kind"], "MIGRATION_FAILED");
+        assert_eq!(data["daemonStatus"]["failure"]["detail"], "test failure");
+        assert_eq!(
+            data["daemonStatus"]["failure"]["backupPath"],
+            "/tmp/bk.sqlite"
+        );
+        // `json` retains the snake_case wire shape identical to /health.
+        let json_str = data["daemonStatus"]["json"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed["failure"]["kind"], "migration_failed");
+        assert_eq!(parsed["failure"]["backup_path"], "/tmp/bk.sqlite");
+    }
+
+    #[tokio::test]
+    async fn daemon_status_changed_subscription_receives_transitions() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let reporter = LifecycleReporter::new(14, "dev", bus.clone());
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(pool.clone())
+            .data(make_command_handler(pool.clone()))
+            .data(bus)
+            .data(auth::PrincipalTable::test_fixture())
+            .data(reporter.clone())
+            .finish();
+
+        let mut stream = schema.execute_stream(
+            Request::new("subscription { daemonStatusChanged { state } }")
+                .data(operator_principal()),
+        );
+        // The BroadcastStream only observes frames sent AFTER
+        // `events.subscribe()` runs inside the subscription handler, which
+        // only runs when the stream is polled. Kick the transition from a
+        // spawned task with a small delay so the first poll activates the
+        // subscription before the frame is broadcast.
+        let reporter_clone = reporter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            reporter_clone.set_state(domain::lifecycle::DaemonLifecycleState::Starting);
+        });
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("subscription frame timed out")
+            .expect("subscription stream ended");
+        let data = frame.data.into_json().unwrap();
+        assert_eq!(data["daemonStatusChanged"]["state"], "STARTING");
+    }
+
+    #[tokio::test]
+    async fn test_daemon_status_changed_subscription_auth_required() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let reporter = LifecycleReporter::new(14, "dev", bus.clone());
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(pool.clone())
+            .data(make_command_handler(pool.clone()))
+            .data(bus)
+            .data(auth::PrincipalTable::test_fixture())
+            .data(reporter.clone())
+            .finish();
+
+        // No principal data inserted into the request — this mirrors what
+        // happens when WS `connection_init` is missing or rejects the
+        // token. The subscription handler must refuse with "unauthorized"
+        // on first poll, not silently pass through frames.
+        let mut stream = schema.execute_stream(Request::new(
+            "subscription { daemonStatusChanged { state } }",
+        ));
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("unauthorized subscription should produce a frame, not hang")
+            .expect("stream should not end before emitting the error");
+        assert!(
+            !frame.errors.is_empty(),
+            "subscription without principal must surface an error, got {frame:?}"
+        );
+        assert!(
+            frame
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("unauthorized")),
+            "error message must mention 'unauthorized': {:?}",
+            frame.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daemon_status_changed_subscription_rejects_non_operator_principal() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let reporter = LifecycleReporter::new(14, "dev", bus.clone());
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(pool.clone())
+            .data(make_command_handler(pool.clone()))
+            .data(bus)
+            .data(auth::PrincipalTable::test_fixture())
+            .data(reporter.clone())
+            .finish();
+
+        // Observer class — has a principal but is not Operator. P042 §5.2
+        // marks the subscription as operator-only bearer auth; the handler
+        // must refuse with `forbidden`, not stream frames.
+        let mut stream = schema.execute_stream(
+            Request::new("subscription { daemonStatusChanged { state } }")
+                .data(observer_principal()),
+        );
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("observer subscription should produce a frame, not hang")
+            .expect("stream should not end before emitting the error");
+        assert!(
+            !frame.errors.is_empty(),
+            "observer subscription must surface an error, got {frame:?}"
+        );
+        assert!(
+            frame
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("forbidden")),
+            "error must mention 'forbidden' for the observer class: {:?}",
+            frame.errors
         );
     }
 }

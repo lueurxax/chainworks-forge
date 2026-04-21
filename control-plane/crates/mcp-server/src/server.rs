@@ -276,7 +276,7 @@ impl McpServer {
                 {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
                 }
-                self.handle_resource_read(id, &uri).await
+                self.handle_resource_read(id, &uri, principal).await
             }
 
             "notifications/initialized" => {
@@ -305,8 +305,10 @@ impl McpServer {
         &self,
         id: Option<serde_json::Value>,
         uri: &str,
+        principal: &auth::Principal,
     ) -> JsonRpcResponse {
-        let result: anyhow::Result<serde_json::Value> = self.read_resource(uri).await;
+        let result: anyhow::Result<serde_json::Value> =
+            self.read_resource_for_principal(uri, principal).await;
         match result {
             Ok(data) => JsonRpcResponse::success(
                 id,
@@ -322,9 +324,22 @@ impl McpServer {
         }
     }
 
-    async fn read_resource(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
+    #[allow(dead_code)]
+    pub(crate) async fn read_resource(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
+        self.read_resource_for_principal(
+            uri,
+            &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+        )
+        .await
+    }
+
+    async fn read_resource_for_principal(
+        &self,
+        uri: &str,
+        principal: &auth::Principal,
+    ) -> anyhow::Result<serde_json::Value> {
         if let Some(run_id) = uri.strip_prefix("run://") {
-            return self.read_canonical_run_resource(run_id).await;
+            return self.read_canonical_run_resource(run_id, principal).await;
         }
 
         if let Some(idea_id_str) = uri.strip_prefix("idea://") {
@@ -392,7 +407,13 @@ impl McpServer {
                 "failed_stages": run_proj.failed_stages,
                 "has_artifacts": !artifact_rows.is_empty(),
                 "stages": stage_rows,
-                "agent_executions": tools::reports::execution_mcp_truth_json(&self.pool, run_id_parsed).await?,
+                "agent_executions": tools::reports::execution_mcp_truth_json(
+                    &self.pool,
+                    run_id_parsed,
+                    principal.class == auth::PrincipalClass::Operator,
+                )
+                .await?,
+                "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "artifact_index": artifact_rows,
                 "artifacts": artifact_payloads,
             }));
@@ -447,14 +468,18 @@ impl McpServer {
                 let rows = projections::list_artifacts_projection(&self.pool, rid).await?;
                 return Ok(serde_json::to_value(rows)?);
             } else {
-                return self.read_canonical_run_resource(run_id).await;
+                return self.read_canonical_run_resource(run_id, principal).await;
             }
         }
 
         anyhow::bail!("Unknown resource URI: {}", uri)
     }
 
-    async fn read_canonical_run_resource(&self, run_id: &str) -> anyhow::Result<serde_json::Value> {
+    async fn read_canonical_run_resource(
+        &self,
+        run_id: &str,
+        _principal: &auth::Principal,
+    ) -> anyhow::Result<serde_json::Value> {
         let run_id_parsed: domain::ids::RunId = run_id
             .parse::<uuid::Uuid>()
             .map_err(|_| anyhow::anyhow!("Invalid run id: {run_id}"))?
@@ -464,6 +489,20 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
         let mut value = serde_json::to_value(run)?;
         if let Some(obj) = value.as_object_mut() {
+            if let Some(projection) =
+                db::repos::artifact_contracts::find_run_state_projection(&self.pool, run_id_parsed)
+                    .await?
+            {
+                obj.insert("active_artifact_index".into(), projection.active_index_json);
+                obj.insert("run_state_projection".into(), projection.run_state_json);
+                obj.insert(
+                    "operator_overrides".into(),
+                    serde_json::to_value(
+                        db::repos::artifact_contracts::list_overrides(&self.pool, run_id_parsed)
+                            .await?,
+                    )?,
+                );
+            }
             if let Some(row) = projections::find_run_projection(&self.pool, run_id).await? {
                 obj.insert("total_stages".into(), serde_json::json!(row.total_stages));
                 obj.insert(
@@ -476,6 +515,14 @@ impl McpServer {
                     serde_json::json!(row.pending_approvals),
                 );
             }
+            obj.insert(
+                "implementation_self_assessment_summary".into(),
+                tools::reports::implementation_self_assessment_summary_json(
+                    &self.pool,
+                    run_id_parsed,
+                )
+                .await?,
+            );
             let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
             let mut stage_values = Vec::new();
             for stage in stage_rows {
@@ -509,7 +556,9 @@ impl McpServer {
         } else if tool_name.starts_with("stages.") {
             tools::stages::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("reports.") {
-            tools::reports::execute(tool_name, params, pool, cmd).await
+            tools::reports::execute(tool_name, params, pool, cmd, principal).await
+        } else if tool_name.starts_with("artifacts.") {
+            tools::artifacts::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
         } else {
@@ -536,7 +585,6 @@ fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
         ResourceTemplateId::ChainworksApprovalsInbox => "chainworks://approvals/inbox",
         ResourceTemplateId::ChainworksRunStages => "chainworks://runs/{run_id}/stages",
         ResourceTemplateId::ChainworksRunArtifacts => "chainworks://runs/{run_id}/artifacts",
-        _ => "unsupported://resource-template",
     }
 }
 
@@ -632,12 +680,6 @@ fn resource_template_value(id: ResourceTemplateId) -> serde_json::Value {
             "description": "Artifact list for a run (artifact_index projection)",
             "mimeType": "application/json"
         }),
-        _ => serde_json::json!({
-            "uri": resource_template_uri(id),
-            "name": "Unsupported resource template",
-            "description": "Unsupported resource template",
-            "mimeType": "application/json"
-        }),
     }
 }
 
@@ -659,14 +701,287 @@ mod resource_tests {
     }
 }
 
+// ── Proposal 029 §9.1 capability-policy tests ────────────────────────────
+//
+// These tests exercise the same `auth::filter_tools` / `auth::filter_resources`
+// / `auth::match_resource_uri` composition that the live MCP handler uses at
+// `tools/list`, `tools/call`, `resources/list`, and `resources/read`. They
+// stay at the unit level (no axum, no subprocess) so the focused gate can
+// run them quickly via `cargo test -p mcp-server <name>`.
+#[cfg(test)]
+mod p029_capability_tests {
+    use super::*;
+    use auth::{Principal, PrincipalClass};
+    use std::collections::BTreeSet;
+
+    /// Mirror of `McpServer::visible_tool_specs` without needing a server
+    /// instance: filter → map to `McpTool` names.
+    fn tools_list_names_for(principal: &Principal) -> BTreeSet<String> {
+        let ids = tools::all_capability_tool_ids();
+        auth::filter_tools(principal, &ids)
+            .into_iter()
+            .map(|id| tools::mcp_tool_for(id).name)
+            .collect()
+    }
+
+    fn resource_list_uris_for(principal: &Principal) -> BTreeSet<String> {
+        auth::filter_resources(principal, &auth::all_resource_templates())
+            .into_iter()
+            .map(|id| resource_template_uri(id).to_string())
+            .collect()
+    }
+
+    /// Mirror of the `tools/call` capability check in `server.rs`:
+    /// returns `true` iff the call would be allowed, `false` iff it would
+    /// return `-32601 Method not found`.
+    fn tools_call_allowed(principal: &Principal, tool_name: &str) -> bool {
+        let Some(id) = tools::capability_id_for(tool_name) else {
+            return false;
+        };
+        principal.tool_capabilities.contains(&id)
+    }
+
+    fn resources_read_allowed(principal: &Principal, uri: &str) -> bool {
+        auth::match_resource_uri(principal, uri, resource_template_id_for_uri).is_some()
+    }
+
+    // ── tools/list filtering ─────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_tools_list_filtered_for_operator() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let names = tools_list_names_for(&op);
+        // Operators see every registered tool (command + read + steward trio).
+        for expected in [
+            "ideas.create",
+            "ideas.list",
+            "runs.start",
+            "runs.list",
+            "runs.get",
+            "runs.cancel",
+            "approvals.list",
+            "approvals.resolve",
+            "stages.retry",
+            "reports.get",
+            "steward.run_analysis",
+            "steward.list_analyses",
+            "steward.get_analysis",
+        ] {
+            assert!(
+                names.contains(expected),
+                "operator tools/list must expose {expected}, got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_tools_list_filtered_for_agent() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let names = tools_list_names_for(&ag);
+        // Agents can create ideas and start runs but cannot approve, cancel,
+        // retry, or enter the steward surface.
+        for expected in [
+            "ideas.create",
+            "ideas.list",
+            "runs.start",
+            "runs.list",
+            "runs.get",
+            "reports.get",
+        ] {
+            assert!(names.contains(expected), "agent missing {expected}");
+        }
+        for forbidden in [
+            "approvals.list",
+            "approvals.resolve",
+            "stages.retry",
+            "runs.cancel",
+            "steward.run_analysis",
+            "steward.list_analyses",
+            "steward.get_analysis",
+        ] {
+            assert!(!names.contains(forbidden), "agent must not see {forbidden}");
+        }
+    }
+
+    #[test]
+    fn test_mcp_tools_list_filtered_for_observer() {
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        let names = tools_list_names_for(&ob);
+        // Observer is read-only: sees list/get surfaces + approvals.list +
+        // steward readers. Must not see any command tool.
+        for expected in [
+            "ideas.list",
+            "runs.list",
+            "runs.get",
+            "approvals.list",
+            "reports.get",
+            "steward.list_analyses",
+            "steward.get_analysis",
+        ] {
+            assert!(names.contains(expected), "observer missing {expected}");
+        }
+        for forbidden in [
+            "ideas.create",
+            "runs.start",
+            "runs.cancel",
+            "approvals.resolve",
+            "stages.retry",
+            "steward.run_analysis",
+        ] {
+            assert!(
+                !names.contains(forbidden),
+                "observer must not see {forbidden}"
+            );
+        }
+    }
+
+    // ── tools/call denial ────────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_tools_call_denied_returns_method_not_found() {
+        // An observer invoking a command tool must fail the capability check
+        // that `server.rs` turns into -32601 Method not found.
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(!tools_call_allowed(&ob, "runs.start"));
+        assert!(!tools_call_allowed(&ob, "approvals.resolve"));
+        assert!(!tools_call_allowed(&ob, "runs.cancel"));
+
+        // Unknown tool name also denied (capability_id_for returns None).
+        let op = Principal::new("op", PrincipalClass::Operator);
+        assert!(!tools_call_allowed(&op, "does.not.exist"));
+    }
+
+    // ── resources/list filtering ─────────────────────────────────────
+
+    #[test]
+    fn test_mcp_resources_list_is_capability_filtered() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let uris = resource_list_uris_for(&ag);
+        // Agent must NOT see steward-analysis template or approvals inbox /
+        // chainworks run stages / chainworks run artifacts (operator+observer-only).
+        for forbidden in [
+            "steward-analysis://{analysis_id}",
+            "chainworks://approvals/inbox",
+            "chainworks://runs/{run_id}/stages",
+            "chainworks://runs/{run_id}/artifacts",
+        ] {
+            assert!(!uris.contains(forbidden), "agent must not see {forbidden}");
+        }
+
+        // Observer sees the approvals inbox and the steward template.
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        let ob_uris = resource_list_uris_for(&ob);
+        assert!(ob_uris.contains("steward-analysis://{analysis_id}"));
+        assert!(ob_uris.contains("chainworks://approvals/inbox"));
+    }
+
+    // ── resources/read denial ────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_resources_read_denied_returns_not_found() {
+        // Agent reading a steward-analysis URI: denial path produces
+        // -32002 Resource not found in server.rs.
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        assert!(!resources_read_allowed(&ag, "steward-analysis://abc-123"));
+
+        // Same agent CAN read run://, idea://, artifact://, report:// (allowed
+        // for all classes).
+        assert!(resources_read_allowed(&ag, "run://r-1"));
+        assert!(resources_read_allowed(&ag, "idea://i-1"));
+
+        // Unknown URI scheme also denied.
+        assert!(!resources_read_allowed(&ag, "bogus://1"));
+
+        // Operator can read steward-analysis.
+        let op = Principal::new("op", PrincipalClass::Operator);
+        assert!(resources_read_allowed(&op, "steward-analysis://abc-123"));
+    }
+
+    // ── Steward-specific capability tests ────────────────────────────
+
+    #[test]
+    fn test_mcp_tools_list_includes_steward_trio_for_operator() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let names = tools_list_names_for(&op);
+        assert!(names.contains("steward.run_analysis"));
+        assert!(names.contains("steward.list_analyses"));
+        assert!(names.contains("steward.get_analysis"));
+    }
+
+    #[test]
+    fn test_mcp_tools_list_includes_steward_readers_for_observer() {
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        let names = tools_list_names_for(&ob);
+        assert!(
+            !names.contains("steward.run_analysis"),
+            "observer must NOT see steward.run_analysis"
+        );
+        assert!(names.contains("steward.list_analyses"));
+        assert!(names.contains("steward.get_analysis"));
+    }
+
+    #[test]
+    fn test_mcp_tools_list_excludes_steward_entirely_for_agent() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let names = tools_list_names_for(&ag);
+        assert!(!names.contains("steward.run_analysis"));
+        assert!(!names.contains("steward.list_analyses"));
+        assert!(!names.contains("steward.get_analysis"));
+    }
+
+    #[test]
+    fn test_mcp_tools_call_steward_run_analysis_denied_for_observer_returns_method_not_found() {
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(!tools_call_allowed(&ob, "steward.run_analysis"));
+        // But the read-only steward tools ARE allowed.
+        assert!(tools_call_allowed(&ob, "steward.list_analyses"));
+        assert!(tools_call_allowed(&ob, "steward.get_analysis"));
+    }
+
+    #[test]
+    fn test_mcp_tools_call_steward_run_analysis_denied_for_agent_returns_method_not_found() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        assert!(!tools_call_allowed(&ag, "steward.run_analysis"));
+        assert!(!tools_call_allowed(&ag, "steward.list_analyses"));
+        assert!(!tools_call_allowed(&ag, "steward.get_analysis"));
+    }
+
+    #[test]
+    fn test_mcp_resources_list_includes_steward_analysis_template_for_operator_and_observer() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(resource_list_uris_for(&op).contains("steward-analysis://{analysis_id}"));
+        assert!(resource_list_uris_for(&ob).contains("steward-analysis://{analysis_id}"));
+    }
+
+    #[test]
+    fn test_mcp_resources_list_excludes_steward_analysis_template_for_agent() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        assert!(!resource_list_uris_for(&ag).contains("steward-analysis://{analysis_id}"));
+    }
+
+    #[test]
+    fn test_mcp_resources_read_steward_analysis_denied_for_agent_returns_not_found() {
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        // Agent can never open a steward-analysis:// URI — matches the -32002
+        // path in server.rs.
+        assert!(!resources_read_allowed(&ag, "steward-analysis://xyz-789"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifacts, ideas, projections, runs, steward, validation};
+    use db::repos::{artifact_contracts, artifacts, ideas, projections, runs, steward, validation};
     use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
     use domain::run::{Run, RunStatus};
@@ -680,6 +995,18 @@ mod tests {
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const P041_FIXTURES: &[&str] = &[
+        "proposal-loop-basic",
+        "implementation-refine-review",
+        "approval-pause-resume",
+        "retry-recovery-flow",
+        "cancelled-or-blocked-run",
+        "terminal-report-evidence",
+        "projection-readback-surface",
+    ];
 
     fn make_idea(id: IdeaId) -> Idea {
         Idea {
@@ -730,7 +1057,67 @@ mod tests {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         }
+    }
+
+    async fn persist_blocked_implementation_summary(
+        pool: &sqlx::SqlitePool,
+        run_id: domain::ids::RunId,
+    ) {
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_8_implementation_continued".into(),
+            agent_id: "code_writer".into(),
+            name: "implementation_self_assessment".into(),
+            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/implementation/self-assessment.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(pool, &artifact).await.unwrap();
+        let raw = serde_json::json!({
+            "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+            "implementation_complete": true,
+            "verification_green": false,
+            "remaining_code_tasks": [],
+            "handoff_tasks": [],
+            "known_risks": ["verification blocked"],
+            "tests_run": ["proposal-054: blocked"],
+            "docs_impacted": []
+        });
+        let summary = parse_implementation_self_assessment_v2(
+            &raw,
+            ContractParseContext {
+                run_id: run_id.to_string(),
+                run_age: None,
+                declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+                canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+                raw_artifact_path: Some(artifact.file_path.clone()),
+                source_generation_id: None,
+                artifact_created_at: Some(artifact.created_at),
+                v2_generation_seen_for_run: true,
+                legacy_v1_generation_available: false,
+            },
+        );
+        artifact_contracts::persist_implementation_self_assessment_summary(
+            pool,
+            run_id,
+            artifact.id,
+            &artifact.contract_id,
+            &summary,
+            artifact.created_at,
+        )
+        .await
+        .unwrap();
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -908,6 +1295,7 @@ mod tests {
         runs::insert(&pool, &make_run(run_id, idea_id))
             .await
             .unwrap();
+        persist_blocked_implementation_summary(&pool, run_id).await;
 
         let server = McpServer::new(
             pool.clone(),
@@ -932,6 +1320,11 @@ mod tests {
                 .unwrap()
                 .contains("repo_root_exists"),
             "run:// resource must expose persisted delivery preflight truth"
+        );
+        assert_eq!(
+            run["implementation_self_assessment_summary"]["status"],
+            serde_json::json!("blocked"),
+            "run:// resource must expose implementation self-assessment summary"
         );
     }
 
@@ -1130,6 +1523,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_041_report_resource_readback_parity_surface() {
+        for fixture_id in P041_FIXTURES {
+            // Same cross-binary ordering dependency as the graphql-server
+            // P041 readback test: under `cargo test --workspace` the
+            // engine integration binary and this mcp-server lib binary
+            // run in parallel. If the engine test hasn't produced the
+            // report/DB yet (or the operator cleaned `target/parity/`),
+            // skip this fixture. The dedicated
+            // `./scripts/test-gate.sh proposal-041` lane orders both
+            // correctly and is the authoritative readiness signal.
+            let report_path = p041_report_path(fixture_id);
+            let replay_path = p041_replay_path(fixture_id);
+            if !report_path.is_file() || !replay_path.is_file() {
+                eprintln!(
+                    "P041 MCP readback: skipping fixture '{fixture_id}' — engine-side \
+                     replay has not produced {} yet.",
+                    report_path.display()
+                );
+                return;
+            }
+            let mut report = p041_report(fixture_id);
+            let replay = p041_replay(fixture_id);
+            let run_id = replay["run_id"].as_str().expect("run_id");
+            let db_path =
+                workspace_root().join(report["database_ref"].as_str().expect("database_ref"));
+            if !db_path.is_file() {
+                eprintln!(
+                    "P041 MCP readback: skipping fixture '{fixture_id}' — engine-side \
+                     replay DB {} is missing (likely cleaned between runs).",
+                    db_path.display()
+                );
+                return;
+            }
+            let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+                .await
+                .expect("open P041 fixture DB");
+            let handler = make_command_handler(pool.clone());
+            let tool_value = crate::tools::reports::execute(
+                "reports.get",
+                serde_json::json!({ "run_id": run_id }),
+                &pool,
+                &handler,
+                &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+            )
+            .await
+            .unwrap();
+            let server =
+                McpServer::new(pool.clone(), handler, auth::PrincipalTable::test_fixture());
+            let resource_value = server
+                .read_resource(&format!("report://{}", run_id))
+                .await
+                .unwrap();
+            let actual = normalize_p041_mcp_actual(tool_value, resource_value);
+            update_p041_surface(
+                &mut report,
+                "mcp_report_readback",
+                actual,
+                "mcp-server::tools::reports::execute + mcp-server::server::McpServer::read_resource",
+            );
+            write_p041_report(fixture_id, &report);
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("mcp crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn control_plane_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("mcp crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn p041_report_path(fixture_id: &str) -> PathBuf {
+        control_plane_root()
+            .join("target/parity/reports")
+            .join(fixture_id)
+            .join("behavioral-diff-report.json")
+    }
+
+    fn p041_replay_path(fixture_id: &str) -> PathBuf {
+        control_plane_root()
+            .join("target/parity")
+            .join(fixture_id)
+            .join("server-replay.json")
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("read JSON")).expect("parse JSON")
+    }
+
+    fn p041_report(fixture_id: &str) -> serde_json::Value {
+        read_json(&p041_report_path(fixture_id))
+    }
+
+    fn p041_replay(fixture_id: &str) -> serde_json::Value {
+        read_json(&p041_replay_path(fixture_id))
+    }
+
+    fn write_p041_report(fixture_id: &str, report: &serde_json::Value) {
+        fs::write(
+            p041_report_path(fixture_id),
+            serde_json::to_string_pretty(report).expect("serialize P041 report"),
+        )
+        .expect("write P041 report");
+    }
+
+    fn normalize_p041_mcp_actual(
+        tool_value: serde_json::Value,
+        resource_value: serde_json::Value,
+    ) -> serde_json::Value {
+        let tool_reports = tool_value
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|report| report["report_kind"] != serde_json::json!("mcp_execution_truth"))
+            .map(|report| {
+                serde_json::json!({
+                    "kind": report["report_kind"],
+                    "version": report["report_version"].as_i64().unwrap_or(1),
+                    "fixture_id": resource_value["run"]["workflow_id"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value);
+        let resource_report_artifacts =
+            report_artifact_names_from_reports(&resource_value["artifacts"]);
+        serde_json::json!({
+            "collector_owner": "mcp-server::tools::reports::execute + mcp-server::server::McpServer::read_resource",
+            "tool": {
+                "name": "reports.get",
+                "reports": tool_reports,
+                "report_artifacts": tool_report_artifacts,
+            },
+            "resource": {
+                "uri": "report://$run_id",
+                "reports": resource_value["artifacts"].as_array().cloned().unwrap_or_default().into_iter()
+                    .filter(|artifact| !artifact["report_kind"].is_null())
+                    .map(|artifact| serde_json::json!({
+                        "kind": artifact["report_kind"],
+                        "version": artifact["report_version"].as_i64().unwrap_or(1),
+                        "fixture_id": resource_value["run"]["workflow_id"],
+                    }))
+                    .collect::<Vec<_>>(),
+                "report_artifacts": resource_report_artifacts,
+            },
+        })
+    }
+
+    fn report_artifact_names_from_reports(value: &serde_json::Value) -> Vec<String> {
+        let mut names = value
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|artifact| {
+                !artifact["report_kind"].is_null()
+                    && artifact["report_kind"] != serde_json::json!("mcp_execution_truth")
+            })
+            .filter_map(|artifact| artifact["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn update_p041_surface(
+        report: &mut serde_json::Value,
+        surface: &str,
+        actual: serde_json::Value,
+        collector_owner: &str,
+    ) {
+        let comparisons = report["surface_comparisons"]
+            .as_array_mut()
+            .expect("surface_comparisons");
+        let comparison = comparisons
+            .iter_mut()
+            .find(|item| item["surface"] == serde_json::json!(surface))
+            .expect("surface comparison");
+        let expected = comparison["expected"].clone();
+        let matched = expected == actual;
+        comparison["actual"] = actual.clone();
+        comparison["collector_owner"] = serde_json::json!(collector_owner);
+        comparison["status"] = serde_json::json!(if matched { "matched" } else { "diverged" });
+
+        let divergences = report["divergences"].as_array_mut().expect("divergences");
+        divergences.retain(|item| item["owner_surface"] != serde_json::json!(surface));
+        if !matched {
+            divergences.push(serde_json::json!({
+                "path": format!("$.{surface}"),
+                "expected": expected,
+                "actual": actual,
+                "severity": "blocking",
+                "owner_surface": surface,
+                "investigation_hint": "P041 fixture-bound MCP readback diverged from expected client truth."
+            }));
+        }
+        let blocking_count = divergences
+            .iter()
+            .filter(|item| item["severity"] == "blocking")
+            .count();
+        report["summary"]["blocking_count"] = serde_json::json!(blocking_count);
+        report["verdict"] = serde_json::json!(if blocking_count == 0 { "ready" } else { "red" });
+    }
+
+    #[tokio::test]
     async fn steward_mcp_resource_returns_same_persisted_truth_as_tool_readback() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -1221,5 +1827,276 @@ mod tests {
             value["recommendations"][0]["target_metric"],
             "lead_time_median_seconds"
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Proposal 029 §4.4 / §9.1 — `journal_id` surfacing contract
+    // ───────────────────────────────────────────────────────────────────
+    //
+    // MCP command tools (runs.start, runs.cancel, approvals.resolve,
+    // stages.retry, steward.run_analysis) include `journal_id` inside
+    // `content[0].text`'s stringified JSON. Direct (non-CommandHandler)
+    // tools (runs.list, runs.get, ideas.list, reports.get,
+    // steward.list_analyses, steward.get_analysis) MUST NOT include
+    // `journal_id` — they never produce a journal row.
+    //
+    // The MCP wire format at `tools/call` is:
+    //   response.result = { "content": [{ "type":"text", "text": <stringified JSON> }] }
+    // These tests parse `text`, then assert the inner payload has/omits
+    // `journal_id`.
+
+    use crate::protocol::JsonRpcRequest;
+
+    /// Drive a `tools/call` request through `handle_request` and return the
+    /// parsed inner payload from `result.content[0].text`.
+    async fn call_tool_and_parse(
+        server: &McpServer,
+        principal: &auth::Principal,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": tool_name,
+                "arguments": arguments,
+            })),
+        };
+        let resp = server.handle_request(req, principal).await;
+        let result = resp
+            .result
+            .expect("tools/call response must have result when the call succeeded");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("result.content[0].text is a string")
+            .to_string();
+        serde_json::from_str(&text).expect("content[0].text parses as JSON")
+    }
+
+    fn operator_principal() -> auth::Principal {
+        auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tools_call_response_includes_journal_id_in_content_text() {
+        // runs.cancel is a command tool — its payload must carry journal_id
+        // inside the MCP content[0].text wire format.
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "runs.cancel",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+        )
+        .await;
+
+        let journal_id = payload["journal_id"]
+            .as_str()
+            .expect("runs.cancel response must contain journal_id as a string");
+        assert!(
+            !journal_id.is_empty(),
+            "journal_id must be non-empty (uuid from CommandHandler::handle)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_read_only_tool_response_omits_journal_id() {
+        // runs.list never invokes CommandHandler — no journal row is written,
+        // so no journal_id should appear in the response payload.
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "runs.list",
+            serde_json::json!({}),
+        )
+        .await;
+
+        let top_level_has_journal_id = payload
+            .as_object()
+            .map(|m| m.contains_key("journal_id"))
+            .unwrap_or(false);
+        assert!(
+            !top_level_has_journal_id,
+            "read-only tool runs.list must not emit journal_id at top level, got {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_steward_list_analyses_response_omits_journal_id() {
+        // steward.list_analyses is a direct reader, not a command tool.
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "steward.list_analyses",
+            serde_json::json!({}),
+        )
+        .await;
+        let has_journal_id = payload
+            .as_object()
+            .map(|m| m.contains_key("journal_id"))
+            .unwrap_or_else(|| {
+                // `steward.list_analyses` returns an array — whose members
+                // should not contain journal_id either.
+                if let Some(arr) = payload.as_array() {
+                    arr.iter().any(|v| {
+                        v.as_object()
+                            .map(|m| m.contains_key("journal_id"))
+                            .unwrap_or(false)
+                    })
+                } else {
+                    false
+                }
+            });
+        assert!(
+            !has_journal_id,
+            "steward.list_analyses (read-only) must not surface journal_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_steward_get_analysis_response_omits_journal_id() {
+        // Seed one analysis so steward.get_analysis can return it.
+        let pool = test_pool().await;
+        let now = Utc::now();
+        steward::insert_analysis(
+            &pool,
+            &StewardAnalysis {
+                id: "analysis-omit".into(),
+                created_at: now,
+                window_start: now,
+                window_end: now,
+                run_count: 1,
+                cohort_keys_json: serde_json::json!({
+                    "workflow_family": "mvp",
+                    "risk_class": "standard"
+                })
+                .to_string(),
+                cohort_quality: CohortQuality::Acceptable,
+                status: StewardAnalysisStatus::Completed,
+                degradation_count: 0,
+                improvement_count: 0,
+                workflow_snapshot_artifact_hash: "w".into(),
+                agent_catalog_snapshot_hash: "c".into(),
+                steward_config_snapshot_hash: "s".into(),
+                metrics_snapshot_artifact_id: None,
+                baseline_snapshot_artifact_id: None,
+                agent_catalog_snapshot_artifact_id: None,
+                workflow_snapshot_artifact_id: None,
+                config_change_log_artifact_id: None,
+                health_report_artifact_id: None,
+                degradation_alert_artifact_id: None,
+                agent_tuning_artifact_id: None,
+                workflow_tuning_artifact_id: None,
+                experiment_plan_artifact_id: None,
+                audit_report_artifact_id: None,
+                trigger_reason: "manual".into(),
+                error_summary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "steward.get_analysis",
+            serde_json::json!({ "analysis_id": "analysis-omit" }),
+        )
+        .await;
+
+        let has_journal_id = payload
+            .as_object()
+            .map(|m| m.contains_key("journal_id"))
+            .unwrap_or(false);
+        assert!(
+            !has_journal_id,
+            "steward.get_analysis (read-only) must not surface journal_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_steward_run_analysis_response_includes_journal_id() {
+        // steward.run_analysis is a command tool — every successful call
+        // must include journal_id in the response payload. The command
+        // will likely succeed with zero runs / no artifacts in this
+        // minimal fixture, but even on failure the MCP layer inserts
+        // journal_id alongside the error surface per tool implementation.
+        //
+        // To keep the test hermetic and fast we only assert: if the tool
+        // call succeeds (returns Some(result)), the parsed payload contains
+        // a journal_id key. Failure handling is tested elsewhere.
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "steward.run_analysis",
+                "arguments": { "reason": "manual" },
+            })),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        if let Some(result) = resp.result {
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("content[0].text");
+            let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert!(
+                parsed.get("journal_id").is_some(),
+                "steward.run_analysis success payload must include journal_id, got {parsed}"
+            );
+        } else {
+            // Command failed (likely missing steward runtime setup). In that
+            // case the journal row WAS still written — verify via DB lookup.
+            let row: (String,) = sqlx::query_as(
+                "SELECT id FROM command_journal WHERE command_type = 'RunStewardAnalysis' ORDER BY created_at DESC LIMIT 1"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect(
+                "steward.run_analysis must insert a command_journal row even when execution fails",
+            );
+            assert!(
+                !row.0.is_empty(),
+                "journal_id must be set on the audit row for the failed run"
+            );
+        }
     }
 }

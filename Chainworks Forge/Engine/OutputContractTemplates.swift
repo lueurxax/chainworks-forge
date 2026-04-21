@@ -26,7 +26,7 @@ struct OutputContractTemplates {
             return (proposalFeedbackCoverage(), .json)
         case "proposal_fact_digest_v1":
             return (proposalFactDigest(), .json)
-        case "implementation_self_assessment_v1":
+        case "implementation_self_assessment_v1", "implementation_self_assessment_v2":
             return (implementationSelfAssessment(), .json)
         case "implementation_progress":
             return (implementationProgress(), .json)
@@ -252,10 +252,20 @@ struct OutputContractTemplates {
 
     private static func implementationSelfAssessment() -> Data {
         let json: [String: Any] = [
-            "seemingly_complete": true,
-            "remaining_tasks": [] as [String],
+            "implementation_complete": true,
+            "verification_green": true,
+            "remaining_code_tasks": [] as [[String: Any]],
+            "handoff_tasks": [
+                [
+                    "summary": "Documentation review remains for downstream handoff.",
+                    "owner_class": "docs",
+                    "target_stage": "state_9_implementation_reviewed",
+                    "blocking_review": false,
+                    "evidence": "Template output records README.md as impacted."
+                ]
+            ],
             "known_risks": ["No external API integration tested"],
-            "tests_run": true,
+            "tests_run": ["template verification: green"],
             "docs_impacted": ["README.md"]
         ]
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
@@ -282,7 +292,7 @@ struct OutputContractTemplates {
 
     private static func testsResult() -> Data {
         let json: [String: Any] = [
-            "green": true,
+            "status": "green",
             "summary": "Targeted verification passed for this implementation slice.",
             "commands": ["swift test"],
             "blocking_failures": [] as [String]

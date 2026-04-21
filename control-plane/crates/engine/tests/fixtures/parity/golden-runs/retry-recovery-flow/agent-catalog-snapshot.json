@@ -1,0 +1,13 @@
+{
+  "schema_version": "agent-catalog-snapshot.v1",
+  "agents": [
+    {
+      "id": "fixture_agent",
+      "provider": "claude"
+    }
+  ],
+  "artifact_templates": {
+    "recovery_snapshot": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/recovery_snapshot.json",
+    "retry_result": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/retry_result.json"
+  }
+}

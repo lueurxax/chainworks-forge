@@ -1,0 +1,20 @@
+{
+  "name": "chainworks-forge-local",
+  "interface": {
+    "displayName": "Chainworks Forge Local"
+  },
+  "plugins": [
+    {
+      "name": "proposal-lifecycle-review",
+      "source": {
+        "source": "local",
+        "path": "./plugins/proposal-lifecycle-review"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

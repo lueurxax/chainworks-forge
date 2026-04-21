@@ -12,7 +12,7 @@ const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, w
              target_branch, delivery_configuration_json, delivery_preflight_json,
              workflow_family, project_key, risk_class, stack, workflow_snapshot_hash,
              catalog_snapshot_hash, workflow_snapshot_json, catalog_snapshot_json,
-             drift_detected_at, drift_details_json"#;
+             drift_detected_at, drift_details_json, chainworks_meta_root"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     let id = run.id.to_string();
@@ -31,9 +31,10 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
                           worktree_root, base_branch, base_revision, target_branch,
                           delivery_configuration_json, delivery_preflight_json, workflow_family, project_key,
                           risk_class, stack, workflow_snapshot_hash, catalog_snapshot_hash,
-                          workflow_snapshot_json, catalog_snapshot_json, drift_detected_at, drift_details_json)
+                          workflow_snapshot_json, catalog_snapshot_json, drift_detected_at, drift_details_json,
+                          chainworks_meta_root)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
         "#,
     )
     .bind(id)
@@ -67,6 +68,7 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     .bind(&run.catalog_snapshot_json)
     .bind(run.drift_detected_at.map(|t| t.to_rfc3339()))
     .bind(&run.drift_details_json)
+    .bind(&run.chainworks_meta_root)
     .execute(pool)
     .await
     .context("insert run")?;
@@ -333,6 +335,7 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
         catalog_snapshot_json: r.get("catalog_snapshot_json"),
         drift_detected_at: drift_detected_at_dt,
         drift_details_json: r.get("drift_details_json"),
+        chainworks_meta_root: r.get("chainworks_meta_root"),
     })
 }
 

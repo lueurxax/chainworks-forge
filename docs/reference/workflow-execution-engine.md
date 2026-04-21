@@ -104,8 +104,9 @@ executor, then persists outputs through `ArtifactManager`.
 
 **Approval flow**: When a state has `approval: required`, the orchestrator pauses,
 creates an `Approval` record, and publishes an `ApprovalRequest`. On resolution:
-granted resumes execution (including any `runAfterApproval` block); rejected cancels
-the run.
+granted resumes execution (including any `runAfterApproval` block); rejected typically
+cancels the run, but some workflows define explicit loopback transitions for
+`approval.rejected == true` (e.g., looping back to proposal refinement).
 
 **Cancellation**: Sets `isCancelled`, updates run status, stops the loop.
 
@@ -175,7 +176,6 @@ Nonisolated, `Sendable` disk I/O layer.
 - Path layout: `{artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}`
 - Path traversal guard: rejects any resolved path outside `workspaceRoot`.
 - Atomic writes with SHA-256 checksums.
-
 ### Transition Evaluator (`TransitionEvaluator.swift`)
 
 Stateless evaluator for transition `when` clauses (ARCH-031). Supports only
@@ -186,15 +186,36 @@ canonical patterns:
 | Always | `when: 'true'` |
 | Artifact exists | `when: exists('proposal_review_summary')` |
 | Approval granted | `when: approval.granted == true` |
+| Approval rejected | `when: approval.rejected == true` |
 | Comparison | `when: review.score >= vars.min_score` |
 | Connectives | `expr and expr`, `expr or expr` |
 
 Value resolution supports `vars.*` (runtime variables), `artifact.field` (artifact
 metadata), and literals (int, double, bool, quoted string). Comparison operators:
-`==`, `>`, `>=`. Unrecognized expressions fail closed (return false).
+`==`, `>`, `>=`, `!=`. Unrecognized expressions fail closed (return false).
 
-### Resume Manager (`ResumeManager.swift`)
+#### Status-based implementation handoff transitions
 
+The implementation completeness and handoff contract uses status-based
+transitions for the implementation loop. The `code_writer` exits the implementation
+loop when the self-assessment status is `complete`, `handoff_required`, or `blocked`.
+
+Example predicates used in `full-mvp-live.yaml`:
+
+- `when: implementation_self_assessment_v2.status == 'needs_code_fixes'`
+- `when: implementation_self_assessment_v2.status == 'complete' or implementation_self_assessment_v2.status == 'handoff_required' or implementation_self_assessment_v2.status == 'blocked'`
+
+**Special Mapping:**
+To support the v2 contract while maintaining compatibility with existing YAML
+definitions, the `TransitionEvaluator` includes a special mapping where
+`implementation_self_assessment_v2.field` automatically resolves to the
+`implementation_self_assessment` artifact's fields. This allows the workflow to
+use the structured v2 status even if the output name in the YAML remains the
+legacy `implementation_self_assessment`.
+
+---
+
+## Resume Manager (`ResumeManager.swift`)
 Classifies interrupted runs at app launch (ARCH-029). Three outcomes per run:
 
 - **`.resume`** -- plan rebuilt successfully, no drift, no mid-side-effect

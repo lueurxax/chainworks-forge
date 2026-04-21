@@ -77,6 +77,11 @@ pub struct ExecutionRequest {
     /// into provider-local runtime ids before ACP startup.
     #[serde(default)]
     pub mcp_servers: Vec<AcpMcpServerPayload>,
+    /// P050: Per-run meta root for workspace isolation.
+    /// Set as `CHAINWORKS_META_ROOT` env var on ACP subprocess so
+    /// YAML artifact path templates resolve to the per-run directory.
+    #[serde(default)]
+    pub chainworks_meta_root: Option<String>,
 }
 
 impl ExecutionRequest {
@@ -124,6 +129,10 @@ pub struct ExecutionResult {
     pub artifact_paths: Vec<String>,
     #[serde(default)]
     pub discovered_artifacts: Vec<DiscoveredArtifact>,
+    /// Sanitized text streamed by the ACP provider during this prompt turn.
+    /// This is persisted by the engine as recovery evidence when present.
+    #[serde(default)]
+    pub transcript_text: Option<String>,
     pub cost_cents: Option<i64>,
     #[serde(default)]
     pub usage: Option<UsageSnapshot>,
@@ -148,6 +157,19 @@ pub struct ExecutionResult {
     pub actual_mcp_runtime_ids: Vec<String>,
     #[serde(default)]
     pub mcp_session_startup_latency_ms: Option<i64>,
+    /// Nonblocking diagnostics observed while closing a one-shot ACP session
+    /// after the provider already returned a prompt result.
+    #[serde(default)]
+    pub close_diagnostic: Option<AcpCloseDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpCloseDiagnostic {
+    #[serde(default)]
+    pub transport_error_code: Option<String>,
+    #[serde(default)]
+    pub provider_exit_status: Option<i64>,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

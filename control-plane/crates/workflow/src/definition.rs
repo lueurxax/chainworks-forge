@@ -56,6 +56,9 @@ pub struct WorkflowState {
     pub loop_config: Option<LoopConfig>,
     /// Transition rules evaluated after the state completes.
     pub transitions: Option<Vec<Transition>>,
+    /// P057: policy for whether valid contract outputs from failed executions
+    /// can satisfy transition truth. Missing means default deny.
+    pub degraded_output_policy: Option<DegradedOutputPolicyDef>,
 }
 
 impl WorkflowState {
@@ -100,6 +103,14 @@ pub struct Transition {
     pub to: String,
     /// Condition expression: `"true"`, `exists('artifact')`, `field == value`, etc.
     pub when: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DegradedOutputPolicyDef {
+    pub mode: String,
+    pub contracts: Option<Vec<String>>,
+    pub failure_kinds: Option<Vec<String>>,
+    pub max_settlement: Option<String>,
 }
 
 /// Loop configuration for revision cycles.

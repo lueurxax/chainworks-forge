@@ -153,6 +153,14 @@ struct RunPlanCompilerTests {
             Issue.record("Expected .approvalGranted condition for state_3")
         }
 
+        let state6 = plan.states["state_6_implementation_approval"]!
+        #expect(state6.transitions.contains { transition in
+            if case .approvalRejected = transition.condition {
+                return transition.to == "state_5_proposal_refined"
+            }
+            return false
+        })
+
         // state_5 has: when: 'true' -> always
         let state5 = plan.states["state_5_proposal_refined"]!
         if case .always = state5.transitions.first?.condition {

@@ -1,4 +1,5 @@
 pub mod approvals;
+pub mod artifacts;
 pub mod ideas;
 pub mod reports;
 pub mod runs;
@@ -8,7 +9,7 @@ pub mod steward;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 13] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 14] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -20,6 +21,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 13] {
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
         CapabilityToolId::ReportsGet,
+        CapabilityToolId::ArtifactsOverrideContract,
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
@@ -38,6 +40,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
+        "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
@@ -46,10 +49,34 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
 }
 
 pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
-    all_tool_specs()
-        .into_iter()
-        .find(|tool| capability_id_for(&tool.name) == Some(id))
-        .expect("every CapabilityToolId must have an MCP tool spec")
+    match id {
+        CapabilityToolId::IdeasCreate => tool_spec_by_name(ideas::tool_specs(), "ideas.create"),
+        CapabilityToolId::IdeasList => tool_spec_by_name(ideas::tool_specs(), "ideas.list"),
+        CapabilityToolId::RunsStart => tool_spec_by_name(runs::tool_specs(), "runs.start"),
+        CapabilityToolId::RunsList => tool_spec_by_name(runs::tool_specs(), "runs.list"),
+        CapabilityToolId::RunsGet => tool_spec_by_name(runs::tool_specs(), "runs.get"),
+        CapabilityToolId::RunsCancel => tool_spec_by_name(runs::tool_specs(), "runs.cancel"),
+        CapabilityToolId::ApprovalsList => {
+            tool_spec_by_name(approvals::tool_specs(), "approvals.list")
+        }
+        CapabilityToolId::ApprovalsResolve => {
+            tool_spec_by_name(approvals::tool_specs(), "approvals.resolve")
+        }
+        CapabilityToolId::StagesRetry => tool_spec_by_name(stages::tool_specs(), "stages.retry"),
+        CapabilityToolId::ReportsGet => tool_spec_by_name(reports::tool_specs(), "reports.get"),
+        CapabilityToolId::ArtifactsOverrideContract => {
+            tool_spec_by_name(artifacts::tool_specs(), "artifacts.override_contract")
+        }
+        CapabilityToolId::StewardRunAnalysis => {
+            tool_spec_by_name(steward::tool_specs(), "steward.run_analysis")
+        }
+        CapabilityToolId::StewardListAnalyses => {
+            tool_spec_by_name(steward::tool_specs(), "steward.list_analyses")
+        }
+        CapabilityToolId::StewardGetAnalysis => {
+            tool_spec_by_name(steward::tool_specs(), "steward.get_analysis")
+        }
+    }
 }
 
 pub fn all_tool_specs() -> Vec<McpTool> {
@@ -59,8 +86,16 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(approvals::tool_specs());
     specs.extend(stages::tool_specs());
     specs.extend(reports::tool_specs());
+    specs.extend(artifacts::tool_specs());
     specs.extend(steward::tool_specs());
     specs
+}
+
+fn tool_spec_by_name(specs: Vec<McpTool>, name: &str) -> McpTool {
+    specs
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .expect("explicit CapabilityToolId mapping must reference a registered MCP tool")
 }
 
 #[cfg(test)]

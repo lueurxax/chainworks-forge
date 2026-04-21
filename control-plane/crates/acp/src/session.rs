@@ -76,6 +76,7 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
+            transcript_text: None,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,
             provider_session_id: Some(self.transport.session_id().to_string()),
@@ -85,6 +86,7 @@ impl AcpSession {
             actual_mcp_extensions,
             actual_mcp_runtime_ids,
             mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
+            close_diagnostic: None,
         })
     }
 

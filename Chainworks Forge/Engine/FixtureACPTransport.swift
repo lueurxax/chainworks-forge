@@ -578,17 +578,27 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         case "implementation_self_assessment":
             return """
             {
-              "seemingly_complete": true,
-              "remaining_tasks": [],
+              "implementation_complete": true,
+              "verification_green": true,
+              "remaining_code_tasks": [],
+              "handoff_tasks": [
+                {
+                  "summary": "Fixture docs impact remains for downstream review.",
+                  "owner_class": "docs",
+                  "target_stage": "state_9_implementation_reviewed",
+                  "blocking_review": false,
+                  "evidence": "Fixture implementation changed README.md."
+                }
+              ],
               "known_risks": [],
-              "tests_run": true,
+              "tests_run": ["fixture verification: green"],
               "docs_impacted": ["README.md"]
             }
             """
         case "tests_result":
             return """
             {
-              "green": true,
+              "status": "green",
               "passed": 12,
               "failed": 0,
               "summary": "Fixture repo-backed tests are green."

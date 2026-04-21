@@ -34,6 +34,7 @@ artifacts:
   implementation_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml
   implementation_progress: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/progress.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
+  implementation_self_assessment_v2: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
   changed_files_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/changed-files.json
   tests_result: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/tests.json
   audit_report: ${CHAINWORKS_META_ROOT:-.chainworks}/audit/proposal-vs-implementation.json
@@ -172,6 +173,18 @@ contracts:
     - known_risks
     - tests_run
     - docs_impacted
+  implementation_self_assessment_v2:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+    - implementation_complete
+    - verification_green
+    - remaining_code_tasks
+    - handoff_tasks
+    - known_risks
+    - tests_run
+    - docs_impacted
   implementation_progress:
     format: json
     machine_format: json
@@ -193,7 +206,7 @@ contracts:
     machine_format: json
     validation_mode: strict_structured
     required_fields:
-    - green
+    - status
     - summary
   audit_report_v1:
     format: json
@@ -979,12 +992,15 @@ agents:
   - implementation_self_assessment
   - changed_files_manifest
   - tests_result
-  output_contract: implementation_self_assessment_v1
+  output_contract: implementation_self_assessment_v2
   requires_human_approval: false
   prompt: |-
     Implement the approved proposal incrementally in the dedicated implementation worktree.
     Prefer small, reversible changes that keep the project buildable.
     Keep a running progress artifact, write or update tests with the code, and record a self-assessment after each pass.
+    Write implementation_self_assessment as strict implementation_self_assessment_v2 JSON with implementation_complete, verification_green, remaining_code_tasks, handoff_tasks, known_risks, tests_run, and docs_impacted.
+    Put code-writer-owned source or test blockers only in remaining_code_tasks; put docs, manual evidence, release, ops, product, or human-operator work in handoff_tasks with owner_class, target_stage, blocking_review, and evidence.
+    Do not use seemingly_complete or tests_result.green as transition truth.
     Do not commit, do not push, and do not edit repository docs unless the docs agent is invoked.
     When in doubt, choose the simplest implementation that satisfies the approved proposal and current review findings.
 - id: proposal_writer

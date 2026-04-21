@@ -1,12 +1,34 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 
-use db::repos::{agent_executions, artifacts, validation};
+use db::repos::{
+    agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, sessions,
+    validation,
+};
+use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
+
+fn fresh_provider_process_for_disposition(disposition: Option<&str>) -> Option<bool> {
+    match disposition {
+        Some("reused") => Some(false),
+        Some("fresh")
+        | Some("reused_after_resume")
+        | Some("fresh_after_reset")
+        | Some("fresh_after_invalidation")
+        | Some("fresh_after_budget")
+        | Some("fresh_after_compaction")
+        | Some("fresh_after_transport_error")
+        | Some("fresh_after_timeout")
+        | Some("fresh_session_required")
+        | Some("unverifiable_session_history") => Some(true),
+        Some(_) | None => None,
+    }
+}
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![McpTool {
@@ -27,6 +49,7 @@ pub async fn execute(
     params: serde_json::Value,
     pool: &SqlitePool,
     _cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     match tool_name {
         "reports.get" => {
@@ -59,8 +82,40 @@ pub async fn execute(
                 "is_pinned": false,
                 "report_kind": "mcp_execution_truth",
                 "report_version": 1,
-                "agent_executions": execution_mcp_truth_json(pool, run_id).await?,
+                "agent_executions": execution_mcp_truth_json(
+                    pool,
+                    run_id,
+                    principal.class == auth::PrincipalClass::Operator,
+                )
+                .await?,
+                "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
             }));
+            if let Some(projection) =
+                db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
+            {
+                let overrides = db::repos::artifact_contracts::list_overrides(pool, run_id).await?;
+                reports.push(serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "run_id": run_id.to_string(),
+                    "stage_id": "__run__",
+                    "agent_id": "system",
+                    "name": "canonical_artifact_contracts",
+                    "contract_id": "canonical_artifact_contracts",
+                    "format": "json",
+                    "file_path": projection.exported_active_index_path,
+                    "checksum_sha256": serde_json::Value::Null,
+                    "size_bytes": serde_json::Value::Null,
+                    "provider": "system",
+                    "model": serde_json::Value::Null,
+                    "created_at": projection.updated_at.to_rfc3339(),
+                    "is_pinned": true,
+                    "report_kind": "canonical_artifact_contracts",
+                    "report_version": 1,
+                    "active_index": projection.active_index_json,
+                    "run_state_projection": projection.run_state_json,
+                    "operator_overrides": overrides,
+                }));
+            }
 
             Ok(serde_json::Value::Array(reports))
         }
@@ -72,37 +127,117 @@ pub async fn execute(
 pub(crate) async fn execution_mcp_truth_json(
     pool: &SqlitePool,
     run_id: RunId,
+    include_operator_debug: bool,
 ) -> Result<serde_json::Value> {
     let executions = agent_executions::list_by_run(pool, run_id).await?;
-    Ok(serde_json::Value::Array(
-        executions
-            .into_iter()
-            .map(|execution| {
-                serde_json::json!({
-                    "agent_execution_id": execution.id.to_string(),
-                    "stage_execution_id": execution.stage_execution_id.to_string(),
-                    "agent_id": execution.agent_id,
-                    "provider": execution.provider,
-                    "model": execution.model,
-                    "status": execution.status.to_string(),
-                    "backend_profile_id": execution.backend_profile_id,
-                    "requested_mcp_extensions_json": execution.requested_mcp_extensions_json,
-                    "predicted_mcp_extensions_json": execution.predicted_mcp_extensions_json,
-                    "predicted_mcp_runtime_ids_json": execution.predicted_mcp_runtime_ids_json,
-                    "actual_mcp_extensions_json": execution.actual_mcp_extensions_json,
-                    "actual_mcp_runtime_ids_json": execution.actual_mcp_runtime_ids_json,
-                    "denied_mcp_extensions_json": execution.denied_mcp_extensions_json,
-                    "mcp_blocking_issues_json": execution.mcp_blocking_issues_json,
-                    "actual_mcp_observation_json": execution.actual_mcp_observation_json,
-                    "xcode_runtime_observation": execution
-                        .actual_xcode_runtime_observation_json
-                        .as_deref()
-                        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()),
-                    "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
-                })
-            })
-            .collect(),
-    ))
+    let runtime_facts = agent_execution_runtime_facts::list_by_run(pool, run_id).await?;
+    let runtime_facts_by_execution_id: HashMap<_, _> = runtime_facts
+        .into_iter()
+        .map(|facts| {
+            let execution_id = facts.agent_execution_id.to_string();
+            (execution_id, facts)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut items = Vec::with_capacity(executions.len());
+    for execution in executions.into_iter() {
+        let execution_id = execution.id.to_string();
+        let runtime_facts = match runtime_facts_by_execution_id.get(&execution_id) {
+            Some(facts) => {
+                runtime_facts_json(pool, &execution, facts, include_operator_debug).await?
+            }
+            None => {
+                let facts =
+                    AgentExecutionRuntimeFacts::defaults_for(execution.id, chrono::Utc::now());
+                runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
+            }
+        };
+        items.push(serde_json::json!({
+            "agent_execution_id": execution_id,
+            "stage_execution_id": execution.stage_execution_id.to_string(),
+            "agent_id": execution.agent_id,
+            "provider": execution.provider,
+            "model": execution.model,
+            "status": execution.status.to_string(),
+            "backend_profile_id": execution.backend_profile_id,
+            "requested_mcp_extensions_json": execution.requested_mcp_extensions_json,
+            "predicted_mcp_extensions_json": execution.predicted_mcp_extensions_json,
+            "predicted_mcp_runtime_ids_json": execution.predicted_mcp_runtime_ids_json,
+            "actual_mcp_extensions_json": execution.actual_mcp_extensions_json,
+            "actual_mcp_runtime_ids_json": execution.actual_mcp_runtime_ids_json,
+            "denied_mcp_extensions_json": execution.denied_mcp_extensions_json,
+            "mcp_blocking_issues_json": execution.mcp_blocking_issues_json,
+            "actual_mcp_observation_json": execution.actual_mcp_observation_json,
+            "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
+            "runtime_facts": runtime_facts,
+        }));
+    }
+    Ok(serde_json::Value::Array(items))
+}
+
+async fn runtime_facts_json(
+    pool: &SqlitePool,
+    execution: &AgentExecution,
+    facts: &AgentExecutionRuntimeFacts,
+    include_operator_debug: bool,
+) -> Result<serde_json::Value> {
+    let lineage = match execution.session_lineage_id.as_deref() {
+        Some(lineage_id) => sessions::find_lineage_by_id(pool, lineage_id).await?,
+        None => None,
+    };
+    let generation = match execution.session_generation_id.as_deref() {
+        Some(generation_id) => sessions::find_generation_by_id(pool, generation_id).await?,
+        None => None,
+    };
+    let provider_session_id = generation
+        .as_ref()
+        .and_then(|generation| generation.provider_session_id.clone());
+    let generation_status = generation.as_ref().map(|generation| {
+        sessions::session_generation_status_to_str(&generation.status).to_string()
+    });
+    let active_session_generation_id = lineage
+        .as_ref()
+        .and_then(|lineage| lineage.active_generation_id.clone());
+    let active_generation_matches_execution =
+        match (lineage.as_ref(), execution.session_generation_id.as_deref()) {
+            (Some(lineage), Some(execution_generation_id)) => {
+                Some(lineage.active_generation_id.as_deref() == Some(execution_generation_id))
+            }
+            _ => None,
+        };
+    Ok(serde_json::json!({
+        "agent_execution_id": facts.agent_execution_id.to_string(),
+        "failure_kind": facts.failure_kind.as_ref().map(ToString::to_string),
+        "failure_kind_raw_debug": include_operator_debug.then(|| facts.failure_kind_raw_debug.clone()).flatten(),
+        "failure_kind_version": facts.failure_kind_version,
+        "failure_message_redacted": facts.failure_message_redacted.clone(),
+        "failure_message_redaction_version": facts.failure_message_redaction_version,
+        "retry_after": facts.retry_after.as_ref().map(|dt| dt.to_rfc3339()),
+        "operator_action_hint": facts.operator_action_hint.as_ref().map(ToString::to_string),
+        "provider_exit_status": facts.provider_exit_status,
+        "transport_error_code": facts.transport_error_code.clone(),
+        "supervision_classification": facts.supervision_classification.clone(),
+        "output_settlement": facts.output_settlement.to_string(),
+        "valid_required_outputs": facts.valid_required_outputs,
+        "late_output_count": facts.late_output_count,
+        "ignored_late_output_count": facts.ignored_late_output_count,
+        "session_lineage_id": execution.session_lineage_id.clone(),
+        "session_generation_id": execution.session_generation_id.clone(),
+        "invocation_owner_key": execution.invocation_owner_key.clone(),
+        "session_reuse_scope": execution.session_reuse_scope.clone(),
+        "session_family_id": execution.session_family_id.clone(),
+        "session_reuse_disposition": execution.session_reuse_disposition.clone(),
+        "session_reuse_reason": facts.session_reuse_reason.clone(),
+        "session_reset_reason": execution.session_reset_reason.clone(),
+        "provider_session_id": provider_session_id,
+        "active_session_generation_id": active_session_generation_id,
+        "active_generation_matches_execution": active_generation_matches_execution,
+        "generation_status": generation_status,
+        "fresh_provider_process": fresh_provider_process_for_disposition(execution.session_reuse_disposition.as_deref()),
+        "rehydrated_from_checkpoint_artifact_id": execution.rehydrated_from_checkpoint_artifact_id.clone(),
+        "quota_ledger_id": facts.quota_ledger_id.clone(),
+        "created_at": facts.created_at.to_rfc3339(),
+        "updated_at": facts.updated_at.to_rfc3339(),
+    }))
 }
 
 fn is_release_report_artifact(name: &str) -> bool {
@@ -114,6 +249,30 @@ fn is_release_report_artifact(name: &str) -> bool {
             | "connect_upload_receipt"
             | "delivery_receipt"
     )
+}
+
+pub(crate) async fn implementation_self_assessment_summary_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
+        .await?
+        .map(|stored| {
+            let mut summary = stored.summary;
+            summary.artifact_path = public_artifact_path(&summary.artifact_path);
+            serde_json::to_value(summary)
+        })
+        .transpose()
+        .map(|summary| summary.unwrap_or(serde_json::Value::Null))
+        .map_err(Into::into)
+}
+
+pub(crate) fn public_artifact_path(path: &str) -> String {
+    if path.ends_with("implementation/self-assessment.json") {
+        "implementation/self-assessment.json".to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 pub(crate) async fn artifact_report_json(
@@ -292,16 +451,18 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifacts, ideas, runs, validation};
+    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation};
     use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
     use domain::validation::{
         ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
-    };
-    use domain::xcode_runtime::{
-        XcodeRuntimeObservationUpdate, XcodeShimEvent, XcodeShimWarningEvent,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
@@ -470,7 +631,6 @@ mod tests {
                 actual_mcp_observation_json: Some(
                     r#"{"source":"provider_session_new_response"}"#.into(),
                 ),
-                actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
             },
         )
@@ -483,6 +643,10 @@ mod tests {
         let events = event_bus::new_bus(64);
         let work_queue = WorkQueue::new(pool.clone());
         CommandHandler::new(pool, events, work_queue)
+    }
+
+    fn test_principal() -> auth::Principal {
+        auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
     fn make_run(id: RunId, idea_id: IdeaId) -> domain::run::Run {
@@ -521,6 +685,7 @@ mod tests {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         }
     }
 
@@ -543,6 +708,68 @@ mod tests {
             report_kind: report_kind.map(|s| s.to_string()),
             report_version: None,
         }
+    }
+
+    async fn persist_handoff_required_summary(pool: &sqlx::SqlitePool, run_id: RunId) {
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_8_implementation_continued".into(),
+            agent_id: "code_writer".into(),
+            name: "implementation_self_assessment".into(),
+            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/implementation/self-assessment.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(pool, &artifact).await.unwrap();
+        let raw = serde_json::json!({
+            "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+            "implementation_complete": true,
+            "verification_green": true,
+            "remaining_code_tasks": [],
+            "handoff_tasks": [{
+                "summary": "Capture release note",
+                "owner_class": "release",
+                "target_stage": "state_11_manual_release",
+                "blocking_review": true,
+                "evidence": "release owner must attach the note before go/no-go"
+            }],
+            "known_risks": [],
+            "tests_run": ["proposal-054: green"],
+            "docs_impacted": []
+        });
+        let summary = parse_implementation_self_assessment_v2(
+            &raw,
+            ContractParseContext {
+                run_id: run_id.to_string(),
+                run_age: None,
+                declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+                canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+                raw_artifact_path: Some(artifact.file_path.clone()),
+                source_generation_id: None,
+                artifact_created_at: Some(artifact.created_at),
+                v2_generation_seen_for_run: true,
+                legacy_v1_generation_available: false,
+            },
+        );
+        artifact_contracts::persist_implementation_self_assessment_summary(
+            pool,
+            run_id,
+            artifact.id,
+            &artifact.contract_id,
+            &summary,
+            artifact.created_at,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -572,11 +799,13 @@ mod tests {
             .unwrap();
 
         let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
         let result = execute(
             "reports.get",
             serde_json::json!({ "run_id": run_id.to_string() }),
             &pool,
             &handler,
+            &principal,
         )
         .await
         .unwrap();
@@ -588,6 +817,47 @@ mod tests {
         assert!(names.contains(&"delivery_receipt".to_string()));
         assert!(names.contains(&"execution_report".to_string()));
         assert!(!names.contains(&"other_blob".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reports_get_includes_implementation_self_assessment_summary() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_handoff_required_summary(&pool, run_id).await;
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let summary = &mcp_truth["implementation_self_assessment_summary"];
+
+        assert_eq!(summary["status"], serde_json::json!("handoff_required"));
+        assert_eq!(
+            summary["handoff_tasks"][0]["summary"],
+            serde_json::json!("Capture release note")
+        );
+        assert_eq!(
+            summary["owner_class_counts"]["release"],
+            serde_json::json!(1)
+        );
     }
 
     #[tokio::test]
@@ -632,11 +902,13 @@ mod tests {
         .unwrap();
 
         let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
         let result = execute(
             "reports.get",
             serde_json::json!({ "run_id": run_id.to_string() }),
             &pool,
             &handler,
+            &principal,
         )
         .await
         .unwrap();
@@ -674,30 +946,16 @@ mod tests {
         runs::insert(&pool, &make_run(run_id, idea_id))
             .await
             .unwrap();
-        let (_stage_execution_id, agent_execution_id) =
-            seed_validation_attempt(&pool, run_id).await;
-        db::repos::agent_executions::append_xcode_runtime_observation(
-            &pool,
-            agent_execution_id,
-            XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
-                XcodeShimWarningEvent {
-                    ts: Utc::now(),
-                    policy_reason: "xcode_absolute_path_in_prompt".into(),
-                    source_field: "agent.prompt".into(),
-                    matched_substring: "/usr/bin/xcrun mcpbridge".into(),
-                    excerpt: "run /usr/bin/xcrun mcpbridge".into(),
-                },
-            )),
-        )
-        .await
-        .unwrap();
+        seed_validation_attempt(&pool, run_id).await;
 
         let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
         let result = execute(
             "reports.get",
             serde_json::json!({ "run_id": run_id.to_string() }),
             &pool,
             &handler,
+            &principal,
         )
         .await
         .unwrap();
@@ -721,9 +979,50 @@ mod tests {
             execution["actual_mcp_runtime_ids_json"],
             serde_json::json!(r#"["fs-runtime"]"#)
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_041_reports_get_readback_parity_surface() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        seed_validation_attempt(&pool, run_id).await;
+        artifacts::insert(
+            &pool,
+            &make_artifact(run_id, "p041_operator_report", Some("operator_summary")),
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+        let reports = result.as_array().expect("reports array");
+        assert!(reports.iter().any(|report| {
+            report["name"] == serde_json::json!("p041_operator_report")
+                && report["report_kind"] == serde_json::json!("operator_summary")
+        }));
+
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let execution = &mcp_truth["agent_executions"][0];
         assert_eq!(
-            execution["xcode_runtime_observation"]["xcode_shim_events"][0]["policy_reason"],
-            serde_json::json!("xcode_absolute_path_in_prompt")
+            execution["actual_mcp_runtime_ids_json"],
+            serde_json::json!(r#"["fs-runtime"]"#)
         );
     }
 
@@ -776,11 +1075,13 @@ mod tests {
         .unwrap();
 
         let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
         let result = execute(
             "reports.get",
             serde_json::json!({ "run_id": run_id.to_string() }),
             &pool,
             &handler,
+            &principal,
         )
         .await
         .unwrap();

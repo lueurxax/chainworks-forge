@@ -1,0 +1,130 @@
+version: 2
+skill: proposal-review-router
+
+scenarios:
+  - id: eval-001-apple-ios
+    title: Auto mode routes a SwiftUI iOS proposal selectively
+    mode: auto
+    prompt_shape: "Review a proposal adding a SwiftUI onboarding flow with navigation state and analytics."
+    success_signals:
+      - Proposal and local evidence are read before routing.
+      - Fingerprint includes `ios`, `apple-client`, `ui`, and navigation/state tags with evidence IDs.
+      - `ios_ui_reviewer` is selected.
+      - `apple_arch_reviewer` is selected only when state/navigation ownership is evidenced.
+      - `product_reviewer` is not selected unless metrics or product decision checkpoints are central.
+
+  - id: eval-002-apple-macos
+    title: Auto mode routes a macOS UI proposal without backend reviewers
+    mode: auto
+    prompt_shape: "Review a proposal changing a macOS settings window toolbar/sidebar layout."
+    success_signals:
+      - `macos_ui_reviewer` is selected.
+      - `apple_ux_reviewer` is selected only if trust/accessibility/journey evidence exists.
+      - Rust and Go reviewers are rejected as close alternatives or not considered due to absent stack evidence.
+
+  - id: eval-003-rust-service
+    title: Auto mode routes Rust service retry and queue work
+    mode: auto
+    prompt_shape: "Review a Rust proposal adding a worker retry path with idempotency keys and SQL migration."
+    success_signals:
+      - `rust_arch_reviewer` is selected.
+      - `rust_reliability_reviewer` is selected for retry/idempotency/worker evidence.
+      - `observability_rollout_reviewer` is selected when migration or rollout evidence exists.
+      - Build/run evidence is not required in proposal-readiness.
+
+  - id: eval-004-go-service
+    title: Auto mode routes Go public endpoint auth and migration work
+    mode: auto
+    prompt_shape: "Review a Go microservice proposal adding a public endpoint, auth middleware, protobuf response, and migration."
+    success_signals:
+      - `go_service_arch_reviewer` is selected.
+      - `go_security_reviewer` is selected for auth/public-boundary evidence.
+      - `api_contract_reviewer` is selected for protobuf/API evidence.
+      - `observability_rollout_reviewer` is selected for migration/rollout evidence.
+      - Reviewer count stays at or below 5.
+
+  - id: eval-005-cross-stack-contract
+    title: Cross-stack Apple plus backend contract proposal stays selective
+    mode: auto
+    prompt_shape: "Review a proposal changing an Apple client request and Rust or Go backend response contract."
+    success_signals:
+      - One primary reviewer per evidenced implementation stack is selected.
+      - `api_contract_reviewer` is selected.
+      - Rollout reviewer is selected only if rollout, telemetry, migration, or compatibility rollout is evidenced.
+      - Rejected alternatives are recorded.
+
+  - id: eval-006-rollout-observability
+    title: Rollout and telemetry seams trigger observability review
+    mode: auto
+    prompt_shape: "Review a proposal adding a feature flag, telemetry, staged rollout, and rollback plan."
+    success_signals:
+      - `observability_rollout_reviewer` is selected.
+      - Findings check telemetry can distinguish old and new paths.
+      - Final review includes decision checkpoint when rollout is central.
+
+  - id: eval-007-research-gated
+    title: Research mode waits for local evidence
+    mode: research
+    prompt_shape: "Research current platform guidance for a proposal after reading the local proposal and repo evidence."
+    success_signals:
+      - Research does not start until the evidence pack has proposal/docs/baseline/code-path/fingerprint sections.
+      - Research questions cite local `RES-*` trigger IDs.
+      - Research pack records sources, freshness risk, and applicability.
+
+  - id: eval-008-baseline-fresh
+    title: Fresh baseline is reused
+    mode: proposal-readiness
+    prompt_shape: "Review a proposal whose affected surfaces are covered by `.review-baselines/current-system-baseline.md`."
+    success_signals:
+      - Baseline slice is marked `Reused`.
+      - Router does not request a full baseline rebuild.
+      - Current-code inspection is narrow and only checks proposal-critical seams.
+
+  - id: eval-009-baseline-partial
+    title: Partial baseline triggers affected-slice refresh only
+    mode: proposal-readiness
+    prompt_shape: "Review a proposal where the baseline lacks the affected API/worker slice."
+    success_signals:
+      - Baseline slice is marked `Missing`, `Stale`, or `Partially refreshed` with scope.
+      - Review recommends or writes proposal integration context only for the affected slice.
+      - Review does not escalate into full runtime workflow by default.
+
+  - id: eval-010-product-opt-in
+    title: Product overlay remains opt-in
+    mode: auto
+    prompt_shape: "Review a technical migration proposal with no KPI or product decision language."
+    success_signals:
+      - `product_reviewer` is not selected.
+      - Final review still has product fields marked `N/A`.
+      - If metrics are central in a different prompt, product reviewer is selected and metric fields are filled.
+
+  - id: eval-011-plugin-ready
+    title: Repo-local reviewer plugins and agents are preferred
+    mode: auto
+    prompt_shape: "Review a proposal in a repo with `.codex/reviewers/custom.yaml`, `.codex/review-router.yaml`, and `.codex/agents/rust_arch_reviewer`."
+    success_signals:
+      - Built-in registry loads first.
+      - Repo-local reviewers merge second.
+      - Routing overrides apply third.
+      - Matching repo-local agent is preferred by exact reviewer id or alias.
+
+  - id: eval-012-single-stack
+    title: Single-stack repo does not force polyglot routing
+    mode: auto
+    prompt_shape: "Review a Go-only repo proposal with no Apple or Rust evidence."
+    success_signals:
+      - Only Go and necessary cross-cutting reviewers are considered.
+      - Apple and Rust reviewers are not selected.
+      - Routing remains evidence-backed and under the hard cap.
+
+  - id: eval-013-static-final-template
+    title: Final template preserves routing and product fields
+    mode: static-check
+    file_check:
+      path: assets/final-review-template.md
+      required_strings:
+        - "Selected reviewers:"
+        - "Rejected close alternatives:"
+        - "Leading metric:"
+        - "Guardrail metric:"
+        - "Decision checkpoint:"

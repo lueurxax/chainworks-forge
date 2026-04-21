@@ -144,6 +144,12 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 session_generation_id: None,
                 provider_session_id: None,
                 mcp_servers: mcp_resolution.payloads,
+                chainworks_meta_root: Some(
+                    invocation
+                        .chainworks_meta_root
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -926,6 +932,7 @@ impl BackgroundExecutor {
                         .as_ref()
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
                     mcp_servers: mcp_resolution.payloads,
+                    chainworks_meta_root: run.chainworks_meta_root.clone(),
                 };
                 // Runtime event: session starting
                 let _ = self
@@ -1183,6 +1190,7 @@ impl BackgroundExecutor {
                             &run.workspace_root,
                             run_id,
                             &plan.artifact_paths,
+                            run.chainworks_meta_root.as_deref(),
                         );
                     }
                 }
@@ -2178,6 +2186,7 @@ impl BackgroundExecutor {
                     return crate::orchestrator::resolve_path_template(
                         template,
                         &run.workspace_root,
+                        run.chainworks_meta_root.as_deref(),
                     );
                 }
             }
@@ -2338,12 +2347,14 @@ fn normalize_artifacts(
     workspace_root: &str,
     run_id: RunId,
     artifact_paths: &std::collections::HashMap<String, String>,
+    meta_root: Option<&str>,
 ) {
     let run_dir = format!("{}/{}", artifact_root, run_id);
     let search_dirs = [artifact_root.to_string(), run_dir];
 
     for (artifact_name, path_template) in artifact_paths {
-        let canonical = crate::orchestrator::resolve_path_template(path_template, workspace_root);
+        let canonical =
+            crate::orchestrator::resolve_path_template(path_template, workspace_root, meta_root);
 
         // Already exists at canonical location — skip
         if std::path::Path::new(&canonical).exists() {

@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{artifacts, ideas, runs, stages};
+use db::repos::{agent_executions, artifacts, ideas, runs, stages};
+use domain::agent::AgentStatus;
 use domain::artifact::ArtifactFormat;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -81,6 +82,7 @@ fn make_run(id: RunId, idea_id: IdeaId, workspace_root: &str, artifact_root: &st
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     }
 }
 
@@ -368,6 +370,7 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     let delivery_config = DeliveryConfiguration {
         repo_identifier: "repo/test".into(),
@@ -1043,6 +1046,19 @@ async fn background_executor_fails_closed_without_delivery_configuration_json_an
     assert!(!persisted
         .iter()
         .any(|artifact| artifact.name == "git_push_receipt"));
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    let execution = executions
+        .iter()
+        .find(|execution| execution.agent_id == "commit_and_push_to_github")
+        .expect("release invoke should create agent execution truth");
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert!(
+        execution.completed_at.is_some(),
+        "failed release agent execution must be settled"
+    );
 }
 
 #[tokio::test]

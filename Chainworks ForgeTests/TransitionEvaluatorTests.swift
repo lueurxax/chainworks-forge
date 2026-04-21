@@ -70,12 +70,14 @@ struct TransitionEvaluatorTests {
     private func makeContext(
         artifacts: Set<String> = [],
         approvalGranted: Bool = false,
+        approvalRejected: Bool = false,
         variables: [String: AnyCodableValue] = [:],
         artifactFields: [String: [String: AnyCodableValue]] = [:]
     ) -> TransitionEvaluator.EvaluationContext {
         TransitionEvaluator.EvaluationContext(
             producedArtifactNames: artifacts,
             approvalGranted: approvalGranted,
+            approvalRejected: approvalRejected,
             variables: variables,
             artifactFields: artifactFields
         )
@@ -108,6 +110,13 @@ struct TransitionEvaluatorTests {
         let ctx = makeContext(approvalGranted: granted)
         let result = TransitionEvaluator.evaluate(.approvalGranted, context: ctx)
         #expect(result == granted)
+    }
+
+    @Test("approval rejected", arguments: [true, false])
+    func approvalRejected(rejected: Bool) {
+        let ctx = makeContext(approvalRejected: rejected)
+        let result = TransitionEvaluator.evaluate(.approvalRejected, context: ctx)
+        #expect(result == rejected)
     }
 
     // MARK: - Expression: true/false literals (parameterized)
@@ -144,6 +153,16 @@ struct TransitionEvaluatorTests {
     func expressionApprovalGranted(granted: Bool, expected: Bool) {
         let ctx = makeContext(approvalGranted: granted)
         let result = TransitionEvaluator.evaluate(.expression("approval.granted == true"), context: ctx)
+        #expect(result == expected)
+    }
+
+    @Test("expression approval.rejected", arguments: [
+        (true, true),
+        (false, false)
+    ])
+    func expressionApprovalRejected(rejected: Bool, expected: Bool) {
+        let ctx = makeContext(approvalRejected: rejected)
+        let result = TransitionEvaluator.evaluate(.expression("approval.rejected == true"), context: ctx)
         #expect(result == expected)
     }
 

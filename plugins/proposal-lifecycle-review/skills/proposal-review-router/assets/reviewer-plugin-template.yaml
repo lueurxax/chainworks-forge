@@ -1,0 +1,21 @@
+version: 1
+schema: proposal-review-router.reviewer-plugin
+
+reviewers:
+  - id: repo_specific_reviewer
+    family: repo-local
+    display_name: Repo Specific Reviewer
+    mode: architecture-only
+    stacks: [rust-backend]
+    surfaces: [architecture]
+    risks: []
+    mandatory_when:
+      any: []
+    strong_proposal_keywords: []
+    strong_repo_files: []
+    strong_repo_symbols: []
+    close_alternatives: []
+    usually_pair_with: []
+    rubric: .codex/reviewers/repo-specific-rubric.md
+    preferred_agent_names: [repo_specific_reviewer]
+    notes: "Keep this reviewer narrow. Do not duplicate built-in reviewers unless this repo has a real local boundary."

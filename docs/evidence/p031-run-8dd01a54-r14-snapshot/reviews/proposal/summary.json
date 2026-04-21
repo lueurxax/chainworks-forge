@@ -1,0 +1,119 @@
+{
+  "pass": false,
+  "average_score": 8.125,
+  "aggregate_score": 32.5,
+  "min_individual_score": 8.0,
+  "blocker_count": 1,
+  "summary": "P031 r9 is a materially corrected proposal: an operator-driven narrowing from GraphQL+MCP thin-client control cutover (r7) to a GraphQL-only read/inspection cutover. The macOS UI becomes a pure renderer of server projections with no MCP, no GraphQL mutations, and no local workflow writes. All four reviewers approve directionally but the architect identifies one blocking issue: the P043 reference contract still describes P031 as owning command-completion and MCP-control UI behavior, creating a dependency-contract conflict with the r9 no-UI-write rule. Product owner (8/10) approves with conditions around documenting the operator write-path workflow and adding user-outcome metrics. UX designer (8.5/10) approves but flags approval task flow fragmentation. UI designer (8/10) approves with comments on Syncing placement in detail views and approval visual coherence. Architect (8/10) approves with conditions but blocks on P043 contract reconciliation plus three medium non-blocking issues around schema field mapping, UI file boundary, and approval disabled-state contract.",
+  "required_changes": [
+    {
+      "id": "ARCH-R9-01",
+      "source_reviewer": "architect",
+      "severity": "blocking",
+      "title": "P043 reference contract still conflicts with the GraphQL-only P031 correction",
+      "required_change": "Before Phase 1, amend P043 reference and any composed P031 gate language so command-completion refresh, command receipt display, and MCP command-control rules are explicitly outside P031-owned UI. Keep MCP command behavior documented for non-UI agents/CLI/diagnostics.",
+      "corroborating_reviewers": [],
+      "corroborating_issue_ids": []
+    },
+    {
+      "id": "ARCH-R9-02",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "title": "Read-only disabled/report/approval metadata is not mapped to concrete GraphQL schema fields",
+      "required_change": "Add a concrete schema matrix for each new read-only field: GraphQL type/query, enum cases, nullability, principal redaction, Swift presenter owner, and tests.",
+      "corroborating_reviewers": ["ux_designer", "ui_designer"],
+      "corroborating_issue_ids": ["UX-R9-01", "UI-02"]
+    },
+    {
+      "id": "ARCH-R9-03",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "title": "Static-guard boundary depends on an undefined P031-owned UI file set",
+      "required_change": "Define the Phase 0 UI ownership inventory: exact Swift files/types in scope, legacy-only files, generated GraphQL operation locations, forbidden import/call patterns, and explicit exclusions.",
+      "corroborating_reviewers": [],
+      "corroborating_issue_ids": []
+    },
+    {
+      "id": "ARCH-R9-04",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "title": "Approval decisions remain a boundary exception without an implementation-safe disabled-state contract",
+      "required_change": "Make approval decision behavior binary: either hidden/read-only diagnostics only, or enabled through a named separately approved transport with its own proposal and tests. No Swift inference of write availability.",
+      "corroborating_reviewers": ["ux_designer", "ui_designer", "product_owner"],
+      "corroborating_issue_ids": ["UX-R9-01", "UI-02", "PO-R9-04"]
+    },
+    {
+      "id": "ARCH-R9-05",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "title": "Source-governance drift between run-local contract and checked-in proposal",
+      "required_change": "Promote the full r9 contract or add a checked-in implementation addendum that marks the run-local artifact as governing and copies Phase 0 obligations.",
+      "corroborating_reviewers": [],
+      "corroborating_issue_ids": []
+    },
+    {
+      "id": "PO-R9-01",
+      "source_reviewer": "product_owner",
+      "severity": "non_blocking",
+      "title": "No documented operator workflow for write operations during the write-removed period",
+      "required_change": "Before dogfood start, publish an operator guide mapping each removed P031 UI write control to its current alternative surface or explicitly marking it temporarily unavailable with a follow-up reference.",
+      "corroborating_reviewers": ["ux_designer"],
+      "corroborating_issue_ids": ["UX-R9-02"]
+    },
+    {
+      "id": "UX-R9-01",
+      "source_reviewer": "ux_designer",
+      "severity": "non_blocking",
+      "title": "Fragmented task flow for approval decisions",
+      "required_change": "Replace disabled primary button with a distinct UI element (e.g., inline banner or terminal-styled text box) that says 'Execute via CLI' with copyable ID, or hide the control entirely.",
+      "corroborating_reviewers": ["ui_designer", "architect", "product_owner"],
+      "corroborating_issue_ids": ["UI-02", "ARCH-R9-04", "PO-R9-04"]
+    },
+    {
+      "id": "UI-01",
+      "source_reviewer": "ui_designer",
+      "severity": "non_blocking",
+      "title": "Ambiguous placement of Syncing pattern in detail views",
+      "required_change": "Explicitly define Syncing pattern placement for RunDetailView and ArtifactsView (e.g., top trailing edge of navigation bar or fixed header slot) to ensure no layout shift in detail screens.",
+      "corroborating_reviewers": [],
+      "corroborating_issue_ids": []
+    },
+    {
+      "id": "UI-03",
+      "source_reviewer": "ui_designer",
+      "severity": "non_blocking",
+      "title": "Vague Report payload availability indicators",
+      "required_change": "Specify the exact icon family or text truncation rules for report payload availability to prevent inconsistent density in the Reports list.",
+      "corroborating_reviewers": [],
+      "corroborating_issue_ids": []
+    }
+  ],
+  "recurring_themes": [
+    {
+      "theme": "Approval control liminal state and disabled UX",
+      "description": "All four reviewers converge on the approval decision surface as the riskiest UX/architecture seam. The architect (ARCH-R9-04) wants a binary disabled-state contract. The UX designer (UX-R9-01) flags 'tease and block' UX. The UI designer (UI-02) flags visual coherence of permanently disabled primary buttons. The product owner (PO-R9-04) wants explicit dogfood validation of operator comprehension. This is the single highest-convergence theme.",
+      "issue_ids": ["ARCH-R9-04", "UX-R9-01", "UI-02", "PO-R9-04"]
+    },
+    {
+      "theme": "P043 dependency contract reconciliation",
+      "description": "The architect (ARCH-R9-01, blocking) identifies that P043 still describes P031 as owning MCP command-control UI behavior. This is a dependency-contract conflict, not stale wording, and must be resolved before Phase 1.",
+      "issue_ids": ["ARCH-R9-01"]
+    },
+    {
+      "theme": "Operator write-path gap documentation",
+      "description": "The product owner (PO-R9-01) and UX designer (UX-R9-02) both flag that removing all write controls without documenting the alternative operator workflow creates an untestable dogfood gap. The PO wants an operator guide before dogfood; the UX wants in-UI guidance to the actual destination.",
+      "issue_ids": ["PO-R9-01", "UX-R9-02"]
+    },
+    {
+      "theme": "Schema field concreteness for new read-only metadata",
+      "description": "The architect (ARCH-R9-02) wants concrete GraphQL types and redaction rules for new disabled/report/approval metadata fields. The UI designer (UI-03) wants specific icon family for report payload availability. Both converge on the need for implementation-ready schema specificity.",
+      "issue_ids": ["ARCH-R9-02", "UI-03"]
+    },
+    {
+      "theme": "UI file/module boundary for static guards",
+      "description": "The architect (ARCH-R9-03) flags that static guards depend on an undefined set of P031-owned UI files. Without a path inventory, guards can miss bypasses or block legitimate legacy rollback code.",
+      "issue_ids": ["ARCH-R9-03"]
+    }
+  ],
+  "decision": "revise"
+}

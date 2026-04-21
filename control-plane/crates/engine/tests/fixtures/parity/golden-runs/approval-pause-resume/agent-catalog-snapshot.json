@@ -1,0 +1,12 @@
+{
+  "schema_version": "agent-catalog-snapshot.v1",
+  "agents": [
+    {
+      "id": "fixture_agent",
+      "provider": "claude"
+    }
+  ],
+  "artifact_templates": {
+    "approval_packet": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/approval_packet.json"
+  }
+}

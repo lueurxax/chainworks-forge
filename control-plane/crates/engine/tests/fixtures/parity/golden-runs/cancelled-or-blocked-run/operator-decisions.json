@@ -1,0 +1,10 @@
+{
+  "schema_version": "operator-decisions.v1",
+  "decisions": [
+    {
+      "stage_id": "blocked",
+      "decision": "cancel_run",
+      "at": "after_stage_settled"
+    }
+  ]
+}

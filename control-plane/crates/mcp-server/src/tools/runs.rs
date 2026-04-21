@@ -1,12 +1,13 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{projections, runs};
-use domain::commands::{CallerContext, CancelRunCmd, Command, StartRunCmd};
+use db::repos::{artifact_contracts, projections, runs};
+use domain::commands::{CancelRunCmd, Command, StartRunCmd};
 use domain::ids::{IdeaId, RunId};
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
+use crate::request_context::mcp_caller;
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -103,7 +104,7 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
 
-            let caller = CallerContext::mcp(&principal.id, &principal.class, "runs.start");
+            let caller = mcp_caller(&principal.id, &principal.class, "runs.start");
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
                 workflow_id,
@@ -139,7 +140,7 @@ pub async fn execute(
                     serde_json::Value::String(commanded.journal_id),
                 );
             }
-            Ok(value)
+            attach_implementation_self_assessment_summary(pool, value).await
         }
 
         "runs.get" => {
@@ -148,12 +149,44 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
             let run = runs::find_by_id(pool, run_id).await?;
-            Ok(serde_json::to_value(&run)?)
+            match run {
+                Some(run) => {
+                    let mut value = serde_json::to_value(&run)?;
+                    if let Some(obj) = value.as_object_mut() {
+                        if let Some(projection) =
+                            db::repos::artifact_contracts::find_run_state_projection(pool, run_id)
+                                .await?
+                        {
+                            obj.insert("active_artifact_index".into(), projection.active_index_json);
+                            obj.insert("run_state_projection".into(), projection.run_state_json);
+                            obj.insert(
+                                "operator_overrides".into(),
+                                serde_json::to_value(
+                                    db::repos::artifact_contracts::list_overrides(pool, run_id)
+                                        .await?,
+                                )?,
+                            );
+                        }
+                    }
+                    attach_implementation_self_assessment_summary(pool, value).await
+                }
+                None => Ok(serde_json::Value::Null),
+            }
         }
 
         "runs.list" => {
             let items = projections::list_active_projection(pool).await?;
-            Ok(serde_json::to_value(&items)?)
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(
+                    attach_implementation_self_assessment_summary(
+                        pool,
+                        serde_json::to_value(&item)?,
+                    )
+                    .await?,
+                );
+            }
+            Ok(serde_json::Value::Array(values))
         }
 
         "runs.cancel" => {
@@ -161,7 +194,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            let caller = CallerContext::mcp(&principal.id, &principal.class, "runs.cancel");
+            let caller = mcp_caller(&principal.id, &principal.class, "runs.cancel");
             let cmd = Command::CancelRun(CancelRunCmd { run_id });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({
@@ -174,15 +207,54 @@ pub async fn execute(
     }
 }
 
+async fn attach_implementation_self_assessment_summary(
+    pool: &SqlitePool,
+    mut value: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let summary = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| id.parse::<RunId>().ok());
+    let summary = match summary {
+        Some(run_id) => {
+            artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
+                .await?
+                .map(|stored| {
+                    let mut summary = stored.summary;
+                    summary.artifact_path =
+                        super::reports::public_artifact_path(&summary.artifact_path);
+                    serde_json::to_value(summary)
+                })
+                .transpose()?
+        }
+        None => None,
+    };
+
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "implementation_self_assessment_summary".to_string(),
+            summary.unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{ideas, runs};
+    use db::repos::{artifact_contracts, artifacts, ideas, runs};
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
     use domain::idea::{Idea, IdeaStatus};
-    use domain::ids::{IdeaId, RunId};
+    use domain::ids::{ArtifactId, IdeaId, RunId};
     use domain::run::{Run, RunStatus};
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
@@ -241,6 +313,7 @@ mod tests {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         }
     }
 
@@ -266,6 +339,62 @@ mod tests {
 
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    async fn persist_blocked_implementation_summary(pool: &SqlitePool, run_id: RunId) {
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_8_implementation_continued".into(),
+            agent_id: "code_writer".into(),
+            name: "implementation_self_assessment".into(),
+            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/implementation/self-assessment.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(pool, &artifact).await.unwrap();
+        let raw = serde_json::json!({
+            "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+            "implementation_complete": true,
+            "verification_green": false,
+            "remaining_code_tasks": [],
+            "handoff_tasks": [],
+            "known_risks": ["verification blocked by environment"],
+            "tests_run": ["cargo test: blocked"],
+            "docs_impacted": []
+        });
+        let summary = parse_implementation_self_assessment_v2(
+            &raw,
+            ContractParseContext {
+                run_id: run_id.to_string(),
+                run_age: None,
+                declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+                canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+                raw_artifact_path: Some(artifact.file_path.clone()),
+                source_generation_id: None,
+                artifact_created_at: Some(artifact.created_at),
+                v2_generation_seen_for_run: true,
+                legacy_v1_generation_available: false,
+            },
+        );
+        artifact_contracts::persist_implementation_self_assessment_summary(
+            pool,
+            run_id,
+            artifact.id,
+            &artifact.contract_id,
+            &summary,
+            artifact.created_at,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -365,6 +494,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runs_get_returns_implementation_self_assessment_summary() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run = make_run(RunId::new(), idea_id);
+        runs::insert(&pool, &run).await.unwrap();
+        persist_blocked_implementation_summary(&pool, run.id).await;
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "runs.get",
+            serde_json::json!({ "run_id": run.id.to_string() }),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        let summary = &result["implementation_self_assessment_summary"];
+        assert_eq!(summary["status"], serde_json::json!("blocked"));
+        assert_eq!(summary["implementation_complete"], serde_json::json!(true));
+        assert_eq!(summary["verification_green"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
     async fn delivery_preflight_mcp_readback_tests() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -444,5 +599,35 @@ mod tests {
             serde_json::json!("2/2 agents settled, 1 sessions closed")
         );
         assert!(item.get("cancellation_settlement_log").is_none());
+    }
+
+    #[tokio::test]
+    async fn runs_list_includes_implementation_self_assessment_summary() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run = make_run(RunId::new(), idea_id);
+        runs::insert(&pool, &run).await.unwrap();
+        persist_blocked_implementation_summary(&pool, run.id).await;
+        db::repos::projections::rebuild_all_for_run(&pool, run.id)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "runs.list",
+            serde_json::json!({}),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        let item = result.as_array().unwrap().first().unwrap();
+        assert_eq!(
+            item["implementation_self_assessment_summary"]["status"],
+            serde_json::json!("blocked")
+        );
     }
 }

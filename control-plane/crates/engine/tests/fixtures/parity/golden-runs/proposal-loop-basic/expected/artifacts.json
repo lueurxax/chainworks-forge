@@ -1,0 +1,1 @@
+{"artifacts":[{"name":"draft_brief","contract_id":"claude.output","stage_id":"draft","format":"json","report_kind":null},{"name":"proposal_review","contract_id":"claude.output","stage_id":"review","format":"json","report_kind":"parity_summary"}]}

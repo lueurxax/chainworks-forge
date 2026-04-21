@@ -1,0 +1,284 @@
+version: 1
+
+compatibility:
+  proposal_review_router_reviewer_ids: true
+  compatible_builtin_source: proposal-review-router/assets/reviewer-registry.yaml
+  note: >
+    These ids intentionally match the proposal-review-router ids so implementation audits can reuse
+    proposal-review routing. The focus here is implementation evidence, not proposal completeness.
+
+merge_order:
+  - assets/implementation-reviewer-registry.yaml
+  - .codex/reviewers/*.yaml
+  - .codex/implementation-reviewers/*.yaml
+  - .codex/review-router.yaml
+  - .codex/implementation-audit-router.yaml
+
+defaults:
+  target_reviewer_count: 3
+  hard_cap: 5
+  reuse_prior_proposal_selection_by_default: true
+  max_delta_reviewers_when_reusing: 2
+  include_product_only_on_explicit_request_or_metric_gate: true
+  score_weights:
+    explicit_user_request: 6
+    prior_proposal_reviewer_reuse: 5
+    implementation_stack_match: 5
+    changed_file_match: 4
+    proposal_requirement_match: 4
+    risk_match: 4
+    runtime_or_test_evidence_gap: 2
+    cross_stack_dependency: 3
+    overlap_penalty: -3
+
+reviewers:
+  - id: ios_ui_reviewer
+    display_name: iOS UI Implementation Reviewer
+    mode: ui-only
+    stacks: [ios, apple-client]
+    surfaces: [ui, navigation, accessibility, runtime-ui]
+    risks: [visual-regression, platform-mismatch, accessibility-regression]
+    finding_prefixes: [UI, READY]
+    strong_proposal_keywords: [SwiftUI, UIKit, NavigationStack, sheet, fullScreenCover, tab bar, deep link, dynamic type, VoiceOver]
+    strong_changed_files: ["**/*.swift", "**/*.storyboard", "**/*.xib", "**/*View*.swift", "**/*Screen*.swift"]
+    implementation_checks:
+      - Verify proposal-mandated iOS screens, navigation entries, controls, labels, visual states, and safe-area behavior.
+      - Distinguish runtime/UI-test/screenshot proof from code-only inference.
+      - Check accessibility identifiers, VoiceOver labels, dynamic type, contrast, hit targets, and non-color cues when relevant.
+    usually_pair_with: [apple_arch_reviewer, apple_ux_reviewer]
+    rubric: references/rubrics/ios-ui-rubric.md
+    preferred_agent_names: [ios_ui_reviewer, ui_reviewer]
+
+  - id: macos_ui_reviewer
+    display_name: macOS UI Implementation Reviewer
+    mode: ui-only
+    stacks: [macos, apple-client]
+    surfaces: [ui, navigation, keyboard, accessibility, runtime-ui]
+    risks: [platform-mismatch, dense-layout-regression, keyboard-regression]
+    finding_prefixes: [UI, READY]
+    strong_proposal_keywords: [AppKit, macOS, settings window, toolbar, sidebar, split view, keyboard shortcut, multiple windows]
+    strong_changed_files: ["**/*.swift", "**/*.xib", "**/*.storyboard", "**/*Window*.swift", "**/*Command*.swift"]
+    implementation_checks:
+      - Verify proposal-mandated macOS windows, toolbars, sidebars, menus, keyboard shortcuts, focus behavior, and multi-window behavior.
+      - Do not apply iOS navigation assumptions to macOS.
+      - Lower confidence when only previews exist for a critical desktop flow.
+    usually_pair_with: [apple_arch_reviewer, apple_ux_reviewer]
+    rubric: references/rubrics/macos-ui-rubric.md
+    preferred_agent_names: [macos_ui_reviewer, ui_reviewer]
+
+  - id: apple_ux_reviewer
+    display_name: Apple UX Implementation Reviewer
+    mode: ux-only
+    stacks: [ios, macos, apple-client]
+    surfaces: [ux, trust, accessibility, multi-step-flow, recovery]
+    risks: [user-error, trust-break, unclear-recovery, inaccessible-flow]
+    finding_prefixes: [UX, PROD, READY]
+    strong_proposal_keywords: [onboarding, error recovery, empty state, confirmation, permission prompt, accessibility, trust, summary screen]
+    strong_changed_files: ["**/*.swift", "**/*.strings", "**/*.stringsdict"]
+    implementation_checks:
+      - Verify the user can complete the proposal's primary journey, including unhappy paths.
+      - Check recovery, confirmation, trust, permission-denied, empty/loading/error states, and accessibility interaction quality.
+      - Separate UX concerns from objective REQ status unless the proposal explicitly promised the UX behavior.
+    usually_pair_with: [ios_ui_reviewer, macos_ui_reviewer, apple_arch_reviewer]
+    rubric: references/rubrics/apple-ux-rubric.md
+    preferred_agent_names: [apple_ux_reviewer, ux_reviewer]
+
+  - id: apple_arch_reviewer
+    display_name: Apple Architecture Implementation Reviewer
+    mode: architecture-only
+    stacks: [ios, macos, apple-client]
+    surfaces: [architecture, navigation, state, concurrency, persistence, integration]
+    risks: [state-drift, data-race, deep-link-breakage, integration-drift]
+    finding_prefixes: [ARCH, REL, READY]
+    strong_proposal_keywords: [coordinator, router, actor, Observable, persistence, background task, deep link, state restoration, feature flag]
+    strong_changed_files: ["**/*.swift", "Package.swift", "*.xcodeproj", "*.xcworkspace"]
+    implementation_checks:
+      - Verify state ownership, data flow, navigation/deep-link seams, dependency flow, and locked architectural decisions.
+      - Check main-thread UI safety, actor boundaries, background work, persistence/sync correctness, and test seams.
+      - Confirm shared/platform-specific boundaries match the proposal.
+    usually_pair_with: [ios_ui_reviewer, macos_ui_reviewer, apple_ux_reviewer, api_contract_reviewer]
+    rubric: references/rubrics/apple-architecture-rubric.md
+    preferred_agent_names: [apple_arch_reviewer, arch_reviewer]
+
+  - id: rust_arch_reviewer
+    display_name: Rust Architecture Implementation Reviewer
+    mode: architecture-only
+    stacks: [rust-backend]
+    surfaces: [architecture, api-contract, persistence, concurrency]
+    risks: [boundary-leak, ownership-confusion, runtime-boundary-drift]
+    finding_prefixes: [ARCH, API, READY]
+    strong_proposal_keywords: [Cargo workspace, crate, trait, async, tokio, axum, tonic, sqlx, serde, migration]
+    strong_changed_files: ["Cargo.toml", "Cargo.lock", "**/*.rs", "migrations/**"]
+    implementation_checks:
+      - Verify crate/module boundaries, trait/API shape, error semantics, and dependency direction against the proposal.
+      - Check async runtime seams, blocking work isolation, persistence and protocol ownership, and generated-code boundaries.
+      - Confirm tests exercise the proposed public behavior, not just internal helpers.
+    usually_pair_with: [rust_reliability_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/rust-architecture-rubric.md
+    preferred_agent_names: [rust_arch_reviewer, arch_reviewer]
+
+  - id: rust_reliability_reviewer
+    display_name: Rust Reliability Implementation Reviewer
+    mode: reliability-only
+    stacks: [rust-backend]
+    surfaces: [reliability, concurrency, background-work, persistence]
+    risks: [idempotency, shutdown-loss, overload, cancellation-loss]
+    finding_prefixes: [REL, READY]
+    strong_proposal_keywords: [retry, idempotency, timeout, deadline, cancellation, backpressure, queue, worker, replay, shutdown]
+    strong_changed_files: ["Cargo.toml", "**/*.rs", "migrations/**", "**/*worker*", "**/*queue*"]
+    implementation_checks:
+      - Verify retries, idempotency, deadlines, cancellation, backpressure, worker lifecycle, and graceful shutdown.
+      - Check task ownership, channel behavior, replay/recovery, error classification, and dependency-failure handling.
+      - Prefer focused tests or failure-injection evidence for critical reliability claims.
+    usually_pair_with: [rust_arch_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/rust-reliability-rubric.md
+    preferred_agent_names: [rust_reliability_reviewer, reliability_reviewer]
+
+  - id: rust_performance_reviewer
+    display_name: Rust Performance Implementation Reviewer
+    mode: performance-only
+    stacks: [rust-backend]
+    surfaces: [performance-hot-path, concurrency, serialization]
+    risks: [latency-sensitive, throughput-sensitive, contention]
+    finding_prefixes: [PERF, READY]
+    strong_proposal_keywords: [hot path, latency, throughput, streaming, allocation, lock contention, batching, serialization, benchmark, cache]
+    strong_changed_files: ["Cargo.toml", "**/*.rs", "benches/**"]
+    implementation_checks:
+      - Verify hot paths, allocation behavior, locking/await boundaries, batching, serialization, and benchmark claims.
+      - Distinguish benchmark definitions from benchmark results.
+      - Check whether tests or metrics can catch regressions in the proposed performance envelope.
+    usually_pair_with: [rust_arch_reviewer]
+    rubric: references/rubrics/rust-performance-rubric.md
+    preferred_agent_names: [rust_performance_reviewer, performance_reviewer]
+
+  - id: rust_security_reviewer
+    display_name: Rust Security Implementation Reviewer
+    mode: security-only
+    stacks: [rust-backend]
+    surfaces: [security, auth, parsing, public-network-boundary]
+    risks: [security-sensitive, unsafe-code, secret-exposure, deserialization-risk]
+    finding_prefixes: [SEC, READY]
+    strong_proposal_keywords: [auth, token, secret, unsafe, FFI, deserialization, PII, permission, public endpoint, rate limit]
+    strong_changed_files: ["Cargo.toml", "**/*.rs", "**/*auth*", "**/*token*", "**/*secret*"]
+    implementation_checks:
+      - Verify authN/authZ checks, request validation, deserialization boundaries, secrets, PII, rate limits, unsafe/FFI, and public endpoints.
+      - Treat new unsafe blocks, FFI, public parsers, and secret handling as high-signal implementation risks.
+    usually_pair_with: [rust_arch_reviewer, api_contract_reviewer]
+    rubric: references/rubrics/rust-security-rubric.md
+    preferred_agent_names: [rust_security_reviewer, security_reviewer]
+
+  - id: go_service_arch_reviewer
+    display_name: Go Service Architecture Implementation Reviewer
+    mode: architecture-only
+    stacks: [go-backend, microservice]
+    surfaces: [architecture, api-contract, persistence, concurrency]
+    risks: [package-sprawl, ownership-confusion, lifecycle-drift]
+    finding_prefixes: [ARCH, API, READY]
+    strong_proposal_keywords: [go.mod, package, interface, cmd, internal, grpc, HTTP handler, repository, worker, migration]
+    strong_changed_files: ["go.mod", "go.sum", "cmd/**", "internal/**", "pkg/**", "**/*.go", "migrations/**"]
+    implementation_checks:
+      - Verify package boundaries, transport/domain/persistence separation, dependency direction, and generated-code ownership.
+      - Check interface placement, context propagation, lifecycle boundaries, and migration/persistence seams.
+      - Confirm implementation tests exercise public behavior and important failure paths.
+    usually_pair_with: [go_reliability_reviewer, api_contract_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/go-service-architecture-rubric.md
+    preferred_agent_names: [go_service_arch_reviewer, arch_reviewer]
+
+  - id: go_reliability_reviewer
+    display_name: Go Reliability Implementation Reviewer
+    mode: reliability-only
+    stacks: [go-backend, microservice]
+    surfaces: [reliability, concurrency, background-work, networking]
+    risks: [idempotency, goroutine-leak, overload, cancellation-loss]
+    finding_prefixes: [REL, READY]
+    strong_proposal_keywords: [retry, deadline, timeout, context cancellation, goroutine, queue, worker, backpressure, idempotency, graceful shutdown]
+    strong_changed_files: ["go.mod", "**/*.go", "**/*worker*", "**/*queue*"]
+    implementation_checks:
+      - Verify context cancellation, deadlines, retries, idempotency, goroutine lifecycle, graceful shutdown, and overload behavior.
+      - Look for dropped contexts, unbounded goroutines/channels, missing error classification, and retry storms.
+    usually_pair_with: [go_service_arch_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/go-reliability-rubric.md
+    preferred_agent_names: [go_reliability_reviewer, reliability_reviewer]
+
+  - id: go_performance_reviewer
+    display_name: Go Performance Implementation Reviewer
+    mode: performance-only
+    stacks: [go-backend, microservice]
+    surfaces: [performance-hot-path, serialization, caching]
+    risks: [latency-sensitive, throughput-sensitive, gc-pressure]
+    finding_prefixes: [PERF, READY]
+    strong_proposal_keywords: [p99, latency, throughput, allocation, GC, pool, benchmark, batch, cache, serialization]
+    strong_changed_files: ["go.mod", "**/*.go", "benchmarks/**"]
+    implementation_checks:
+      - Verify p99-sensitive paths, allocation/GC behavior, encoding/decoding, pooling, lock contention, cache shape, and benchmark claims.
+      - Distinguish benchmark files from benchmark results.
+    usually_pair_with: [go_service_arch_reviewer]
+    rubric: references/rubrics/go-performance-rubric.md
+    preferred_agent_names: [go_performance_reviewer, performance_reviewer]
+
+  - id: go_security_reviewer
+    display_name: Go Security Implementation Reviewer
+    mode: security-only
+    stacks: [go-backend, microservice]
+    surfaces: [security, auth, validation, public-network-boundary]
+    risks: [security-sensitive, secret-exposure, outbound-abuse]
+    finding_prefixes: [SEC, READY]
+    strong_proposal_keywords: [auth, token, secret, JWT, OAuth, SSRF, request validation, PII, rate limit, public endpoint]
+    strong_changed_files: ["go.mod", "**/*.go", "**/*auth*", "**/*token*", "**/*secret*"]
+    implementation_checks:
+      - Verify authN/authZ, request validation, outbound URL handling, secrets, PII, TLS, rate limiting, and public endpoint behavior.
+      - Check that security-critical tests exist and were run when the proposal promised them.
+    usually_pair_with: [go_service_arch_reviewer, api_contract_reviewer]
+    rubric: references/rubrics/go-security-rubric.md
+    preferred_agent_names: [go_security_reviewer, security_reviewer]
+
+  - id: api_contract_reviewer
+    display_name: API Contract Implementation Reviewer
+    mode: api-contract-only
+    stacks: [shared-api, rust-backend, go-backend, apple-client]
+    surfaces: [api-contract, backward-compatibility, migration]
+    risks: [backward-compatibility, multi-service-coordination, generated-code-drift]
+    finding_prefixes: [API, SEC, READY]
+    strong_proposal_keywords: [protobuf, OpenAPI, schema, payload, request, response, versioning, backward compatibility, pagination, event contract, DTO]
+    strong_changed_files: ["**/*.proto", "**/*openapi*", "**/*swagger*", "**/*.json", "**/*.yaml", "**/*schema*", "**/*generated*"]
+    implementation_checks:
+      - Verify request/response/schema changes, backward compatibility, generated types, clients, migrations, and deprecation behavior.
+      - Check contract tests and cross-service/client/server alignment.
+      - Treat schema drift or partial regeneration as high signal.
+    usually_pair_with: [rust_arch_reviewer, go_service_arch_reviewer, apple_arch_reviewer, observability_rollout_reviewer]
+    rubric: references/rubrics/api-contract-rubric.md
+    preferred_agent_names: [api_contract_reviewer]
+
+  - id: observability_rollout_reviewer
+    display_name: Observability and Rollout Implementation Reviewer
+    mode: observability-rollout-only
+    stacks: [apple-client, rust-backend, go-backend, shared-api]
+    surfaces: [telemetry, feature-flag, rollout, rollback, migration]
+    risks: [operability-sensitive, dark-launch-missing, weak-rollback, blind-failure]
+    finding_prefixes: [OPS, READY]
+    strong_proposal_keywords: [feature flag, rollout, rollback, telemetry, tracing, metrics, alerting, kill switch, migration, dark launch]
+    strong_changed_files: ["**/*feature*", "**/*flag*", "**/*metrics*", "**/*telemetry*", "**/*tracing*", "**/*migration*", "**/*.sql", "deploy/**", "config/**"]
+    implementation_checks:
+      - Verify flags, migrations, rollback paths, telemetry, logs, traces, alerts, dashboards, health checks, and deploy sequencing.
+      - Check whether proposed decision gates can be measured from actual instrumentation.
+      - Confirm failure/rollback paths are executable, not just described.
+    usually_pair_with: [rust_reliability_reviewer, go_reliability_reviewer, product_reviewer]
+    rubric: references/rubrics/observability-rollout-rubric.md
+    preferred_agent_names: [observability_rollout_reviewer]
+
+  - id: product_reviewer
+    display_name: Product Implementation Reviewer
+    mode: product-only
+    stacks: [apple-client, rust-backend, go-backend, shared-api]
+    surfaces: [product, metrics, prioritization, rollout]
+    risks: [unclear-value, weak-decision-gates, incomplete-user-job]
+    finding_prefixes: [PROD, READY]
+    strong_proposal_keywords: [KPI, success metric, guardrail, experiment, rollout decision, prioritization, user value, segment, adoption, trust metric]
+    strong_changed_files: ["**/*analytics*", "**/*tracking*", "**/*experiment*", "**/*rollout*"]
+    implementation_checks:
+      - Verify the implementation actually delivers the proposal's intended user/customer value.
+      - Check whether leading metrics, guardrails, and decision checkpoints are instrumented and reviewable.
+      - Use product review sparingly; do not make it a default catch-all for technical uncertainty.
+    usually_pair_with: [observability_rollout_reviewer]
+    rubric: references/rubrics/product-review-rubric.md
+    preferred_agent_names: [product_reviewer]

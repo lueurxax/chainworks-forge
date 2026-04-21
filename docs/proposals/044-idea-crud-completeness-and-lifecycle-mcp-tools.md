@@ -2,12 +2,14 @@
 
 | Field | Value |
 |---|---|
-| Date | 2026-04-17 |
-| Status | Draft |
+| Date | 2026-04-17 (revised R3) |
+| Status | Draft (R3 - readiness blockers addressed: StartRun lifecycle ownership, atomic archive/start invariant, command/journal ownership, explicit capabilities, GraphQL patch semantics, distinct gate alias) |
 | Author | Andrey Khasanov |
-| Depends on | [../reference/domain-model.md](../reference/domain-model.md) |
+| Depends on | [../reference/idea-lifecycle.md](../reference/idea-lifecycle.md), [../reference/project-workspace-contract.md](../reference/project-workspace-contract.md), [../reference/current-system-baseline.md](../reference/current-system-baseline.md), [../reference/test-gates.md](../reference/test-gates.md), [029-mcp-northbound-control-plane-server.md](029-mcp-northbound-control-plane-server.md), [../reference/domain-model.md](../reference/domain-model.md) |
 | Scope | Add get, update, archive, unarchive, and duplicate MCP tools for ideas, plus enhanced list filtering, with matching GraphQL mutations and server-side guard rails. |
 | Goal | Give MCP-connected agents and operators full idea lifecycle management with patch-semantic updates and safety guards that exceed the Swift app's current capabilities. |
+
+**Gate naming note:** the repository already owns `proposal-044|p044` for the post-approval task execution and release gate completion proof lane. This proposal must use the distinct canonical gate alias `proposal-044-ideas|p044-ideas`; it must not replace or repurpose the existing `proposal-044|p044` gate.
 
 ---
 
@@ -57,16 +59,21 @@ This proposal includes:
 - Server-side guard: archive rejects ideas with non-terminal runs.
 - Server-side guard: status transition Draft-to-Active requires non-empty title and body.
 - New DB repo functions: `update_fields`, `duplicate`, `list_filtered`.
+- New domain command variants and `CommandHandler` execution paths for journaled idea lifecycle writes.
+- `StartRun` lifecycle guard integration so runs can start only from eligible ideas and cannot accidentally clear archive metadata.
+- Atomic archive/start invariant: archiving an idea and starting a run for that idea cannot race into "archived with active run" truth.
+- Explicit northbound capability IDs and principal-class policy for idea read/write/archive/duplicate operations.
 - New GraphQL mutations: `updateIdea`, `archiveIdea`, `unarchiveIdea`, `duplicateIdea`.
 - Updated GraphQL `ideas` query with filter/pagination arguments.
+- Distinct proof gate `proposal-044-ideas|p044-ideas` because `proposal-044|p044` is already owned by another proof lane.
 
 This proposal does **not** include:
 
 - Changes to the Swift app UI (the app can adopt the new GraphQL mutations separately).
 - Idea deletion (ideas are archived, not deleted; deletion is out of scope).
 - Bulk operations (archive-all, update-many).
-- Changes to `Run`, `Artifact`, or any domain model other than `Idea`.
-- Changes to MCP tool authorization / principal-based access control (existing `auth` layer applies unchanged).
+- Changes to `Run`, `Artifact`, or their persistence schema. `StartRun` behavior changes only at the command guard boundary.
+- New principal classes or external auth mechanisms. This proposal does change the existing exhaustive capability map by adding explicit idea lifecycle capability IDs for the new tools.
 
 ---
 
@@ -171,8 +178,9 @@ Creating a variation of an existing idea requires manual field-by-field copying.
 2. Reject if idea status is `Archived`: `"Cannot update an archived idea. Unarchive it first."`.
 3. Apply patch: for each optional field present in the request, overwrite the existing value. Fields absent from the request are left unchanged. Fields explicitly set to `null` clear the value (for nullable fields only: `workspace_root_path`, `project_key`).
 4. **Draft-to-Active validation:** If the idea is in `Draft` status, check whether the resulting title and body are both non-empty. If so, automatically transition the idea to `Active` status. This prevents ideas with empty fields from reaching Active and failing at run-start preflight.
-5. Persist via new repo function `ideas::update_fields`.
-6. Return the updated `Idea` as JSON.
+5. Updating `workspace_root_path` or `project_key` changes the idea row for future use only. It must not rewrite existing run records, run workspace roots, release artifact paths, or per-run metadata covered by `project-workspace-contract.md`.
+6. Persist via new repo function `ideas::update_fields`.
+7. Return `{ "idea": updated_idea, "journal_id": commanded.journal_id }` for MCP and `UpdateIdeaPayload { idea, journalId }` for GraphQL.
 
 **New DB repo function:**
 
@@ -210,7 +218,28 @@ type Mutation {
 }
 ```
 
-Note: GraphQL nullable fields use the `String` scalar (nullable by default). To distinguish "omit" from "set to null", the resolver checks whether the field key was present in the input object.
+**GraphQL patch semantics:**
+
+The Rust resolver must not model `UpdateIdeaInput` fields as plain `Option<String>`, because async-graphql collapses omitted fields and explicit `null` into `None`. Use `async_graphql::MaybeUndefined<String>` for each patch field:
+
+```rust
+#[derive(InputObject)]
+struct UpdateIdeaInput {
+    title: MaybeUndefined<String>,
+    body: MaybeUndefined<String>,
+    workspace_root_path: MaybeUndefined<String>,
+    project_key: MaybeUndefined<String>,
+}
+```
+
+Resolver behavior:
+
+- `MaybeUndefined::Undefined` means "no change".
+- `MaybeUndefined::Value(v)` means "set to `v`".
+- `MaybeUndefined::Null` clears nullable fields (`workspaceRootPath`, `projectKey`).
+- `MaybeUndefined::Null` is rejected for non-null logical fields (`title`, `body`) with a validation error.
+
+This preserves JSON/MCP merge-patch semantics and makes GraphQL clearing executable.
 
 ### 5.3 `ideas.archive` -- archive with active-run guard
 
@@ -238,14 +267,15 @@ Note: GraphQL nullable fields use the `String` scalar (nullable by default). To 
 
 1. Fetch the idea. Return error if not found.
 2. If already `Archived`, return the idea as-is (idempotent).
-3. **Active-run guard:** Call `runs::list_by_idea(pool, id)` and check whether any run has a non-terminal status (i.e., `!run.status.is_terminal()`). If any non-terminal run exists, return error:
+3. **Active-run guard:** Check whether any run has a non-terminal status (i.e., `!run.status.is_terminal()`). If any non-terminal run exists, return error:
    ```
    "Cannot archive idea {id}: {n} run(s) are still active
    (statuses: {comma-separated statuses}). Cancel or wait for
    them to complete before archiving."
    ```
-4. Set status to `Archived` and `archived_at` to `Utc::now()` via `ideas::update_status`.
-5. Return the updated `Idea`.
+4. The guard and the archive write must be one atomic DB operation. Implement this as either a single conditional `UPDATE ... WHERE NOT EXISTS (...)` or a SQLite transaction that takes a write lock before checking active runs. A check-then-update sequence outside a transaction is not acceptable because it can race `StartRun`.
+5. Set status to `Archived` and `archived_at` to `Utc::now()` via an archive-specific repo helper.
+6. Return `{ "idea": updated_idea, "journal_id": commanded.journal_id }` for MCP and `ArchiveIdeaPayload { idea, journalId }` for GraphQL.
 
 **GraphQL mutation:**
 
@@ -286,22 +316,18 @@ type Mutation {
 
 1. Fetch the idea. Return error if not found.
 2. If not `Archived`, return the idea as-is (idempotent).
-3. Set status to `Active` and clear `archived_at` to `None`.
-4. Return the updated `Idea`.
+3. Set status to `Active` and clear `archived_at` to `None` through an unarchive-specific repo helper. This is the only P044 path allowed to clear `archived_at`.
+4. Return `{ "idea": updated_idea, "journal_id": commanded.journal_id }` for MCP and `UnarchiveIdeaPayload { idea, journalId }` for GraphQL.
 
-**DB change:** `update_status` already sets `archived_at` conditionally when the new status is `Archived`. Extend it to clear `archived_at` when the new status is not `Archived`:
+**DB change:** do not make generic `update_status(..., Active)` clear `archived_at`. Current `StartRun` already calls `update_status(..., Active)`, so changing the generic helper to unconditional `archived_at = NULL` would let run start accidentally erase archive history. Split status writes into lifecycle-specific helpers instead:
 
 ```rust
-// In update_status, replace COALESCE logic:
-let archived_at: Option<String> = if matches!(status, IdeaStatus::Archived) {
-    Some(Utc::now().to_rfc3339())
-} else {
-    None  // This clears archived_at for unarchive
-};
-
-// SQL: UPDATE ideas SET status = ?1, archived_at = ?2 WHERE id = ?3
-// (unconditional set, not COALESCE)
+archive_if_no_active_runs(pool, idea_id, now)        // sets status=Archived, archived_at=now atomically
+unarchive(pool, idea_id)                             // sets status=Active, archived_at=NULL
+mark_active_from_valid_update(pool, idea_id)         // sets status=Active and preserves archived_at
 ```
+
+The existing generic `update_status` may be removed, made private to tests, or retained only with semantics that cannot clear `archived_at` except through `unarchive`.
 
 **GraphQL mutation:**
 
@@ -355,7 +381,7 @@ type Mutation {
    - `created_at`: `Utc::now()`.
    - `archived_at`: `None`.
 3. Insert via `ideas::insert`.
-4. Return the new `Idea`.
+4. Return `{ "idea": new_idea, "journal_id": commanded.journal_id }` for MCP and `DuplicateIdeaPayload { idea, journalId }` for GraphQL.
 
 **GraphQL mutation:**
 
@@ -456,16 +482,131 @@ All status transitions are governed by the following matrix:
 | Draft | Archived | `ideas.archive` | No non-terminal runs |
 | Active | Archived | `ideas.archive` | No non-terminal runs |
 | Archived | Active | `ideas.unarchive` | None |
+| Active | Active | `runs.start` | Idea is already Active and not archived |
 
 Transitions not listed are rejected. In particular:
 
 - Active-to-Draft is not allowed (ideas do not regress).
 - Direct status field writes via `ideas.update` are not allowed (use archive/unarchive tools).
 - Archived ideas cannot be updated (must unarchive first).
+- `runs.start` must not activate Draft ideas. Callers that want to start a run from a Draft must first use `ideas.update` to make title and body non-empty and observe the returned `Active` idea.
+- `runs.start` must reject Archived ideas. Callers must use `ideas.unarchive` first, which clears `archived_at` through the explicit unarchive path.
+- Duplicated ideas remain Draft and inert until explicitly activated by `ideas.update`.
 
-### 5.8 MCP tool registration
+### 5.8 `runs.start` lifecycle participation
 
-Add the five new tools to `tool_specs()` in `mcp-server/src/tools/ideas.rs` and extend the `execute` match arms. The capability tool ID for all idea tools maps to a new `CapabilityToolId::IdeasManage` variant (or reuse the existing tool-registration pattern if no capability gating is needed for ideas).
+`StartRun` is an existing journaled command and is already a lifecycle participant because current code promotes an idea to `Active` while creating a run. P044 makes this contract explicit and changes it from implicit promotion to eligibility validation:
+
+1. `CommandHandler::execute_command` for `StartRun` must load the idea inside the same command execution path that creates the run.
+2. It must reject missing ideas, Draft ideas, and Archived ideas before inserting a run.
+3. It must not call a generic `update_status(..., Active)` after run insertion.
+4. It must not clear or rewrite `archived_at`.
+5. If the command fails eligibility validation, it returns a failed command journal row and inserts no run.
+6. The run insert and the archive guard must use compatible locking/transaction semantics so an archive and a start cannot both succeed for the same idea when the resulting state would be an archived idea with a non-terminal run.
+
+This is an intentional behavior change from the current baseline: run start is allowed only for ideas that are already `Active`. Draft-to-Active remains owned by `ideas.update`, where title/body validation and journal readback are explicit.
+
+### 5.9 MCP tool registration
+
+Add the five new tools to `tool_specs()` in `mcp-server/src/tools/ideas.rs` and extend the `execute` match arms. Tool registration must use explicit capability IDs; do not reuse `IdeasList` or `IdeasCreate` for lifecycle writes.
+
+### 5.10 Capability and principal policy
+
+The current northbound auth model is exhaustive: every tool must have a `CapabilityToolId`, a converter mapping, inclusion in all-capability arrays, and class policy. P044 adds the following exact policy:
+
+| Surface | Operation | CapabilityToolId | Principal classes |
+|---|---|---|---|
+| MCP | `ideas.create` | `IdeasCreate` | Operator, Agent |
+| MCP | `ideas.list` | `IdeasRead` | Operator, Agent, Observer |
+| MCP | `ideas.get` | `IdeasRead` | Operator, Agent, Observer |
+| MCP / GraphQL | `ideas.update` / `updateIdea` | `IdeasUpdate` | Operator, Agent |
+| MCP / GraphQL | `ideas.archive` / `archiveIdea` | `IdeasArchive` | Operator, Agent |
+| MCP / GraphQL | `ideas.unarchive` / `unarchiveIdea` | `IdeasArchive` | Operator, Agent |
+| MCP / GraphQL | `ideas.duplicate` / `duplicateIdea` | `IdeasDuplicate` | Operator, Agent |
+
+`IdeasRead` replaces the existing `IdeasList` capability name for idea read access. After P044, converters must map `ideas.list` and `ideas.get` to `IdeasRead`; no new lifecycle write may use the old `IdeasList` read capability.
+
+Implementation requirements:
+
+- Replace `IdeasList` with `IdeasRead`, and add `IdeasUpdate`, `IdeasArchive`, and `IdeasDuplicate` to `domain::CapabilityToolId`.
+- Preserve serialized compatibility for the old read capability name. Current principal persistence stores token, id, and principal class rather than per-principal capability rows, but `CapabilityToolId` is serialized in northbound/debug surfaces and fixtures. Add a one-release `serde` alias from `"IdeasList"` to `IdeasRead`, or provide an explicit fixture migration; the gate must prove old serialized `IdeasList` payloads still read back as `IdeasRead`.
+- Update `auth::all_tool_capabilities()` and `auth::tool_allowed_for_class()` with the policy above.
+- Update `mcp-server/src/tools/mod.rs` `all_capability_tool_ids()`, `capability_id_for(tool_name)`, and `mcp_tool_for(id)`.
+- Update GraphQL `MutationName` and `capability_id_for(mutation)` so `updateIdea`, `archiveIdea`, `unarchiveIdea`, and `duplicateIdea` are authorized through the same capability IDs.
+- Add converter tests proving every new MCP tool and GraphQL mutation maps to the expected capability ID and class policy.
+
+### 5.11 Command and journal ownership
+
+Any GraphQL payload that includes `journalId` must be backed by a real `command_journal` row created by `CommandHandler::handle(Command, CallerContext)`. P044 therefore owns idea lifecycle writes in the command layer, not in direct resolver/tool DB writes.
+
+Add these command variants in `domain/src/commands.rs`:
+
+```rust
+pub enum Command {
+    // existing variants...
+    UpdateIdea(UpdateIdeaCmd),
+    ArchiveIdea(ArchiveIdeaCmd),
+    UnarchiveIdea(UnarchiveIdeaCmd),
+    DuplicateIdea(DuplicateIdeaCmd),
+}
+
+pub struct UpdateIdeaCmd {
+    pub idea_id: IdeaId,
+    pub title: PatchField<String>,
+    pub body: PatchField<String>,
+    pub workspace_root_path: PatchField<Option<String>>,
+    pub project_key: PatchField<Option<String>>,
+}
+
+pub struct ArchiveIdeaCmd {
+    pub idea_id: IdeaId,
+}
+
+pub struct UnarchiveIdeaCmd {
+    pub idea_id: IdeaId,
+}
+
+pub struct DuplicateIdeaCmd {
+    pub source_idea_id: IdeaId,
+    pub title_override: Option<String>,
+}
+```
+
+`PatchField<T>` is a small serializable domain helper with `Unchanged` and `Set(T)` variants. It is not exposed northbound; GraphQL `MaybeUndefined` and MCP JSON parameter presence are converted into it before command execution.
+
+Add `CommandResult` variants that carry the resulting idea so GraphQL and MCP can return the exact persisted row:
+
+```rust
+pub enum CommandResult {
+    // existing variants...
+    IdeaUpdated { idea: Idea },
+    IdeaArchived { idea: Idea },
+    IdeaUnarchived { idea: Idea },
+    IdeaDuplicated { idea: Idea },
+}
+```
+
+`CommandHandler::execute_command` owns:
+
+- archive active-run guard
+- archived-idea update rejection
+- Draft-to-Active validation and transition
+- unarchive `archived_at` clearing
+- duplicate creation
+- `StartRun` idea eligibility validation (`Active` only, not Draft or Archived)
+- archive/start atomicity so archive and start cannot race into invalid persisted truth
+- DB repo calls for the final write
+
+Journal behavior:
+
+- GraphQL `updateIdea`, `archiveIdea`, `unarchiveIdea`, and `duplicateIdea` call `CommandHandler::handle` with `CallerContext::graphql(...)` and return `commanded.journal_id`.
+- MCP `ideas.update`, `ideas.archive`, `ideas.unarchive`, and `ideas.duplicate` call `CommandHandler::handle` with `CallerContext::mcp(...)` and return `{ "idea": ..., "journal_id": ... }`.
+- `ideas.get` and `ideas.list` remain read-only and do not create command journal rows.
+- `StartRun` remains the existing run-scoped command. P044 does not add a new journal payload for it, but it does require the existing `StartRun` command journal to record validation failures when the idea is Draft or Archived.
+- `run_id_for_journal` is `None` for idea lifecycle commands because they are idea-scoped, not run-scoped.
+- `command_journal_redact::redact_for_journal` must cover the new command variants. Redact free-text and local-path patch values (`title`, `body`, `workspace_root_path`, `title_override`) while preserving field presence and IDs. `project_key` may remain visible because it is a cohort identifier.
+
+Resolvers and tools must not fabricate `journalId` values and must not write idea lifecycle changes directly through `db::repos::ideas` when a journaled command exists.
 
 ---
 
@@ -475,9 +616,17 @@ Add the five new tools to `tool_specs()` in `mcp-server/src/tools/ideas.rs` and 
 
 No schema migration required. The `ideas` table already has all columns: `id`, `title`, `body`, `workspace_root_path`, `project_key`, `status`, `created_at`, `archived_at`. The new repo functions operate on existing columns.
 
-### 6.2 `update_status` behavior change
+### 6.2 Status helper split
 
-The existing `update_status` function uses `COALESCE(?2, archived_at)` which preserves `archived_at` when the new value is NULL. For unarchive to work correctly, this must change to an unconditional set: `archived_at = ?2`. This is a backward-compatible change because the only callers today set `archived_at` when archiving and pass NULL otherwise (which COALESCE also handles as no-op on non-archived ideas).
+The existing `update_status` function uses `COALESCE(?2, archived_at)` and is currently called by `StartRun` with `IdeaStatus::Active`. P044 must not change that generic helper to unconditional `archived_at = ?2`; doing so would make `StartRun` capable of clearing archive metadata.
+
+Instead, the DB repo owns explicit lifecycle helpers:
+
+- `archive_if_no_active_runs`: atomically verifies no non-terminal runs and sets `status = Archived`, `archived_at = now`.
+- `unarchive`: sets `status = Active`, `archived_at = NULL`.
+- `update_fields`: applies patch fields and may promote Draft to Active while preserving `archived_at`.
+
+After these helpers exist, production command paths should stop using generic `update_status` for idea lifecycle transitions.
 
 ### 6.3 Existing `ideas.list` callers
 
@@ -489,40 +638,94 @@ New mutations are additive. Existing queries and mutations are unchanged. No cli
 
 ---
 
-## 7. Verification
+## 7. Implementation Inventory and Gate
 
-### 7.1 `ideas.get`
+### 7.1 Files to modify
+
+| File | Change |
+|---|---|
+| `domain/src/commands.rs` | Add idea lifecycle command structs, `PatchField`, and `Command` variants |
+| `domain/src/capabilities.rs` | Replace `IdeasList` with `IdeasRead`; add `IdeasUpdate`, `IdeasArchive`, `IdeasDuplicate` |
+| `db/src/repos/ideas.rs` | Add `update_fields`, `duplicate`, `list_filtered`, `archive_if_no_active_runs`, and `unarchive`; avoid generic `update_status` semantics that let `StartRun` clear `archived_at` |
+| `engine/src/command_handler.rs` | Add `CommandResult` variants, execute idea lifecycle commands with guards, and update `StartRun` to require an already-Active idea without mutating idea status |
+| `engine/src/command_journal_redact.rs` | Redact free-text/path fields for idea lifecycle commands |
+| `auth/src/lib.rs` | Update all-capability inventory, principal-class policy, and tool-name converter tests |
+| `mcp-server/src/tools/ideas.rs` | Add new tool specs, route lifecycle writes through `CommandHandler`, return real `journal_id` |
+| `mcp-server/src/tools/mod.rs` | Update exhaustive capability registration and tool lookup |
+| `graphql-server/src/schema.rs` | Add GraphQL mutations, `MaybeUndefined` patch input, mutation capability mapping, and `CommandHandler` routing |
+| `scripts/test-gate.sh` | Add distinct `proposal-044-ideas|p044-ideas` gate without changing existing `proposal-044|p044` |
+| `docs/reference/test-gates.md` | Document `proposal-044-ideas|p044-ideas` and preserve the existing Proposal 044 post-approval gate |
+| `docs/reference/idea-lifecycle.md` | Update lifecycle reference if needed so `runs.start` eligibility and Draft activation ownership match P044 |
+
+### 7.2 Canonical gate
+
+The canonical proof gate for this proposal is:
+
+```bash
+./scripts/test-gate.sh proposal-044-ideas
+```
+
+The runner must also accept `p044-ideas`. `./scripts/test-gate.sh proposal-044` and `p044` remain owned by the existing post-approval task execution/release gate and must not be changed by this proposal.
+
+The gate must include focused Rust/control-plane tests for:
+
+- idea command execution and command journal rows
+- GraphQL mutation `journalId` readback from real command journal IDs
+- MCP lifecycle write `journal_id` readback from real command journal IDs
+- capability converter and principal-class policy for all new idea tools and mutations
+- async-graphql `MaybeUndefined` patch behavior
+- lifecycle guards and list filtering
+- `StartRun` lifecycle eligibility, including Draft/Archived rejection and preservation of `archived_at`
+- archive/start race coverage proving the atomic guard cannot produce an archived idea with a non-terminal run
+- `IdeasList` serialized compatibility or fixture migration for the `IdeasRead` rename
+
+---
+
+## 8. Verification
+
+### 8.1 `ideas.get`
 
 - Calling `ideas.get` with a valid ID returns the full idea JSON.
 - Calling `ideas.get` with a non-existent UUID returns an error containing "not found".
 - Calling `ideas.get` with a malformed ID returns a parse error.
 
-### 7.2 `ideas.update`
+### 8.2 `ideas.update`
 
 - Sending only `{ "id": "...", "title": "New Title" }` updates the title and leaves body, workspace_root_path, and project_key unchanged.
 - Sending `{ "id": "...", "project_key": null }` clears the project_key field.
 - Updating a Draft idea to have non-empty title and body transitions it to Active automatically.
 - Updating an Archived idea returns an error mentioning "unarchive".
+- Updating `workspace_root_path` or `project_key` affects future idea readback only and does not mutate existing run workspace roots or release artifact metadata.
 
-### 7.3 `ideas.archive`
+### 8.3 `ideas.archive`
 
 - Archiving an Active idea with no runs succeeds. The returned idea has status "archived" and a non-null `archived_at`.
 - Archiving an idea with a `running` run returns an error listing the active run statuses.
 - Archiving an idea with only `completed` and `failed` runs succeeds.
 - Archiving an already-archived idea returns the idea unchanged (idempotent).
+- Archive/start interleaving cannot produce an archived idea with a newly inserted non-terminal run. At most one of the archive command and `StartRun` command succeeds when they race for the same idea.
 
-### 7.4 `ideas.unarchive`
+### 8.4 `ideas.unarchive`
 
 - Unarchiving an Archived idea returns it with status "active" and `archived_at` cleared to null.
 - Unarchiving a non-archived idea returns it unchanged (idempotent).
+- Unarchive is the only lifecycle path that clears `archived_at`.
 
-### 7.5 `ideas.duplicate`
+### 8.5 `runs.start` lifecycle eligibility
+
+- Starting a run from an Active idea succeeds and does not mutate idea status or `archived_at`.
+- Starting a run from a Draft idea fails before run insertion and returns a failed `StartRun` command journal row.
+- Starting a run from a duplicated Draft idea fails before run insertion; the duplicate remains Draft.
+- Starting a run from an Archived idea fails before run insertion and preserves the archived idea's `archived_at`.
+- A Draft idea can become eligible only after `ideas.update` promotes it to Active by setting non-empty title and body.
+
+### 8.6 `ideas.duplicate`
 
 - Duplicating an idea returns a new idea with a different ID, status "draft", fresh `created_at`, and title prefixed with "Copy of ".
 - Providing `title_override` uses that title instead of the prefix.
 - The source idea is not modified.
 
-### 7.6 Enhanced `ideas.list`
+### 8.7 Enhanced `ideas.list`
 
 - `ideas.list` with no parameters returns non-archived ideas (backward-compatible).
 - `ideas.list` with `{ "status": "draft" }` returns only Draft ideas.
@@ -530,21 +733,39 @@ New mutations are additive. Existing queries and mutations are unchanged. No cli
 - `ideas.list` with `{ "offset": 10, "limit": 5 }` returns at most 5 ideas starting from the 11th.
 - `ideas.list` with `{ "status": "archived" }` returns archived ideas regardless of `include_archived`.
 
-### 7.7 GraphQL parity
+### 8.8 GraphQL parity
 
 - `updateIdea`, `archiveIdea`, `unarchiveIdea`, `duplicateIdea` mutations succeed and return `journalId`.
 - The `ideas` query accepts `status`, `projectKey`, `offset`, `limit` arguments.
 - All guard rails (active-run check, archived-idea update rejection, Draft-to-Active auto-transition) apply identically in both MCP and GraphQL paths.
+- GraphQL `updateIdea` uses `MaybeUndefined` patch input semantics: omitted nullable fields remain unchanged, explicit `null` clears `workspaceRootPath`/`projectKey`, and explicit `null` for `title`/`body` is rejected.
+
+### 8.9 Command journal and auth proof
+
+- Every successful `updateIdea`, `archiveIdea`, `unarchiveIdea`, and `duplicateIdea` response has a `journalId` that exists in `command_journal`.
+- Failed idea lifecycle commands create a failed command journal row rather than returning a fabricated ID.
+- MCP `ideas.update`, `ideas.archive`, `ideas.unarchive`, and `ideas.duplicate` return `journal_id` from `CommandHandler::handle`.
+- `command_journal_redact` redacts configured idea free-text/path fields and preserves IDs/field presence.
+- `CapabilityToolId` converter tests cover `ideas.create`, `ideas.list`, `ideas.get`, `ideas.update`, `ideas.archive`, `ideas.unarchive`, and `ideas.duplicate`, including `ideas.list`/`ideas.get` -> `IdeasRead`.
+- Serialized capability compatibility tests cover old `"IdeasList"` payloads reading back as `IdeasRead` or the explicit fixture migration chosen by the implementation.
+- GraphQL mutation capability tests cover `updateIdea`, `archiveIdea`, `unarchiveIdea`, and `duplicateIdea`.
+- Principal class tests prove Observers can read ideas but cannot create, update, archive, unarchive, or duplicate; Operators and Agents can use the lifecycle tools.
+- `./scripts/test-gate.sh proposal-044-ideas` passes and `./scripts/test-gate.sh proposal-044` still points to the existing post-approval/release gate.
 
 ---
 
-## 8. Risks
+## 9. Risks
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | Active-run guard blocks legitimate archive when a run is stuck in `pending` | Low | The operator can cancel the stuck run first via `runs.cancel`, then archive. The error message lists the blocking statuses to guide the operator. |
 | Auto-transition from Draft to Active on update surprises callers | Low | The behavior is documented in the tool description. Callers that want to keep an idea in Draft can leave title or body empty. The transition is also visible in the returned idea's `status` field. |
-| Patch semantics for nullable fields (null vs. absent) are hard to express in JSON | Medium | The implementation distinguishes `"project_key": null` (clear) from key-absent (no change) by checking `params.get("project_key")` presence before reading the value. This is standard JSON Merge Patch (RFC 7396) behavior. |
+| Patch semantics for nullable fields (null vs. absent) are hard to express in GraphQL | Medium | MCP uses JSON key presence; GraphQL uses `async_graphql::MaybeUndefined<String>` and tests omitted vs explicit null behavior. |
 | `ideas.duplicate` could be used to create many junk ideas | Low | Duplication creates Draft ideas which are inert (cannot have runs started until they reach Active). Standard rate limiting and principal-based access control apply. |
-| Changing `update_status` COALESCE to unconditional set could clear `archived_at` unexpectedly | Low | The only callers of `update_status` are the archive/unarchive paths, which always provide the correct `archived_at` value. The new behavior is actually more correct: unarchive should clear the timestamp. |
+| A generic status helper could clear `archived_at` from an unrelated caller such as `StartRun` | High | Split lifecycle writes into archive/unarchive/update helpers. Only `unarchive` may clear `archived_at`; `StartRun` must stop mutating idea status. |
+| Archive and `StartRun` could race if the active-run check is not atomic | High | Implement archive guard and run start eligibility with compatible DB transaction/locking semantics and add race-focused tests to the proposal gate. |
+| Requiring Active before `StartRun` changes current implicit Draft promotion behavior | Medium | Make the behavior explicit in MCP/GraphQL errors and tests. Draft-to-Active remains available through `ideas.update`, where validation and journal ownership are clear. |
 | `ideas.list` with large offset on a big table is slow (SQLite OFFSET scans) | Low | The 200-row limit cap and the expected idea-set size (tens to low hundreds) make this a non-issue for the foreseeable future. Keyset pagination can be added later if needed. |
+| New lifecycle tools accidentally bypass command journaling | High | GraphQL and MCP write paths must route through `CommandHandler`; verification asserts returned journal IDs exist in `command_journal`. |
+| New idea tools get the wrong principal-class semantics | High | P044 adds explicit capability IDs and converter/class-policy tests instead of reusing `IdeasList` or `IdeasCreate`. |
+| Renaming `IdeasList` to `IdeasRead` breaks serialized fixtures/debug payloads | Medium | Keep a one-release serde alias or implement a fixture migration, and gate it with compatibility readback tests. |

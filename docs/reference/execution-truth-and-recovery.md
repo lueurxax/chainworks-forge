@@ -111,6 +111,67 @@ Readers must therefore interpret agent-level execution truth in this order:
 3. `transportErrorKind` and `providerStopReason` for transport/provider context,
 4. evidence payloads only as supporting detail.
 
+### Rust ACP runtime facts are durable execution truth
+
+The Rust control plane persists provider-independent runtime facts for every ACP-backed
+agent execution that reaches the engine-owned execution path. These facts are not log
+parsing and are not reconstructed from transcripts during readback.
+
+`agent_execution_runtime_facts` is the durable execution-facts row keyed by
+`agent_execution_id`. It records:
+
+- `failure_kind` as a stable `AgentFailureKind`,
+- `failure_kind_raw_debug` for future or provider-specific raw values,
+- `failure_message_redacted` and its redaction version,
+- `retry_after` and `operator_action_hint`,
+- provider process / transport diagnostics such as exit status, transport code, and
+  supervision classification,
+- `output_settlement`,
+- required-output validity and late-output counters,
+- session reuse reason,
+- `quota_ledger_id`,
+- creation and update timestamps.
+
+Current `AgentFailureKind` values include:
+
+- `provider_quota`
+- `provider_permission_required`
+- `provider_permission_rejected`
+- `provider_timeout`
+- `provider_internal_error`
+- `transport_epipe`
+- `transport_protocol_error`
+- `transport_closed`
+- `mcp_startup_timeout`
+- `mcp_permission_modal_stall`
+- `xcode_host_environment_error`
+- `missing_required_outputs`
+- `invalid_output_contract`
+- `cancelled_by_operator`
+- `superseded_by_retry`
+- `unknown`
+
+Rules:
+
+- unknown stored failure kinds map to public `unknown` while preserving the raw value
+  in operator-only debug readback,
+- non-operator GraphQL/MCP readers must receive `null` or omitted raw debug detail,
+- `quota_ledger_id` references the durable provider-quota retry ledger,
+- runtime facts are the preferred source for recovery action hints and report summaries,
+- output-settlement truth stays separate from failure-kind truth.
+
+`AgentOutputSettlement` captures what happened to declared outputs independently of
+why the provider finished:
+
+- `none`
+- `valid_outputs_from_completed_execution`
+- `valid_outputs_from_failed_execution`
+- `missing_required_outputs`
+- `invalid_required_outputs`
+- `ignored_late_outputs`
+
+`ignored_late_outputs` is settlement truth, not an `AgentFailureKind`.
+
 ## Stage Truth and Recovery Evidence
 
 ### `StageExecution` is the stage-level owner
@@ -147,6 +208,26 @@ It may narrow the operator action after a watchdog failure or exhausted retry, b
 - clone run from current config.
 
 `RunReportBuilder` and `RecoveryCoordinator` consume these snapshots directly when present and synthesize them from stage evidence only as a fallback.
+
+### Provider quota recovery uses a durable ledger
+
+Provider quota failures are classified as `provider_quota`, may persist `retry_after`,
+and are linked to `agent_retry_budget_ledger` through
+`agent_execution_runtime_facts.quota_ledger_id`.
+
+The retry ledger is idempotent per execution and records whether a retry waited for
+the provider reset window or explicitly consumed normal retry budget early. Stage
+retry handling must consult this ledger before resetting execution state so operators
+cannot accidentally hide quota exhaustion as an ordinary retry.
+
+Recovery snapshots should prefer runtime facts when selecting the next action:
+
+- `provider_quota` -> wait for `retry_after` or explicitly consume budget,
+- `provider_permission_required` -> provider authorization,
+- `mcp_permission_modal_stall` -> Xcode/MCP authorization,
+- `missing_required_outputs` -> inspect outputs then retry,
+- `invalid_required_outputs` -> inspect contract then retry,
+- `valid_outputs_from_failed_execution` -> accept degraded outputs or retry.
 
 ## Resume and Approval Restore
 
@@ -220,9 +301,10 @@ The narrower binding contract is documented in [provider-binding-truth.md](provi
 Current report/recovery readers should prefer:
 
 1. `AgentExecution` execution-truth columns,
-2. `StageExecution` failure and recovery payloads,
-3. run-level trust / provenance metadata,
-4. coarse legacy statuses only as compatibility fallback.
+2. Rust `agent_execution_runtime_facts` when present,
+3. `StageExecution` failure and recovery payloads,
+4. run-level trust / provenance metadata,
+5. coarse legacy statuses only as compatibility fallback.
 
 This keeps report timelines, failed-step summaries, retry hints, and resume guidance tied to persisted truth rather than heuristic rescans of historical artifacts.
 
@@ -236,7 +318,10 @@ High-signal proof owners include:
 - `OrchestratorTests` for persistence of canonical outcome, provider/model truth, and validation-after-output settlement,
 - `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 - `RecoveryCoordinatorTests` for narrow recovery action ownership,
-- failed-stage evidence and report/recovery fallback suites.
+- failed-stage evidence and report/recovery fallback suites,
+- `./scripts/test-gate.sh proposal-058` for Rust ACP runtime facts, claim/start ownership,
+  source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
+  retry ledger behavior.
 
 ## Adjacent References
 

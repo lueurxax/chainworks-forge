@@ -123,7 +123,26 @@ Pending -> WaitingApproval -> [approval] -> Running
 Pending -> Running -> tasks execute -> [complete] -> run marked Completed
 ```
 
-## Native Release Execution
+### Release gate UI
+
+`ReleaseGateView` is the operator-facing approval surface for the final gate. It must show enough context to make an informed decision:
+
+- proposal and workflow context,
+- review artifact availability,
+- repo identity, branch, and worktree,
+- release target,
+- quick actions around diff/worktree inspection.
+
+**Verification Truth:**
+When `implementation_self_assessment_v2` is available, `ReleaseGateView` uses its `verification_green` signal instead of legacy test results. This ensures the release gate does not show conflicting legacy test truth.
+
+**Blocked Status:**
+If the implementation self-assessment status is `blocked` (meaning code work is finished but verification is not green), `ReleaseGateView` displays a high-visibility warning row at the top of the Change Summary section.
+
+**Handoff Tasks:**
+Pending handoff tasks from the self-assessment are displayed when applicable. Handoff tasks with `blocking_review: true` use warning treatment and provide links to the full artifact or assessment panel.
+
+### Native Release Execution
 
 ### Release agents bypass ACP
 
@@ -133,7 +152,9 @@ This is the hard safety boundary for the release slice: agents may recommend rel
 
 ### Delivery configuration is frozen at run start
 
-Repo-backed release execution depends on the run's frozen `delivery_configuration_json`. That payload is accepted at the northbound start surfaces, persisted on `Run`, and deserialized fail-closed when the executor enters a release step.
+Repo-backed release execution depends on the run's frozen `delivery_configuration_json`. That payload is accepted at the northbound start surfaces, validated by delivery preflight, persisted on `Run`, and deserialized fail-closed when the executor enters a release step.
+
+Workflows that contain release agents (`commit_and_push_to_github` or `build_archive_and_push_connect`) require `delivery_configuration_json` at `StartRun`. If the payload is absent, `StartRun` returns a blocked delivery-preflight result and does not create a `Run` row.
 
 The frozen configuration is the only release input owner for:
 
@@ -212,7 +233,7 @@ Pre-release failures without release lineage do not get a metadata-only receipt.
 
 ### Missing delivery configuration fails closed
 
-If a repo-backed release step starts without valid `delivery_configuration_json`, the executor fails closed. The pre-release failure path does not synthesize an executor-side `delivery_receipt`.
+If a repo-backed release step still starts without valid `delivery_configuration_json`, the executor fails closed as a defensive last line of protection. The pre-release failure path settles the native release `AgentExecution` and `StageExecution` as failed, and does not synthesize an executor-side `delivery_receipt`.
 
 ### Git failure is terminal for publish
 

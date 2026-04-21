@@ -1,0 +1,213 @@
+version: 1
+schema: proposal-lifecycle-review.eval-suite
+coverage_note: "Union of 13 proposal-review-router scenarios and 10 proposal-implementation-audit scenarios; no source scenario was intentionally removed."
+
+scenarios:
+  - id: review-eval-001-apple-ios
+    source_skill: proposal-review-router
+    source_id: eval-001-apple-ios
+    prompt: "Review a proposal adding a SwiftUI onboarding flow with navigation state and analytics."
+    must_pass:
+      - "Read proposal and local evidence before routing."
+      - "Select ios_ui_reviewer and evidence-backed Apple reviewers only when warranted."
+      - "Do not select product_reviewer unless metrics or decision checkpoints are central."
+
+  - id: review-eval-002-apple-macos
+    source_skill: proposal-review-router
+    source_id: eval-002-apple-macos
+    prompt: "Review a proposal changing a macOS settings window toolbar/sidebar layout."
+    must_pass:
+      - "Select macos_ui_reviewer."
+      - "Select apple_ux_reviewer only with journey, trust, or accessibility evidence."
+      - "Reject absent Rust and Go stacks."
+
+  - id: review-eval-003-rust-service
+    source_skill: proposal-review-router
+    source_id: eval-003-rust-service
+    prompt: "Review a Rust proposal adding a worker retry path with idempotency keys and SQL migration."
+    must_pass:
+      - "Select rust_arch_reviewer."
+      - "Select rust_reliability_reviewer for retry, idempotency, or worker evidence."
+      - "Select observability_rollout_reviewer when migration or rollout evidence exists."
+
+  - id: review-eval-004-go-service
+    source_skill: proposal-review-router
+    source_id: eval-004-go-service
+    prompt: "Review a Go microservice proposal adding a public endpoint, auth middleware, protobuf response, and migration."
+    must_pass:
+      - "Select go_service_arch_reviewer."
+      - "Select go_security_reviewer for auth or public-boundary evidence."
+      - "Select api_contract_reviewer for protobuf or API evidence."
+      - "Keep reviewer count at or below 5."
+
+  - id: review-eval-005-cross-stack-contract
+    source_skill: proposal-review-router
+    source_id: eval-005-cross-stack-contract
+    prompt: "Review a proposal changing an Apple client request and Rust or Go backend response contract."
+    must_pass:
+      - "Select one primary reviewer per evidenced implementation stack."
+      - "Select api_contract_reviewer."
+      - "Record rejected alternatives."
+
+  - id: review-eval-006-rollout-observability
+    source_skill: proposal-review-router
+    source_id: eval-006-rollout-observability
+    prompt: "Review a proposal adding a feature flag, telemetry, staged rollout, and rollback plan."
+    must_pass:
+      - "Select observability_rollout_reviewer."
+      - "Check whether telemetry distinguishes old and new paths."
+      - "Include decision checkpoint when rollout is central."
+
+  - id: review-eval-007-research-gated
+    source_skill: proposal-review-router
+    source_id: eval-007-research-gated
+    prompt: "Research current platform guidance for a proposal after reading the local proposal and repo evidence."
+    must_pass:
+      - "Do not start research before the local evidence pack is sufficient."
+      - "Cite local research-trigger evidence IDs."
+      - "Record sources, freshness risk, and applicability."
+
+  - id: review-eval-008-baseline-fresh
+    source_skill: proposal-review-router
+    source_id: eval-008-baseline-fresh
+    prompt: "Review a proposal whose affected surfaces are covered by .review-baselines/current-system-baseline.md."
+    must_pass:
+      - "Mark relevant baseline slice reused."
+      - "Do not request a full baseline rebuild."
+      - "Keep current-code inspection narrow."
+
+  - id: review-eval-009-baseline-partial
+    source_skill: proposal-review-router
+    source_id: eval-009-baseline-partial
+    prompt: "Review a proposal where the baseline lacks the affected API or worker slice."
+    must_pass:
+      - "Mark baseline slice missing, stale, or partially refreshed with scope."
+      - "Recommend affected-slice integration context only."
+      - "Do not escalate into full runtime workflow by default."
+
+  - id: review-eval-010-product-opt-in
+    source_skill: proposal-review-router
+    source_id: eval-010-product-opt-in
+    prompt: "Review a technical migration proposal with no KPI or product decision language."
+    must_pass:
+      - "Do not select product_reviewer by default."
+      - "Mark product fields N/A when product review is not selected."
+      - "Select product_reviewer only when metrics or product decision language is central."
+
+  - id: review-eval-011-plugin-ready
+    source_skill: proposal-review-router
+    source_id: eval-011-plugin-ready
+    prompt: "Review a proposal in a repo with .codex/reviewers/custom.yaml, .codex/review-router.yaml, and .codex/agents/rust_arch_reviewer."
+    must_pass:
+      - "Load built-in registry first."
+      - "Merge repo-local reviewers second."
+      - "Apply routing overrides third."
+      - "Prefer exact repo-local reviewer agent ids."
+
+  - id: review-eval-012-single-stack
+    source_skill: proposal-review-router
+    source_id: eval-012-single-stack
+    prompt: "Review a Go-only repo proposal with no Apple or Rust evidence."
+    must_pass:
+      - "Consider only Go and necessary cross-cutting reviewers."
+      - "Do not select Apple or Rust reviewers."
+      - "Keep routing evidence-backed and under the hard cap."
+
+  - id: review-eval-013-static-final-template
+    source_skill: proposal-review-router
+    source_id: eval-013-static-final-template
+    prompt: "Static check proposal-review final template."
+    must_pass:
+      - "Template includes Selected reviewers."
+      - "Template includes Rejected close alternatives."
+      - "Template includes Leading metric, Guardrail metric, and Decision checkpoint."
+
+  - id: audit-reuse-rust-proposal-review-selection
+    source_skill: proposal-implementation-audit
+    source_id: reuse-rust-proposal-review-selection
+    prompt: "Use proposal-implementation-audit for docs/proposals/RUST_QUEUE_RETRY.md with prior proposal-review reuse."
+    must_pass:
+      - "Discover prior proposal-review artifacts beside the proposal."
+      - "Reuse rust_arch_reviewer and rust_reliability_reviewer when evidence still matches."
+      - "Add observability_rollout_reviewer only from rollout, flag, migration, telemetry, or rollback evidence."
+
+  - id: audit-go-security-delta-from-prior-routing
+    source_skill: proposal-implementation-audit
+    source_id: go-security-delta-from-prior-routing
+    prompt: "Audit a Go public API PR diff while reusing prior proposal-review selection."
+    must_pass:
+      - "Start from prior selected reviewers."
+      - "Detect auth, JWT, or request-validation changes."
+      - "Add or justify go_security_reviewer as a delta reviewer."
+
+  - id: audit-apple-ui-ux-implementation-proof
+    source_skill: proposal-implementation-audit
+    source_id: apple-ui-ux-implementation-proof
+    prompt: "Audit implementation for an iOS onboarding flow proposal."
+    must_pass:
+      - "Select Apple UI/UX reviewers only for user-visible iOS/macOS surfaces."
+      - "Distinguish code-level SwiftUI evidence from runtime, screenshot, or UI-test evidence."
+      - "Preserve Not Verifiable for critical UI flow without live proof."
+
+  - id: audit-cross-stack-client-server-contract
+    source_skill: proposal-implementation-audit
+    source_id: cross-stack-client-server-contract
+    prompt: "Audit a profile API v2 proposal against current client and backend implementation."
+    must_pass:
+      - "Route across client and backend surfaces when both are touched."
+      - "Include api_contract_reviewer."
+      - "Verify generated code and client-server compatibility."
+
+  - id: audit-implemented-but-not-ready
+    source_skill: proposal-implementation-audit
+    source_id: implemented-but-not-ready
+    prompt: "Audit implementation readiness for a migration rollout proposal."
+    must_pass:
+      - "Allow implemented conformance with lower readiness only with passing same-tree full regression or canonical gate evidence."
+      - "Include observability_rollout_reviewer for migration, rollback, or flag surfaces."
+      - "Produce OPS or READY findings when readiness is blocked."
+
+  - id: audit-successful-verdict-requires-full-regression
+    source_skill: proposal-implementation-audit
+    source_id: successful-verdict-requires-full-regression
+    prompt: "Audit a proposal where every requirement appears implemented but full regression evidence is missing."
+    must_pass:
+      - "Fail closed instead of reporting Overall Conformance = Implemented without same-tree full regression or canonical gate evidence."
+      - "Do not report Ready or Ready with Risks without passing same-tree gate evidence."
+      - "Record missing, stale, or failed gate in verification log and readiness checklist."
+
+  - id: audit-conformance-only-no-reviewer-drift
+    source_skill: proposal-implementation-audit
+    source_id: conformance-only-no-reviewer-drift
+    prompt: "Run conformance-only implementation audit for a scoped schema fix proposal."
+    must_pass:
+      - "Produce REQ audit without broad specialist review."
+      - "Mention specialist findings were skipped by mode."
+      - "Avoid generic code review drift."
+
+  - id: audit-prior-review-required-change-follow-through
+    source_skill: proposal-implementation-audit
+    source_id: prior-review-required-change-follow-through
+    prompt: "Audit an implementation where prior proposal review listed required changes before implementation."
+    must_pass:
+      - "Extract prior required changes."
+      - "Verify whether implementation addressed each change."
+      - "Do not treat prior review text as implementation proof."
+
+  - id: audit-performance-claim-needs-benchmark-proof
+    source_skill: proposal-implementation-audit
+    source_id: performance-claim-needs-benchmark-proof
+    prompt: "Audit a Rust streaming fast path proposal with performance claims."
+    must_pass:
+      - "Select rust_performance_reviewer for latency, throughput, or hot-path claims."
+      - "Distinguish benchmark files from benchmark results."
+      - "Mark performance requirements Not Verifiable or partial when benchmark proof is absent."
+
+  - id: audit-no-unrelated-review-sweep
+    source_skill: proposal-implementation-audit
+    source_id: no-unrelated-review-sweep
+    prompt: "Run diff-only implementation audit for a Go worker timeout proposal."
+    must_pass:
+      - "Stay focused on changed worker/reliability slice and adjacent context."
+      - "Avoid unrelated package or UI review."
+      - "Record evidence gaps instead of broadening the audit."

@@ -1,0 +1,34 @@
+version: 1
+schema: proposal-review-router.repo-routing-config
+
+routing:
+  target_reviewer_count: 3
+  hard_cap: 5
+  product_opt_in: true
+
+stack_aliases:
+  ios: []
+  macos: []
+  rust-backend: []
+  go-backend: []
+  shared-api: []
+
+path_overrides:
+  - pattern: "apps/ios/**"
+    add_stack_tags: [ios, apple-client]
+    add_surface_tags: []
+  - pattern: "services/**"
+    add_stack_tags: []
+    add_surface_tags: []
+
+reviewer_overrides:
+  force_include: []
+  force_exclude: []
+  prefer_agents: true
+
+baseline:
+  current_system_baseline: ".review-baselines/current-system-baseline.md"
+  proposal_review_dir_suffix: ".review"
+  refresh_policy: affected-slices-only
+
+notes: "Repo overrides must cite local evidence in the review output. Do not use this file to bypass evidence-backed routing."

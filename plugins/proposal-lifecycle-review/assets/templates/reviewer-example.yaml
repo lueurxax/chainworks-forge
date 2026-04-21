@@ -1,0 +1,25 @@
+version: 1
+schema: proposal-review-router.reviewer-plugin
+
+reviewers:
+  - id: custom_domain_reviewer
+    family: repo-local
+    display_name: Custom Domain Reviewer
+    mode: domain-only
+    stacks: []
+    surfaces: []
+    risks: []
+    mandatory_when:
+      any: []
+    strong_proposal_keywords: []
+    strong_repo_files: []
+    strong_repo_symbols: []
+    close_alternatives: []
+    usually_pair_with: []
+    rubric: .codex/reviewers/custom-domain-rubric.md
+    preferred_agent_names:
+      - custom_domain_reviewer
+
+notes:
+  - Keep built-in reviewer ids unchanged when overriding behavior.
+  - Add repo-specific reviewers only when the built-in lifecycle reviewers do not cover the domain.

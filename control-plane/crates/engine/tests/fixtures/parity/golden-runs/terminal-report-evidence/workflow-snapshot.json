@@ -1,0 +1,28 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "terminal-report-evidence",
+  "title": "Terminal Report Evidence",
+  "initial_state": "execute",
+  "states": [
+    {
+      "stage_id": "execute",
+      "label": "Execute",
+      "owner": "fixture_agent",
+      "outputs": [
+        "execution_evidence"
+      ],
+      "next_stage": "terminal_report",
+      "terminal": false
+    },
+    {
+      "stage_id": "terminal_report",
+      "label": "Terminal Report",
+      "owner": "fixture_agent",
+      "outputs": [
+        "terminal_report"
+      ],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

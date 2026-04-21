@@ -1,0 +1,62 @@
+version: 1
+
+# Place this at .codex/implementation-audit-router.yaml when a repo needs implementation-audit-specific routing.
+# Keep it thin. Prefer built-in reviewer ids and local aliases over copying the global registry.
+
+routing:
+  target_reviewer_count: 3
+  hard_cap: 5
+  reuse_prior_proposal_selection_by_default: true
+  prefer_diff_only_when_compare_base_present: true
+
+proposal_locations:
+  - docs/proposals
+  - proposals
+  - rfcs
+
+prior_review_locations:
+  - "<proposal>.review"
+  - docs/proposal-reviews
+  - .reviews
+
+implementation_targets:
+  default: current_worktree
+  compare_base_hint: main
+
+reviewer_overrides:
+  # Example:
+  # rust_reliability_reviewer:
+  #   mandatory_when_changed_files_match:
+  #     - "crates/**/worker/**"
+  #     - "**/*queue*.rs"
+  # go_security_reviewer:
+  #   mandatory_when_changed_files_match:
+  #     - "internal/**/auth/**"
+
+agent_overrides:
+  # reviewer_id: local_agent_name
+  # api_contract_reviewer: protobuf_contract_reviewer
+
+product_review:
+  default: opt_in
+  include_when_prior_review_has_metric_gate: true
+  include_when_changed_files_match:
+    - "**/*analytics*"
+    - "**/*experiment*"
+    - "**/*rollout*"
+
+validation_commands:
+  # Keep commands narrow and repo-specific.
+  # rust:
+  #   - cargo test -p <crate> <test_filter>
+  # go:
+  #   - go test ./internal/<pkg> -run <TestName>
+  # apple:
+  #   - xcodebuild -scheme <scheme> -destination '<destination>' test -only-testing:<target>/<test>
+
+forbidden_commands:
+  - rm -rf
+  - git push
+  - git reset --hard
+  - cargo publish
+  - go install ./...

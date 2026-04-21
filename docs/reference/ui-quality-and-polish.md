@@ -138,6 +138,7 @@ These surfaces now define the stable proof-owning UI quality baseline:
 | `RecoverySheet` | Interaction/runtime proof | recovery action discoverability and dismissal |
 | `RunStartOverridesView` | Preview | bounded secondary-surface consistency |
 | `WorkflowMapView` | Preview + runtime proof | stage-card affordance, status badges, topology readability |
+| `ImplementationSelfAssessmentPanel` | Preview + interaction/runtime proof | 2x2 metric grid, status-mapped icons, detail disclosure groups, accessibility summary |
 
 ## Minimum-window contract
 

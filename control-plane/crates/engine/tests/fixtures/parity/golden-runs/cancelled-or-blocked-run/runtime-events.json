@@ -1,0 +1,1 @@
+{"schema_version":"runtime-events.v1","stages":[{"stage_id":"blocked","label":"Blocked","status":"completed","attempt_number":1}],"artifacts":[{"name":"blocked_recovery","contract_id":"recovery.blocked","stage_id":"blocked","format":"json","report_kind":"failed_stage_evidence"}]}

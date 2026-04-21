@@ -22,6 +22,19 @@ pub struct PreflightCheck {
     pub detail: Option<String>,
 }
 
+pub fn missing_delivery_configuration_preflight() -> DeliveryPreflightResult {
+    DeliveryPreflightResult {
+        checks: vec![PreflightCheck {
+            id: "delivery_configuration_present".into(),
+            label: "Delivery configuration is present".into(),
+            passed: false,
+            detail: Some("release workflows require frozen delivery_configuration_json".into()),
+        }],
+        passed: false,
+        timestamp: Utc::now(),
+    }
+}
+
 pub fn run_delivery_preflight(config: &DeliveryConfiguration) -> DeliveryPreflightResult {
     let mut checks = Vec::new();
     checks.push(check_repo_root_exists(&config.repo_root));
