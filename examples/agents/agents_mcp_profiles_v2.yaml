@@ -1218,7 +1218,13 @@ agents:
 
       Write implementation_self_assessment as strict implementation_self_assessment_v2 JSON with implementation_complete, verification_green, remaining_code_tasks, handoff_tasks, known_risks, tests_run, and docs_impacted.
 
-      Put code-writer-owned source or test blockers only in remaining_code_tasks; put docs, manual evidence, release, ops, product, or human-operator work in handoff_tasks with owner_class, target_stage, blocking_review, and evidence.
+      Put code-writer-owned source or test blockers only in remaining_code_tasks; each entry must be an object with summary, owner, blocking, and evidence.
+
+      Put docs, manual evidence, release, ops, product, or human-operator work in handoff_tasks; each entry must be an object with summary, owner_class, target_stage, blocking_review, and evidence.
+
+      Use only these owner_class values: docs, manual_evidence, release, ops, product, human_operator, unknown. Do not use docs-agent, docs_agent, operator, security-owner, release-owner, or slash-qualified owner_class values.
+
+      known_risks, tests_run, and docs_impacted must be arrays of strings. Do not set docs_impacted to true or false.
 
       Do not use seemingly_complete or tests_result.green as transition truth.
 
