@@ -1,13 +1,15 @@
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifacts, ideas, projections, runs, stages, steward, validation,
+    agent_executions, approvals, artifacts, command_journal, ideas, projections, runs, scheduler,
+    stages, steward, validation, work_items,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::steward::{
@@ -1393,6 +1395,1083 @@ async fn test_file_backed_sqlite_durability_across_restart() {
 
         pool.close().await;
     }
+}
+
+#[tokio::test]
+async fn proposal_061_scheduler_foundation_tables_and_repos_round_trip() {
+    use sqlx::Row;
+
+    let pool = test_pool().await;
+    let rows = sqlx::query(
+        r#"SELECT name
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name IN (
+               'scheduler_service_state',
+               'scheduler_queue_summaries',
+               'scheduler_health_snapshots',
+               'scheduler_db_writer_observations',
+               'host_interruption_epochs',
+               'host_interruption_affected_executions'
+             )
+           ORDER BY name ASC"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let table_names: Vec<String> = rows.into_iter().map(|row| row.get("name")).collect();
+
+    assert_eq!(
+        table_names,
+        vec![
+            "host_interruption_affected_executions".to_string(),
+            "host_interruption_epochs".to_string(),
+            "scheduler_db_writer_observations".to_string(),
+            "scheduler_health_snapshots".to_string(),
+            "scheduler_queue_summaries".to_string(),
+            "scheduler_service_state".to_string(),
+        ]
+    );
+    assert!(scheduler::list_queue_summaries(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let now = Utc::now();
+    let state = scheduler::SchedulerServiceState {
+        scope: "global".into(),
+        scope_id: "".into(),
+        last_served_at: Some(now),
+        last_claimed_work_item_id: Some("work-123".into()),
+        updated_at: now,
+    };
+    scheduler::upsert_service_state(&pool, &state)
+        .await
+        .unwrap();
+    let stored_state = scheduler::get_service_state(&pool, "global", "")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_state.scope, state.scope);
+    assert_eq!(
+        stored_state.last_claimed_work_item_id,
+        state.last_claimed_work_item_id
+    );
+
+    let snapshot = scheduler::SchedulerHealthSnapshot {
+        id: "snapshot-1".into(),
+        queued_count: 3,
+        oldest_queued_age_ms: 15_000,
+        global_queue_depth: 7,
+        active_agent_executions: 2,
+        db_writer_wait_p95_ms: Some(42),
+        command_latency_p95_ms_json: Some(
+            r#"{"approve_stage":120,"retry_stage":180,"cancel_run":90}"#.into(),
+        ),
+        last_host_interruption_epoch_id: Some("epoch-latest".into()),
+        sustained_backpressure_state: "clear".into(),
+        stale_after_ms: 60_000,
+        updated_at: now,
+    };
+    scheduler::insert_health_snapshot(&pool, &snapshot)
+        .await
+        .unwrap();
+    let latest = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.id, snapshot.id);
+    assert_eq!(latest.queued_count, snapshot.queued_count);
+    assert_eq!(latest.db_writer_wait_p95_ms, Some(42));
+    assert_eq!(
+        latest.command_latency_p95_ms_json,
+        snapshot.command_latency_p95_ms_json
+    );
+    assert_eq!(
+        latest.last_host_interruption_epoch_id,
+        Some("epoch-latest".into())
+    );
+    assert!(!latest.is_stale_at(now + chrono::Duration::milliseconds(59_999)));
+    assert!(latest.is_stale_at(now + chrono::Duration::milliseconds(60_000)));
+}
+
+#[tokio::test]
+async fn proposal_061_scheduler_refresh_populates_runtime_health_metrics() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    for offset in 0..100 {
+        scheduler::record_db_writer_wait_observation(
+            &pool,
+            "fixture_writer_wait",
+            77,
+            now - chrono::Duration::milliseconds(offset),
+        )
+        .await
+        .unwrap();
+    }
+
+    for millis in 1..=20 {
+        let created_at = now - chrono::Duration::seconds(60 - millis);
+        let completed_at = created_at + chrono::Duration::milliseconds(millis);
+        let id = format!("approve-latency-{millis}");
+        command_journal::record(
+            &pool,
+            &id,
+            "ApproveStage",
+            "{}",
+            None,
+            created_at,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        command_journal::complete_entry(&pool, &id, completed_at)
+            .await
+            .unwrap();
+    }
+
+    for millis in [5_i64, 10, 15, 20] {
+        let created_at = now - chrono::Duration::seconds(120 - millis);
+        let completed_at = created_at + chrono::Duration::milliseconds(millis);
+        let id = format!("retry-latency-{millis}");
+        command_journal::record(
+            &pool,
+            &id,
+            "RetryStage",
+            "{}",
+            None,
+            created_at,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        command_journal::complete_entry(&pool, &id, completed_at)
+            .await
+            .unwrap();
+    }
+
+    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
+        .await
+        .unwrap();
+
+    let latest = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("scheduler health snapshot");
+    assert_eq!(latest.db_writer_wait_p95_ms, Some(77));
+
+    let latency_json = latest
+        .command_latency_p95_ms_json
+        .expect("command latency p95 json");
+    let latency: serde_json::Value = serde_json::from_str(&latency_json).unwrap();
+    assert_eq!(latency["approve_stage"], 19);
+    assert_eq!(latency["retry_stage"], 20);
+    assert!(latency["cancel_run"].is_null());
+
+    assert_eq!(
+        scheduler::latest_db_writer_wait_p95_ms(&pool)
+            .await
+            .unwrap(),
+        Some(77)
+    );
+    assert_eq!(
+        scheduler::command_latency_p95_ms_json(&pool).await.unwrap(),
+        Some(latency_json)
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_sustained_backpressure_requires_two_snapshots_to_fire_and_clear() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(&pool, IdeaId::new(), run_id, stage_execution_id, now).await;
+    insert_pending_invoke_agent_work(
+        &pool,
+        "sustained-backpressure-work",
+        run_id,
+        stage_execution_id,
+        "codex",
+        now - chrono::Duration::minutes(6),
+    )
+    .await;
+
+    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
+        .await
+        .unwrap();
+    let first_high = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("first high-pressure snapshot");
+    assert_eq!(first_high.sustained_backpressure_state, "pending_active");
+
+    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
+        .await
+        .unwrap();
+    let second_high = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("second high-pressure snapshot");
+    assert_eq!(second_high.sustained_backpressure_state, "active");
+    let notification = scheduler::latest_backpressure_notification(&pool)
+        .await
+        .unwrap()
+        .expect("active backpressure notification");
+    assert_eq!(notification.run_id, Some(run_id.to_string()));
+    assert_eq!(
+        notification.stage_execution_id,
+        Some(stage_execution_id.to_string())
+    );
+    assert_eq!(notification.provider_family.as_deref(), Some("codex"));
+    assert_eq!(notification.state, "active");
+
+    sqlx::query(
+        "UPDATE work_items SET status = 'cancelled' WHERE id = 'sustained-backpressure-work'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
+        .await
+        .unwrap();
+    let first_clear = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("first clear snapshot");
+    assert_eq!(first_clear.sustained_backpressure_state, "pending_clear");
+
+    scheduler::refresh_queue_summaries(&pool, &InvokeAgentCapacityConfig::default())
+        .await
+        .unwrap();
+    let second_clear = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("second clear snapshot");
+    assert_eq!(second_clear.sustained_backpressure_state, "clear");
+    let clear_notification = scheduler::latest_backpressure_notification(&pool)
+        .await
+        .unwrap()
+        .expect("clear backpressure notification");
+    assert_eq!(clear_notification.state, "clear");
+    assert_eq!(clear_notification.top_reason, "clear");
+    assert_eq!(clear_notification.global_queue_depth, 0);
+}
+
+#[tokio::test]
+async fn proposal_061_host_interruption_readback_round_trip_by_run() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let agent_execution_id = AgentExecutionId::new();
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"INSERT INTO ideas (id, title, body, status, created_at)
+           VALUES (?1, 'Host interruption idea', 'body', 'active', ?2)"#,
+    )
+    .bind(idea_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO runs
+           (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+           VALUES (?1, ?2, 'running', 'wf-p061-host', 'Host interruption workflow', '/tmp/ws', '/tmp/art', ?3)"#,
+    )
+    .bind(run_id.to_string())
+    .bind(idea_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO stage_executions
+           (id, run_id, stage_id, label, status, started_at)
+           VALUES (?1, ?2, 'stage-p061-host', 'Host interruption stage', 'running', ?3)"#,
+    )
+    .bind(stage_execution_id.to_string())
+    .bind(run_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
+           VALUES (?1, ?2, 'agent-p061-host', 'codex', 'codex', 'running', ?3)"#,
+    )
+    .bind(agent_execution_id.to_string())
+    .bind(stage_execution_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    scheduler::insert_host_interruption_epoch(
+        &pool,
+        &scheduler::HostInterruptionEpoch {
+            id: "epoch-sleep-1".into(),
+            kind: "sleep_wake".into(),
+            started_at: now - chrono::Duration::seconds(90),
+            ended_at: Some(now - chrono::Duration::seconds(30)),
+            monotonic_gap_ms: Some(60_000),
+            wall_clock_gap_ms: Some(90_000),
+            details_json: Some(r#"{"source":"wall_clock_gap"}"#.into()),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    scheduler::insert_host_interruption_affected_execution(
+        &pool,
+        &scheduler::HostInterruptionAffectedExecution {
+            epoch_id: "epoch-sleep-1".into(),
+            agent_execution_id: agent_execution_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            stage_execution_id: stage_execution_id.to_string(),
+            provider_family: Some("codex".into()),
+            action: "recovering_from_system_sleep".into(),
+            retry_enqueued_at: Some(now + chrono::Duration::seconds(5)),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let readback = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(readback.len(), 1);
+    assert_eq!(readback[0].epoch.kind, "sleep_wake");
+    assert_eq!(
+        readback[0].affected_executions[0].agent_execution_id,
+        agent_execution_id.to_string()
+    );
+    assert_eq!(
+        readback[0].affected_executions[0].action,
+        "recovering_from_system_sleep"
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_queue_summary_upsert_and_zero_count_cleanup_round_trip() {
+    let pool = test_pool().await;
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    let summary = scheduler::SchedulerQueueSummary {
+        scope: "run".into(),
+        scope_id: run_id.to_string(),
+        run_id: Some(run_id.to_string()),
+        stage_execution_id: Some(stage_execution_id.to_string()),
+        provider_family: Some("gemini".into()),
+        top_reason: "provider_capacity".into(),
+        queued_count: 4,
+        oldest_queued_age_ms: 30_000,
+        global_queue_depth: 11,
+        stale_after_ms: 60_000,
+        updated_at: now,
+    };
+
+    scheduler::upsert_queue_summary(&pool, &summary)
+        .await
+        .unwrap();
+
+    let by_run = scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(by_run.len(), 1);
+    assert_eq!(by_run[0].provider_family.as_deref(), Some("gemini"));
+    assert_eq!(by_run[0].queued_count, 4);
+    assert_eq!(by_run[0].global_queue_depth, 11);
+    assert!(!by_run[0].is_stale_at(now + chrono::Duration::milliseconds(59_999)));
+    assert!(by_run[0].is_stale_at(now + chrono::Duration::milliseconds(60_000)));
+
+    let by_stage = scheduler::list_queue_summaries_by_stage(&pool, &stage_execution_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(by_stage, by_run);
+
+    let cleared = scheduler::SchedulerQueueSummary {
+        queued_count: 0,
+        updated_at: now + chrono::Duration::milliseconds(1),
+        ..summary
+    };
+    scheduler::upsert_queue_summary(&pool, &cleared)
+        .await
+        .unwrap();
+
+    assert!(scheduler::list_queue_summaries(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn proposal_061_capacity_claim_skips_blocked_invoke_agent_and_refreshes_projection() {
+    use std::collections::BTreeMap;
+
+    use sqlx::Row;
+
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let idea_id = IdeaId::new();
+    let blocked_run_id = RunId::new();
+    let blocked_stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(
+        &pool,
+        idea_id,
+        blocked_run_id,
+        blocked_stage_execution_id,
+        now,
+    )
+    .await;
+    let eligible_run_id = RunId::new();
+    let eligible_stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(
+        &pool,
+        IdeaId::new(),
+        eligible_run_id,
+        eligible_stage_execution_id,
+        now,
+    )
+    .await;
+
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
+           VALUES ('active-gemini', ?1, 'agent-active', 'gemini', 'gemini', 'running', ?2)"#,
+    )
+    .bind(blocked_stage_execution_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    insert_pending_invoke_agent_work(
+        &pool,
+        "blocked-gemini-work",
+        blocked_run_id,
+        blocked_stage_execution_id,
+        "gemini",
+        now,
+    )
+    .await;
+    insert_pending_invoke_agent_work(
+        &pool,
+        "eligible-codex-work",
+        eligible_run_id,
+        eligible_stage_execution_id,
+        "codex",
+        now + chrono::Duration::milliseconds(1),
+    )
+    .await;
+
+    let capacity = InvokeAgentCapacityConfig {
+        global_active_agent_executions: 20,
+        per_run_active_agent_executions: 4,
+        provider_caps: BTreeMap::from([
+            (ProviderFamily::Claude, 8),
+            (ProviderFamily::Gemini, 1),
+            (ProviderFamily::Codex, 1),
+            (ProviderFamily::Auggie, 1),
+            (ProviderFamily::Junie, 1),
+        ]),
+    };
+
+    scheduler::refresh_queue_summaries(&pool, &capacity)
+        .await
+        .unwrap();
+    let blocked_summary =
+        scheduler::list_queue_summaries_by_run(&pool, &blocked_run_id.to_string())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.top_reason == "provider_capacity")
+            .expect("blocked run should have provider-capacity summary");
+    assert_eq!(blocked_summary.provider_family.as_deref(), Some("gemini"));
+    assert_eq!(blocked_summary.queued_count, 1);
+    assert_eq!(blocked_summary.global_queue_depth, 2);
+
+    let claimed = work_items::claim_next_with_invoke_agent_capacity(&pool, &capacity)
+        .await
+        .unwrap()
+        .expect("eligible later candidate should be claimed");
+    assert_eq!(claimed.id, "eligible-codex-work");
+
+    let statuses = sqlx::query(
+        r#"SELECT id, status
+           FROM work_items
+           WHERE id IN ('blocked-gemini-work', 'eligible-codex-work')
+           ORDER BY id ASC"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(statuses[0].get::<String, _>("id"), "blocked-gemini-work");
+    assert_eq!(statuses[0].get::<String, _>("status"), "pending");
+    assert_eq!(statuses[1].get::<String, _>("id"), "eligible-codex-work");
+    assert_eq!(statuses[1].get::<String, _>("status"), "running");
+
+    let global_state = scheduler::get_service_state(&pool, "global", "")
+        .await
+        .unwrap()
+        .expect("global scheduler service state");
+    assert_eq!(
+        global_state.last_claimed_work_item_id.as_deref(),
+        Some("eligible-codex-work")
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_capacity_claim_prefers_least_recently_served_run_within_window() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let recently_served_run_id = RunId::new();
+    let recently_served_stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(
+        &pool,
+        IdeaId::new(),
+        recently_served_run_id,
+        recently_served_stage_execution_id,
+        now,
+    )
+    .await;
+    let least_recently_served_run_id = RunId::new();
+    let least_recently_served_stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(
+        &pool,
+        IdeaId::new(),
+        least_recently_served_run_id,
+        least_recently_served_stage_execution_id,
+        now,
+    )
+    .await;
+
+    scheduler::upsert_service_state(
+        &pool,
+        &scheduler::SchedulerServiceState {
+            scope: "run".into(),
+            scope_id: recently_served_run_id.to_string(),
+            last_served_at: Some(now),
+            last_claimed_work_item_id: Some("recently-served-previous".into()),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    scheduler::upsert_service_state(
+        &pool,
+        &scheduler::SchedulerServiceState {
+            scope: "run".into(),
+            scope_id: least_recently_served_run_id.to_string(),
+            last_served_at: Some(now - chrono::Duration::seconds(60)),
+            last_claimed_work_item_id: Some("least-recently-served-previous".into()),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    insert_pending_invoke_agent_work(
+        &pool,
+        "recently-served-work",
+        recently_served_run_id,
+        recently_served_stage_execution_id,
+        "codex",
+        now - chrono::Duration::seconds(2),
+    )
+    .await;
+    insert_pending_invoke_agent_work(
+        &pool,
+        "least-recently-served-work",
+        least_recently_served_run_id,
+        least_recently_served_stage_execution_id,
+        "codex",
+        now - chrono::Duration::seconds(1),
+    )
+    .await;
+
+    let claimed = work_items::claim_next_with_invoke_agent_capacity(
+        &pool,
+        &InvokeAgentCapacityConfig::default(),
+    )
+    .await
+    .unwrap()
+    .expect("eligible least-recently-served run candidate should be claimed");
+    assert_eq!(claimed.id, "least-recently-served-work");
+
+    let least_recently_served_state =
+        scheduler::get_service_state(&pool, "run", &least_recently_served_run_id.to_string())
+            .await
+            .unwrap()
+            .expect("least-recently-served run state");
+    assert_eq!(
+        least_recently_served_state
+            .last_claimed_work_item_id
+            .as_deref(),
+        Some("least-recently-served-work")
+    );
+
+    let recently_served_work = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM work_items WHERE id = 'recently-served-work'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recently_served_work, "pending");
+}
+
+#[tokio::test]
+async fn proposal_061_capacity_claim_reports_all_blocked_window_without_claiming() {
+    use std::collections::BTreeMap;
+
+    use sqlx::Row;
+
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(&pool, IdeaId::new(), run_id, stage_execution_id, now).await;
+
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
+           VALUES ('active-codex', ?1, 'agent-active', 'codex', 'codex', 'running', ?2)"#,
+    )
+    .bind(stage_execution_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    insert_pending_invoke_agent_work(
+        &pool,
+        "blocked-codex-work-1",
+        run_id,
+        stage_execution_id,
+        "codex",
+        now - chrono::Duration::seconds(10),
+    )
+    .await;
+    insert_pending_invoke_agent_work(
+        &pool,
+        "blocked-codex-work-2",
+        run_id,
+        stage_execution_id,
+        "codex",
+        now - chrono::Duration::seconds(5),
+    )
+    .await;
+
+    let capacity = InvokeAgentCapacityConfig {
+        global_active_agent_executions: 20,
+        per_run_active_agent_executions: 4,
+        provider_caps: BTreeMap::from([
+            (ProviderFamily::Claude, 8),
+            (ProviderFamily::Gemini, 4),
+            (ProviderFamily::Codex, 1),
+            (ProviderFamily::Auggie, 1),
+            (ProviderFamily::Junie, 1),
+        ]),
+    };
+
+    let result = work_items::claim_next_with_invoke_agent_capacity_result(&pool, &capacity)
+        .await
+        .unwrap();
+    assert!(result.item.is_none());
+    assert!(result.all_invoke_agent_candidates_blocked);
+
+    let statuses = sqlx::query(
+        r#"SELECT id, status
+           FROM work_items
+           WHERE id IN ('blocked-codex-work-1', 'blocked-codex-work-2')
+           ORDER BY id ASC"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses
+        .iter()
+        .all(|row| row.get::<String, _>("status") == "pending"));
+
+    assert!(scheduler::get_service_state(&pool, "global", "")
+        .await
+        .unwrap()
+        .is_none());
+
+    scheduler::refresh_queue_summaries(&pool, &capacity)
+        .await
+        .unwrap();
+    let summary = scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.top_reason == "provider_capacity")
+        .expect("blocked candidate window should refresh provider-capacity summary");
+    assert_eq!(summary.provider_family.as_deref(), Some("codex"));
+    assert_eq!(summary.queued_count, 2);
+    assert_eq!(summary.global_queue_depth, 2);
+}
+
+#[tokio::test]
+async fn proposal_061_queue_position_hint_reports_non_eta_run_and_stage_position() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let first_run_id = RunId::new();
+    let first_stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(
+        &pool,
+        IdeaId::new(),
+        first_run_id,
+        first_stage_execution_id,
+        now,
+    )
+    .await;
+    let target_run_id = RunId::new();
+    let target_stage_execution_id = StageExecutionId::new();
+    seed_minimal_stage(
+        &pool,
+        IdeaId::new(),
+        target_run_id,
+        target_stage_execution_id,
+        now,
+    )
+    .await;
+
+    insert_pending_invoke_agent_work(
+        &pool,
+        "first-work",
+        first_run_id,
+        first_stage_execution_id,
+        "claude",
+        now - chrono::Duration::seconds(30),
+    )
+    .await;
+    insert_pending_invoke_agent_work(
+        &pool,
+        "target-work-oldest",
+        target_run_id,
+        target_stage_execution_id,
+        "codex",
+        now - chrono::Duration::seconds(20),
+    )
+    .await;
+    insert_pending_invoke_agent_work(
+        &pool,
+        "target-work-newer",
+        target_run_id,
+        target_stage_execution_id,
+        "gemini",
+        now - chrono::Duration::seconds(10),
+    )
+    .await;
+
+    let run_hint = scheduler::queue_position_hint_by_run(&pool, &target_run_id.to_string())
+        .await
+        .unwrap()
+        .expect("target run should have queue position hint");
+    assert_eq!(run_hint.scope, "run");
+    assert_eq!(run_hint.scope_id, target_run_id.to_string());
+    assert_eq!(run_hint.queue_position, 2);
+    assert_eq!(run_hint.queued_ahead_count, 1);
+    assert_eq!(run_hint.global_queue_depth, 3);
+    assert_eq!(run_hint.scoped_queued_count, 2);
+    assert!(run_hint.oldest_queued_age_ms >= 20_000);
+
+    let stage_hint =
+        scheduler::queue_position_hint_by_stage(&pool, &target_stage_execution_id.to_string())
+            .await
+            .unwrap()
+            .expect("target stage should have queue position hint");
+    assert_eq!(stage_hint.scope, "stage");
+    assert_eq!(
+        stage_hint.stage_execution_id.as_deref(),
+        Some(target_stage_execution_id.to_string().as_str())
+    );
+    assert_eq!(stage_hint.queue_position, 2);
+    assert_eq!(stage_hint.scoped_queued_count, 2);
+}
+
+#[tokio::test]
+async fn proposal_061_agent_execution_insert_canonicalizes_provider_family() {
+    use sqlx::Row;
+
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    seed_minimal_stage(&pool, idea_id, run_id, stage_execution_id, now).await;
+
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id,
+        agent_id: "code_writer".into(),
+        provider: "codex_acp".into(),
+        model: None,
+        started_at: now,
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+    };
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let stored = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.provider, "codex");
+
+    let row = sqlx::query("SELECT provider, provider_family FROM agent_executions WHERE id = ?1")
+        .bind(execution.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("provider"), "codex");
+    assert_eq!(row.get::<String, _>("provider_family"), "codex");
+}
+
+#[tokio::test]
+async fn proposal_061_hot_index_query_plans_cover_scheduler_scans() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    seed_minimal_stage(&pool, idea_id, run_id, stage_execution_id, now).await;
+
+    for i in 0..1000 {
+        sqlx::query(
+            r#"INSERT INTO work_items
+               (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
+               VALUES (?1, 'invoke_agent', '{}', 'pending', ?2, ?3, ?4, ?5)"#,
+        )
+        .bind(format!("p061-work-{i}"))
+        .bind(run_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind(now.to_rfc3339())
+        .bind((now + chrono::Duration::milliseconds(i)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for i in 0..500 {
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
+               VALUES (?1, ?2, ?3, 'gemini', 'gemini', 'running', ?4)"#,
+        )
+        .bind(format!("p061-agent-{i}"))
+        .bind(stage_execution_id.to_string())
+        .bind(format!("agent-{i}"))
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for i in 0..20 {
+        let id = StageExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, started_at)
+               VALUES (?1, ?2, ?3, ?4, 'pending', ?5)"#,
+        )
+        .bind(id.to_string())
+        .bind(run_id.to_string())
+        .bind(format!("stage-extra-{i}"))
+        .bind(format!("Stage extra {i}"))
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let work_plan = explain_details(
+        &pool,
+        r#"EXPLAIN QUERY PLAN
+           SELECT id FROM work_items
+           WHERE kind = 'invoke_agent' AND status = 'pending' AND scheduled_at <= '9999'
+           ORDER BY scheduled_at ASC
+           LIMIT 50"#,
+    )
+    .await;
+    assert!(
+        work_plan.contains("idx_work_items_kind_status_scheduled_at"),
+        "work item global scan should use hot index, got {work_plan}"
+    );
+
+    let run_work_plan = explain_details(
+        &pool,
+        &format!(
+            r#"EXPLAIN QUERY PLAN
+               SELECT id FROM work_items
+               WHERE run_id = '{}' AND status = 'pending' AND kind = 'invoke_agent' AND scheduled_at <= '9999'
+               ORDER BY scheduled_at ASC
+               LIMIT 50"#,
+            run_id
+        ),
+    )
+    .await;
+    assert!(
+        run_work_plan.contains("idx_work_items_run_status_kind_scheduled_at"),
+        "run-local work item scan should use hot index, got {run_work_plan}"
+    );
+
+    let agent_provider_plan = explain_details(
+        &pool,
+        r#"EXPLAIN QUERY PLAN
+           SELECT id FROM agent_executions
+           WHERE status = 'running' AND provider_family = 'gemini'"#,
+    )
+    .await;
+    assert!(
+        agent_provider_plan.contains("idx_agent_executions_status_provider_family"),
+        "agent provider active-count scan should use hot index, got {agent_provider_plan}"
+    );
+
+    let agent_status_plan = explain_details(
+        &pool,
+        r#"EXPLAIN QUERY PLAN
+           SELECT id FROM agent_executions
+           WHERE status = 'running'"#,
+    )
+    .await;
+    assert!(
+        agent_status_plan.contains("idx_agent_executions_status"),
+        "agent status active-count scan should use hot index, got {agent_status_plan}"
+    );
+
+    let stage_plan = explain_details(
+        &pool,
+        &format!(
+            r#"EXPLAIN QUERY PLAN
+               SELECT id FROM stage_executions
+               WHERE run_id = '{}'
+               ORDER BY id ASC"#,
+            run_id
+        ),
+    )
+    .await;
+    assert!(
+        stage_plan.contains("idx_stage_executions_run_id_id"),
+        "stage run lookup should use hot index, got {stage_plan}"
+    );
+}
+
+async fn explain_details(pool: &sqlx::SqlitePool, sql: &str) -> String {
+    use sqlx::Row;
+
+    let rows = sqlx::query(sql).fetch_all(pool).await.unwrap();
+    rows.into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn insert_pending_invoke_agent_work(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    run_id: RunId,
+    stage_execution_id: StageExecutionId,
+    provider: &str,
+    scheduled_at: chrono::DateTime<Utc>,
+) {
+    let payload = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "stage_id": "stage-p061",
+        "stage_execution_id": stage_execution_id.to_string(),
+        "agent_id": format!("{provider}-agent"),
+        "provider": provider,
+    });
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
+           VALUES (?1, 'invoke_agent', ?2, 'pending', ?3, 'stage-p061', ?4, ?5)"#,
+    )
+    .bind(id)
+    .bind(payload.to_string())
+    .bind(run_id.to_string())
+    .bind(scheduled_at.to_rfc3339())
+    .bind(scheduled_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_minimal_stage(
+    pool: &sqlx::SqlitePool,
+    idea_id: IdeaId,
+    run_id: RunId,
+    stage_execution_id: StageExecutionId,
+    now: chrono::DateTime<Utc>,
+) {
+    sqlx::query(
+        r#"INSERT INTO ideas (id, title, body, status, created_at)
+           VALUES (?1, 'P061 idea', 'body', 'active', ?2)"#,
+    )
+    .bind(idea_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"INSERT INTO runs
+           (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+           VALUES (?1, ?2, 'running', 'wf-p061', 'P061', '/tmp/ws', '/tmp/art', ?3)"#,
+    )
+    .bind(run_id.to_string())
+    .bind(idea_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"INSERT INTO stage_executions
+           (id, run_id, stage_id, label, status, started_at)
+           VALUES (?1, ?2, 'stage-p061', 'Stage P061', 'running', ?3)"#,
+    )
+    .bind(stage_execution_id.to_string())
+    .bind(run_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ pub mod command_journal;
 pub mod ideas;
 pub mod projections;
 pub mod runs;
+pub mod scheduler;
 pub mod sessions;
 pub mod stages;
 pub mod startup_repairs;

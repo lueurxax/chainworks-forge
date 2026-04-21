@@ -43,4 +43,16 @@ pub enum DomainEvent {
         /// "session_started" | "session_completed" | "session_failed"
         event_kind: String,
     },
+    SchedulerBackpressureChanged {
+        run_id: Option<String>,
+        stage_execution_id: Option<String>,
+        provider_family: Option<String>,
+        top_reason: String,
+        queued_count: i64,
+        oldest_queued_age_ms: i64,
+        global_queue_depth: i64,
+        state: String,
+        updated_at: String,
+        is_stale: bool,
+    },
 }

@@ -37,6 +37,16 @@ use crate::session::fingerprint::{
 use crate::session::policy::{ensure_policy, SessionPolicyDecision, SessionPolicyInput};
 use crate::work_queue::WorkQueue;
 
+const IDLE_POLL_DELAYS: [Duration; 5] = [
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+];
+const BACKPRESSURED_POLL_DELAY: Duration = Duration::from_millis(500);
+const CLAIM_ERROR_DELAY: Duration = Duration::from_millis(500);
+
 pub struct BackgroundExecutor {
     pool: SqlitePool,
     work_queue: WorkQueue,
@@ -44,6 +54,38 @@ pub struct BackgroundExecutor {
     acp: Arc<AcpRuntimeManager>,
     events: EventSender,
     steward_runtime_inputs: Option<Arc<crate::steward::config::StewardRuntimeInputs>>,
+}
+
+#[derive(Default)]
+struct WorkQueuePollBackoff {
+    consecutive_empty_claims: usize,
+}
+
+impl WorkQueuePollBackoff {
+    fn reset(&mut self) {
+        self.consecutive_empty_claims = 0;
+    }
+
+    fn next_empty_delay(&mut self, all_invoke_agent_candidates_blocked: bool) -> Duration {
+        if all_invoke_agent_candidates_blocked {
+            self.reset();
+            return BACKPRESSURED_POLL_DELAY;
+        }
+
+        let index = self
+            .consecutive_empty_claims
+            .min(IDLE_POLL_DELAYS.len() - 1);
+        self.consecutive_empty_claims = self
+            .consecutive_empty_claims
+            .saturating_add(1)
+            .min(IDLE_POLL_DELAYS.len() - 1);
+        IDLE_POLL_DELAYS[index]
+    }
+
+    fn claim_error_delay(&mut self) -> Duration {
+        self.consecutive_empty_claims = IDLE_POLL_DELAYS.len() - 1;
+        CLAIM_ERROR_DELAY
+    }
 }
 
 struct BackgroundStewardAgentExecutor {
@@ -378,9 +420,18 @@ impl BackgroundExecutor {
 
     async fn run_loop(self: &Arc<Self>) {
         info!("BackgroundExecutor: starting work loop");
+        let mut poll_backoff = WorkQueuePollBackoff::default();
         loop {
-            match self.work_queue.claim_next().await {
-                Ok(Some(item)) => {
+            match self.work_queue.claim_next_with_status().await {
+                Ok(claim) => {
+                    let Some(item) = claim.item else {
+                        let delay = poll_backoff
+                            .next_empty_delay(claim.all_invoke_agent_candidates_blocked);
+                        self.work_queue.wait_for_wake_or_timeout(delay).await;
+                        continue;
+                    };
+
+                    poll_backoff.reset();
                     let item_id = item.id.clone();
                     let kind = item.kind.clone();
                     info!(item_id = %item_id, kind = %kind, "Processing work item");
@@ -425,12 +476,9 @@ impl BackgroundExecutor {
                         }
                     }
                 }
-                Ok(None) => {
-                    sleep(Duration::from_millis(100)).await;
-                }
                 Err(e) => {
                     error!(error = %e, "Error claiming next work item");
-                    sleep(Duration::from_millis(500)).await;
+                    sleep(poll_backoff.claim_error_delay()).await;
                 }
             }
         }
@@ -473,15 +521,14 @@ impl BackgroundExecutor {
                     .to_string();
 
                 // provider is required — no "stub" fallback.
-                let provider = payload["provider"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "InvokeAgent payload missing 'provider' field; \
+                let provider_alias = payload["provider"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "InvokeAgent payload missing 'provider' field; \
                              set CHAINWORKS_DEFAULT_PROVIDER or include 'provider' in the payload"
-                        )
-                    })?
-                    .to_string();
+                    )
+                })?;
+                let provider =
+                    domain::provider::ProviderFamily::canonicalize_alias(provider_alias)?;
 
                 // Build the ACP request from the run record (workspace_root lives there).
                 let run = db::repos::runs::find_by_id(&self.pool, run_id)
@@ -2341,6 +2388,27 @@ fn normalize_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposal_061_poll_backoff_distinguishes_idle_and_capacity_backpressure() {
+        let mut backoff = WorkQueuePollBackoff::default();
+
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(25));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(50));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(100));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(200));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(500));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(500));
+
+        assert_eq!(backoff.next_empty_delay(true), Duration::from_millis(500));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(25));
+
+        assert_eq!(backoff.claim_error_delay(), Duration::from_millis(500));
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(500));
+
+        backoff.reset();
+        assert_eq!(backoff.next_empty_delay(false), Duration::from_millis(25));
+    }
 
     #[test]
     fn materialize_declared_outputs_writes_machine_and_companion_payloads() {

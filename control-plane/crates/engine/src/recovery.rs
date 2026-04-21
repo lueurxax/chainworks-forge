@@ -3,7 +3,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use db::repos::{agent_executions, runs, stages, startup_repairs};
+use db::repos::{agent_executions, runs, stages, startup_repairs, work_items};
 use db::work_item::WorkItemKind;
 use domain::run::Run;
 use domain::stage::StageStatus;
@@ -127,12 +127,24 @@ impl RecoveryService {
             );
             // Mark as blocked so we can retry safely
             stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+            let cancelled_executions =
+                agent_executions::cancel_running_by_stage(&self.pool, stage.id, now).await?;
+            let requeued_invoke_work = work_items::requeue_running_invoke_agent_by_stage(
+                &self.pool,
+                run.id,
+                &stage.stage_id,
+                stage.id,
+                now,
+            )
+            .await?;
             let drift_details = serde_json::json!({
                 "source": "startup_repair",
                 "reason": "stage_stuck_running",
                 "stage_execution_id": stage.id.to_string(),
                 "stage_id": stage.stage_id,
                 "action": "marked_blocked_for_operator_retry",
+                "cancelled_running_agent_executions": cancelled_executions,
+                "requeued_running_invoke_agent_work_items": requeued_invoke_work,
             });
             runs::update_drift_detection(&self.pool, run.id, now, &drift_details.to_string())
                 .await?;
@@ -167,6 +179,7 @@ impl RecoveryService {
                 now,
             )
             .await;
+            requeued += requeued_invoke_work as usize;
         }
 
         if !running_stages.is_empty() {

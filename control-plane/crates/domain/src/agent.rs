@@ -37,6 +37,63 @@ impl std::str::FromStr for AgentStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFailureKind {
+    HostInterruption,
+}
+
+impl std::fmt::Display for AgentFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentFailureKind::HostInterruption => write!(f, "host_interruption"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentFailureKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "host_interruption" => Ok(AgentFailureKind::HostInterruption),
+            other => Err(format!("Unknown AgentFailureKind: {other}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorActionHint {
+    RecoveringFromSystemSleep,
+    ResumingAfterNetworkChange,
+}
+
+impl std::fmt::Display for OperatorActionHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperatorActionHint::RecoveringFromSystemSleep => {
+                write!(f, "recovering_from_system_sleep")
+            }
+            OperatorActionHint::ResumingAfterNetworkChange => {
+                write!(f, "resuming_after_network_change")
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for OperatorActionHint {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "recovering_from_system_sleep" => Ok(OperatorActionHint::RecoveringFromSystemSleep),
+            "resuming_after_network_change" => Ok(OperatorActionHint::ResumingAfterNetworkChange),
+            other => Err(format!("Unknown OperatorActionHint: {other}")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentExecution {
     pub id: AgentExecutionId,

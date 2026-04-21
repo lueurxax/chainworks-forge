@@ -1,4 +1,5 @@
 pub mod cancellation;
+pub mod capacity;
 pub mod command_handler;
 pub mod command_journal_redact;
 pub mod contracts;
@@ -6,6 +7,7 @@ pub mod domain_engine;
 pub mod event_bus;
 pub mod evidence;
 pub mod executor;
+pub mod host_interruption;
 pub mod mcp;
 pub mod orchestrator;
 pub mod preflight;

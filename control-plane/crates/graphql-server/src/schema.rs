@@ -5,7 +5,7 @@ use async_graphql::*;
 use sqlx::SqlitePool;
 use tokio_stream::wrappers::BroadcastStream;
 
-use db::repos::{approvals, ideas, projections, runs, steward as steward_repo};
+use db::repos::{approvals, ideas, projections, runs, scheduler, steward as steward_repo};
 use domain::commands::{
     ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
     StartRunCmd,
@@ -41,6 +41,241 @@ pub fn build_schema(
 }
 
 pub struct QueryRoot;
+
+fn require_scheduler_read(ctx: &Context<'_>) -> Result<()> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized: no principal in context"))?;
+    if auth::filter_tools(principal, &[domain::CapabilityToolId::ReportsGet]).len() == 1 {
+        Ok(())
+    } else {
+        Err(Error::new("forbidden"))
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct GqlSchedulerHealthSummary {
+    pub queued_count: i64,
+    pub oldest_queued_age_ms: i64,
+    pub global_queue_depth: i64,
+    pub active_agent_executions: i64,
+    pub db_writer_wait_p95_ms: Option<i64>,
+    pub command_latency_p95_ms_json: Option<String>,
+    pub last_host_interruption_epoch_id: Option<String>,
+    pub sustained_backpressure_state: String,
+    pub stale_after_ms: i64,
+    pub updated_at: String,
+    pub is_stale: bool,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlDbWriterContentionSummary {
+    pub db_writer_wait_p95_ms: Option<i64>,
+    pub stale_after_ms: i64,
+    pub updated_at: String,
+    pub is_stale: bool,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlCommandLatencySummary {
+    pub command_latency_p95_ms_json: Option<String>,
+    pub stale_after_ms: i64,
+    pub updated_at: String,
+    pub is_stale: bool,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlSchedulerQueueSummary {
+    pub scope: String,
+    pub scope_id: String,
+    pub run_id: Option<String>,
+    pub stage_execution_id: Option<String>,
+    pub provider_family: Option<String>,
+    pub top_reason: String,
+    pub queued_count: i64,
+    pub oldest_queued_age_ms: i64,
+    pub global_queue_depth: i64,
+    pub stale_after_ms: i64,
+    pub updated_at: String,
+    pub is_stale: bool,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlSchedulerProviderActiveCount {
+    pub provider_family: String,
+    pub active_count: i64,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlSchedulerQueuePositionHint {
+    pub scope: String,
+    pub scope_id: String,
+    pub run_id: Option<String>,
+    pub stage_execution_id: Option<String>,
+    pub queue_position: i64,
+    pub global_queue_depth: i64,
+    pub queued_ahead_count: i64,
+    pub scoped_queued_count: i64,
+    pub oldest_queued_age_ms: i64,
+    pub updated_at: String,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlSchedulerBackpressureEvent {
+    pub run_id: Option<String>,
+    pub stage_execution_id: Option<String>,
+    pub provider_family: Option<String>,
+    pub top_reason: String,
+    pub queued_count: i64,
+    pub oldest_queued_age_ms: i64,
+    pub global_queue_depth: i64,
+    pub state: String,
+    pub updated_at: String,
+    pub is_stale: bool,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlHostInterruptionAffectedExecution {
+    pub epoch_id: String,
+    pub agent_execution_id: String,
+    pub run_id: Option<String>,
+    pub stage_execution_id: String,
+    pub provider_family: Option<String>,
+    pub action: String,
+    pub retry_enqueued_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(SimpleObject)]
+pub struct GqlHostInterruptionEpoch {
+    pub id: String,
+    pub kind: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub monotonic_gap_ms: Option<i64>,
+    pub wall_clock_gap_ms: Option<i64>,
+    pub details_json: Option<String>,
+    pub created_at: String,
+    pub affected_executions: Vec<GqlHostInterruptionAffectedExecution>,
+}
+
+impl From<scheduler::SchedulerProviderActiveCount> for GqlSchedulerProviderActiveCount {
+    fn from(count: scheduler::SchedulerProviderActiveCount) -> Self {
+        Self {
+            provider_family: count.provider_family,
+            active_count: count.active_count,
+        }
+    }
+}
+
+fn gql_scheduler_health(snapshot: scheduler::SchedulerHealthSnapshot) -> GqlSchedulerHealthSummary {
+    let now = chrono::Utc::now();
+    let is_stale = snapshot.is_stale_at(now);
+    GqlSchedulerHealthSummary {
+        queued_count: snapshot.queued_count,
+        oldest_queued_age_ms: snapshot.oldest_queued_age_ms,
+        global_queue_depth: snapshot.global_queue_depth,
+        active_agent_executions: snapshot.active_agent_executions,
+        db_writer_wait_p95_ms: snapshot.db_writer_wait_p95_ms,
+        command_latency_p95_ms_json: snapshot.command_latency_p95_ms_json,
+        last_host_interruption_epoch_id: snapshot.last_host_interruption_epoch_id,
+        sustained_backpressure_state: snapshot.sustained_backpressure_state,
+        stale_after_ms: snapshot.stale_after_ms,
+        updated_at: snapshot.updated_at.to_rfc3339(),
+        is_stale,
+    }
+}
+
+fn gql_db_writer_contention(
+    snapshot: scheduler::SchedulerHealthSnapshot,
+) -> GqlDbWriterContentionSummary {
+    let now = chrono::Utc::now();
+    let is_stale = snapshot.is_stale_at(now);
+    GqlDbWriterContentionSummary {
+        db_writer_wait_p95_ms: snapshot.db_writer_wait_p95_ms,
+        stale_after_ms: snapshot.stale_after_ms,
+        updated_at: snapshot.updated_at.to_rfc3339(),
+        is_stale,
+    }
+}
+
+fn gql_command_latency(snapshot: scheduler::SchedulerHealthSnapshot) -> GqlCommandLatencySummary {
+    let now = chrono::Utc::now();
+    let is_stale = snapshot.is_stale_at(now);
+    GqlCommandLatencySummary {
+        command_latency_p95_ms_json: snapshot.command_latency_p95_ms_json,
+        stale_after_ms: snapshot.stale_after_ms,
+        updated_at: snapshot.updated_at.to_rfc3339(),
+        is_stale,
+    }
+}
+
+fn gql_scheduler_queue_summary(
+    summary: scheduler::SchedulerQueueSummary,
+) -> GqlSchedulerQueueSummary {
+    let now = chrono::Utc::now();
+    let is_stale = summary.is_stale_at(now);
+    GqlSchedulerQueueSummary {
+        scope: summary.scope,
+        scope_id: summary.scope_id,
+        run_id: summary.run_id,
+        stage_execution_id: summary.stage_execution_id,
+        provider_family: summary.provider_family,
+        top_reason: summary.top_reason,
+        queued_count: summary.queued_count,
+        oldest_queued_age_ms: summary.oldest_queued_age_ms,
+        global_queue_depth: summary.global_queue_depth,
+        stale_after_ms: summary.stale_after_ms,
+        updated_at: summary.updated_at.to_rfc3339(),
+        is_stale,
+    }
+}
+
+fn gql_scheduler_queue_position_hint(
+    hint: scheduler::SchedulerQueuePositionHint,
+) -> GqlSchedulerQueuePositionHint {
+    GqlSchedulerQueuePositionHint {
+        scope: hint.scope,
+        scope_id: hint.scope_id,
+        run_id: hint.run_id,
+        stage_execution_id: hint.stage_execution_id,
+        queue_position: hint.queue_position,
+        global_queue_depth: hint.global_queue_depth,
+        queued_ahead_count: hint.queued_ahead_count,
+        scoped_queued_count: hint.scoped_queued_count,
+        oldest_queued_age_ms: hint.oldest_queued_age_ms,
+        updated_at: hint.updated_at.to_rfc3339(),
+    }
+}
+
+fn gql_host_interruption_epoch(
+    readback: scheduler::HostInterruptionEpochReadback,
+) -> GqlHostInterruptionEpoch {
+    GqlHostInterruptionEpoch {
+        id: readback.epoch.id,
+        kind: readback.epoch.kind,
+        started_at: readback.epoch.started_at.to_rfc3339(),
+        ended_at: readback.epoch.ended_at.map(|value| value.to_rfc3339()),
+        monotonic_gap_ms: readback.epoch.monotonic_gap_ms,
+        wall_clock_gap_ms: readback.epoch.wall_clock_gap_ms,
+        details_json: readback.epoch.details_json,
+        created_at: readback.epoch.created_at.to_rfc3339(),
+        affected_executions: readback
+            .affected_executions
+            .into_iter()
+            .map(|affected| GqlHostInterruptionAffectedExecution {
+                epoch_id: affected.epoch_id,
+                agent_execution_id: affected.agent_execution_id,
+                run_id: affected.run_id,
+                stage_execution_id: affected.stage_execution_id,
+                provider_family: affected.provider_family,
+                action: affected.action,
+                retry_enqueued_at: affected.retry_enqueued_at.map(|value| value.to_rfc3339()),
+                created_at: affected.created_at.to_rfc3339(),
+            })
+            .collect(),
+    }
+}
 
 #[Object]
 impl QueryRoot {
@@ -195,6 +430,140 @@ impl QueryRoot {
             .into_iter()
             .map(GqlStewardRecommendation::from)
             .collect())
+    }
+
+    async fn scheduler_health_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlSchedulerHealthSummary>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(gql_scheduler_health))
+    }
+
+    async fn db_writer_contention_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlDbWriterContentionSummary>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(gql_db_writer_contention))
+    }
+
+    async fn command_latency_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlCommandLatencySummary>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(gql_command_latency))
+    }
+
+    async fn active_execution_counts_by_provider(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<GqlSchedulerProviderActiveCount>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::list_active_execution_counts_by_provider(pool)
+            .await?
+            .into_iter()
+            .map(GqlSchedulerProviderActiveCount::from)
+            .collect())
+    }
+
+    async fn queued_backpressured_counts_by_provider_and_reason(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<GqlSchedulerQueueSummary>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::list_queue_summaries(pool)
+            .await?
+            .into_iter()
+            .filter(|summary| summary.scope == "global")
+            .map(gql_scheduler_queue_summary)
+            .collect())
+    }
+
+    async fn run_queue_summary(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlSchedulerQueueSummary>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_queue_summaries_by_run(pool, run_id.as_str())
+                .await?
+                .into_iter()
+                .map(gql_scheduler_queue_summary)
+                .collect(),
+        )
+    }
+
+    async fn stage_queue_summary(
+        &self,
+        ctx: &Context<'_>,
+        stage_execution_id: ID,
+    ) -> Result<Vec<GqlSchedulerQueueSummary>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_queue_summaries_by_stage(pool, stage_execution_id.as_str())
+                .await?
+                .into_iter()
+                .map(gql_scheduler_queue_summary)
+                .collect(),
+        )
+    }
+
+    async fn run_queue_position_hint(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Option<GqlSchedulerQueuePositionHint>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::queue_position_hint_by_run(pool, run_id.as_str())
+            .await?
+            .map(gql_scheduler_queue_position_hint))
+    }
+
+    async fn stage_queue_position_hint(
+        &self,
+        ctx: &Context<'_>,
+        stage_execution_id: ID,
+    ) -> Result<Option<GqlSchedulerQueuePositionHint>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::queue_position_hint_by_stage(pool, stage_execution_id.as_str())
+                .await?
+                .map(gql_scheduler_queue_position_hint),
+        )
+    }
+
+    async fn host_interruption_epochs(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlHostInterruptionEpoch>> {
+        require_scheduler_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_host_interruption_epochs_by_run(pool, run_id.as_str())
+                .await?
+                .into_iter()
+                .map(gql_host_interruption_epoch)
+                .collect(),
+        )
     }
 }
 
@@ -636,6 +1005,50 @@ impl SubscriptionRoot {
         }))
     }
 
+    async fn scheduler_backpressure_changed(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<
+        impl async_graphql::futures_util::Stream<Item = Result<GqlSchedulerBackpressureEvent>>,
+    > {
+        require_scheduler_read(ctx)?;
+        let events = ctx.data::<EventSender>()?.clone();
+
+        let rx = events.subscribe();
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
+            let fut = async move {
+                let event = msg.ok()?;
+                match event {
+                    DomainEvent::SchedulerBackpressureChanged {
+                        run_id,
+                        stage_execution_id,
+                        provider_family,
+                        top_reason,
+                        queued_count,
+                        oldest_queued_age_ms,
+                        global_queue_depth,
+                        state,
+                        updated_at,
+                        is_stale,
+                    } => Some(Ok(GqlSchedulerBackpressureEvent {
+                        run_id,
+                        stage_execution_id,
+                        provider_family,
+                        top_reason,
+                        queued_count,
+                        oldest_queued_age_ms,
+                        global_queue_depth,
+                        state,
+                        updated_at,
+                        is_stale,
+                    })),
+                    _ => None,
+                }
+            };
+            fut
+        }))
+    }
+
     /// Live stream of ACP runtime/session lifecycle events.
     /// Emits on session_started, session_completed, and session_failed.
     /// Required for the SwiftUI thin-client's runtime health surface (P027 §8.1).
@@ -705,7 +1118,7 @@ mod tests {
     use async_graphql::Request;
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifacts, ideas, projections, runs, steward};
+    use db::repos::{artifacts, ideas, projections, runs, scheduler, steward};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -1277,6 +1690,405 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("repo_root_exists"));
+    }
+
+    #[tokio::test]
+    async fn proposal_061_scheduler_graphql_readback_tests() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let now = Utc::now();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        scheduler::insert_health_snapshot(
+            &pool,
+            &scheduler::SchedulerHealthSnapshot {
+                id: "scheduler-health-graphql".into(),
+                queued_count: 3,
+                oldest_queued_age_ms: 310_000,
+                global_queue_depth: 3,
+                active_agent_executions: 20,
+                db_writer_wait_p95_ms: Some(37),
+                command_latency_p95_ms_json: Some(
+                    r#"{"approve_stage":120,"retry_stage":180,"cancel_run":90}"#.into(),
+                ),
+                last_host_interruption_epoch_id: Some("graphql-host-epoch".into()),
+                sustained_backpressure_state: "active".into(),
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::upsert_queue_summary(
+            &pool,
+            &scheduler::SchedulerQueueSummary {
+                scope: "global".into(),
+                scope_id: "".into(),
+                run_id: None,
+                stage_execution_id: None,
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 210_000,
+                global_queue_depth: 3,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::upsert_queue_summary(
+            &pool,
+            &scheduler::SchedulerQueueSummary {
+                scope: "run".into(),
+                scope_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: None,
+                provider_family: Some("claude".into()),
+                top_reason: "run_capacity".into(),
+                queued_count: 1,
+                oldest_queued_age_ms: 180_000,
+                global_queue_depth: 3,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::upsert_queue_summary(
+            &pool,
+            &scheduler::SchedulerQueueSummary {
+                scope: "stage".into(),
+                scope_id: stage_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: Some(stage_execution_id.to_string()),
+                provider_family: Some("claude".into()),
+                top_reason: "run_capacity".into(),
+                queued_count: 1,
+                oldest_queued_age_ms: 180_000,
+                global_queue_depth: 3,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let ahead_payload = serde_json::json!({
+            "run_id": RunId::new().to_string(),
+            "stage_id": "stage-ahead",
+            "stage_execution_id": domain::ids::StageExecutionId::new().to_string(),
+            "agent_id": "claude-agent",
+            "provider": "claude",
+        });
+        sqlx::query(
+            r#"INSERT INTO work_items
+               (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
+               VALUES ('graphql-ahead-work', 'invoke_agent', ?1, 'pending', ?2, 'stage-ahead', ?3, ?4)"#,
+        )
+        .bind(ahead_payload.to_string())
+        .bind(ahead_payload["run_id"].as_str().unwrap())
+        .bind((now - chrono::Duration::seconds(30)).to_rfc3339())
+        .bind((now - chrono::Duration::seconds(30)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let target_payload = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "stage_id": "stage-p061",
+            "stage_execution_id": stage_execution_id.to_string(),
+            "agent_id": "codex-agent",
+            "provider": "codex",
+        });
+        sqlx::query(
+            r#"INSERT INTO work_items
+               (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
+               VALUES ('graphql-target-work', 'invoke_agent', ?1, 'pending', ?2, 'stage-p061', ?3, ?4)"#,
+        )
+        .bind(target_payload.to_string())
+        .bind(run_id.to_string())
+        .bind((now - chrono::Duration::seconds(15)).to_rfc3339())
+        .bind((now - chrono::Duration::seconds(15)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, started_at)
+               VALUES (?1, ?2, 'stage-host', 'Host interruption stage', 'running', ?3)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
+               VALUES (?1, ?2, 'agent-host', 'codex', 'codex', 'running', ?3)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_epoch(
+            &pool,
+            &scheduler::HostInterruptionEpoch {
+                id: "graphql-host-epoch".into(),
+                kind: "network_migration".into(),
+                started_at: now - chrono::Duration::seconds(70),
+                ended_at: Some(now - chrono::Duration::seconds(20)),
+                monotonic_gap_ms: Some(50_000),
+                wall_clock_gap_ms: Some(70_000),
+                details_json: Some(r#"{"path":"wifi"}"#.into()),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_affected_execution(
+            &pool,
+            &scheduler::HostInterruptionAffectedExecution {
+                epoch_id: "graphql-host-epoch".into(),
+                agent_execution_id: agent_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: stage_execution_id.to_string(),
+                provider_family: Some("codex".into()),
+                action: "resuming_after_network_change".into(),
+                retry_enqueued_at: None,
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query SchedulerReadback {{
+                  schedulerHealthSummary {{
+                    queuedCount
+                    oldestQueuedAgeMs
+                    dbWriterWaitP95Ms
+                    commandLatencyP95MsJson
+                    lastHostInterruptionEpochId
+                    sustainedBackpressureState
+                    isStale
+                  }}
+                  dbWriterContentionSummary {{
+                    dbWriterWaitP95Ms
+                    isStale
+                  }}
+                  commandLatencySummary {{
+                    commandLatencyP95MsJson
+                    isStale
+                  }}
+                  queuedBackpressuredCountsByProviderAndReason {{
+                    scope
+                    providerFamily
+                    topReason
+                    queuedCount
+                  }}
+                  runQueueSummary(runId: "{run_id}") {{
+                    scope
+                    topReason
+                    queuedCount
+                  }}
+                  stageQueueSummary(stageExecutionId: "{stage_execution_id}") {{
+                    scope
+                    stageExecutionId
+                    topReason
+                  }}
+                  runQueuePositionHint(runId: "{run_id}") {{
+                    scope
+                    queuePosition
+                    queuedAheadCount
+                    globalQueueDepth
+                  }}
+                  stageQueuePositionHint(stageExecutionId: "{stage_execution_id}") {{
+                    scope
+                    stageExecutionId
+                    queuePosition
+                  }}
+                  activeExecutionCountsByProvider {{
+                    providerFamily
+                    activeCount
+                  }}
+                  hostInterruptionEpochs(runId: "{run_id}") {{
+                    kind
+                    wallClockGapMs
+                    affectedExecutions {{
+                      agentExecutionId
+                      providerFamily
+                      action
+                    }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(
+            json["schedulerHealthSummary"]["sustainedBackpressureState"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            json["schedulerHealthSummary"]["dbWriterWaitP95Ms"],
+            serde_json::json!(37)
+        );
+        assert_eq!(
+            json["schedulerHealthSummary"]["lastHostInterruptionEpochId"],
+            serde_json::json!("graphql-host-epoch")
+        );
+        assert_eq!(
+            json["dbWriterContentionSummary"]["dbWriterWaitP95Ms"],
+            serde_json::json!(37)
+        );
+        assert_eq!(
+            json["commandLatencySummary"]["commandLatencyP95MsJson"],
+            serde_json::json!(r#"{"approve_stage":120,"retry_stage":180,"cancel_run":90}"#)
+        );
+        assert_eq!(
+            json["queuedBackpressuredCountsByProviderAndReason"][0]["providerFamily"],
+            serde_json::json!("codex")
+        );
+        assert_eq!(
+            json["runQueueSummary"][0]["topReason"],
+            serde_json::json!("run_capacity")
+        );
+        assert_eq!(
+            json["stageQueueSummary"][0]["stageExecutionId"],
+            serde_json::json!(stage_execution_id.to_string())
+        );
+        assert_eq!(
+            json["runQueuePositionHint"]["queuePosition"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            json["runQueuePositionHint"]["queuedAheadCount"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            json["stageQueuePositionHint"]["stageExecutionId"],
+            serde_json::json!(stage_execution_id.to_string())
+        );
+        assert_eq!(
+            json["activeExecutionCountsByProvider"],
+            serde_json::json!([{
+                "providerFamily": "codex",
+                "activeCount": 1
+            }])
+        );
+        assert_eq!(
+            json["hostInterruptionEpochs"][0]["kind"],
+            serde_json::json!("network_migration")
+        );
+        assert_eq!(
+            json["hostInterruptionEpochs"][0]["affectedExecutions"][0]["action"],
+            serde_json::json!("resuming_after_network_change")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_061_scheduler_backpressure_subscription_maps_domain_event() {
+        let pool = test_pool().await;
+        let events = event_bus::new_bus(16);
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            events.clone(),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let mut stream = Box::pin(
+            schema.execute_stream(
+                Request::new(
+                    r#"
+                subscription SchedulerBackpressureChanged {
+                  schedulerBackpressureChanged {
+                    runId
+                    stageExecutionId
+                    providerFamily
+                    topReason
+                    queuedCount
+                    oldestQueuedAgeMs
+                    globalQueueDepth
+                    state
+                    updatedAt
+                    isStale
+                  }
+                }
+                "#,
+                )
+                .data(test_principal()),
+            ),
+        );
+        let run_id = RunId::new().to_string();
+        let stage_execution_id = domain::ids::StageExecutionId::new().to_string();
+        let updated_at = Utc::now().to_rfc3339();
+        let events_for_task = events.clone();
+        let run_id_for_task = run_id.clone();
+        let stage_execution_id_for_task = stage_execution_id.clone();
+        let updated_at_for_task = updated_at.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = events_for_task.send(DomainEvent::SchedulerBackpressureChanged {
+                run_id: Some(run_id_for_task),
+                stage_execution_id: Some(stage_execution_id_for_task),
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 310_000,
+                global_queue_depth: 5,
+                state: "active".into(),
+                updated_at: updated_at_for_task,
+                is_stale: false,
+            });
+        });
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("subscription response should arrive")
+            .expect("subscription stream should yield");
+        assert!(
+            response.errors.is_empty(),
+            "subscription must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let event = &json["schedulerBackpressureChanged"];
+        assert_eq!(event["runId"], serde_json::json!(run_id));
+        assert_eq!(
+            event["stageExecutionId"],
+            serde_json::json!(stage_execution_id)
+        );
+        assert_eq!(event["providerFamily"], serde_json::json!("codex"));
+        assert_eq!(event["topReason"], serde_json::json!("provider_capacity"));
+        assert_eq!(event["queuedCount"], serde_json::json!(2));
+        assert_eq!(event["oldestQueuedAgeMs"], serde_json::json!(310_000));
+        assert_eq!(event["globalQueueDepth"], serde_json::json!(5));
+        assert_eq!(event["state"], serde_json::json!("active"));
+        assert_eq!(event["updatedAt"], serde_json::json!(updated_at));
+        assert_eq!(event["isStale"], serde_json::json!(false));
     }
 
     #[tokio::test]

@@ -1,22 +1,27 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifacts, ideas, runs, sessions, stages, work_items,
+    agent_executions, approvals, artifacts, ideas, runs, scheduler, sessions, stages, work_items,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::commands::{
-    ApproveStageCmd, CallerContext, Command, RejectStageCmd, RetryStageCmd, RunStewardAnalysisCmd,
-    StartRunCmd,
+    ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
+    RunStewardAnalysisCmd, StartRunCmd,
 };
+use domain::events::DomainEvent;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
+use engine::host_interruption::{
+    HostInterruptionClockSnapshot, HostInterruptionDetector, HostInterruptionDetectorConfig,
+    HostInterruptionEvent, HostInterruptionKind, HostInterruptionService,
+};
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
@@ -211,6 +216,51 @@ fn make_agent_execution(
     }
 }
 
+async fn seed_active_fake_agent_executions(pool: &sqlx::SqlitePool, count: usize) {
+    for idx in 0..count {
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+
+        ideas::insert(pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(pool, &make_run(run_id, idea_id, RunStatus::Running))
+            .await
+            .unwrap();
+        let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Running);
+        stage.stage_id = format!("active_fake_agent_{idx}");
+        stages::insert(pool, &stage).await.unwrap();
+
+        let mut execution = make_agent_execution(stage_execution_id, AgentStatus::Running);
+        execution.agent_id = format!("fake-agent-{idx}");
+        agent_executions::insert(pool, &execution).await.unwrap();
+    }
+}
+
+fn p95_latency_ms(values: &[u128]) -> u128 {
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let rank = (values.len() * 95).div_ceil(100).max(1);
+    values[rank - 1]
+}
+
+fn assert_proposal_061_latency_budget(command: &str, values: &[u128]) {
+    assert!(
+        !values.is_empty(),
+        "{command} must have latency samples for the P061 gate"
+    );
+    let p95 = p95_latency_ms(values);
+    assert!(
+        p95 < 2_000,
+        "{command} p95 latency must stay below 2s under 20 active fake agents; got {p95}ms from {values:?}"
+    );
+    for value in values {
+        assert!(
+            *value <= 5_000,
+            "{command} single-command latency must stay below the 5s hard ceiling; got {value}ms"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Recovery parity harness (P027)
 // Proves daemon RecoveryService matches app-side ResumeManager semantics:
@@ -266,6 +316,86 @@ async fn steward_drift_tests_startup_repair_clears_stuck_running_stage_and_marks
         serde_json::from_str(&repaired_run.drift_details_json.unwrap()).unwrap();
     assert_eq!(drift_details["source"], "startup_repair");
     assert_eq!(drift_details["reason"], "stage_stuck_running");
+}
+
+#[tokio::test]
+async fn proposal_061_startup_repair_clears_stale_running_execution_and_requeues_work() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    let queued_since = Utc::now() - chrono::Duration::minutes(6);
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running))
+        .await
+        .unwrap();
+
+    let execution = make_agent_execution(stage_id, AgentStatus::Running);
+    agent_executions::insert(&pool, &execution).await.unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "stale-running-invoke".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "claude",
+                "stage_execution_id": stage_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: queued_since,
+            scheduled_at: queued_since,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_repaired, 1);
+    assert_eq!(
+        summary.work_items_requeued, 2,
+        "startup repair should count the requeued InvokeAgent and the AdvanceRun wakeup"
+    );
+
+    let repaired_execution = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired_execution.status, AgentStatus::Cancelled);
+    assert!(repaired_execution.completed_at.is_some());
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke_item = items
+        .iter()
+        .find(|item| item.id == "stale-running-invoke")
+        .expect("stale InvokeAgent item should remain durable");
+    assert_eq!(invoke_item.status, db::work_item::WorkItemStatus::Pending);
+    assert_eq!(
+        invoke_item.last_error.as_deref(),
+        Some("requeued by startup repair")
+    );
+
+    let snapshot = db::repos::scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("scheduler health snapshot should be refreshed");
+    assert_eq!(snapshot.active_agent_executions, 0);
+    assert_eq!(snapshot.queued_count, 1);
+    assert_eq!(snapshot.sustained_backpressure_state, "clear");
 }
 
 /// A run with no stuck stages must not be counted as repaired.
@@ -730,6 +860,741 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
         new_stage.status,
         StageStatus::Pending,
         "new stage execution must start as Pending"
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_retry_stage_cancels_stale_running_execution_and_work_item() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Blocked);
+    stage.stage_id = "flaky_stage".into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let execution = make_agent_execution(old_stage_exec_id, AgentStatus::Running);
+    agent_executions::insert(&pool, &execution).await.unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "old-running-invoke".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "claude",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("flaky_stage".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "flaky_stage".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let repaired_execution = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired_execution.status, AgentStatus::Cancelled);
+    assert!(repaired_execution.completed_at.is_some());
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let old_item = items
+        .iter()
+        .find(|item| item.id == "old-running-invoke")
+        .expect("old InvokeAgent item should remain durable");
+    assert_eq!(old_item.status, db::work_item::WorkItemStatus::Cancelled);
+    assert_eq!(
+        old_item.last_error.as_deref(),
+        Some("superseded by retry stage")
+    );
+    assert!(
+        items.iter().any(|item| {
+            item.kind == db::work_item::WorkItemKind::AdvanceRun
+                && item.status == db::work_item::WorkItemStatus::Pending
+        }),
+        "RetryStage should enqueue a fresh AdvanceRun for the new attempt"
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_cancel_run_clears_queued_invoke_agent_projection() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Pending),
+    )
+    .await
+    .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "pending-cancelled-invoke".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "claude",
+                "stage_execution_id": stage_exec_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::repos::scheduler::refresh_queue_summaries(
+        &pool,
+        &domain::provider::InvokeAgentCapacityConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !db::repos::scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "pending InvokeAgent should be visible before cancellation"
+    );
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let cancelled_item = items
+        .iter()
+        .find(|item| item.id == "pending-cancelled-invoke")
+        .expect("pending InvokeAgent should remain durable");
+    assert_eq!(
+        cancelled_item.status,
+        db::work_item::WorkItemStatus::Cancelled
+    );
+    assert_eq!(
+        cancelled_item.last_error.as_deref(),
+        Some("cancelled by run cancellation")
+    );
+    assert!(
+        db::repos::scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "CancelRun should refresh scheduler projections after clearing queued work"
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_operator_commands_stay_responsive_under_active_fake_agents() {
+    let pool = test_pool().await;
+    seed_active_fake_agent_executions(&pool, 20).await;
+
+    let handler = make_command_handler(pool.clone());
+    let mut approve_latencies = Vec::new();
+    let mut retry_latencies = Vec::new();
+    let mut cancel_latencies = Vec::new();
+
+    for idx in 0..5 {
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let stage_id = format!("approval_latency_stage_{idx}");
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(
+            &pool,
+            &make_run(run_id, idea_id, RunStatus::WaitingApproval),
+        )
+        .await
+        .unwrap();
+        let mut stage = make_stage(stage_execution_id, run_id, StageStatus::WaitingApproval);
+        stage.stage_id = stage_id.clone();
+        stages::insert(&pool, &stage).await.unwrap();
+        approvals::insert(
+            &pool,
+            &make_approval(run_id, &stage_id, ApprovalDecision::Pending),
+        )
+        .await
+        .unwrap();
+
+        let started_at = Instant::now();
+        handler
+            .handle(
+                Command::ApproveStage(ApproveStageCmd {
+                    run_id,
+                    stage_id,
+                    comment: Some("proposal-061 latency gate".into()),
+                }),
+                CallerContext::test_fixture(),
+            )
+            .await
+            .unwrap();
+        approve_latencies.push(started_at.elapsed().as_millis());
+    }
+
+    for idx in 0..5 {
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let stage_id = format!("retry_latency_stage_{idx}");
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+            .await
+            .unwrap();
+        let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Failed);
+        stage.stage_id = stage_id.clone();
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let started_at = Instant::now();
+        handler
+            .handle(
+                Command::RetryStage(RetryStageCmd { run_id, stage_id }),
+                CallerContext::test_fixture(),
+            )
+            .await
+            .unwrap();
+        retry_latencies.push(started_at.elapsed().as_millis());
+    }
+
+    for _ in 0..5 {
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+            .await
+            .unwrap();
+        stages::insert(
+            &pool,
+            &make_stage(stage_execution_id, run_id, StageStatus::Running),
+        )
+        .await
+        .unwrap();
+
+        let started_at = Instant::now();
+        handler
+            .handle(
+                Command::CancelRun(CancelRunCmd { run_id }),
+                CallerContext::test_fixture(),
+            )
+            .await
+            .unwrap();
+        cancel_latencies.push(started_at.elapsed().as_millis());
+    }
+
+    assert_proposal_061_latency_budget("ApproveStage", &approve_latencies);
+    assert_proposal_061_latency_budget("RetryStage", &retry_latencies);
+    assert_proposal_061_latency_budget("CancelRun", &cancel_latencies);
+
+    scheduler::refresh_queue_summaries(
+        &pool,
+        &domain::provider::InvokeAgentCapacityConfig::default(),
+    )
+    .await
+    .unwrap();
+    let snapshot = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("scheduler health snapshot should include command latency summary");
+    let command_latency = snapshot
+        .command_latency_p95_ms_json
+        .expect("command latency p95 JSON should be populated");
+    let command_latency: serde_json::Value = serde_json::from_str(&command_latency).unwrap();
+    for key in ["approve_stage", "retry_stage", "cancel_run"] {
+        assert!(
+            command_latency[key]
+                .as_i64()
+                .is_some_and(|value| value < 2_000),
+            "{key} durable command latency p95 should stay below 2s; got {command_latency}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proposal_061_work_queue_emits_sustained_backpressure_transition_event() {
+    let pool = test_pool().await;
+    let events = event_bus::new_bus(16);
+    let work_queue = WorkQueue::new(pool.clone()).with_event_sender(events.clone());
+    let mut rx = events.subscribe();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Pending),
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "sustained-backpressure-event-work".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "codex",
+                "stage_execution_id": stage_exec_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: now - chrono::Duration::minutes(6),
+            scheduled_at: now - chrono::Duration::minutes(6),
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    work_queue.refresh_scheduler_projection().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "first high-pressure snapshot should not notify"
+    );
+
+    work_queue.refresh_scheduler_projection().await.unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("active backpressure event should arrive")
+        .expect("event bus should yield");
+    match event {
+        DomainEvent::SchedulerBackpressureChanged {
+            run_id: event_run_id,
+            stage_execution_id,
+            provider_family,
+            state,
+            top_reason,
+            global_queue_depth,
+            ..
+        } => {
+            assert_eq!(event_run_id, Some(run_id.to_string()));
+            assert_eq!(stage_execution_id, Some(stage_exec_id.to_string()));
+            assert_eq!(provider_family.as_deref(), Some("codex"));
+            assert_eq!(state, "active");
+            assert_eq!(top_reason, "queued");
+            assert_eq!(global_queue_depth, 1);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn proposal_061_work_queue_claim_status_exposes_all_blocked_backpressure() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Running),
+    )
+    .await
+    .unwrap();
+
+    let mut active_execution = make_agent_execution(stage_exec_id, AgentStatus::Running);
+    active_execution.provider = "codex".into();
+    agent_executions::insert(&pool, &active_execution)
+        .await
+        .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "blocked-codex-work".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "codex",
+                "stage_id": "stage_test",
+                "stage_execution_id": stage_exec_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let work_queue = WorkQueue::with_capacity_config(
+        pool.clone(),
+        domain::provider::InvokeAgentCapacityConfig {
+            global_active_agent_executions: 20,
+            per_run_active_agent_executions: 4,
+            provider_caps: std::collections::BTreeMap::from([
+                (domain::provider::ProviderFamily::Claude, 8),
+                (domain::provider::ProviderFamily::Gemini, 4),
+                (domain::provider::ProviderFamily::Codex, 1),
+                (domain::provider::ProviderFamily::Auggie, 1),
+                (domain::provider::ProviderFamily::Junie, 1),
+            ]),
+        },
+    );
+
+    let claim = work_queue.claim_next_with_status().await.unwrap();
+    assert!(claim.item.is_none());
+    assert!(
+        claim.all_invoke_agent_candidates_blocked,
+        "executor backoff needs the all-blocked signal rather than treating backpressure as an idle queue"
+    );
+
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM work_items WHERE id = 'blocked-codex-work'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "pending");
+}
+
+#[tokio::test]
+async fn proposal_061_host_interruption_classifies_cancels_and_batches_retries() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let now = Utc::now();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut execution_ids = Vec::new();
+    for idx in 0..3 {
+        let stage_exec_id = StageExecutionId::new();
+        let stage_id = format!("host_stage_{idx}");
+        let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+        stage.stage_id = stage_id.clone();
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Running);
+        execution.provider = "codex".into();
+        execution.started_at = now - chrono::Duration::minutes(10);
+        execution_ids.push(execution.id);
+        agent_executions::insert(&pool, &execution).await.unwrap();
+
+        work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("host-interruption-running-{idx}"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "provider": "codex",
+                    "stage_id": stage_id,
+                    "stage_execution_id": stage_exec_id.to_string(),
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some(format!("host_stage_{idx}")),
+                created_at: now - chrono::Duration::minutes(10),
+                scheduled_at: now - chrono::Duration::minutes(10),
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let late_stage_exec_id = StageExecutionId::new();
+    let mut late_stage = make_stage(late_stage_exec_id, run_id, StageStatus::Running);
+    late_stage.stage_id = "host_stage_after_epoch_start".into();
+    stages::insert(&pool, &late_stage).await.unwrap();
+
+    let mut late_execution = make_agent_execution(late_stage_exec_id, AgentStatus::Running);
+    late_execution.provider = "codex".into();
+    late_execution.started_at = now - chrono::Duration::seconds(390);
+    let late_execution_id = late_execution.id;
+    agent_executions::insert(&pool, &late_execution)
+        .await
+        .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "host-interruption-late-running".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "codex",
+                "stage_id": "host_stage_after_epoch_start",
+                "stage_execution_id": late_stage_exec_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("host_stage_after_epoch_start".into()),
+            created_at: now - chrono::Duration::seconds(390),
+            scheduled_at: now - chrono::Duration::seconds(390),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let work_queue = WorkQueue::new(pool.clone());
+    let service = HostInterruptionService::with_capacity_config(
+        pool.clone(),
+        work_queue,
+        domain::provider::InvokeAgentCapacityConfig::default(),
+    );
+    let summary = service
+        .record_and_requeue(HostInterruptionEvent {
+            kind: HostInterruptionKind::SystemSleep,
+            started_at: now - chrono::Duration::minutes(7),
+            ended_at: Some(now - chrono::Duration::minutes(6)),
+            monotonic_gap_ms: Some(60_000),
+            wall_clock_gap_ms: Some(90_000),
+            details_json: Some(r#"{"source":"test"}"#.into()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(summary.affected_executions, 3);
+    assert_eq!(summary.cancelled_executions, 3);
+    assert_eq!(
+        summary.retries_enqueued, 2,
+        "host interruption retry batches should enqueue at most two per provider window"
+    );
+    assert_eq!(
+        summary.retries_deferred_capacity, 1,
+        "surplus provider retries should be left pending for a later jitter window"
+    );
+    assert_eq!(summary.retries_missing_work_item, 0);
+
+    for execution_id in execution_ids {
+        let execution = agent_executions::find_by_id(&pool, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, AgentStatus::Cancelled);
+        assert!(execution.completed_at.is_some());
+    }
+
+    let late_execution = agent_executions::find_by_id(&pool, late_execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        late_execution.status,
+        AgentStatus::Running,
+        "executions that start after the host interruption begins must not be classified as affected"
+    );
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.status == db::work_item::WorkItemStatus::Pending)
+            .count(),
+        3,
+        "all host-interrupted work should become pending instead of staying stale-running"
+    );
+    assert!(items
+        .iter()
+        .filter(|item| item.status == db::work_item::WorkItemStatus::Pending)
+        .all(|item| { item.last_error.as_deref() == Some("requeued after host interruption") }));
+    let late_item = items
+        .iter()
+        .find(|item| item.id == "host-interruption-late-running")
+        .expect("late-starting InvokeAgent work should remain durable");
+    assert_eq!(late_item.status, db::work_item::WorkItemStatus::Running);
+    assert!(late_item.last_error.is_none());
+
+    let readback = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(readback.len(), 1);
+    assert_eq!(readback[0].epoch.id, summary.epoch_id);
+    assert_eq!(readback[0].epoch.kind, "system_sleep");
+    assert_eq!(readback[0].affected_executions.len(), 3);
+    assert!(readback[0].affected_executions.iter().all(|affected| {
+        affected.action == "recovering_from_system_sleep"
+            && affected.provider_family.as_deref() == Some("codex")
+            && affected.retry_enqueued_at.is_some()
+    }));
+
+    let snapshot = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .expect("host interruption recovery should refresh scheduler health");
+    assert_eq!(
+        snapshot.last_host_interruption_epoch_id.as_deref(),
+        Some(summary.epoch_id.as_str())
+    );
+    assert_eq!(snapshot.active_agent_executions, 1);
+    assert_eq!(
+        snapshot.queued_count, 0,
+        "jitter-scheduled host retries are durable pending work but are not due in the immediate scheduler queue"
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_host_interruption_wall_clock_detector_records_epoch_and_requeues() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "wall_clock_gap_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Running);
+    execution.provider = "claude".into();
+    execution.started_at = now - chrono::Duration::minutes(3);
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "wall-clock-gap-running-work".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "provider": "claude",
+                "stage_id": "wall_clock_gap_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("wall_clock_gap_stage".into()),
+            created_at: now - chrono::Duration::minutes(3),
+            scheduled_at: now - chrono::Duration::minutes(3),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let service = HostInterruptionService::new(pool.clone(), WorkQueue::new(pool.clone()));
+    let mut detector = HostInterruptionDetector::with_config(
+        service,
+        HostInterruptionDetectorConfig {
+            wall_clock_gap_threshold_ms: 60_000,
+        },
+    );
+
+    assert!(detector
+        .observe_clock_snapshot(HostInterruptionClockSnapshot {
+            wall_clock: now - chrono::Duration::minutes(2),
+            monotonic_elapsed_ms: Some(1_000),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    let summary = detector
+        .observe_clock_snapshot(HostInterruptionClockSnapshot {
+            wall_clock: now - chrono::Duration::seconds(30),
+            monotonic_elapsed_ms: Some(2_000),
+        })
+        .await
+        .unwrap()
+        .expect("wall-clock drift above threshold should create a host interruption epoch");
+
+    assert_eq!(summary.affected_executions, 1);
+    assert_eq!(summary.cancelled_executions, 1);
+    assert_eq!(summary.retries_enqueued, 1);
+
+    let execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.status, AgentStatus::Cancelled);
+
+    let readback = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(readback.len(), 1);
+    assert_eq!(readback[0].epoch.kind, "wall_clock_gap");
+    assert_eq!(readback[0].epoch.monotonic_gap_ms, Some(1_000));
+    assert_eq!(readback[0].epoch.wall_clock_gap_ms, Some(90_000));
+    assert_eq!(
+        readback[0].affected_executions[0].action,
+        "recovering_from_system_sleep"
+    );
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status, db::work_item::WorkItemStatus::Pending);
+    assert_eq!(
+        items[0].last_error.as_deref(),
+        Some("requeued after host interruption")
     );
 }
 

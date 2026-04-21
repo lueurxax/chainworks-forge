@@ -4,8 +4,9 @@ use sqlx::{Row, SqlitePool};
 
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
+use domain::provider::ProviderFamily;
 
-const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
+const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, provider_family, model, status, started_at, completed_at,
                 owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
                 invocation_owner_key, session_reuse_scope, session_family_id,
                 session_reuse_disposition, session_reset_reason,
@@ -14,10 +15,24 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
                 mcp_session_startup_latency_ms"#;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunningAgentExecution {
+    pub id: AgentExecutionId,
+    pub run_id: RunId,
+    pub stage_execution_id: StageExecutionId,
+    pub stage_id: String,
+    pub provider_family: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
 pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
+    let provider = ProviderFamily::canonicalize_known_alias(&exec.provider)
+        .unwrap_or_else(|| exec.provider.clone());
+    let provider_family = ProviderFamily::canonicalize_known_alias(&exec.provider);
+
     sqlx::query(
         "INSERT INTO agent_executions
-         (id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
+         (id, stage_execution_id, agent_id, provider, provider_family, model, status, started_at, completed_at,
           owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
           invocation_owner_key, session_reuse_scope, session_family_id,
           session_reuse_disposition, session_reset_reason,
@@ -25,12 +40,13 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
           predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
           denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
           mcp_session_startup_latency_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
     .bind(exec.stage_execution_id.to_string())
     .bind(&exec.agent_id)
-    .bind(&exec.provider)
+    .bind(&provider)
+    .bind(&provider_family)
     .bind(&exec.model)
     .bind(exec.status.to_string())
     .bind(exec.started_at.to_rfc3339())
@@ -197,6 +213,69 @@ pub async fn cancel_running_by_run(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn cancel_running_by_stage(
+    pool: &SqlitePool,
+    stage_execution_id: StageExecutionId,
+    completed_at: DateTime<Utc>,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE agent_executions
+         SET status = ?, completed_at = ?
+         WHERE status = ? AND stage_execution_id = ?",
+    )
+    .bind(AgentStatus::Cancelled.to_string())
+    .bind(completed_at.to_rfc3339())
+    .bind(AgentStatus::Running.to_string())
+    .bind(stage_execution_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn list_running_across_interval(
+    pool: &SqlitePool,
+    interval_started_at: DateTime<Utc>,
+    _interval_ended_at: DateTime<Utc>,
+) -> Result<Vec<RunningAgentExecution>> {
+    let rows = sqlx::query(
+        r#"SELECT ae.id, se.run_id, ae.stage_execution_id, se.stage_id,
+                  COALESCE(ae.provider_family, ae.provider) AS provider_family,
+                  ae.started_at
+           FROM agent_executions ae
+           INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+           WHERE ae.status = ?1
+             AND ae.started_at <= ?2
+           ORDER BY ae.started_at ASC, ae.id ASC"#,
+    )
+    .bind(AgentStatus::Running.to_string())
+    .bind(interval_started_at.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let id: String = row.get("id");
+            let run_id: String = row.get("run_id");
+            let stage_execution_id: String = row.get("stage_execution_id");
+            let started_at: String = row.get("started_at");
+            let provider_family: Option<String> = row
+                .get::<Option<String>, _>("provider_family")
+                .and_then(ProviderFamily::canonicalize_known_alias);
+
+            Ok(RunningAgentExecution {
+                id: id.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
+                run_id: run_id.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
+                stage_execution_id: stage_execution_id
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?,
+                stage_id: row.get("stage_id"),
+                provider_family,
+                started_at: started_at.parse::<DateTime<Utc>>()?,
+            })
+        })
+        .collect()
 }
 
 fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecution> {

@@ -193,6 +193,14 @@ PROPOSAL_029_MCP_TESTS=(
   "graphql_server::tests"
 )
 
+PROPOSAL_061_TESTS=(
+  "provider"
+  "proposal_061"
+  "proposal_061"
+  "proposal_061"
+  "proposal_061_reports_get_includes_scheduler_readback"
+)
+
 DEFAULT_REMOTE_UI_TEST_HOSTS=("SMacBook.local" "SMacBook")
 LAST_BUILD_DERIVED_DATA_PATH=""
 
@@ -1205,6 +1213,7 @@ Available gates:
   proposal-047    Proposal 047 control-plane workspace verification gate
   proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
   proposal-049    Proposal 049 steward analysis system gate
+  proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -1565,6 +1574,18 @@ case "$GATE" in
       cargo test -p mcp-server steward_mcp -- --nocapture
     )
     log "Proposal 049 control-plane gate passed"
+    ;;
+  proposal-061|p061)
+    log "Proposal 061 control-plane gate: provider normalization, scheduler schema, and capacity defaults"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p domain "${PROPOSAL_061_TESTS[0]}" -- --nocapture &&
+      cargo test -p db "${PROPOSAL_061_TESTS[1]}" -- --nocapture &&
+      cargo test -p engine "${PROPOSAL_061_TESTS[2]}" -- --nocapture &&
+      cargo test -p graphql-server "${PROPOSAL_061_TESTS[3]}" -- --nocapture &&
+      cargo test -p mcp-server "${PROPOSAL_061_TESTS[4]}" -- --nocapture
+    )
+    log "Proposal 061 control-plane gate passed"
     ;;
   full)
     check_idle_environment strict

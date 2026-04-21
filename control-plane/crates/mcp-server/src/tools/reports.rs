@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{agent_executions, artifacts, validation};
+use db::repos::{agent_executions, artifacts, scheduler, validation};
 use domain::artifact::Artifact;
 use domain::ids::RunId;
 use engine::command_handler::CommandHandler;
@@ -60,6 +60,7 @@ pub async fn execute(
                 "report_kind": "mcp_execution_truth",
                 "report_version": 1,
                 "agent_executions": execution_mcp_truth_json(pool, run_id).await?,
+                "scheduler": scheduler_mcp_truth_json(pool, run_id).await?,
             }));
 
             Ok(serde_json::Value::Array(reports))
@@ -99,6 +100,159 @@ pub(crate) async fn execution_mcp_truth_json(
             })
             .collect(),
     ))
+}
+
+pub(crate) async fn scheduler_mcp_truth_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let latest = scheduler::latest_health_snapshot(pool).await?;
+    let health = latest.map(|snapshot| {
+        let is_stale = snapshot.is_stale_at(chrono::Utc::now());
+        serde_json::json!({
+            "queued_count": snapshot.queued_count,
+            "oldest_queued_age_ms": snapshot.oldest_queued_age_ms,
+            "global_queue_depth": snapshot.global_queue_depth,
+            "active_agent_executions": snapshot.active_agent_executions,
+            "db_writer_wait_p95_ms": snapshot.db_writer_wait_p95_ms,
+            "command_latency_p95_ms_json": snapshot.command_latency_p95_ms_json,
+            "last_host_interruption_epoch_id": snapshot.last_host_interruption_epoch_id,
+            "sustained_backpressure_state": snapshot.sustained_backpressure_state,
+            "stale_after_ms": snapshot.stale_after_ms,
+            "updated_at": snapshot.updated_at.to_rfc3339(),
+            "is_stale": is_stale,
+        })
+    });
+    let queue_summaries = scheduler::list_queue_summaries_by_run(pool, &run_id.to_string())
+        .await?
+        .into_iter()
+        .map(|summary| {
+            let is_stale = summary.is_stale_at(chrono::Utc::now());
+            serde_json::json!({
+                "scope": summary.scope,
+                "scope_id": summary.scope_id,
+                "run_id": summary.run_id,
+                "stage_execution_id": summary.stage_execution_id,
+                "provider_family": summary.provider_family,
+                "top_reason": summary.top_reason,
+                "queued_count": summary.queued_count,
+                "oldest_queued_age_ms": summary.oldest_queued_age_ms,
+                "global_queue_depth": summary.global_queue_depth,
+                "stale_after_ms": summary.stale_after_ms,
+                "updated_at": summary.updated_at.to_rfc3339(),
+                "is_stale": is_stale,
+            })
+        })
+        .collect::<Vec<_>>();
+    let active_execution_counts_by_provider =
+        scheduler::list_active_execution_counts_by_provider(pool)
+            .await?
+            .into_iter()
+            .map(|count| {
+                serde_json::json!({
+                    "provider_family": count.provider_family,
+                    "active_count": count.active_count,
+                })
+            })
+            .collect::<Vec<_>>();
+    let run_queue_position_hint = scheduler::queue_position_hint_by_run(pool, &run_id.to_string())
+        .await?
+        .map(|hint| {
+            serde_json::json!({
+                "scope": hint.scope,
+                "scope_id": hint.scope_id,
+                "run_id": hint.run_id,
+                "stage_execution_id": hint.stage_execution_id,
+                "queue_position": hint.queue_position,
+                "global_queue_depth": hint.global_queue_depth,
+                "queued_ahead_count": hint.queued_ahead_count,
+                "scoped_queued_count": hint.scoped_queued_count,
+                "oldest_queued_age_ms": hint.oldest_queued_age_ms,
+                "updated_at": hint.updated_at.to_rfc3339(),
+            })
+        });
+    let host_interruption_epochs =
+        scheduler::list_host_interruption_epochs_by_run(pool, &run_id.to_string())
+            .await?
+            .into_iter()
+            .map(|readback| {
+                let affected_executions = readback
+            .affected_executions
+            .into_iter()
+            .map(|affected| {
+                serde_json::json!({
+                    "epoch_id": affected.epoch_id,
+                    "agent_execution_id": affected.agent_execution_id,
+                    "run_id": affected.run_id,
+                    "stage_execution_id": affected.stage_execution_id,
+                    "provider_family": affected.provider_family,
+                    "action": affected.action,
+                    "retry_enqueued_at": affected.retry_enqueued_at.map(|value| value.to_rfc3339()),
+                    "created_at": affected.created_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
+                serde_json::json!({
+                    "id": readback.epoch.id,
+                    "kind": readback.epoch.kind,
+                    "started_at": readback.epoch.started_at.to_rfc3339(),
+                    "ended_at": readback.epoch.ended_at.map(|value| value.to_rfc3339()),
+                    "monotonic_gap_ms": readback.epoch.monotonic_gap_ms,
+                    "wall_clock_gap_ms": readback.epoch.wall_clock_gap_ms,
+                    "details_json": readback.epoch.details_json,
+                    "created_at": readback.epoch.created_at.to_rfc3339(),
+                    "affected_executions": affected_executions,
+                })
+            })
+            .collect::<Vec<_>>();
+
+    let db_writer_contention_summary = health.as_ref().map(|health| {
+        serde_json::json!({
+            "db_writer_wait_p95_ms": health["db_writer_wait_p95_ms"],
+            "stale_after_ms": health["stale_after_ms"],
+            "updated_at": health["updated_at"],
+            "is_stale": health["is_stale"],
+        })
+    });
+    let command_latency_summary = health.as_ref().map(|health| {
+        serde_json::json!({
+            "command_latency_p95_ms_json": health["command_latency_p95_ms_json"],
+            "stale_after_ms": health["stale_after_ms"],
+            "updated_at": health["updated_at"],
+            "is_stale": health["is_stale"],
+        })
+    });
+    let sustained_backpressure_notification = scheduler::latest_backpressure_notification(pool)
+        .await?
+        .map(|notification| {
+            let is_stale = notification.is_stale_at(chrono::Utc::now());
+            serde_json::json!({
+                "method": "scheduler.backpressure.changed",
+                "params": {
+                    "run_id": notification.run_id,
+                    "stage_execution_id": notification.stage_execution_id,
+                    "provider_family": notification.provider_family,
+                    "top_reason": notification.top_reason,
+                    "queued_count": notification.queued_count,
+                    "oldest_queued_age_ms": notification.oldest_queued_age_ms,
+                    "global_queue_depth": notification.global_queue_depth,
+                    "state": notification.state,
+                    "updated_at": notification.updated_at.to_rfc3339(),
+                    "is_stale": is_stale,
+                }
+            })
+        });
+
+    Ok(serde_json::json!({
+        "health": health,
+        "queue_summaries": queue_summaries,
+        "active_execution_counts_by_provider": active_execution_counts_by_provider,
+        "run_queue_position_hint": run_queue_position_hint,
+        "db_writer_contention_summary": db_writer_contention_summary,
+        "command_latency_summary": command_latency_summary,
+        "sustained_backpressure_notification": sustained_backpressure_notification,
+        "host_interruption_epochs": host_interruption_epochs,
+    }))
 }
 
 fn is_release_report_artifact(name: &str) -> bool {
@@ -288,7 +442,7 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifacts, ideas, runs, validation};
+    use db::repos::{artifacts, ideas, runs, scheduler, validation};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -696,6 +850,207 @@ mod tests {
         assert_eq!(
             execution["actual_mcp_runtime_ids_json"],
             serde_json::json!(r#"["fs-runtime"]"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_061_reports_get_includes_scheduler_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let now = Utc::now();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        scheduler::insert_health_snapshot(
+            &pool,
+            &scheduler::SchedulerHealthSnapshot {
+                id: "scheduler-health-mcp".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 305_000,
+                global_queue_depth: 2,
+                active_agent_executions: 20,
+                db_writer_wait_p95_ms: Some(44),
+                command_latency_p95_ms_json: Some(
+                    r#"{"approve_stage":110,"retry_stage":170,"cancel_run":80}"#.into(),
+                ),
+                last_host_interruption_epoch_id: Some("mcp-host-epoch".into()),
+                sustained_backpressure_state: "active".into(),
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::upsert_queue_summary(
+            &pool,
+            &scheduler::SchedulerQueueSummary {
+                scope: "run".into(),
+                scope_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: None,
+                provider_family: Some("gemini".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 305_000,
+                global_queue_depth: 2,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let queued_payload = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "stage_id": "stage-p061",
+            "stage_execution_id": domain::ids::StageExecutionId::new().to_string(),
+            "agent_id": "gemini-agent",
+            "provider": "gemini",
+        });
+        sqlx::query(
+            r#"INSERT INTO work_items
+               (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at)
+               VALUES ('mcp-target-work', 'invoke_agent', ?1, 'pending', ?2, 'stage-p061', ?3, ?4)"#,
+        )
+        .bind(queued_payload.to_string())
+        .bind(run_id.to_string())
+        .bind((now - chrono::Duration::seconds(10)).to_rfc3339())
+        .bind((now - chrono::Duration::seconds(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, started_at)
+               VALUES (?1, ?2, 'stage-host', 'Host interruption stage', 'running', ?3)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, status, started_at)
+               VALUES (?1, ?2, 'agent-host', 'gemini', 'gemini', 'running', ?3)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_epoch(
+            &pool,
+            &scheduler::HostInterruptionEpoch {
+                id: "mcp-host-epoch".into(),
+                kind: "sleep_wake".into(),
+                started_at: now - chrono::Duration::seconds(120),
+                ended_at: Some(now - chrono::Duration::seconds(60)),
+                monotonic_gap_ms: Some(60_000),
+                wall_clock_gap_ms: Some(120_000),
+                details_json: Some(r#"{"source":"sleep_wake"}"#.into()),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_affected_execution(
+            &pool,
+            &scheduler::HostInterruptionAffectedExecution {
+                epoch_id: "mcp-host-epoch".into(),
+                agent_execution_id: agent_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: stage_execution_id.to_string(),
+                provider_family: Some("gemini".into()),
+                action: "recovering_from_system_sleep".into(),
+                retry_enqueued_at: Some(now + chrono::Duration::seconds(5)),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+
+        assert_eq!(
+            mcp_truth["scheduler"]["health"]["sustained_backpressure_state"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["health"]["db_writer_wait_p95_ms"],
+            serde_json::json!(44)
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["health"]["last_host_interruption_epoch_id"],
+            serde_json::json!("mcp-host-epoch")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["db_writer_contention_summary"]["db_writer_wait_p95_ms"],
+            serde_json::json!(44)
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["command_latency_summary"]["command_latency_p95_ms_json"],
+            serde_json::json!(r#"{"approve_stage":110,"retry_stage":170,"cancel_run":80}"#)
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["sustained_backpressure_notification"]["method"],
+            serde_json::json!("scheduler.backpressure.changed")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["sustained_backpressure_notification"]["params"]["run_id"],
+            serde_json::json!(run_id.to_string())
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["sustained_backpressure_notification"]["params"]
+                ["provider_family"],
+            serde_json::json!("gemini")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["sustained_backpressure_notification"]["params"]["state"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["queue_summaries"][0]["provider_family"],
+            serde_json::json!("gemini")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["active_execution_counts_by_provider"],
+            serde_json::json!([{
+                "provider_family": "gemini",
+                "active_count": 1
+            }])
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["run_queue_position_hint"]["queue_position"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["host_interruption_epochs"][0]["kind"],
+            serde_json::json!("sleep_wake")
+        );
+        assert_eq!(
+            mcp_truth["scheduler"]["host_interruption_epochs"][0]["affected_executions"][0]
+                ["action"],
+            serde_json::json!("recovering_from_system_sleep")
         );
     }
 

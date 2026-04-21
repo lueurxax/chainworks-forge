@@ -7,6 +7,7 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_executions, approvals, command_journal, ideas, projections, runs, sessions, stages,
+    work_items,
 };
 use db::work_item::WorkItemKind;
 use domain::approval::ApprovalDecision;
@@ -52,6 +53,7 @@ pub struct Commanded {
 
 impl CommandHandler {
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
+        let work_queue = work_queue.with_event_sender(events.clone());
         Self {
             pool,
             events,
@@ -66,6 +68,7 @@ impl CommandHandler {
         work_queue: WorkQueue,
         acp: Arc<AcpRuntimeManager>,
     ) -> Self {
+        let work_queue = work_queue.with_event_sender(events.clone());
         Self {
             pool,
             events,
@@ -393,6 +396,14 @@ impl CommandHandler {
                 let now = Utc::now();
                 // Mark old stage as skipped
                 stages::settle(&self.pool, old_stage.id, StageSettlementKind::Skipped, now).await?;
+                agent_executions::cancel_running_by_stage(&self.pool, old_stage.id, now).await?;
+                work_items::cancel_running_invoke_agent_by_stage(
+                    &self.pool,
+                    c.run_id,
+                    &old_stage.stage_id,
+                    old_stage.id,
+                )
+                .await?;
 
                 // Create new stage execution with attempt+1
                 let new_stage = StageExecution {
@@ -446,6 +457,7 @@ impl CommandHandler {
 
                 let now = Utc::now();
                 cancellation::begin_settlement(&self.pool, c.run_id, now).await?;
+                self.work_queue.refresh_scheduler_projection().await?;
 
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
