@@ -1518,6 +1518,7 @@ impl BackgroundExecutor {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::InvokeAgent => {
@@ -2568,12 +2569,14 @@ impl BackgroundExecutor {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::SettleStage => {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::RebuildProjection => {

@@ -73,6 +73,32 @@ fn is_release_agent(agent_id: &str) -> bool {
     )
 }
 
+fn find_source_invoke_work_item<'a>(
+    work_items: &'a [WorkItem],
+    stage_execution_id: &str,
+    agent_id: &str,
+    agent_execution_id: &str,
+) -> Option<&'a WorkItem> {
+    work_items
+        .iter()
+        .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+        .filter_map(|item| {
+            let payload = serde_json::from_str::<serde_json::Value>(&item.payload_json).ok()?;
+            let claimed_agent_execution_id = payload
+                .pointer("/p058_claimed/agent_execution_id")
+                .and_then(|value| value.as_str());
+            let payload_stage_execution_id = payload
+                .get("stage_execution_id")
+                .and_then(|value| value.as_str());
+            let payload_agent_id = payload.get("agent_id").and_then(|value| value.as_str());
+            let matches = claimed_agent_execution_id == Some(agent_execution_id)
+                || (payload_stage_execution_id == Some(stage_execution_id)
+                    && payload_agent_id == Some(agent_id));
+            matches.then_some(item)
+        })
+        .max_by_key(|item| item.created_at)
+}
+
 impl CommandHandler {
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
         Self {
@@ -471,124 +497,27 @@ impl CommandHandler {
             }
 
             Command::RetryStage(c) => {
-                let run_stages = stages::list_by_run(&self.pool, c.run_id).await?;
-                let matching_stages = run_stages
-                    .iter()
-                    .filter(|s| s.stage_id == c.stage_id)
-                    .collect::<Vec<_>>();
-                let old_stage = matching_stages
-                    .iter()
-                    .copied()
-                    .max_by_key(|s| s.started_at)
-                    .ok_or_else(|| anyhow!("Stage {} not found", c.stage_id))?;
-                let completed_current_stage_on_blocked_run =
-                    if old_stage.status == StageStatus::Completed {
-                        let run = runs::find_by_id(&self.pool, c.run_id)
-                            .await?
-                            .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
-                        run.status == RunStatus::Blocked
-                            && (run.current_state.as_deref() == Some(c.stage_id.as_str())
-                                || old_stage.stage_id == c.stage_id)
-                    } else {
-                        false
-                    };
-
-                if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
-                    && !completed_current_stage_on_blocked_run
-                {
-                    return Err(anyhow!(
-                        "Stage {} latest attempt is {} and cannot be retried yet",
-                        c.stage_id,
-                        old_stage.status
-                    ));
+                if let Some(agent_execution_id) = c.agent_execution_id {
+                    return self
+                        .retry_agent_execution(
+                            c.run_id,
+                            &c.stage_id,
+                            agent_execution_id,
+                            c.consume_quota_budget_now,
+                            journal_id,
+                        )
+                        .await;
                 }
-                let next_attempt_number = matching_stages
-                    .iter()
-                    .map(|s| s.attempt_number)
-                    .max()
-                    .unwrap_or(old_stage.attempt_number)
-                    + 1;
 
-                let now = Utc::now();
-                let new_stage = StageExecution {
-                    id: domain::ids::StageExecutionId::new(),
-                    run_id: c.run_id,
-                    stage_id: old_stage.stage_id.clone(),
-                    label: old_stage.label.clone(),
-                    status: StageStatus::Pending,
-                    iteration: old_stage.iteration,
-                    attempt_number: next_attempt_number,
-                    settlement_kind: None,
-                    started_at: now,
-                    completed_at: None,
-                    owner_agent: old_stage.owner_agent.clone(),
-                    provider: old_stage.provider.clone(),
-                    model: old_stage.model.clone(),
-                    stage_type: old_stage.stage_type.clone(),
-                    validation_failure_json: None,
-                    evidence_packet_json: None,
-                    recovery_snapshot_json: None,
-                    retry_reason: Some("operator_retry".into()),
-                };
-                let retry_advance_work_item_id = new_stage.id.to_string();
-                let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
-                let retry_tx_started = Instant::now();
-                let mut retry_tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
-                apply_quota_retry_budget_for_stage_tx(
-                    &mut retry_tx,
-                    c.run_id,
-                    old_stage.id,
-                    c.consume_quota_budget_now,
-                    journal_id,
-                )
-                .await?;
-                stages::settle_tx(
-                    &mut retry_tx,
-                    old_stage.id,
-                    StageSettlementKind::Skipped,
-                    now,
-                )
-                .await?;
-                stages::insert_tx(&mut retry_tx, &new_stage).await?;
-                artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
-                    &mut retry_tx,
-                    c.run_id,
-                    &old_stage.id.to_string(),
-                    &retry_invoke_work_item_id,
-                    journal_id,
-                )
-                .await?;
-                work_items::enqueue_tx(
-                    &mut retry_tx,
-                    &WorkItem {
-                        id: retry_advance_work_item_id,
-                        kind: WorkItemKind::AdvanceRun,
-                        payload_json: serde_json::json!({
-                            "run_id": c.run_id.to_string(),
-                            "stage_id": c.stage_id.clone()
-                        })
-                        .to_string(),
-                        status: WorkItemStatus::Pending,
-                        run_id: Some(c.run_id),
-                        stage_id: Some(c.stage_id.clone()),
-                        created_at: now,
-                        scheduled_at: now,
-                        attempt_count: 0,
-                        last_error: None,
-                    },
-                )
-                .await?;
-                retry_tx.commit().await?;
-                db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
-
-                // Refresh projections so reads reflect the retry.
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
-
-                Ok(CommandResult::StageRetryScheduled {
-                    run_id: c.run_id,
-                    stage_id: c.stage_id,
-                })
+                return self
+                    .retry_stage_latest_attempt(
+                        c.run_id,
+                        &c.stage_id,
+                        c.consume_quota_budget_now,
+                        journal_id,
+                        "operator_retry",
+                    )
+                    .await;
             }
 
             Command::CancelRun(c) => {
@@ -713,6 +642,391 @@ impl CommandHandler {
                 })
             }
         }
+    }
+
+    async fn retry_stage_latest_attempt(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+        consume_quota_budget_now: bool,
+        journal_id: &str,
+        retry_reason: &str,
+    ) -> Result<CommandResult> {
+        let run_stages = stages::list_by_run(&self.pool, run_id).await?;
+        let matching_stages = run_stages
+            .iter()
+            .filter(|s| s.stage_id == stage_id)
+            .collect::<Vec<_>>();
+        let old_stage = matching_stages
+            .iter()
+            .copied()
+            .max_by_key(|s| s.started_at)
+            .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let completed_current_stage_on_blocked_run = if old_stage.status == StageStatus::Completed {
+            let run = runs::find_by_id(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+            run.status == RunStatus::Blocked
+                && (run.current_state.as_deref() == Some(stage_id)
+                    || old_stage.stage_id == stage_id)
+        } else {
+            false
+        };
+
+        if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
+            && !completed_current_stage_on_blocked_run
+        {
+            return Err(anyhow!(
+                "Stage {} latest attempt is {} and cannot be retried yet",
+                stage_id,
+                old_stage.status
+            ));
+        }
+        let next_attempt_number = matching_stages
+            .iter()
+            .map(|s| s.attempt_number)
+            .max()
+            .unwrap_or(old_stage.attempt_number)
+            + 1;
+
+        let now = Utc::now();
+        let new_stage = StageExecution {
+            id: domain::ids::StageExecutionId::new(),
+            run_id,
+            stage_id: old_stage.stage_id.clone(),
+            label: old_stage.label.clone(),
+            status: StageStatus::Pending,
+            iteration: old_stage.iteration,
+            attempt_number: next_attempt_number,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: None,
+            owner_agent: old_stage.owner_agent.clone(),
+            provider: old_stage.provider.clone(),
+            model: old_stage.model.clone(),
+            stage_type: old_stage.stage_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some(retry_reason.into()),
+        };
+        let retry_advance_work_item_id = new_stage.id.to_string();
+        let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
+        let retry_tx_started = Instant::now();
+        let mut retry_tx =
+            db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
+        apply_quota_retry_budget_for_stage_tx(
+            &mut retry_tx,
+            run_id,
+            old_stage.id,
+            consume_quota_budget_now,
+            journal_id,
+        )
+        .await?;
+        stages::settle_tx(
+            &mut retry_tx,
+            old_stage.id,
+            StageSettlementKind::Skipped,
+            now,
+        )
+        .await?;
+        stages::insert_tx(&mut retry_tx, &new_stage).await?;
+        artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
+            &mut retry_tx,
+            run_id,
+            &old_stage.id.to_string(),
+            &retry_invoke_work_item_id,
+            journal_id,
+        )
+        .await?;
+        sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+            .bind(RunStatus::Running.to_string())
+            .bind(stage_id)
+            .bind(run_id.to_string())
+            .execute(&mut *retry_tx)
+            .await?;
+        work_items::enqueue_tx(
+            &mut retry_tx,
+            &WorkItem {
+                id: retry_advance_work_item_id,
+                kind: WorkItemKind::AdvanceRun,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": stage_id
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some(stage_id.to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await?;
+        retry_tx.commit().await?;
+        db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+
+        // Refresh projections so reads reflect the retry.
+        projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+        Ok(CommandResult::StageRetryScheduled {
+            run_id,
+            stage_id: stage_id.to_string(),
+        })
+    }
+
+    async fn retry_agent_execution(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        consume_quota_budget_now: bool,
+        journal_id: &str,
+    ) -> Result<CommandResult> {
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+        if run.status.is_terminal() {
+            return Err(anyhow!("Run {} is already in terminal state", run_id));
+        }
+
+        let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
+            .await?
+            .ok_or_else(|| anyhow!("Agent execution {} not found", agent_execution_id))?;
+        let old_stage = stages::find_by_id(&self.pool, target_exec.stage_execution_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Stage execution {} for agent execution {} not found",
+                    target_exec.stage_execution_id,
+                    agent_execution_id
+                )
+            })?;
+        if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
+            return Err(anyhow!(
+                "Agent execution {} belongs to run {} stage {}, not run {} stage {}",
+                agent_execution_id,
+                old_stage.run_id,
+                old_stage.stage_id,
+                run_id,
+                stage_id
+            ));
+        }
+
+        let run_stages = stages::list_by_run(&self.pool, run_id).await?;
+        let matching_stages = run_stages
+            .iter()
+            .filter(|s| s.stage_id == stage_id)
+            .collect::<Vec<_>>();
+        let latest_stage = matching_stages
+            .iter()
+            .copied()
+            .max_by_key(|s| s.started_at)
+            .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        if latest_stage.id != old_stage.id {
+            return Err(anyhow!(
+                "Agent execution {} is on stale stage execution {}; latest for {} is {}",
+                agent_execution_id,
+                old_stage.id,
+                stage_id,
+                latest_stage.id
+            ));
+        }
+
+        let completed_current_stage_on_blocked_run = old_stage.status == StageStatus::Completed
+            && run.status == RunStatus::Blocked
+            && (run.current_state.as_deref() == Some(stage_id) || old_stage.stage_id == stage_id);
+        if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
+            && !completed_current_stage_on_blocked_run
+        {
+            return Err(anyhow!(
+                "Stage {} latest attempt is {} and cannot be targeted-retried yet",
+                stage_id,
+                old_stage.status
+            ));
+        }
+
+        let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
+        let source_item = find_source_invoke_work_item(
+            &run_work_items,
+            &old_stage.id.to_string(),
+            &target_exec.agent_id,
+            &agent_execution_id.to_string(),
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "InvokeAgent work item for agent execution {} not found",
+                agent_execution_id
+            )
+        })?;
+        if matches!(
+            source_item.status,
+            WorkItemStatus::Pending | WorkItemStatus::Running
+        ) {
+            return Err(anyhow!(
+                "Agent execution {} source work item {} is still {}",
+                agent_execution_id,
+                source_item.id,
+                source_item.status
+            ));
+        }
+        if let (Some(acp), Some(generation_id)) = (
+            self.acp.as_ref(),
+            target_exec.session_generation_id.as_deref(),
+        ) {
+            if !acp.has_live_session(generation_id, None).await {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage_id,
+                    agent_execution_id = %agent_execution_id,
+                    generation_id = %generation_id,
+                    source_work_item_id = %source_item.id,
+                    source_work_item_status = %source_item.status,
+                    "Targeted retry source ACP generation is no longer live; falling back to full stage retry"
+                );
+                return self
+                    .retry_stage_latest_attempt(
+                        run_id,
+                        stage_id,
+                        consume_quota_budget_now,
+                        journal_id,
+                        "operator_retry_stale_targeted_retry",
+                    )
+                    .await;
+            }
+        }
+
+        let mut retry_payload: serde_json::Value = serde_json::from_str(&source_item.payload_json)
+            .map_err(|e| {
+                anyhow!(
+                    "Source InvokeAgent work item {} has invalid payload: {}",
+                    source_item.id,
+                    e
+                )
+            })?;
+        let next_attempt_number = matching_stages
+            .iter()
+            .map(|s| s.attempt_number)
+            .max()
+            .unwrap_or(old_stage.attempt_number)
+            + 1;
+        let now = Utc::now();
+        let new_stage = StageExecution {
+            id: domain::ids::StageExecutionId::new(),
+            run_id,
+            stage_id: old_stage.stage_id.clone(),
+            label: old_stage.label.clone(),
+            status: StageStatus::Running,
+            iteration: old_stage.iteration,
+            attempt_number: next_attempt_number,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: None,
+            owner_agent: old_stage.owner_agent.clone(),
+            provider: old_stage.provider.clone(),
+            model: old_stage.model.clone(),
+            stage_type: old_stage.stage_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some(format!("operator_targeted_retry:{}", target_exec.agent_id)),
+        };
+        let retry_work_item_id = format!(
+            "p058-targeted-retry:{}:{}",
+            new_stage.id, agent_execution_id
+        );
+        if let Some(object) = retry_payload.as_object_mut() {
+            object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
+            object.insert("stage_id".into(), serde_json::json!(stage_id));
+            object.insert(
+                "stage_execution_id".into(),
+                serde_json::json!(new_stage.id.to_string()),
+            );
+            object.remove("p058_claimed");
+            object.insert(
+                "targeted_retry".into(),
+                serde_json::json!({
+                    "journal_id": journal_id,
+                    "source_stage_execution_id": old_stage.id.to_string(),
+                    "source_agent_execution_id": agent_execution_id.to_string(),
+                    "source_work_item_id": source_item.id,
+                    "reason": "operator_targeted_retry"
+                }),
+            );
+        } else {
+            return Err(anyhow!(
+                "Source InvokeAgent work item {} payload is not a JSON object",
+                source_item.id
+            ));
+        }
+
+        let retry_tx_started = Instant::now();
+        let mut retry_tx =
+            db::pool::begin_immediate_with_retry(&self.pool, "command.RetryAgentExecution").await?;
+        apply_quota_retry_budget_for_stage_tx(
+            &mut retry_tx,
+            run_id,
+            old_stage.id,
+            consume_quota_budget_now,
+            journal_id,
+        )
+        .await?;
+        stages::settle_tx(
+            &mut retry_tx,
+            old_stage.id,
+            StageSettlementKind::Skipped,
+            now,
+        )
+        .await?;
+        stages::insert_tx(&mut retry_tx, &new_stage).await?;
+        sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+            .bind(RunStatus::Running.to_string())
+            .bind(stage_id)
+            .bind(run_id.to_string())
+            .execute(&mut *retry_tx)
+            .await?;
+        work_items::enqueue_tx(
+            &mut retry_tx,
+            &WorkItem {
+                id: retry_work_item_id,
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::to_string(&retry_payload)?,
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some(stage_id.to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await?;
+        retry_tx.commit().await?;
+        db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
+
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: old_stage.id,
+            status: StageStatus::Skipped,
+        });
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: new_stage.id,
+            status: StageStatus::Running,
+        });
+        let _ = self.events.send(DomainEvent::RunStatusChanged {
+            run_id,
+            status: RunStatus::Running,
+        });
+
+        projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+        Ok(CommandResult::StageRetryScheduled {
+            run_id,
+            stage_id: stage_id.to_string(),
+        })
     }
 
     /// P044 §3d helper: Check whether the workflow plan for the given run has
