@@ -1443,6 +1443,14 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             actual_mcp_runtime_ids: Vec::new(),
             mcp_session_startup_latency_ms: Some(0),
             close_diagnostic: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
         })
     }
 }

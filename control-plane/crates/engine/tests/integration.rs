@@ -4223,6 +4223,14 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
                 close_diagnostic: None,
+                acp_pre_initialize_local_latency_ms: None,
+                acp_initialize_latency_ms: None,
+                acp_session_new_latency_ms: None,
+                acp_prompt_duration_ms: None,
+                acp_pre_prompt_metadata_latency_ms: None,
+                acp_pre_prompt_metadata_timeout: false,
+                acp_pre_prompt_metadata_digest_bytes: 0,
+                legacy_broad_discovery_snapshot: None,
             })
         }
     }
@@ -4411,6 +4419,14 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
                 close_diagnostic: None,
+                acp_pre_initialize_local_latency_ms: None,
+                acp_initialize_latency_ms: None,
+                acp_session_new_latency_ms: None,
+                acp_prompt_duration_ms: None,
+                acp_pre_prompt_metadata_latency_ms: None,
+                acp_pre_prompt_metadata_timeout: false,
+                acp_pre_prompt_metadata_digest_bytes: 0,
+                legacy_broad_discovery_snapshot: None,
             })
         }
     }

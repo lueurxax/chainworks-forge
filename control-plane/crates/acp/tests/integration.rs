@@ -792,6 +792,12 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         1,
         "workspace diff must find exactly the one file created by the fixture"
     );
+    let pre_initialize_latency_ms = result
+        .acp_pre_initialize_local_latency_ms
+        .expect("P053 fixture must report pre-initialize local latency");
+    println!(
+        "observed acp_pre_initialize_local_latency_ms={pre_initialize_latency_ms}"
+    );
     assert!(
         result.artifact_paths[0].ends_with("result.json"),
         "discovered artifact must be result.json, got: {:?}",

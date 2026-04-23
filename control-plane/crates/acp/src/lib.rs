@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 
 use domain::agent::AgentStatus;
 use domain::discovery::{
-    ExpectedOutputSpec, LegacyBroadDiscoveryPolicy, PrePromptExpectedOutputMetadata,
+    ExpectedOutputSpec, LegacyBroadDiscoveryPolicy, LegacyBroadDiscoverySnapshot,
+    PrePromptExpectedOutputMetadata,
 };
 use domain::ids::{AgentExecutionId, RunId};
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,22 @@ pub struct ExecutionResult {
     /// after the provider already returned a prompt result.
     #[serde(default)]
     pub close_diagnostic: Option<AcpCloseDiagnostic>,
+    #[serde(default)]
+    pub acp_pre_initialize_local_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_initialize_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_session_new_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_prompt_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_pre_prompt_metadata_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_pre_prompt_metadata_timeout: bool,
+    #[serde(default)]
+    pub acp_pre_prompt_metadata_digest_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_broad_discovery_snapshot: Option<LegacyBroadDiscoverySnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

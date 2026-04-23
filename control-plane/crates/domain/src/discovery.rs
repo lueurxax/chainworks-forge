@@ -410,6 +410,78 @@ pub struct DiscoveryDiagnosticsV1 {
     #[serde(default)]
     pub warnings: Vec<String>,
     pub generated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_pre_initialize_local_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_initialize_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_session_new_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_prompt_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_pre_prompt_metadata_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_pre_prompt_metadata_timeout: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_pre_prompt_metadata_digest_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_expected_output_spec_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_control_plane_manifest_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_exact_output_acceptance_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_meta_root_discovery_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_git_changed_files_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_expected_outputs_found_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_expected_outputs_missing_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_expected_outputs_stale_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_expected_outputs_rejected_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_meta_discovery_truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_meta_discovery_truncation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_legacy_broad_discovery_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_legacy_broad_discovery_used: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_git_manifest_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_resume_discovery_warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_discovery_schema_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_discovery_override_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_missing_required_output_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_rejected_output_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_stale_output_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_exact_output_acceptance_timeout: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_exact_output_aggregate_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_exact_output_aggregate_cap_hit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_cap_validation_sample_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_cap_validation_p90_output_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_cap_validation_p90_aggregate_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_legacy_broad_discovery_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_legacy_broad_discovery_truncation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_reconciliation_pending: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,7 +502,7 @@ pub struct AgentExecutionDiscoveryDiagnostics {
 }
 
 impl AgentExecutionDiscoveryDiagnostics {
-    pub fn from_payload(payload: DiscoveryDiagnosticsV1, now: DateTime<Utc>) -> Self {
+    pub fn from_payload(mut payload: DiscoveryDiagnosticsV1, now: DateTime<Utc>) -> Self {
         let missing_required_output_count = payload
             .decisions
             .iter()
@@ -455,6 +527,93 @@ impl AgentExecutionDiscoveryDiagnostics {
                         || discovery.truncated_by_file_size
                         || discovery.truncated_by_total_bytes
                 });
+        payload.acp_expected_output_spec_count.get_or_insert_with(|| {
+            payload.pre_prompt_expected_outputs.len() as u64
+        });
+        payload
+            .acp_expected_outputs_found_count
+            .get_or_insert_with(|| {
+                payload
+                    .decisions
+                    .iter()
+                    .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
+                    .count() as i64
+            });
+        payload
+            .acp_expected_outputs_missing_count
+            .get_or_insert(missing_required_output_count);
+        payload
+            .acp_expected_outputs_rejected_count
+            .get_or_insert(rejected_output_count);
+        payload
+            .acp_expected_outputs_stale_count
+            .get_or_insert(stale_output_count);
+        payload
+            .acp_meta_discovery_truncated
+            .get_or_insert(meta_discovery_truncated);
+        payload.acp_meta_discovery_truncation_reason = payload
+            .acp_meta_discovery_truncation_reason
+            .or_else(|| {
+                payload
+                    .bounded_meta_root_discovery
+                    .as_ref()
+                    .and_then(bounded_meta_root_truncation_reason)
+            });
+        payload
+            .acp_legacy_broad_discovery_used
+            .get_or_insert(payload.legacy_broad_discovery_used);
+        payload.acp_git_manifest_status = payload
+            .acp_git_manifest_status
+            .clone()
+            .or_else(|| payload.git_manifest_status.clone());
+        payload.acp_resume_discovery_warning = payload
+            .acp_resume_discovery_warning
+            .clone()
+            .or_else(|| payload.resume_warnings.first().cloned());
+        payload.acp_discovery_schema_version = payload
+            .acp_discovery_schema_version
+            .clone()
+            .or_else(|| Some(payload.schema_version.clone()));
+        payload
+            .acp_missing_required_output_count
+            .get_or_insert(missing_required_output_count);
+        payload
+            .acp_rejected_output_count
+            .get_or_insert(rejected_output_count);
+        payload
+            .acp_stale_output_count
+            .get_or_insert(stale_output_count);
+        payload
+            .acp_exact_output_acceptance_timeout
+            .get_or_insert(false);
+        payload.acp_exact_output_aggregate_bytes = payload
+            .acp_exact_output_aggregate_bytes
+            .or_else(|| {
+                payload
+                    .decisions
+                    .iter()
+                    .filter_map(|decision| decision.aggregate_bytes_after_acceptance)
+                    .max()
+            });
+        payload
+            .acp_exact_output_aggregate_cap_hit
+            .get_or_insert_with(|| {
+                payload
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.reason == OutputDiscoveryReason::AggregateExactOutputCap)
+            });
+        payload
+            .acp_legacy_broad_discovery_timeout_ms
+            .get_or_insert(LEGACY_BROAD_DISCOVERY_TIMEOUT.as_millis() as u64);
+        payload.acp_legacy_broad_discovery_truncation_reason = payload
+            .acp_legacy_broad_discovery_truncation_reason
+            .clone()
+            .or_else(|| payload.warnings.iter().find_map(|warning| {
+                warning
+                    .strip_prefix("legacy_broad_discovery_truncated:")
+                    .map(str::to_string)
+            }));
         Self {
             agent_execution_id: payload.agent_execution_id.clone(),
             discovery_schema_version: payload.schema_version.clone(),
@@ -472,12 +631,28 @@ impl AgentExecutionDiscoveryDiagnostics {
     }
 }
 
+fn bounded_meta_root_truncation_reason(
+    discovery: &BoundedMetaRootDiscovery,
+) -> Option<String> {
+    if discovery.truncated_by_file_cap {
+        Some("file_cap".to_string())
+    } else if discovery.truncated_by_file_size {
+        Some("per_file_bytes".to_string())
+    } else if discovery.truncated_by_total_bytes {
+        Some("total_bytes".to_string())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundedMetaRootDiscovery {
     pub root_path: String,
     pub artifact_paths: Vec<String>,
     pub files_visited: usize,
     pub total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
     pub truncated_by_file_cap: bool,
     pub truncated_by_file_size: bool,
     pub truncated_by_total_bytes: bool,
@@ -529,6 +704,7 @@ impl BoundedMetaRootDiscovery {
             artifact_paths: Vec::new(),
             files_visited: 0,
             total_bytes: 0,
+            latency_ms: None,
             truncated_by_file_cap: false,
             truncated_by_file_size: false,
             truncated_by_total_bytes: false,
@@ -1001,6 +1177,7 @@ fn discover_bounded_meta_root_artifacts(
         artifact_paths: Vec::new(),
         files_visited: 0,
         total_bytes: 0,
+        latency_ms: None,
         truncated_by_file_cap: false,
         truncated_by_file_size: false,
         truncated_by_total_bytes: false,

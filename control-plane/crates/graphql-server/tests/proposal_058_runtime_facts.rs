@@ -245,6 +245,61 @@ fn accepted_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDi
     }
 }
 
+fn discovery_payload(
+    agent_execution_id: AgentExecutionId,
+    decisions: Vec<OutputDiscoveryDecision>,
+    now: chrono::DateTime<Utc>,
+) -> DiscoveryDiagnosticsV1 {
+    DiscoveryDiagnosticsV1 {
+        schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
+        agent_execution_id: agent_execution_id.to_string(),
+        decisions,
+        pre_prompt_expected_outputs: Vec::new(),
+        legacy_broad_discovery_used: false,
+        bounded_meta_root_discovery: None,
+        git_manifest_status: None,
+        resume_warnings: Vec::new(),
+        warnings: Vec::new(),
+        generated_at: now,
+        acp_pre_initialize_local_latency_ms: None,
+        acp_initialize_latency_ms: None,
+        acp_session_new_latency_ms: None,
+        acp_prompt_duration_ms: None,
+        acp_pre_prompt_metadata_latency_ms: None,
+        acp_pre_prompt_metadata_timeout: None,
+        acp_pre_prompt_metadata_digest_bytes: None,
+        acp_expected_output_spec_count: None,
+        acp_control_plane_manifest_latency_ms: None,
+        acp_exact_output_acceptance_latency_ms: None,
+        acp_meta_root_discovery_latency_ms: None,
+        acp_git_changed_files_latency_ms: None,
+        acp_expected_outputs_found_count: None,
+        acp_expected_outputs_missing_count: None,
+        acp_expected_outputs_stale_count: None,
+        acp_expected_outputs_rejected_count: None,
+        acp_meta_discovery_truncated: None,
+        acp_meta_discovery_truncation_reason: None,
+        acp_legacy_broad_discovery_policy: None,
+        acp_legacy_broad_discovery_used: None,
+        acp_git_manifest_status: None,
+        acp_resume_discovery_warning: None,
+        acp_discovery_schema_version: None,
+        acp_discovery_override_status: None,
+        acp_missing_required_output_count: None,
+        acp_rejected_output_count: None,
+        acp_stale_output_count: None,
+        acp_exact_output_acceptance_timeout: None,
+        acp_exact_output_aggregate_bytes: None,
+        acp_exact_output_aggregate_cap_hit: None,
+        acp_cap_validation_sample_size: None,
+        acp_cap_validation_p90_output_bytes: None,
+        acp_cap_validation_p90_aggregate_bytes: None,
+        acp_legacy_broad_discovery_timeout_ms: None,
+        acp_legacy_broad_discovery_truncation_reason: None,
+        acp_reconciliation_pending: None,
+    }
+}
+
 #[tokio::test]
 async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenance() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -418,18 +473,7 @@ async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending(
         seed_execution(&pool).await;
     let now = Utc::now();
     let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(
-        DiscoveryDiagnosticsV1 {
-            schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
-            agent_execution_id: agent_execution_id.to_string(),
-            decisions: vec![accepted_discovery_decision(agent_execution_id)],
-            pre_prompt_expected_outputs: Vec::new(),
-            legacy_broad_discovery_used: false,
-            bounded_meta_root_discovery: None,
-            git_manifest_status: None,
-            resume_warnings: Vec::new(),
-            warnings: Vec::new(),
-            generated_at: now,
-        },
+        discovery_payload(agent_execution_id, vec![accepted_discovery_decision(agent_execution_id)], now),
         now,
     );
     agent_execution_discovery_diagnostics::upsert(&pool, &diagnostics)

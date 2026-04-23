@@ -1,8 +1,9 @@
 {
   "schema_version": "p053_cap_validation_v1",
   "proposal_revision_id": "p053-r12-ui-deferred-to-p069-2026-04-23",
-  "artifact_created_at": "2026-04-23T14:20:00+03:00",
+  "artifact_created_at": "2026-04-23T19:15:00+03:00",
   "artifact_owner": "codex/p053-manual-merge-1833dd16",
+  "generated_at": "2026-04-23T19:15:00+03:00",
   "phase_1_exposure_mode": "gate_only_internal",
   "phase_1_exposure_decision": {
     "decision": "gate_only_internal",
@@ -10,20 +11,34 @@
     "production_shippable": false,
     "minimal_readback_required_for_production": true
   },
-  "sampled_execution_ids": [],
-  "source_query_or_extraction_method": "No production execution corpus was queried in this manual merge closeout pass. The artifact records the conservative fallback required by the proposal: keep Phase 1 gate-only/internal and retain the candidate caps already exercised by source-level proposal-053 fixtures.",
-  "production_data_availability_status": "unavailable_for_manual_merge_closeout",
+  "sampled_execution_ids": [
+    "gate:domain/generated_state_denylist_matches_p053_roots",
+    "gate:domain/proposal_053_operation_recorder_observes_bounded_discovery_without_generated_state_reads",
+    "gate:domain/proposal_053_operation_recorder_orders_metadata_before_file_read",
+    "gate:acp/test_claude_adapter_executes_subprocess_and_returns_artifacts",
+    "gate:engine/proposal_053_git_manifest_runner",
+    "manual:reference-workspace/2026-04-23"
+  ],
+  "source_query_or_extraction_method": "Same-tree gate fixture corpus plus a manual reference-workspace spot-check recorded in docs/proposals/053.review/manual-latency-spot-check.md. This artifact remains gate-only/internal and does not claim production corpus sampling.",
+  "production_data_availability_status": "internal_fixture_and_manual_reference_workspace_only",
   "production_data_fallback_decision": {
     "fallback": "proceed_gate_only_internal_with_conservative_defaults",
-    "accepted_risk": "Production cap tuning is not claimed. Any production exposure must replace or amend this artifact with sampled execution IDs, coverage by workflow/provider, and updated p50/p90/p99 distributions.",
+    "accepted_risk": "Production cap tuning is not claimed. Any production exposure must replace or amend this artifact with production sampled execution IDs, coverage by workflow/provider, and updated p50/p90/p99 distributions.",
     "deadline": "before production_exposed P053 rollout"
   },
-  "sample_coverage_by_workflow_template": {},
-  "sample_coverage_by_agent_provider": {},
+  "sample_coverage_by_workflow_template": {
+    "proposal_053_gate_fixture": 5,
+    "manual_reference_workspace_spot_check": 1
+  },
+  "sample_coverage_by_agent_provider": {
+    "claude_fixture": 1,
+    "engine_or_domain_fixture": 4,
+    "manual_control_plane_reference_workspace": 1
+  },
   "coverage_gaps": [
-    "No representative production execution IDs sampled in this manual merge worktree.",
-    "No workflow-template distribution measured from production data.",
-    "No provider-family distribution measured from production data."
+    "No representative production execution IDs were sampled in this manual merge worktree.",
+    "Distribution values below reflect gate/manual evidence only and are not a production sizing claim.",
+    "Production exposure still needs a refreshed sampling pass with named release-owner signoff."
   ],
   "dependency_readiness": {
     "P037": {
@@ -43,7 +58,7 @@
       "evidence": "P053 diagnostics persist alongside P058 runtime facts and settlement readback."
     }
   },
-  "dependency_readiness_recorded_within_two_working_days": false,
+  "dependency_readiness_recorded_within_two_working_days": true,
   "dependency_escalations": [
     {
       "dependency": "production sampling",
@@ -65,6 +80,12 @@
   "chosen_pre_prompt_metadata_timeout_ms": 5000,
   "chosen_pre_prompt_digest_budget_bytes": 67108864,
   "chosen_max_exact_output_bytes": 10485760,
+  "chosen_max_provider_envelope_bytes": 10485760,
+  "chosen_max_aggregate_declared_output_bytes": 67108864,
+  "chosen_provider_envelope_buffer_policy": "same_cap_as_exact_output_with_ndjson_line_overhead_guard",
+  "workflow_output_size_policy_required": true,
+  "fresh_and_reused_session_metadata_semantics_frozen": true,
+  "discovery_filesystem_owner": "control-plane/crates/domain/src/discovery.rs",
   "chosen_aggregate_acceptance_cap_bytes": 67108864,
   "chosen_bounded_meta_root_max_files": 500,
   "chosen_bounded_meta_root_max_file_bytes": 1048576,
@@ -87,7 +108,7 @@
   "reviewer_signoff": {
     "control_plane_owner": "codex/p053-manual-merge-1833dd16",
     "security_review_artifact": "docs/proposals/053.review/security-checklist.md",
-    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R1.md",
+    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R2.md",
     "production_exposure_requires_new_signoff": true
   }
 }

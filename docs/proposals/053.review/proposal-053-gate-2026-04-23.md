@@ -6,7 +6,7 @@
 | Worktree | `.chainworks/worktrees/codex-p053-manual-merge-1833dd16` |
 | Branch | `codex/p053-manual-merge-1833dd16` |
 | Result | Passed |
-| Completed at | 2026-04-23 |
+| Completed at | 2026-04-23 20:09 Asia/Nicosia |
 
 ## Covered Slices
 
@@ -24,3 +24,5 @@
 ## Notes
 
 This is same-tree control-plane validation. It does not claim production exposure; `docs/proposals/053.review/cap-validation.json` records `phase_1_exposure_mode = gate_only_internal`.
+
+The current recorded rerun includes the ACP fixture observation `acp_pre_initialize_local_latency_ms=0`, which is also captured in `docs/proposals/053.review/manual-latency-spot-check.md`.

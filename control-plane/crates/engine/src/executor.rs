@@ -898,6 +898,8 @@ struct DeclaredOutputDiscoverySettlement {
     decisions: Vec<OutputDiscoveryDecision>,
     accepted_payloads: HashMap<String, Vec<u8>>,
     idempotency_key: Option<String>,
+    accepted_aggregate_bytes: u64,
+    aggregate_cap_hit: bool,
 }
 
 fn build_declared_output_discovery_settlement(
@@ -908,6 +910,7 @@ fn build_declared_output_discovery_settlement(
     let mut decisions = Vec::with_capacity(expected_outputs.len());
     let mut accepted_payloads = HashMap::new();
     let mut accepted_aggregate_bytes = 0u64;
+    let mut aggregate_cap_hit = false;
 
     for spec in expected_outputs {
         let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
@@ -991,6 +994,7 @@ fn build_declared_output_discovery_settlement(
 
         let aggregate_after = accepted_aggregate_bytes.saturating_add(bytes.len() as u64);
         if aggregate_after > spec.aggregate_acceptance_cap_bytes {
+            aggregate_cap_hit = true;
             decisions.push(rejected_output_decision(
                 spec,
                 OutputDiscoveryReason::AggregateExactOutputCap,
@@ -1035,6 +1039,8 @@ fn build_declared_output_discovery_settlement(
         decisions,
         accepted_payloads,
         idempotency_key: discovery_settlement_idempotency_key(pre_prompt_expected_outputs),
+        accepted_aggregate_bytes,
+        aggregate_cap_hit,
     }
 }
 
@@ -1404,16 +1410,30 @@ fn control_plane_payload_ref(output_name: &str) -> String {
     format!("control_plane:{output_name}")
 }
 
-fn bounded_meta_root_artifact_paths(chainworks_meta_root: Option<&str>) -> Vec<String> {
+fn bounded_meta_root_artifact_paths(
+    chainworks_meta_root: Option<&str>,
+) -> domain::discovery::BoundedMetaRootDiscovery {
     let Some(meta_root) = chainworks_meta_root.filter(|root| !root.trim().is_empty()) else {
         warn!("P053 bounded meta-root discovery skipped: chainworks_meta_root absent");
-        return Vec::new();
+        return domain::discovery::BoundedMetaRootDiscovery {
+            root_path: String::new(),
+            artifact_paths: Vec::new(),
+            files_visited: 0,
+            total_bytes: 0,
+            latency_ms: None,
+            truncated_by_file_cap: false,
+            truncated_by_file_size: false,
+            truncated_by_total_bytes: false,
+            warnings: vec!["meta_root_absent".to_string()],
+        };
     };
     let meta_root_started = Instant::now();
-    let discovery = DiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
+    let mut discovery = DiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
+    let latency_ms = meta_root_started.elapsed().as_millis() as u64;
+    discovery.latency_ms = Some(latency_ms);
     info!(
         chainworks_meta_root = %discovery.root_path,
-        acp_meta_root_discovery_latency_ms = meta_root_started.elapsed().as_millis() as u64,
+        acp_meta_root_discovery_latency_ms = latency_ms,
         files_visited = discovery.files_visited,
         total_bytes = discovery.total_bytes,
         truncated_by_file_cap = discovery.truncated_by_file_cap,
@@ -1442,7 +1462,7 @@ fn bounded_meta_root_artifact_paths(chainworks_meta_root: Option<&str>) -> Vec<S
             "P053 bounded meta-root discovery warning"
         );
     }
-    discovery.artifact_paths
+    discovery
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -1578,26 +1598,145 @@ fn runtime_facts_for_execution_result(
     facts
 }
 
+struct ExecutionDiscoveryMetrics {
+    acp_pre_initialize_local_latency_ms: Option<u64>,
+    acp_initialize_latency_ms: Option<u64>,
+    acp_session_new_latency_ms: Option<u64>,
+    acp_prompt_duration_ms: Option<u64>,
+    acp_pre_prompt_metadata_latency_ms: Option<u64>,
+    acp_pre_prompt_metadata_timeout: bool,
+    acp_pre_prompt_metadata_digest_bytes: u64,
+    acp_expected_output_spec_count: usize,
+    acp_control_plane_manifest_latency_ms: Option<u64>,
+    acp_git_changed_files_latency_ms: Option<u64>,
+    acp_git_manifest_status: Option<String>,
+    acp_exact_output_acceptance_latency_ms: Option<u64>,
+    acp_exact_output_acceptance_timeout: bool,
+    acp_exact_output_aggregate_bytes: u64,
+    acp_exact_output_aggregate_cap_hit: bool,
+    acp_legacy_broad_discovery_policy: String,
+    acp_legacy_broad_discovery_used: bool,
+    acp_discovery_override_status: String,
+    acp_legacy_broad_discovery_truncation_reason: Option<String>,
+    acp_resume_discovery_warning: Option<String>,
+    acp_cap_validation_sample_size: Option<u64>,
+    acp_cap_validation_p90_output_bytes: Option<u64>,
+    acp_cap_validation_p90_aggregate_bytes: Option<u64>,
+}
+
 fn discovery_diagnostics_for_execution_result(
     agent_exec_id: domain::ids::AgentExecutionId,
     decisions: &[OutputDiscoveryDecision],
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
-    legacy_broad_discovery_used: bool,
+    bounded_meta_root_discovery: Option<domain::discovery::BoundedMetaRootDiscovery>,
+    metrics: ExecutionDiscoveryMetrics,
     now: chrono::DateTime<chrono::Utc>,
 ) -> AgentExecutionDiscoveryDiagnostics {
+    let acp_meta_root_discovery_latency_ms = bounded_meta_root_discovery
+        .as_ref()
+        .and_then(|discovery| discovery.latency_ms);
     let payload = DiscoveryDiagnosticsV1 {
         schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
         agent_execution_id: agent_exec_id.to_string(),
         decisions: decisions.to_vec(),
         pre_prompt_expected_outputs: pre_prompt_expected_outputs.to_vec(),
-        legacy_broad_discovery_used,
-        bounded_meta_root_discovery: None,
-        git_manifest_status: None,
-        resume_warnings: Vec::new(),
+        legacy_broad_discovery_used: metrics.acp_legacy_broad_discovery_used,
+        bounded_meta_root_discovery,
+        git_manifest_status: metrics.acp_git_manifest_status.clone(),
+        resume_warnings: metrics
+            .acp_resume_discovery_warning
+            .iter()
+            .cloned()
+            .collect(),
         warnings: Vec::new(),
         generated_at: now,
+        acp_pre_initialize_local_latency_ms: metrics.acp_pre_initialize_local_latency_ms,
+        acp_initialize_latency_ms: metrics.acp_initialize_latency_ms,
+        acp_session_new_latency_ms: metrics.acp_session_new_latency_ms,
+        acp_prompt_duration_ms: metrics.acp_prompt_duration_ms,
+        acp_pre_prompt_metadata_latency_ms: metrics.acp_pre_prompt_metadata_latency_ms,
+        acp_pre_prompt_metadata_timeout: Some(metrics.acp_pre_prompt_metadata_timeout),
+        acp_pre_prompt_metadata_digest_bytes: Some(metrics.acp_pre_prompt_metadata_digest_bytes),
+        acp_expected_output_spec_count: Some(metrics.acp_expected_output_spec_count as u64),
+        acp_control_plane_manifest_latency_ms: metrics.acp_control_plane_manifest_latency_ms,
+        acp_exact_output_acceptance_latency_ms: metrics.acp_exact_output_acceptance_latency_ms,
+        acp_meta_root_discovery_latency_ms,
+        acp_git_changed_files_latency_ms: metrics.acp_git_changed_files_latency_ms,
+        acp_expected_outputs_found_count: None,
+        acp_expected_outputs_missing_count: None,
+        acp_expected_outputs_stale_count: None,
+        acp_expected_outputs_rejected_count: None,
+        acp_meta_discovery_truncated: None,
+        acp_meta_discovery_truncation_reason: None,
+        acp_legacy_broad_discovery_policy: Some(metrics.acp_legacy_broad_discovery_policy),
+        acp_legacy_broad_discovery_used: Some(metrics.acp_legacy_broad_discovery_used),
+        acp_git_manifest_status: metrics.acp_git_manifest_status,
+        acp_resume_discovery_warning: metrics.acp_resume_discovery_warning,
+        acp_discovery_schema_version: Some(DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string()),
+        acp_discovery_override_status: Some(metrics.acp_discovery_override_status),
+        acp_missing_required_output_count: None,
+        acp_rejected_output_count: None,
+        acp_stale_output_count: None,
+        acp_exact_output_acceptance_timeout: Some(metrics.acp_exact_output_acceptance_timeout),
+        acp_exact_output_aggregate_bytes: Some(metrics.acp_exact_output_aggregate_bytes),
+        acp_exact_output_aggregate_cap_hit: Some(metrics.acp_exact_output_aggregate_cap_hit),
+        acp_cap_validation_sample_size: metrics.acp_cap_validation_sample_size,
+        acp_cap_validation_p90_output_bytes: metrics.acp_cap_validation_p90_output_bytes,
+        acp_cap_validation_p90_aggregate_bytes: metrics.acp_cap_validation_p90_aggregate_bytes,
+        acp_legacy_broad_discovery_timeout_ms: Some(5_000),
+        acp_legacy_broad_discovery_truncation_reason:
+            metrics.acp_legacy_broad_discovery_truncation_reason,
+        acp_reconciliation_pending: Some(false),
     };
     AgentExecutionDiscoveryDiagnostics::from_payload(payload, now)
+}
+
+fn legacy_broad_discovery_policy_name(
+    policy: domain::discovery::LegacyBroadDiscoveryPolicy,
+) -> String {
+    match policy {
+        domain::discovery::LegacyBroadDiscoveryPolicy::Disabled => "disabled".to_string(),
+        domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn => {
+            "workflow_opt_in".to_string()
+        }
+    }
+}
+
+fn legacy_broad_discovery_truncation_reason(
+    snapshot: Option<&domain::discovery::LegacyBroadDiscoverySnapshot>,
+) -> Option<String> {
+    let snapshot = snapshot?;
+    if snapshot.timed_out {
+        Some("timeout".to_string())
+    } else if snapshot.truncated_by_file_cap {
+        Some("file_cap".to_string())
+    } else if snapshot.truncated_by_file_size {
+        Some("per_file_bytes".to_string())
+    } else if snapshot.truncated_by_total_bytes {
+        Some("total_bytes".to_string())
+    } else {
+        None
+    }
+}
+
+fn load_p053_cap_validation_metrics(
+    workspace_root: &str,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let path = std::path::Path::new(workspace_root)
+        .join("docs/proposals/053.review/cap-validation.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (None, None, None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None, None);
+    };
+    (
+        value["sampled_execution_ids"]
+            .as_array()
+            .map(|items| items.len() as u64),
+        value["per_output_bytes_p90"].as_u64(),
+        value["aggregate_bytes_p90"].as_u64(),
+    )
 }
 
 fn session_reuse_reason_for_policy_decision(decision: &SessionPolicyDecision) -> String {
@@ -2845,6 +2984,13 @@ impl BackgroundExecutor {
                     .await?
                     .map(|stage| stage.attempt_number)
                     .unwrap_or(1);
+                let mut discovery_override_status = if legacy_broad_discovery_policy
+                    .allows_broad_discovery()
+                {
+                    "workflow_opt_in".to_string()
+                } else {
+                    "not_requested".to_string()
+                };
                 if !legacy_broad_discovery_policy.allows_broad_discovery() {
                     let mut tx = db::pool::begin_immediate_with_retry(
                         &self.pool,
@@ -2862,6 +3008,7 @@ impl BackgroundExecutor {
                         .await?
                     {
                         legacy_broad_discovery_policy = override_row.requested_policy;
+                        discovery_override_status = "consumed".to_string();
                         warn!(
                             run_id = %run_id,
                             stage_id = %stage_id,
@@ -3113,29 +3260,51 @@ impl BackgroundExecutor {
                     .await?;
                 }
 
+                let mut acp_control_plane_manifest_latency_ms: Option<u64> = None;
+                let mut acp_git_changed_files_latency_ms: Option<u64> = None;
+                let mut acp_git_manifest_status: Option<String> = None;
+                let mut acp_exact_output_acceptance_latency_ms: Option<u64> = None;
+                let mut acp_resume_discovery_warning: Option<String> = None;
                 let declared_output_settlement = if !declared_outputs.is_empty() {
                     let manifest_started = Instant::now();
-                    if let Err(error) = generate_changed_files_manifest_if_declared(
+                    match generate_changed_files_manifest_if_declared(
                         &declared_outputs,
                         Some(effective_working_directory.as_str()),
                         worktree_write_enabled,
                     )
                     .await
                     {
-                        error!(
-                            run_id = %run_id,
-                            stage_id = %stage_id,
-                            agent_id = %agent_id,
-                            error = %error,
-                            "Failed to generate changed-files manifest"
-                        );
+                        Ok(status) => {
+                            acp_git_manifest_status = status.map(|status| {
+                                serde_json::to_value(status)
+                                    .ok()
+                                    .and_then(|value| value.as_str().map(str::to_string))
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            });
+                        }
+                        Err(error) => {
+                            acp_git_manifest_status = Some("command_failed".to_string());
+                            acp_resume_discovery_warning =
+                                Some("git_manifest_generation_failed".to_string());
+                            error!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                error = %error,
+                                "Failed to generate changed-files manifest"
+                            );
+                        }
                     }
+                    let manifest_latency_ms = manifest_started.elapsed().as_millis() as u64;
+                    acp_control_plane_manifest_latency_ms = Some(manifest_latency_ms);
+                    acp_git_changed_files_latency_ms = Some(manifest_latency_ms);
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
                         agent_id = %agent_id,
-                        acp_control_plane_manifest_latency_ms = manifest_started.elapsed().as_millis() as u64,
-                        acp_git_changed_files_latency_ms = manifest_started.elapsed().as_millis() as u64,
+                        acp_control_plane_manifest_latency_ms = manifest_latency_ms,
+                        acp_git_changed_files_latency_ms = manifest_latency_ms,
+                        acp_git_manifest_status = acp_git_manifest_status.as_deref().unwrap_or("unknown"),
                         "P053 control-plane manifest generation measured"
                     );
                     let exact_output_acceptance_started = Instant::now();
@@ -3167,15 +3336,21 @@ impl BackgroundExecutor {
                         .iter()
                         .filter(|decision| decision.status == OutputDiscoveryStatus::Rejected)
                         .count();
+                    let exact_output_acceptance_latency_ms =
+                        exact_output_acceptance_started.elapsed().as_millis() as u64;
+                    acp_exact_output_acceptance_latency_ms =
+                        Some(exact_output_acceptance_latency_ms);
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
                         agent_id = %agent_id,
-                        acp_exact_output_acceptance_latency_ms = exact_output_acceptance_started.elapsed().as_millis() as u64,
+                        acp_exact_output_acceptance_latency_ms = exact_output_acceptance_latency_ms,
                         acp_expected_outputs_found_count = found_count,
                         acp_expected_outputs_missing_count = missing_count,
                         acp_expected_outputs_stale_count = stale_count,
                         acp_expected_outputs_rejected_count = rejected_count,
+                        acp_exact_output_aggregate_bytes = settlement.accepted_aggregate_bytes,
+                        acp_exact_output_aggregate_cap_hit = settlement.aggregate_cap_hit,
                         acp_reconciliation_pending = false,
                         "P053 exact-output acceptance measured"
                     );
@@ -3296,10 +3471,14 @@ impl BackgroundExecutor {
 
                 let supplemental_meta_root_artifact_paths =
                     bounded_meta_root_artifact_paths(run.chainworks_meta_root.as_deref());
+                let supplemental_meta_root_discovery =
+                    (!supplemental_meta_root_artifact_paths.root_path.is_empty()
+                        || !supplemental_meta_root_artifact_paths.warnings.is_empty())
+                    .then_some(supplemental_meta_root_artifact_paths.clone());
                 for path in result
                     .artifact_paths
                     .iter()
-                    .chain(supplemental_meta_root_artifact_paths.iter())
+                    .chain(supplemental_meta_root_artifact_paths.artifact_paths.iter())
                 {
                     if persisted_paths.contains(path) {
                         continue;
@@ -3331,12 +3510,51 @@ impl BackgroundExecutor {
                         )
                     })
                     .unwrap_or_default();
+                let (acp_cap_validation_sample_size, acp_cap_validation_p90_output_bytes, acp_cap_validation_p90_aggregate_bytes) =
+                    load_p053_cap_validation_metrics(&run.workspace_root);
                 let discovery_diagnostics = declared_output_settlement.as_ref().map(|settlement| {
                     discovery_diagnostics_for_execution_result(
                         agent_exec_id,
                         &settlement.decisions,
                         &result.pre_prompt_expected_outputs,
-                        req.legacy_broad_discovery_policy.allows_broad_discovery(),
+                        supplemental_meta_root_discovery.clone(),
+                        ExecutionDiscoveryMetrics {
+                            acp_pre_initialize_local_latency_ms: result
+                                .acp_pre_initialize_local_latency_ms,
+                            acp_initialize_latency_ms: result.acp_initialize_latency_ms,
+                            acp_session_new_latency_ms: result.acp_session_new_latency_ms,
+                            acp_prompt_duration_ms: result.acp_prompt_duration_ms,
+                            acp_pre_prompt_metadata_latency_ms: result
+                                .acp_pre_prompt_metadata_latency_ms,
+                            acp_pre_prompt_metadata_timeout: result
+                                .acp_pre_prompt_metadata_timeout,
+                            acp_pre_prompt_metadata_digest_bytes: result
+                                .acp_pre_prompt_metadata_digest_bytes,
+                            acp_expected_output_spec_count: expected_outputs.len(),
+                            acp_control_plane_manifest_latency_ms,
+                            acp_git_changed_files_latency_ms,
+                            acp_git_manifest_status: acp_git_manifest_status.clone(),
+                            acp_exact_output_acceptance_latency_ms,
+                            acp_exact_output_acceptance_timeout: false,
+                            acp_exact_output_aggregate_bytes: settlement
+                                .accepted_aggregate_bytes,
+                            acp_exact_output_aggregate_cap_hit: settlement.aggregate_cap_hit,
+                            acp_legacy_broad_discovery_policy: legacy_broad_discovery_policy_name(
+                                req.legacy_broad_discovery_policy,
+                            ),
+                            acp_legacy_broad_discovery_used: req
+                                .legacy_broad_discovery_policy
+                                .allows_broad_discovery(),
+                            acp_discovery_override_status: discovery_override_status.clone(),
+                            acp_legacy_broad_discovery_truncation_reason:
+                                legacy_broad_discovery_truncation_reason(
+                                    result.legacy_broad_discovery_snapshot.as_ref(),
+                                ),
+                            acp_resume_discovery_warning: acp_resume_discovery_warning.clone(),
+                            acp_cap_validation_sample_size,
+                            acp_cap_validation_p90_output_bytes,
+                            acp_cap_validation_p90_aggregate_bytes,
+                        },
                         completed_at,
                     )
                 });
@@ -5190,8 +5408,8 @@ mod tests {
 
         let paths = bounded_meta_root_artifact_paths(Some(meta_root.to_str().unwrap()));
 
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("logs/agent.log"));
+        assert_eq!(paths.artifact_paths.len(), 1);
+        assert!(paths.artifact_paths[0].ends_with("logs/agent.log"));
     }
 
     #[test]

@@ -2392,37 +2392,81 @@ PY
     log "Proposal 053 control-plane gate: bounded ACP artifact discovery"
     python3 - <<'PY'
 import json
+from datetime import datetime
 from pathlib import Path
 
 root = Path.cwd()
 cap = root / "docs/proposals/053.review/cap-validation.json"
 security = root / "docs/proposals/053.review/security-checklist.md"
+manual_latency = root / "docs/proposals/053.review/manual-latency-spot-check.md"
+operator_clarity = root / "docs/proposals/053.review/operator-clarity-evidence.md"
+retrospective = root / "docs/proposals/053.review/phase-1-retrospective.md"
 if not cap.exists():
     raise SystemExit("proposal-053: missing docs/proposals/053.review/cap-validation.json")
 if not security.exists():
     raise SystemExit("proposal-053: missing docs/proposals/053.review/security-checklist.md")
+if not manual_latency.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/manual-latency-spot-check.md")
+if not operator_clarity.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/operator-clarity-evidence.md")
+if not retrospective.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/phase-1-retrospective.md")
 data = json.loads(cap.read_text())
 required = {
     "schema_version",
     "proposal_revision_id",
+    "sampled_execution_ids",
+    "source_query_or_extraction_method",
+    "sample_coverage_by_workflow_template",
+    "sample_coverage_by_agent_provider",
+    "dependency_readiness_recorded_within_two_working_days",
+    "dependency_escalations",
+    "narrow_adapter_owner_when_needed",
     "phase_1_exposure_mode",
+    "production_data_availability_status",
+    "production_data_fallback_decision",
+    "excluded_outputs",
+    "per_output_bytes_p50",
+    "per_output_bytes_p90",
+    "per_output_bytes_p99",
+    "aggregate_bytes_p50",
+    "aggregate_bytes_p90",
+    "aggregate_bytes_p99",
+    "expected_output_spec_count_p90",
     "dependency_readiness",
     "chosen_max_expected_output_specs",
     "chosen_pre_prompt_metadata_timeout_ms",
     "chosen_pre_prompt_digest_budget_bytes",
     "chosen_max_exact_output_bytes",
+    "chosen_max_provider_envelope_bytes",
+    "chosen_max_aggregate_declared_output_bytes",
+    "chosen_provider_envelope_buffer_policy",
+    "workflow_output_size_policy_required",
+    "fresh_and_reused_session_metadata_semantics_frozen",
+    "discovery_filesystem_owner",
     "chosen_aggregate_acceptance_cap_bytes",
     "interface_freeze",
     "reviewer_signoff",
+    "generated_at",
 }
 missing = sorted(required.difference(data))
 if missing:
     raise SystemExit(f"proposal-053: cap-validation missing fields: {missing}")
+if not isinstance(data["sampled_execution_ids"], list) or not data["sampled_execution_ids"]:
+    raise SystemExit("proposal-053: sampled_execution_ids must be a non-empty list")
+if data["dependency_readiness_recorded_within_two_working_days"] is not True:
+    raise SystemExit("proposal-053: dependency_readiness_recorded_within_two_working_days must be true")
 if data["phase_1_exposure_mode"] not in {"gate_only_internal", "production_exposed"}:
     raise SystemExit("proposal-053: phase_1_exposure_mode must be gate_only_internal or production_exposed")
+try:
+    datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(f"proposal-053: generated_at must be ISO-8601 ({exc})")
 for dep in ["P037", "P050", "P057", "P058"]:
     if dep not in data["dependency_readiness"]:
         raise SystemExit(f"proposal-053: dependency_readiness missing {dep}")
+    if data["dependency_readiness"][dep].get("status") not in {"ready", "ready_with_adapter", "blocked"}:
+        raise SystemExit(f"proposal-053: dependency_readiness.{dep}.status invalid")
 for key in [
     "expected_output_spec",
     "pre_prompt_expected_output_metadata",
@@ -2442,6 +2486,15 @@ for needle in [
 ]:
     if needle not in text:
         raise SystemExit(f"proposal-053: security checklist missing {needle!r}")
+for path, required_needles in [
+    (manual_latency, ["# P053 Manual Latency Spot-Check", "Result:", "pre-`initialize`"]),
+    (operator_clarity, ["# P053 Operator Clarity Evidence", "Result:", "provider latency"]),
+    (retrospective, ["# P053 Phase 1 Retrospective", "Decision:", "P069"]),
+]:
+    text = path.read_text()
+    for needle in required_needles:
+        if needle not in text:
+            raise SystemExit(f"proposal-053: {path.name} missing {needle!r}")
 PY
     (
       cd "$ROOT_DIR/control-plane"

@@ -949,6 +949,9 @@ pub struct AcpTransportSession {
     session_id: String,
     mcp_observation: Option<McpActualObservation>,
     mcp_session_startup_latency_ms: Option<i64>,
+    acp_pre_initialize_local_latency_ms: u64,
+    acp_initialize_latency_ms: u64,
+    acp_session_new_latency_ms: u64,
     snapshot_root: String,
     baseline_files: Option<LegacyBroadDiscoverySnapshot>,
     request_counter: u64,
@@ -1058,11 +1061,12 @@ impl AcpTransportSession {
         } else {
             req.workspace_root.clone()
         };
+        let acp_pre_initialize_local_latency_ms = startup_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
             stage_id = %req.stage_id,
             provider = %req.provider,
-            acp_pre_initialize_local_latency_ms = startup_started.elapsed().as_millis() as u64,
+            acp_pre_initialize_local_latency_ms = acp_pre_initialize_local_latency_ms,
             "P053 ACP pre-initialize local overhead measured"
         );
         let init_id = next_id!();
@@ -1088,11 +1092,12 @@ impl AcpTransportSession {
         await_response(&mut reader, init_id, handshake_timeout, "initialize")
             .await
             .context("ACP: initialize handshake")?;
+        let acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
             stage_id = %req.stage_id,
             provider = %req.provider,
-            acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64,
+            acp_initialize_latency_ms = acp_initialize_latency_ms,
             "P053 ACP initialize latency measured"
         );
 
@@ -1117,11 +1122,12 @@ impl AcpTransportSession {
         let sn_result = await_response(&mut reader, sn_id, handshake_timeout, "session/new")
             .await
             .context("ACP: session/new handshake")?;
+        let acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
             stage_id = %req.stage_id,
             provider = %req.provider,
-            acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64,
+            acp_session_new_latency_ms = acp_session_new_latency_ms,
             "P053 ACP session/new latency measured"
         );
 
@@ -1193,6 +1199,9 @@ impl AcpTransportSession {
             session_id,
             mcp_observation,
             mcp_session_startup_latency_ms,
+            acp_pre_initialize_local_latency_ms,
+            acp_initialize_latency_ms,
+            acp_session_new_latency_ms,
             snapshot_root,
             baseline_files: None,
             request_counter: req_counter,
@@ -1210,6 +1219,18 @@ impl AcpTransportSession {
 
     pub fn mcp_session_startup_latency_ms(&self) -> Option<i64> {
         self.mcp_session_startup_latency_ms
+    }
+
+    pub fn acp_pre_initialize_local_latency_ms(&self) -> u64 {
+        self.acp_pre_initialize_local_latency_ms
+    }
+
+    pub fn acp_initialize_latency_ms(&self) -> u64 {
+        self.acp_initialize_latency_ms
+    }
+
+    pub fn acp_session_new_latency_ms(&self) -> u64 {
+        self.acp_session_new_latency_ms
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -1249,6 +1270,14 @@ impl AcpTransportSession {
         Vec<PrePromptExpectedOutputMetadata>,
         Option<String>,
         Option<UsageSnapshot>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
     )> {
         let typed_expected_outputs = !req.expected_outputs.is_empty();
         let expected_baseline_paths: Vec<&str> = if typed_expected_outputs {
@@ -1314,11 +1343,23 @@ impl AcpTransportSession {
                 )
             })
             .count();
+        let pre_prompt_metadata_timeout = pre_prompt_expected_outputs.iter().any(|metadata| {
+            metadata.baseline_status == ExpectedPathBaselineStatus::MetadataTimeout
+        });
+        let pre_prompt_metadata_digest_bytes = pre_prompt_expected_outputs
+            .iter()
+            .filter_map(|metadata| metadata.content_digest.as_ref().zip(metadata.size_bytes))
+            .map(|(_, size_bytes)| size_bytes)
+            .sum::<u64>();
+        let acp_pre_prompt_metadata_latency_ms =
+            pre_prompt_metadata_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
             stage_id = %req.stage_id,
             provider = %req.provider,
-            acp_pre_prompt_metadata_latency_ms = pre_prompt_metadata_started.elapsed().as_millis() as u64,
+            acp_pre_prompt_metadata_latency_ms = acp_pre_prompt_metadata_latency_ms,
+            acp_pre_prompt_metadata_timeout = pre_prompt_metadata_timeout,
+            acp_pre_prompt_metadata_digest_bytes = pre_prompt_metadata_digest_bytes,
             acp_expected_output_spec_count = req.expected_outputs.len(),
             acp_expected_outputs_missing_count = missing_count,
             acp_expected_outputs_stale_count = stale_or_digest_count,
@@ -1456,6 +1497,14 @@ impl AcpTransportSession {
                             pre_prompt_expected_outputs,
                             non_empty_transcript(streamed_text),
                             latest_usage_snapshot,
+                            self.acp_pre_initialize_local_latency_ms,
+                            self.acp_initialize_latency_ms,
+                            self.acp_session_new_latency_ms,
+                            0,
+                            acp_pre_prompt_metadata_latency_ms,
+                            pre_prompt_metadata_timeout,
+                            pre_prompt_metadata_digest_bytes,
+                            None,
                         ));
                     }
                     if let Some(chunk) = extract_text_chunk(&parsed) {
@@ -1470,6 +1519,18 @@ impl AcpTransportSession {
                 continue;
             }
         }
+
+        let acp_prompt_duration_ms = SystemTime::now()
+            .duration_since(prompt_started_at)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_prompt_duration_ms = acp_prompt_duration_ms,
+            "P053 ACP prompt duration measured"
+        );
 
         let post_files = legacy_broad_discovery_enabled
             .then(|| snapshot_legacy_broad_discovery(&self.snapshot_root));
@@ -1573,8 +1634,8 @@ impl AcpTransportSession {
             }
         }
         new_files.sort();
-        if let Some(post_files) = post_files {
-            self.baseline_files = Some(post_files);
+        if let Some(post_files_snapshot) = post_files.clone() {
+            self.baseline_files = Some(post_files_snapshot);
         }
 
         let mut discovered_artifacts =
@@ -1616,6 +1677,14 @@ impl AcpTransportSession {
             pre_prompt_expected_outputs,
             non_empty_transcript(streamed_text),
             latest_usage_snapshot,
+            self.acp_pre_initialize_local_latency_ms,
+            self.acp_initialize_latency_ms,
+            self.acp_session_new_latency_ms,
+            acp_prompt_duration_ms,
+            acp_pre_prompt_metadata_latency_ms,
+            pre_prompt_metadata_timeout,
+            pre_prompt_metadata_digest_bytes,
+            post_files,
         ))
     }
 
@@ -1768,8 +1837,22 @@ pub async fn run_acp_session(
     config: &AcpSessionConfig<'_>,
 ) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>)> {
     let mut session = AcpTransportSession::start(child, req, config).await?;
-    let (status, paths, artifacts, _pre_prompt_expected_outputs, _transcript_text, _usage) =
-        session.prompt(req).await?;
+    let (
+        status,
+        paths,
+        artifacts,
+        _pre_prompt_expected_outputs,
+        _transcript_text,
+        _usage,
+        _acp_pre_initialize_local_latency_ms,
+        _acp_initialize_latency_ms,
+        _acp_session_new_latency_ms,
+        _acp_prompt_duration_ms,
+        _acp_pre_prompt_metadata_latency_ms,
+        _acp_pre_prompt_metadata_timeout,
+        _acp_pre_prompt_metadata_digest_bytes,
+        _legacy_broad_discovery_snapshot,
+    ) = session.prompt(req).await?;
     let _ = session.close().await;
     Ok((status, paths, artifacts))
 }

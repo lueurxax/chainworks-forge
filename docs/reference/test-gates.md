@@ -915,6 +915,11 @@ Bounded ACP artifact discovery and startup latency gate.
 Scope:
 
 - Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/proposals/053.review/`
+- full Phase 0 cap-validation schema, including sampled execution IDs, readiness timing, envelope/aggregate cap selections, and discovery ownership
+- Phase 1 evidence pack:
+  - `manual-latency-spot-check.md`
+  - `operator-clarity-evidence.md`
+  - `phase-1-retrospective.md`
 - `control-plane` discovery logic (`crates/domain/src/discovery.rs`)
 - engine discovery settlement pipeline
 - `OutputDiscoveryDecision` and `agent_execution_discovery_diagnostics` persistence
@@ -947,6 +952,8 @@ Important:
 - broad recursive discovery is disabled by default
 - discovery settlement is governed by the engine-owned pipeline, not provider-side heuristics
 - a `gate_only_internal` cap-validation artifact is sufficient for same-tree control-plane validation, but production exposure requires a refreshed production sampling/signoff artifact
+- the gate enforces the full declared Phase 0 cap-validation schema rather than a reduced subset
+- the Phase 1 evidence pack must exist in-tree before P053 closeout
 
 ### `proposal-057|p057`
 

@@ -17,6 +17,7 @@ pub struct AgentExecutionDiscoveryDiagnosticsReadback {
 impl AgentExecutionDiscoveryDiagnosticsReadback {
     pub fn projected_payload(&self) -> DiscoveryDiagnosticsV1 {
         let mut payload = self.diagnostics.payload.clone();
+        payload.acp_reconciliation_pending = Some(self.reconciliation_pending);
         if self.reconciliation_pending
             && !payload
                 .resume_warnings
@@ -31,6 +32,9 @@ impl AgentExecutionDiscoveryDiagnosticsReadback {
             if !payload.warnings.iter().any(|existing| existing == warning) {
                 payload.warnings.push(warning.clone());
             }
+        }
+        if payload.acp_resume_discovery_warning.is_none() {
+            payload.acp_resume_discovery_warning = payload.resume_warnings.first().cloned();
         }
         payload
     }
