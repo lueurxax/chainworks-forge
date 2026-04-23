@@ -1,8 +1,8 @@
 # P053 Operator Clarity Evidence
 
 Date: `2026-04-23`
-Tree: `codex/p053-manual-merge-1833dd16`
-Scope: internal same-tree validation only
+Tree: `main`
+Scope: production-exposure replacement-sample validation for P053 control-plane/API/readback behavior
 
 ## Goal
 

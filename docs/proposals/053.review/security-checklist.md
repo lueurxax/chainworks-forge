@@ -36,11 +36,13 @@ This checklist approves production exposure for the P053 control-plane/API/readb
 | Validation consumes accepted discovery decisions rather than rereading raw target paths. | Source-covered | `build_captured_outputs_from_discovery_decisions` and `proposal_053_declared_artifact_persistence_requires_accepted_decision`. |
 | Legacy broad discovery is disabled by default and generated-state aware when explicitly enabled. | Source-covered | `LegacyBroadDiscoveryPolicy::Disabled` default and generated-state denylist tests. |
 | Current-run meta-root discovery is bounded and supplemental-only. | Source-covered | `discover_bounded_meta_root_artifacts` caps plus `proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only`. |
-| Filesystem discovery paths are injectable through the `DiscoveryFilesystem` trait and deterministic fake. | Source-covered | `FakeDiscoveryFilesystem` and `proposal_053_gate_uses_discovery_filesystem_trait_fake`. |
+| Filesystem discovery paths are injectable through the `DiscoveryFilesystem` trait and deterministic fake. | Source-covered | `FakeDiscoveryFilesystem`, `proposal_053_gate_uses_discovery_filesystem_trait_fake`, `proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake`, `proposal_053_engine_settlement_uses_discovery_filesystem_fake_for_exact_path`, `proposal_053_engine_stale_detection_uses_discovery_filesystem_fake`, and `proposal_053_bounded_meta_root_uses_discovery_filesystem_fake`. |
 | Filesystem discovery paths remain inspectable through an operation-recorder boundary. | Source-covered | `RecordingDiscoveryOperationRecorder` and `proposal_053_operation_recorder_*` tests. |
 | Stale required outputs remain distinct from absent outputs in durable readback. | Source-covered | `StaleExpectedOutput` production settlement and GraphQL/MCP stale count fixtures. |
 | Sensitive local paths are not exposed to non-operator UI through this proposal. | Deferred to P069/P031 | P053 only persists server readback; macOS UI rendering is blocked by P031 and P069. |
 
 ## Decision
 
-P053 is approved for production exposure of the Rust control-plane/API/readback behavior on `main` after the R5 closeout patches. The approval relies on the documented replacement sample because direct production execution IDs were unavailable in the local closeout environment. Production telemetry should be reviewed after rollout to retune caps if needed.
+P053 is approved for production exposure of the Rust control-plane/API/readback behavior on `main` after the R6 closeout patches. The approval relies on the documented replacement sample because direct production execution IDs were unavailable in the local closeout environment. Production telemetry should be reviewed after rollout to retune caps if needed.
+
+Approval basis: the fallback signoff substitutes the local control-plane merge owner plus operator/product-owner decision for unavailable production execution IDs. The production claim is limited to P053 control-plane/API/readback behavior; P069 owns macOS operator UI exposure.

@@ -747,7 +747,41 @@ impl BoundedMetaRootDiscovery {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryPathKind {
+    RegularFile,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryPathMetadata {
+    pub kind: DiscoveryPathKind,
+    pub size_bytes: u64,
+}
+
 pub trait DiscoveryFilesystem: Send + Sync {
+    fn path_metadata_with_recorder(
+        &self,
+        path: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<DiscoveryPathMetadata>;
+
+    fn canonicalize_path_with_recorder(
+        &self,
+        path: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<PathBuf>;
+
+    fn read_file_with_cap_and_recorder(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<Vec<u8>>;
+
     fn capture_expected_path_baseline_with_recorder(
         &self,
         path: &Path,
@@ -766,12 +800,86 @@ pub trait DiscoveryFilesystem: Send + Sync {
         root: &Path,
         recorder: &dyn DiscoveryOperationRecorder,
     ) -> BoundedMetaRootDiscovery;
+
+    fn snapshot_legacy_broad_discovery_with_recorder(
+        &self,
+        root: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> LegacyBroadDiscoverySnapshot;
+
+    fn expected_path_has_current_content_with_recorder(
+        &self,
+        baseline: &ExpectedPathBaseline,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> bool;
+
+    fn expected_output_has_current_content_with_recorder(
+        &self,
+        spec: &ExpectedOutputSpec,
+        baseline: &PrePromptExpectedOutputMetadata,
+        context: &PrePromptExpectedOutputContext,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> bool;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdDiscoveryFilesystem;
 
 impl DiscoveryFilesystem for StdDiscoveryFilesystem {
+    fn path_metadata_with_recorder(
+        &self,
+        path: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<DiscoveryPathMetadata> {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::SymlinkMetadata,
+            path,
+        ));
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        let kind = if metadata.file_type().is_symlink() {
+            DiscoveryPathKind::Symlink
+        } else if metadata.is_file() {
+            DiscoveryPathKind::RegularFile
+        } else if metadata.is_dir() {
+            DiscoveryPathKind::Directory
+        } else {
+            DiscoveryPathKind::Other
+        };
+        Some(DiscoveryPathMetadata {
+            kind,
+            size_bytes: metadata.len(),
+        })
+    }
+
+    fn canonicalize_path_with_recorder(
+        &self,
+        path: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<PathBuf> {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::Canonicalize,
+            path,
+        ));
+        std::fs::canonicalize(path).ok()
+    }
+
+    fn read_file_with_cap_and_recorder(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<Vec<u8>> {
+        let metadata = self.path_metadata_with_recorder(path, recorder)?;
+        if metadata.kind != DiscoveryPathKind::RegularFile || metadata.size_bytes > max_bytes {
+            return None;
+        }
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::ReadFile,
+            path,
+        ));
+        std::fs::read(path).ok()
+    }
+
     fn capture_expected_path_baseline_with_recorder(
         &self,
         path: &Path,
@@ -798,6 +906,63 @@ impl DiscoveryFilesystem for StdDiscoveryFilesystem {
     ) -> BoundedMetaRootDiscovery {
         StdDiscoveryFilesystem::discover_bounded_meta_root_artifacts_with_recorder(root, recorder)
     }
+
+    fn snapshot_legacy_broad_discovery_with_recorder(
+        &self,
+        root: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> LegacyBroadDiscoverySnapshot {
+        StdDiscoveryFilesystem::snapshot_legacy_broad_discovery_with_recorder(root, recorder)
+    }
+
+    fn expected_path_has_current_content_with_recorder(
+        &self,
+        baseline: &ExpectedPathBaseline,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> bool {
+        let path = Path::new(&baseline.target_path);
+        let current =
+            capture_expected_path_baseline(path, DEFAULT_EXACT_PATH_READ_CAP_BYTES, recorder);
+        match (&baseline.status, &current.status) {
+            (
+                ExpectedPathBaselineStatus::Absent,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => true,
+            (
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => baseline.content != current.content,
+            _ => false,
+        }
+    }
+
+    fn expected_output_has_current_content_with_recorder(
+        &self,
+        spec: &ExpectedOutputSpec,
+        baseline: &PrePromptExpectedOutputMetadata,
+        context: &PrePromptExpectedOutputContext,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> bool {
+        if !matches!(
+            baseline.baseline_status,
+            ExpectedPathBaselineStatus::Absent | ExpectedPathBaselineStatus::RegularContentCaptured
+        ) {
+            return false;
+        }
+        let current =
+            capture_pre_prompt_expected_output_metadata(spec, context, None, None, recorder);
+        match (&baseline.baseline_status, &current.baseline_status) {
+            (
+                ExpectedPathBaselineStatus::Absent,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => true,
+            (
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => baseline.content_digest != current.content_digest,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -805,6 +970,10 @@ pub struct FakeDiscoveryFilesystem {
     expected_path_baselines: BTreeMap<String, ExpectedPathBaseline>,
     pre_prompt_metadata: BTreeMap<String, PrePromptExpectedOutputMetadata>,
     bounded_meta_root_discoveries: BTreeMap<String, BoundedMetaRootDiscovery>,
+    legacy_broad_discoveries: BTreeMap<String, LegacyBroadDiscoverySnapshot>,
+    path_metadata: BTreeMap<String, DiscoveryPathMetadata>,
+    canonical_paths: BTreeMap<String, PathBuf>,
+    file_bytes: BTreeMap<String, Vec<u8>>,
 }
 
 impl FakeDiscoveryFilesystem {
@@ -840,9 +1009,89 @@ impl FakeDiscoveryFilesystem {
             .insert(root.into(), discovery);
         self
     }
+
+    pub fn with_legacy_broad_discovery(
+        mut self,
+        root: impl Into<String>,
+        discovery: LegacyBroadDiscoverySnapshot,
+    ) -> Self {
+        self.legacy_broad_discoveries.insert(root.into(), discovery);
+        self
+    }
+
+    pub fn with_path_metadata(
+        mut self,
+        path: impl Into<String>,
+        metadata: DiscoveryPathMetadata,
+    ) -> Self {
+        self.path_metadata.insert(path.into(), metadata);
+        self
+    }
+
+    pub fn with_canonical_path(mut self, path: impl Into<String>, canonical: PathBuf) -> Self {
+        self.canonical_paths.insert(path.into(), canonical);
+        self
+    }
+
+    pub fn with_file_bytes(mut self, path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        self.file_bytes.insert(path.into(), bytes);
+        self
+    }
 }
 
 impl DiscoveryFilesystem for FakeDiscoveryFilesystem {
+    fn path_metadata_with_recorder(
+        &self,
+        path: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<DiscoveryPathMetadata> {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::SymlinkMetadata,
+            path,
+        ));
+        let key = path.to_string_lossy().into_owned();
+        self.path_metadata.get(&key).cloned().or_else(|| {
+            self.file_bytes
+                .get(&key)
+                .map(|bytes| DiscoveryPathMetadata {
+                    kind: DiscoveryPathKind::RegularFile,
+                    size_bytes: bytes.len() as u64,
+                })
+        })
+    }
+
+    fn canonicalize_path_with_recorder(
+        &self,
+        path: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<PathBuf> {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::Canonicalize,
+            path,
+        ));
+        self.canonical_paths
+            .get(&path.to_string_lossy().into_owned())
+            .cloned()
+            .or_else(|| Some(path.to_path_buf()))
+    }
+
+    fn read_file_with_cap_and_recorder(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Option<Vec<u8>> {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::ReadFile,
+            path,
+        ));
+        let bytes = self
+            .file_bytes
+            .get(&path.to_string_lossy().into_owned())?
+            .clone();
+        (bytes.len() as u64 <= max_bytes).then_some(bytes)
+    }
+
     fn capture_expected_path_baseline_with_recorder(
         &self,
         path: &Path,
@@ -892,6 +1141,88 @@ impl DiscoveryFilesystem for FakeDiscoveryFilesystem {
                     "fake_discovery_not_configured",
                 )
             })
+    }
+
+    fn snapshot_legacy_broad_discovery_with_recorder(
+        &self,
+        root: &Path,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> LegacyBroadDiscoverySnapshot {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::LegacyBroadDiscovery,
+            root,
+        ));
+        self.legacy_broad_discoveries
+            .get(&root.to_string_lossy().into_owned())
+            .cloned()
+            .unwrap_or_else(|| LegacyBroadDiscoverySnapshot {
+                root_path: root.to_string_lossy().into_owned(),
+                files: HashSet::new(),
+                files_visited: 0,
+                total_bytes: 0,
+                truncated_by_file_cap: false,
+                truncated_by_file_size: false,
+                truncated_by_total_bytes: false,
+                timed_out: false,
+                warnings: vec!["fake_legacy_discovery_not_configured".to_string()],
+            })
+    }
+
+    fn expected_path_has_current_content_with_recorder(
+        &self,
+        baseline: &ExpectedPathBaseline,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> bool {
+        let path = Path::new(&baseline.target_path);
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::CaptureExpectedPathBaseline,
+            path,
+        ));
+        let current = self
+            .expected_path_baselines
+            .get(&baseline.target_path)
+            .cloned()
+            .unwrap_or_else(|| ExpectedPathBaseline::absent(path));
+        match (&baseline.status, &current.status) {
+            (
+                ExpectedPathBaselineStatus::Absent,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => true,
+            (
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => baseline.content != current.content,
+            _ => false,
+        }
+    }
+
+    fn expected_output_has_current_content_with_recorder(
+        &self,
+        spec: &ExpectedOutputSpec,
+        baseline: &PrePromptExpectedOutputMetadata,
+        _context: &PrePromptExpectedOutputContext,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> bool {
+        recorder.record(DiscoveryOperation::output(
+            DiscoveryOperationKind::CapturePrePromptMetadata,
+            spec,
+        ));
+        let current = self
+            .pre_prompt_metadata
+            .get(&spec.output_name)
+            .cloned()
+            .unwrap_or_else(|| PrePromptExpectedOutputMetadata::absent(spec, _context));
+        match (&baseline.baseline_status, &current.baseline_status) {
+            (
+                ExpectedPathBaselineStatus::Absent,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => true,
+            (
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+                ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => baseline.content_digest != current.content_digest,
+            _ => false,
+        }
     }
 }
 
@@ -986,21 +1317,8 @@ impl StdDiscoveryFilesystem {
     }
 
     pub fn expected_path_has_current_content(baseline: &ExpectedPathBaseline) -> bool {
-        let path = Path::new(&baseline.target_path);
         let recorder = NoopDiscoveryOperationRecorder;
-        let current =
-            capture_expected_path_baseline(path, DEFAULT_EXACT_PATH_READ_CAP_BYTES, &recorder);
-        match (&baseline.status, &current.status) {
-            (
-                ExpectedPathBaselineStatus::Absent,
-                ExpectedPathBaselineStatus::RegularContentCaptured,
-            ) => true,
-            (
-                ExpectedPathBaselineStatus::RegularContentCaptured,
-                ExpectedPathBaselineStatus::RegularContentCaptured,
-            ) => baseline.content != current.content,
-            _ => false,
-        }
+        StdDiscoveryFilesystem.expected_path_has_current_content_with_recorder(baseline, &recorder)
     }
 
     pub fn expected_output_has_current_content(
@@ -1015,19 +1333,8 @@ impl StdDiscoveryFilesystem {
             return false;
         }
         let recorder = NoopDiscoveryOperationRecorder;
-        let current =
-            capture_pre_prompt_expected_output_metadata(spec, context, None, None, &recorder);
-        match (&baseline.baseline_status, &current.baseline_status) {
-            (
-                ExpectedPathBaselineStatus::Absent,
-                ExpectedPathBaselineStatus::RegularContentCaptured,
-            ) => true,
-            (
-                ExpectedPathBaselineStatus::RegularContentCaptured,
-                ExpectedPathBaselineStatus::RegularContentCaptured,
-            ) => baseline.content_digest != current.content_digest,
-            _ => false,
-        }
+        StdDiscoveryFilesystem
+            .expected_output_has_current_content_with_recorder(spec, baseline, context, &recorder)
     }
 
     pub fn should_skip_generated_state_dir(path: impl AsRef<Path>) -> bool {

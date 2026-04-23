@@ -17,7 +17,11 @@
     "gate:domain/proposal_053_operation_recorder_orders_metadata_before_file_read",
     "gate:acp/test_claude_adapter_executes_subprocess_and_returns_artifacts",
     "gate:domain/proposal_053_gate_uses_discovery_filesystem_trait_fake",
+    "gate:acp/proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake",
     "gate:engine/proposal_053_must_produce_does_not_accept_unchanged_existing_output",
+    "gate:engine/proposal_053_engine_settlement_uses_discovery_filesystem_fake_for_exact_path",
+    "gate:engine/proposal_053_engine_stale_detection_uses_discovery_filesystem_fake",
+    "gate:engine/proposal_053_bounded_meta_root_uses_discovery_filesystem_fake",
     "gate:graphql/proposal_053_agent_execution_projects_discovery_reconciliation_pending",
     "gate:mcp/proposal_053_reports_get_projects_discovery_reconciliation_pending",
     "gate:engine/proposal_053_git_manifest_runner",
@@ -28,15 +32,21 @@
   "production_data_fallback_decision": {
     "fallback": "approve_replacement_sample_for_limited_production_exposure",
     "accepted_risk": "Direct production execution IDs are absent, but the replacement sample exercises a workspace larger than the motivating 8.9 GB / 126,643-file case and covers caps, stale readback, filesystem fake/recorder paths, GraphQL, and MCP. Future production telemetry may retune caps without blocking P053 control-plane sign-off.",
-    "deadline": "next production telemetry review"
+    "deadline": "next production telemetry review",
+    "approver_record": {
+      "control_plane_tech_lead": "control-plane P053 merge owner",
+      "product_owner": "operator-approved substitute for unavailable production execution IDs",
+      "approval_scope": "P053 Rust control-plane/API/readback behavior only; macOS UI deferred to P069"
+    }
   },
   "sample_coverage_by_workflow_template": {
-    "proposal_053_gate_fixture": 9,
+    "proposal_053_gate_fixture": 13,
     "manual_reference_workspace_spot_check": 1
   },
   "sample_coverage_by_agent_provider": {
     "claude_fixture": 1,
-    "engine_or_domain_fixture": 7,
+    "engine_or_domain_fixture": 10,
+    "acp_fake_filesystem_fixture": 1,
     "graphql_fixture": 1,
     "mcp_fixture": 1,
     "manual_control_plane_reference_workspace": 1
@@ -113,9 +123,11 @@
     "settle_agent_outputs_from_discovery_decisions": true
   },
   "reviewer_signoff": {
-    "control_plane_owner": "main/d17a447b-plus-r5-closeout",
+    "control_plane_owner": "main/c9a59787-plus-r6-closeout",
+    "control_plane_tech_lead": "control-plane P053 merge owner",
+    "product_owner": "operator-approved substitute for unavailable production execution IDs",
     "security_review_artifact": "docs/proposals/053.review/security-checklist.md",
-    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R5.md",
+    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R6.md",
     "production_exposure_requires_new_signoff": false,
     "production_exposure_signoff": "approved_replacement_sample"
   }

@@ -2,7 +2,7 @@
 
 Date: `2026-04-23`
 Tree: `main`
-Scope: internal same-tree validation only
+Scope: production-exposure replacement-sample validation for P053 control-plane/API/readback behavior
 
 ## Goal
 
@@ -69,5 +69,6 @@ The same-tree command `./scripts/test-gate.sh proposal-053` passed on `2026-04-2
 
 ## Remaining Boundary
 
-- This spot-check is sufficient for `gate_only_internal` P053 closeout.
-- Production exposure still requires refreshed production-sample evidence, as recorded in `cap-validation.json`.
+- This spot-check is part of the approved replacement sample recorded in `cap-validation.json`.
+- Direct production execution IDs were unavailable in the local closeout environment; the replacement sample is accepted for limited P053 control-plane/API/readback production exposure.
+- Post-rollout production telemetry remains required for cap retuning, but it is not a blocker for P053 sign-off.

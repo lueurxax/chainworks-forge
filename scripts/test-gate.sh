@@ -2541,11 +2541,15 @@ PY
       cargo test -p workflow proposal_053_output_policies -- --nocapture &&
       cargo test -p workflow proposal_053_legacy_broad_discovery_policy -- --nocapture &&
       cargo test -p acp caps_declared_payload_before_settlement -- --nocapture &&
+      cargo test -p acp proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake --lib -- --nocapture &&
       cargo test -p acp test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default --test integration -- --nocapture &&
       cargo test -p acp test_claude_adapter_executes_subprocess_and_returns_artifacts --test integration -- --nocapture &&
       cargo test -p engine expected_output_specs -- --nocapture &&
       cargo test -p engine proposal_053_must_produce_does_not_accept_unchanged_existing_output --lib -- --nocapture &&
       cargo test -p engine proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only --lib -- --nocapture &&
+      cargo test -p engine proposal_053_engine_settlement_uses_discovery_filesystem_fake_for_exact_path --lib -- --nocapture &&
+      cargo test -p engine proposal_053_engine_stale_detection_uses_discovery_filesystem_fake --lib -- --nocapture &&
+      cargo test -p engine proposal_053_bounded_meta_root_uses_discovery_filesystem_fake --lib -- --nocapture &&
       cargo test -p engine proposal_053_git_manifest_runner -- --nocapture &&
       cargo test -p engine proposal_053_declared_manifest_preserves_agent_authored_file -- --nocapture &&
       cargo test -p engine test_retry_stage_legacy_discovery_override_validation_failure_leaves_no_journal --test integration -- --nocapture &&

@@ -17,9 +17,9 @@
 use anyhow::{bail, Context, Result};
 use domain::agent::AgentStatus;
 use domain::discovery::{
-    ExpectedOutputSpec, ExpectedPathBaseline, ExpectedPathBaselineStatus,
-    LegacyBroadDiscoverySnapshot, PrePromptExpectedOutputContext, PrePromptExpectedOutputMetadata,
-    StdDiscoveryFilesystem,
+    DiscoveryFilesystem, ExpectedOutputSpec, ExpectedPathBaseline, ExpectedPathBaselineStatus,
+    LegacyBroadDiscoverySnapshot, NoopDiscoveryOperationRecorder, PrePromptExpectedOutputContext,
+    PrePromptExpectedOutputMetadata, StdDiscoveryFilesystem,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -244,10 +244,6 @@ fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
     line.contains("EPIPE") || line.contains("write EPIPE")
 }
 
-fn snapshot_legacy_broad_discovery(root: &str) -> LegacyBroadDiscoverySnapshot {
-    StdDiscoveryFilesystem::snapshot_legacy_broad_discovery(root)
-}
-
 fn legacy_broad_file_modified_after_prompt_start(
     path: &str,
     prompt_started_at: SystemTime,
@@ -255,6 +251,45 @@ fn legacy_broad_file_modified_after_prompt_start(
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|modified| modified >= prompt_started_at)
+}
+
+fn pre_prompt_expected_output_context(
+    req: &ExecutionRequest,
+    session_id: &str,
+    prompt_id: u64,
+) -> PrePromptExpectedOutputContext {
+    PrePromptExpectedOutputContext {
+        agent_execution_id: req
+            .agent_execution_id
+            .clone()
+            .unwrap_or_else(|| req.agent_id.clone()),
+        stage_execution_id: req
+            .stage_execution_id
+            .clone()
+            .unwrap_or_else(|| req.stage_id.clone()),
+        attempt_number: req.attempt_number,
+        session_generation_id: req
+            .session_generation_id
+            .clone()
+            .unwrap_or_else(|| session_id.to_string()),
+        prompt_turn_id: format!("prompt-{prompt_id}"),
+        discovery_generation_id: uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+fn capture_pre_prompt_expected_outputs(
+    filesystem: &dyn DiscoveryFilesystem,
+    req: &ExecutionRequest,
+    context: &PrePromptExpectedOutputContext,
+) -> Vec<PrePromptExpectedOutputMetadata> {
+    req.expected_outputs
+        .iter()
+        .map(|spec| {
+            let recorder = NoopDiscoveryOperationRecorder;
+            filesystem
+                .capture_pre_prompt_expected_output_metadata_with_recorder(spec, context, &recorder)
+        })
+        .collect()
 }
 
 fn extract_text_from_value(value: &Value) -> Option<String> {
@@ -955,15 +990,26 @@ pub struct AcpTransportSession {
     acp_session_new_latency_ms: u64,
     snapshot_root: String,
     baseline_files: Option<LegacyBroadDiscoverySnapshot>,
+    discovery_filesystem: Box<dyn DiscoveryFilesystem>,
     request_counter: u64,
     closed: bool,
 }
 
 impl AcpTransportSession {
     pub async fn start(
+        child: Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+    ) -> Result<Self> {
+        Self::start_with_discovery_filesystem(child, req, config, Box::new(StdDiscoveryFilesystem))
+            .await
+    }
+
+    pub async fn start_with_discovery_filesystem(
         mut child: Child,
         req: &ExecutionRequest,
         config: &AcpSessionConfig<'_>,
+        discovery_filesystem: Box<dyn DiscoveryFilesystem>,
     ) -> Result<Self> {
         let startup_started = Instant::now();
         let mut stdin = child
@@ -1205,6 +1251,7 @@ impl AcpTransportSession {
             acp_session_new_latency_ms,
             snapshot_root,
             baseline_files: None,
+            discovery_filesystem,
             request_counter: req_counter,
             closed: false,
         })
@@ -1292,31 +1339,20 @@ impl AcpTransportSession {
         };
         let expected_path_baselines: Vec<ExpectedPathBaseline> = expected_baseline_paths
             .iter()
-            .map(|path| StdDiscoveryFilesystem::capture_expected_path_baseline(*path))
+            .map(|path| {
+                let recorder = NoopDiscoveryOperationRecorder;
+                self.discovery_filesystem
+                    .capture_expected_path_baseline_with_recorder(Path::new(*path), &recorder)
+            })
             .collect();
         self.request_counter += 1;
         let prompt_id = self.request_counter;
-        let metadata_context = PrePromptExpectedOutputContext {
-            agent_execution_id: req
-                .agent_execution_id
-                .clone()
-                .unwrap_or_else(|| req.agent_id.clone()),
-            stage_execution_id: req
-                .stage_execution_id
-                .clone()
-                .unwrap_or_else(|| req.stage_id.clone()),
-            attempt_number: req.attempt_number,
-            session_generation_id: req
-                .session_generation_id
-                .clone()
-                .unwrap_or_else(|| self.session_id.clone()),
-            prompt_turn_id: format!("prompt-{prompt_id}"),
-            discovery_generation_id: uuid::Uuid::new_v4().to_string(),
-        };
+        let metadata_context = pre_prompt_expected_output_context(req, &self.session_id, prompt_id);
         let pre_prompt_metadata_started = Instant::now();
         let pre_prompt_expected_outputs: Vec<PrePromptExpectedOutputMetadata> =
-            StdDiscoveryFilesystem::capture_bounded_pre_prompt_expected_output_metadata(
-                &req.expected_outputs,
+            capture_pre_prompt_expected_outputs(
+                self.discovery_filesystem.as_ref(),
+                req,
                 &metadata_context,
             );
         let missing_count = pre_prompt_expected_outputs
@@ -1533,8 +1569,14 @@ impl AcpTransportSession {
             "P053 ACP prompt duration measured"
         );
 
-        let post_files = legacy_broad_discovery_enabled
-            .then(|| snapshot_legacy_broad_discovery(&self.snapshot_root));
+        let post_files = legacy_broad_discovery_enabled.then(|| {
+            let recorder = NoopDiscoveryOperationRecorder;
+            self.discovery_filesystem
+                .snapshot_legacy_broad_discovery_with_recorder(
+                    Path::new(&self.snapshot_root),
+                    &recorder,
+                )
+        });
         let mut new_files: Vec<String> = match (broad_baseline.as_ref(), post_files.as_ref()) {
             (Some(baseline), Some(post_files)) => {
                 let paths: Vec<String> = post_files
@@ -1595,22 +1637,30 @@ impl AcpTransportSession {
                 }) else {
                     return false;
                 };
-                StdDiscoveryFilesystem::expected_output_has_current_content(
-                    spec,
-                    metadata,
-                    &metadata_context,
-                )
+                let recorder = NoopDiscoveryOperationRecorder;
+                self.discovery_filesystem
+                    .expected_output_has_current_content_with_recorder(
+                        spec,
+                        metadata,
+                        &metadata_context,
+                        &recorder,
+                    )
             });
             for spec in &req.expected_outputs {
                 if let Some(metadata) = pre_prompt_expected_outputs.iter().find(|metadata| {
                     metadata.output_name == spec.output_name
                         && metadata.target_path == spec.target_path
                 }) {
-                    if StdDiscoveryFilesystem::expected_output_has_current_content(
-                        spec,
-                        metadata,
-                        &metadata_context,
-                    ) && !new_files.iter().any(|p| p == &spec.target_path)
+                    let recorder = NoopDiscoveryOperationRecorder;
+                    if self
+                        .discovery_filesystem
+                        .expected_output_has_current_content_with_recorder(
+                            spec,
+                            metadata,
+                            &metadata_context,
+                            &recorder,
+                        )
+                        && !new_files.iter().any(|p| p == &spec.target_path)
                     {
                         new_files.push(spec.target_path.clone());
                     }
@@ -1624,10 +1674,15 @@ impl AcpTransportSession {
                 else {
                     return true;
                 };
-                StdDiscoveryFilesystem::expected_path_has_current_content(baseline)
+                let recorder = NoopDiscoveryOperationRecorder;
+                self.discovery_filesystem
+                    .expected_path_has_current_content_with_recorder(baseline, &recorder)
             });
             for baseline in &expected_path_baselines {
-                if StdDiscoveryFilesystem::expected_path_has_current_content(baseline)
+                let recorder = NoopDiscoveryOperationRecorder;
+                if self
+                    .discovery_filesystem
+                    .expected_path_has_current_content_with_recorder(baseline, &recorder)
                     && !new_files.iter().any(|p| p == &baseline.target_path)
                 {
                     new_files.push(baseline.target_path.clone());
@@ -1913,6 +1968,72 @@ mod tests {
         ));
         assert!(stderr_line_is_diagnostic_warning("code: 'EPIPE'"));
         assert!(!stderr_line_is_diagnostic_warning("ordinary debug detail"));
+    }
+
+    #[test]
+    fn proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake() {
+        let output_path = "/tmp/run/proposal_review.json";
+        let expected_output = ExpectedOutputSpec {
+            output_name: "proposal_review".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: output_path.to_string(),
+            companion_of: None,
+            display_label: "Proposal review".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![domain::discovery::AuthorizedRoot {
+                root_class: domain::discovery::OutputRootClass::ChainworksMetaRoot,
+                root_path: "/tmp/run".to_string(),
+            }],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        };
+        let context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let mut metadata = PrePromptExpectedOutputMetadata::absent(&expected_output, &context);
+        metadata.baseline_status = ExpectedPathBaselineStatus::RegularContentCaptured;
+        metadata.existed = true;
+        metadata.file_type = "regular".to_string();
+        metadata.size_bytes = Some(42);
+        let fake = domain::discovery::FakeDiscoveryFilesystem::new()
+            .with_pre_prompt_metadata("proposal_review", metadata.clone());
+        let req = ExecutionRequest {
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: Some("stage-exec-1".to_string()),
+            stage_id: "stage-1".to_string(),
+            attempt_number: 1,
+            agent_execution_id: Some("agent-exec-1".to_string()),
+            agent_id: "agent-1".to_string(),
+            provider: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("high".to_string()),
+            workspace_root: "/tmp/run".to_string(),
+            prompt: "write the output".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: vec![expected_output],
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: Some("session-1".to_string()),
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some("/tmp/run".to_string()),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        };
+
+        let captured = capture_pre_prompt_expected_outputs(&fake, &req, &context);
+
+        assert_eq!(captured, vec![metadata]);
     }
 
     #[test]

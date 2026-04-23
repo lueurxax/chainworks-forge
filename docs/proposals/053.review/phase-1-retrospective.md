@@ -1,7 +1,7 @@
 # P053 Phase 1 Retrospective
 
 Date: `2026-04-23`
-Tree: `codex/p053-manual-merge-1833dd16`
+Tree: `main`
 
 ## What Changed
 
@@ -22,8 +22,16 @@ Decision: `proceed with P053 merge closeout after same-tree proposal-053 gate pa
 
 Status update: the same-tree command `./scripts/test-gate.sh proposal-053` passed on `2026-04-23`; see `docs/proposals/053.review/proposal-053-gate-2026-04-23.md`.
 
+Exposure decision: `production_exposed` for P053 Rust control-plane/API/readback behavior, using the approved replacement sample in `cap-validation.json`.
+
+Fallback approval: direct production execution IDs were unavailable in the local closeout environment. The approved substitute is the same-tree P053 gate, manual reference-workspace latency spot-check, stale-vs-absent readback fixtures, GraphQL/MCP readback fixtures, and trait-injected `DiscoveryFilesystem` fake coverage. Product/UI exposure remains deferred to P069.
+
 ## Follow-On Boundaries
 
-- Production exposure still requires refreshed production sampling/signoff.
+- Production exposure does not require new pre-signoff sampling for P053 control-plane/API/readback; production telemetry should be reviewed after rollout for cap retuning.
 - P069 remains the follow-up for macOS operator UI.
 - P053 does not reopen broad discovery by default.
+
+## Branch Scope Note
+
+Current `main` also contains non-P053 catalog/config/P017 audit changes committed after the P053 closeout merge. Those changes are not part of the P053 production-exposure claim and should be validated under their own proposal/release evidence. P053 readiness is scoped to the P053 Rust control-plane/API/readback files, evidence sidecars, and canonical `proposal-053` gate.

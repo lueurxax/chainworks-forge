@@ -36,11 +36,12 @@ use domain::artifact_contracts::{
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::discovery::{
-    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, ExpectedOutputSpec,
-    ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy, OutputDiscoveryDecision,
-    OutputDiscoveryProvenance, OutputDiscoveryReason, OutputDiscoveryStatus, OutputReusePolicy,
-    OutputRootClass, PrePromptExpectedOutputMetadata, SourceGenerationOwner,
-    StdDiscoveryFilesystem, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
+    DiscoveryPathKind, ExpectedOutputSpec, ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy,
+    NoopDiscoveryOperationRecorder, OutputDiscoveryDecision, OutputDiscoveryProvenance,
+    OutputDiscoveryReason, OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass,
+    PrePromptExpectedOutputMetadata, SourceGenerationOwner, StdDiscoveryFilesystem,
+    DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
@@ -907,6 +908,21 @@ fn build_declared_output_discovery_settlement(
     discovered_artifacts: &[acp::DiscoveredArtifact],
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
 ) -> DeclaredOutputDiscoverySettlement {
+    let filesystem = StdDiscoveryFilesystem;
+    build_declared_output_discovery_settlement_with_filesystem(
+        expected_outputs,
+        discovered_artifacts,
+        pre_prompt_expected_outputs,
+        &filesystem,
+    )
+}
+
+fn build_declared_output_discovery_settlement_with_filesystem(
+    expected_outputs: &[ExpectedOutputSpec],
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    filesystem: &dyn DiscoveryFilesystem,
+) -> DeclaredOutputDiscoverySettlement {
     let mut decisions = Vec::with_capacity(expected_outputs.len());
     let mut accepted_payloads = HashMap::new();
     let mut accepted_aggregate_bytes = 0u64;
@@ -926,7 +942,7 @@ fn build_declared_output_discovery_settlement(
                 None,
             ))
         } else if spec.source_generation_owner == SourceGenerationOwner::ControlPlane {
-            read_control_plane_generated_output(spec)
+            read_control_plane_generated_output(spec, filesystem)
         } else if let Some(artifact) = exact_path {
             Some((
                 OutputDiscoveryReason::ExactPathChanged,
@@ -938,7 +954,7 @@ fn build_declared_output_discovery_settlement(
                 Some(ExpectedPathBaselineStatus::RegularContentCaptured),
             ))
         } else if spec.reuse_policy == OutputReusePolicy::AllowUnchangedExisting {
-            read_declared_reuse_policy_output(spec, pre_prompt_expected_outputs)
+            read_declared_reuse_policy_output(spec, pre_prompt_expected_outputs, filesystem)
         } else {
             None
         };
@@ -954,7 +970,7 @@ fn build_declared_output_discovery_settlement(
         )) = candidate
         else {
             decisions.push(
-                stale_expected_output_decision(spec, pre_prompt_expected_outputs)
+                stale_expected_output_decision(spec, pre_prompt_expected_outputs, filesystem)
                     .unwrap_or_else(|| missing_output_decision(spec)),
             );
             continue;
@@ -965,7 +981,7 @@ fn build_declared_output_discovery_settlement(
             OutputDiscoveryProvenance::ExactPath | OutputDiscoveryProvenance::DeclaredReusePolicy
         ) {
             if let Some((reason, baseline_status)) =
-                exact_path_rejection_for_spec(spec, source_path.as_deref())
+                exact_path_rejection_for_spec(spec, source_path.as_deref(), filesystem)
             {
                 decisions.push(rejected_output_decision(
                     spec,
@@ -976,6 +992,7 @@ fn build_declared_output_discovery_settlement(
                     Some(bytes.len() as u64),
                     Some(spec.max_bytes),
                     None,
+                    filesystem,
                 ));
                 continue;
             }
@@ -991,6 +1008,7 @@ fn build_declared_output_discovery_settlement(
                 Some(bytes.len() as u64),
                 Some(spec.max_bytes),
                 None,
+                filesystem,
             ));
             continue;
         }
@@ -1007,6 +1025,7 @@ fn build_declared_output_discovery_settlement(
                 Some(bytes.len() as u64),
                 Some(spec.max_bytes),
                 Some(accepted_aggregate_bytes),
+                filesystem,
             ));
             continue;
         }
@@ -1022,7 +1041,11 @@ fn build_declared_output_discovery_settlement(
             status: OutputDiscoveryStatus::Accepted,
             reason,
             provenance: Some(provenance),
-            canonical_path: canonical_path_for_decision(source_path.as_deref(), &spec.target_path),
+            canonical_path: canonical_path_for_decision(
+                source_path.as_deref(),
+                &spec.target_path,
+                filesystem,
+            ),
             root_class: spec.authorized_roots.first().map(|root| root.root_class),
             baseline_status,
             size_bytes: Some(bytes.len() as u64),
@@ -1100,36 +1123,41 @@ fn settle_agent_outputs_from_discovery_decisions(
 fn exact_path_rejection_for_spec(
     spec: &ExpectedOutputSpec,
     source_path: Option<&str>,
+    filesystem: &dyn DiscoveryFilesystem,
 ) -> Option<(OutputDiscoveryReason, ExpectedPathBaselineStatus)> {
     let source_path = source_path?;
     let source = Path::new(source_path);
-    let source_metadata = match std::fs::symlink_metadata(source) {
-        Ok(metadata) => metadata,
-        Err(_) => {
+    let recorder = NoopDiscoveryOperationRecorder;
+    let source_metadata = match filesystem.path_metadata_with_recorder(source, &recorder) {
+        Some(metadata) => metadata,
+        None => {
             return Some((
                 OutputDiscoveryReason::ReadError,
                 ExpectedPathBaselineStatus::Unreadable,
             ));
         }
     };
-    let source_is_symlink = source_metadata.file_type().is_symlink();
-    let canonical_source = match std::fs::canonicalize(source) {
-        Ok(path) => path,
-        Err(_) => {
+    let source_is_symlink = source_metadata.kind == DiscoveryPathKind::Symlink;
+    let canonical_source = match filesystem.canonicalize_path_with_recorder(source, &recorder) {
+        Some(path) => path,
+        None => {
             return Some((
                 OutputDiscoveryReason::ReadError,
                 ExpectedPathBaselineStatus::Unreadable,
             ));
         }
     };
-    if !canonical_source.is_file() {
+    if filesystem
+        .path_metadata_with_recorder(&canonical_source, &recorder)
+        .is_none_or(|metadata| metadata.kind != DiscoveryPathKind::RegularFile)
+    {
         return Some((
             OutputDiscoveryReason::NotRegularFile,
             ExpectedPathBaselineStatus::NotRegularFile,
         ));
     }
 
-    if authorized_root_class_for_canonical_path(spec, &canonical_source).is_some() {
+    if authorized_root_class_for_canonical_path(spec, &canonical_source, filesystem).is_some() {
         return None;
     }
 
@@ -1161,18 +1189,22 @@ fn exact_path_rejection_for_spec(
 fn authorized_root_class_for_canonical_path(
     spec: &ExpectedOutputSpec,
     canonical_path: &Path,
+    filesystem: &dyn DiscoveryFilesystem,
 ) -> Option<OutputRootClass> {
+    let recorder = NoopDiscoveryOperationRecorder;
     spec.authorized_roots.iter().find_map(|root| {
         let root_path = Path::new(&root.root_path);
-        let canonical_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| {
-            if root_path.is_absolute() {
-                root_path.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(root_path))
-                    .unwrap_or_else(|_| root_path.to_path_buf())
-            }
-        });
+        let canonical_root = filesystem
+            .canonicalize_path_with_recorder(root_path, &recorder)
+            .unwrap_or_else(|| {
+                if root_path.is_absolute() {
+                    root_path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(root_path))
+                        .unwrap_or_else(|_| root_path.to_path_buf())
+                }
+            });
         canonical_path
             .starts_with(&canonical_root)
             .then_some(root.root_class)
@@ -1232,6 +1264,7 @@ fn find_exact_path_artifact_for_spec<'a>(
 
 fn read_control_plane_generated_output(
     spec: &ExpectedOutputSpec,
+    filesystem: &dyn DiscoveryFilesystem,
 ) -> Option<(
     OutputDiscoveryReason,
     OutputDiscoveryProvenance,
@@ -1241,11 +1274,12 @@ fn read_control_plane_generated_output(
     Option<String>,
     Option<ExpectedPathBaselineStatus>,
 )> {
-    let metadata = std::fs::metadata(&spec.target_path).ok()?;
-    if metadata.len() > spec.max_bytes {
-        return None;
-    }
-    let bytes = std::fs::read(&spec.target_path).ok()?;
+    let recorder = NoopDiscoveryOperationRecorder;
+    let bytes = filesystem.read_file_with_cap_and_recorder(
+        Path::new(&spec.target_path),
+        spec.max_bytes,
+        &recorder,
+    )?;
     Some((
         OutputDiscoveryReason::ControlPlaneGenerated,
         OutputDiscoveryProvenance::ControlPlaneGenerated,
@@ -1260,6 +1294,7 @@ fn read_control_plane_generated_output(
 fn read_declared_reuse_policy_output(
     spec: &ExpectedOutputSpec,
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    filesystem: &dyn DiscoveryFilesystem,
 ) -> Option<(
     OutputDiscoveryReason,
     OutputDiscoveryProvenance,
@@ -1275,16 +1310,15 @@ fn read_declared_reuse_policy_output(
             && metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured
     })?;
     let pre_prompt_digest = metadata.content_digest.as_deref()?;
-    if exact_path_rejection_for_spec(spec, Some(&spec.target_path)).is_some() {
+    if exact_path_rejection_for_spec(spec, Some(&spec.target_path), filesystem).is_some() {
         return None;
     }
-    if std::fs::metadata(&spec.target_path)
-        .ok()
-        .is_none_or(|metadata| metadata.len() > spec.max_bytes)
-    {
-        return None;
-    }
-    let bytes = std::fs::read(&spec.target_path).ok()?;
+    let recorder = NoopDiscoveryOperationRecorder;
+    let bytes = filesystem.read_file_with_cap_and_recorder(
+        Path::new(&spec.target_path),
+        spec.max_bytes,
+        &recorder,
+    )?;
     if sha256_digest(&bytes) != pre_prompt_digest {
         return None;
     }
@@ -1344,6 +1378,7 @@ fn missing_output_decision(spec: &ExpectedOutputSpec) -> OutputDiscoveryDecision
 fn stale_expected_output_decision(
     spec: &ExpectedOutputSpec,
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    filesystem: &dyn DiscoveryFilesystem,
 ) -> Option<OutputDiscoveryDecision> {
     if spec.reuse_policy != OutputReusePolicy::MustProduce {
         return None;
@@ -1354,14 +1389,15 @@ fn stale_expected_output_decision(
             && metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured
     })?;
     let pre_prompt_digest = metadata.content_digest.as_deref()?;
-    if exact_path_rejection_for_spec(spec, Some(&spec.target_path)).is_some() {
+    if exact_path_rejection_for_spec(spec, Some(&spec.target_path), filesystem).is_some() {
         return None;
     }
-    let current_metadata = std::fs::metadata(&spec.target_path).ok()?;
-    if current_metadata.len() > spec.max_bytes {
-        return None;
-    }
-    let bytes = std::fs::read(&spec.target_path).ok()?;
+    let recorder = NoopDiscoveryOperationRecorder;
+    let bytes = filesystem.read_file_with_cap_and_recorder(
+        Path::new(&spec.target_path),
+        spec.max_bytes,
+        &recorder,
+    )?;
     let current_digest = sha256_digest(&bytes);
     if current_digest != pre_prompt_digest {
         return None;
@@ -1375,7 +1411,11 @@ fn stale_expected_output_decision(
         status: OutputDiscoveryStatus::Missing,
         reason: OutputDiscoveryReason::StaleExpectedOutput,
         provenance: Some(OutputDiscoveryProvenance::ExactPath),
-        canonical_path: canonical_path_for_decision(Some(&spec.target_path), &spec.target_path),
+        canonical_path: canonical_path_for_decision(
+            Some(&spec.target_path),
+            &spec.target_path,
+            filesystem,
+        ),
         root_class: spec.authorized_roots.first().map(|root| root.root_class),
         baseline_status: Some(metadata.baseline_status),
         size_bytes: Some(bytes.len() as u64),
@@ -1399,6 +1439,7 @@ fn rejected_output_decision(
     size_bytes: Option<u64>,
     max_bytes_applied: Option<u64>,
     aggregate_bytes_after_acceptance: Option<u64>,
+    filesystem: &dyn DiscoveryFilesystem,
 ) -> OutputDiscoveryDecision {
     OutputDiscoveryDecision {
         output_name: spec.output_name.clone(),
@@ -1408,7 +1449,11 @@ fn rejected_output_decision(
         status: OutputDiscoveryStatus::Rejected,
         reason,
         provenance,
-        canonical_path: canonical_path_for_decision(source_path.as_deref(), &spec.target_path),
+        canonical_path: canonical_path_for_decision(
+            source_path.as_deref(),
+            &spec.target_path,
+            filesystem,
+        ),
         root_class: spec.authorized_roots.first().map(|root| root.root_class),
         baseline_status,
         size_bytes,
@@ -1439,10 +1484,15 @@ fn oversized_reason_for_provenance(
     }
 }
 
-fn canonical_path_for_decision(source_path: Option<&str>, target_path: &str) -> Option<String> {
+fn canonical_path_for_decision(
+    source_path: Option<&str>,
+    target_path: &str,
+    filesystem: &dyn DiscoveryFilesystem,
+) -> Option<String> {
     let path = source_path.unwrap_or(target_path);
-    std::fs::canonicalize(path)
-        .ok()
+    let recorder = NoopDiscoveryOperationRecorder;
+    filesystem
+        .canonicalize_path_with_recorder(Path::new(path), &recorder)
         .map(|path| path.to_string_lossy().into_owned())
 }
 
@@ -1465,6 +1515,14 @@ fn control_plane_payload_ref(output_name: &str) -> String {
 fn bounded_meta_root_artifact_paths(
     chainworks_meta_root: Option<&str>,
 ) -> domain::discovery::BoundedMetaRootDiscovery {
+    let filesystem = StdDiscoveryFilesystem;
+    bounded_meta_root_artifact_paths_with_filesystem(chainworks_meta_root, &filesystem)
+}
+
+fn bounded_meta_root_artifact_paths_with_filesystem(
+    chainworks_meta_root: Option<&str>,
+    filesystem: &dyn DiscoveryFilesystem,
+) -> domain::discovery::BoundedMetaRootDiscovery {
     let Some(meta_root) = chainworks_meta_root.filter(|root| !root.trim().is_empty()) else {
         warn!("P053 bounded meta-root discovery skipped: chainworks_meta_root absent");
         return domain::discovery::BoundedMetaRootDiscovery {
@@ -1480,7 +1538,9 @@ fn bounded_meta_root_artifact_paths(
         };
     };
     let meta_root_started = Instant::now();
-    let mut discovery = StdDiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
+    let recorder = NoopDiscoveryOperationRecorder;
+    let mut discovery = filesystem
+        .discover_bounded_meta_root_artifacts_with_recorder(Path::new(meta_root), &recorder);
     let latency_ms = meta_root_started.elapsed().as_millis() as u64;
     discovery.latency_ms = Some(latency_ms);
     info!(
@@ -5462,6 +5522,147 @@ mod tests {
 
         assert_eq!(paths.artifact_paths.len(), 1);
         assert!(paths.artifact_paths[0].ends_with("logs/agent.log"));
+    }
+
+    #[test]
+    fn proposal_053_engine_settlement_uses_discovery_filesystem_fake_for_exact_path() {
+        let target_path = "/workspace/run/proposal_review.json";
+        let root_path = "/workspace/run";
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: target_path.to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let mut specs = build_expected_output_specs(&[declared], root_path, None, None, false);
+        specs[0].authorized_roots = vec![domain::discovery::AuthorizedRoot {
+            root_class: OutputRootClass::Worktree,
+            root_path: root_path.to_string(),
+        }];
+        let fake = domain::discovery::FakeDiscoveryFilesystem::new()
+            .with_canonical_path(target_path, PathBuf::from(target_path))
+            .with_canonical_path(root_path, PathBuf::from(root_path))
+            .with_path_metadata(
+                target_path,
+                domain::discovery::DiscoveryPathMetadata {
+                    kind: domain::discovery::DiscoveryPathKind::RegularFile,
+                    size_bytes: 34,
+                },
+            );
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"summary":"new","status":"green"}"#.to_vec(),
+            source_path: Some(target_path.to_string()),
+            source_kind: acp::DiscoveredArtifactSourceKind::ExactPath,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement_with_filesystem(
+            &specs,
+            &discovered,
+            &[],
+            &fake,
+        );
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].canonical_path.as_deref(),
+            Some(target_path)
+        );
+    }
+
+    #[test]
+    fn proposal_053_engine_stale_detection_uses_discovery_filesystem_fake() {
+        let target_path = "/workspace/run/proposal_review.json";
+        let root_path = "/workspace/run";
+        let bytes = br#"{"summary":"stale","status":"green"}"#.to_vec();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: target_path.to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let mut specs = build_expected_output_specs(&[declared], root_path, None, None, false);
+        specs[0].authorized_roots = vec![domain::discovery::AuthorizedRoot {
+            root_class: OutputRootClass::Worktree,
+            root_path: root_path.to_string(),
+        }];
+        let metadata_context = domain::discovery::PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let mut baseline = domain::discovery::PrePromptExpectedOutputMetadata::absent(
+            &specs[0],
+            &metadata_context,
+        );
+        baseline.baseline_status = ExpectedPathBaselineStatus::RegularContentCaptured;
+        baseline.existed = true;
+        baseline.file_type = "regular".to_string();
+        baseline.size_bytes = Some(bytes.len() as u64);
+        baseline.content_digest = Some(sha256_digest(&bytes));
+        let fake = domain::discovery::FakeDiscoveryFilesystem::new()
+            .with_canonical_path(target_path, PathBuf::from(target_path))
+            .with_canonical_path(root_path, PathBuf::from(root_path))
+            .with_path_metadata(
+                target_path,
+                domain::discovery::DiscoveryPathMetadata {
+                    kind: domain::discovery::DiscoveryPathKind::RegularFile,
+                    size_bytes: bytes.len() as u64,
+                },
+            )
+            .with_file_bytes(target_path, bytes);
+
+        let settlement = build_declared_output_discovery_settlement_with_filesystem(
+            &specs,
+            &[],
+            &[baseline],
+            &fake,
+        );
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Missing
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::StaleExpectedOutput
+        );
+    }
+
+    #[test]
+    fn proposal_053_bounded_meta_root_uses_discovery_filesystem_fake() {
+        let fake = domain::discovery::FakeDiscoveryFilesystem::new()
+            .with_bounded_meta_root_discovery(
+                "/workspace/.chainworks/runs/run-1",
+                domain::discovery::BoundedMetaRootDiscovery {
+                    root_path: "/workspace/.chainworks/runs/run-1".to_string(),
+                    artifact_paths: vec!["logs/agent.log".to_string()],
+                    files_visited: 1,
+                    total_bytes: 128,
+                    latency_ms: None,
+                    truncated_by_file_cap: false,
+                    truncated_by_file_size: false,
+                    truncated_by_total_bytes: false,
+                    warnings: Vec::new(),
+                },
+            );
+
+        let discovery = bounded_meta_root_artifact_paths_with_filesystem(
+            Some("/workspace/.chainworks/runs/run-1"),
+            &fake,
+        );
+
+        assert_eq!(discovery.artifact_paths, vec!["logs/agent.log"]);
     }
 
     #[test]
