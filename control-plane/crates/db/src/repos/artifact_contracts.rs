@@ -47,8 +47,11 @@ pub async fn upsert_generation_and_rebuild_tx(
     tx: &mut Transaction<'_, Sqlite>,
     input: ActiveArtifactGenerationInput,
 ) -> Result<()> {
-    let raw_status =
-        effective_raw_status_for_generation(&input.contract_id, &input.raw_path, &input.raw_status)?;
+    let raw_status = effective_raw_status_for_generation(
+        &input.contract_id,
+        &input.raw_path,
+        &input.raw_status,
+    )?;
     let normalized =
         normalize_contract_status(&input.contract_id, &raw_status).map_err(anyhow::Error::msg)?;
     let mut warnings = input.warnings.clone();
@@ -380,8 +383,11 @@ pub async fn import_generation_with_claim_cas_tx(
     source_session_generation_id: &str,
     input: ActiveArtifactGenerationInput,
 ) -> Result<SourceGenerationImportDecision> {
-    let raw_status =
-        effective_raw_status_for_generation(&input.contract_id, &input.raw_path, &input.raw_status)?;
+    let raw_status = effective_raw_status_for_generation(
+        &input.contract_id,
+        &input.raw_path,
+        &input.raw_status,
+    )?;
     let normalized =
         normalize_contract_status(&input.contract_id, &raw_status).map_err(anyhow::Error::msg)?;
     let mut warnings = input.warnings.clone();

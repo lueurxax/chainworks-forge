@@ -425,6 +425,27 @@ PROPOSAL_054_SWIFT_TESTS=(
   "Chainworks ForgeTests/OrchestratorTests"
 )
 
+PROPOSAL_061_TESTS=(
+  "provider"
+  "capacity"
+  "start_run_closes_journal_with_run_wake_and_scheduler_refresh"
+  "approve_and_reject_stage_close_journal_with_stage_mutation_and_scheduler_refresh"
+  "approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_active_fake_agents"
+  "cancel_run_closes_journal_with_cancellation_settlement_and_scheduler_refresh"
+  "reset_session_closes_journal_with_repair_wake_and_scheduler_refresh"
+  "startup_repair_blocks_stale_running_stage_enqueues_wake_and_scheduler_refresh"
+  "retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_running_executions"
+  "invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_provider"
+  "invoke_agent_capacity_precheck_reports_when_all_pending_work_is_blocked"
+  "invoke_agent_claim_prefers_least_recently_served_run_within_candidate_window"
+  "retry_stage_capacity_refresh_clears_superseded_invoke_backpressure"
+  "work_queue_refresh_publishes_scheduler_backpressure_domain_event_on_transition"
+  "host_interruption_records_epoch_cancels_execution_and_requeues_invoke_work"
+  "host_interruption_late_output_from_superseded_attempt_cannot_promote_over_retry_generation"
+  "host_interruption_requires_runtime_cleanup_before_retry_enqueue"
+  "host_interruption_retry_does_not_consume_provider_quota_budget"
+)
+
 PROPOSAL_029_MCP_TESTS=(
   # Principal table bootstrap (auth/tests/principals_bootstrap.rs)
   "auth test_principals_file_created_with_owner_only_permissions"
@@ -1630,6 +1651,7 @@ Available gates:
                   Proposal 060 implementation ticket map control artifact gate
   proposal-060-calibration|p060-calibration
                   Proposal 060 routing calibration control artifact gate
+  proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -2377,6 +2399,21 @@ PY
     ;;
   proposal-060-baseline|p060-baseline|proposal-060-storage|p060-storage|proposal-060-router-fixtures|p060-router-fixtures|proposal-060-snapshot-inventory|p060-snapshot-inventory|proposal-060-fixed-quartet|p060-fixed-quartet|proposal-060-ticket-map|p060-ticket-map|proposal-060-calibration|p060-calibration)
     run_proposal060_control_artifact_gate "$GATE"
+    ;;
+  proposal-061|p061)
+    log "Proposal 061 control-plane gate: provider normalization and capacity defaults"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p domain "${PROPOSAL_061_TESTS[0]}" -- --nocapture
+      cargo test -p workflow proposal_061_catalog --test integration -- --nocapture
+      cargo test -p db proposal_061_hot_index_query_plans_use_indexes_at_fixture_scale -- --nocapture
+      for test_name in "${PROPOSAL_061_TESTS[@]:1}"; do
+        cargo test -p engine "$test_name" -- --nocapture
+      done
+      cargo test -p graphql-server proposal_061 -- --nocapture
+      cargo test -p mcp-server proposal_061 -- --nocapture
+    )
+    log "Proposal 061 control-plane gate passed"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"

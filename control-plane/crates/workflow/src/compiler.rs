@@ -9,6 +9,7 @@
 //! 5. Return a `RunPlan`
 
 use anyhow::{Context, Result};
+use domain::provider::ProviderFamily;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, warn};
@@ -289,7 +290,12 @@ fn build_agent_lookup(
             )
         })?;
 
-        let provider = normalize_provider(&profile.provider);
+        let provider = normalize_provider(&profile.provider).with_context(|| {
+            format!(
+                "Agent '{}' backend_profile '{}' has unknown provider '{}'",
+                agent.id, agent.backend_profile, profile.provider
+            )
+        })?;
         let model = profile.model.clone();
         let effort = profile.effort.clone();
         let max_turns = profile.max_turns;
@@ -384,21 +390,14 @@ fn build_agent_lookup(
     Ok(lookup)
 }
 
-/// Normalize YAML provider names to ACP adapter names.
-/// `claude_acp` → `claude`, `codex_acp` → `codex`, `gemini_acp` → `gemini`, etc.
-/// Also handles runtime-profile flavored providers like `claude_agent_acp` and `gemini_cli_acp`.
-/// If the name doesn't end with a known ACP suffix, it's used as-is.
-fn normalize_provider(yaml_provider: &str) -> String {
-    if let Some(stripped) = yaml_provider.strip_suffix("_agent_acp") {
-        return stripped.to_string();
-    }
-    if let Some(stripped) = yaml_provider.strip_suffix("_cli_acp") {
-        return stripped.to_string();
-    }
-    yaml_provider
-        .strip_suffix("_acp")
-        .unwrap_or(yaml_provider)
-        .to_string()
+/// Normalize YAML provider names to canonical provider families.
+///
+/// P061 requires catalog/workflow compilation to reuse the shared provider
+/// resolver so unknown aliases fail before they can bypass scheduler caps.
+fn normalize_provider(
+    yaml_provider: &str,
+) -> Result<String, domain::provider::UnknownProviderFamily> {
+    ProviderFamily::canonicalize_alias(yaml_provider)
 }
 
 // ---------------------------------------------------------------------------
