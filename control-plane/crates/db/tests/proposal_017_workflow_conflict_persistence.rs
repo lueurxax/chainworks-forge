@@ -373,11 +373,10 @@ async fn p017_conflict_insert_rejects_invalid_redaction_tier() {
         .await
         .expect_err("invalid redaction tier should fail schema validation");
 
+    let error_chain = format!("{error:#}");
     assert!(
-        error
-            .to_string()
-            .contains("CHECK constraint failed"),
-        "unexpected error: {error:#}"
+        error_chain.contains("CHECK constraint failed"),
+        "unexpected error: {error_chain}"
     );
 }
 
