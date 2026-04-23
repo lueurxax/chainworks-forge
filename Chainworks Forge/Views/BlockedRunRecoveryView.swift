@@ -598,7 +598,7 @@ struct BlockedRunRecoveryView: View {
                 if let next = cursor.nextScheduledStateID {
                     return stageSnapshots.first(where: { $0.stageID == next })?.label ?? next
                 }
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 if let last = cursor.lastCompletedStateID {
                     return stageSnapshots.first(where: { $0.stageID == last })?.label ?? last
                 }

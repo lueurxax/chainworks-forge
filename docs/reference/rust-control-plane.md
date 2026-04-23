@@ -194,8 +194,23 @@ Single-task stages settle immediately after the agent completes.
 
 ### Transition evaluation
 
-After a stage completes, the orchestrator evaluates transition conditions in order. The first matching transition wins. Supported expression syntax (`crates/engine/src/orchestrator.rs`, line 487):
+After a stage completes, the orchestrator evaluates transition conditions in order
+via the **Transition Authority Resolver**. The first matching declarative
+transition wins. Agent-authored hints are treated as advisory only.
 
+**Authority Rules:**
+- The compiled workflow graph is the only authority.
+- Agent-authored hints (`next_stage`, `next_action`) are advisory evidence.
+- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate 
+  to true; they fail closed as `invalid_expression` or `missing_input`.
+
+**Aggregate Artifact Field Authority:**
+To ensure deterministic evaluation, aggregate artifact fields are classified by 
+authority. For `proposal_review_summary_v1`:
+- `pass` and `blocker_count` are **transition authoritative**.
+- `next_action` and `next_stage` are **advisory only**.
+
+Supported expression syntax (`crates/engine/src/orchestrator.rs`, line 487):
 | Pattern | Meaning |
 |---|---|
 | `"true"` / `"false"` | Boolean literals |
@@ -204,6 +219,11 @@ After a stage completes, the orchestrator evaluates transition conditions in ord
 | `approval.rejected == true` | Checks if any approval for the run was rejected |
 | `lhs == rhs`, `!=`, `<`, `<=`, `>`, `>=` | Comparison (numeric or string) |
 | `expr and expr`, `expr or expr` | Logical connectives (parenthesis-aware split) |
+
+**Workflow Conflict Persistence:**
+If no transition matches or multiple match without a tie-break, the orchestrator 
+persists a `WorkflowConflictRecord` to the `workflow_conflicts` table. Non-blocking 
+rejected hints are recorded in `workflow_advisory_rejections`.
 
 **Implementation self-assessment mapping:**
 Transition expressions can inspect `implementation_self_assessment_v2.status` and other fields. These resolve against the domain-owned assessment summary projection rather than raw files.
@@ -341,18 +361,30 @@ language-specific scheduler capacity dimensions.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `021_p017_workflow_conflicts.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
-| `agent_executions` | Per-agent invocation records (provider, model, status) |
+| `agent_executions` | Per-agent invocation records (provider, model, status, **owner_kind**, **owner_id**) |
+| `workflow_conflicts` | Blocking graph-authority conflicts by fingerprint and status |
+| `workflow_advisory_rejections` | Non-blocking historical records of rejected agent hints |
+| `lead_mediation` | State for lead-owned conflict resolution attempts |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
+
+**AgentExecution Owner Migration (Phase B):**
+To support lead-mediated conflicts without synthetic stage states, `agent_executions` 
+migrated to a general owner model:
+- `owner_kind`: `stage_execution` or `lead_conflict_mediation`.
+- `owner_id`: References either `stage_execution_id` or `mediation_record_id`.
+- `stage_execution_id` remains as a nullable compatibility field.
+- This allows mediation-owned executions to reuse the same retry, quota, 
+  artifact, and cost infrastructure as stage-owned executions.
 
 **Projections and read-model tables** (e.g., `002_projections.sql`, `021_scheduler_backpressure_foundation.sql`):
 

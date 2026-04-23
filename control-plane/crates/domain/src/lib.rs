@@ -14,6 +14,7 @@ pub mod session;
 pub mod stage;
 pub mod steward;
 pub mod validation;
+pub mod workflow_conflict;
 
 // P029: PrincipalClass is canonically defined in domain::commands.
 pub use capabilities::{CapabilityToolId, ResourceTemplateId};

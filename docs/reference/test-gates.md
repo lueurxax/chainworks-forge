@@ -251,6 +251,46 @@ Important:
 - the gate keeps its historical proposal label for reproducibility
 - the documentation source of truth for the slice is now [design-system-and-brand-application.md](design-system-and-brand-application.md), not the old proposal file
 
+### `proposal-017`
+
+Proposal 017 Phase A workflow-authority and conflict-truth gate.
+
+Scope:
+
+- `TransitionAuthorityResolver` and `CandidateTransitionEvaluation` parity fixtures (Swift/Rust)
+- blocking conflict persistence by fingerprint
+- non-blocking advisory rejection history
+- `ImplementationHandoffStatus` authority and handoff-failure readback
+- aggregate field authority for `proposal_review_summary_v1`
+- fail-closed unknown transition-input classification
+- per-surface `workflow_conflict` report shape parity (Swift/MCP/GraphQL)
+- transition cursor and resume consistency with conflict truth
+- Phase A only: this gate does not prove Phase B lead mediation or Phase C lead-validation coverage
+
+Use when:
+
+- changing workflow authority, transition evaluation, or conflict/advisory persistence
+- changing implementation-entry handoff or approved proposal freeze logic
+- changing report/API shapes for workflow conflicts
+- changing the Phase A workflow-conflict persistence/readback slice
+
+Host policy:
+
+- local target; exercises Swift and Rust workspace tests without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-017
+```
+
+Important:
+
+- this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
+- it validates that agent-authored `next_stage` cannot override the compiled graph
+- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the current Phase A slice
+- it must not be cited as proof for Rust `agent_executions` owner-kind migration, lead mediation runtime, or Phase C lead-validation requirements until those surfaces and tests exist
+
 ### `proposal-019`
 
 Context-strategy framework gate for strategy handoff, lazy evidence, telemetry, and recommendation proof.

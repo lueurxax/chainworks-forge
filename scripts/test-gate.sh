@@ -84,6 +84,10 @@ PROPOSAL_015_NON_UI_TESTS=(
   "Chainworks ForgeTests/RuntimeSessionBridgeTests"
 )
 
+PROPOSAL_017_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal017Tests"
+)
+
 PROPOSAL_018_TESTS=(
   "Chainworks ForgeTests/AgentSessionTests"
   "Chainworks ForgeTests/RuntimeAgentExecutorTests"
@@ -1614,6 +1618,7 @@ Available gates:
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-015    Proposal 015 skill resolution and runtime injection gate
+  proposal-017    Proposal 017 Phase A workflow conflict truth gate
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
@@ -1794,6 +1799,23 @@ case "$GATE" in
     run_build "proposal-015"
     run_targeted_tests "proposal-015-non-ui" "${PROPOSAL_015_NON_UI_TESTS[@]}"
     run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
+    ;;
+  proposal-017|p017)
+    log "Proposal 017 gate: Phase A Swift bridge/report readback plus control-plane conflict truth"
+    check_idle_environment allow_app
+    run_targeted_tests "proposal-017-swift" "${PROPOSAL_017_SWIFT_TESTS[@]}"
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-017-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p workflow proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p domain --test proposal_017_workflow_conflict -- --test-threads=1 --nocapture
+      cargo test -p db --test proposal_017_workflow_conflict_persistence -- --test-threads=1 --nocapture
+      cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p mcp-server proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p graphql-server proposal_017_ -- --test-threads=1 --nocapture
+    )
+    log "Proposal 017 gate passed"
     ;;
   proposal-018|p018)
     check_idle_environment allow_app

@@ -494,6 +494,7 @@ impl McpServer {
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
+                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "artifact_index": artifact_rows,
                 "artifacts": artifact_payloads,

@@ -4,7 +4,7 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_executions, approvals, artifact_contracts, artifacts, ideas, runs, sessions, stages,
-    work_items,
+    work_items, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
@@ -12,10 +12,12 @@ use domain::commands::{
     ApproveStageCmd, CallerContext, Command, RejectStageCmd, RetryStageCmd, RunStewardAnalysisCmd,
     StartRunCmd,
 };
+use domain::artifact::{Artifact, ArtifactFormat};
 use domain::idea::{Idea, IdeaStatus};
-use domain::ids::{AgentExecutionId, ApprovalId, IdeaId, RunId, StageExecutionId};
+use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
+use domain::workflow_conflict::{WorkflowConflictReason, WorkflowTransitionCursorRecord};
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
 use engine::orchestrator::Orchestrator;
@@ -310,6 +312,188 @@ async fn test_startup_repair_skips_clean_runs() {
         StageStatus::Completed,
         "clean stage must not be modified by startup repair"
     );
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_respects_conflict_cursor_resume_policy() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: "stage_test".into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some("conflict-startup".into()),
+            conflict_fingerprint: Some("sha256:startup-conflict".into()),
+            candidate_transition_hash: Some("sha256:candidates".into()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_inspected, 1);
+    assert_eq!(
+        summary.runs_repaired, 0,
+        "workflow conflict cursor must keep restart repair at the conflict boundary"
+    );
+    assert_eq!(
+        summary.work_items_requeued, 0,
+        "startup repair must not enqueue AdvanceRun while conflict resolution is awaited"
+    );
+    assert!(
+        work_items::list_by_run(&pool, run_id).await.unwrap().is_empty(),
+        "no catchup work item should be created for a cursor-blocked run"
+    );
+    let stored = workflow_conflicts::get_transition_cursor(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("cursor remains readable after startup repair");
+    assert_eq!(stored.resume_policy, "await_conflict_resolution");
+    assert_eq!(stored.conflict_id.as_deref(), Some("conflict-startup"));
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_respects_terminal_failure_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("review".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: "review".into(),
+            cursor_status: "terminal_unverifiable".into(),
+            resume_policy: "terminal_failure".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some("conflict-terminal".into()),
+            conflict_fingerprint: Some("sha256:terminal-conflict".into()),
+            candidate_transition_hash: Some("sha256:candidates".into()),
+            terminal_failure_reason: Some("workflow_conflict_unverifiable".into()),
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_inspected, 1);
+    assert_eq!(
+        summary.runs_repaired, 0,
+        "terminal failure cursor must stay parked at the workflow boundary"
+    );
+    assert_eq!(
+        summary.work_items_requeued, 0,
+        "startup repair must not enqueue AdvanceRun after terminal-unverifiable settlement"
+    );
+    assert!(
+        work_items::list_by_run(&pool, run_id).await.unwrap().is_empty(),
+        "terminal cursor must not create catchup work"
+    );
+    let stored = workflow_conflicts::get_transition_cursor(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("terminal cursor remains readable after startup repair");
+    assert_eq!(stored.resume_policy, "terminal_failure");
+    assert_eq!(stored.cursor_status, "terminal_unverifiable");
+    assert_eq!(stored.conflict_id.as_deref(), Some("conflict-terminal"));
+    assert_eq!(
+        stored.terminal_failure_reason.as_deref(),
+        Some("workflow_conflict_unverifiable")
+    );
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_resumes_selected_transition_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("review".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: "review".into(),
+            cursor_status: "graph_transition_selected".into(),
+            resume_policy: "continue_from_selected_transition".into(),
+            selected_transition_id: Some("review__to__refine__0".into()),
+            selected_next_state_id: Some("refine".into()),
+            conflict_id: None,
+            conflict_fingerprint: None,
+            candidate_transition_hash: Some("sha256:candidates".into()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_inspected, 1);
+    assert_eq!(
+        summary.runs_repaired, 1,
+        "selected-transition cursor should still allow startup catchup"
+    );
+    assert_eq!(summary.work_items_requeued, 1);
+    let work = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(work.len(), 1);
+    assert_eq!(work[0].kind, db::work_item::WorkItemKind::AdvanceRun);
+    assert_eq!(work[0].stage_id, None);
 }
 
 #[tokio::test]
@@ -1697,6 +1881,303 @@ agents:
         prompt.contains("handoff_tasks"),
         "code_writer prompt should route non-code blockers as handoff tasks"
     );
+}
+
+#[tokio::test]
+async fn test_proposal_017_code_writer_start_missing_handoff_blocks_before_invoke() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("missing-handoff.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: code-writer-missing-handoff
+initial_state: implementation
+states:
+  implementation:
+    label: Implementation
+    owner: code_writer
+    run:
+      sequence:
+        - agent: code_writer
+          task: start_implementation
+          inputs:
+            - approved_proposal
+          outputs:
+            - implementation_self_assessment
+    transitions:
+      - to: reviewed
+        when: implementation_self_assessment.implementation_complete == true
+  reviewed:
+    label: Reviewed
+    type: end
+    owner: code_writer
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+artifacts:
+  approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
+  implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
+backend_profiles:
+  code_writer_profile:
+    provider: codex
+contracts:
+  implementation_self_assessment_v2:
+    format: json
+    required_fields:
+      - implementation_complete
+      - verification_green
+      - remaining_code_tasks
+      - handoff_tasks
+      - known_risks
+      - tests_run
+      - docs_impacted
+agents:
+  - id: code_writer
+    backend_profile: code_writer_profile
+    output_contract: implementation_self_assessment_v2
+"#,
+    )
+    .unwrap();
+
+    let meta_root = temp.path().join(".chainworks");
+    std::fs::create_dir_all(&meta_root).unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("implementation".into());
+    run.workspace_root = temp.path().to_string_lossy().into_owned();
+    run.artifact_root = temp.path().join("artifacts").to_string_lossy().into_owned();
+    run.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut pending_stage = make_stage(stage_execution_id, run_id, StageStatus::Pending);
+    pending_stage.stage_id = "implementation".into();
+    pending_stage.label = "Implementation".into();
+    stages::insert(&pool, &pending_stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let invoke_items: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert!(
+        invoke_items.is_empty(),
+        "code_writer must not be invoked before approved_proposal handoff truth exists"
+    );
+
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    let stored_stage = stages::find_by_id(&pool, stage_execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_stage.status, StageStatus::Blocked);
+
+    let handoff = workflow_conflicts::get_implementation_handoff_status(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("missing handoff status should be persisted");
+    assert_eq!(handoff.status, "blocked_before_code");
+    assert_eq!(handoff.code_writer_start_status, "blocked_before_code");
+    assert_eq!(
+        handoff.missing_input_artifacts,
+        vec!["approved_proposal".to_string()]
+    );
+    assert!(!handoff.approved_proposal_present);
+
+    let conflict = workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("missing handoff should persist a current workflow conflict");
+    assert_eq!(
+        conflict.reason,
+        WorkflowConflictReason::ImplementationHandoffUnavailable
+    );
+    assert_eq!(
+        conflict.candidate_transitions[0].missing_artifacts,
+        handoff.missing_input_artifacts
+    );
+}
+
+#[tokio::test]
+async fn test_proposal_017_code_writer_start_snapshots_proposal_current_before_invoke() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("snapshot-handoff.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: code-writer-handoff-snapshot
+initial_state: implementation
+states:
+  implementation:
+    label: Implementation
+    owner: code_writer
+    run:
+      sequence:
+        - agent: code_writer
+          task: start_implementation
+          inputs:
+            - approved_proposal
+          outputs:
+            - implementation_self_assessment
+    transitions:
+      - to: reviewed
+        when: implementation_self_assessment.implementation_complete == true
+  reviewed:
+    label: Reviewed
+    type: end
+    owner: code_writer
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+artifacts:
+  approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
+  implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
+backend_profiles:
+  code_writer_profile:
+    provider: codex
+contracts:
+  implementation_self_assessment_v2:
+    format: json
+    required_fields:
+      - implementation_complete
+      - verification_green
+      - remaining_code_tasks
+      - handoff_tasks
+      - known_risks
+      - tests_run
+      - docs_impacted
+agents:
+  - id: code_writer
+    backend_profile: code_writer_profile
+    output_contract: implementation_self_assessment_v2
+"#,
+    )
+    .unwrap();
+
+    let meta_root = temp.path().join(".chainworks");
+    std::fs::create_dir_all(&meta_root).unwrap();
+    let proposal_current_path = temp.path().join("proposal-current.md");
+    std::fs::write(&proposal_current_path, "# Approved proposal\n").unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("implementation".into());
+    run.workspace_root = temp.path().to_string_lossy().into_owned();
+    run.artifact_root = temp.path().join("artifacts").to_string_lossy().into_owned();
+    run.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+
+    artifacts::insert(
+        &pool,
+        &Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "proposal_review".into(),
+            agent_id: "lead_orchestrator".into(),
+            name: "proposal_current".into(),
+            contract_id: "proposal_current".into(),
+            format: ArtifactFormat::Markdown,
+            file_path: proposal_current_path.to_string_lossy().into_owned(),
+            checksum_sha256: None,
+            size_bytes: Some(20),
+            provider: "codex".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut pending_stage = make_stage(stage_execution_id, run_id, StageStatus::Pending);
+    pending_stage.stage_id = "implementation".into();
+    pending_stage.label = "Implementation".into();
+    stages::insert(&pool, &pending_stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let invoke_items: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect();
+    assert!(
+        !invoke_items.is_empty(),
+        "code_writer should be queued after engine-owned approved_proposal snapshot exists"
+    );
+
+    let handoff = workflow_conflicts::get_implementation_handoff_status(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("handoff status should be persisted");
+    assert_eq!(handoff.status, "ready");
+    assert_eq!(handoff.code_writer_start_status, "queued");
+    assert!(handoff.approved_proposal_present);
+    assert!(handoff.approved_proposal_artifact_id.is_some());
+    assert!(handoff.approved_proposal_digest.is_some());
+    assert!(handoff.missing_handoff_outputs.is_empty());
+
+    let approved_artifact = artifacts::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|artifact| artifact.name == "approved_proposal")
+        .expect("engine should create approved_proposal artifact record");
+    let approved_artifact_id = approved_artifact.id.to_string();
+    assert_eq!(
+        handoff.approved_proposal_artifact_id.as_deref(),
+        Some(approved_artifact_id.as_str())
+    );
+    assert!(std::path::Path::new(&approved_artifact.file_path).exists());
 }
 
 /// Starting a run must persist the frozen delivery configuration JSON on the

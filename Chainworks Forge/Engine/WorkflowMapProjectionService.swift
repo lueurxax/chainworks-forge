@@ -191,7 +191,7 @@ final class WorkflowMapProjectionService {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
                 return cursor.nextScheduledStateID
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 return cursor.lastCompletedStateID
             case .awaitingFirstState:
                 break // Fall through to heuristic
@@ -228,7 +228,7 @@ final class WorkflowMapProjectionService {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
                 return cursor.nextScheduledStateID
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 return cursor.lastCompletedStateID
             case .awaitingFirstState:
                 break
