@@ -926,6 +926,8 @@ Scope:
 - pre-prompt metadata capture and digest-backed validation
 - bounded meta-root discovery (max 500 files, 10 MiB aggregate)
 - discovery filesystem operation-recorder coverage for bounded traversal and metadata reads
+- trait-backed `DiscoveryFilesystem` fake coverage for deterministic P053 filesystem tests
+- stale-vs-absent required-output settlement and GraphQL/MCP stale-count readback
 - legacy broad discovery opt-in policy
 - GraphQL and MCP readback for discovery diagnostics
 

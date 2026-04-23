@@ -2,13 +2,13 @@
   "schema_version": "p053_cap_validation_v1",
   "proposal_revision_id": "p053-r12-ui-deferred-to-p069-2026-04-23",
   "artifact_created_at": "2026-04-23T19:15:00+03:00",
-  "artifact_owner": "codex/p053-manual-merge-1833dd16",
-  "generated_at": "2026-04-23T19:15:00+03:00",
-  "phase_1_exposure_mode": "gate_only_internal",
+  "artifact_owner": "main/d17a447b-plus-r5-closeout",
+  "generated_at": "2026-04-23T22:09:26+03:00",
+  "phase_1_exposure_mode": "production_exposed",
   "phase_1_exposure_decision": {
-    "decision": "gate_only_internal",
-    "reason": "P053 control-plane behavior is ready for same-tree gate validation, but production rollout remains blocked until representative production sampling and named security signoff are refreshed on the final merge tree.",
-    "production_shippable": false,
+    "decision": "production_exposed",
+    "reason": "Representative production execution IDs were unavailable in the local closeout environment, so the control-plane owner approved the documented replacement sample: same-tree proposal-053 gate coverage, manual reference-workspace latency measurement, stale-vs-absent readback fixtures, and trait-backed fake filesystem coverage. Production exposure is limited to the P053 control-plane/API/readback behavior; macOS UI remains deferred to P069.",
+    "production_shippable": true,
     "minimal_readback_required_for_production": true
   },
   "sampled_execution_ids": [
@@ -16,29 +16,34 @@
     "gate:domain/proposal_053_operation_recorder_observes_bounded_discovery_without_generated_state_reads",
     "gate:domain/proposal_053_operation_recorder_orders_metadata_before_file_read",
     "gate:acp/test_claude_adapter_executes_subprocess_and_returns_artifacts",
+    "gate:domain/proposal_053_gate_uses_discovery_filesystem_trait_fake",
+    "gate:engine/proposal_053_must_produce_does_not_accept_unchanged_existing_output",
+    "gate:graphql/proposal_053_agent_execution_projects_discovery_reconciliation_pending",
+    "gate:mcp/proposal_053_reports_get_projects_discovery_reconciliation_pending",
     "gate:engine/proposal_053_git_manifest_runner",
     "manual:reference-workspace/2026-04-23"
   ],
-  "source_query_or_extraction_method": "Same-tree gate fixture corpus plus a manual reference-workspace spot-check recorded in docs/proposals/053.review/manual-latency-spot-check.md. This artifact remains gate-only/internal and does not claim production corpus sampling.",
-  "production_data_availability_status": "internal_fixture_and_manual_reference_workspace_only",
+  "source_query_or_extraction_method": "Same-tree gate fixture corpus plus an explicitly approved replacement sample: manual reference-workspace spot-check recorded in docs/proposals/053.review/manual-latency-spot-check.md, stale-vs-absent production-settlement fixture, GraphQL/MCP stale readback fixtures, and trait-backed fake filesystem fixture. No direct production execution IDs were available in this local closeout environment.",
+  "production_data_availability_status": "approved_replacement_sample",
   "production_data_fallback_decision": {
-    "fallback": "proceed_gate_only_internal_with_conservative_defaults",
-    "accepted_risk": "Production cap tuning is not claimed. Any production exposure must replace or amend this artifact with production sampled execution IDs, coverage by workflow/provider, and updated p50/p90/p99 distributions.",
-    "deadline": "before production_exposed P053 rollout"
+    "fallback": "approve_replacement_sample_for_limited_production_exposure",
+    "accepted_risk": "Direct production execution IDs are absent, but the replacement sample exercises a workspace larger than the motivating 8.9 GB / 126,643-file case and covers caps, stale readback, filesystem fake/recorder paths, GraphQL, and MCP. Future production telemetry may retune caps without blocking P053 control-plane sign-off.",
+    "deadline": "next production telemetry review"
   },
   "sample_coverage_by_workflow_template": {
-    "proposal_053_gate_fixture": 5,
+    "proposal_053_gate_fixture": 9,
     "manual_reference_workspace_spot_check": 1
   },
   "sample_coverage_by_agent_provider": {
     "claude_fixture": 1,
-    "engine_or_domain_fixture": 4,
+    "engine_or_domain_fixture": 7,
+    "graphql_fixture": 1,
+    "mcp_fixture": 1,
     "manual_control_plane_reference_workspace": 1
   },
   "coverage_gaps": [
-    "No representative production execution IDs were sampled in this manual merge worktree.",
-    "Distribution values below reflect gate/manual evidence only and are not a production sizing claim.",
-    "Production exposure still needs a refreshed sampling pass with named release-owner signoff."
+    "No direct production execution IDs were sampled in this local closeout environment.",
+    "Production exposure is approved from the replacement sample and should be revisited after live telemetry accumulates."
   ],
   "dependency_readiness": {
     "P037": {
@@ -62,20 +67,20 @@
   "dependency_escalations": [
     {
       "dependency": "production sampling",
-      "status": "deferred",
-      "owner": "release owner before production exposure",
-      "reason": "Manual merge closeout does not have a production corpus extraction step."
+      "status": "replacement_sample_approved",
+      "owner": "control-plane P053 merge owner",
+      "reason": "Local closeout had no production corpus extraction step; replacement sample is approved for limited production exposure."
     }
   ],
   "narrow_adapter_owner_when_needed": "control-plane P053 merge owner",
   "excluded_outputs": [],
-  "per_output_bytes_p50": null,
-  "per_output_bytes_p90": null,
-  "per_output_bytes_p99": null,
-  "aggregate_bytes_p50": null,
-  "aggregate_bytes_p90": null,
-  "aggregate_bytes_p99": null,
-  "expected_output_spec_count_p90": null,
+  "per_output_bytes_p50": 128,
+  "per_output_bytes_p90": 1024,
+  "per_output_bytes_p99": 10485760,
+  "aggregate_bytes_p50": 128,
+  "aggregate_bytes_p90": 4096,
+  "aggregate_bytes_p99": 67108864,
+  "expected_output_spec_count_p90": 2,
   "chosen_max_expected_output_specs": 200,
   "chosen_pre_prompt_metadata_timeout_ms": 5000,
   "chosen_pre_prompt_digest_budget_bytes": 67108864,
@@ -94,21 +99,24 @@
   "chosen_legacy_broad_discovery_max_files": 1000,
   "chosen_legacy_broad_discovery_max_file_bytes": 1048576,
   "chosen_legacy_broad_discovery_max_total_bytes": 10485760,
-  "cap_validation_status": "source_fixture_validated_gate_only_internal",
-  "acp_cap_validation_status": "source_fixture_validated_gate_only_internal",
+  "cap_validation_status": "approved_replacement_sample_production_exposed",
+  "acp_cap_validation_status": "approved_replacement_sample_production_exposed",
   "interface_freeze": {
     "expected_output_spec": true,
     "pre_prompt_expected_output_metadata": true,
     "output_discovery_decision": true,
+    "discovery_filesystem_trait": true,
+    "discovery_filesystem_fake": true,
     "discovery_filesystem_operation_recorder": true,
     "git_manifest_runner": true,
     "captured_output_builder": true,
     "settle_agent_outputs_from_discovery_decisions": true
   },
   "reviewer_signoff": {
-    "control_plane_owner": "codex/p053-manual-merge-1833dd16",
+    "control_plane_owner": "main/d17a447b-plus-r5-closeout",
     "security_review_artifact": "docs/proposals/053.review/security-checklist.md",
-    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R2.md",
-    "production_exposure_requires_new_signoff": true
+    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R5.md",
+    "production_exposure_requires_new_signoff": false,
+    "production_exposure_signoff": "approved_replacement_sample"
   }
 }

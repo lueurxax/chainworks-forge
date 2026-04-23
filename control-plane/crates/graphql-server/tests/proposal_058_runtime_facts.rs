@@ -15,8 +15,8 @@ use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::ActiveArtifactGenerationInput;
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, ExpectedOutputRole,
-    OutputDiscoveryDecision, OutputDiscoveryReason, OutputDiscoveryStatus,
-    DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+    OutputDiscoveryDecision, OutputDiscoveryProvenance, OutputDiscoveryReason,
+    OutputDiscoveryStatus, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
@@ -241,6 +241,33 @@ fn accepted_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDi
         accepted_bytes_sha256: Some("accepted".into()),
         generated_by: Some(agent_execution_id.to_string()),
         diagnostics: BTreeMap::new(),
+        decision_at: Utc::now(),
+    }
+}
+
+fn stale_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: "proposal_review".into(),
+        output_role: ExpectedOutputRole::Machine,
+        target_path: "proposal_review.json".into(),
+        companion_of: None,
+        status: OutputDiscoveryStatus::Missing,
+        reason: OutputDiscoveryReason::StaleExpectedOutput,
+        provenance: Some(OutputDiscoveryProvenance::ExactPath),
+        canonical_path: Some("/tmp/artifacts/proposal_review.json".into()),
+        root_class: None,
+        baseline_status: None,
+        size_bytes: Some(128),
+        content_digest: Some("sha256:stale".into()),
+        max_bytes_applied: Some(10 * 1024 * 1024),
+        aggregate_bytes_after_acceptance: None,
+        accepted_payload_ref: None,
+        accepted_bytes_sha256: None,
+        generated_by: None,
+        diagnostics: BTreeMap::from([(
+            "agent_execution_id".to_string(),
+            agent_execution_id.to_string(),
+        )]),
         decision_at: Utc::now(),
     }
 }
@@ -473,7 +500,14 @@ async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending(
         seed_execution(&pool).await;
     let now = Utc::now();
     let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(
-        discovery_payload(agent_execution_id, vec![accepted_discovery_decision(agent_execution_id)], now),
+        discovery_payload(
+            agent_execution_id,
+            vec![
+                accepted_discovery_decision(agent_execution_id),
+                stale_discovery_decision(agent_execution_id),
+            ],
+            now,
+        ),
         now,
     );
     agent_execution_discovery_diagnostics::upsert(&pool, &diagnostics)
@@ -525,6 +559,14 @@ async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending(
     assert_eq!(
         execution["discoveryDiagnostics"]["reconciliation_pending"],
         true
+    );
+    assert_eq!(
+        execution["discoveryDiagnostics"]["stale_output_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        execution["discoveryDiagnostics"]["missing_required_output_count"],
+        serde_json::json!(1)
     );
     assert_eq!(
         execution["discoveryDiagnostics"]["payload"]["resume_warnings"],

@@ -12,9 +12,8 @@ use domain::agent::{
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, BoundedMetaRootDiscovery, DiscoveryDiagnosticsV1,
     ExpectedOutputRole, LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput,
-    LegacyDiscoveryOverrideStatus, OutputDiscoveryDecision, OutputDiscoveryReason,
-    OutputDiscoveryStatus,
-    DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+    LegacyDiscoveryOverrideStatus, OutputDiscoveryDecision, OutputDiscoveryProvenance,
+    OutputDiscoveryReason, OutputDiscoveryStatus, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
@@ -170,6 +169,33 @@ fn missing_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDeci
     }
 }
 
+fn stale_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: "proposal_review".into(),
+        output_role: ExpectedOutputRole::Machine,
+        target_path: "proposal_review.json".into(),
+        companion_of: None,
+        status: OutputDiscoveryStatus::Missing,
+        reason: OutputDiscoveryReason::StaleExpectedOutput,
+        provenance: Some(OutputDiscoveryProvenance::ExactPath),
+        canonical_path: Some("/tmp/artifacts/proposal_review.json".into()),
+        root_class: None,
+        baseline_status: None,
+        size_bytes: Some(128),
+        content_digest: Some("sha256:stale".into()),
+        max_bytes_applied: Some(10 * 1024 * 1024),
+        aggregate_bytes_after_acceptance: None,
+        accepted_payload_ref: None,
+        accepted_bytes_sha256: None,
+        generated_by: None,
+        diagnostics: BTreeMap::from([(
+            "agent_execution_id".to_string(),
+            agent_execution_id.to_string(),
+        )]),
+        decision_at: Utc::now(),
+    }
+}
+
 fn accepted_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
     OutputDiscoveryDecision {
         output_name: "implementation_self_assessment".into(),
@@ -254,7 +280,14 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let (run_id, agent_execution_id) = seed_execution(&pool).await;
     let now = Utc::now();
-    let mut payload = discovery_payload(agent_execution_id, vec![missing_decision(agent_execution_id)], now);
+    let mut payload = discovery_payload(
+        agent_execution_id,
+        vec![
+            missing_decision(agent_execution_id),
+            stale_decision(agent_execution_id),
+        ],
+        now,
+    );
     payload.legacy_broad_discovery_used = true;
     payload.bounded_meta_root_discovery = Some(BoundedMetaRootDiscovery {
         root_path: "/tmp/ws/.chainworks/runs/current".into(),
@@ -276,7 +309,7 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
     payload.acp_pre_prompt_metadata_latency_ms = Some(15);
     payload.acp_pre_prompt_metadata_timeout = Some(false);
     payload.acp_pre_prompt_metadata_digest_bytes = Some(16);
-    payload.acp_expected_output_spec_count = Some(1);
+    payload.acp_expected_output_spec_count = Some(2);
     payload.acp_control_plane_manifest_latency_ms = Some(17);
     payload.acp_exact_output_acceptance_latency_ms = Some(18);
     payload.acp_meta_root_discovery_latency_ms = Some(33);
@@ -312,10 +345,11 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
         DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION
     );
     assert!(read.legacy_broad_discovery_used);
-    assert_eq!(read.missing_required_output_count, 1);
+    assert_eq!(read.missing_required_output_count, 2);
     assert_eq!(read.rejected_output_count, 0);
+    assert_eq!(read.stale_output_count, 1);
     assert_eq!(read.resume_warning_count, 1);
-    assert_eq!(read.payload.decisions.len(), 1);
+    assert_eq!(read.payload.decisions.len(), 2);
     let projected = &read.payload;
     assert_eq!(projected.acp_pre_initialize_local_latency_ms, Some(11));
     assert_eq!(projected.acp_initialize_latency_ms, Some(12));
@@ -324,14 +358,14 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
     assert_eq!(projected.acp_pre_prompt_metadata_latency_ms, Some(15));
     assert_eq!(projected.acp_pre_prompt_metadata_timeout, Some(false));
     assert_eq!(projected.acp_pre_prompt_metadata_digest_bytes, Some(16));
-    assert_eq!(projected.acp_expected_output_spec_count, Some(1));
+    assert_eq!(projected.acp_expected_output_spec_count, Some(2));
     assert_eq!(projected.acp_control_plane_manifest_latency_ms, Some(17));
     assert_eq!(projected.acp_exact_output_acceptance_latency_ms, Some(18));
     assert_eq!(projected.acp_meta_root_discovery_latency_ms, Some(33));
     assert_eq!(projected.acp_git_changed_files_latency_ms, Some(19));
     assert_eq!(projected.acp_expected_outputs_found_count, Some(0));
-    assert_eq!(projected.acp_expected_outputs_missing_count, Some(1));
-    assert_eq!(projected.acp_expected_outputs_stale_count, Some(0));
+    assert_eq!(projected.acp_expected_outputs_missing_count, Some(2));
+    assert_eq!(projected.acp_expected_outputs_stale_count, Some(1));
     assert_eq!(projected.acp_expected_outputs_rejected_count, Some(0));
     assert_eq!(projected.acp_meta_discovery_truncated, Some(true));
     assert_eq!(
@@ -359,9 +393,9 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
         projected.acp_discovery_override_status.as_deref(),
         Some("not_requested")
     );
-    assert_eq!(projected.acp_missing_required_output_count, Some(1));
+    assert_eq!(projected.acp_missing_required_output_count, Some(2));
     assert_eq!(projected.acp_rejected_output_count, Some(0));
-    assert_eq!(projected.acp_stale_output_count, Some(0));
+    assert_eq!(projected.acp_stale_output_count, Some(1));
     assert_eq!(projected.acp_exact_output_acceptance_timeout, Some(false));
     assert_eq!(projected.acp_exact_output_aggregate_bytes, Some(20));
     assert_eq!(projected.acp_exact_output_aggregate_cap_hit, Some(false));
@@ -370,7 +404,9 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
     assert_eq!(projected.acp_cap_validation_p90_aggregate_bytes, Some(4096));
     assert_eq!(projected.acp_legacy_broad_discovery_timeout_ms, Some(5000));
     assert_eq!(
-        projected.acp_legacy_broad_discovery_truncation_reason.as_deref(),
+        projected
+            .acp_legacy_broad_discovery_truncation_reason
+            .as_deref(),
         Some("total_bytes_cap")
     );
 
@@ -386,7 +422,11 @@ async fn proposal_053_discovery_diagnostics_readback_marks_reconciliation_pendin
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let (_run_id, agent_execution_id) = seed_execution(&pool).await;
     let now = Utc::now();
-    let payload = discovery_payload(agent_execution_id, vec![accepted_decision(agent_execution_id)], now);
+    let payload = discovery_payload(
+        agent_execution_id,
+        vec![accepted_decision(agent_execution_id)],
+        now,
+    );
     let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(payload, now);
     agent_execution_discovery_diagnostics::upsert(&pool, &diagnostics)
         .await

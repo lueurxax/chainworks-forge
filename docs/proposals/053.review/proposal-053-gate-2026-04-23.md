@@ -6,7 +6,7 @@
 | Worktree | `/Users/user/Documents/Chainworks Forge` |
 | Branch | `main` |
 | Result | Passed |
-| Completed at | 2026-04-23 21:40 Asia/Nicosia |
+| Completed at | 2026-04-23 22:13 Asia/Nicosia |
 
 ## Covered Slices
 
@@ -14,16 +14,17 @@
 - Phase 1 security-checklist artifact validation.
 - Domain generated-state denylist and expected-output policy serialization.
 - P053 operation-recorder evidence for bounded discovery and pre-prompt metadata reads.
+- P053 trait-backed fake `DiscoveryFilesystem` coverage.
 - Bounded pre-prompt metadata caps, bounded meta-root discovery, and legacy broad-discovery policy.
 - DB discovery diagnostics and legacy override persistence.
 - Workflow output policy compatibility.
 - ACP envelope cap behavior and adapter defaults.
-- Engine expected-output specs, settlement, bounded meta-root supplemental behavior, changed-files manifest, and legacy override validation.
-- GraphQL and MCP discovery diagnostics readback.
+- Engine expected-output specs, stale-vs-absent settlement, bounded meta-root supplemental behavior, changed-files manifest, and legacy override validation.
+- GraphQL and MCP discovery diagnostics readback, including stale output counts.
 
 ## Notes
 
-This is same-tree control-plane validation. It does not claim production exposure; `docs/proposals/053.review/cap-validation.json` records `phase_1_exposure_mode = gate_only_internal`.
+This is same-tree control-plane validation. `docs/proposals/053.review/cap-validation.json` records `phase_1_exposure_mode = production_exposed` based on the approved replacement sample.
 
 The current recorded rerun includes the ACP fixture observation `acp_pre_initialize_local_latency_ms=0`, which is also captured in `docs/proposals/053.review/manual-latency-spot-check.md`.
 

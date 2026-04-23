@@ -17,8 +17,9 @@
 use anyhow::{bail, Context, Result};
 use domain::agent::AgentStatus;
 use domain::discovery::{
-    DiscoveryFilesystem, ExpectedOutputSpec, ExpectedPathBaseline, ExpectedPathBaselineStatus,
+    ExpectedOutputSpec, ExpectedPathBaseline, ExpectedPathBaselineStatus,
     LegacyBroadDiscoverySnapshot, PrePromptExpectedOutputContext, PrePromptExpectedOutputMetadata,
+    StdDiscoveryFilesystem,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -244,7 +245,7 @@ fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
 }
 
 fn snapshot_legacy_broad_discovery(root: &str) -> LegacyBroadDiscoverySnapshot {
-    DiscoveryFilesystem::snapshot_legacy_broad_discovery(root)
+    StdDiscoveryFilesystem::snapshot_legacy_broad_discovery(root)
 }
 
 fn legacy_broad_file_modified_after_prompt_start(
@@ -1291,7 +1292,7 @@ impl AcpTransportSession {
         };
         let expected_path_baselines: Vec<ExpectedPathBaseline> = expected_baseline_paths
             .iter()
-            .map(|path| DiscoveryFilesystem::capture_expected_path_baseline(*path))
+            .map(|path| StdDiscoveryFilesystem::capture_expected_path_baseline(*path))
             .collect();
         self.request_counter += 1;
         let prompt_id = self.request_counter;
@@ -1314,7 +1315,7 @@ impl AcpTransportSession {
         };
         let pre_prompt_metadata_started = Instant::now();
         let pre_prompt_expected_outputs: Vec<PrePromptExpectedOutputMetadata> =
-            DiscoveryFilesystem::capture_bounded_pre_prompt_expected_output_metadata(
+            StdDiscoveryFilesystem::capture_bounded_pre_prompt_expected_output_metadata(
                 &req.expected_outputs,
                 &metadata_context,
             );
@@ -1594,7 +1595,7 @@ impl AcpTransportSession {
                 }) else {
                     return false;
                 };
-                DiscoveryFilesystem::expected_output_has_current_content(
+                StdDiscoveryFilesystem::expected_output_has_current_content(
                     spec,
                     metadata,
                     &metadata_context,
@@ -1605,7 +1606,7 @@ impl AcpTransportSession {
                     metadata.output_name == spec.output_name
                         && metadata.target_path == spec.target_path
                 }) {
-                    if DiscoveryFilesystem::expected_output_has_current_content(
+                    if StdDiscoveryFilesystem::expected_output_has_current_content(
                         spec,
                         metadata,
                         &metadata_context,
@@ -1623,10 +1624,10 @@ impl AcpTransportSession {
                 else {
                     return true;
                 };
-                DiscoveryFilesystem::expected_path_has_current_content(baseline)
+                StdDiscoveryFilesystem::expected_path_has_current_content(baseline)
             });
             for baseline in &expected_path_baselines {
-                if DiscoveryFilesystem::expected_path_has_current_content(baseline)
+                if StdDiscoveryFilesystem::expected_path_has_current_content(baseline)
                     && !new_files.iter().any(|p| p == &baseline.target_path)
                 {
                     new_files.push(baseline.target_path.clone());

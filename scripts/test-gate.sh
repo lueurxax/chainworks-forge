@@ -2458,6 +2458,22 @@ if data["dependency_readiness_recorded_within_two_working_days"] is not True:
     raise SystemExit("proposal-053: dependency_readiness_recorded_within_two_working_days must be true")
 if data["phase_1_exposure_mode"] not in {"gate_only_internal", "production_exposed"}:
     raise SystemExit("proposal-053: phase_1_exposure_mode must be gate_only_internal or production_exposed")
+if data["phase_1_exposure_mode"] == "production_exposed":
+    if data.get("phase_1_exposure_decision", {}).get("production_shippable") is not True:
+        raise SystemExit("proposal-053: production_exposed mode requires production_shippable=true")
+    if data.get("production_data_availability_status") != "approved_replacement_sample":
+        raise SystemExit("proposal-053: production_exposed mode requires approved replacement sample evidence")
+    for key in [
+        "per_output_bytes_p50",
+        "per_output_bytes_p90",
+        "per_output_bytes_p99",
+        "aggregate_bytes_p50",
+        "aggregate_bytes_p90",
+        "aggregate_bytes_p99",
+        "expected_output_spec_count_p90",
+    ]:
+        if data.get(key) is None:
+            raise SystemExit(f"proposal-053: production_exposed mode requires {key}")
 try:
     datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
 except Exception as exc:  # noqa: BLE001
@@ -2475,14 +2491,16 @@ for key in [
     "git_manifest_runner",
     "captured_output_builder",
     "settle_agent_outputs_from_discovery_decisions",
+    "discovery_filesystem_trait",
+    "discovery_filesystem_fake",
 ]:
     if data["interface_freeze"].get(key) is not True:
         raise SystemExit(f"proposal-053: interface_freeze.{key} must be true")
 text = security.read_text()
 for needle in [
-    "Production exposure | Not approved by this checklist",
-    "operation-recorder evidence",
-    "P053 remains approved only for gate-only/internal control-plane validation",
+    "Production exposure | Approved for P053 control-plane/API/readback behavior",
+    "proposal_053_gate_uses_discovery_filesystem_trait_fake",
+    "StaleExpectedOutput",
 ]:
     if needle not in text:
         raise SystemExit(f"proposal-053: security checklist missing {needle!r}")
@@ -2513,6 +2531,7 @@ PY
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
       cargo test -p domain discovery::tests::generated_state_denylist_matches_p053_roots -- --exact --nocapture &&
       cargo test -p domain discovery::tests::proposal_053_operation_recorder_observes_bounded_discovery_without_generated_state_reads -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::proposal_053_gate_uses_discovery_filesystem_trait_fake -- --exact --nocapture &&
       cargo test -p domain discovery::tests::proposal_053_operation_recorder_orders_metadata_before_file_read -- --exact --nocapture &&
       cargo test -p domain discovery::tests::expected_output_spec_serializes_p053_policy_fields -- --exact --nocapture &&
       cargo test -p domain bounded_pre_prompt_metadata -- --nocapture &&
@@ -2525,6 +2544,7 @@ PY
       cargo test -p acp test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default --test integration -- --nocapture &&
       cargo test -p acp test_claude_adapter_executes_subprocess_and_returns_artifacts --test integration -- --nocapture &&
       cargo test -p engine expected_output_specs -- --nocapture &&
+      cargo test -p engine proposal_053_must_produce_does_not_accept_unchanged_existing_output --lib -- --nocapture &&
       cargo test -p engine proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only --lib -- --nocapture &&
       cargo test -p engine proposal_053_git_manifest_runner -- --nocapture &&
       cargo test -p engine proposal_053_declared_manifest_preserves_agent_authored_file -- --nocapture &&

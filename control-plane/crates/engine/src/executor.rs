@@ -36,11 +36,11 @@ use domain::artifact_contracts::{
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::discovery::{
-    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
-    ExpectedOutputSpec, ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy,
-    OutputDiscoveryDecision, OutputDiscoveryProvenance, OutputDiscoveryReason,
-    OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass, PrePromptExpectedOutputMetadata,
-    SourceGenerationOwner, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, ExpectedOutputSpec,
+    ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy, OutputDiscoveryDecision,
+    OutputDiscoveryProvenance, OutputDiscoveryReason, OutputDiscoveryStatus, OutputReusePolicy,
+    OutputRootClass, PrePromptExpectedOutputMetadata, SourceGenerationOwner,
+    StdDiscoveryFilesystem, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
@@ -953,7 +953,10 @@ fn build_declared_output_discovery_settlement(
             baseline_status,
         )) = candidate
         else {
-            decisions.push(missing_output_decision(spec));
+            decisions.push(
+                stale_expected_output_decision(spec, pre_prompt_expected_outputs)
+                    .unwrap_or_else(|| missing_output_decision(spec)),
+            );
             continue;
         };
 
@@ -1338,6 +1341,55 @@ fn missing_output_decision(spec: &ExpectedOutputSpec) -> OutputDiscoveryDecision
     }
 }
 
+fn stale_expected_output_decision(
+    spec: &ExpectedOutputSpec,
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+) -> Option<OutputDiscoveryDecision> {
+    if spec.reuse_policy != OutputReusePolicy::MustProduce {
+        return None;
+    }
+    let metadata = pre_prompt_expected_outputs.iter().find(|metadata| {
+        metadata.output_name == spec.output_name
+            && metadata.target_path == spec.target_path
+            && metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured
+    })?;
+    let pre_prompt_digest = metadata.content_digest.as_deref()?;
+    if exact_path_rejection_for_spec(spec, Some(&spec.target_path)).is_some() {
+        return None;
+    }
+    let current_metadata = std::fs::metadata(&spec.target_path).ok()?;
+    if current_metadata.len() > spec.max_bytes {
+        return None;
+    }
+    let bytes = std::fs::read(&spec.target_path).ok()?;
+    let current_digest = sha256_digest(&bytes);
+    if current_digest != pre_prompt_digest {
+        return None;
+    }
+
+    Some(OutputDiscoveryDecision {
+        output_name: spec.output_name.clone(),
+        output_role: spec.output_role,
+        target_path: spec.target_path.clone(),
+        companion_of: spec.companion_of.clone(),
+        status: OutputDiscoveryStatus::Missing,
+        reason: OutputDiscoveryReason::StaleExpectedOutput,
+        provenance: Some(OutputDiscoveryProvenance::ExactPath),
+        canonical_path: canonical_path_for_decision(Some(&spec.target_path), &spec.target_path),
+        root_class: spec.authorized_roots.first().map(|root| root.root_class),
+        baseline_status: Some(metadata.baseline_status),
+        size_bytes: Some(bytes.len() as u64),
+        content_digest: Some(current_digest),
+        max_bytes_applied: Some(spec.max_bytes),
+        aggregate_bytes_after_acceptance: None,
+        accepted_payload_ref: None,
+        accepted_bytes_sha256: None,
+        generated_by: None,
+        diagnostics: Default::default(),
+        decision_at: chrono::Utc::now(),
+    })
+}
+
 fn rejected_output_decision(
     spec: &ExpectedOutputSpec,
     reason: OutputDiscoveryReason,
@@ -1428,7 +1480,7 @@ fn bounded_meta_root_artifact_paths(
         };
     };
     let meta_root_started = Instant::now();
-    let mut discovery = DiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
+    let mut discovery = StdDiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
     let latency_ms = meta_root_started.elapsed().as_millis() as u64;
     discovery.latency_ms = Some(latency_ms);
     info!(
@@ -1684,8 +1736,8 @@ fn discovery_diagnostics_for_execution_result(
         acp_cap_validation_p90_output_bytes: metrics.acp_cap_validation_p90_output_bytes,
         acp_cap_validation_p90_aggregate_bytes: metrics.acp_cap_validation_p90_aggregate_bytes,
         acp_legacy_broad_discovery_timeout_ms: Some(5_000),
-        acp_legacy_broad_discovery_truncation_reason:
-            metrics.acp_legacy_broad_discovery_truncation_reason,
+        acp_legacy_broad_discovery_truncation_reason: metrics
+            .acp_legacy_broad_discovery_truncation_reason,
         acp_reconciliation_pending: Some(false),
     };
     AgentExecutionDiscoveryDiagnostics::from_payload(payload, now)
@@ -1722,8 +1774,8 @@ fn legacy_broad_discovery_truncation_reason(
 fn load_p053_cap_validation_metrics(
     workspace_root: &str,
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let path = std::path::Path::new(workspace_root)
-        .join("docs/proposals/053.review/cap-validation.json");
+    let path =
+        std::path::Path::new(workspace_root).join("docs/proposals/053.review/cap-validation.json");
     let Ok(raw) = std::fs::read_to_string(path) else {
         return (None, None, None);
     };
@@ -2984,13 +3036,12 @@ impl BackgroundExecutor {
                     .await?
                     .map(|stage| stage.attempt_number)
                     .unwrap_or(1);
-                let mut discovery_override_status = if legacy_broad_discovery_policy
-                    .allows_broad_discovery()
-                {
-                    "workflow_opt_in".to_string()
-                } else {
-                    "not_requested".to_string()
-                };
+                let mut discovery_override_status =
+                    if legacy_broad_discovery_policy.allows_broad_discovery() {
+                        "workflow_opt_in".to_string()
+                    } else {
+                        "not_requested".to_string()
+                    };
                 if !legacy_broad_discovery_policy.allows_broad_discovery() {
                     let mut tx = db::pool::begin_immediate_with_retry(
                         &self.pool,
@@ -3510,8 +3561,11 @@ impl BackgroundExecutor {
                         )
                     })
                     .unwrap_or_default();
-                let (acp_cap_validation_sample_size, acp_cap_validation_p90_output_bytes, acp_cap_validation_p90_aggregate_bytes) =
-                    load_p053_cap_validation_metrics(&run.workspace_root);
+                let (
+                    acp_cap_validation_sample_size,
+                    acp_cap_validation_p90_output_bytes,
+                    acp_cap_validation_p90_aggregate_bytes,
+                ) = load_p053_cap_validation_metrics(&run.workspace_root);
                 let discovery_diagnostics = declared_output_settlement.as_ref().map(|settlement| {
                     discovery_diagnostics_for_execution_result(
                         agent_exec_id,
@@ -3526,8 +3580,7 @@ impl BackgroundExecutor {
                             acp_prompt_duration_ms: result.acp_prompt_duration_ms,
                             acp_pre_prompt_metadata_latency_ms: result
                                 .acp_pre_prompt_metadata_latency_ms,
-                            acp_pre_prompt_metadata_timeout: result
-                                .acp_pre_prompt_metadata_timeout,
+                            acp_pre_prompt_metadata_timeout: result.acp_pre_prompt_metadata_timeout,
                             acp_pre_prompt_metadata_digest_bytes: result
                                 .acp_pre_prompt_metadata_digest_bytes,
                             acp_expected_output_spec_count: expected_outputs.len(),
@@ -3536,8 +3589,7 @@ impl BackgroundExecutor {
                             acp_git_manifest_status: acp_git_manifest_status.clone(),
                             acp_exact_output_acceptance_latency_ms,
                             acp_exact_output_acceptance_timeout: false,
-                            acp_exact_output_aggregate_bytes: settlement
-                                .accepted_aggregate_bytes,
+                            acp_exact_output_aggregate_bytes: settlement.accepted_aggregate_bytes,
                             acp_exact_output_aggregate_cap_hit: settlement.aggregate_cap_hit,
                             acp_legacy_broad_discovery_policy: legacy_broad_discovery_policy_name(
                                 req.legacy_broad_discovery_policy,
@@ -5867,7 +5919,7 @@ mod tests {
             discovery_generation_id: "discovery-1".to_string(),
         };
         let pre_prompt_metadata = vec![
-            DiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
+            StdDiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
                 &specs[0],
                 &metadata_context,
             ),
@@ -5922,7 +5974,7 @@ mod tests {
             discovery_generation_id: "discovery-1".to_string(),
         };
         let pre_prompt_metadata = vec![
-            DiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
+            StdDiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
                 &specs[0],
                 &metadata_context,
             ),
@@ -5937,7 +5989,11 @@ mod tests {
         );
         assert_eq!(
             settlement.decisions[0].reason,
-            OutputDiscoveryReason::MissingAfterPrompt
+            OutputDiscoveryReason::StaleExpectedOutput
+        );
+        assert_eq!(
+            settlement.decisions[0].baseline_status,
+            Some(ExpectedPathBaselineStatus::RegularContentCaptured)
         );
         assert!(settlement.accepted_payloads.is_empty());
     }
